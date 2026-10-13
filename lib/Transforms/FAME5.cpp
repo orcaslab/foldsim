@@ -1347,9 +1347,13 @@ LogicalResult Threader::run() {
     results.push_back(outValid[i]);
     if (hw::getBitWidth(channel.type) == 0)
       continue;
+    // An eager output that has fired offers the next cycle's value, which is
+    // the current one if the target clock does not tick on this finish.
     Value bits = channel.eager
-                     ? Value(comb::MuxOp::create(b, outFired[i], channel.next,
-                                                 channel.current))
+                     ? Value(comb::MuxOp::create(
+                           b,
+                           b.createOrFold<comb::AndOp>(outFired[i], clkEnabled),
+                           channel.next, channel.current))
                      : channel.current;
     bits = b.createOrFold<hw::BitcastOp>(
         b.getIntegerType(hw::getBitWidth(channel.type)), bits);

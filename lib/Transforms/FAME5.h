@@ -15,10 +15,11 @@ namespace foldsim {
 
 /// Replaces `model` with its FAME-5 threaded module `name` of `threads`
 /// instances, as `foldsim-fame5` with `clock-enable` and `thread-index` builds
-/// it: each target port a channel, the current thread on `threadIdx`. With
-/// `readySchedule`, a `thread_ready` input of one bit per thread says whose
-/// inputs are all there, and the thread after the current one among those is
-/// next.
+/// it but for one thing: a thread's target clock ticks from its first finish
+/// after reset on, rather than from its second. Each target port is a channel,
+/// the current thread on `threadIdx`. With `readySchedule`, a `thread_ready`
+/// input of one bit per thread says whose inputs are all there, and the thread
+/// after the current one among those is next.
 mlir::FailureOr<circt::hw::HWModuleOp>
 threadModel(circt::hw::HWModuleOp model, unsigned threads, mlir::StringAttr name,
             bool readySchedule);
