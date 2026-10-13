@@ -21,7 +21,7 @@ def ExtractModels : Pass<"foldsim-extract-models", "::mlir::ModuleOp"> {
   let summary = "Cut the instances of separately simulated models out of a "
                 "parent";
   let description = [{
-    FireSim's Golden Gate simulates each partitioned class as its own model,
+    A simulator simulates each class of instances as a model of its own,
     connected to the others by channels. This pass removes the instances of
     the `models` modules from the flat `module`, leaving it with ports for
     what it exchanges with them, named `<instance>_<port>`:
@@ -120,9 +120,9 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
       tokens: every thread of it has two slots, written in turn, and a count
       of tokens written. A token is taken by each input it feeds, which counts
       the tokens it has read from it; the producer is ready while every reader
-      has read all but at most one of them. This is the two-entry channel of
-      FireSim's LI-BDN simulators, with fan-out, so a model's outputs reach
-      their inputs on the next host cycle.
+      has read all but at most one of them: a two-entry latency-insensitive
+      channel, with fan-out, so a model's outputs reach their inputs on the
+      next host cycle.
     - An input reads its bits from the producers its netlist wiring gives,
       for each thread; it is valid when all of them have a token for it. A
       producer whose readers are all threaded inputs that read it for every
@@ -150,11 +150,11 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
 }
 
 def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
-  let summary = "Thread a flat model's state for FireSim's FAME-5 simulation";
+  let summary = "Thread a flat model's state for FAME-5 simulation";
   let description = [{
     Turns a flat `hw.module`, the model of one class of identical instances,
-    into the FAME-5 multithreaded model FireSim's Golden Gate builds for it:
-    one module simulating all `threads` instances, one host cycle per thread
+    into its FAME-5 multithreaded model: one module simulating all `threads`
+    instances, one host cycle per thread
     in turn, with each target port a latency-insensitive channel.
 
     - Every register becomes a memory of one entry per thread, read
@@ -165,15 +165,17 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
       output has fired; outputs that do not depend combinationally on an input
       fire eagerly, with the next cycle's value once the thread has finished.
       An input the model does not read has no channel.
-    - The target clock is `hostClock` through a `FireSimFabricClockGate`,
+    - The target clock is `hostClock` through a `ClockGate` the platform
+      provides (`hw.module.extern @ClockGate(in %I, in %CE, out O)`),
       enabled when the current thread finishes; or, with `clock-enable`, the
       host clock itself, every target register and memory port enabled then.
 
     The module must be flat, with one clock input, and registers without
     asynchronous reset. A model of one instance keeps its state in registers;
-    its target clock may come in on a channel (`clock-channel`), as from
-    FireSim's clock bridge: then a cycle whose edge is not enabled has no
-    tokens, and the first token only says which inputs the first cycle takes.
+    its target clock may come in on a channel (`clock-channel`), from a
+    platform that gates target clocks itself: then a cycle whose edge is not
+    enabled has no tokens, and the first token only says which inputs the
+    first cycle takes.
   }];
   let options = [
     Option<"moduleName", "module", "std::string", "",

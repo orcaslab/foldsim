@@ -8,7 +8,7 @@
 //
 // Composes the simulator of a netlist of models: the instances of each model
 // threaded into one module, and every channel between them in one fabric of
-// two-slot token buffers, as FireSim's LI-BDN simulators connect their models.
+// two-slot token buffers, a latency-insensitive network of the models.
 //
 //===----------------------------------------------------------------------===//
 

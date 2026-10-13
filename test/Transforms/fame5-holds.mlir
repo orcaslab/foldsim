@@ -46,7 +46,7 @@ hw.module @Wired(in %clk : !seq.clock, in %en : i1, in %d : i8, out q : i6) {
 // clock, enabled when its thread finishes, and the thread is an output.
 // CE-LABEL: hw.module @Hold_threaded_Hold(
 // CE-SAME:    out threadIdx : i2, out finish : i1)
-// CE-NOT:   FireSimFabricClockGate
+// CE-NOT:   ClockGate
 // CE:       seq.firmem.write_port %r[%threadIdx] = %d_sink_bits, clock %hostClock enable [[EN:%.+]] :
 // CE:       [[EN]] = comb.and %en_sink_bits, {{%.+}} : i1
 // CE:       hw.output {{.*}}, %threadIdx, {{%.+}} : {{.*}}, i2, i1

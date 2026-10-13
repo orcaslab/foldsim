@@ -6,7 +6,7 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// FireSim's Golden Gate simulates each partitioned class as its own model,
+// A simulator simulates each class of instances as a model of its own,
 // connected to the others by channels. This pass cuts the instances of those
 // classes out of a flat parent, leaving the parent's own logic as a model whose
 // ports are what it exchanges with them.

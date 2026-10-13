@@ -14,7 +14,7 @@
 // An input is fired from reset until the first clock token.
 // CHECK-DAG:     [[A:%.+]] = comb.or %hostReset, {{%.+}} : i1
 // CHECK-DAG:     %a_fired = seq.firreg [[A]] clock %hostClock : i1
-// CHECK:         hw.instance "clk_buffer" @FireSimFabricClockGate(I: %hostClock: !seq.clock, CE: {{%.+}}: i1)
+// CHECK:         hw.instance "clk_buffer" @ClockGate(I: %hostClock: !seq.clock, CE: {{%.+}}: i1)
 // CHECK:         hw.output [[FINISHING]],
 hw.module @Hub(in %clk : !seq.clock, in %a : i8, in %en : i1, out q : i8, out s : i8) {
   %r = seq.firreg %n clock %clk : i8

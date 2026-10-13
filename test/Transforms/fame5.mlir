@@ -1,7 +1,7 @@
 // RUN: foldsim-opt %s --foldsim-fame5="module=Model threads=4" | FileCheck %s
 
-// The clock gate the FireSim platform provides.
-// CHECK: hw.module.extern @FireSimFabricClockGate(in %I : !seq.clock, in %CE : i1, out O : !seq.clock)
+// The clock gate the platform provides.
+// CHECK: hw.module.extern @ClockGate(in %I : !seq.clock, in %CE : i1, out O : !seq.clock)
 
 // The threaded model: the host clock and reset, then a decoupled channel per
 // target port, inputs first.
@@ -26,7 +26,7 @@
 // CHECK: %clk_enabled = seq.firmem 0, 1, undefined, undefined : <4 x 1, mask 1>
 
 // The target clock is the host clock, enabled when the thread finishes.
-// CHECK: %clk_buffer.O = hw.instance "clk_buffer" @FireSimFabricClockGate(I: %hostClock: !seq.clock, CE: {{%.+}}: i1) -> (O: !seq.clock)
+// CHECK: %clk_buffer.O = hw.instance "clk_buffer" @ClockGate(I: %hostClock: !seq.clock, CE: {{%.+}}: i1) -> (O: !seq.clock)
 
 // `y` depends on no input, so it fires eagerly, with the next value once the
 // thread has finished; `z` depends on `a` and waits for it.

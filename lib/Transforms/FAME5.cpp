@@ -6,9 +6,10 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// The FAME-1 channelization, with eager outputs, and the FAME-5 multithreading
-// FireSim's Golden Gate applies to a model (midas/passes/fame/FAMETransform
-// and MuxingMultithreader, with the `mem1` state layout), on HW/Comb/Seq IR.
+// Channelizes a model (FAME-1: every port a token channel, an output that
+// depends on no input fired eagerly) and multithreads it (FAME-5: one copy
+// holds the state of every instance, each register a memory with a word per
+// instance, and simulates one instance per host cycle), on HW/Comb/Seq IR.
 //
 //===----------------------------------------------------------------------===//
 
@@ -178,7 +179,7 @@ private:
   StringRef clockChannel;
   bool threadIndexPort;
   /// Whether the target clock ticks from the first finish after reset, rather
-  /// than from the second as Golden Gate's models do.
+  /// than from the second.
   bool tickFromFirst;
   /// Whether the next thread is one whose inputs are all there, by a
   /// `thread_ready` input, rather than the next in turn.
@@ -578,8 +579,8 @@ void Threader::computeDeps() {
   }
 }
 
-/// Whether `value` is computed from a memory's read data. Golden Gate does not
-/// compute the next value of such an output, so it does not fire it eagerly.
+/// Whether `value` is computed from a memory's read data. The next value of
+/// such an output is not computed, so it is not fired eagerly.
 bool Threader::dependsOnMemory(Value value) {
   if (auto it = memoryDeps.find(value); it != memoryDeps.end())
     return it->second;
@@ -875,7 +876,7 @@ LogicalResult Threader::run() {
   computeDeps();
 
   // The threaded module's ports: the host clock and reset, then a decoupled
-  // channel per target port, inputs first, its bits flat as Golden Gate's.
+  // channel per target port, inputs first, its bits flat.
   auto *context = model.getContext();
   auto i1 = IntegerType::get(context, 1);
   SmallVector<hw::PortInfo> ports;
@@ -1064,8 +1065,7 @@ LogicalResult Threader::run() {
   // Each memory holds every thread's contents, the thread in the low address
   // bits, and is written on the target clock. A registered read reads on the
   // target clock too, and its data is kept per thread in a buffer filled on
-  // the next host cycle, as FireSim's FameRam does, so that the memory stays
-  // a block RAM.
+  // the next host cycle, so that the memory stays a block RAM.
   Value edgeSeen;
   auto getEdgeSeen = [&]() {
     if (edgeSeen)
@@ -1420,9 +1420,9 @@ void FAME5Pass::runOnOperation() {
     return signalPassFailure();
   }
 
-  // The clock gate the FireSim platform provides.
+  // The clock gate the platform provides.
   auto gate = dyn_cast_or_null<hw::HWModuleExternOp>(
-      SymbolTable::lookupSymbolIn(top, "FireSimFabricClockGate"));
+      SymbolTable::lookupSymbolIn(top, "ClockGate"));
   if (!gate && !clockEnable) {
     OpBuilder builder(top.getBody(), top.getBody()->begin());
     auto clock = seq::ClockType::get(&getContext());
@@ -1437,7 +1437,7 @@ void FAME5Pass::runOnOperation() {
         {builder.getStringAttr("O"), clock, hw::ModulePort::Direction::Output},
         0};
     gate = hw::HWModuleExternOp::create(
-        builder, top.getLoc(), builder.getStringAttr("FireSimFabricClockGate"),
+        builder, top.getLoc(), builder.getStringAttr("ClockGate"),
         hw::ModulePortInfo(ports));
   }
 
