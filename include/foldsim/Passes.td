@@ -165,6 +165,10 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
       output has fired; outputs that do not depend combinationally on an input
       fire eagerly, with the next cycle's value once the thread has finished.
       An input the model does not read has no channel.
+    - On `hostReset`, every thread's channel flags are cleared: with several
+      threads, on the host cycles after it, one thread each, from thread 0;
+      no thread takes or offers a token until then, so a reset of one host
+      cycle is enough.
     - The target clock is `hostClock` through a `ClockGate` the platform
       provides (`hw.module.extern @ClockGate(in %I, in %CE, out O)`),
       enabled when the current thread finishes; or, with `clock-enable`, the

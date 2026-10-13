@@ -24,7 +24,7 @@
 // CHECK-SAME:    attributes {foldsim.eager_channels = ["t"]}
 
 // The threads share each memory, a copy of it per thread side by side.
-// CHECK: %threadIdx = seq.firreg {{%.+}} clock %hostClock : i2
+// CHECK: %threadIdx = seq.firreg {{%.+}} clock %hostClock reset sync %hostReset, %c0_i2 preset 0 : i2
 
 // A combinational read is one of the threaded memory.
 // CHECK: %lut = seq.firmem 0, 1, undefined, undefined : <32 x 8>

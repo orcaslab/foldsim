@@ -1093,11 +1093,29 @@ LogicalResult Threader::run() {
   // The current thread, advancing every host cycle: to the next in turn, or,
   // scheduling by readiness, to the first after it whose inputs are all there.
   Backedge idxNext;
+  // The threads' state is initialized on reset and, with more than one
+  // thread, on the host cycles after it, one thread each, before any thread
+  // runs: a reset of one cycle initializes them all.
+  Value initializing = hostReset, sweeping;
   if (threads > 1) {
     auto idxType = b.getIntegerType(llvm::Log2_32_Ceil(threads));
     idxNext = backedges.get(idxType);
-    threadIdx = seq::FirRegOp::create(b, idxNext, hostClock,
-                                      b.getStringAttr("threadIdx"));
+    threadIdx = seq::FirRegOp::create(
+        b, idxNext, hostClock, b.getStringAttr("threadIdx"), hostReset,
+        hw::ConstantOp::create(b, idxType, 0), hw::InnerSymAttr{},
+        /*isAsync=*/false, b.getIntegerAttr(idxType, 0));
+    auto sweepNext = backedges.get(i1);
+    sweeping = seq::FirRegOp::create(
+        b, sweepNext, hostClock, b.getStringAttr("init_sweep"), hostReset,
+        hw::ConstantOp::create(b, i1, 1), hw::InnerSymAttr{},
+        /*isAsync=*/false, b.getIntegerAttr(i1, 1));
+    Value last = comb::ICmpOp::create(
+        b, comb::ICmpPredicate::eq, threadIdx,
+        hw::ConstantOp::create(b, idxType, threads - 1));
+    sweepNext.setValue(comb::AndOp::create(
+        b, sweeping,
+        comb::XorOp::create(b, last, hw::ConstantOp::create(b, i1, 1))));
+    initializing = comb::OrOp::create(b, hostReset, sweeping);
   }
 
   // An output that depends on no input fires eagerly, with the next cycle's
@@ -1302,10 +1320,15 @@ LogicalResult Threader::run() {
     finishTerms.push_back(fof);
   }
   finishTerms.append(sinkValid.begin(), sinkValid.end());
+  // Nor does any thread take or offer tokens while initialized.
+  Value running = notOf(initializing);
+  finishTerms.push_back(running);
   finishing.setValue(
-      finishTerms.empty()
-          ? Value(one)
+      finishTerms.size() == 1
+          ? finishTerms[0]
           : comb::AndOp::create(b, ValueRange(finishTerms), false));
+  for (auto &valid : outValid)
+    valid = comb::AndOp::create(b, valid, running);
 
   if (threads > 1) {
     auto idxType = threadIdx.getType();
@@ -1320,6 +1343,7 @@ LogicalResult Threader::run() {
     if (!threadReady) {
       idxNext.setValue(inTurn);
     } else {
+      // In turn while the threads are initialized.
       // A thread finishing now takes its inputs: it is not ready next.
       auto vecType = b.getIntegerType(threads);
       Value ones = hw::ConstantOp::create(b, APInt::getAllOnes(threads));
@@ -1354,13 +1378,15 @@ LogicalResult Threader::run() {
                                     constant(vecType, 0));
       };
       idxNext.setValue(comb::MuxOp::create(
-          b, any(after), lowest(after),
-          comb::MuxOp::create(b, any(ready), lowest(ready), inTurn)));
+          b, sweeping, inTurn,
+          comb::MuxOp::create(
+              b, any(after), lowest(after),
+              comb::MuxOp::create(b, any(ready), lowest(ready), inTurn))));
     }
   }
 
   auto unlessReset = [&](Value v) {
-    return comb::MuxOp::create(b, hostReset, zero, v);
+    return comb::MuxOp::create(b, initializing, zero, v);
   };
   // With a clock channel, a cycle whose edge is not enabled has no tokens: its
   // outputs start out fired, as do its inputs.
@@ -1386,7 +1412,7 @@ LogicalResult Threader::run() {
       writeThreadState(
           b, inMem[i], hostClock,
           comb::MuxOp::create(
-              b, hostReset, one,
+              b, initializing, one,
               comb::MuxOp::create(b, finishing, notOf(clockBits), accepted)));
       continue;
     }
@@ -1404,8 +1430,7 @@ LogicalResult Threader::run() {
                         ? Value(comb::MuxOp::create(b, finishing, clockBits,
                                                     clkEnabled))
                         : Value(comb::OrOp::create(b, finishing, clkEnabled))));
-  Value enable = comb::AndOp::create(
-      b, ValueRange{clkEnabled, finishing, notOf(hostReset)}, false);
+  Value enable = comb::AndOp::create(b, clkEnabled, finishing);
   if (gate) {
     auto clockGate =
         hw::InstanceOp::create(b, gate, b.getStringAttr("clk_buffer"),
