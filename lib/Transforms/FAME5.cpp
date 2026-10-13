@@ -1347,7 +1347,7 @@ LogicalResult Threader::run() {
     finishTerms.push_back(fof);
   }
   finishTerms.append(sinkValid.begin(), sinkValid.end());
-  // Nor does any thread take or offer tokens while initialized.
+  // No thread finishes, takes or offers a token while they are initialized.
   Value running = notOf(initializing);
   finishTerms.push_back(running);
   finishing.setValue(
@@ -1370,7 +1370,6 @@ LogicalResult Threader::run() {
     if (!threadReady) {
       idxNext.setValue(inTurn);
     } else {
-      // In turn while the threads are initialized.
       // A thread finishing now takes its inputs: it is not ready next.
       auto vecType = b.getIntegerType(threads);
       Value ones = hw::ConstantOp::create(b, APInt::getAllOnes(threads));
@@ -1404,6 +1403,7 @@ LogicalResult Threader::run() {
         return comb::ICmpOp::create(b, comb::ICmpPredicate::ne, v,
                                     constant(vecType, 0));
       };
+      // In turn while the threads are initialized.
       idxNext.setValue(comb::MuxOp::create(
           b, sweeping, inTurn,
           comb::MuxOp::create(
