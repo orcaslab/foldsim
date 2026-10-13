@@ -9,14 +9,26 @@
 // CHECK-SAME:    in %x_valid : i1, in %x_bits : i8, out x_ready : i1,
 // CHECK-SAME:    in %z_ready : i1, out z_valid : i1, out z_bits : i8, out profile_finish : i2)
 // CHECK-SAME:    attributes {foldsim.threads = ["Top_model=1", "Child=2"]}
-// CHECK:         %Top_model_i.x_sink_ready, {{.*}} = hw.instance "Top_model_i" @Top_model_threaded(hostClock: %hostClock: !seq.clock, hostReset: %hostReset: i1, x_sink_valid: %x_valid: i1, x_sink_bits: %x_bits: i8,
-// CHECK:         {{.*}}, %Child_i.threadIdx, %Child_i.finish = hw.instance "Child_i" @Child_threaded(
+// CHECK:         %Top_model_i.x_sink_ready, {{.*}} = hw.instance "Top_model_i" @Top_model_threaded(hostClock: %hostClock: !seq.clock, hostReset: %hostReset: i1, x_sink_valid: %x_valid: i1, x_sink_bits: %x_bits: i8, b_y_sink_valid: [[BY_VALID:%[0-9]+]]: i1, b_y_sink_bits: [[BY_BITS:%[0-9]+]]: i8,
+// CHECK:         {{.*}}, %Child_i.threadIdx, %Child_i.finish = hw.instance "Child_i" @Child_threaded({{.*}}, a_sink_valid: [[A_VALID:%[0-9]+]]: i1, a_sink_bits: [[A_BITS:%[0-9]+]]: i8,
 // CHECK-DAG:     %Child_reset_deq0_0 = seq.firreg {{.*}} reset sync %hostReset
 // CHECK-DAG:     %Child_reset_deq1_0 = seq.firreg {{.*}} reset sync %hostReset
 // CHECK-DAG:     %reset_enq0 = seq.firreg {{.*}} reset sync %hostReset
-// The output of thread 0 feeds thread 1, and thread 1's the rest of `Top`.
 // CHECK-DAG:     %Child_y_enq0 = seq.firreg
 // CHECK-DAG:     %Child_y_enq1 = seq.firreg
+
+// The output of thread 0 feeds thread 1, and thread 1's the rest of `Top`:
+// `Top`'s model reads the tokens of thread 1 of `y`, from its slots; thread 1
+// of `a` those of thread 0, and thread 0 those of `Top`'s model's `a_a`.
+// CHECK:         [[BY_VALID]] = comb.icmp ne %Child_y_enq1, %Top_model_b_y_deq0_0 : i2
+// CHECK:         [[BY_BITS]] = comb.mux {{%.+}}, %Child_y_slot1_1, %Child_y_slot1_0 : i8
+// CHECK:         [[A_VALID_1:%.+]] = comb.icmp ne %Child_y_enq0, %Child_a_deq1_0 : i2
+// CHECK:         [[A_VALIDS:%.+]] = hw.array_create [[A_VALID_1]], {{%.+}} : i1
+// CHECK:         [[A_VALID]] = hw.array_get [[A_VALIDS]][%Child_i.threadIdx]
+// CHECK:         [[A_BITS_0:%.+]] = comb.mux {{%.+}}, %Top_model_a_a_slot0_1, %Top_model_a_a_slot0_0 : i8
+// CHECK:         [[A_BITS_1:%.+]] = comb.mux {{%.+}}, %Child_y_slot0_1, %Child_y_slot0_0 : i8
+// CHECK:         [[A_BITSS:%.+]] = hw.array_create [[A_BITS_1]], [[A_BITS_0]] : i8
+// CHECK:         [[A_BITS]] = hw.array_get [[A_BITSS]][%Child_i.threadIdx]
 // CHECK:         hw.output %{{.+}}, %{{.+}}, %Top_model_i.z_source_valid, %Top_model_i.z_source_bits, %{{.+}} : i1, i1, i1, i8, i2
 // CHECK-NOT:   hw.module @Top(
 // CHECK-NOT:   hw.module private @Child(
