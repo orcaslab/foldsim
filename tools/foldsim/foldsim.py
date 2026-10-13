@@ -77,9 +77,47 @@ def signature(text, module):
     return ports
 
 
+def read_srcs(path, defines, incdirs, files, base=None, seen=()):
+    """Adds the `-D`s, `-I`s and source files of the source list `path` to the
+    lists. A list holds, separated by whitespace, `+define+<macro>[=<value>]`
+    and `+incdir+<dir>`, each repeatable within one argument, source files, and
+    other lists: `-f <list>`, whose paths are as written, and `-F <list>`,
+    whose paths are relative to its directory. `//` starts a comment. The
+    paths of this list are relative to `base`, if any."""
+    resolve = lambda p: os.path.join(base, p) if base else p
+    if os.path.realpath(path) in seen:
+        sys.exit(f'{path}: source list includes itself')
+    seen += (os.path.realpath(path),)
+    try:
+        text = open(path).read()
+    except OSError as e:
+        sys.exit(f'source list: {e}')
+    tokens = []
+    for line in text.split('\n'):
+        tokens += line.split('//', 1)[0].split()
+    tokens = iter(tokens)
+    for token in tokens:
+        if token.startswith('+define+'):
+            defines += ['-D' + d for d in token[len('+define+'):].split('+') if d]
+        elif token.startswith('+incdir+'):
+            incdirs += ['-I' + resolve(d) for d in token[len('+incdir+'):].split('+') if d]
+        elif token in ('-f', '-F'):
+            nested = next(tokens, None)
+            if nested is None:
+                sys.exit(f'{path}: {token} without a source list')
+            nested = resolve(nested)
+            read_srcs(nested, defines, incdirs, files,
+                      (os.path.dirname(nested) or '.') if token == '-F' else None, seen)
+        elif token.startswith(('+', '-')):
+            sys.exit(f'{path}: unsupported option {token} in a source list')
+        else:
+            files.append(resolve(token))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--srcs', required=True, help='source list: +define+, +incdir+ and files')
+    ap.add_argument('--srcs', required=True,
+                    help='source list: +define+, +incdir+, -f/-F lists and files')
     ap.add_argument('--top', required=True)
     ap.add_argument('--out', required=True)
     ap.add_argument('--circt-bin', default='')
@@ -94,13 +132,7 @@ def main():
     out = lambda f: os.path.join(a.out, f)
 
     defines, incdirs, files = [], [], []
-    for line in open(a.srcs).read().split('\n'):
-        if line.startswith('+define+'):
-            defines.append('-D' + line[len('+define+'):])
-        elif line.startswith('+incdir+'):
-            incdirs.append('-I' + line[len('+incdir+'):])
-        elif line.strip():
-            files.append(line.strip())
+    read_srcs(a.srcs, defines, incdirs, files)
     design = out('design.mlir')
     run([tool('circt-verilog'), '--ir-hw', f'--top={a.top}', '--allow-use-before-declare',
          '--allow-hierarchical-const', '--ignore-uninstantiated-modules', '--detect-memories',

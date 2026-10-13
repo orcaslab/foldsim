@@ -48,8 +48,9 @@ foldsim --srcs design.f --top Top --out gen --circt-bin $CIRCT/bin \
   Unit A+B Socket
 ```
 
-`design.f` lists `+define+`, `+incdir+` and source files. Each class names a
-module whose instances are folded; `A+B` fuses two modules of the same parent
+`design.f` lists `+define+`, `+incdir+` and source files, and other lists
+with `-f` (paths as written) or `-F` (paths relative to that list); `//`
+starts a comment. Each class names a module whose instances are folded; `A+B` fuses two modules of the same parent
 into one model. The driver writes `gen/foldsim_sim.sv` (the simulator: a
 channel per target port and a `profile_finish` bit per class),
 `gen/foldsim_sim.json` (its ports and each class's thread count) and

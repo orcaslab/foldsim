@@ -1,0 +1,12 @@
+# The source list's defines, include directories, files and nested list all
+# reach the design: `Top` has its two leaves only with `WITH_LEAF`, and they
+# build only with `STEP` and the header found through `include`.
+# RUN: rm -rf %t && cd %S/Inputs/source-list && foldsim --srcs top.f --top Top --out %t Leaf
+# RUN: FileCheck %s < %t/foldsim_sim.json
+# CHECK: "threads": {
+# CHECK-NEXT: "Leaf": 2,
+# CHECK-NEXT: "Top_model": 1
+
+# RUN: printf -- '-v lib.v\n' > %t/bad.f
+# RUN: not foldsim --srcs %t/bad.f --top Top --out %t/bad Leaf 2>&1 | FileCheck %s --check-prefix=BAD
+# BAD: bad.f: unsupported option -v in a source list
