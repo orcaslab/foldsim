@@ -1138,7 +1138,11 @@ LogicalResult Threader::run() {
             dout.getType(), buffer);
         Value capture = comb::AndOp::create(b, getEdgeSeen(), readEdge);
         if (threads == 1) {
-          writeThreadState(b, buffer, hostClock, dout, capture);
+          // The thread runs again on the host cycle that fills the buffer, so
+          // it reads the data as it comes. With more threads, that cycle is
+          // another thread's: the next thread is never one that just finished.
+          data = comb::MuxOp::create(b, capture, dout, data);
+          writeThreadState(b, buffer, hostClock, data);
         } else {
           auto readThread = seq::FirRegOp::create(
               b, threadIdx, targetClock, b.getStringAttr("read_thread"));

@@ -3,14 +3,17 @@
 
 // One thread keeps a registered read's data the same way: the read port's data
 // is there only on the host cycle after the target edge, so a register holds it.
+// That cycle is the thread's next one, which reads the read port's data
+// itself, not the register it is only now written to.
 // ONE-LABEL: hw.module @Mem_threaded_Mem(
 // ONE: [[DOUT:%.+]] = seq.firmem.read_port %ram[%raddr_sink_bits], clock %clk_buffer.O
 // ONE: %read_edge = seq.firreg %true clock %clk_buffer.O : i1
-// ONE: %ram_rdata = seq.firreg [[NEXT:%.+]] clock %hostClock : i8
+// ONE: %ram_rdata = seq.firreg [[R:%.+]] clock %hostClock : i8
 // ONE: [[EDGE:%.+]] = comb.xor %target_toggle, %target_toggle_seen : i1
-// ONE: [[WRITE:%.+]] = comb.and [[EDGE]], %read_edge : i1
-// ONE: [[NEXT]] = comb.mux [[WRITE]], [[DOUT]], %ram_rdata : i8
+// ONE: [[FRESH:%.+]] = comb.and [[EDGE]], %read_edge : i1
+// ONE: [[R]] = comb.mux [[FRESH]], [[DOUT]], %ram_rdata : i8
 // ONE-NOT: read_thread
+// ONE: hw.output {{.*}}, [[R]], {{%.+}} : i1, i1, i1, i1, i1, i8, i1, i8, i1
 
 // `unused` is not read, so it has no channel; `t` has no bits, so its channel
 // carries tokens only.
