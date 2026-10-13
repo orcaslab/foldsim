@@ -147,8 +147,12 @@ private:
   LogicalResult checkModel();
   void computeDeps();
   const BitDeps &getDeps(Value value);
+  BitDeps computeBitDeps(Value value);
   Value getNext(Value value, ImplicitLocOpBuilder &b);
-  bool dependsOnState(Value value);
+  /// Finds the values computed from the target state, and those computed
+  /// from a memory's read data.
+  void computeStateDeps();
+  bool dependsOnState(Value value) { return fromState.contains(value); }
   /// A memory of one entry per thread, read at the current thread; a register
   /// for a single thread.
   Value createThreadState(ImplicitLocOpBuilder &b, StringRef stateName,
@@ -195,21 +199,33 @@ private:
   SmallVector<Attribute> bypasses;
   SmallVector<seq::FirRegOp> registers;
   SmallVector<seq::FirMemOp> memories;
-  DenseMap<Value, bool> memoryDeps;
-  bool dependsOnMemory(Value value);
+  /// Whether `value` is computed from a memory's read data, other than
+  /// through a register. The next value of such an output is not computed, so
+  /// it is not fired eagerly.
+  bool dependsOnMemory(Value value) { return fromMemory.contains(value); }
   /// For each bit of an input port, the channel carrying it.
   DenseMap<Value, SmallVector<unsigned>> inputOfArg;
   /// The channels of fields, by name, as their index plus one.
   llvm::StringMap<unsigned> inputBundles, outputBundles;
   std::map<std::pair<unsigned, bool>, SmallVector<unsigned>> fieldRanks;
   DenseMap<Value, std::unique_ptr<BitDeps>> deps;
-  /// The union of a value's bits' sets.
+  /// The union of a value's bits' sets, once they are final.
   DenseMap<Value, unsigned> allDeps;
-  /// Values whose sets are being computed: a cycle reads them unfinished.
-  DenseSet<Value> depsInProgress;
+  /// The values whose sets are not final yet, each with its index in the
+  /// order they were reached and the lowest index of the values it reaches
+  /// that are not final: a combinational cycle is a strongly connected
+  /// component of them, whose sets are iterated until they do not change.
+  DenseMap<Value, std::pair<unsigned, unsigned>> depsOpen;
+  SmallVector<Value> depsStack, depsCalls;
+  DenseSet<Value> depsSelfCycles;
+  unsigned depsReached = 0;
   std::unique_ptr<DepSets> depSets;
   DenseMap<Value, Value> nexts;
-  DenseMap<Value, bool> stateDeps;
+  /// The next values of a combinational cycle, used before they are built.
+  DenseSet<Value> nextsInProgress;
+  DenseMap<Value, Backedge> nextsAhead;
+  std::unique_ptr<BackedgeBuilder> nextCycles;
+  DenseSet<Value> fromState, fromMemory;
   Value threadIdx, hostClock;
 };
 
@@ -428,17 +444,65 @@ LogicalResult Threader::checkModel() {
 /// data into an aggregate does not take on the data's dependences; any other
 /// op makes each result bit depend on every operand bit.
 const BitDeps &Threader::getDeps(Value value) {
-  if (auto it = deps.find(value); it != deps.end())
+  if (auto it = deps.find(value); it != deps.end()) {
+    // A value reached again before its sets are final is on a cycle: its
+    // sets so far are read, and the cycle iterated once it is all reached.
+    if (auto open = depsOpen.find(value); open != depsOpen.end()) {
+      auto &caller = depsOpen[depsCalls.back()].second;
+      caller = std::min(caller, open->second.first);
+      if (depsCalls.back() == value)
+        depsSelfCycles.insert(value);
+    }
     return *it->second;
+  }
   auto width = std::max<int64_t>(hw::getBitWidth(value.getType()), 0);
   if (!depSets)
     depSets = std::make_unique<DepSets>(inputs.size());
+  unsigned index = depsReached++;
+  depsOpen[value] = {index, index};
+  depsStack.push_back(value);
+  deps[value] = std::make_unique<BitDeps>(width, 0);
+  depsCalls.push_back(value);
+  *deps[value] = computeBitDeps(value);
+  depsCalls.pop_back();
+  unsigned low = depsOpen[value].second;
+  if (!depsCalls.empty()) {
+    auto &caller = depsOpen[depsCalls.back()].second;
+    caller = std::min(caller, low);
+  }
+  if (low != index)
+    return *deps[value];
+
+  // The first value reached of a cycle: the sets of the cycle's values only
+  // grow, from none, until they hold every input any of them depends on.
+  SmallVector<Value> cycle;
+  do
+    cycle.push_back(depsStack.pop_back_val());
+  while (cycle.back() != value);
+  if (cycle.size() > 1 || depsSelfCycles.contains(value)) {
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (auto member : cycle) {
+        depsCalls.push_back(member);
+        auto bits = computeBitDeps(member);
+        depsCalls.pop_back();
+        if (bits != *deps[member]) {
+          *deps[member] = std::move(bits);
+          changed = true;
+        }
+      }
+    }
+  }
+  for (auto member : cycle)
+    depsOpen.erase(member);
+  return *deps[value];
+}
+
+/// The sets of `value`'s bits from those of its operands, as they are now.
+BitDeps Threader::computeBitDeps(Value value) {
+  auto width = std::max<int64_t>(hw::getBitWidth(value.getType()), 0);
   auto &sets = *depSets;
-  auto result = std::make_unique<BitDeps>(width, 0);
-  // Placeholder against combinational cycles.
-  deps[value] = std::make_unique<BitDeps>(*result);
-  depsInProgress.insert(value);
-  auto &bits = *result;
+  BitDeps bits(width, 0);
   auto all = [&](Value operand) -> unsigned {
     if (auto it = allDeps.find(operand); it != allDeps.end())
       return it->second;
@@ -446,7 +510,7 @@ const BitDeps &Threader::getDeps(Value value) {
     auto operandBits = getDeps(operand);
     for (auto bit : operandBits)
       any = sets.unite(any, bit);
-    if (depsInProgress.contains(operand))
+    if (depsOpen.contains(operand))
       return any;
     return allDeps[operand] = any;
   };
@@ -548,9 +612,7 @@ const BitDeps &Threader::getDeps(Value value) {
     for (auto &bit : bits)
       bit = any;
   }
-  depsInProgress.erase(value);
-  deps[value] = std::move(result);
-  return *deps[value];
+  return bits;
 }
 
 void Threader::computeDeps() {
@@ -579,38 +641,34 @@ void Threader::computeDeps() {
   }
 }
 
-/// Whether `value` is computed from a memory's read data. The next value of
-/// such an output is not computed, so it is not fired eagerly.
-bool Threader::dependsOnMemory(Value value) {
-  if (auto it = memoryDeps.find(value); it != memoryDeps.end())
-    return it->second;
-  auto *op = value.getDefiningOp();
-  bool result = false;
-  if (isa_and_nonnull<seq::FirMemReadOp>(op)) {
-    result = true;
-  } else if (op && !isa<seq::FirRegOp>(op)) {
-    memoryDeps[value] = false;
-    result = llvm::any_of(op->getOperands(), [&](Value operand) {
-      return dependsOnMemory(operand);
-    });
-  }
-  return memoryDeps[value] = result;
+/// Marks the values computed from `sources`, through the ops `through` takes.
+static void markUsers(ArrayRef<Value> sources, DenseSet<Value> &marked,
+                      function_ref<bool(Operation *)> through) {
+  SmallVector<Value> worklist;
+  for (auto source : sources)
+    if (marked.insert(source).second)
+      worklist.push_back(source);
+  while (!worklist.empty())
+    for (auto *user : worklist.pop_back_val().getUsers())
+      if (through(user))
+        for (auto result : user->getResults())
+          if (marked.insert(result).second)
+            worklist.push_back(result);
 }
 
-bool Threader::dependsOnState(Value value) {
-  if (auto it = stateDeps.find(value); it != stateDeps.end())
-    return it->second;
-  auto *op = value.getDefiningOp();
-  bool result = false;
-  if (isa_and_nonnull<seq::FirRegOp>(op)) {
-    result = true;
-  } else if (op) {
-    stateDeps[value] = false;
-    result = llvm::any_of(op->getOperands(), [&](Value operand) {
-      return dependsOnState(operand);
-    });
-  }
-  return stateDeps[value] = result;
+/// Forward from the state rather than back from each value: a combinational
+/// cycle then needs no special care.
+void Threader::computeStateDeps() {
+  SmallVector<Value> registerValues, readData;
+  for (auto reg : registers)
+    registerValues.push_back(reg.getResult());
+  for (auto memory : memories)
+    for (auto *user : memory->getUsers())
+      if (auto read = dyn_cast<seq::FirMemReadOp>(user))
+        readData.push_back(read.getData());
+  markUsers(registerValues, fromState, [](Operation *) { return true; });
+  markUsers(readData, fromMemory,
+            [](Operation *op) { return !isa<seq::FirRegOp>(op); });
 }
 
 /// The value `value` takes in the next target cycle: its logic with every
@@ -619,6 +677,15 @@ bool Threader::dependsOnState(Value value) {
 Value Threader::getNext(Value value, ImplicitLocOpBuilder &b) {
   if (auto it = nexts.find(value); it != nexts.end())
     return it->second;
+  // On a combinational cycle, a value's next value is used before it is
+  // built.
+  if (nextsInProgress.contains(value)) {
+    if (auto it = nextsAhead.find(value); it != nextsAhead.end())
+      return it->second;
+    if (!nextCycles)
+      nextCycles = std::make_unique<BackedgeBuilder>(b, value.getLoc());
+    return nextsAhead[value] = nextCycles->get(value.getType());
+  }
   Value result;
   if (auto reg = value.getDefiningOp<seq::FirRegOp>()) {
     result = reg.getNext();
@@ -629,12 +696,20 @@ Value Threader::getNext(Value value, ImplicitLocOpBuilder &b) {
     result = value;
   } else {
     auto *op = value.getDefiningOp();
+    for (auto result : op->getResults())
+      nextsInProgress.insert(result);
     IRMapping mapping;
     for (auto operand : op->getOperands())
       mapping.map(operand, getNext(operand, b));
     auto *clone = b.clone(*op, mapping);
-    for (auto [old, cloned] : llvm::zip(op->getResults(), clone->getResults()))
+    for (auto [old, cloned] : llvm::zip(op->getResults(), clone->getResults())) {
+      nextsInProgress.erase(old);
       nexts[old] = cloned;
+      if (auto ahead = nextsAhead.find(old); ahead != nextsAhead.end()) {
+        ahead->second.setValue(cloned);
+        nextsAhead.erase(ahead);
+      }
+    }
     return nexts[value];
   }
   return nexts[value] = result;
@@ -874,6 +949,7 @@ LogicalResult Threader::run() {
   if (failed(checkModel()))
     return failure();
   computeDeps();
+  computeStateDeps();
 
   // The threaded module's ports: the host clock and reset, then a decoupled
   // channel per target port, inputs first, its bits flat.
