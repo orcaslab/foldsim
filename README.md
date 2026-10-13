@@ -19,7 +19,7 @@ LLVM: CIRCT imports and lowers the design (`circt-verilog`, `circt-opt`,
 | `lib/Transforms` | the passes: `foldsim-extract-models`, `foldsim-fuse-models`, `foldsim-fame5`, `foldsim-compose` |
 | `tools/foldsim-opt` | runs them, with CIRCT's HW, Comb, Seq and SV passes |
 | `tools/foldsim` | the driver: design in, simulator out |
-| `test` | lit tests (`check-foldsim`) |
+| `test` | lit tests (`check-foldsim`): the passes' output, and simulators run with Verilator |
 
 ## Build
 
@@ -36,6 +36,10 @@ ninja -C build
 ninja -C build check-foldsim
 cmake --install build --prefix $PREFIX
 ```
+
+The tests under `test/Simulation` build small simulators and run them with
+Verilator; CMake looks for `verilator` on the `PATH`, or takes
+`-DFOLDSIM_VERILATOR=<path>`. Without it they are reported unsupported.
 
 ## Use
 
