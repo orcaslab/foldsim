@@ -179,3 +179,21 @@ hw.module @Other(in %clk : !seq.clock, in %en : i1, out busy : i1) {
   %k.busy = hw.instance "k" @Kept(clk: %clk: !seq.clock, en: %en: i1) -> (busy: i1)
   hw.output %k.busy : i1
 }
+
+// RUN: foldsim-opt %s --foldsim-extract-models="module=PresetParent models=PresetChild" | FileCheck %s --check-prefix=PRESET
+
+// A register always 0 after its first edge, but 1 before it, is not the
+// constant 0: the parent takes it as an input. One preset to 0 is.
+// PRESET-LABEL: hw.module @PresetParent(
+// PRESET-SAME:    in %p_q : i1, out q : i1, out k : i1)
+// PRESET:         hw.output %p_q, %false
+hw.module @PresetChild(in %clk : !seq.clock, out q : i1, out k : i1) {
+  %false = hw.constant false
+  %r = seq.firreg %false clock %clk preset 1 : i1
+  %s = seq.firreg %false clock %clk preset 0 : i1
+  hw.output %r, %s : i1, i1
+}
+hw.module @PresetParent(in %clk : !seq.clock, out q : i1, out k : i1) {
+  %p.q, %p.k = hw.instance "p" @PresetChild(clk: %clk: !seq.clock) -> (q: i1, k: i1)
+  hw.output %p.q, %p.k : i1, i1
+}

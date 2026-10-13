@@ -221,19 +221,26 @@ BitSources BitTracer::compute(Value value) {
 }
 
 /// A register bit is that constant if its next value and its reset value, if
-/// any, are always the same constant: its value is undefined only before the
-/// first clock edge.
+/// any, are always the same constant: without a preset value, its value is
+/// undefined only before the first clock edge. A preset value must be that
+/// constant too.
 BitSources BitTracer::computeRegister(seq::FirRegOp reg) {
-  BitSources sources(hw::getBitWidth(reg.getType()));
+  auto width = hw::getBitWidth(reg.getType());
+  BitSources sources(width);
   auto next = get(reg.getNext());
   BitSources reset;
   if (reg.hasReset())
     reset = get(reg.getResetValue());
+  std::optional<APInt> preset = reg.getPreset();
+  if (preset)
+    preset = preset->zextOrTrunc(width);
   for (auto [bit, source] : llvm::enumerate(sources)) {
     if (next[bit].kind != BitSource::Constant)
       continue;
     if (!reset.empty() && (reset[bit].kind != BitSource::Constant ||
                            reset[bit].value != next[bit].value))
+      continue;
+    if (preset && (*preset)[bit] != next[bit].value)
       continue;
     source = next[bit];
   }

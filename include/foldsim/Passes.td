@@ -33,8 +33,8 @@ def ExtractModels : Pass<"foldsim-extract-models", "::mlir::ModuleOp"> {
     - An output of an instance becomes an input of the parent, but for the
       bits that are always the same constant in the model, which the parent
       uses instead. Those are found through wiring and through register bits
-      whose next and reset values are that constant. The inputs for the other
-      bits are named `<instance>_<port>_<hi>_<lo>_`, or
+      whose next, reset and preset values, if any, are that constant. The
+      inputs for the other bits are named `<instance>_<port>_<hi>_<lo>_`, or
       `<instance>_<port>_<bit>_` for one, when they are not all of them.
 
     Clock ports are left out, as models take their clock from the simulator.
@@ -165,10 +165,13 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
       output has fired; outputs that do not depend combinationally on an input
       fire eagerly, with the next cycle's value once the thread has finished.
       An input the model does not read has no channel.
-    - On `hostReset`, every thread's channel flags are cleared: with several
-      threads, on the host cycles after it, one thread each, from thread 0;
-      no thread takes or offers a token until then, so a reset of one host
-      cycle is enough.
+    - On `hostReset`, every thread's channel flags are cleared and its
+      registers with a preset value take it, the target's state before its
+      first edge: with several threads, on the host cycles after it, one
+      thread each, from thread 0; no thread takes or offers a token until
+      then, so a reset of one host cycle is enough. A register with a preset
+      value is written on the host clock, on the target clock's edges, and,
+      for one thread, keeps its preset value from the FPGA's configuration.
     - The target clock is `hostClock` through a `ClockGate` the platform
       provides (`hw.module.extern @ClockGate(in %I, in %CE, out O)`),
       enabled when the current thread finishes; or, with `clock-enable`, the

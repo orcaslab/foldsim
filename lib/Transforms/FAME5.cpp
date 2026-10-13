@@ -154,9 +154,9 @@ private:
   void computeStateDeps();
   bool dependsOnState(Value value) { return fromState.contains(value); }
   /// A memory of one entry per thread, read at the current thread; a register
-  /// for a single thread.
+  /// for a single thread, with the `preset` value if any.
   Value createThreadState(ImplicitLocOpBuilder &b, StringRef stateName,
-                          Type type, Value &memory);
+                          Type type, Value &memory, IntegerAttr preset = {});
   void writeThreadState(ImplicitLocOpBuilder &b, Value memory, Value clock,
                         Value data, Value enable = {});
   /// How a register is written: never (it only holds its value), or with
@@ -716,13 +716,18 @@ Value Threader::getNext(Value value, ImplicitLocOpBuilder &b) {
 }
 
 Value Threader::createThreadState(ImplicitLocOpBuilder &b, StringRef stateName,
-                                  Type type, Value &memory) {
+                                  Type type, Value &memory,
+                                  IntegerAttr preset) {
   auto width = hw::getBitWidth(type);
   if (threads == 1) {
     // Its write gives the register its next value and clock.
     auto next = registers1->get(b.getIntegerType(width));
     auto clock = registers1->get(seq::ClockType::get(b.getContext()));
-    memory = seq::FirRegOp::create(b, next, clock, b.getStringAttr(stateName));
+    if (preset)
+      preset = b.getIntegerAttr(b.getIntegerType(width),
+                                preset.getValue().zextOrTrunc(width));
+    memory = seq::FirRegOp::create(b, next, clock, b.getStringAttr(stateName),
+                                   hw::InnerSymAttr{}, preset);
     unwritten.try_emplace(memory, next, clock);
     return b.createOrFold<hw::BitcastOp>(type, memory);
   }
@@ -1139,6 +1144,10 @@ LogicalResult Threader::run() {
   // Each register keeps one value per thread. The branches of its next value
   // that hold it become the write enable of its memory rather than logic that
   // writes it back.
+  // A register with a preset value takes it while the threads are initialized,
+  // each thread's entry when that thread is current: its target edges are then
+  // those of the host clock it is written on.
+  auto targetEdge = backedges.get(i1);
   for (auto reg : registers) {
     Value next = reg.getNext();
     if (reg.getReset())
@@ -1148,11 +1157,29 @@ LogicalResult Threader::run() {
     if (!write.holds && !write.enable)
       write.data = next;
     Value memory;
-    auto value = createThreadState(b, reg.getName(), reg.getType(), memory);
+    auto value = createThreadState(b, reg.getName(), reg.getType(), memory,
+                                   reg.getPresetAttr());
     reg.getResult().replaceAllUsesWith(value);
     replaced[reg.getResult()] = value;
-    if (!write.holds)
+    if (auto preset = reg.getPreset()) {
+      auto width = hw::getBitWidth(reg.getType());
+      Value initial = hw::ConstantOp::create(b, preset->zextOrTrunc(width));
+      Value data = initial, enable = initializing;
+      if (!write.holds) {
+        data = comb::MuxOp::create(
+            b, initializing, initial,
+            b.createOrFold<hw::BitcastOp>(b.getIntegerType(width),
+                                          write.data));
+        Value edge = write.enable
+                         ? Value(comb::AndOp::create(b, targetEdge,
+                                                     write.enable))
+                         : Value(targetEdge);
+        enable = comb::OrOp::create(b, initializing, edge);
+      }
+      writeThreadState(b, memory, hostClock, data, enable);
+    } else if (!write.holds) {
       writeThreadState(b, memory, targetClock, write.data, write.enable);
+    }
     reg.erase();
   }
 
@@ -1431,6 +1458,7 @@ LogicalResult Threader::run() {
                                                     clkEnabled))
                         : Value(comb::OrOp::create(b, finishing, clkEnabled))));
   Value enable = comb::AndOp::create(b, clkEnabled, finishing);
+  targetEdge.setValue(enable);
   if (gate) {
     auto clockGate =
         hw::InstanceOp::create(b, gate, b.getStringAttr("clk_buffer"),
