@@ -1,5 +1,6 @@
 // RUN: foldsim-opt %s --foldsim-fame5="module=Hold threads=4 clock-enable thread-index region-loads=8" | FileCheck %s
 // RUN: foldsim-opt %s --foldsim-fame5="module=Hold threads=4 clock-enable thread-index region-loads=16" | FileCheck %s --check-prefix=ONE
+// RUN: foldsim-opt %s --foldsim-fame5="module=Hold threads=4 clock-enable thread-index region-loads=8 compact-staging" | FileCheck %s --check-prefix=COMPACT
 // RUN: foldsim-opt %s --foldsim-fame5="module=Hold threads=1 clock-enable region-loads=8" | FileCheck %s --check-prefix=SINGLE
 // RUN: not foldsim-opt %s --foldsim-fame5="module=Hold threads=4 region-loads=8" 2>&1 | FileCheck %s --check-prefix=GATED
 
@@ -33,6 +34,10 @@
 // CHECK: [[SEN]] = comb.or %init_r1, [[SEDGE]] : i1
 // CHECK-NOT: %threadIdx_r2
 // CHECK: hw.output {{.*}}, %threadIdx, [[EDGE]] :
+
+// With compact staging a staged write enable has no preset.
+// COMPACT-LABEL: hw.module @Hold_threaded_Hold(
+// COMPACT: %r_wen = seq.firreg %en_sink_bits clock %hostClock : i1
 
 // With 16 loads both registers share one region.
 // ONE-LABEL: hw.module @Hold_threaded_Hold(

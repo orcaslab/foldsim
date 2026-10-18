@@ -30,6 +30,7 @@
 #include "llvm/Support/Debug.h"
 #include <map>
 #include <numeric>
+#include <optional>
 
 namespace foldsim {
 #define GEN_PASS_DEF_FAME5
@@ -146,7 +147,8 @@ public:
         registeredState(options.registeredState),
         stateStages(options.stateStages), commitSelect(options.commitSelect),
         stagedRamWrites(options.stagedRamWrites),
-        pipelineMultipliers(options.pipelineMultipliers) {}
+        pipelineMultipliers(options.pipelineMultipliers),
+        compactStaging(options.compactStaging) {}
 
   LogicalResult run();
 
@@ -205,6 +207,9 @@ private:
     SmallVector<RegionWrite> writes;
     /// The thread state of a register, read ahead with registered state.
     bool state = false;
+    /// Where its staging is located with compact staging: the register or
+    /// memory it threads.
+    std::optional<Location> loc;
   };
   /// With registered state, a register of a single thread: committed by
   /// select, its `candidate` taken on its enable (`wen` on the edge, and with
@@ -263,6 +268,9 @@ private:
   /// With state written two host cycles late: whether a state computed by
   /// a multiplier takes its first stage at its next value's inputs.
   bool pipelineMultipliers;
+  /// With regions: whether staging takes the location of the state it
+  /// stages, and a staged write enable has no preset value.
+  bool compactStaging;
   /// The combinational cone of a next value, within the model.
   static bool inCone(Operation *op) {
     if (!op || op->getNumRegions() || isa<hw::InstanceOp, hw::OutputOp>(op))
@@ -1054,7 +1062,7 @@ Threader::RegionMemory &Threader::regionMemory(Value memory) {
   auto [it, inserted] =
       regionMemoryIndex.try_emplace(memory, regionMemories.size());
   if (inserted)
-    regionMemories.push_back({memory, {}, {}});
+    regionMemories.push_back({memory, {}, {}, false, std::nullopt});
   return regionMemories[it->second];
 }
 
@@ -1235,6 +1243,10 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
         fresh(write.low);
         fresh(write.term);
       }
+      // Staging located where the state is, rather than at the whole model:
+      // merged locations of thousands of registers grow the Verilog.
+      if (compactStaging)
+        b.setLoc(state.loc ? *state.loc : state.memory.getLoc());
       Value stateIdx = aheadIdx && state.state ? aheadCopy : readIdx;
       for (auto &read : state.reads)
         read.op.getAddressMutable().assign(
@@ -1298,10 +1310,15 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
           if (write.term)
             enable = comb::AndOp::create(
                 b,
-                seq::FirRegOp::create(
-                    b, write.term, hostClock,
-                    b.getStringAttr(memoryName + "_wen"), hw::InnerSymAttr{},
-                    b.getIntegerAttr(i1, 0)),
+                // With compact staging, without a preset: the edge's copy is
+                // zero until the first edge it copies.
+                compactStaging
+                    ? seq::FirRegOp::create(b, write.term, hostClock,
+                                            b.getStringAttr(memoryName + "_wen"))
+                    : seq::FirRegOp::create(
+                          b, write.term, hostClock,
+                          b.getStringAttr(memoryName + "_wen"),
+                          hw::InnerSymAttr{}, b.getIntegerAttr(i1, 0)),
                 edgeLate);
         }
         if (write.preset) {
@@ -1433,6 +1450,8 @@ void Threader::commitBySelect(ImplicitLocOpBuilder &b, Value edge,
       loads = 0;
     }
     loads += width;
+    if (compactStaging)
+      b.setLoc(reg.getLoc());
     Value enable = edgeLate;
     if (single.wen)
       enable = comb::AndOp::create(b, single.wen, edgeLate);
@@ -1701,6 +1720,9 @@ LogicalResult Threader::run() {
             b.createOrFold<hw::BitcastOp>(b.getIntegerType(width), write.data));
       }
       auto single = memory.getDefiningOp<seq::FirRegOp>();
+      auto loc = b.getLoc();
+      if (compactStaging)
+        b.setLoc(single.getLoc());
       // The candidate and its enable, taken every host cycle.
       Value candidate = seq::FirRegOp::create(
           b, b.createOrFold<hw::BitcastOp>(single.getType(), data), hostClock,
@@ -1711,12 +1733,14 @@ LogicalResult Threader::run() {
                                     b.getStringAttr(single.getName() + "_wen"),
                                     hw::InnerSymAttr{},
                                     b.getIntegerAttr(i1, 0));
+      b.setLoc(loc);
       singleRegisters.push_back(
           {single, candidate, wen, bool(reg.getPreset())});
     }
     if (regions) {
       auto &state = regionMemory(memory);
       state.state = true;
+      state.loc = reg.getLoc();
       for (auto *user : memory.getUsers()) {
         if (auto read = dyn_cast<seq::FirMemReadOp>(user))
           state.reads.push_back({read, {}, /*registered=*/false, {}});
@@ -1783,6 +1807,8 @@ LogicalResult Threader::run() {
         // to its address reads what the memory's read-under-write says, so
         // such a memory's writes land on the edge.
         bool staged = memory.getReadLatency() == 0 || stagedRamWrites;
+        if (regions)
+          regionMemory(threadedMemory).loc = memory.getLoc();
         if (regions)
           regionMemory(threadedMemory)
               .writes.push_back({port, lastLow, write.getEnable(),
@@ -2213,7 +2239,7 @@ void FAME5Pass::runOnOperation() {
     return signalPassFailure();
   }
   if ((regionLoads || registeredState || commitSelect || stagedRamWrites ||
-       pipelineMultipliers) &&
+       pipelineMultipliers || compactStaging) &&
       !clockEnable) {
     model.emitError("regions are for state written with `clock-enable`");
     return signalPassFailure();
@@ -2224,7 +2250,8 @@ void FAME5Pass::runOnOperation() {
                       foldsim::ThreadOptions{regionLoads, registeredState,
                                              stateStages, commitSelect,
                                              stagedRamWrites,
-                                             pipelineMultipliers})
+                                             pipelineMultipliers,
+                                             compactStaging})
                  .run()))
     return signalPassFailure();
 }

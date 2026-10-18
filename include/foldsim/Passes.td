@@ -165,6 +165,9 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"pipelineMultipliers", "pipeline-multipliers", "bool", "false",
            "Thread each model with its multipliers' state pipelined at their "
            "inputs, as `foldsim-fame5`'s `pipeline-multipliers`">,
+    Option<"compactStaging", "compact-staging", "bool", "false",
+           "Thread each model with compact staging, as `foldsim-fame5`'s "
+           "`compact-staging`">,
     Option<"stagedTokens", "staged-tokens", "bool", "false",
            "Write each token into its slot a host cycle after it is taken, "
            "from registers of the token, its thread and slot, and forward it "
@@ -273,6 +276,12 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
            "registered once) and computes it on the next host cycle, rather "
            "than registering the product: the stage synthesis cannot retime "
            "into a DSP">,
+    Option<"compactStaging", "compact-staging", "bool", "false",
+           "With regions: locate each staging register at the state it "
+           "stages rather than at the whole model, and give staged write "
+           "enables no preset value (the edge's copy is zero until its first "
+           "edge); on large models the merged locations of the presets grow "
+           "the Verilog tenfold">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

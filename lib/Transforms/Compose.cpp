@@ -1048,7 +1048,8 @@ void ComposePass::runOnOperation() {
   }
   foldsim::ThreadOptions threadOptions{regionLoads, registeredState,
                                        stateStages, commitSelect,
-                                       stagedRamWrites, pipelineMultipliers};
+                                       stagedRamWrites, pipelineMultipliers,
+                                       compactStaging};
   if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
                           threadOptions, stagedTokens)
                      .run()))
