@@ -27,6 +27,7 @@ struct ThreadOptions {
   unsigned stateStages = 1;
   bool commitSelect = false;
   bool stagedRamWrites = false;
+  bool pipelineMultipliers = false;
 };
 mlir::FailureOr<circt::hw::HWModuleOp>
 threadModel(circt::hw::HWModuleOp model, unsigned threads, mlir::StringAttr name,

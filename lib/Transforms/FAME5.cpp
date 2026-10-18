@@ -145,7 +145,8 @@ public:
         readySchedule(readySchedule), regionLoads(options.regionLoads),
         registeredState(options.registeredState),
         stateStages(options.stateStages), commitSelect(options.commitSelect),
-        stagedRamWrites(options.stagedRamWrites) {}
+        stagedRamWrites(options.stagedRamWrites),
+        pipelineMultipliers(options.pipelineMultipliers) {}
 
   LogicalResult run();
 
@@ -259,6 +260,20 @@ private:
   /// host cycle after the edge too, its read forwarding the staged write
   /// where it reads new data under a write.
   bool stagedRamWrites;
+  /// With state written two host cycles late: whether a state computed by
+  /// a multiplier takes its first stage at its next value's inputs.
+  bool pipelineMultipliers;
+  /// The combinational cone of a next value, within the model.
+  static bool inCone(Operation *op) {
+    if (!op || op->getNumRegions() || isa<hw::InstanceOp, hw::OutputOp>(op))
+      return false;
+    auto ns = op->getDialect()->getNamespace();
+    return ns == "comb" || ns == "hw";
+  }
+  bool coneHasMultiplier(Value value);
+  Value pipelinedCone(ImplicitLocOpBuilder &b, Value value);
+  /// The cone inputs registered for `pipelineMultipliers`, shared by cones.
+  DenseMap<Value, Value> coneInputs;
   bool deepState() const {
     return registeredState && stateStages > 1 && threads >= 3;
   }
@@ -1043,6 +1058,78 @@ Threader::RegionMemory &Threader::regionMemory(Value memory) {
   return regionMemories[it->second];
 }
 
+bool Threader::coneHasMultiplier(Value value) {
+  SmallVector<Operation *> stack;
+  DenseSet<Operation *> seen;
+  if (auto *op = value.getDefiningOp(); inCone(op))
+    stack.push_back(op);
+  while (!stack.empty()) {
+    auto *op = stack.pop_back_val();
+    if (!seen.insert(op).second)
+      continue;
+    if (isa<comb::MulOp>(op))
+      return true;
+    for (auto operand : op->getOperands())
+      if (auto *def = operand.getDefiningOp(); inCone(def))
+        stack.push_back(def);
+  }
+  return false;
+}
+
+/// `value`'s cone computed from its inputs a host cycle late: each input (a
+/// port, a register, a memory's read data) registered once for every cone,
+/// the cone's logic cloned on the registered inputs.
+Value Threader::pipelinedCone(ImplicitLocOpBuilder &b, Value value) {
+  auto input = [&](Value leaf) -> Value {
+    auto &reg = coneInputs[leaf];
+    if (!reg) {
+      std::string leafName = "cone_in";
+      if (auto r = leaf.getDefiningOp<seq::FirRegOp>())
+        leafName = (r.getName() + "_in").str();
+      else if (auto read = leaf.getDefiningOp<seq::FirMemReadOp>())
+        leafName = (read.getMemory().getDefiningOp<seq::FirMemOp>().getName()
+                        .value_or("mem") +
+                    "_in")
+                       .str();
+      else if (auto arg = dyn_cast<BlockArgument>(leaf))
+        leafName = (cast<hw::HWModuleOp>(arg.getOwner()->getParentOp())
+                        .getInputName(arg.getArgNumber()) +
+                    "_in")
+                       .str();
+      reg = seq::FirRegOp::create(b, leaf, hostClock,
+                                  b.getStringAttr(leafName));
+    }
+    return reg;
+  };
+  auto *root = value.getDefiningOp();
+  if (!inCone(root))
+    return input(value);
+  // Post-order over the cone, then clones in that order.
+  SmallVector<Operation *> order;
+  DenseSet<Operation *> seen;
+  SmallVector<std::pair<Operation *, unsigned>> stack = {{root, 0}};
+  seen.insert(root);
+  while (!stack.empty()) {
+    auto &[op, next] = stack.back();
+    if (next < op->getNumOperands()) {
+      auto *def = op->getOperand(next++).getDefiningOp();
+      if (inCone(def) && seen.insert(def).second)
+        stack.push_back({def, 0});
+      continue;
+    }
+    order.push_back(op);
+    stack.pop_back();
+  }
+  IRMapping map;
+  for (auto *op : order)
+    for (auto operand : op->getOperands())
+      if (!inCone(operand.getDefiningOp()) && !map.contains(operand))
+        map.map(operand, input(operand));
+  for (auto *op : order)
+    b.clone(*op, map);
+  return map.lookup(value);
+}
+
 void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
                             Value initializing, Value hostReset) {
   auto *context = b.getContext();
@@ -1196,7 +1283,14 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
         if (write.low)
           address = comb::ConcatOp::create(
               b, staged(write.low, memoryName + "_waddr"), writeIdx);
-        Value data = staged(write.op.getData(), memoryName + "_wdata");
+        Value unstagedData = write.op.getData();
+        bool deep = deepState() && state.state && !write.low;
+        // A multiplier's cone takes the first stage at its inputs: Vivado
+        // cannot retime the stage into the DSPs that compute it.
+        bool pipelined = deep && pipelineMultipliers &&
+                         coneHasMultiplier(unstagedData);
+        Value data = pipelined ? pipelinedCone(b, unstagedData)
+                               : staged(unstagedData, memoryName + "_wdata");
         Value mask = staged(write.op.getMask(), memoryName + "_wmask");
         Value enable;
         if (write.edge) {
@@ -1218,7 +1312,7 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
         }
         // The state's write a second host cycle late: the next thread but
         // one is never one finishing now either.
-        if (deepState() && state.state && !write.low) {
+        if (deep) {
           if (!writeIdx2)
             writeIdx2 = copy(writeIdx, "threadIdx_v" + Twine(r), {}, {});
           address = writeIdx2;
@@ -2118,7 +2212,8 @@ void FAME5Pass::runOnOperation() {
                     "after its edge");
     return signalPassFailure();
   }
-  if ((regionLoads || registeredState || commitSelect || stagedRamWrites) &&
+  if ((regionLoads || registeredState || commitSelect || stagedRamWrites ||
+       pipelineMultipliers) &&
       !clockEnable) {
     model.emitError("regions are for state written with `clock-enable`");
     return signalPassFailure();
@@ -2128,7 +2223,8 @@ void FAME5Pass::runOnOperation() {
                       /*readySchedule=*/false,
                       foldsim::ThreadOptions{regionLoads, registeredState,
                                              stateStages, commitSelect,
-                                             stagedRamWrites})
+                                             stagedRamWrites,
+                                             pipelineMultipliers})
                  .run()))
     return signalPassFailure();
 }

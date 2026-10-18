@@ -162,6 +162,9 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"stagedRamWrites", "staged-ram-writes", "bool", "false",
            "Thread each model with its registered-read memories written a "
            "host cycle late too, as `foldsim-fame5`'s `staged-ram-writes`">,
+    Option<"pipelineMultipliers", "pipeline-multipliers", "bool", "false",
+           "Thread each model with its multipliers' state pipelined at their "
+           "inputs, as `foldsim-fame5`'s `pipeline-multipliers`">,
     Option<"stagedTokens", "staged-tokens", "bool", "false",
            "Write each token into its slot a host cycle after it is taken, "
            "from registers of the token, its thread and slot, and forward it "
@@ -263,6 +266,13 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
            "its read reads on every host cycle with the target's enable, and "
            "where the memory reads new data under a write it takes the staged "
            "write's data when the edge wrote its address">,
+    Option<"pipelineMultipliers", "pipeline-multipliers", "bool", "false",
+           "With `registered-state` and `state-stages=2`: a thread state whose "
+           "next value is computed by a multiplier takes its first stage at "
+           "that value's inputs (ports, registers, memory reads, each "
+           "registered once) and computes it on the next host cycle, rather "
+           "than registering the product: the stage synthesis cannot retime "
+           "into a DSP">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
