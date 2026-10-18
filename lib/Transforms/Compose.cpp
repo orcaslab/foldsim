@@ -89,6 +89,9 @@ struct Producer {
   /// it is taken, readers seeing the count a host cycle late and the producer
   /// the readers' counts a host cycle late.
   bool relay = false;
+  /// With staged tokens (and no relay): the slot written a host cycle after
+  /// the token is taken, from registers, and read through them until then.
+  bool staged = false;
   /// Built: each thread's token count, and slots in registers or a memory.
   SmallVector<Value> enq;
   SmallVector<SmallVector<Value>> slots;
@@ -100,6 +103,9 @@ struct Producer {
   };
   std::map<std::tuple<unsigned, unsigned, int>, Memories> mems;
   Value writeAddress, writeEnable, writeData;
+  /// Built, with a staged write: the token being written, and its thread
+  /// and slot.
+  Value stagedFire, stagedThread, stagedSlot, stagedBits;
 };
 
 /// A sink of tokens: an input of a model, or an output of the netlist.
@@ -121,9 +127,10 @@ class Composer {
 public:
   Composer(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
            bool readySchedule, ArrayRef<std::string> relay,
-           const foldsim::ThreadOptions &threadOptions)
+           const foldsim::ThreadOptions &threadOptions, bool stagedTokens)
       : top(top), netlist(netlist), simName(simName),
-        readySchedule(readySchedule), threadOptions(threadOptions) {
+        readySchedule(readySchedule), threadOptions(threadOptions),
+        stagedTokens(stagedTokens) {
     for (auto &name : relay)
       relayModels.insert(name);
   }
@@ -147,6 +154,7 @@ private:
   StringRef simName;
   bool readySchedule;
   foldsim::ThreadOptions threadOptions;
+  bool stagedTokens;
   llvm::StringSet<> relayModels;
   llvm::SmallPtrSet<Operation *, 4> inlined;
   std::vector<Class> classes;
@@ -382,6 +390,11 @@ LogicalResult Composer::collect() {
              relayModels.contains(q + ":" + p);
     });
   }
+
+  // With staged tokens, every channel with slots stages its writes.
+  for (auto &producer : producers)
+    producer.staged = stagedTokens && !producer.direct && !producer.relay &&
+                      producer.width > 0 && !producer.reads.empty();
   return success();
 }
 
@@ -782,18 +795,26 @@ LogicalResult Composer::build() {
     auto slotOf = [&](Value count) {
       return comb::ExtractOp::create(b, b.getIntegerType(slotBits), count, 0);
     };
-    // With a relay, the token, its thread and slot are staged a host cycle.
+    // With a relay or staged tokens, the token, its thread and slot are
+    // staged a host cycle: the slot's write enable is a register rather than
+    // the fire of this cycle.
     Value writeFire = fire, writeThread = source.thread,
           writeBits = source.bits, writeSlot;
-    if (producer.memory || producer.relay)
+    if (producer.memory || producer.relay || producer.staged)
       writeSlot = slotOf(select(producer.enq, source.thread));
-    if (producer.relay) {
+    if (producer.relay || producer.staged) {
       writeFire = delayed(fire, producer.name + "_stg_fire");
       if (source.thread)
         writeThread = delayed(source.thread, producer.name + "_stg_thread");
       writeSlot = delayed(writeSlot, producer.name + "_stg_slot");
       writeBits = seq::FirRegOp::create(b, source.bits, hostClock,
                                         b.getStringAttr(producer.name + "_stg_bits"));
+    }
+    if (producer.staged) {
+      producer.stagedFire = writeFire;
+      producer.stagedThread = writeThread;
+      producer.stagedSlot = writeSlot;
+      producer.stagedBits = writeBits;
     }
     if (producer.memory) {
       producer.writeAddress = comb::ConcatOp::create(b, writeThread, writeSlot);
@@ -804,7 +825,8 @@ LogicalResult Composer::build() {
     for (unsigned k = 0; k < producer.threads; ++k) {
       auto &slots = producer.slots.emplace_back();
       Value write = comb::AndOp::create(b, writeFire, isThread(writeThread, k));
-      Value slot = producer.relay ? writeSlot : slotOf(producer.enq[k]);
+      Value slot = producer.relay || producer.staged ? writeSlot
+                                                     : slotOf(producer.enq[k]);
       for (unsigned s = 0; s < numSlots; ++s) {
         auto next = backedges.get(writeBits.getType());
         auto reg = seq::FirRegOp::create(
@@ -838,6 +860,26 @@ LogicalResult Composer::build() {
     return copy;
   };
 
+  // A staged token is in its slot a host cycle after it is taken: a reader
+  // of that slot until then reads it from the staging registers.
+  auto forwarded = [&](Producer &producer, Value thread, Value slot,
+                       unsigned low, unsigned width, Value data) -> Value {
+    if (!producer.staged)
+      return data;
+    Value hit = comb::AndOp::create(
+        b, producer.stagedFire,
+        comb::ICmpOp::create(b, comb::ICmpPredicate::eq, producer.stagedSlot,
+                             slot));
+    if (producer.stagedThread)
+      hit = comb::AndOp::create(
+          b, hit,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::eq,
+                               producer.stagedThread, thread));
+    Value bits = b.createOrFold<comb::ExtractOp>(b.getIntegerType(width),
+                                                 producer.stagedBits, low);
+    return comb::MuxOp::create(b, hit, bits, data);
+  };
+
   // For each class, each thread: whether every input has a token for it.
   std::vector<std::vector<SmallVector<Value>>> readyTerms(classes.size());
   for (auto [c, cls] : llvm::enumerate(classes))
@@ -863,6 +905,16 @@ LogicalResult Composer::build() {
       } else {
         Value slot = comb::ExtractOp::create(b, i1, consumer.deq[t][j], 0);
         data = comb::MuxOp::create(b, slot, slots[1], slots[0]);
+        if (producer.staged) {
+          Value thread;
+          if (producer.stagedThread)
+            thread = constant(
+                APInt(producer.stagedThread.getType().getIntOrFloatBitWidth(),
+                      piece.thread));
+          return forwarded(producer, thread, slot, piece.low, piece.width,
+                           b.createOrFold<comb::ExtractOp>(
+                               b.getIntegerType(piece.width), data, piece.low));
+        }
       }
       return b.createOrFold<comb::ExtractOp>(b.getIntegerType(piece.width),
                                              data, piece.low);
@@ -906,12 +958,14 @@ LogicalResult Composer::build() {
                 b, b.getIntegerType(producer.relay ? 2 : 1),
                 consumer.deq[t][j], 0));
           }
-          Value address = comb::ConcatOp::create(
-              b, select(threads, sink.thread), select(slots, sink.thread));
-          parts.push_back(seq::FirMemReadOp::create(
+          Value thread = select(threads, sink.thread);
+          Value slot = select(slots, sink.thread);
+          Value address = comb::ConcatOp::create(b, thread, slot);
+          Value data = seq::FirMemReadOp::create(
               b, tokenMemory(producer, piece.low, piece.width, consumer.cls),
-              address,
-              hostClock, bit(true)));
+              address, hostClock, bit(true));
+          parts.push_back(forwarded(producer, thread, slot, piece.low,
+                                    piece.width, data));
           continue;
         }
         for (unsigned t = 0; t < consumer.threads; ++t)
@@ -995,7 +1049,7 @@ void ComposePass::runOnOperation() {
   foldsim::ThreadOptions threadOptions{regionLoads, registeredState,
                                        stateStages, commitSelect};
   if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
-                          threadOptions)
+                          threadOptions, stagedTokens)
                      .run()))
     signalPassFailure();
 }

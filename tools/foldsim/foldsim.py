@@ -133,6 +133,9 @@ def main():
     ap.add_argument('--state-stages', type=int, default=1,
                     help='with --registered-state: host cycles from a thread\'s edge to its '
                          'state\'s write in models of three threads or more (foldsim-fame5)')
+    ap.add_argument('--staged-tokens', action='store_true',
+                    help='write each token into its slot a host cycle after it is taken, '
+                         'forwarded to its readers until then (foldsim-compose)')
     ap.add_argument('--relay', default='',
                     help='models, or <model>:<model> pairs, whose channels get a relay stage, '
                          'comma-separated (foldsim-compose)')
@@ -206,6 +209,8 @@ def main():
         compose += f' state-stages={a.state_stages}'
     if a.relay:
         compose += f' relay={a.relay}'
+    if a.staged_tokens:
+        compose += ' staged-tokens'
     pipeline = passes + OPTIMIZE + [f'foldsim-compose{{{compose}}}',
                                     'canonicalize', 'topological-sort', 'cse']
     sim = out('foldsim_sim.mlir')

@@ -159,6 +159,12 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"stateStages", "state-stages", "unsigned", "1",
            "Thread each model with this many host cycles to its state's "
            "write, as `foldsim-fame5`'s `state-stages`">,
+    Option<"stagedTokens", "staged-tokens", "bool", "false",
+           "Write each token into its slot a host cycle after it is taken, "
+           "from registers of the token, its thread and slot, and forward it "
+           "from them to a reader of that slot until then: the slots' write "
+           "enables are registers, and a token is still readable on the next "
+           "host cycle">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
