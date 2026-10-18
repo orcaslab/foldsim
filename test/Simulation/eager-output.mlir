@@ -4,6 +4,12 @@
 // RUN: firtool --format=mlir %t/sim.mlir -o %t/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal --top-module tb -Mdir %t/obj %S/Inputs/tb_eager.sv %t/sim.sv > %t/build.log 2>&1
 // RUN: %t/obj/Vtb | FileCheck %s
+// With the state read a host cycle ahead and committed by select, the
+// tokens are the same too.
+// RUN: mkdir -p %t/p && foldsim-opt %s --foldsim-fame5="module=M threads=1 clock-enable registered-state commit-select" -o %t/p/sim.mlir
+// RUN: firtool --format=mlir %t/p/sim.mlir -o %t/p/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --top-module tb -Mdir %t/p/obj %S/Inputs/tb_eager.sv %t/p/sim.sv > %t/p/build.log 2>&1
+// RUN: %t/p/obj/Vtb | FileCheck %s
 
 // `y` fires eagerly, ahead of `z`, which waits for `m`; both are `acc`. The
 // target clock does not tick on the first finish after reset, so `y`'s second

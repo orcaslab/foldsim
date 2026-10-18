@@ -150,6 +150,15 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"regionLoads", "region-loads", "unsigned", "0",
            "Thread each model with regions of at most this many loads, as "
            "`foldsim-fame5`'s `region-loads`">,
+    Option<"registeredState", "registered-state", "bool", "false",
+           "Thread each model with its state read a host cycle ahead, as "
+           "`foldsim-fame5`'s `registered-state`">,
+    Option<"commitSelect", "commit-select", "bool", "false",
+           "Commit a single thread's state by select, as `foldsim-fame5`'s "
+           "`commit-select`">,
+    Option<"stateStages", "state-stages", "unsigned", "1",
+           "Thread each model with this many host cycles to its state's "
+           "write, as `foldsim-fame5`'s `state-stages`">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
@@ -224,6 +233,21 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
            "state read and written per thread), each with its own registered "
            "copies of the thread index and of the target edge; writes land a "
            "host cycle after the edge. 0: one control for the whole model">,
+    Option<"registeredState", "registered-state", "bool", "false",
+           "With `clock-enable`: read the thread state a host cycle ahead into "
+           "registers, the next thread chosen a host cycle earlier and never "
+           "the one after the current, writes landing a cycle late and "
+           "forwarded">,
+    Option<"commitSelect", "commit-select", "bool", "false",
+           "With `clock-enable` and one thread: commit the state by select, "
+           "its candidate and enable registered every host cycle, rather than "
+           "with the target edge as each register's enable">,
+    Option<"stateStages", "state-stages", "unsigned", "1",
+           "With `registered-state` and at least three threads: host cycles "
+           "from a thread's edge to its state's write (1 or 2); with 2 the "
+           "extra stage is for synthesis to retime into the logic that "
+           "computes the next state, and the next thread but one is never "
+           "one that finishes now">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

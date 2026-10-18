@@ -4,6 +4,12 @@
 // RUN: firtool --format=mlir %t/sim.mlir -o %t/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal --top-module tb -Mdir %t/obj %S/Inputs/tb_memory.sv %t/sim.sv > %t/build.log 2>&1
 // RUN: %t/obj/Vtb | FileCheck %s
+// With the state read a host cycle ahead and committed by select, the
+// tokens are the same too.
+// RUN: mkdir -p %t/p && foldsim-opt %s --foldsim-extract-models="module=Top models=Mem netlist" --foldsim-compose="module=Top region-loads=1 registered-state commit-select" -o %t/p/sim.mlir
+// RUN: firtool --format=mlir %t/p/sim.mlir -o %t/p/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --top-module tb -Mdir %t/p/obj %S/Inputs/tb_memory.sv %t/p/sim.sv > %t/p/build.log 2>&1
+// RUN: %t/p/obj/Vtb | FileCheck %s
 
 // A registered read's data is the next target cycle's, with one thread too:
 // the read of address 1 in cycle 2 sees the A1 written in cycle 0, that of

@@ -142,7 +142,9 @@ public:
       : model(model), threads(threads), name(name), gate(gate), slices(slices),
         fields(fields), clockChannel(clockChannel),
         threadIndexPort(threadIndexPort), tickFromFirst(tickFromFirst),
-        readySchedule(readySchedule), regionLoads(options.regionLoads) {}
+        readySchedule(readySchedule), regionLoads(options.regionLoads),
+        registeredState(options.registeredState),
+        stateStages(options.stateStages), commitSelect(options.commitSelect) {}
 
   LogicalResult run();
 
@@ -195,7 +197,24 @@ private:
     Value memory;
     SmallVector<RegionRead> reads;
     SmallVector<RegionWrite> writes;
+    /// The thread state of a register, read ahead with registered state.
+    bool state = false;
   };
+  /// With registered state, a register of a single thread: committed by
+  /// select, its `candidate` taken on its enable (`wen` on the edge, and with
+  /// `preset` while initialized). Both are registered as soon as the register
+  /// is threaded: as operands, they follow the later replacement of what they
+  /// read (another register, a memory's read data).
+  struct SingleRegister {
+    seq::FirRegOp reg;
+    Value candidate, wen;
+    bool preset;
+  };
+  SmallVector<SingleRegister> singleRegisters;
+  /// Commits each single thread's register by select: the candidate and the
+  /// enable are registered every host cycle and the state is the committed
+  /// value or the candidate, by the registered enable.
+  void commitBySelect(ImplicitLocOpBuilder &b, Value edge, Value initializing);
   RegionMemory &regionMemory(Value memory);
   /// Splits the recorded state into regions of at most `regionLoads` loads,
   /// in name order so that a region is a submodule's state, and gives each
@@ -221,9 +240,29 @@ private:
   /// The most loads a region's copy of the thread index or of the target edge
   /// drives; 0 for no regions.
   unsigned regionLoads;
+  /// Whether the state is read a host cycle ahead into registers, the next
+  /// thread chosen a cycle earlier (Phase 2), and a single thread's state
+  /// committed by select.
+  bool registeredState;
+  /// With registered state and at least three threads: the host cycles from
+  /// a thread's edge to its state's write, so that synthesis can retime the
+  /// stages into the logic computing it (C-slow on the state's update).
+  unsigned stateStages;
+  /// Whether a single thread's registers commit by select.
+  bool commitSelect;
+  bool deepState() const {
+    return registeredState && stateStages > 1 && threads >= 3;
+  }
   /// Whether the state is split into regions with their own control.
-  bool hasRegions() const { return regionLoads && threads > 1 && !gate; }
+  bool hasRegions() const {
+    return (regionLoads || registeredState) && threads > 1 && !gate;
+  }
+  /// With registered state, the thread after the current one.
+  Value aheadIdx;
   SmallVector<RegionMemory> regionMemories;
+  /// With registered state, each state read whose uses its read-ahead
+  /// register took.
+  DenseMap<Value, Value> readAhead;
   DenseMap<Value, unsigned> regionMemoryIndex;
   /// A single thread's state: the registers not written yet, with their next
   /// value and clock to be.
@@ -1026,7 +1065,7 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
   for (auto i : order) {
     auto memoryLoads = loadsOf(regionMemories[i]);
     if (regions.empty() || readOnly(i) != readOnly(regions.back().front()) ||
-        (loads && loads + memoryLoads > regionLoads)) {
+        (regionLoads && loads && loads + memoryLoads > regionLoads)) {
       regions.emplace_back();
       loads = 0;
     }
@@ -1040,9 +1079,9 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
   // edge and the initialization a copy a cycle late. Kept: equal registers
   // are otherwise merged back into one.
   auto copy = [&](Value next, const Twine &copyName, Value reset,
-                  Value resetValue) {
+                  Value resetValue, uint64_t initial = 0) {
     auto type = next.getType();
-    auto preset = b.getIntegerAttr(type, 0);
+    auto preset = b.getIntegerAttr(type, initial);
     seq::FirRegOp reg =
         reset ? seq::FirRegOp::create(b, next, hostClock,
                                       b.getStringAttr(copyName), reset,
@@ -1066,20 +1105,45 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
   for (auto [r, region] : llvm::enumerate(regions)) {
     Value readIdx = copy(idxNext, "threadIdx_r" + Twine(r), hostReset,
                          hw::ConstantOp::create(b, idxType, 0));
+    // With registered state, the thread state is read for the next thread.
+    Value aheadCopy;
+    if (aheadIdx && llvm::any_of(region, [&](unsigned i) {
+          return regionMemories[i].state;
+        }))
+      aheadCopy =
+          copy(aheadIdx.getDefiningOp<seq::FirRegOp>().getNext(),
+               "threadIdx_a" + Twine(r), hostReset,
+               hw::ConstantOp::create(b, idxType, 1), /*initial=*/1);
     // Only a region with writes has their control.
     Value writeIdx, edgeLate;
     if (!readOnly(region.front())) {
       writeIdx = copy(readIdx, "threadIdx_w" + Twine(r), {}, {});
       edgeLate = copy(edge, "edge_r" + Twine(r), {}, {});
     }
+    Value writeIdx2;
     Value initLate;
     for (auto i : region) {
       auto &state = regionMemories[i];
       auto memoryName = nameOf(state);
+      // A port's address or enable may be a state read whose uses an earlier
+      // region already moved to its read-ahead register: it is that register.
+      auto fresh = [&](Value &value) {
+        if (auto it = readAhead.find(value); value && it != readAhead.end())
+          value = it->second;
+      };
+      for (auto &read : state.reads)
+        fresh(read.low);
+      for (auto &write : state.writes) {
+        fresh(write.low);
+        fresh(write.term);
+      }
+      Value stateIdx = aheadIdx && state.state ? aheadCopy : readIdx;
       for (auto &read : state.reads)
         read.op.getAddressMutable().assign(
-            read.low ? b.createOrFold<comb::ConcatOp>(read.low, readIdx)
-                     : readIdx);
+            read.low ? b.createOrFold<comb::ConcatOp>(read.low, stateIdx)
+                     : stateIdx);
+      // The write landing on this cycle's edge.
+      Value pendingData, pendingEnable;
       for (auto &write : state.writes) {
         if (!write.staged) {
           write.op.getAddressMutable().assign(
@@ -1111,13 +1175,97 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
           enable = enable ? Value(comb::OrOp::create(b, initLate, enable))
                           : initLate;
         }
+        // The state's write a second host cycle late: the next thread but
+        // one is never one finishing now either.
+        if (deepState() && state.state && !write.low) {
+          if (!writeIdx2)
+            writeIdx2 = copy(writeIdx, "threadIdx_v" + Twine(r), {}, {});
+          address = writeIdx2;
+          data = staged(data, memoryName + "_wdata2");
+          mask = staged(mask, memoryName + "_wmask2");
+          enable = seq::FirRegOp::create(b, enable, hostClock,
+                                         b.getStringAttr(memoryName + "_wen2"),
+                                         hw::InnerSymAttr{},
+                                         b.getIntegerAttr(i1, 0));
+        }
         write.op.getAddressMutable().assign(address);
         write.op.getDataMutable().assign(data);
         if (mask)
           write.op.getMaskMutable().assign(mask);
         write.op.getEnableMutable().assign(enable);
+        pendingData = data;
+        pendingEnable = enable;
+      }
+      if (!aheadIdx || !state.state)
+        continue;
+      // The next thread's state, read a host cycle ahead into registers. The
+      // write landing on this cycle's edge is the only one not in the memory
+      // yet: it is forwarded when it is that thread's.
+      Value hit;
+      if (pendingEnable)
+        hit = comb::AndOp::create(
+            b, pendingEnable,
+            comb::ICmpOp::create(b, comb::ICmpPredicate::eq,
+                                 writeIdx2 ? writeIdx2 : writeIdx, aheadCopy));
+      for (auto &read : state.reads) {
+        Value data = read.op.getData();
+        auto ahead = seq::FirRegOp::create(
+            b, data, hostClock, b.getStringAttr(memoryName + "_state"));
+        data.replaceAllUsesExcept(ahead, ahead);
+        readAhead[data] = ahead;
+        if (hit)
+          ahead.getNextMutable().assign(
+              comb::MuxOp::create(b, hit, pendingData, data));
       }
     }
+  }
+}
+
+void Threader::commitBySelect(ImplicitLocOpBuilder &b, Value edge,
+                              Value initializing) {
+  auto i1 = b.getI1Type();
+  auto keep = sv::SVAttributeAttr::get(b.getContext(), "keep", R"("true")",
+                                       /*emitAsComment=*/false);
+  // Registers in name order, a copy of the enables per `regionLoads` bits.
+  llvm::stable_sort(singleRegisters, [](const SingleRegister &x,
+                                       const SingleRegister &y) {
+    return seq::FirRegOp(x.reg).getName() < seq::FirRegOp(y.reg).getName();
+  });
+  Value edgeLate, initLate;
+  uint64_t loads = 0;
+  unsigned region = 0;
+  for (auto &single : singleRegisters) {
+    auto reg = single.reg;
+    auto type = reg.getType();
+    uint64_t width = hw::getBitWidth(type);
+    if (!edgeLate || (regionLoads && loads && loads + width > regionLoads)) {
+      auto late = [&](Value value, const Twine &lateName) {
+        auto copy = seq::FirRegOp::create(b, value, hostClock,
+                                          b.getStringAttr(lateName),
+                                          hw::InnerSymAttr{},
+                                          b.getIntegerAttr(i1, 0));
+        sv::addSVAttributes(copy, {keep});
+        return Value(copy);
+      };
+      edgeLate = late(edge, "edge_r" + Twine(region));
+      initLate = late(initializing, "init_r" + Twine(region));
+      ++region;
+      loads = 0;
+    }
+    loads += width;
+    Value enable = edgeLate;
+    if (single.wen)
+      enable = comb::AndOp::create(b, single.wen, edgeLate);
+    if (single.preset)
+      enable = comb::OrOp::create(b, initLate, enable);
+    // The committed value, and the state: it or the candidate committed now.
+    auto committed = seq::FirRegOp::create(
+        b, reg.getResult(), hostClock, reg.getNameAttr(), hw::InnerSymAttr{},
+        reg.getPresetAttr());
+    Value value = comb::MuxOp::create(b, enable, single.candidate, committed);
+    reg.getResult().replaceAllUsesWith(value);
+    committed.getNextMutable().assign(value);
+    reg.erase();
   }
 }
 
@@ -1293,6 +1441,17 @@ LogicalResult Threader::run() {
         comb::XorOp::create(b, last, hw::ConstantOp::create(b, i1, 1))));
     initializing = comb::OrOp::create(b, hostReset, sweeping);
   }
+  // With registered state the next thread is chosen a host cycle earlier: the
+  // thread after the current one is a register too.
+  Backedge aheadNext;
+  if (threads > 1 && registeredState) {
+    auto idxType = b.getIntegerType(llvm::Log2_32_Ceil(threads));
+    aheadNext = backedges.get(idxType);
+    aheadIdx = seq::FirRegOp::create(
+        b, aheadNext, hostClock, b.getStringAttr("threadIdx_ahead"), hostReset,
+        hw::ConstantOp::create(b, idxType, 1), hw::InnerSymAttr{},
+        /*isAsync=*/false, b.getIntegerAttr(idxType, 1));
+  }
 
   // An output that depends on no input fires eagerly, with the next cycle's
   // value once its thread has finished.
@@ -1352,8 +1511,32 @@ LogicalResult Threader::run() {
     } else if (!write.holds) {
       writeThreadState(b, memory, targetClock, write.data, write.enable);
     }
+    if (commitSelect && threads == 1 && !write.holds && !gate) {
+      Value data = write.data;
+      if (reg.getPreset()) {
+        auto width = hw::getBitWidth(reg.getType());
+        data = comb::MuxOp::create(
+            b, initializing,
+            hw::ConstantOp::create(b, reg.getPreset()->zextOrTrunc(width)),
+            b.createOrFold<hw::BitcastOp>(b.getIntegerType(width), write.data));
+      }
+      auto single = memory.getDefiningOp<seq::FirRegOp>();
+      // The candidate and its enable, taken every host cycle.
+      Value candidate = seq::FirRegOp::create(
+          b, b.createOrFold<hw::BitcastOp>(single.getType(), data), hostClock,
+          b.getStringAttr(single.getName() + "_next"));
+      Value wen;
+      if (write.enable)
+        wen = seq::FirRegOp::create(b, write.enable, hostClock,
+                                    b.getStringAttr(single.getName() + "_wen"),
+                                    hw::InnerSymAttr{},
+                                    b.getIntegerAttr(i1, 0));
+      singleRegisters.push_back(
+          {single, candidate, wen, bool(reg.getPreset())});
+    }
     if (regions) {
       auto &state = regionMemory(memory);
+      state.state = true;
       for (auto *user : memory.getUsers()) {
         if (auto read = dyn_cast<seq::FirMemReadOp>(user))
           state.reads.push_back({read, {}});
@@ -1561,28 +1744,42 @@ LogicalResult Threader::run() {
     auto constant = [&](Type type, uint64_t value) -> Value {
       return hw::ConstantOp::create(b, type, value);
     };
-    auto isLast = comb::ICmpOp::create(b, comb::ICmpPredicate::eq, threadIdx,
+    // With registered state, the thread chosen now runs after the next one,
+    // `aheadIdx`, which it must not be: that one's state is read before it
+    // finishes.
+    Value from = aheadIdx ? aheadIdx : threadIdx;
+    auto isLast = comb::ICmpOp::create(b, comb::ICmpPredicate::eq, from,
                                        constant(idxType, threads - 1));
     Value inTurn = comb::MuxOp::create(
         b, isLast, constant(idxType, 0),
-        comb::AddOp::create(b, threadIdx, constant(idxType, 1)));
+        comb::AddOp::create(b, from, constant(idxType, 1)));
+    if (aheadIdx)
+      idxNext.setValue(aheadIdx);
+    auto &chosen = aheadIdx ? aheadNext : idxNext;
     if (!threadReady) {
-      idxNext.setValue(inTurn);
+      chosen.setValue(inTurn);
     } else {
       // A thread finishing now takes its inputs: it is not ready next.
       auto vecType = b.getIntegerType(threads);
       Value ones = hw::ConstantOp::create(b, APInt::getAllOnes(threads));
-      Value current = comb::ShlOp::create(
-          b, constant(vecType, 1),
-          b.createOrFold<comb::ConcatOp>(
-              constant(
-                  b.getIntegerType(threads - idxType.getIntOrFloatBitWidth()),
-                  0),
-              threadIdx));
+      auto oneHot = [&](Value index) -> Value {
+        return comb::ShlOp::create(
+            b, constant(vecType, 1),
+            b.createOrFold<comb::ConcatOp>(
+                constant(b.getIntegerType(threads -
+                                          idxType.getIntOrFloatBitWidth()),
+                         0),
+                index));
+      };
+      Value current = oneHot(from);
       Value finishingMask = comb::AndOp::create(
-          b, current, comb::ReplicateOp::create(b, vecType, finishing));
+          b, aheadIdx ? oneHot(threadIdx) : current,
+          comb::ReplicateOp::create(b, vecType, finishing));
       Value ready = comb::AndOp::create(
           b, threadReady, comb::XorOp::create(b, finishingMask, ones));
+      if (aheadIdx)
+        ready = comb::AndOp::create(b, ready,
+                                    comb::XorOp::create(b, current, ones));
       // The threads after the current one.
       Value upTo = comb::SubOp::create(
           b, comb::ShlOp::create(b, current, constant(vecType, 1)),
@@ -1602,12 +1799,25 @@ LogicalResult Threader::run() {
         return comb::ICmpOp::create(b, comb::ICmpPredicate::ne, v,
                                     constant(vecType, 0));
       };
+      // Without a ready thread, the next in turn; with the state written two
+      // host cycles late, the next in turn that is neither the thread after
+      // the current one nor the current one if it finishes now.
+      Value fallback = inTurn;
+      if (deepState()) {
+        Value allowed = comb::AndOp::create(
+            b, comb::XorOp::create(b, current, ones),
+            comb::XorOp::create(b, finishingMask, ones));
+        Value allowedAfter =
+            comb::AndOp::create(b, allowed, comb::XorOp::create(b, upTo, ones));
+        fallback = comb::MuxOp::create(b, any(allowedAfter),
+                                       lowest(allowedAfter), lowest(allowed));
+      }
       // In turn while the threads are initialized.
-      idxNext.setValue(comb::MuxOp::create(
+      chosen.setValue(comb::MuxOp::create(
           b, sweeping, inTurn,
           comb::MuxOp::create(
               b, any(after), lowest(after),
-              comb::MuxOp::create(b, any(ready), lowest(ready), inTurn))));
+              comb::MuxOp::create(b, any(ready), lowest(ready), fallback))));
     }
   }
 
@@ -1666,8 +1876,6 @@ LogicalResult Threader::run() {
   } else if (failed(enableOnHostClock(b, targetClock, enable))) {
     return failure();
   }
-  if (regions)
-    buildRegions(b, enable, initializing, hostReset);
 
   SmallVector<Value> results;
   if (clockBits)
@@ -1703,7 +1911,15 @@ LogicalResult Threader::run() {
     results.push_back(threadIdx);
   if (threadIndexPort)
     results.push_back(enable);
-  hw::OutputOp::create(b, results);
+  auto output = hw::OutputOp::create(b, results);
+  // Regions and registered state replace values the outputs may be, so they
+  // come last.
+  b.setInsertionPoint(output);
+  if (regions)
+    buildRegions(b, enable, initializing, hostReset);
+  if (commitSelect && threads == 1 && !gate)
+    commitBySelect(b, enable, initializing);
+  b.setInsertionPointToEnd(body);
 
   // A single thread's state that is never written holds its value.
   for (auto &[memory, entry] : unwritten) {
@@ -1807,14 +2023,20 @@ void FAME5Pass::runOnOperation() {
   }
   if (clockEnable)
     gate = {};
-  if (regionLoads && !clockEnable) {
+  if (stateStages < 1 || stateStages > 2) {
+    model.emitError("a thread's state is written one or two host cycles "
+                    "after its edge");
+    return signalPassFailure();
+  }
+  if ((regionLoads || registeredState || commitSelect) && !clockEnable) {
     model.emitError("regions are for state written with `clock-enable`");
     return signalPassFailure();
   }
   if (failed(Threader(model, threads, name, gate, slices, channelFields,
                       clockChannel, threadIndex, /*tickFromFirst=*/false,
                       /*readySchedule=*/false,
-                      foldsim::ThreadOptions{regionLoads})
+                      foldsim::ThreadOptions{regionLoads, registeredState,
+                                             stateStages, commitSelect})
                  .run()))
     return signalPassFailure();
 }

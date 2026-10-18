@@ -125,6 +125,14 @@ def main():
     ap.add_argument('--region-loads', type=int, default=0,
                     help="split each threaded model's state into regions of at most this "
                          'many loads, each with its own thread index and edge (foldsim-fame5)')
+    ap.add_argument('--registered-state', action='store_true',
+                    help='read the thread state a host cycle ahead into registers and commit '
+                         "a single thread's state by select (foldsim-fame5)")
+    ap.add_argument('--commit-select', action='store_true',
+                    help="commit a single thread's state by select (foldsim-fame5)")
+    ap.add_argument('--state-stages', type=int, default=1,
+                    help='with --registered-state: host cycles from a thread\'s edge to its '
+                         'state\'s write in models of three threads or more (foldsim-fame5)')
     ap.add_argument('--relay', default='',
                     help='models, or <model>:<model> pairs, whose channels get a relay stage, '
                          'comma-separated (foldsim-compose)')
@@ -190,6 +198,12 @@ def main():
     compose = f'module={a.top} sim=foldsim_sim'
     if a.region_loads:
         compose += f' region-loads={a.region_loads}'
+    if a.registered_state:
+        compose += ' registered-state'
+    if a.commit_select:
+        compose += ' commit-select'
+    if a.state_stages > 1:
+        compose += f' state-stages={a.state_stages}'
     if a.relay:
         compose += f' relay={a.relay}'
     pipeline = passes + OPTIMIZE + [f'foldsim-compose{{{compose}}}',

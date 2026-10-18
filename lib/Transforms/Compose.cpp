@@ -981,13 +981,19 @@ LogicalResult Composer::run() {
 
 void ComposePass::runOnOperation() {
   auto top = getOperation();
+  if (stateStages < 1 || stateStages > 2) {
+    top.emitError("a thread's state is written one or two host cycles after "
+                  "its edge");
+    return signalPassFailure();
+  }
   auto netlist = dyn_cast_or_null<hw::HWModuleOp>(
       SymbolTable::lookupSymbolIn(top, moduleName));
   if (!netlist) {
     top.emitError("no netlist '") << moduleName << "'";
     return signalPassFailure();
   }
-  foldsim::ThreadOptions threadOptions{regionLoads};
+  foldsim::ThreadOptions threadOptions{regionLoads, registeredState,
+                                       stateStages, commitSelect};
   if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
                           threadOptions)
                      .run()))

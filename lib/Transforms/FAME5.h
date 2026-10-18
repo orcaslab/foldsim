@@ -23,6 +23,9 @@ namespace foldsim {
 /// options of the same names.
 struct ThreadOptions {
   unsigned regionLoads = 0;
+  bool registeredState = false;
+  unsigned stateStages = 1;
+  bool commitSelect = false;
 };
 mlir::FailureOr<circt::hw::HWModuleOp>
 threadModel(circt::hw::HWModuleOp model, unsigned threads, mlir::StringAttr name,
