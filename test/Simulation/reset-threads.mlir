@@ -29,6 +29,13 @@
 // RUN: %t/s/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 // RUN: %t/s/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
 // RUN: %t/s/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 | FileCheck %s
+// As a tree of domains, with regions, the tokens are the same too.
+// RUN: mkdir -p %t/d && foldsim-opt %s --foldsim-extract-models="module=Top models=Acc netlist" --foldsim-compose="module=Top region-loads=1 domains" -o %t/d/sim.mlir
+// RUN: firtool --format=mlir %t/d/sim.mlir -o %t/d/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/d/obj %S/Inputs/tb_threads.sv %t/d/sim.sv > %t/d/build.log 2>&1
+// RUN: %t/d/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/d/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+// RUN: %t/d/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 | FileCheck %s
 
 // And with the state written two host cycles late and the staged tokens.
 // RUN: mkdir -p %t/f && foldsim-opt %s --foldsim-extract-models="module=Top models=Acc netlist" --foldsim-compose="module=Top region-loads=1 registered-state state-stages=2 staged-tokens" -o %t/f/sim.mlir

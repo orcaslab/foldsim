@@ -155,6 +155,9 @@ def main():
                          'inputs are all there, or the next in turn (foldsim-compose). '
                          'Default: in turn with --registered-state, whose look-ahead pick '
                          'is a host cycle staler, ready otherwise')
+    ap.add_argument('--domains', action='store_true',
+                    help='emit the simulator as a tree of domains, one module per class '
+                         'nested as the class tree (foldsim-compose)')
     ap.add_argument('--relay', default='',
                     help='models, or <model>:<model> pairs, whose channels get a relay stage, '
                          'comma-separated (foldsim-compose)')
@@ -253,6 +256,8 @@ def main():
         compose += ' fold-pipelines'
     if a.channel_depth != 2:
         compose += f' channel-depth={a.channel_depth}'
+    if a.domains:
+        compose += ' domains'
     if a.relay:
         compose += f' relay={a.relay}'
     if a.staged_tokens:

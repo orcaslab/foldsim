@@ -15,6 +15,7 @@
 #include "FAME5.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/SV/SVAttributes.h"
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
@@ -26,7 +27,9 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
+#include <functional>
 #include <map>
 
 namespace foldsim {
@@ -131,10 +134,11 @@ public:
   Composer(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
            bool readySchedule, ArrayRef<std::string> relay,
            const foldsim::ThreadOptions &threadOptions, bool stagedTokens,
-           unsigned channelDepth)
+           unsigned channelDepth, bool domains)
       : top(top), netlist(netlist), simName(simName),
         readySchedule(readySchedule), threadOptions(threadOptions),
-        stagedTokens(stagedTokens), channelDepth(channelDepth) {
+        stagedTokens(stagedTokens), channelDepth(channelDepth),
+        emitDomainTree(domains) {
     for (auto &name : relay)
       relayModels.insert(name);
   }
@@ -160,7 +164,26 @@ private:
   foldsim::ThreadOptions threadOptions;
   bool stagedTokens;
   unsigned channelDepth;
+  bool emitDomainTree;
   llvm::StringSet<> relayModels;
+  hw::HWModuleOp sim;
+  /// The netlist each model instance and each netlist instance comes from,
+  /// as inlined: the class tree.
+  DenseMap<Operation *, std::string> ownerOf;
+  llvm::StringMap<std::string> netlistParent;
+  /// The domain tree: a netlist's domain holds its model and the domains of
+  /// what it instantiates; a class without a netlist is a domain of its own.
+  struct Domain {
+    std::string name;
+    int parent = -1;
+    unsigned depth = 0;
+    SmallVector<int> children;
+  };
+  std::vector<Domain> domainTree;
+  llvm::StringMap<int> domainIndex;
+  SmallVector<int> classDomain;
+  LogicalResult buildDomainTree();
+  LogicalResult emitDomains();
   llvm::SmallPtrSet<Operation *, 4> inlined;
   std::vector<Class> classes;
   DenseMap<Operation *, std::pair<unsigned, unsigned>> threadOf;
@@ -174,6 +197,8 @@ private:
 
 void Composer::inlineNetlists() {
   auto *body = netlist.getBodyBlock();
+  for (auto instance : body->getOps<hw::InstanceOp>())
+    ownerOf[instance] = netlist.getModuleName().str();
   for (bool changed = true; changed;) {
     changed = false;
     for (auto instance :
@@ -184,6 +209,10 @@ void Composer::inlineNetlists() {
       if (!callee || !callee->hasAttr("foldsim.netlist"))
         continue;
       inlined.insert(callee);
+      auto owner = ownerOf.lookup(instance);
+      auto calleeName = callee.getModuleName().str();
+      if (!netlistParent.count(calleeName))
+        netlistParent[calleeName] = owner;
       auto *calleeBody = callee.getBodyBlock();
       IRMapping map;
       for (auto [arg, operand] :
@@ -193,9 +222,11 @@ void Composer::inlineNetlists() {
       SmallVector<Operation *> clones;
       for (auto &op : calleeBody->without_terminator()) {
         auto *clone = builder.clone(op, map);
-        if (auto inner = dyn_cast<hw::InstanceOp>(clone))
+        if (auto inner = dyn_cast<hw::InstanceOp>(clone)) {
           inner.setInstanceNameAttr(builder.getStringAttr(
               instance.getInstanceName() + "_" + inner.getInstanceName()));
+          ownerOf[inner] = calleeName;
+        }
         clones.push_back(clone);
       }
       // A graph region: an operand may be defined further down.
@@ -580,7 +611,7 @@ LogicalResult Composer::build() {
                              IntegerType::get(context, classes.size()), false);
 
   OpBuilder outer(netlist);
-  auto sim = hw::HWModuleOp::create(outer, netlist.getLoc(),
+  sim = hw::HWModuleOp::create(outer, netlist.getLoc(),
                                     StringAttr::get(context, simName),
                                     hw::ModulePortInfo(ports));
   auto *body = sim.getBodyBlock();
@@ -1042,9 +1073,541 @@ LogicalResult Composer::build() {
   return success();
 }
 
+
+LogicalResult Composer::buildDomainTree() {
+  auto addDomain = [&](StringRef name) -> int {
+    auto [it, inserted] = domainIndex.try_emplace(name, domainTree.size());
+    if (inserted)
+      domainTree.push_back({name.str(), -1, 0, {}});
+    return it->second;
+  };
+  std::string topName = netlist.getModuleName().str();
+  addDomain(topName);
+  // A netlist's domain under the netlist that instantiates it.
+  std::function<int(StringRef)> netlistDomain = [&](StringRef name) -> int {
+    if (auto it = domainIndex.find(name); it != domainIndex.end())
+      return it->second;
+    int parent = netlistDomain(netlistParent.lookup(name));
+    int d = addDomain(name);
+    domainTree[d].parent = parent;
+    return d;
+  };
+  for (auto &cls : classes) {
+    // The netlists a class is instantiated in.
+    SmallVector<int> owners;
+    for (auto instance : cls.instances) {
+      auto it = ownerOf.find(instance);
+      if (it == ownerOf.end())
+        return instance.emitError("a model instance from no netlist");
+      int owner = netlistDomain(it->second);
+      if (!llvm::is_contained(owners, owner))
+        owners.push_back(owner);
+    }
+    if (owners.size() != 1)
+      return cls.instances[0].emitError(
+          "a class instantiated by several netlists has no one domain");
+    int owner = owners[0];
+    if (cls.name == domainTree[owner].name + "_model") {
+      classDomain.push_back(owner);
+      continue;
+    }
+    if (domainIndex.count(cls.name))
+      return cls.instances[0].emitError("a class named as a netlist");
+    int d = addDomain(cls.name);
+    domainTree[d].parent = owner;
+    classDomain.push_back(d);
+  }
+  if (domainTree.size() > 64)
+    return netlist.emitError("more than 64 domains");
+  for (auto [d, domain] : llvm::enumerate(domainTree)) {
+    if (domain.parent >= 0)
+      domainTree[domain.parent].children.push_back(d);
+    for (int p = domain.parent; p >= 0; p = domainTree[p].parent)
+      ++domain.depth;
+  }
+  return success();
+}
+
+LogicalResult Composer::emitDomains() {
+  auto *context = top.getContext();
+  auto *body = sim.getBodyBlock();
+  auto *terminator = body->getTerminator();
+  unsigned numDomains = domainTree.size();
+  using Mask = uint64_t;
+  const int topDomain = 0;
+  auto bit = [](int d) -> Mask { return Mask(1) << d; };
+  auto lca = [&](Mask mask) -> int {
+    if (!mask)
+      return topDomain;
+    int best = -1;
+    for (unsigned d = 0; d < numDomains; ++d) {
+      if (!(mask & bit(d)))
+        continue;
+      if (best < 0) {
+        best = d;
+        continue;
+      }
+      int x = best, y = d;
+      while (domainTree[x].depth > domainTree[y].depth)
+        x = domainTree[x].parent;
+      while (domainTree[y].depth > domainTree[x].depth)
+        y = domainTree[y].parent;
+      while (x != y) {
+        x = domainTree[x].parent;
+        y = domainTree[y].parent;
+      }
+      best = x;
+    }
+    return best;
+  };
+
+  // The models' domains.
+  DenseMap<Operation *, int> domainOf;
+  DenseMap<Operation *, unsigned> modelClass;
+  for (auto &op : body->without_terminator())
+    if (auto instance = dyn_cast<hw::InstanceOp>(op))
+      for (auto [c, cls] : llvm::enumerate(classes))
+        if (instance.getModuleNameAttr().getAttr() ==
+            cls.threaded.getModuleNameAttr()) {
+          domainOf[instance] = classDomain[c];
+          modelClass[instance] = c;
+        }
+  auto isModel = [&](Operation *op) { return modelClass.count(op) > 0; };
+  auto isConstant = [](Operation *op) {
+    return isa<hw::ConstantOp, hw::AggregateConstantOp>(op);
+  };
+  auto isState = [&](Operation *op) {
+    return isModel(op) ||
+           isa<seq::FirRegOp, seq::FirMemOp, seq::FirMemReadOp,
+               seq::FirMemWriteOp>(op);
+  };
+  Value clock = body->getArgument(0), reset = body->getArgument(1);
+  SmallVector<Operation *> ops;
+  for (auto &op : body->without_terminator())
+    ops.push_back(&op);
+
+  // The models an op is connected to: through anything but a model
+  // (`throughState`), or through combinational logic only.
+  auto cones = [&](bool throughState, auto stops, DenseMap<Operation *, Mask> &in,
+                   DenseMap<Operation *, Mask> &out) {
+    auto sourceMask = [&](Value v, DenseMap<Operation *, Mask> &table) -> Mask {
+      if (v == clock || v == reset)
+        return 0;
+      auto *def = v.getDefiningOp();
+      if (!def)
+        return bit(topDomain);
+      if (isModel(def))
+        return bit(domainOf[def]);
+      if (isConstant(def) || stops(def))
+        return 0;
+      return table.lookup(def);
+    };
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (auto *op : ops) {
+        if (isModel(op) || isConstant(op) || stops(op))
+          continue;
+        Mask m = in.lookup(op);
+        for (auto operand : op->getOperands())
+          m |= sourceMask(operand, in);
+        if (m != in.lookup(op)) {
+          in[op] = m;
+          changed = true;
+        }
+      }
+      for (auto *op : llvm::reverse(ops)) {
+        if (isModel(op) || isConstant(op) || stops(op))
+          continue;
+        Mask m = out.lookup(op);
+        for (auto *user : op->getUsers()) {
+          if (user == terminator)
+            m |= bit(topDomain);
+          else if (isModel(user))
+            m |= bit(domainOf[user]);
+          else if (!stops(user))
+            m |= out.lookup(user);
+        }
+        if (m != out.lookup(op)) {
+          out[op] = m;
+          changed = true;
+        }
+      }
+    }
+    (void)throughState;
+  };
+  // A memory goes with its ports.
+  DenseMap<Operation *, Operation *> memoryOf;
+  for (auto *op : ops) {
+    if (auto read = dyn_cast<seq::FirMemReadOp>(op))
+      memoryOf[op] = read.getMemory().getDefiningOp();
+    else if (auto write = dyn_cast<seq::FirMemWriteOp>(op))
+      memoryOf[op] = write.getMemory().getDefiningOp();
+    else if (isa<seq::FirMemOp>(op))
+      memoryOf[op] = op;
+  }
+
+  // Through the state: a channel's state and logic go to the LCA of the
+  // models it connects.
+  DenseMap<Operation *, Mask> fanIn, fanOut;
+  cones(true, [](Operation *) { return false; }, fanIn, fanOut);
+  DenseMap<Operation *, Mask> groupMask;
+  for (auto *op : ops)
+    if (auto *memory = memoryOf.lookup(op))
+      groupMask[memory] |= fanIn.lookup(op) | fanOut.lookup(op);
+  for (auto *op : ops) {
+    if (isModel(op) || isConstant(op))
+      continue;
+    if (auto *memory = memoryOf.lookup(op))
+      domainOf[op] = lca(groupMask[memory]);
+    else
+      domainOf[op] = lca(fanIn.lookup(op) | fanOut.lookup(op));
+  }
+
+  // Behind a relay, a channel's state is on its producer's or its
+  // consumer's side, and logic goes next to what it drives; a staged token's
+  // staging is on its producer's.
+  auto relaySide = [](StringRef name) -> int {
+    for (auto key : {"_renq", "_deqd", "_stg_"})
+      if (name.contains(key))
+        return 1;
+    for (auto key : {"_rdeq", "_enqd_", "_rslot", "_rtokens"})
+      if (name.contains(key))
+        return 2;
+    return 0;
+  };
+  // Staged tokens stage their producer's side the same way.
+  bool anyRelay =
+      llvm::any_of(producers, [](auto &p) { return p.relay || p.staged; });
+  if (anyRelay) {
+    DenseMap<Operation *, Mask> combIn, combOut;
+    cones(false, [&](Operation *op) { return isState(op) && !isa<seq::FirMemReadOp>(op); },
+          combIn, combOut);
+    auto combSources = [&](Operation *op) {
+      Mask m = 0;
+      for (auto operand : op->getOperands()) {
+        if (operand == clock || operand == reset)
+          continue;
+        auto *def = operand.getDefiningOp();
+        if (!def)
+          m |= bit(topDomain);
+        else if (isModel(def))
+          m |= bit(domainOf[def]);
+        else if (!isConstant(def) && !(isState(def) && !isa<seq::FirMemReadOp>(def)))
+          m |= combIn.lookup(def);
+      }
+      return m;
+    };
+    auto combSinks = [&](Operation *op) {
+      Mask m = 0;
+      for (auto *user : op->getUsers()) {
+        if (user == terminator)
+          m |= bit(topDomain);
+        else if (isModel(user))
+          m |= bit(domainOf[user]);
+        else if (!(isState(user) && !isa<seq::FirMemReadOp>(user)))
+          m |= combOut.lookup(user);
+      }
+      return m;
+    };
+    for (auto *op : ops) {
+      auto reg = dyn_cast<seq::FirRegOp>(op);
+      if (!reg)
+        continue;
+      if (int side = relaySide(reg.getName()))
+        domainOf[op] = lca(side == 1 ? combSources(op) : combSinks(op));
+    }
+    for (auto *op : ops) {
+      auto memory = dyn_cast<seq::FirMemOp>(op);
+      if (!memory || !relaySide(memory.getName().value_or("")))
+        continue;
+      Mask m = 0;
+      for (auto *user : memory->getUsers())
+        if (isa<seq::FirMemReadOp>(user))
+          m |= combSinks(user);
+      int d = lca(m);
+      for (auto *other : ops)
+        if (memoryOf.lookup(other) == op)
+          domainOf[other] = d;
+    }
+    // Logic between state goes with what it drives, where that state is a
+    // relay's: elsewhere it stays at the LCA, so a leaf does not pull in the
+    // wide reads of fabric it does not own.
+    DenseSet<Operation *> relayState;
+    for (auto *op : ops) {
+      if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
+        if (relaySide(reg.getName()))
+          relayState.insert(op);
+      } else if (auto *memory = memoryOf.lookup(op)) {
+        if (relaySide(cast<seq::FirMemOp>(memory).getName().value_or("")))
+          relayState.insert(op);
+      }
+    }
+    DenseSet<Operation *> nearRelay;
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (auto *op : ops) {
+        if (isState(op) || isConstant(op) || nearRelay.contains(op))
+          continue;
+        bool near = false;
+        for (auto operand : op->getOperands())
+          if (auto *def = operand.getDefiningOp())
+            near |= relayState.contains(def) ||
+                    (!isState(def) && nearRelay.contains(def));
+        for (auto *user : op->getUsers())
+          near |= relayState.contains(user) ||
+                  (!isState(user) && nearRelay.contains(user));
+        if (near) {
+          nearRelay.insert(op);
+          changed = true;
+        }
+      }
+    }
+    DenseMap<Operation *, Mask> anchorIn, anchorOut;
+    auto anchor = [&](Operation *op) { return isState(op); };
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (auto *op : ops) {
+        if (anchor(op) || isConstant(op))
+          continue;
+        Mask m = anchorIn.lookup(op);
+        for (auto operand : op->getOperands()) {
+          if (operand == clock || operand == reset)
+            continue;
+          auto *def = operand.getDefiningOp();
+          if (!def)
+            m |= bit(topDomain);
+          else if (anchor(def))
+            m |= bit(domainOf[def]);
+          else if (!isConstant(def))
+            m |= anchorIn.lookup(def);
+        }
+        if (m != anchorIn.lookup(op)) {
+          anchorIn[op] = m;
+          changed = true;
+        }
+      }
+      for (auto *op : llvm::reverse(ops)) {
+        if (anchor(op) || isConstant(op))
+          continue;
+        Mask m = anchorOut.lookup(op);
+        for (auto *user : op->getUsers()) {
+          if (user == terminator)
+            m |= bit(topDomain);
+          else
+            m |= anchor(user) ? bit(domainOf[user]) : anchorOut.lookup(user);
+        }
+        if (m != anchorOut.lookup(op)) {
+          anchorOut[op] = m;
+          changed = true;
+        }
+      }
+    }
+    for (auto *op : ops) {
+      if (anchor(op) || isConstant(op) || !nearRelay.contains(op))
+        continue;
+      Mask out = anchorOut.lookup(op);
+      domainOf[op] = lca(out ? out : anchorIn.lookup(op));
+    }
+  }
+
+  // The values crossing each domain's boundary, in and out.
+  auto valueDomain = [&](Value v) -> int {
+    auto *def = v.getDefiningOp();
+    return def ? domainOf.lookup(def) : topDomain;
+  };
+  std::vector<llvm::SetVector<Value>> inputs(numDomains), outputs(numDomains);
+  auto need = [&](Value v, int e) {
+    int dv = valueDomain(v);
+    if (dv == e)
+      return;
+    int l = lca(bit(dv) | bit(e));
+    for (int x = dv; x != l; x = domainTree[x].parent)
+      outputs[x].insert(v);
+    for (int x = e; x != l; x = domainTree[x].parent)
+      inputs[x].insert(v);
+  };
+  for (auto *op : ops) {
+    if (isConstant(op))
+      continue;
+    for (auto operand : op->getOperands()) {
+      auto *def = operand.getDefiningOp();
+      if (def && isConstant(def))
+        continue;
+      need(operand, domainOf[op]);
+    }
+  }
+  for (auto operand : terminator->getOperands()) {
+    auto *def = operand.getDefiningOp();
+    if (!def || !isConstant(def))
+      need(operand, topDomain);
+  }
+
+  // Port names from what a value is.
+  auto nameOf = [&](Value v) -> std::string {
+    if (auto arg = dyn_cast<BlockArgument>(v))
+      return sim.getInputName(arg.getArgNumber()).str();
+    auto *def = v.getDefiningOp();
+    if (auto reg = dyn_cast<seq::FirRegOp>(def))
+      return reg.getName().str();
+    if (auto instance = dyn_cast<hw::InstanceOp>(def))
+      return (instance.getInstanceName() + "_" +
+              cast<StringAttr>(instance.getResultNames()[cast<OpResult>(v)
+                                                              .getResultNumber()])
+                  .getValue())
+          .str();
+    if (auto read = dyn_cast<seq::FirMemReadOp>(def))
+      return (read.getMemory().getDefiningOp<seq::FirMemOp>().getName().value_or(
+                  "mem") +
+              "_rdata")
+          .str();
+    return "w";
+  };
+
+  // A module per domain but the top one, the simulator itself.
+  OpBuilder outer(sim);
+  SmallVector<hw::HWModuleOp> modules(numDomains);
+  std::vector<DenseMap<Value, Value>> local(numDomains);
+  for (unsigned d = 1; d < numDomains; ++d) {
+    SmallVector<hw::PortInfo> ports;
+    llvm::StringSet<> used;
+    auto unique = [&](std::string name) {
+      std::string candidate = name;
+      for (unsigned i = 1; !used.insert(candidate).second; ++i)
+        candidate = name + "_" + std::to_string(i);
+      return candidate;
+    };
+    unsigned numIn = 0, numOut = 0;
+    for (auto v : inputs[d]) {
+      hw::PortInfo port;
+      port.name = StringAttr::get(context, unique(nameOf(v)));
+      port.type = v.getType();
+      port.dir = hw::ModulePort::Direction::Input;
+      port.argNum = numIn++;
+      ports.push_back(port);
+    }
+    for (auto v : outputs[d]) {
+      hw::PortInfo port;
+      port.name = StringAttr::get(context, unique(nameOf(v)));
+      port.type = v.getType();
+      port.dir = hw::ModulePort::Direction::Output;
+      port.argNum = numOut++;
+      ports.push_back(port);
+    }
+    modules[d] = hw::HWModuleOp::create(
+        outer, sim.getLoc(),
+        StringAttr::get(context, simName + "_" + domainTree[d].name),
+        hw::ModulePortInfo(ports));
+    modules[d].setPrivate();
+    for (auto [i, v] : llvm::enumerate(inputs[d]))
+      local[d][v] = modules[d].getBodyBlock()->getArgument(i);
+  }
+  auto bodyOf = [&](int d) {
+    return d == topDomain ? body : modules[d].getBodyBlock();
+  };
+  // Move each op into its domain.
+  for (auto *op : ops) {
+    int d = domainOf.lookup(op);
+    if (isConstant(op) || d == topDomain)
+      continue;
+    op->moveBefore(bodyOf(d)->getTerminator());
+  }
+  // The child domains' instances, with their outputs as the parent's values.
+  bool keepRelayed = anyRelay;
+  SmallVector<hw::InstanceOp> instances(numDomains);
+  for (unsigned d = 1; d < numDomains; ++d) {
+    int p = domainTree[d].parent;
+    OpBuilder b = OpBuilder::atBlockTerminator(bodyOf(p));
+    SmallVector<Value> operands(inputs[d].begin(), inputs[d].end());
+    instances[d] = hw::InstanceOp::create(
+        b, sim.getLoc(), modules[d],
+        b.getStringAttr(domainTree[d].name + "_dom"), operands);
+    for (auto [i, v] : llvm::enumerate(outputs[d]))
+      local[p][v] = instances[d].getResult(i);
+  }
+  // A value as a domain sees it.
+  std::function<Value(int, Value)> localOf = [&](int d, Value v) -> Value {
+    if (valueDomain(v) == d)
+      return v;
+    auto it = local[d].find(v);
+    if (it != local[d].end())
+      return it->second;
+    return Value();
+  };
+  DenseMap<std::pair<int, Operation *>, Value> constants;
+  auto constantIn = [&](int d, Operation *constant) -> Value {
+    if (d == topDomain)
+      return constant->getResult(0);
+    auto &value = constants[{d, constant}];
+    if (!value) {
+      OpBuilder b(bodyOf(d), bodyOf(d)->begin());
+      value = b.clone(*constant)->getResult(0);
+    }
+    return value;
+  };
+  auto rewire = [&](Operation *op, int d) -> LogicalResult {
+    for (auto &operand : op->getOpOperands()) {
+      Value v = operand.get();
+      auto *def = v.getDefiningOp();
+      if (def && isConstant(def)) {
+        operand.set(constantIn(d, def));
+        continue;
+      }
+      Value mapped = localOf(d, v);
+      if (!mapped)
+        return op->emitError("a value its domain does not see");
+      operand.set(mapped);
+    }
+    return success();
+  };
+  for (auto *op : ops)
+    if (!isConstant(op) && failed(rewire(op, domainOf.lookup(op))))
+      return failure();
+  for (unsigned d = 1; d < numDomains; ++d) {
+    if (failed(rewire(instances[d], domainTree[d].parent)))
+      return failure();
+    SmallVector<Value> results;
+    for (auto v : outputs[d])
+      results.push_back(localOf(d, v));
+    if (llvm::any_of(results, [](Value v) { return !v; }))
+      return sim.emitError("a domain output it does not see");
+    auto *output = modules[d].getBodyBlock()->getTerminator();
+    output->setOperands(results);
+    // A relayed boundary is kept: nothing crosses it combinationally.
+    if (keepRelayed) {
+      bool relayed = false;
+      for (auto &producer : producers) {
+        if (!producer.relay)
+          continue;
+        int pd = classDomain[producer.cls];
+        for (auto &read : producer.reads) {
+          int cd = classDomain[consumers[read.consumer].cls];
+          auto inside = [&](int x) {
+            for (; x >= 0; x = domainTree[x].parent)
+              if (x == int(d))
+                return true;
+            return false;
+          };
+          if (inside(pd) != inside(cd))
+            relayed = true;
+        }
+      }
+      if (relayed)
+        sv::setSVAttributes(instances[d],
+                            sv::SVAttributeAttr::get(context, "keep_hierarchy",
+                                                     R"("yes")", false));
+    }
+  }
+  if (failed(rewire(terminator, topDomain)))
+    return failure();
+  // Constants nobody uses any more in the top domain stay for canonicalize.
+  return success();
+}
+
 LogicalResult Composer::run() {
   inlineNetlists();
   if (failed(collect()) || failed(build()))
+    return failure();
+  if (emitDomainTree && (failed(buildDomainTree()) || failed(emitDomains())))
     return failure();
   netlist.erase();
   for (auto *op : inlined)
@@ -1074,7 +1637,7 @@ void ComposePass::runOnOperation() {
     return signalPassFailure();
   }
   if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
-                          threadOptions, stagedTokens, channelDepth)
+                          threadOptions, stagedTokens, channelDepth, domains)
                      .run()))
     signalPassFailure();
 }

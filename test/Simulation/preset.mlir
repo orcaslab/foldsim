@@ -19,6 +19,12 @@
 // RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/p/obj %S/Inputs/tb_preset.sv %t/p/sim.sv > %t/p/build.log 2>&1
 // RUN: %t/p/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 // RUN: %t/p/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+// As a tree of domains, with regions, the tokens are the same too.
+// RUN: mkdir -p %t/d && foldsim-opt %s --foldsim-extract-models="module=Top models=P netlist" --foldsim-compose="module=Top region-loads=1 domains" -o %t/d/sim.mlir
+// RUN: firtool --format=mlir %t/d/sim.mlir -o %t/d/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/d/obj %S/Inputs/tb_preset.sv %t/d/sim.sv > %t/d/build.log 2>&1
+// RUN: %t/d/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/d/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
 
 // Registers start out at their preset values: in each of `P`'s two threads,
 // `r` at 9 and `f` at 1, though it is 0 from the first edge on, and in the

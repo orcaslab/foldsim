@@ -156,6 +156,14 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"commitSelect", "commit-select", "bool", "false",
            "Commit a single thread's state by select, as `foldsim-fame5`'s "
            "`commit-select`">,
+    Option<"domains", "domains", "bool", "false",
+           "Emit the simulator as a tree of domains, one module per domain "
+           "nested as the class tree: a netlist's domain holds its model, "
+           "the channels between it and its children and the domains of "
+           "what it instantiates; a class without a netlist is a domain of "
+           "its own. A domain is `<sim>_<name>`, its instance `<name>_dom`; "
+           "domain boundaries are module ports, kept in synthesis where a "
+           "relayed channel crosses them">,
     Option<"stateStages", "state-stages", "unsigned", "1",
            "Thread each model with this many host cycles to its state's "
            "write, as `foldsim-fame5`'s `state-stages`">,
