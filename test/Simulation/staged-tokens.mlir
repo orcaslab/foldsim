@@ -18,6 +18,15 @@
 // RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/p/obj %S/Inputs/tb_staged.sv %t/p/sim.sv > %t/p/build.log 2>&1
 // RUN: %t/p/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s --check-prefix=TOKENS
 
+// Four slots per channel, with and without staged tokens: the same tokens.
+// RUN: mkdir -p %t/d && foldsim-opt %s --foldsim-extract-models="module=Top models=Child,Sink netlist" --foldsim-compose="module=Top channel-depth=4" -o %t/d/sim.mlir
+// RUN: firtool --format=mlir %t/d/sim.mlir -o %t/d/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/d/obj %S/Inputs/tb_staged.sv %t/d/sim.sv > %t/d/build.log 2>&1
+// RUN: %t/d/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s --check-prefix=TOKENS
+// RUN: mkdir -p %t/ds && foldsim-opt %s --foldsim-extract-models="module=Top models=Child,Sink netlist" --foldsim-compose="module=Top channel-depth=4 staged-tokens" -o %t/ds/sim.mlir
+// RUN: firtool --format=mlir %t/ds/sim.mlir -o %t/ds/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/ds/obj %S/Inputs/tb_staged.sv %t/ds/sim.sv > %t/ds/build.log 2>&1
+// RUN: %t/ds/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s --check-prefix=TOKENS
 // Two accumulators of `x`, each read by a register of its own thread (its
 // slots in a memory), on the netlist's outputs (slots in registers).
 // CHECK: z0: 00 00 02 05 09 0e 14 1b 23 2c 36

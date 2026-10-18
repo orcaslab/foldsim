@@ -142,6 +142,8 @@ def main():
     ap.add_argument('--compact-staging', action='store_true',
                     help='with regions: staging located at its state, staged write '
                          'enables without preset (foldsim-fame5)')
+    ap.add_argument('--channel-depth', type=int, default=2,
+                    help='slots per producer thread of each channel (foldsim-compose)')
     ap.add_argument('--staged-tokens', action='store_true',
                     help='write each token into its slot a host cycle after it is taken, '
                          'forwarded to its readers until then (foldsim-compose)')
@@ -222,6 +224,8 @@ def main():
         compose += ' pipeline-multipliers'
     if a.compact_staging:
         compose += ' compact-staging'
+    if a.channel_depth != 2:
+        compose += f' channel-depth={a.channel_depth}'
     if a.relay:
         compose += f' relay={a.relay}'
     if a.staged_tokens:

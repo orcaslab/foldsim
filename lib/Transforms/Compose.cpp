@@ -92,6 +92,9 @@ struct Producer {
   /// With staged tokens (and no relay): the slot written a host cycle after
   /// the token is taken, from registers, and read through them until then.
   bool staged = false;
+  /// Slots per thread, a power of two: two, four behind a relay, or the
+  /// channel depth asked for.
+  unsigned depth = 2;
   /// Built: each thread's token count, and slots in registers or a memory.
   SmallVector<Value> enq;
   SmallVector<SmallVector<Value>> slots;
@@ -127,10 +130,11 @@ class Composer {
 public:
   Composer(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
            bool readySchedule, ArrayRef<std::string> relay,
-           const foldsim::ThreadOptions &threadOptions, bool stagedTokens)
+           const foldsim::ThreadOptions &threadOptions, bool stagedTokens,
+           unsigned channelDepth)
       : top(top), netlist(netlist), simName(simName),
         readySchedule(readySchedule), threadOptions(threadOptions),
-        stagedTokens(stagedTokens) {
+        stagedTokens(stagedTokens), channelDepth(channelDepth) {
     for (auto &name : relay)
       relayModels.insert(name);
   }
@@ -155,6 +159,7 @@ private:
   bool readySchedule;
   foldsim::ThreadOptions threadOptions;
   bool stagedTokens;
+  unsigned channelDepth;
   llvm::StringSet<> relayModels;
   llvm::SmallPtrSet<Operation *, 4> inlined;
   std::vector<Class> classes;
@@ -392,9 +397,11 @@ LogicalResult Composer::collect() {
   }
 
   // With staged tokens, every channel with slots stages its writes.
-  for (auto &producer : producers)
+  for (auto &producer : producers) {
     producer.staged = stagedTokens && !producer.direct && !producer.relay &&
                       producer.width > 0 && !producer.reads.empty();
+    producer.depth = producer.relay ? 4 : channelDepth;
+  }
   return success();
 }
 
@@ -488,7 +495,7 @@ Value Composer::tokenMemory(Producer &producer, unsigned low, unsigned width,
     b.setInsertionPointAfterValue(producer.writeData);
     auto loc = producer.writeAddress.getLoc();
     unsigned threadBits = llvm::Log2_32_Ceil(producer.threads);
-    unsigned slots = producer.relay ? 4 : 2;
+    unsigned slots = producer.depth;
     auto type = seq::FirMemType::get(b.getContext(), slots << threadBits,
                                      width, std::nullopt);
     std::string name = producer.name + (producer.relay ? "_rtokens" : "_tokens");
@@ -746,10 +753,11 @@ LogicalResult Composer::build() {
           deq.push_back(Value());
           continue;
         }
-        bool relay = producers[piece.producer].relay;
-        deq.push_back(counter(consumer.name + (relay ? "_rdeq" : "_deq") +
+        auto &producer = producers[piece.producer];
+        deq.push_back(counter(consumer.name +
+                                  (producer.relay ? "_rdeq" : "_deq") +
                                   Twine(t) + "_" + Twine(j),
-                              relay ? 3 : 2));
+                              llvm::Log2_32(producer.depth) + 1));
       }
     }
   }
@@ -757,8 +765,8 @@ LogicalResult Composer::build() {
     if (producer.direct)
       continue;
     auto source = sourceOf(p);
-    unsigned countBits = producer.relay ? 3 : 2;
-    unsigned numSlots = producer.relay ? 4 : 2;
+    unsigned numSlots = producer.depth;
+    unsigned countBits = llvm::Log2_32(numSlots) + 1;
     for (unsigned k = 0; k < producer.threads; ++k)
       producer.enq.push_back(
           counter(producer.name + (producer.relay ? "_renq" : "_enq") + Twine(k),
@@ -791,7 +799,7 @@ LogicalResult Composer::build() {
                     comb::AndOp::create(b, fire, isThread(source.thread, k))));
     if (producer.width == 0)
       continue;
-    unsigned slotBits = producer.relay ? 2 : 1;
+    unsigned slotBits = llvm::Log2_32(numSlots);
     auto slotOf = [&](Value count) {
       return comb::ExtractOp::create(b, b.getIntegerType(slotBits), count, 0);
     };
@@ -834,7 +842,7 @@ LogicalResult Composer::build() {
             b.getStringAttr(producer.name + (producer.relay ? "_rslot" : "_slot") +
                             Twine(k) + "_" + Twine(s)));
         Value at =
-            producer.relay
+            numSlots > 2
                 ? Value(comb::ICmpOp::create(b, comb::ICmpPredicate::eq, slot,
                                              constant(APInt(slotBits, s))))
             : s ? slot
@@ -898,10 +906,21 @@ LogicalResult Composer::build() {
       auto &producer = producers[piece.producer];
       auto &slots = producer.slots[piece.thread];
       Value data;
-      if (producer.relay) {
-        Value slot = comb::ExtractOp::create(b, b.getIntegerType(2),
-                                             consumer.deq[t][j], 0);
+      if (producer.depth > 2) {
+        Value slot = comb::ExtractOp::create(
+            b, b.getIntegerType(llvm::Log2_32(producer.depth)),
+            consumer.deq[t][j], 0);
         data = select(slots, slot);
+        if (producer.staged) {
+          Value thread;
+          if (producer.stagedThread)
+            thread = constant(
+                APInt(producer.stagedThread.getType().getIntOrFloatBitWidth(),
+                      piece.thread));
+          return forwarded(producer, thread, slot, piece.low, piece.width,
+                           b.createOrFold<comb::ExtractOp>(
+                               b.getIntegerType(piece.width), data, piece.low));
+        }
       } else {
         Value slot = comb::ExtractOp::create(b, i1, consumer.deq[t][j], 0);
         data = comb::MuxOp::create(b, slot, slots[1], slots[0]);
@@ -955,7 +974,7 @@ LogicalResult Composer::build() {
             threads.push_back(
                 constant(APInt(threadBits, consumer.pieces[t][j].thread)));
             slots.push_back(comb::ExtractOp::create(
-                b, b.getIntegerType(producer.relay ? 2 : 1),
+                b, b.getIntegerType(llvm::Log2_32(producer.depth)),
                 consumer.deq[t][j], 0));
           }
           Value thread = select(threads, sink.thread);
@@ -1050,8 +1069,12 @@ void ComposePass::runOnOperation() {
                                        stateStages, commitSelect,
                                        stagedRamWrites, pipelineMultipliers,
                                        compactStaging};
+  if (channelDepth < 2 || !llvm::isPowerOf2_32(channelDepth)) {
+    top.emitError("a channel's depth is a power of two, at least two");
+    return signalPassFailure();
+  }
   if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
-                          threadOptions, stagedTokens)
+                          threadOptions, stagedTokens, channelDepth)
                      .run()))
     signalPassFailure();
 }

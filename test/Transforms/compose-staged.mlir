@@ -29,6 +29,12 @@
 // CHECK-DAG:     [[YTHREAD:%.+]] = comb.icmp eq %Child_y_stg_thread, {{%.+}} : i1
 // CHECK-DAG:     [[YHIT:%.+]] = comb.and [[YSLOT]], [[YTHREAD]] : i1
 // CHECK-DAG:     comb.mux [[YHIT]], %Child_y_stg_bits, [[READ]] : i8
+// With four slots, the counts have three bits and each thread four slots.
+// RUN: foldsim-opt %s --foldsim-extract-models="module=Top models=Child,Sink netlist" --foldsim-compose="module=Top channel-depth=4 staged-tokens" | FileCheck %s --check-prefix=DEPTH
+// DEPTH-LABEL: hw.module @foldsim_sim(
+// DEPTH-DAG: %x_enq0 = seq.firreg {{.*}} : i3
+// DEPTH-DAG: %x_slot0_3 = seq.firreg {{.*}} : i8
+// DEPTH-DAG: seq.firmem {{.*}} : <8 x 8>
 // Without the option, nothing is staged.
 // RUN: foldsim-opt %s --foldsim-extract-models="module=Top models=Child,Sink netlist" --foldsim-compose="module=Top" | FileCheck %s --check-prefix=PLAIN
 // PLAIN-NOT: _stg_

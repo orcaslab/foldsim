@@ -168,6 +168,10 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"compactStaging", "compact-staging", "bool", "false",
            "Thread each model with compact staging, as `foldsim-fame5`'s "
            "`compact-staging`">,
+    Option<"channelDepth", "channel-depth", "unsigned", "2",
+           "Slots per producer thread of a channel without a relay, a power of "
+           "two: deeper channels give producers slack ahead of their readers "
+           "at the cost of slot memory">,
     Option<"stagedTokens", "staged-tokens", "bool", "false",
            "Write each token into its slot a host cycle after it is taken, "
            "from registers of the token, its thread and slot, and forward it "
