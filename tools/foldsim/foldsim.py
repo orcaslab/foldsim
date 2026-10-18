@@ -122,6 +122,9 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--circt-bin', default='')
     ap.add_argument('--foldsim-bin', default='')
+    ap.add_argument('--relay', default='',
+                    help='models, or <model>:<model> pairs, whose channels get a relay stage, '
+                         'comma-separated (foldsim-compose)')
     ap.add_argument('classes', nargs='+')
     a = ap.parse_args()
     tool = lambda t: os.path.join(a.circt_bin, t) if a.circt_bin else t
@@ -181,7 +184,10 @@ def main():
     for g in groups:
         if not any(set(g) <= children[m] for m in order):
             sys.exit(f'{"+".join(g)}: not instantiated by the same module')
-    pipeline = passes + OPTIMIZE + [f'foldsim-compose{{module={a.top} sim=foldsim_sim}}',
+    compose = f'module={a.top} sim=foldsim_sim'
+    if a.relay:
+        compose += f' relay={a.relay}'
+    pipeline = passes + OPTIMIZE + [f'foldsim-compose{{{compose}}}',
                                     'canonicalize', 'topological-sort', 'cse']
     sim = out('foldsim_sim.mlir')
     run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(pipeline)})', '-o', sim])

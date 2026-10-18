@@ -141,6 +141,12 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"readySchedule", "ready-schedule", "bool", "true",
            "Advance each model to a thread whose inputs are all there, "
            "rather than to the next in turn">,
+    ListOption<"relayModels", "relay", "std::string",
+               "Models whose channels to and from other models get a relay "
+               "stage, or pairs <model>:<model> whose channels between them "
+               "do: four slots, the token written a host cycle after it is "
+               "taken, and each side seeing the other's count a host cycle "
+               "late, so every signal between the two sides is registered">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

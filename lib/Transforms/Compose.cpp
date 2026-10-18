@@ -24,6 +24,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Debug.h"
 #include <map>
 
@@ -83,16 +84,20 @@ struct Producer {
   };
   SmallVector<Read> reads;
   bool memory = false, direct = false;
+  /// Behind a relay stage: four slots, the token written a host cycle after
+  /// it is taken, readers seeing the count a host cycle late and the producer
+  /// the readers' counts a host cycle late.
+  bool relay = false;
   /// Built: each thread's token count, and slots in registers or a memory.
   SmallVector<Value> enq;
-  SmallVector<std::array<Value, 2>> slots;
+  SmallVector<SmallVector<Value>> slots;
   /// The memories of the bits readers read, by low bit and width: each has
   /// copies written alike, read by up to kMaxReadPorts readers.
   struct Memories {
     SmallVector<Value> copies;
     unsigned readPorts = 0;
   };
-  std::map<std::pair<unsigned, unsigned>, Memories> mems;
+  std::map<std::tuple<unsigned, unsigned, int>, Memories> mems;
   Value writeAddress, writeEnable, writeData;
 };
 
@@ -114,9 +119,12 @@ struct Consumer {
 class Composer {
 public:
   Composer(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
-           bool readySchedule)
+           bool readySchedule, ArrayRef<std::string> relay)
       : top(top), netlist(netlist), simName(simName),
-        readySchedule(readySchedule) {}
+        readySchedule(readySchedule) {
+    for (auto &name : relay)
+      relayModels.insert(name);
+  }
   LogicalResult run();
 
 private:
@@ -125,7 +133,8 @@ private:
   LogicalResult decompose(Value value, unsigned low, unsigned width,
                           Pieces &pieces);
   LogicalResult build();
-  Value tokenMemory(Producer &producer, unsigned low, unsigned width);
+  Value tokenMemory(Producer &producer, unsigned low, unsigned width,
+                    int reader);
 
   /// The read ports of a copy of a token memory.
   static constexpr unsigned kMaxReadPorts = 8;
@@ -135,6 +144,7 @@ private:
   hw::HWModuleOp netlist;
   StringRef simName;
   bool readySchedule;
+  llvm::StringSet<> relayModels;
   llvm::SmallPtrSet<Operation *, 4> inlined;
   std::vector<Class> classes;
   DenseMap<Operation *, std::pair<unsigned, unsigned>> threadOf;
@@ -350,6 +360,25 @@ LogicalResult Composer::collect() {
                       llvm::all_of(producer.reads, [&](auto &read) {
                         return consumers[read.consumer].regular;
                       });
+
+  // A channel between two models, one of them relayed, gets a relay stage.
+  for (auto &producer : producers) {
+    if (producer.cls < 0 || producer.direct || producer.reads.empty() ||
+        llvm::any_of(producer.reads, [&](auto &read) {
+          return consumers[read.consumer].cls < 0;
+        }))
+      continue;
+    bool mine = relayModels.contains(classes[producer.cls].name);
+    producer.relay = llvm::any_of(producer.reads, [&](auto &read) {
+      int c = consumers[read.consumer].cls;
+      if (c == producer.cls)
+        return false;
+      auto &p = classes[producer.cls].name, &q = classes[c].name;
+      return mine || relayModels.contains(q) ||
+             relayModels.contains(p + ":" + q) ||
+             relayModels.contains(q + ":" + p);
+    });
+  }
   return success();
 }
 
@@ -434,18 +463,23 @@ LogicalResult Composer::decompose(Value value, unsigned low, unsigned width,
 /// distributed RAM has a copy per read port, and a port of the whole token
 /// would keep every bit in it. FPGA tools map a memory of up to 16 ports to
 /// distributed RAM, so a range with many readers has several copies.
-Value Composer::tokenMemory(Producer &producer, unsigned low, unsigned width) {
-  auto &memories = producer.mems[{low, width}];
+Value Composer::tokenMemory(Producer &producer, unsigned low, unsigned width,
+                            int reader) {
+  // Behind a relay, each reading class has copies of its own, next to it.
+  auto &memories = producer.mems[{low, width, producer.relay ? reader : -1}];
   if (memories.readPorts++ % kMaxReadPorts == 0) {
     OpBuilder b(producer.writeAddress.getContext());
     b.setInsertionPointAfterValue(producer.writeData);
     auto loc = producer.writeAddress.getLoc();
     unsigned threadBits = llvm::Log2_32_Ceil(producer.threads);
-    auto type = seq::FirMemType::get(b.getContext(), 2ULL << threadBits, width,
-                                     std::nullopt);
-    std::string name = producer.name + "_tokens";
+    unsigned slots = producer.relay ? 4 : 2;
+    auto type = seq::FirMemType::get(b.getContext(), slots << threadBits,
+                                     width, std::nullopt);
+    std::string name = producer.name + (producer.relay ? "_rtokens" : "_tokens");
     if (width != producer.width)
       name += "_" + std::to_string(low + width - 1) + "_" + std::to_string(low);
+    if (producer.relay)
+      name += "_" + classes[reader].name;
     if (!memories.copies.empty())
       name += "_" + std::to_string(memories.copies.size());
     Value mem = seq::FirMemOp::create(
@@ -538,11 +572,11 @@ LogicalResult Composer::build() {
     return hw::ConstantOp::create(b, value);
   };
   auto bit = [&](bool value) { return constant(APInt(1, value)); };
-  auto counter = [&](const Twine &name) -> Value {
-    auto i2 = b.getIntegerType(2);
-    auto next = backedges.get(i2);
+  auto counter = [&](const Twine &name, unsigned width = 2) -> Value {
+    auto type = b.getIntegerType(width);
+    auto next = backedges.get(type);
     auto reg = seq::FirRegOp::create(b, next, hostClock, b.getStringAttr(name),
-                                     hostReset, constant(APInt(2, 0)));
+                                     hostReset, constant(APInt(width, 0)));
     // The next value is set later, through the register's operand.
     return reg;
   };
@@ -564,8 +598,16 @@ LogicalResult Composer::build() {
         b, comb::ICmpPredicate::eq, index,
         constant(APInt(index.getType().getIntOrFloatBitWidth(), thread)));
   };
+  // A copy of `value` a host cycle late.
+  auto delayed = [&](Value value, const Twine &name) -> Value {
+    unsigned width = value.getType().getIntOrFloatBitWidth();
+    return seq::FirRegOp::create(b, value, hostClock, b.getStringAttr(name),
+                                 hostReset, constant(APInt(width, 0)));
+  };
   auto increment = [&](Value count, Value enable) -> Value {
-    auto plusOne = comb::AddOp::create(b, count, constant(APInt(2, 1)));
+    auto plusOne = comb::AddOp::create(
+        b, count,
+        constant(APInt(count.getType().getIntOrFloatBitWidth(), 1)));
     return comb::MuxOp::create(b, enable, plusOne, count);
   };
   auto andAll = [&](ArrayRef<Value> values) -> Value {
@@ -683,26 +725,42 @@ LogicalResult Composer::build() {
       continue;
     for (auto [t, pieces] : llvm::enumerate(consumer.pieces)) {
       auto &deq = consumer.deq.emplace_back();
-      for (auto [j, piece] : llvm::enumerate(pieces))
-        deq.push_back(piece.producer >= 0 ? counter(consumer.name + "_deq" +
-                                                    Twine(t) + "_" + Twine(j))
-                                          : Value());
+      for (auto [j, piece] : llvm::enumerate(pieces)) {
+        if (piece.producer < 0) {
+          deq.push_back(Value());
+          continue;
+        }
+        bool relay = producers[piece.producer].relay;
+        deq.push_back(counter(consumer.name + (relay ? "_rdeq" : "_deq") +
+                                  Twine(t) + "_" + Twine(j),
+                              relay ? 3 : 2));
+      }
     }
   }
   for (auto [p, producer] : llvm::enumerate(producers)) {
     if (producer.direct)
       continue;
     auto source = sourceOf(p);
+    unsigned countBits = producer.relay ? 3 : 2;
+    unsigned numSlots = producer.relay ? 4 : 2;
     for (unsigned k = 0; k < producer.threads; ++k)
-      producer.enq.push_back(counter(producer.name + "_enq" + Twine(k)));
-    // Ready while every reader of the thread has read all but one token.
+      producer.enq.push_back(
+          counter(producer.name + (producer.relay ? "_renq" : "_enq") + Twine(k),
+                  countBits));
+    // Ready while every reader of the thread has read all but one token; with
+    // a relay, while the reader's count of a host cycle ago leaves a slot.
     SmallVector<SmallVector<Value>> notFull(producer.threads);
     for (auto &read : producer.reads) {
-      auto &piece = consumers[read.consumer].pieces[read.thread][read.piece];
-      Value deq = consumers[read.consumer].deq[read.thread][read.piece];
+      auto &consumer = consumers[read.consumer];
+      auto &piece = consumer.pieces[read.thread][read.piece];
+      Value deq = consumer.deq[read.thread][read.piece];
+      if (producer.relay)
+        deq = delayed(deq, consumer.name + "_deqd" + Twine(read.thread) + "_" +
+                               Twine(read.piece));
       Value count = comb::SubOp::create(b, producer.enq[piece.thread], deq);
-      notFull[piece.thread].push_back(comb::ICmpOp::create(
-          b, comb::ICmpPredicate::ne, count, constant(APInt(2, 2))));
+      notFull[piece.thread].push_back(
+          comb::ICmpOp::create(b, comb::ICmpPredicate::ne, count,
+                               constant(APInt(countBits, numSlots))));
     }
     SmallVector<Value> readyOf;
     for (auto &terms : notFull)
@@ -717,34 +775,65 @@ LogicalResult Composer::build() {
                     comb::AndOp::create(b, fire, isThread(source.thread, k))));
     if (producer.width == 0)
       continue;
+    unsigned slotBits = producer.relay ? 2 : 1;
     auto slotOf = [&](Value count) {
-      return comb::ExtractOp::create(b, i1, count, 0);
+      return comb::ExtractOp::create(b, b.getIntegerType(slotBits), count, 0);
     };
+    // With a relay, the token, its thread and slot are staged a host cycle.
+    Value writeFire = fire, writeThread = source.thread,
+          writeBits = source.bits, writeSlot;
+    if (producer.memory || producer.relay)
+      writeSlot = slotOf(select(producer.enq, source.thread));
+    if (producer.relay) {
+      writeFire = delayed(fire, producer.name + "_stg_fire");
+      if (source.thread)
+        writeThread = delayed(source.thread, producer.name + "_stg_thread");
+      writeSlot = delayed(writeSlot, producer.name + "_stg_slot");
+      writeBits = seq::FirRegOp::create(b, source.bits, hostClock,
+                                        b.getStringAttr(producer.name + "_stg_bits"));
+    }
     if (producer.memory) {
-      Value slot = slotOf(select(producer.enq, source.thread));
-      producer.writeAddress = comb::ConcatOp::create(b, source.thread, slot);
-      producer.writeEnable = fire;
-      producer.writeData = source.bits;
+      producer.writeAddress = comb::ConcatOp::create(b, writeThread, writeSlot);
+      producer.writeEnable = writeFire;
+      producer.writeData = writeBits;
       continue;
     }
     for (unsigned k = 0; k < producer.threads; ++k) {
       auto &slots = producer.slots.emplace_back();
-      Value write = comb::AndOp::create(b, fire, isThread(source.thread, k));
-      Value slot = slotOf(producer.enq[k]);
-      for (unsigned s = 0; s < 2; ++s) {
-        auto next = backedges.get(source.bits.getType());
-        auto reg =
-            seq::FirRegOp::create(b, next, hostClock,
-                                  b.getStringAttr(producer.name + "_slot" +
-                                                  Twine(k) + "_" + Twine(s)));
-        Value here = comb::AndOp::create(
-            b, write,
-            s ? slot : Value(comb::XorOp::create(b, slot, bit(true))));
-        next.setValue(comb::MuxOp::create(b, here, source.bits, reg));
-        slots[s] = reg;
+      Value write = comb::AndOp::create(b, writeFire, isThread(writeThread, k));
+      Value slot = producer.relay ? writeSlot : slotOf(producer.enq[k]);
+      for (unsigned s = 0; s < numSlots; ++s) {
+        auto next = backedges.get(writeBits.getType());
+        auto reg = seq::FirRegOp::create(
+            b, next, hostClock,
+            b.getStringAttr(producer.name + (producer.relay ? "_rslot" : "_slot") +
+                            Twine(k) + "_" + Twine(s)));
+        Value at =
+            producer.relay
+                ? Value(comb::ICmpOp::create(b, comb::ICmpPredicate::eq, slot,
+                                             constant(APInt(slotBits, s))))
+            : s ? slot
+                : Value(comb::XorOp::create(b, slot, bit(true)));
+        Value here = comb::AndOp::create(b, write, at);
+        next.setValue(comb::MuxOp::create(b, here, writeBits, reg));
+        slots.push_back(reg);
       }
     }
   }
+
+  // With a relay, each reader sees a producer thread's count a host cycle
+  // late, from its own copy.
+  std::map<std::tuple<unsigned, unsigned, unsigned>, Value> enqCopies;
+  auto enqSeen = [&](unsigned c, unsigned p, unsigned k) -> Value {
+    auto &producer = producers[p];
+    if (!producer.relay)
+      return producer.enq[k];
+    auto &copy = enqCopies[{c, p, k}];
+    if (!copy)
+      copy = delayed(producer.enq[k], consumers[c].name + "_enqd_" +
+                                          producer.name + "_" + Twine(k));
+    return copy;
+  };
 
   // For each class, each thread: whether every input has a token for it.
   std::vector<std::vector<SmallVector<Value>>> readyTerms(classes.size());
@@ -763,8 +852,15 @@ LogicalResult Composer::build() {
         return constant(piece.constant);
       auto &producer = producers[piece.producer];
       auto &slots = producer.slots[piece.thread];
-      Value slot = comb::ExtractOp::create(b, i1, consumer.deq[t][j], 0);
-      Value data = comb::MuxOp::create(b, slot, slots[1], slots[0]);
+      Value data;
+      if (producer.relay) {
+        Value slot = comb::ExtractOp::create(b, b.getIntegerType(2),
+                                             consumer.deq[t][j], 0);
+        data = select(slots, slot);
+      } else {
+        Value slot = comb::ExtractOp::create(b, i1, consumer.deq[t][j], 0);
+        data = comb::MuxOp::create(b, slot, slots[1], slots[0]);
+      }
       return b.createOrFold<comb::ExtractOp>(b.getIntegerType(piece.width),
                                              data, piece.low);
     };
@@ -782,7 +878,7 @@ LogicalResult Composer::build() {
         if (piece.producer >= 0)
           terms.push_back(comb::ICmpOp::create(
               b, comb::ICmpPredicate::ne,
-              producers[piece.producer].enq[piece.thread], consumer.deq[t][j]));
+              enqSeen(c, piece.producer, piece.thread), consumer.deq[t][j]));
       validOf.push_back(andAll(terms));
     }
     Value valid = select(validOf, sink.thread);
@@ -803,13 +899,15 @@ LogicalResult Composer::build() {
           for (unsigned t = 0; t < consumer.threads; ++t) {
             threads.push_back(
                 constant(APInt(threadBits, consumer.pieces[t][j].thread)));
-            slots.push_back(
-                comb::ExtractOp::create(b, i1, consumer.deq[t][j], 0));
+            slots.push_back(comb::ExtractOp::create(
+                b, b.getIntegerType(producer.relay ? 2 : 1),
+                consumer.deq[t][j], 0));
           }
           Value address = comb::ConcatOp::create(
               b, select(threads, sink.thread), select(slots, sink.thread));
           parts.push_back(seq::FirMemReadOp::create(
-              b, tokenMemory(producer, piece.low, piece.width), address,
+              b, tokenMemory(producer, piece.low, piece.width, consumer.cls),
+              address,
               hostClock, bit(true)));
           continue;
         }
@@ -886,6 +984,6 @@ void ComposePass::runOnOperation() {
     top.emitError("no netlist '") << moduleName << "'";
     return signalPassFailure();
   }
-  if (failed(Composer(top, netlist, simName, readySchedule).run()))
+  if (failed(Composer(top, netlist, simName, readySchedule, relayModels).run()))
     signalPassFailure();
 }
