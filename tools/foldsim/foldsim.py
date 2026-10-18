@@ -147,6 +147,11 @@ def main():
     ap.add_argument('--staged-tokens', action='store_true',
                     help='write each token into its slot a host cycle after it is taken, '
                          'forwarded to its readers until then (foldsim-compose)')
+    ap.add_argument('--schedule', choices=('ready', 'in-turn'),
+                    help='how each threaded model picks its next thread: the next whose '
+                         'inputs are all there, or the next in turn (foldsim-compose). '
+                         'Default: in turn with --registered-state, whose look-ahead pick '
+                         'is a host cycle staler, ready otherwise')
     ap.add_argument('--relay', default='',
                     help='models, or <model>:<model> pairs, whose channels get a relay stage, '
                          'comma-separated (foldsim-compose)')
@@ -210,6 +215,12 @@ def main():
         if not any(set(g) <= children[m] for m in order):
             sys.exit(f'{"+".join(g)}: not instantiated by the same module')
     compose = f'module={a.top} sim=foldsim_sim'
+    # With registered state the next thread is picked a host cycle earlier, from
+    # inputs a cycle older: on classes of 16 threads that costs 37.5 % more host
+    # cycles than picking in turn, and on s2w4i2 picking in turn costs nothing.
+    schedule = a.schedule or ('in-turn' if a.registered_state else 'ready')
+    if schedule == 'in-turn':
+        compose += ' ready-schedule=false'
     if a.region_loads:
         compose += f' region-loads={a.region_loads}'
     if a.registered_state:

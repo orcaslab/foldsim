@@ -1,0 +1,11 @@
+# With registered state the driver picks threads in turn unless asked to pick
+# them by readiness; without it, by readiness unless asked to pick in turn.
+# RUN: rm -rf %t && cd %S/Inputs/source-list
+# RUN: foldsim --srcs top.f --top Top --out %t/plain Leaf 2>&1 | FileCheck %s --check-prefix=READY
+# RUN: foldsim --srcs top.f --top Top --out %t/reg --registered-state Leaf 2>&1 | FileCheck %s --check-prefix=TURN
+# RUN: foldsim --srcs top.f --top Top --out %t/reg-ready --registered-state --schedule ready Leaf 2>&1 | FileCheck %s --check-prefix=READY
+# RUN: foldsim --srcs top.f --top Top --out %t/turn --schedule in-turn Leaf 2>&1 | FileCheck %s --check-prefix=TURN
+# READY: foldsim-compose{module=Top sim=foldsim_sim
+# READY-NOT: ready-schedule=false
+# READY-SAME: }
+# TURN: foldsim-compose{module=Top sim=foldsim_sim ready-schedule=false
