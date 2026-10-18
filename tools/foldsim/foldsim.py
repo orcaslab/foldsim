@@ -158,7 +158,8 @@ def main():
     ap.add_argument('--relay', default='',
                     help='models, or <model>:<model> pairs, whose channels get a relay stage, '
                          'comma-separated (foldsim-compose)')
-    ap.add_argument('classes', nargs='+')
+    ap.add_argument('classes', nargs='*',
+                    help='none: the whole target one model of one thread, unthreaded')
     a = ap.parse_args()
     tool = lambda t: os.path.join(a.circt_bin, t) if a.circt_bin else t
     here = os.path.dirname(os.path.realpath(__file__))
@@ -173,6 +174,12 @@ def main():
     run([tool('circt-verilog'), '--ir-hw', f'--top={a.top}', '--allow-use-before-declare',
          '--allow-hierarchical-const', '--ignore-uninstantiated-modules', '--detect-memories',
          '--preserve-unpacked-ports', *defines, *incdirs, *files, '-o', design])
+
+    # A module declared a black box (a core the synthesis flow provides) stays
+    # an instance through flattening; foldsim-fame5 folds it by its contract.
+    if 'black_box' in open(design).read():
+        run([foldsim_opt, design, '--foldsim-black-boxes', '-o', design + '.tmp'])
+        os.replace(design + '.tmp', design)
 
     groups = [c.split('+') for c in a.classes if '+' in c]
     if any(len(g) != 2 for g in groups):
@@ -208,9 +215,13 @@ def main():
     unused = classes - seen
     if unused:
         sys.exit(f'classes not in {a.top}: {" ".join(sorted(unused))}')
+    # Without classes, the target is a netlist of its own logic alone.
+    if not order:
+        order = [a.top]
     passes = []
     for m in order:
-        passes.append(f'foldsim-extract-models{{module={m} models={",".join(sorted(children[m]))} netlist absorb-logic={ABSORB_LOGIC}}}')
+        models = f' models={",".join(sorted(children[m]))}' if children[m] else ''
+        passes.append(f'foldsim-extract-models{{module={m}{models} netlist absorb-logic={ABSORB_LOGIC}}}')
         fused = [g for g in groups if set(g) <= children[m]]
         if fused:
             passes.append(f'foldsim-fuse-models{{module={m} groups={",".join("+".join(g) for g in fused)}}}')

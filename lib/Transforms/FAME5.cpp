@@ -288,6 +288,9 @@ private:
   DenseMap<Operation *, unsigned> foldOfStore;
   /// The ops of the unthreaded copies: on the host clock, not target state.
   DenseSet<Operation *> physical;
+  /// In a model of one thread, the black boxes with a pipeline contract: they
+  /// stay instances, on the host clock and enabled on the target's edges.
+  DenseSet<Operation *> keptBoxes;
   std::unique_ptr<BackedgeBuilder> foldEdges;
   Backedge physClock, foldThread, foldEdge, foldReset;
   /// Whether the scheduler built never makes a thread that finishes current
@@ -548,6 +551,26 @@ LogicalResult Threader::checkModel() {
                  << "' in a threaded model has no pipeline contract: its "
                     "state cannot be threaded, and without a contract it "
                     "cannot be folded";
+        // One thread has no state to thread: the box is its own state, as
+        // its contract says, on the target's edges.
+        if (threads == 1 && !gate) {
+          auto ports = cast<hw::HWModuleLike>(module).getPortList();
+          for (auto &port : ports) {
+            if (port.dir != hw::ModulePort::Direction::Input)
+              continue;
+            auto operand = inst.getOperand(port.argNum);
+            if (port.getName() == (*contract)->clock) {
+              auto conv = operand.getDefiningOp<seq::FromClockOp>();
+              Value clock = conv ? conv.getInput() : operand;
+              if (clock != body->getArgument(clockArg))
+                return inst.emitError("black box '")
+                       << inst.getInstanceName()
+                       << "' not on the model's clock";
+            }
+          }
+          keptBoxes.insert(inst);
+          continue;
+        }
         return inst.emitError("black box '")
                << inst.getReferencedModuleName()
                << "' in a threaded model: "
@@ -581,17 +604,26 @@ LogicalResult Threader::checkModel() {
       memories.push_back(memory);
       continue;
     }
-    if (isa<hw::OutputOp, seq::FirMemReadOp, seq::FirMemWriteOp>(op))
+    // A clock as a bit is checked with the clock's uses below.
+    if (isa<hw::OutputOp, seq::FirMemReadOp, seq::FirMemWriteOp,
+            seq::FromClockOp>(op))
       continue;
     if (isa<hw::HWInstanceLike>(op) || op.getDialect()->getNamespace() == "seq")
       return op.emitError("a threaded model must be flat and keep its state "
                           "in registers and memories");
   }
-  for (auto &use : body->getArgument(clockArg).getUses())
-    if (!isa<seq::FirRegOp, seq::FirMemReadOp, seq::FirMemWriteOp>(
-            use.getOwner()))
-      return use.getOwner()->emitError(
-          "clock used other than by a register or memory");
+  for (auto &use : body->getArgument(clockArg).getUses()) {
+    auto *owner = use.getOwner();
+    if (isa<seq::FirRegOp, seq::FirMemReadOp, seq::FirMemWriteOp>(owner) ||
+        keptBoxes.contains(owner))
+      continue;
+    // A black box's clock input of one bit.
+    if (isa<seq::FromClockOp>(owner) &&
+        llvm::all_of(owner->getUsers(),
+                     [&](Operation *user) { return keptBoxes.contains(user); }))
+      continue;
+    return owner->emitError("clock used other than by a register or memory");
+  }
   return success();
 }
 
@@ -692,7 +724,8 @@ BitDeps Threader::computeBitDeps(Value value) {
         bit = any;
     }
   } else if (!op ||
-             isa<seq::FirRegOp, hw::ConstantOp, hw::AggregateConstantOp>(op)) {
+             isa<seq::FirRegOp, hw::ConstantOp, hw::AggregateConstantOp>(op) ||
+             keptBoxes.contains(op)) {
     // Inputs of the threaded module's state only.
   } else if (auto concat = dyn_cast<comb::ConcatOp>(op)) {
     unsigned at = 0;
@@ -822,6 +855,11 @@ void Threader::computeStateDeps() {
     for (auto *user : memory->getUsers())
       if (auto read = dyn_cast<seq::FirMemReadOp>(user))
         readData.push_back(read.getData());
+  // A kept black box's outputs change on the target's edges like a memory's
+  // registered read, its next value not computed here.
+  for (auto *box : keptBoxes)
+    for (auto result : box->getResults())
+      readData.push_back(result);
   markUsers(registerValues, fromState, [](Operation *) { return true; });
   markUsers(readData, fromMemory,
             [](Operation *op) { return !isa<seq::FirRegOp>(op); });
@@ -2673,7 +2711,32 @@ LogicalResult Threader::run() {
         hw::InstanceOp::create(b, gate, b.getStringAttr("clk_buffer"),
                                ArrayRef<Value>{hostClock, enable});
     targetClock.setValue(clockGate.getResult(0));
-  } else if (failed(enableOnHostClock(b, targetClock, enable))) {
+  } else {
+    // A kept black box: on the host clock, enabled on the target's edges.
+    for (auto *op : keptBoxes) {
+      auto inst = cast<hw::InstanceOp>(op);
+      auto *module = SymbolTable::lookupNearestSymbolFrom(
+          inst, inst.getReferencedModuleNameAttr());
+      auto contract = **foldsim::getPipelineContract(module);
+      for (auto &port : cast<hw::HWModuleLike>(module).getPortList()) {
+        if (port.dir != hw::ModulePort::Direction::Input)
+          continue;
+        auto operand = inst.getOperand(port.argNum);
+        if (port.getName() == contract.clock) {
+          auto conv = operand.getDefiningOp<seq::FromClockOp>();
+          inst->setOperand(port.argNum,
+                           conv ? Value(seq::FromClockOp::create(b, hostClock))
+                                : Value(hostClock));
+          if (conv && conv->use_empty())
+            conv.erase();
+        } else if (port.getName() == contract.enable) {
+          inst->setOperand(port.argNum,
+                           comb::AndOp::create(b, operand, enable));
+        }
+      }
+    }
+  }
+  if (!gate && failed(enableOnHostClock(b, targetClock, enable))) {
     return failure();
   }
 

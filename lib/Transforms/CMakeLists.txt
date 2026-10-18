@@ -1,4 +1,5 @@
 add_mlir_library(FoldsimTransforms
+  BlackBoxes.cpp
   Compose.cpp
   ExtractModels.cpp
   FAME5.cpp

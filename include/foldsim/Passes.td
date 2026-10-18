@@ -306,6 +306,18 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
   ];
 }
 
+def BlackBoxes : Pass<"foldsim-black-boxes", "::mlir::ModuleOp"> {
+  let summary = "Make the modules declared black boxes external";
+  let description = [{
+    Replaces each module with the `black_box` Verilog attribute, a
+    declaration of its ports for a core the synthesis flow provides (its
+    contents empty or a stand-in), by an `hw.module.extern` of the same ports
+    and attributes: flattening keeps its instances, and `foldsim-fame5` folds
+    them by their pipeline contract.
+  }];
+  let dependentDialects = ["circt::hw::HWDialect"];
+}
+
 def FindPipelines : Pass<"foldsim-find-pipelines", "::mlir::ModuleOp"> {
   let summary = "Report the fixed-latency pipelines of each model";
   let description = [{

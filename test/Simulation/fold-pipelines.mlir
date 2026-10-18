@@ -23,6 +23,13 @@
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/i/obj %S/Inputs/tb_fold.sv %S/Inputs/xbox.sv %t/target.sv %t/i/sim.sv > %t/i/build.log 2>&1
 // RUN: %t/i/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 // RUN: %t/i/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 | FileCheck %s
+// The whole target one model of one thread: the black box stays an instance,
+// on the host clock and enabled on the target's edges.
+// RUN: mkdir -p %t/u && foldsim-opt %t/in.mlir --hw-flatten-modules --foldsim-extract-models="module=Top netlist" --foldsim-compose="module=Top" -o %t/u/sim.mlir
+// RUN: FileCheck %s --check-prefix=ONE < %t/u/sim.mlir
+// RUN: firtool --format=mlir %t/u/sim.mlir -o %t/u/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/u/obj %S/Inputs/tb_fold.sv %S/Inputs/xbox.sv %t/target.sv %t/u/sim.sv > %t/u/build.log 2>&1
+// RUN: %t/u/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 // Without folding, threaded: an error.
 // RUN: mkdir -p %t/n && not foldsim-opt %t/in.mlir --foldsim-extract-models="module=Top models=Model netlist" --foldsim-compose="module=Top region-loads=16 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens" -o %t/n/sim.mlir 2>&1 | FileCheck %s --check-prefix=NOFOLD
 
@@ -36,6 +43,9 @@
 // FOLD-DAG: %s1_fold = seq.firreg {{%.+}} clock %hostClock : i8
 // FOLD-DAG: %fold0_issue = seq.firreg %a_sink_bits clock %hostClock : i8
 // FOLD-DAG: sv.fatal.procedural
+
+// ONE: hw.instance "m0/box" @XBox(clk: %hostClock: !seq.clock, ce: [[CE:%[0-9]+]]: i1
+// ONE: [[CE]] = comb.and {{%.+}}, {{%.+}} : i1
 
 // A black box is only simulated folded.
 // NOFOLD: error: black box 'XBox' in a threaded model: it is simulated only as a folded pipeline (fold-pipelines)
