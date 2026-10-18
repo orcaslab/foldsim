@@ -17,6 +17,11 @@
 // RUN: %verilator --binary --timing -Wno-fatal --top-module tb -DTWO -Mdir %t/p/obj %S/Inputs/tb_memory.sv %t/p/sim.sv > %t/p/build.log 2>&1
 // RUN: %t/p/obj/Vtb | FileCheck %s
 
+// And with all of the Fmax options.
+// RUN: mkdir -p %t/f && foldsim-opt %s --foldsim-extract-models="module=Top models=Mem netlist" --foldsim-compose="module=Top region-loads=1 registered-state commit-select staged-ram-writes staged-tokens" -o %t/f/sim.mlir
+// RUN: firtool --format=mlir %t/f/sim.mlir -o %t/f/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --top-module tb -DTWO -Mdir %t/f/obj %S/Inputs/tb_memory.sv %t/f/sim.sv > %t/f/build.log 2>&1
+// RUN: %t/f/obj/Vtb | FileCheck %s
 // As with one thread (memory-one-thread.mlir), each thread's own.
 // CHECK: r 2 = a1
 // CHECK: r 3 = b2

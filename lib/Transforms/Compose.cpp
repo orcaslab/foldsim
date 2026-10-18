@@ -1047,7 +1047,8 @@ void ComposePass::runOnOperation() {
     return signalPassFailure();
   }
   foldsim::ThreadOptions threadOptions{regionLoads, registeredState,
-                                       stateStages, commitSelect};
+                                       stateStages, commitSelect,
+                                       stagedRamWrites};
   if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
                           threadOptions, stagedTokens)
                      .run()))

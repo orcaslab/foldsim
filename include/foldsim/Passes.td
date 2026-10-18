@@ -159,6 +159,9 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"stateStages", "state-stages", "unsigned", "1",
            "Thread each model with this many host cycles to its state's "
            "write, as `foldsim-fame5`'s `state-stages`">,
+    Option<"stagedRamWrites", "staged-ram-writes", "bool", "false",
+           "Thread each model with its registered-read memories written a "
+           "host cycle late too, as `foldsim-fame5`'s `staged-ram-writes`">,
     Option<"stagedTokens", "staged-tokens", "bool", "false",
            "Write each token into its slot a host cycle after it is taken, "
            "from registers of the token, its thread and slot, and forward it "
@@ -254,6 +257,12 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
            "extra stage is for synthesis to retime into the logic that "
            "computes the next state, and the next thread but one is never "
            "one that finishes now">,
+    Option<"stagedRamWrites", "staged-ram-writes", "bool", "false",
+           "With regions: write a memory with a registered read a host cycle "
+           "after the edge too, address, data, mask and enable registered; "
+           "its read reads on every host cycle with the target's enable, and "
+           "where the memory reads new data under a write it takes the staged "
+           "write's data when the edge wrote its address">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

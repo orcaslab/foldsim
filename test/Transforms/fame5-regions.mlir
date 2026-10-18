@@ -56,25 +56,49 @@ hw.module @Hold(in %clk : !seq.clock, in %reset : i1, in %en : i1, in %d : i8, o
   hw.output %r, %s : i8, i8
 }
 
-// RUN: foldsim-opt %s --foldsim-fame5="module=Mem threads=4 clock-enable region-loads=1000" | FileCheck %s --check-prefix=MEM
+// RUN: foldsim-opt %s --foldsim-fame5="module=Mem threads=4 clock-enable region-loads=1000 staged-ram-writes" | FileCheck %s --check-prefix=MEM
+// RUN: foldsim-opt %s --foldsim-fame5="module=Mem threads=4 clock-enable region-loads=1000" | FileCheck %s --check-prefix=ONEDGE
 
-// A memory's ports take the region's thread index. A combinational read's
-// memory is written a host cycle late like the state; a registered read reads
-// on the edge of a write what the memory's read-under-write says, so that
-// memory is still written on the edge, at the region's index.
+// Without `staged-ram-writes`, a registered read reads on the edge of a write
+// what the memory's read-under-write says, so its memory is still written on
+// the edge, at the region's index; the read's enable keeps the edge.
+// ONEDGE-LABEL: hw.module @Mem_threaded_Mem(
+// ONEDGE: seq.firmem.write_port %ram[[[RADDR:%.+]]] = %wdata_sink_bits, clock %hostClock enable
+// ONEDGE: seq.firmem.read_port %ram[{{%.+}}], clock %hostClock enable {{%[0-9]+}} :
+// ONEDGE: %threadIdx_r0 = seq.firreg
+// ONEDGE-DAG: [[RADDR]] = comb.concat %waddr_sink_bits, %threadIdx_r0 : i3, i2
+// ONEDGE-NOT: _fwd
+
+// A memory's ports take the region's thread index, and with
+// `staged-ram-writes` every memory is written a host cycle late like the
+// state. A registered read reads on every
+// host cycle (its data is used only after an edge); one of a memory that
+// reads new data under a write takes the staged data when the edge wrote its
+// address.
 // MEM-LABEL: hw.module @Mem_threaded_Mem(
 // MEM: seq.firmem.write_port %lut[[[LADDR:%.+]]] = %lut_wdata, clock %hostClock enable [[LEN:%.+]] :
 // MEM: seq.firmem.read_port %lut[[[LREAD:%.+]]], clock %hostClock
-// MEM: seq.firmem.write_port %ram[[[RADDR:%.+]]] = %wdata_sink_bits, clock %hostClock enable
-// MEM: seq.firmem.read_port %ram[{{%.+}}], clock %hostClock enable
+// MEM: seq.firmem.write_port %ram[[[RADDR:%.+]]] = %ram_wdata, clock %hostClock enable [[REN:%.+]] :
+// MEM: [[RDATA:%.+]] = seq.firmem.read_port %ram[{{%.+}}], clock %hostClock enable %true :
+// MEM: seq.firmem.write_port %ram_rdata[%read_thread] = [[RDATA]],
+// MEM: seq.firmem.write_port %ram2[{{%.+}}] = %ram2_wdata, clock %hostClock enable {{%.+}} :
+// MEM: [[NDATA:%.+]] = seq.firmem.read_port %ram2[{{%.+}}], clock %hostClock enable %true :
+// MEM: seq.firmem.write_port %ram2_rdata[%read_thread{{.*}}] = [[FWD:%[0-9]+]],
 // MEM: %threadIdx_r0 = seq.firreg
 // MEM-DAG: [[LREAD]] = comb.concat %raddr_sink_bits, %threadIdx_r0 : i3, i2
 // MEM-DAG: %lut_waddr = seq.firreg %waddr_sink_bits clock %hostClock : i3
 // MEM-DAG: [[LADDR]] = comb.concat %lut_waddr, %threadIdx_w0 : i3, i2
 // MEM-DAG: %lut_wen = seq.firreg %we_sink_bits clock %hostClock preset 0 : i1
 // MEM-DAG: [[LEN]] = comb.and %lut_wen, %edge_r0 : i1
-// MEM-DAG: [[RADDR]] = comb.concat %waddr_sink_bits, %threadIdx_r0 : i3, i2
-hw.module @Mem(in %clk : !seq.clock, in %waddr : i3, in %wdata : i8, in %we : i1, in %raddr : i3, out q : i8, out r : i8) {
+// MEM-DAG: %ram_waddr = seq.firreg %waddr_sink_bits clock %hostClock : i3
+// MEM-DAG: [[RADDR]] = comb.concat %ram_waddr, %threadIdx_w0 : i3, i2
+// MEM-DAG: [[REN]] = comb.and %ram_wen, %edge_r0 : i1
+// MEM-DAG: %ram2_fwd = seq.firreg [[HIT:%.+]] clock %hostClock preset 0 : i1
+// MEM-DAG: [[SAME:%.+]] = comb.icmp eq %waddr_sink_bits, %raddr_sink_bits : i3
+// MEM-DAG: [[HIT]] = comb.and %we_sink_bits, [[SAME]] : i1
+// MEM-DAG: [[FWD]] = comb.mux %ram2_fwd, %ram2_wdata, [[NDATA]] : i8
+// MEM-NOT: ram_fwd
+hw.module @Mem(in %clk : !seq.clock, in %waddr : i3, in %wdata : i8, in %we : i1, in %raddr : i3, out q : i8, out r : i8, out n : i8) {
   %true = hw.constant true
   %lut = seq.firmem 0, 1, undefined, undefined : <8 x 8>
   %q = seq.firmem.read_port %lut[%raddr], clock %clk enable %true : <8 x 8>
@@ -82,5 +106,8 @@ hw.module @Mem(in %clk : !seq.clock, in %waddr : i3, in %wdata : i8, in %we : i1
   %ram = seq.firmem 1, 1, old, undefined : <8 x 8>
   %r = seq.firmem.read_port %ram[%raddr], clock %clk enable %true : <8 x 8>
   seq.firmem.write_port %ram[%waddr] = %wdata, clock %clk enable %we : <8 x 8>
-  hw.output %q, %r : i8, i8
+  %ram2 = seq.firmem 1, 1, new, undefined : <8 x 8>
+  %n = seq.firmem.read_port %ram2[%raddr], clock %clk enable %true : <8 x 8>
+  seq.firmem.write_port %ram2[%waddr] = %wdata, clock %clk enable %we : <8 x 8>
+  hw.output %q, %r, %n : i8, i8, i8
 }

@@ -144,7 +144,8 @@ public:
         threadIndexPort(threadIndexPort), tickFromFirst(tickFromFirst),
         readySchedule(readySchedule), regionLoads(options.regionLoads),
         registeredState(options.registeredState),
-        stateStages(options.stateStages), commitSelect(options.commitSelect) {}
+        stateStages(options.stateStages), commitSelect(options.commitSelect),
+        stagedRamWrites(options.stagedRamWrites) {}
 
   LogicalResult run();
 
@@ -183,10 +184,14 @@ private:
   /// a memory port's address without its thread bits; a write's `term` is its
   /// enable without the target edge, which writes on the `edge`, and with
   /// `preset` also while the threads are initialized. A write that is not
-  /// `staged` keeps its enable and data and lands on the edge itself.
+  /// `staged` keeps its enable and data and lands on the edge itself. A
+  /// registered read of a memory whose writes are staged has its `enable` in
+  /// the target, without the edge.
   struct RegionRead {
     seq::FirMemReadOp op;
     Value low;
+    bool registered = false;
+    Value enable;
   };
   struct RegionWrite {
     seq::FirMemWriteOp op;
@@ -250,6 +255,10 @@ private:
   unsigned stateStages;
   /// Whether a single thread's registers commit by select.
   bool commitSelect;
+  /// With regions: whether a memory with a registered read is written a
+  /// host cycle after the edge too, its read forwarding the staged write
+  /// where it reads new data under a write.
+  bool stagedRamWrites;
   bool deepState() const {
     return registeredState && stateStages > 1 && threads >= 3;
   }
@@ -1131,8 +1140,10 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
         if (auto it = readAhead.find(value); value && it != readAhead.end())
           value = it->second;
       };
-      for (auto &read : state.reads)
+      for (auto &read : state.reads) {
         fresh(read.low);
+        fresh(read.enable);
+      }
       for (auto &write : state.writes) {
         fresh(write.low);
         fresh(write.term);
@@ -1144,6 +1155,15 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
                      : stateIdx);
       // The write landing on this cycle's edge.
       Value pendingData, pendingEnable;
+      // A registered read on an edge that writes its address reads the
+      // write's data if the memory reads new data under a write: the write
+      // lands a host cycle later, so its staged data is forwarded then.
+      auto memoryOp = state.memory.getDefiningOp<seq::FirMemOp>();
+      bool readsNew = memoryOp.getRuw() == seq::RUW::New;
+      struct Forward {
+        Value hit, data, mask;
+      };
+      SmallVector<SmallVector<Forward>> forwards(state.reads.size());
       for (auto &write : state.writes) {
         if (!write.staged) {
           write.op.getAddressMutable().assign(
@@ -1151,6 +1171,27 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
                         : readIdx);
           continue;
         }
+        if (readsNew)
+          for (auto [k, read] : llvm::enumerate(state.reads)) {
+            if (!read.registered)
+              continue;
+            SmallVector<Value> terms;
+            for (auto term : {write.term, read.enable})
+              if (term && !matchPattern(term, m_One()))
+                terms.push_back(term);
+            if (write.low)
+              terms.push_back(comb::ICmpOp::create(
+                  b, comb::ICmpPredicate::eq, write.low, read.low));
+            Value hit = terms.empty()
+                            ? Value(hw::ConstantOp::create(b, i1, 1))
+                            : b.createOrFold<comb::AndOp>(terms, false);
+            forwards[k].push_back(
+                {seq::FirRegOp::create(b, hit, hostClock,
+                                       b.getStringAttr(memoryName + "_fwd"),
+                                       hw::InnerSymAttr{},
+                                       b.getIntegerAttr(i1, 0)),
+                 {}, {}});
+          }
         Value address = writeIdx;
         if (write.low)
           address = comb::ConcatOp::create(
@@ -1195,6 +1236,51 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
         write.op.getEnableMutable().assign(enable);
         pendingData = data;
         pendingEnable = enable;
+        for (auto &forward : forwards)
+          if (!forward.empty() && !forward.back().data) {
+            forward.back().data = data;
+            forward.back().mask = mask;
+          }
+      }
+      for (auto [k, read] : llvm::enumerate(state.reads)) {
+        if (!read.registered)
+          continue;
+        // Its data is used only on the host cycle after an edge, so it reads
+        // on every host cycle: its enable is the target's alone.
+        if (read.enable)
+          read.op.getEnableMutable().assign(read.enable);
+        else
+          read.op.getEnableMutable().clear();
+        Value dout = read.op.getData();
+        SmallVector<OpOperand *> uses;
+        for (auto &use : dout.getUses())
+          uses.push_back(&use);
+        Value data = dout;
+        auto width = hw::getBitWidth(dout.getType());
+        // The writes in port order: the last one that hits wins.
+        for (auto &forward : forwards[k]) {
+          unsigned granules =
+              forward.mask ? hw::getBitWidth(forward.mask.getType()) : 1;
+          unsigned granule = width / granules;
+          SmallVector<Value> pieces;
+          for (unsigned g = granules; g-- > 0;) {
+            Value hit = forward.hit;
+            if (forward.mask)
+              hit = comb::AndOp::create(
+                  b, hit,
+                  b.createOrFold<comb::ExtractOp>(i1, forward.mask, g));
+            auto type = b.getIntegerType(granule);
+            pieces.push_back(comb::MuxOp::create(
+                b, hit,
+                b.createOrFold<comb::ExtractOp>(type, forward.data,
+                                                g * granule),
+                b.createOrFold<comb::ExtractOp>(type, data, g * granule)));
+          }
+          data = pieces.size() == 1 ? pieces[0]
+                                    : b.createOrFold<comb::ConcatOp>(pieces);
+        }
+        for (auto *use : uses)
+          use->set(data);
       }
       if (!aheadIdx || !state.state)
         continue;
@@ -1539,7 +1625,7 @@ LogicalResult Threader::run() {
       state.state = true;
       for (auto *user : memory.getUsers()) {
         if (auto read = dyn_cast<seq::FirMemReadOp>(user))
-          state.reads.push_back({read, {}});
+          state.reads.push_back({read, {}, /*registered=*/false, {}});
         else if (auto port = dyn_cast<seq::FirMemWriteOp>(user))
           state.writes.push_back({port, {}, write.enable, !write.holds,
                                   bool(reg.getPreset()), /*staged=*/true});
@@ -1599,14 +1685,14 @@ LogicalResult Threader::run() {
         auto port = seq::FirMemWriteOp::create(
             b, threadedMemory, addressOf(write.getAddress()), targetClock,
             write.getEnable(), write.getData(), write.getMask());
-        // A registered read on the edge of a write to its address reads
-        // what the memory's read-under-write says, so such a memory's writes
-        // land on the edge.
+        // Without staged RAM writes, a registered read on the edge of a write
+        // to its address reads what the memory's read-under-write says, so
+        // such a memory's writes land on the edge.
+        bool staged = memory.getReadLatency() == 0 || stagedRamWrites;
         if (regions)
           regionMemory(threadedMemory)
               .writes.push_back({port, lastLow, write.getEnable(),
-                                 /*edge=*/true, /*preset=*/false,
-                                 /*staged=*/memory.getReadLatency() == 0});
+                                 /*edge=*/true, /*preset=*/false, staged});
         write.erase();
         continue;
       }
@@ -1617,7 +1703,8 @@ LogicalResult Threader::run() {
                                               addressOf(read.getAddress()),
                                               hostClock, read.getEnable());
         if (regions)
-          regionMemory(threadedMemory).reads.push_back({port, lastLow});
+          regionMemory(threadedMemory)
+              .reads.push_back({port, lastLow, /*registered=*/false, {}});
         data = port;
       } else {
         // A registered read's data is only there on the host cycle after the
@@ -1628,7 +1715,10 @@ LogicalResult Threader::run() {
             b, threadedMemory, addressOf(read.getAddress()), targetClock,
             read.getEnable());
         if (regions)
-          regionMemory(threadedMemory).reads.push_back({doutPort, lastLow});
+          regionMemory(threadedMemory)
+              .reads.push_back({doutPort, lastLow,
+                                /*registered=*/stagedRamWrites,
+                                read.getEnable()});
         Value dout = doutPort;
         Value enable = read.getEnable()
                            ? read.getEnable()
@@ -2028,7 +2118,8 @@ void FAME5Pass::runOnOperation() {
                     "after its edge");
     return signalPassFailure();
   }
-  if ((regionLoads || registeredState || commitSelect) && !clockEnable) {
+  if ((regionLoads || registeredState || commitSelect || stagedRamWrites) &&
+      !clockEnable) {
     model.emitError("regions are for state written with `clock-enable`");
     return signalPassFailure();
   }
@@ -2036,7 +2127,8 @@ void FAME5Pass::runOnOperation() {
                       clockChannel, threadIndex, /*tickFromFirst=*/false,
                       /*readySchedule=*/false,
                       foldsim::ThreadOptions{regionLoads, registeredState,
-                                             stateStages, commitSelect})
+                                             stateStages, commitSelect,
+                                             stagedRamWrites})
                  .run()))
     return signalPassFailure();
 }

@@ -133,6 +133,9 @@ def main():
     ap.add_argument('--state-stages', type=int, default=1,
                     help='with --registered-state: host cycles from a thread\'s edge to its '
                          'state\'s write in models of three threads or more (foldsim-fame5)')
+    ap.add_argument('--staged-ram-writes', action='store_true',
+                    help='with regions: write registered-read memories a host cycle late '
+                         'too, forwarding to their reads (foldsim-fame5)')
     ap.add_argument('--staged-tokens', action='store_true',
                     help='write each token into its slot a host cycle after it is taken, '
                          'forwarded to its readers until then (foldsim-compose)')
@@ -207,6 +210,8 @@ def main():
         compose += ' commit-select'
     if a.state_stages > 1:
         compose += f' state-stages={a.state_stages}'
+    if a.staged_ram_writes:
+        compose += ' staged-ram-writes'
     if a.relay:
         compose += f' relay={a.relay}'
     if a.staged_tokens:
