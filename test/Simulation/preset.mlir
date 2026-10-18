@@ -5,6 +5,13 @@
 // RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/obj %S/Inputs/tb_preset.sv %t/sim.sv > %t/build.log 2>&1
 // RUN: %t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 // RUN: %t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+// Regions of one memory each: every write lands a host cycle late, from
+// staged registers, and the tokens are the same.
+// RUN: mkdir -p %t/r && foldsim-opt %s --foldsim-extract-models="module=Top models=P netlist" --foldsim-compose="module=Top region-loads=1" -o %t/r/sim.mlir
+// RUN: firtool --format=mlir %t/r/sim.mlir -o %t/r/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/r/obj %S/Inputs/tb_preset.sv %t/r/sim.sv > %t/r/build.log 2>&1
+// RUN: %t/r/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/r/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
 
 // Registers start out at their preset values: in each of `P`'s two threads,
 // `r` at 9 and `f` at 1, though it is 0 from the first edge on, and in the

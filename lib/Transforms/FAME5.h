@@ -19,10 +19,14 @@ namespace foldsim {
 /// after reset on, rather than from its second. Each target port is a channel,
 /// the current thread on `threadIdx`. With `readySchedule`, a `thread_ready`
 /// input of one bit per thread says whose inputs are all there, and the thread
-/// after the current one among those is next.
+/// after the current one among those is next. `options` are `foldsim-fame5`'s
+/// options of the same names.
+struct ThreadOptions {
+  unsigned regionLoads = 0;
+};
 mlir::FailureOr<circt::hw::HWModuleOp>
 threadModel(circt::hw::HWModuleOp model, unsigned threads, mlir::StringAttr name,
-            bool readySchedule);
+            bool readySchedule, const ThreadOptions &options = {});
 
 } // namespace foldsim
 

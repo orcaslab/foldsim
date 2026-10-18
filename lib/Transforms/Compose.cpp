@@ -15,6 +15,7 @@
 #include "FAME5.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 #include "foldsim/Passes.h"
@@ -119,9 +120,10 @@ struct Consumer {
 class Composer {
 public:
   Composer(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
-           bool readySchedule, ArrayRef<std::string> relay)
+           bool readySchedule, ArrayRef<std::string> relay,
+           const foldsim::ThreadOptions &threadOptions)
       : top(top), netlist(netlist), simName(simName),
-        readySchedule(readySchedule) {
+        readySchedule(readySchedule), threadOptions(threadOptions) {
     for (auto &name : relay)
       relayModels.insert(name);
   }
@@ -144,6 +146,7 @@ private:
   hw::HWModuleOp netlist;
   StringRef simName;
   bool readySchedule;
+  foldsim::ThreadOptions threadOptions;
   llvm::StringSet<> relayModels;
   llvm::SmallPtrSet<Operation *, 4> inlined;
   std::vector<Class> classes;
@@ -231,7 +234,7 @@ LogicalResult Composer::collect() {
   for (auto &cls : classes) {
     auto name = StringAttr::get(top.getContext(), cls.name + "_threaded");
     auto threaded = foldsim::threadModel(cls.model, cls.instances.size(), name,
-                                        readySchedule);
+                                        readySchedule, threadOptions);
     if (failed(threaded))
       return failure();
     cls.threaded = *threaded;
@@ -984,6 +987,9 @@ void ComposePass::runOnOperation() {
     top.emitError("no netlist '") << moduleName << "'";
     return signalPassFailure();
   }
-  if (failed(Composer(top, netlist, simName, readySchedule, relayModels).run()))
+  foldsim::ThreadOptions threadOptions{regionLoads};
+  if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
+                          threadOptions)
+                     .run()))
     signalPassFailure();
 }

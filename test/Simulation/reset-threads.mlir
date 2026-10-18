@@ -6,6 +6,14 @@
 // RUN: %t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 // RUN: %t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
 // RUN: %t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 | FileCheck %s
+// Regions of one memory each: every write lands a host cycle late, from
+// staged registers, and the tokens are the same.
+// RUN: mkdir -p %t/r && foldsim-opt %s --foldsim-extract-models="module=Top models=Acc netlist" --foldsim-compose="module=Top region-loads=1" -o %t/r/sim.mlir
+// RUN: firtool --format=mlir %t/r/sim.mlir -o %t/r/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/r/obj %S/Inputs/tb_threads.sv %t/r/sim.sv > %t/r/build.log 2>&1
+// RUN: %t/r/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/r/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+// RUN: %t/r/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 | FileCheck %s
 
 // Four threads, whose state starts out random, initialized by a reset of one
 // host cycle: each takes every token of `reset` and `x`, and gives every one

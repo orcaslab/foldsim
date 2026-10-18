@@ -122,6 +122,9 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--circt-bin', default='')
     ap.add_argument('--foldsim-bin', default='')
+    ap.add_argument('--region-loads', type=int, default=0,
+                    help="split each threaded model's state into regions of at most this "
+                         'many loads, each with its own thread index and edge (foldsim-fame5)')
     ap.add_argument('--relay', default='',
                     help='models, or <model>:<model> pairs, whose channels get a relay stage, '
                          'comma-separated (foldsim-compose)')
@@ -185,6 +188,8 @@ def main():
         if not any(set(g) <= children[m] for m in order):
             sys.exit(f'{"+".join(g)}: not instantiated by the same module')
     compose = f'module={a.top} sim=foldsim_sim'
+    if a.region_loads:
+        compose += f' region-loads={a.region_loads}'
     if a.relay:
         compose += f' relay={a.relay}'
     pipeline = passes + OPTIMIZE + [f'foldsim-compose{{{compose}}}',

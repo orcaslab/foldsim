@@ -16,6 +16,8 @@
 #include "FAME5.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/SV/SVAttributes.h"
+#include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 #include "foldsim/Passes.h"
@@ -135,11 +137,12 @@ public:
   Threader(hw::HWModuleOp model, unsigned threads, StringAttr name,
            hw::HWModuleExternOp gate, const Slices &slices,
            const Fields &fields, StringRef clockChannel, bool threadIndexPort,
-           bool tickFromFirst = false, bool readySchedule = false)
+           bool tickFromFirst = false, bool readySchedule = false,
+           const foldsim::ThreadOptions &options = {})
       : model(model), threads(threads), name(name), gate(gate), slices(slices),
         fields(fields), clockChannel(clockChannel),
         threadIndexPort(threadIndexPort), tickFromFirst(tickFromFirst),
-        readySchedule(readySchedule) {}
+        readySchedule(readySchedule), regionLoads(options.regionLoads) {}
 
   LogicalResult run();
 
@@ -173,6 +176,33 @@ private:
   LogicalResult enableOnHostClock(ImplicitLocOpBuilder &b, Value targetClock,
                                   Value enable);
 
+  /// With regions, the ports of the target's state and memories, whose
+  /// thread index and write control come from their region's copies. `low` is
+  /// a memory port's address without its thread bits; a write's `term` is its
+  /// enable without the target edge, which writes on the `edge`, and with
+  /// `preset` also while the threads are initialized. A write that is not
+  /// `staged` keeps its enable and data and lands on the edge itself.
+  struct RegionRead {
+    seq::FirMemReadOp op;
+    Value low;
+  };
+  struct RegionWrite {
+    seq::FirMemWriteOp op;
+    Value low, term;
+    bool edge, preset, staged = true;
+  };
+  struct RegionMemory {
+    Value memory;
+    SmallVector<RegionRead> reads;
+    SmallVector<RegionWrite> writes;
+  };
+  RegionMemory &regionMemory(Value memory);
+  /// Splits the recorded state into regions of at most `regionLoads` loads,
+  /// in name order so that a region is a submodule's state, and gives each
+  /// its control.
+  void buildRegions(ImplicitLocOpBuilder &b, Value edge, Value initializing,
+                    Value hostReset);
+
   hw::HWModuleOp model;
   unsigned threads;
   StringAttr name;
@@ -188,6 +218,13 @@ private:
   /// Whether the next thread is one whose inputs are all there, by a
   /// `thread_ready` input, rather than the next in turn.
   bool readySchedule;
+  /// The most loads a region's copy of the thread index or of the target edge
+  /// drives; 0 for no regions.
+  unsigned regionLoads;
+  /// Whether the state is split into regions with their own control.
+  bool hasRegions() const { return regionLoads && threads > 1 && !gate; }
+  SmallVector<RegionMemory> regionMemories;
+  DenseMap<Value, unsigned> regionMemoryIndex;
   /// A single thread's state: the registers not written yet, with their next
   /// value and clock to be.
   DenseMap<Value, std::pair<Backedge, Backedge>> unwritten;
@@ -950,6 +987,140 @@ LogicalResult Threader::enableOnHostClock(ImplicitLocOpBuilder &b,
   return success();
 }
 
+Threader::RegionMemory &Threader::regionMemory(Value memory) {
+  auto [it, inserted] =
+      regionMemoryIndex.try_emplace(memory, regionMemories.size());
+  if (inserted)
+    regionMemories.push_back({memory, {}, {}});
+  return regionMemories[it->second];
+}
+
+void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
+                            Value initializing, Value hostReset) {
+  auto *context = b.getContext();
+  auto i1 = b.getI1Type();
+  auto idxType = threadIdx.getType();
+  auto idxNext = threadIdx.getDefiningOp<seq::FirRegOp>().getNext();
+  auto keep = sv::SVAttributeAttr::get(context, "keep", R"("true")",
+                                       /*emitAsComment=*/false);
+  auto nameOf = [&](const RegionMemory &state) {
+    return state.memory.getDefiningOp<seq::FirMemOp>().getName().value_or("");
+  };
+  // A memory's port drives a LUT's address pins per bit and 32 entries.
+  auto loadsOf = [&](const RegionMemory &state) {
+    auto type = cast<seq::FirMemType>(state.memory.getType());
+    return uint64_t(type.getWidth()) * llvm::divideCeil(type.getDepth(), 32);
+  };
+  SmallVector<unsigned> order(regionMemories.size());
+  std::iota(order.begin(), order.end(), 0);
+  // The state written here first, then the thread state only read here, in
+  // regions of their own.
+  auto readOnly = [&](unsigned i) { return regionMemories[i].writes.empty(); };
+  llvm::stable_sort(order, [&](unsigned x, unsigned y) {
+    if (readOnly(x) != readOnly(y))
+      return readOnly(y);
+    return nameOf(regionMemories[x]) < nameOf(regionMemories[y]);
+  });
+  SmallVector<SmallVector<unsigned>> regions;
+  uint64_t loads = 0;
+  for (auto i : order) {
+    auto memoryLoads = loadsOf(regionMemories[i]);
+    if (regions.empty() || readOnly(i) != readOnly(regions.back().front()) ||
+        (loads && loads + memoryLoads > regionLoads)) {
+      regions.emplace_back();
+      loads = 0;
+    }
+    regions.back().push_back(i);
+    loads += memoryLoads;
+  }
+
+  // Each region's copies are registers with the same next value as the one
+  // they copy, so they hold its value on the same host cycle. The thread
+  // index has its copy for reads and, a cycle later, for writes; the target
+  // edge and the initialization a copy a cycle late. Kept: equal registers
+  // are otherwise merged back into one.
+  auto copy = [&](Value next, const Twine &copyName, Value reset,
+                  Value resetValue) {
+    auto type = next.getType();
+    auto preset = b.getIntegerAttr(type, 0);
+    seq::FirRegOp reg =
+        reset ? seq::FirRegOp::create(b, next, hostClock,
+                                      b.getStringAttr(copyName), reset,
+                                      resetValue, hw::InnerSymAttr{},
+                                      /*isAsync=*/false, preset)
+              : seq::FirRegOp::create(b, next, hostClock,
+                                      b.getStringAttr(copyName),
+                                      hw::InnerSymAttr{}, preset);
+    sv::addSVAttributes(reg, {keep});
+    return Value(reg);
+  };
+  // A write lands a host cycle after its thread's edge: the next thread is
+  // never the one that just finished, nor, after the initialization, the
+  // last one initialized, so no read sees it late.
+  auto staged = [&](Value value, const Twine &stagedName) -> Value {
+    if (!value)
+      return value;
+    return seq::FirRegOp::create(b, value, hostClock,
+                                 b.getStringAttr(stagedName));
+  };
+  for (auto [r, region] : llvm::enumerate(regions)) {
+    Value readIdx = copy(idxNext, "threadIdx_r" + Twine(r), hostReset,
+                         hw::ConstantOp::create(b, idxType, 0));
+    // Only a region with writes has their control.
+    Value writeIdx, edgeLate;
+    if (!readOnly(region.front())) {
+      writeIdx = copy(readIdx, "threadIdx_w" + Twine(r), {}, {});
+      edgeLate = copy(edge, "edge_r" + Twine(r), {}, {});
+    }
+    Value initLate;
+    for (auto i : region) {
+      auto &state = regionMemories[i];
+      auto memoryName = nameOf(state);
+      for (auto &read : state.reads)
+        read.op.getAddressMutable().assign(
+            read.low ? b.createOrFold<comb::ConcatOp>(read.low, readIdx)
+                     : readIdx);
+      for (auto &write : state.writes) {
+        if (!write.staged) {
+          write.op.getAddressMutable().assign(
+              write.low ? b.createOrFold<comb::ConcatOp>(write.low, readIdx)
+                        : readIdx);
+          continue;
+        }
+        Value address = writeIdx;
+        if (write.low)
+          address = comb::ConcatOp::create(
+              b, staged(write.low, memoryName + "_waddr"), writeIdx);
+        Value data = staged(write.op.getData(), memoryName + "_wdata");
+        Value mask = staged(write.op.getMask(), memoryName + "_wmask");
+        Value enable;
+        if (write.edge) {
+          enable = edgeLate;
+          if (write.term)
+            enable = comb::AndOp::create(
+                b,
+                seq::FirRegOp::create(
+                    b, write.term, hostClock,
+                    b.getStringAttr(memoryName + "_wen"), hw::InnerSymAttr{},
+                    b.getIntegerAttr(i1, 0)),
+                edgeLate);
+        }
+        if (write.preset) {
+          if (!initLate)
+            initLate = copy(initializing, "init_r" + Twine(r), {}, {});
+          enable = enable ? Value(comb::OrOp::create(b, initLate, enable))
+                          : initLate;
+        }
+        write.op.getAddressMutable().assign(address);
+        write.op.getDataMutable().assign(data);
+        if (mask)
+          write.op.getMaskMutable().assign(mask);
+        write.op.getEnableMutable().assign(enable);
+      }
+    }
+  }
+}
+
 LogicalResult Threader::run() {
   if (failed(checkModel()))
     return failure();
@@ -1148,6 +1319,7 @@ LogicalResult Threader::run() {
   // each thread's entry when that thread is current: its target edges are then
   // those of the host clock it is written on.
   auto targetEdge = backedges.get(i1);
+  bool regions = hasRegions();
   for (auto reg : registers) {
     Value next = reg.getNext();
     if (reg.getReset())
@@ -1179,6 +1351,16 @@ LogicalResult Threader::run() {
       writeThreadState(b, memory, hostClock, data, enable);
     } else if (!write.holds) {
       writeThreadState(b, memory, targetClock, write.data, write.enable);
+    }
+    if (regions) {
+      auto &state = regionMemory(memory);
+      for (auto *user : memory.getUsers()) {
+        if (auto read = dyn_cast<seq::FirMemReadOp>(user))
+          state.reads.push_back({read, {}});
+        else if (auto port = dyn_cast<seq::FirMemWriteOp>(user))
+          state.writes.push_back({port, {}, write.enable, !write.holds,
+                                  bool(reg.getPreset()), /*staged=*/true});
+      }
     }
     reg.erase();
   }
@@ -1217,37 +1399,54 @@ LogicalResult Threader::run() {
         memory.getOutputFileAttr());
     threadedMemory->setDialectAttrs(memory->getDialectAttrs());
     unsigned addrWidth = llvm::Log2_64_Ceil(depth) - idxWidth;
+    Value lastLow;
     auto addressOf = [&](Value addr) -> Value {
+      lastLow = {};
       if (!idxWidth)
         return addr;
       if (!addrWidth)
         return threadIdx;
       Value low =
           b.createOrFold<comb::ExtractOp>(b.getIntegerType(addrWidth), addr, 0);
+      lastLow = low;
       return b.createOrFold<comb::ConcatOp>(low, threadIdx);
     };
     for (auto *user : llvm::make_early_inc_range(memory->getUsers())) {
       if (auto write = dyn_cast<seq::FirMemWriteOp>(user)) {
-        seq::FirMemWriteOp::create(
+        auto port = seq::FirMemWriteOp::create(
             b, threadedMemory, addressOf(write.getAddress()), targetClock,
             write.getEnable(), write.getData(), write.getMask());
+        // A registered read on the edge of a write to its address reads
+        // what the memory's read-under-write says, so such a memory's writes
+        // land on the edge.
+        if (regions)
+          regionMemory(threadedMemory)
+              .writes.push_back({port, lastLow, write.getEnable(),
+                                 /*edge=*/true, /*preset=*/false,
+                                 /*staged=*/memory.getReadLatency() == 0});
         write.erase();
         continue;
       }
       auto read = cast<seq::FirMemReadOp>(user);
       Value data;
       if (memory.getReadLatency() == 0) {
-        data = seq::FirMemReadOp::create(b, threadedMemory,
-                                         addressOf(read.getAddress()),
-                                         hostClock, read.getEnable());
+        auto port = seq::FirMemReadOp::create(b, threadedMemory,
+                                              addressOf(read.getAddress()),
+                                              hostClock, read.getEnable());
+        if (regions)
+          regionMemory(threadedMemory).reads.push_back({port, lastLow});
+        data = port;
       } else {
         // A registered read's data is only there on the host cycle after the
         // target edge that read it, even for one thread: once the target
         // clock runs on the host clock with an enable, so does the read. The
         // thread keeps it until its next read.
-        Value dout = seq::FirMemReadOp::create(b, threadedMemory,
-                                               addressOf(read.getAddress()),
-                                               targetClock, read.getEnable());
+        auto doutPort = seq::FirMemReadOp::create(
+            b, threadedMemory, addressOf(read.getAddress()), targetClock,
+            read.getEnable());
+        if (regions)
+          regionMemory(threadedMemory).reads.push_back({doutPort, lastLow});
+        Value dout = doutPort;
         Value enable = read.getEnable()
                            ? read.getEnable()
                            : Value(hw::ConstantOp::create(b, i1, 1));
@@ -1467,6 +1666,8 @@ LogicalResult Threader::run() {
   } else if (failed(enableOnHostClock(b, targetClock, enable))) {
     return failure();
   }
+  if (regions)
+    buildRegions(b, enable, initializing, hostReset);
 
   SmallVector<Value> results;
   if (clockBits)
@@ -1525,16 +1726,15 @@ LogicalResult Threader::run() {
   return success();
 }
 
-FailureOr<hw::HWModuleOp> foldsim::threadModel(hw::HWModuleOp model,
-                                                     unsigned threads,
-                                                     StringAttr name,
-                                                     bool readySchedule) {
+FailureOr<hw::HWModuleOp>
+foldsim::threadModel(hw::HWModuleOp model, unsigned threads, StringAttr name,
+                     bool readySchedule, const ThreadOptions &options) {
   auto *parent = model->getParentOp();
   Threader::Slices slices;
   Threader::Fields fields;
   if (failed(Threader(model, threads, name, /*gate=*/{}, slices, fields,
                       /*clockChannel=*/"", /*threadIndexPort=*/true,
-                      /*tickFromFirst=*/true, readySchedule)
+                      /*tickFromFirst=*/true, readySchedule, options)
                  .run()))
     return failure();
   return cast<hw::HWModuleOp>(SymbolTable::lookupSymbolIn(parent, name));
@@ -1607,8 +1807,14 @@ void FAME5Pass::runOnOperation() {
   }
   if (clockEnable)
     gate = {};
+  if (regionLoads && !clockEnable) {
+    model.emitError("regions are for state written with `clock-enable`");
+    return signalPassFailure();
+  }
   if (failed(Threader(model, threads, name, gate, slices, channelFields,
-                      clockChannel, threadIndex)
+                      clockChannel, threadIndex, /*tickFromFirst=*/false,
+                      /*readySchedule=*/false,
+                      foldsim::ThreadOptions{regionLoads})
                  .run()))
     return signalPassFailure();
 }

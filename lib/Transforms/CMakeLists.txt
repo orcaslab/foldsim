@@ -12,6 +12,7 @@ add_mlir_library(FoldsimTransforms
   CIRCTHW
   CIRCTHWTransforms
   CIRCTSeq
+  CIRCTSV
   CIRCTSupport
   MLIRIR
   MLIRPass

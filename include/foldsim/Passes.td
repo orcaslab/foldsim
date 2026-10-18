@@ -147,11 +147,15 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
                "do: four slots, the token written a host cycle after it is "
                "taken, and each side seeing the other's count a host cycle "
                "late, so every signal between the two sides is registered">,
+    Option<"regionLoads", "region-loads", "unsigned", "0",
+           "Thread each model with regions of at most this many loads, as "
+           "`foldsim-fame5`'s `region-loads`">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
     "circt::comb::CombDialect",
-    "circt::seq::SeqDialect"
+    "circt::seq::SeqDialect",
+    "circt::sv::SVDialect"
   ];
 }
 
@@ -214,11 +218,18 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
            "finishes, rather than on a gated target clock">,
     Option<"threadIndex", "thread-index", "bool", "false",
            "Output the current thread on a `threadIdx` port">,
+    Option<"regionLoads", "region-loads", "unsigned", "0",
+           "With `clock-enable` and several threads: split the thread state "
+           "and memories into regions of at most this many loads (bits of "
+           "state read and written per thread), each with its own registered "
+           "copies of the thread index and of the target edge; writes land a "
+           "host cycle after the edge. 0: one control for the whole model">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
     "circt::comb::CombDialect",
-    "circt::seq::SeqDialect"
+    "circt::seq::SeqDialect",
+    "circt::sv::SVDialect"
   ];
 }
 
