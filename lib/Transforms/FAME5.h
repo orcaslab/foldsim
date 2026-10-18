@@ -10,6 +10,7 @@
 #define FOLDSIM_LIB_TRANSFORMS_FAME5_H
 
 #include "circt/Dialect/HW/HWOps.h"
+#include "mlir/IR/ImplicitLocOpBuilder.h"
 
 namespace foldsim {
 
@@ -29,7 +30,19 @@ struct ThreadOptions {
   bool stagedRamWrites = false;
   bool pipelineMultipliers = false;
   bool compactStaging = false;
+  bool foldPipelines = false;
 };
+/// How a register is written: never (it only holds its value), or with
+/// `data` when `enable` (always, if null).
+struct HeldWrite {
+  bool holds;
+  mlir::Value enable, data;
+};
+/// The write of a register whose next value is `next`: the branches of its
+/// muxes that hold the register are the cycles it is not written.
+HeldWrite peelHolds(mlir::ImplicitLocOpBuilder &b, mlir::Value next,
+                    mlir::Value reg);
+
 mlir::FailureOr<circt::hw::HWModuleOp>
 threadModel(circt::hw::HWModuleOp model, unsigned threads, mlir::StringAttr name,
             bool readySchedule, const ThreadOptions &options = {});

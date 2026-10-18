@@ -168,6 +168,9 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"compactStaging", "compact-staging", "bool", "false",
            "Thread each model with compact staging, as `foldsim-fame5`'s "
            "`compact-staging`">,
+    Option<"foldPipelines", "fold-pipelines", "bool", "false",
+           "Thread each model with its fixed-latency pipelines folded, as "
+           "`foldsim-fame5`'s `fold-pipelines`">,
     Option<"channelDepth", "channel-depth", "unsigned", "2",
            "Slots per producer thread of a channel without a relay, a power of "
            "two: deeper channels give producers slack ahead of their readers "
@@ -286,12 +289,46 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
            "enables no preset value (the edge's copy is zero until its first "
            "edge); on large models the merged locations of the presets grow "
            "the Verilog tenfold">,
+    Option<"foldPipelines", "fold-pipelines", "bool", "false",
+           "With `clock-enable` and two threads or more: simulate each "
+           "fixed-latency pipeline (see `foldsim-find-pipelines`) by one "
+           "unthreaded copy on the host clock, fed by the current thread, "
+           "and a per-thread store of its results read at the thread's "
+           "count of enabled edges, rather than by threading its registers. "
+           "A black box with a pipeline contract is simulated this way, by "
+           "an instance of itself">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
     "circt::comb::CombDialect",
     "circt::seq::SeqDialect",
     "circt::sv::SVDialect"
+  ];
+}
+
+def FindPipelines : Pass<"foldsim-find-pipelines", "::mlir::ModuleOp"> {
+  let summary = "Report the fixed-latency pipelines of each model";
+  let description = [{
+    Finds, in each model of `models` (all modules with registers if none),
+    the pipelines `foldsim-fame5` with `fold-pipelines` simulates without
+    threading their state: registers, and black boxes with a pipeline
+    contract, whose outputs depend only on their inputs of a fixed number of
+    enabled cycles before (see `Pipelines.h`). For each, prints its layers,
+    the bits of each, of its inputs and of a stored result, the threaded
+    state it replaces and the estimated cost of both ways for the model's
+    thread count. Leaves the design as it is.
+  }];
+  let options = [
+    ListOption<"models", "models", "std::string",
+               "The models, as <module>=<threads>">,
+    Option<"stagingRegisters", "staging-registers", "unsigned", "3",
+           "Registers per bit of threaded state besides its memory (3 with "
+           "registered state and two state stages)">,
+  ];
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect",
+    "circt::seq::SeqDialect"
   ];
 }
 

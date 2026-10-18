@@ -14,10 +14,12 @@
 //===----------------------------------------------------------------------===//
 
 #include "FAME5.h"
+#include "Pipelines.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/SV/SVAttributes.h"
 #include "circt/Dialect/SV/SVDialect.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 #include "foldsim/Passes.h"
@@ -148,12 +150,20 @@ public:
         stateStages(options.stateStages), commitSelect(options.commitSelect),
         stagedRamWrites(options.stagedRamWrites),
         pipelineMultipliers(options.pipelineMultipliers),
-        compactStaging(options.compactStaging) {}
+        compactStaging(options.compactStaging),
+        foldPipelines(options.foldPipelines) {}
 
   LogicalResult run();
 
 private:
   LogicalResult checkModel();
+  /// With `foldPipelines`: replaces each fixed-latency pipeline of the model
+  /// by its target state (a slot counter, a store of results, the last layer
+  /// if it stays) and an unthreaded copy on the host clock, whose host-side
+  /// placeholders `finishFolds` connects once the threaded module exists.
+  LogicalResult prepareFolds();
+  LogicalResult finishFolds(ImplicitLocOpBuilder &b, Value edge,
+                            Value hostReset);
   void computeDeps();
   const BitDeps &getDeps(Value value);
   BitDeps computeBitDeps(Value value);
@@ -170,13 +180,7 @@ private:
                         Value data, Value enable = {});
   /// How a register is written: never (it only holds its value), or with
   /// `data` when `enable` (always, if null).
-  struct Write {
-    bool holds;
-    Value enable, data;
-  };
-  /// The write of a register whose next value is `next`: the branches of its
-  /// muxes that hold the register are the cycles it is not written.
-  Write peelHolds(ImplicitLocOpBuilder &b, Value next, Value reg);
+  using Write = foldsim::HeldWrite;
   /// Moves everything on the target clock to the host clock, written only
   /// when `enable`.
   LogicalResult enableOnHostClock(ImplicitLocOpBuilder &b, Value targetClock,
@@ -271,6 +275,25 @@ private:
   /// With regions: whether staging takes the location of the state it
   /// stages, and a staged write enable has no preset value.
   bool compactStaging;
+  /// Whether fixed-latency pipelines are simulated by an unthreaded copy and
+  /// a per-thread store of their results rather than threaded.
+  bool foldPipelines;
+  /// A folded pipeline's store and its write from the unthreaded copy.
+  struct Fold {
+    seq::FirMemOp store;
+    Value threadedStore;
+    Value slot, thread, valid, data;
+  };
+  SmallVector<Fold> folds;
+  DenseMap<Operation *, unsigned> foldOfStore;
+  /// The ops of the unthreaded copies: on the host clock, not target state.
+  DenseSet<Operation *> physical;
+  std::unique_ptr<BackedgeBuilder> foldEdges;
+  Backedge physClock, foldThread, foldEdge, foldReset;
+  /// Whether the scheduler built never makes a thread that finishes current
+  /// on the next host cycle, which folding relies on. Each scheduler that
+  /// keeps it says so.
+  bool separatesFinishes = false;
   /// The combinational cone of a next value, within the model.
   static bool inCone(Operation *op) {
     if (!op || op->getNumRegions() || isa<hw::InstanceOp, hw::OutputOp>(op))
@@ -510,6 +533,31 @@ LogicalResult Threader::checkModel() {
     return model.emitError("a model has a clock input");
 
   for (auto &op : *body) {
+    if (physical.contains(&op))
+      continue;
+    if (auto inst = dyn_cast<hw::InstanceOp>(op)) {
+      auto *module = SymbolTable::lookupNearestSymbolFrom(
+          inst, inst.getReferencedModuleNameAttr());
+      if (module && foldsim::isBlackBox(module)) {
+        auto contract = foldsim::getPipelineContract(module);
+        if (failed(contract))
+          return failure();
+        if (!*contract)
+          return inst.emitError("black box '")
+                 << inst.getReferencedModuleName()
+                 << "' in a threaded model has no pipeline contract: its "
+                    "state cannot be threaded, and without a contract it "
+                    "cannot be folded";
+        return inst.emitError("black box '")
+               << inst.getReferencedModuleName()
+               << "' in a threaded model: "
+               << (foldPipelines
+                       ? "it is not in a pipeline that can be folded (see "
+                         "foldsim-find-pipelines)"
+                       : "it is simulated only as a folded pipeline "
+                         "(fold-pipelines)");
+      }
+    }
     if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
       if (reg.getIsAsync())
         return reg.emitError("asynchronous reset in a threaded model");
@@ -981,8 +1029,8 @@ static Value hoistMux(ImplicitLocOpBuilder &b, Value value) {
   return value;
 }
 
-Threader::Write Threader::peelHolds(ImplicitLocOpBuilder &b, Value next,
-                                    Value reg) {
+foldsim::HeldWrite foldsim::peelHolds(ImplicitLocOpBuilder &b, Value next,
+                                      Value reg) {
   if (next == reg)
     return {/*holds=*/true, {}, {}};
   next = hoistMux(b, next);
@@ -1468,7 +1516,543 @@ void Threader::commitBySelect(ImplicitLocOpBuilder &b, Value edge,
   }
 }
 
+/// Bits `[low, low + width)` of `value` as an integer.
+static Value bitsOf(ImplicitLocOpBuilder &b, Value value, unsigned low,
+                    unsigned width) {
+  auto all = hw::getBitWidth(value.getType());
+  Value bits = castBits(b, value, b.getIntegerType(all));
+  return sliceBits(b, bits, low, width);
+}
+
+/// The value of `width` bits made of runs of bits of other values: (value,
+/// low bit, count), the least significant run first.
+static Value fromRuns(ImplicitLocOpBuilder &b,
+                      ArrayRef<std::tuple<Value, unsigned, unsigned>> runs) {
+  SmallVector<Value> pieces;
+  for (auto &[value, low, count] : llvm::reverse(runs))
+    pieces.push_back(bitsOf(b, value, low, count));
+  return joinBits(b, pieces);
+}
+
+/// Appends bit `bit` of `value` to `runs`, extending the last run if it is
+/// the next bit of the same value.
+static void addBit(SmallVectorImpl<std::tuple<Value, unsigned, unsigned>> &runs,
+                   Value value, unsigned bit) {
+  if (!runs.empty()) {
+    auto &[v, low, count] = runs.back();
+    if (v == value && low + count == bit) {
+      ++count;
+      return;
+    }
+  }
+  runs.push_back({value, bit, 1});
+}
+
+// Folding a pipeline. Its unthreaded copy runs on the host clock, every host
+// cycle, on whatever thread is current; a thread's issue (its target edge with
+// the pipeline enabled) enters it tagged with the thread and the thread's slot,
+// its count of enabled edges modulo the store's depth S. The copy's result
+// comes out c host cycles later (c = S) and is written, a host cycle later
+// still, into the store at (slot, thread): readable c + 2 host cycles after
+// the issue. The thread reads it, at its own slot, on the edge S enabled edges
+// later (last layer kept: c = S = L - 1) or on any host cycle once it has made
+// S of them (last layer stored: c = S = L).
+//
+// A thread advances at most one target cycle per host cycle, and every
+// scheduler of this threader with two threads or more never makes a thread
+// that finishes current on the next host cycle. So the edges of one thread are
+// two host cycles apart at least: S enabled edges after an issue at host cycle
+// h, the thread's edge is at h + 2S at the earliest, and with the last layer
+// stored, its next host cycle at h + 2S + 2. The result is readable at
+// h + S + 2: in time when S >= 2. A slot is overwritten by the issue S enabled
+// edges later, after its last read. A thread's slot counter is target state:
+// it is threaded like any register, so any scheduler order keeps it right.
+LogicalResult Threader::prepareFolds() {
+  auto *body = model.getBodyBlock();
+  // Where folding cannot be exact: with one thread, it is current on every
+  // host cycle; a clock gate is the platform's, and its edges too.
+  StringRef unfit;
+  if (threads < 2)
+    unfit = "its one thread is current on every host cycle, so its edges "
+            "may be on consecutive host cycles";
+  else if (gate)
+    unfit = "its target clock is a clock gate of the platform's";
+  else if (!llvm::isPowerOf2_32(threads))
+    unfit = "a threaded store needs a power of two of threads";
+  ImplicitLocOpBuilder b(model.getLoc(), body->getTerminator());
+  foldsim::PipelineAnalysis analysis(model);
+  if (!unfit.empty()) {
+    // Only reported when there is something to fold; the model is left as
+    // it is (a black box in it is an error of `checkModel`).
+    auto copy = cast<hw::HWModuleOp>(OpBuilder(model).clone(*model));
+    ImplicitLocOpBuilder cb(copy.getLoc(), copy.getBodyBlock()->getTerminator());
+    foldsim::PipelineAnalysis probe(copy);
+    bool any = succeeded(probe.run(cb)) && !probe.pipelines.empty();
+    copy.erase();
+    if (any)
+      model.emitRemark("pipelines of '")
+          << model.getName() << "' not folded: " << unfit;
+    return success();
+  }
+  if (failed(analysis.run(b)))
+    return failure();
+  if (analysis.pipelines.empty())
+    return success();
+  auto *context = model.getContext();
+  auto i1 = b.getI1Type();
+  Value modelClock;
+  for (auto [i, port] : llvm::enumerate(model.getPortList()))
+    if (isa<seq::ClockType>(port.type) &&
+        port.dir == hw::ModulePort::Direction::Input)
+      modelClock = body->getArgument(port.argNum);
+  if (!modelClock)
+    return model.emitError("a model has a clock input");
+  foldEdges = std::make_unique<BackedgeBuilder>(b, model.getLoc());
+  physClock = foldEdges->get(seq::ClockType::get(context));
+  auto idxType = b.getIntegerType(llvm::Log2_32_Ceil(threads));
+  foldThread = foldEdges->get(idxType);
+  foldEdge = foldEdges->get(i1);
+  foldReset = foldEdges->get(i1);
+  auto one = hw::ConstantOp::create(b, i1, 1);
+  auto hostReg = [&](Value next, const Twine &regName,
+                     bool cleared = false) -> Value {
+    auto type = next.getType();
+    seq::FirRegOp reg =
+        cleared ? seq::FirRegOp::create(
+                      b, next, physClock, b.getStringAttr(regName), foldReset,
+                      hw::ConstantOp::create(b, type, 0), hw::InnerSymAttr{},
+                      /*isAsync=*/false, b.getIntegerAttr(type, 0))
+                : seq::FirRegOp::create(b, next, physClock,
+                                        b.getStringAttr(regName));
+    physical.insert(reg);
+    return reg;
+  };
+
+  // The stored bits of each pipeline: a register bit of the last layer (its
+  // next value if the last layer stays, else its value), and a black box's
+  // outputs in the last layer.
+  auto &pipelines = analysis.pipelines;
+  auto &registers = analysis.registers;
+  auto &boxes = analysis.boxes;
+  struct Bit {
+    int reg = -1, box = -1;
+    Value result;
+    unsigned bit = 0;
+  };
+  std::vector<SmallVector<Bit>> words(pipelines.size());
+  DenseMap<std::pair<unsigned, unsigned>, unsigned> regBitAt;
+  DenseMap<std::pair<Value, unsigned>, unsigned> boxBitAt;
+  for (auto [ri, reg] : llvm::enumerate(registers))
+    for (unsigned bit = 0; bit < reg.layer.size(); ++bit) {
+      if (!reg.layer[bit])
+        continue;
+      auto pi = reg.pipeline[bit];
+      if (reg.layer[bit] != pipelines[pi].layers)
+        continue;
+      regBitAt[{ri, bit}] = words[pi].size();
+      words[pi].push_back({int(ri), -1, {}, bit});
+    }
+  auto boxPorts = [&](foldsim::PipelineBox &box) {
+    auto *module = SymbolTable::lookupNearestSymbolFrom(
+        box.inst, box.inst.getReferencedModuleNameAttr());
+    return cast<hw::HWModuleLike>(module).getPortList();
+  };
+  DenseMap<unsigned, unsigned> boxPipeline;
+  for (auto [pi, p] : llvm::enumerate(pipelines))
+    for (auto bi : p.boxes)
+      boxPipeline[bi] = pi;
+  for (auto [bi, box] : llvm::enumerate(boxes)) {
+    auto pi = boxPipeline[bi];
+    if (box.outLayer != pipelines[pi].layers)
+      continue;
+    for (auto &port : boxPorts(box)) {
+      if (port.dir == hw::ModulePort::Direction::Input ||
+          !llvm::is_contained(box.contract.dataOut, port.getName()))
+        continue;
+      auto result = box.inst.getResult(port.argNum);
+      for (int64_t k = 0; k < hw::getBitWidth(result.getType()); ++k) {
+        boxBitAt[{result, unsigned(k)}] = words[pi].size();
+        words[pi].push_back({-1, int(bi), result, unsigned(k)});
+      }
+    }
+  }
+
+  SmallVector<Value> storeRead(pipelines.size());
+  for (unsigned pi = 0; pi < pipelines.size(); ++pi) {
+    auto &p = pipelines[pi];
+    auto prefix = ("fold" + Twine(pi)).str();
+    unsigned depth = p.depth();
+    unsigned layers = p.layers;
+    bool stored = p.lastLayerStored;
+    // When the result is readable, and when it is read at the earliest.
+    // The copy registers its issue first: the leaves of the first layer's
+    // logic (state, inputs), so that the thread's state reaches registers
+    // through no logic. Its result comes out a host cycle later for it.
+    unsigned out = depth + 1;
+    unsigned readable = out + 2;
+    unsigned firstRead = stored ? 2 * layers : 2 * (layers - 1);
+    if (readable > firstRead)
+      return model.emitError("folded pipeline ")
+             << pi << " of " << layers << " layers: its results are back "
+             << readable << " host cycles after issue, after their first "
+             << "read at " << firstRead;
+
+    // The thread's slot: its enabled edges modulo the store's depth.
+    auto slotType = b.getIntegerType(llvm::Log2_32_Ceil(depth));
+    auto slotNext = foldEdges->get(slotType);
+    Value slot = seq::FirRegOp::create(b, slotNext, modelClock,
+                                       b.getStringAttr(prefix + "_slot"),
+                                       hw::InnerSymAttr{},
+                                       b.getIntegerAttr(slotType, 0));
+    Value last = comb::ICmpOp::create(b, comb::ICmpPredicate::eq, slot,
+                                      hw::ConstantOp::create(b, slotType,
+                                                             depth - 1));
+    Value step = comb::MuxOp::create(
+        b, last, hw::ConstantOp::create(b, slotType, 0),
+        comb::AddOp::create(b, slot, hw::ConstantOp::create(b, slotType, 1)));
+    slotNext.setValue(p.enable ? Value(comb::MuxOp::create(b, p.enable, step,
+                                                           slot))
+                               : step);
+
+    // The store, read at the thread's slot.
+    unsigned width = words[pi].size();
+    auto memType = seq::FirMemType::get(context, depth, width, 1);
+    auto store = seq::FirMemOp::create(
+        b, memType, /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined,
+        seq::WUW::Undefined, b.getStringAttr(prefix + "_store"),
+        hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+    storeRead[pi] = seq::FirMemReadOp::create(b, store, slot, modelClock, one);
+    foldOfStore[store] = folds.size();
+
+    // The unthreaded copy: a host register per register of the pipeline, a
+    // black box per black box, on the values the current thread gives its
+    // first layer.
+    DenseMap<Value, Value> copies;
+    SmallVector<std::pair<unsigned, Backedge>> copyNexts;
+    for (auto ri : p.registers) {
+      auto &reg = registers[ri];
+      // A last layer that stays needs no copy.
+      bool copied = false;
+      for (unsigned bit = 0; bit < reg.layer.size(); ++bit)
+        if (reg.layer[bit] && reg.pipeline[bit] == pi &&
+            (stored || reg.layer[bit] < layers))
+          copied = true;
+      if (!copied)
+        continue;
+      auto type = b.getIntegerType(reg.layer.size());
+      auto next = foldEdges->get(type);
+      auto copy = hostReg(next, reg.reg.getName() + "_fold");
+      copies[reg.reg.getResult()] =
+          castBits(b, copy, reg.reg.getResult().getType());
+      copyNexts.push_back({ri, next});
+    }
+    SmallVector<std::pair<unsigned, hw::InstanceOp>> boxCopies;
+    for (auto bi : p.boxes)
+      boxCopies.push_back({bi, {}});
+    // `value` computed from the copy's registers and black boxes: its logic
+    // cloned where it depends on the pipeline, the value itself elsewhere.
+    bool cloneFailed = false;
+    std::function<Value(Value)> overCopy = [&](Value value) -> Value {
+      if (auto it = copies.find(value); it != copies.end())
+        return it->second;
+      if (!analysis.dependsOnPipeline(value, pi))
+        return value;
+      auto *op = value.getDefiningOp();
+      if (!op || !inCone(op)) {
+        if (!cloneFailed)
+          (op ? op->emitError() : model.emitError())
+              << "folded pipeline " << pi << " depends on this other than "
+              << "through logic";
+        cloneFailed = true;
+        return value;
+      }
+      IRMapping mapping;
+      for (auto operand : op->getOperands())
+        mapping.map(operand, overCopy(operand));
+      auto *clone = b.clone(*op, mapping);
+      for (auto [old, cloned] :
+           llvm::zip(op->getResults(), clone->getResults()))
+        copies[old] = cloned;
+      return copies[value];
+    };
+    // The issue, registered: the logic of the first layer cloned on its
+    // leaves, each registered once.
+    DenseMap<Value, Value> issued;
+    std::function<Value(Value)> issueCopy = [&](Value value) -> Value {
+      if (auto it = issued.find(value); it != issued.end())
+        return it->second;
+      auto *op = value.getDefiningOp();
+      if (op && inCone(op) && op->getNumOperands() == 0)
+        return issued[value] = value;
+      if (!op || !inCone(op))
+        return issued[value] = hostReg(value, prefix + "_issue");
+      IRMapping mapping;
+      for (auto operand : op->getOperands())
+        mapping.map(operand, issueCopy(operand));
+      auto *clone = b.clone(*op, mapping);
+      for (auto [old, cloned] :
+           llvm::zip(op->getResults(), clone->getResults()))
+        issued[old] = cloned;
+      return issued[value];
+    };
+    // Black boxes first: registers after them read their outputs.
+    for (auto &[bi, copy] : boxCopies) {
+      auto &box = boxes[bi];
+      SmallVector<Value> operands;
+      Value clockConv;
+      for (auto &port : boxPorts(box)) {
+        if (port.dir != hw::ModulePort::Direction::Input)
+          continue;
+        Value operand = box.inst.getOperand(port.argNum);
+        auto name = port.getName();
+        if (name == box.contract.clock)
+          operand = isa<seq::ClockType>(port.type)
+                        ? Value(physClock)
+                        : (clockConv = seq::FromClockOp::create(b, physClock));
+        else if (name == box.contract.enable)
+          operand = hw::ConstantOp::create(b, port.type, 1);
+        else if (llvm::is_contained(box.contract.dataIn, name))
+          operand = box.inLayer > 0
+                        ? Value() // set below, once registers have copies
+                        : issueCopy(operand);
+        operands.push_back(operand);
+      }
+      // Inputs from the pipeline are cloned once every copy exists.
+      for (auto &operand : operands)
+        if (!operand)
+          operand = hw::ConstantOp::create(b, b.getI1Type(), 0);
+      auto *module = SymbolTable::lookupNearestSymbolFrom(
+          box.inst, box.inst.getReferencedModuleNameAttr());
+      copy = hw::InstanceOp::create(
+          b, module, b.getStringAttr(box.inst.getInstanceName() + "_fold"),
+          operands);
+      physical.insert(copy);
+      if (clockConv)
+        physical.insert(clockConv.getDefiningOp());
+      for (auto [old, cloned] :
+           llvm::zip(box.inst.getResults(), copy.getResults()))
+        copies[old] = cloned;
+    }
+    for (auto &[bi, copy] : boxCopies) {
+      auto &box = boxes[bi];
+      if (box.inLayer == 0)
+        continue;
+      unsigned i = 0;
+      for (auto &port : boxPorts(box)) {
+        if (port.dir != hw::ModulePort::Direction::Input)
+          continue;
+        if (llvm::is_contained(box.contract.dataIn, port.getName()))
+          copy->setOperand(i, overCopy(box.inst.getOperand(port.argNum)));
+        ++i;
+      }
+    }
+    // Each register's copy takes its next value: the thread's own, issued,
+    // for its first layer, the copy's for the later ones.
+    DenseMap<unsigned, Value> dataCopy;
+    auto copiedData = [&](unsigned ri) {
+      auto &v = dataCopy[ri];
+      if (!v)
+        v = overCopy(registers[ri].data);
+      return v;
+    };
+    for (auto &[ri, next] : copyNexts) {
+      auto &reg = registers[ri];
+      SmallVector<std::tuple<Value, unsigned, unsigned>> runs;
+      for (unsigned bit = 0; bit < reg.layer.size(); ++bit) {
+        bool later = reg.layer[bit] > 1 && reg.pipeline[bit] == pi;
+        bool first = reg.layer[bit] == 1 && reg.pipeline[bit] == pi;
+        addBit(runs,
+               later ? copiedData(ri)
+                     : first ? issueCopy(reg.data) : reg.data,
+               bit);
+      }
+      next.setValue(fromRuns(b, runs));
+    }
+    if (cloneFailed)
+      return failure();
+
+    // The stored word, from the copy.
+    SmallVector<std::tuple<Value, unsigned, unsigned>> runs;
+    for (auto &bit : words[pi]) {
+      if (bit.box >= 0)
+        addBit(runs, copies[bit.result], bit.bit);
+      else if (stored)
+        addBit(runs, copies[registers[bit.reg].reg.getResult()], bit.bit);
+      else
+        addBit(runs, copiedData(bit.reg), bit.bit);
+    }
+    Value word = fromRuns(b, runs);
+
+    // The tags, along with the copy, and the registered write.
+    Value valid = p.enable ? Value(comb::AndOp::create(b, foldEdge, p.enable))
+                           : foldEdge;
+    Value slotTag = slot, threadTag = foldThread;
+    for (unsigned k = 1; k <= out + 1; ++k) {
+      valid = hostReg(valid, prefix + "_valid" + Twine(k), /*cleared=*/true);
+      slotTag = hostReg(slotTag, prefix + "_slot" + Twine(k));
+      threadTag = hostReg(threadTag, prefix + "_thread" + Twine(k));
+    }
+    Value data = hostReg(word, prefix + "_wdata");
+    folds.push_back({store, {}, slotTag, threadTag, valid, data});
+  }
+
+  // The target: each register of a pipeline keeps its bits that stay (the
+  // last layer, now taking its next value from the store, and bits of no
+  // pipeline); a stored last layer is read from the store; the other layers
+  // are gone.
+  auto zeroBits = [&](unsigned count) {
+    return hw::ConstantOp::create(b, b.getIntegerType(count), 0);
+  };
+  for (auto [ri, reg] : llvm::enumerate(registers)) {
+    auto width = unsigned(reg.layer.size());
+    SmallVector<unsigned> kept, other;
+    for (unsigned bit = 0; bit < width; ++bit) {
+      if (!reg.layer[bit])
+        other.push_back(bit);
+      else if (!pipelines[reg.pipeline[bit]].lastLayerStored &&
+               reg.layer[bit] == pipelines[reg.pipeline[bit]].layers)
+        kept.push_back(bit);
+    }
+    auto name = reg.reg.getName();
+    Value keptReg, otherReg;
+    if (!kept.empty()) {
+      SmallVector<std::tuple<Value, unsigned, unsigned>> runs;
+      for (auto bit : kept)
+        addBit(runs, storeRead[reg.pipeline[bit]], regBitAt[{ri, bit}]);
+      Value data = fromRuns(b, runs);
+      auto next = foldEdges->get(data.getType());
+      keptReg = seq::FirRegOp::create(b, next, reg.reg.getClk(),
+                                      b.getStringAttr(name));
+      next.setValue(reg.enable
+                        ? Value(comb::MuxOp::create(b, reg.enable, data,
+                                                    keptReg))
+                        : data);
+    }
+    if (!other.empty()) {
+      SmallVector<std::tuple<Value, unsigned, unsigned>> runs;
+      for (auto bit : other)
+        addBit(runs, reg.reg.getNext(), bit);
+      auto next = foldEdges->get(b.getIntegerType(other.size()));
+      otherReg = seq::FirRegOp::create(b, next, reg.reg.getClk(),
+                                       b.getStringAttr(name));
+      next.setValue(fromRuns(b, runs));
+    }
+    // The register's value, from the bits that stay, the store and zeros
+    // for the bits only the pipeline read.
+    SmallVector<std::tuple<Value, unsigned, unsigned>> runs;
+    Value zeros = zeroBits(width);
+    unsigned k = 0, o = 0;
+    for (unsigned bit = 0; bit < width; ++bit) {
+      if (!reg.layer[bit]) {
+        addBit(runs, otherReg, o++);
+        continue;
+      }
+      auto &p = pipelines[reg.pipeline[bit]];
+      if (reg.layer[bit] != p.layers)
+        addBit(runs, zeros, bit);
+      else if (p.lastLayerStored)
+        addBit(runs, storeRead[reg.pipeline[bit]], regBitAt[{ri, bit}]);
+      else
+        addBit(runs, keptReg, k++);
+    }
+    Value value = castBits(b, fromRuns(b, runs), reg.reg.getType());
+    reg.reg.getResult().replaceAllUsesWith(value);
+    reg.reg.erase();
+  }
+  for (auto [bi, box] : llvm::enumerate(boxes)) {
+    auto &p = pipelines[boxPipeline[bi]];
+    for (auto result : box.inst.getResults()) {
+      if (result.use_empty())
+        continue;
+      auto w = hw::getBitWidth(result.getType());
+      SmallVector<std::tuple<Value, unsigned, unsigned>> runs;
+      if (box.outLayer == p.layers) {
+        for (int64_t k = 0; k < w; ++k)
+          addBit(runs, storeRead[boxPipeline[bi]],
+                 boxBitAt[{result, unsigned(k)}]);
+        result.replaceAllUsesWith(
+            castBits(b, fromRuns(b, runs), result.getType()));
+      } else {
+        result.replaceAllUsesWith(castBits(b, zeroBits(w), result.getType()));
+      }
+    }
+    box.inst.erase();
+  }
+
+  // What only the pipelines' registers used, and the analysis' peeled
+  // writes, are dead.
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (auto &op : llvm::make_early_inc_range(llvm::reverse(*body))) {
+      if (physical.contains(&op) || !op.use_empty() || op.getNumResults() == 0)
+        continue;
+      if (inCone(&op) || isa<seq::FromClockOp>(op)) {
+        op.erase();
+        changed = true;
+      }
+    }
+  }
+  return success();
+}
+
+LogicalResult Threader::finishFolds(ImplicitLocOpBuilder &b, Value edge,
+                                    Value hostReset) {
+  if (!separatesFinishes)
+    return model.emitError("fold-pipelines: the scheduler of '")
+           << model.getName()
+           << "' may make a thread that finishes current on the next host "
+              "cycle, which folded pipelines cannot follow";
+  for (auto &fold : folds) {
+    auto port = seq::FirMemWriteOp::create(
+        b, fold.threadedStore,
+        b.createOrFold<comb::ConcatOp>(fold.slot, fold.thread), hostClock,
+        fold.valid, fold.data, Value{});
+    (void)port;
+  }
+  physClock.setValue(hostClock);
+  foldThread.setValue(threadIdx);
+  foldEdge.setValue(edge);
+  foldReset.setValue(hostReset);
+
+  // The folding is exact because a thread that finishes is never current on
+  // the next host cycle: checked in simulation, so that a scheduler that
+  // breaks it does not go unnoticed.
+  auto i1 = b.getI1Type();
+  auto top = model->getParentOfType<ModuleOp>();
+  if (!top.lookupSymbol<sv::MacroDeclOp>("SYNTHESIS")) {
+    OpBuilder tb(top.getBody(), top.getBody()->begin());
+    sv::MacroDeclOp::create(tb, model.getLoc(), "SYNTHESIS");
+  }
+  auto zero = b.getIntegerAttr(i1, 0);
+  Value lastEdge = seq::FirRegOp::create(
+      b, edge, hostClock, b.getStringAttr("fold_last_edge"), hostReset,
+      hw::ConstantOp::create(b, i1, 0), hw::InnerSymAttr{}, false, zero);
+  Value lastThread = seq::FirRegOp::create(
+      b, threadIdx, hostClock, b.getStringAttr("fold_last_thread"));
+  Value again = comb::AndOp::create(
+      b, lastEdge,
+      comb::ICmpOp::create(b, comb::ICmpPredicate::eq, lastThread, threadIdx));
+  Value clock = seq::FromClockOp::create(b, hostClock);
+  sv::IfDefOp::create(
+      b, "SYNTHESIS", [] {},
+      [&] {
+        sv::AlwaysOp::create(b, ArrayRef{sv::EventControl::AtPosEdge},
+                             ArrayRef{clock}, [&] {
+          sv::IfOp::create(b, again, [&] {
+            sv::FatalProceduralOp::create(
+                b, 1,
+                b.getStringAttr("foldsim: a thread is current on the host "
+                                "cycle after its edge; folded pipelines "
+                                "need it never to be"));
+          });
+        });
+      });
+  return success();
+}
+
 LogicalResult Threader::run() {
+  if (foldPipelines && failed(prepareFolds()))
+    return failure();
   if (failed(checkModel()))
     return failure();
   computeDeps();
@@ -1682,7 +2266,7 @@ LogicalResult Threader::run() {
     Value next = reg.getNext();
     if (reg.getReset())
       next = comb::MuxOp::create(b, reg.getReset(), reg.getResetValue(), next);
-    auto write = peelHolds(b, next, reg.getResult());
+    auto write = foldsim::peelHolds(b, next, reg.getResult());
     // Written every cycle: the next value as it is.
     if (!write.holds && !write.enable)
       write.data = next;
@@ -1785,6 +2369,8 @@ LogicalResult Threader::run() {
         hw::InnerSymAttr{}, seq::FirMemInitAttr{}, memory.getPrefixAttr(),
         memory.getOutputFileAttr());
     threadedMemory->setDialectAttrs(memory->getDialectAttrs());
+    if (auto fold = foldOfStore.find(memory); fold != foldOfStore.end())
+      folds[fold->second].threadedStore = threadedMemory;
     unsigned addrWidth = llvm::Log2_64_Ceil(depth) - idxWidth;
     Value lastLow;
     auto addressOf = [&](Value addr) -> Value {
@@ -1967,7 +2553,9 @@ LogicalResult Threader::run() {
       idxNext.setValue(aheadIdx);
     auto &chosen = aheadIdx ? aheadNext : idxNext;
     if (!threadReady) {
+      // The next in turn is another thread.
       chosen.setValue(inTurn);
+      separatesFinishes = true;
     } else {
       // A thread finishing now takes its inputs: it is not ready next.
       auto vecType = b.getIntegerType(threads);
@@ -2022,7 +2610,9 @@ LogicalResult Threader::run() {
         fallback = comb::MuxOp::create(b, any(allowedAfter),
                                        lowest(allowedAfter), lowest(allowed));
       }
-      // In turn while the threads are initialized.
+      // A thread finishing now is not ready, and the fallbacks are other
+      // threads: in turn while the threads are initialized, too.
+      separatesFinishes = true;
       chosen.setValue(comb::MuxOp::create(
           b, sweeping, inTurn,
           comb::MuxOp::create(
@@ -2086,6 +2676,9 @@ LogicalResult Threader::run() {
   } else if (failed(enableOnHostClock(b, targetClock, enable))) {
     return failure();
   }
+
+  if (foldEdges && failed(finishFolds(b, enable, hostReset)))
+    return failure();
 
   SmallVector<Value> results;
   if (clockBits)
@@ -2239,7 +2832,7 @@ void FAME5Pass::runOnOperation() {
     return signalPassFailure();
   }
   if ((regionLoads || registeredState || commitSelect || stagedRamWrites ||
-       pipelineMultipliers || compactStaging) &&
+       pipelineMultipliers || compactStaging || foldPipelines) &&
       !clockEnable) {
     model.emitError("regions are for state written with `clock-enable`");
     return signalPassFailure();
@@ -2251,7 +2844,7 @@ void FAME5Pass::runOnOperation() {
                                              stateStages, commitSelect,
                                              stagedRamWrites,
                                              pipelineMultipliers,
-                                             compactStaging})
+                                             compactStaging, foldPipelines})
                  .run()))
     return signalPassFailure();
 }

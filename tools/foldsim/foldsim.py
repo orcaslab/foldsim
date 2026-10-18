@@ -142,6 +142,9 @@ def main():
     ap.add_argument('--compact-staging', action='store_true',
                     help='with regions: staging located at its state, staged write '
                          'enables without preset (foldsim-fame5)')
+    ap.add_argument('--fold-pipelines', action='store_true',
+                    help='simulate fixed-latency pipelines by an unthreaded copy and a '
+                         'per-thread store of their results (foldsim-fame5)')
     ap.add_argument('--channel-depth', type=int, default=2,
                     help='slots per producer thread of each channel (foldsim-compose)')
     ap.add_argument('--staged-tokens', action='store_true',
@@ -235,6 +238,8 @@ def main():
         compose += ' pipeline-multipliers'
     if a.compact_staging:
         compose += ' compact-staging'
+    if a.fold_pipelines:
+        compose += ' fold-pipelines'
     if a.channel_depth != 2:
         compose += f' channel-depth={a.channel_depth}'
     if a.relay:
