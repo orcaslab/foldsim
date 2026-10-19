@@ -2,7 +2,8 @@
 // simulator (`foldsim_sim`) on the same input tokens, the simulator with
 // random stalls of every input and output channel, and compares each
 // output's tokens from cycle W on, once every stage of the model holds
-// values of its inputs (enables and valids high, reset, in the first cycles).
+// values of its inputs (enables and valids high, reset, in the first cycles);
+// the target resets again in mid-run.
 // `N` instances; prints MATCH or the first difference.
 `ifndef N
 `define N 4
@@ -14,7 +15,8 @@ module tb;
     x ^= x >> 15; x *= 32'h2c1b3c6d; x ^= x >> 12;
     return x;
   endfunction
-  function automatic logic stim_reset(int t); return t < 4; endfunction
+  // Reset at the start and again in mid-run, with items in the pipelines.
+  function automatic logic stim_reset(int t); return t < 4 || (t >= 50 && t < 52); endfunction
   function automatic logic [7:0] stim_a(int t); return mix(t, 1)[7:0]; endfunction
   function automatic logic [N-1:0] stim_en(int t);
     return t < 8 ? '1 : mix(t, 2)[N-1:0] | mix(t, 4)[N-1:0];
