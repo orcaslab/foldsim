@@ -940,6 +940,10 @@ LogicalResult foldsim::PipelineAnalysis::run(ImplicitLocOpBuilder &b) {
           if (extra.size() > 1 ||
               (extra.size() == 1 && !extra[0].getType().isInteger(1)))
             violate(n, "enable not the pipeline's and one gate");
+          // A gated box holds its items through the gate's bubbles, so its
+          // latency follows later valids; the copy runs it ungated.
+          else if (extra.size() == 1 && nodes[n].box >= 0)
+            violate(n, "black box with a gate on its enable");
           else if (extra.size() == 1)
             gate[n] = extra[0];
         }

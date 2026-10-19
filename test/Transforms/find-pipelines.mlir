@@ -1,4 +1,4 @@
-// RUN: foldsim-opt %s --foldsim-find-pipelines="models=Ok=4,Short=4,Gated=4,Box=4,BoxOut=4,Feedback=4,MixedEnables=4,Unbalanced=4,ReadEarly=4,BadGate=4" | FileCheck %s
+// RUN: foldsim-opt %s --foldsim-find-pipelines="models=Ok=4,Short=4,Gated=4,Box=4,BoxOut=4,Feedback=4,MixedEnables=4,Unbalanced=4,ReadEarly=4,BadGate=4,GatedBox=4" | FileCheck %s
 
 // Four stages on one enable: folded, the last layer staying.
 // CHECK-LABEL: model Ok threads 4
@@ -166,4 +166,33 @@ hw.module @BadGate(in %clk : !seq.clock, in %en : i1, in %v : i1, in %w : i1, in
   %n3 = comb.mux %g2, %s2, %s3 : i8
   %s3 = seq.firreg %n3 clock %clk : i8
   hw.output %s3 : i8
+}
+
+// A gated pipeline with a black box in the middle whose enable is gated by
+// the valid of its first layer: the box holds its items through the bubbles,
+// so its latency follows later valids. It is left out, not folded ungated.
+// CHECK-LABEL: model GatedBox threads 4
+// CHECK-NOT: boxes=1
+// CHECK: left out: black box with a gate on its enable
+hw.module @GatedBox(in %clk : !seq.clock, in %reset : i1, in %en : i1, in %v : i1, in %a : i8, out y : i8, out yv : i1) {
+  %c0_i5 = hw.constant 0 : i5
+  %c1 = hw.constant 1 : i8
+  %true = hw.constant true
+  %lo = comb.extract %vr from 0 : (i5) -> i4
+  %sh = comb.concat %lo, %v : i4, i1
+  %vm = comb.mux %en, %sh, %vr : i5
+  %vn = comb.mux %reset, %c0_i5, %vm : i5
+  %vr = seq.firreg %vn clock %clk : i5
+  %v0 = comb.extract %vr from 0 : (i5) -> i1
+  %v4 = comb.extract %vr from 4 : (i5) -> i1
+  %g1 = comb.and %en, %v : i1
+  %gb = comb.and %en, %v0 : i1
+  %g6 = comb.and %en, %v4 : i1
+  %u1 = comb.add %a, %c1 : i8
+  %n1 = comb.mux %g1, %u1, %t1 : i8
+  %t1 = seq.firreg %n1 clock %clk : i8
+  %q, %qv = hw.instance "box" @XBox(clk: %clk: !seq.clock, ce: %gb: i1, d: %t1: i8, d_valid: %true: i1) -> (q: i8, q_valid: i1)
+  %n6 = comb.mux %g6, %q, %t6 : i8
+  %t6 = seq.firreg %n6 clock %clk : i8
+  hw.output %t6, %v4 : i8, i1
 }
