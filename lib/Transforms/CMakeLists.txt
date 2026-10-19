@@ -6,6 +6,7 @@ add_mlir_library(FoldsimTransforms
   FindPipelines.cpp
   FuseModels.cpp
   Pipelines.cpp
+  Sort.cpp
 
   DEPENDS
   FoldsimPassesIncGen

@@ -326,6 +326,15 @@ def BlackBoxes : Pass<"foldsim-black-boxes", "::mlir::ModuleOp"> {
   let dependentDialects = ["circt::hw::HWDialect"];
 }
 
+def Sort : Pass<"foldsim-sort"> {
+  let summary = "Sort graph regions topologically, in linear time";
+  let description = [{
+    Orders the ops of each block of a region without SSA dominance as
+    `topological-sort` does -- the same order -- in O((n + e) log n) rather
+    than a scan of the block per register loop.
+  }];
+}
+
 def FindPipelines : Pass<"foldsim-find-pipelines", "::mlir::ModuleOp"> {
   let summary = "Report the fixed-latency pipelines of each model";
   let description = [{

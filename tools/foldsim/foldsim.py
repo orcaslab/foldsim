@@ -37,7 +37,7 @@ import sys
 # first in a module body.
 OPTIMIZE = ['hw.module(hw-expand-array-writes)', 'hw.module(seq-reg-const-prop)',
             'hw.module(comb-share-adders)', 'canonicalize', 'hw.module(comb-low-bits-narrowing)',
-            'canonicalize', 'topological-sort', 'cse']
+            'canonicalize', 'foldsim-sort', 'cse']
 
 # Logic of up to this many ops that drives a model's input from other models
 # is computed in the model, so the input comes from them directly rather than
@@ -263,7 +263,7 @@ def main():
     if a.staged_tokens:
         compose += ' staged-tokens'
     pipeline = passes + OPTIMIZE + [f'foldsim-compose{{{compose}}}',
-                                    'canonicalize', 'topological-sort', 'cse']
+                                    'canonicalize', 'foldsim-sort', 'cse']
     sim = out('foldsim_sim.mlir')
     run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(pipeline)})', '-o', sim])
     sim_text = open(sim).read()
