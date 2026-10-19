@@ -44,6 +44,16 @@ using namespace circt;
 
 namespace {
 
+/// On state a relay or staged tokens add: the side of the channel it belongs
+/// to, 1 the producer's and 2 the consumer's. Domains place it by this.
+constexpr llvm::StringLiteral kRelaySide = "foldsim.relay_side";
+
+Value onSide(Value value, int side) {
+  value.getDefiningOp()->setAttr(
+      kRelaySide, IntegerAttr::get(IntegerType::get(value.getContext(), 32), side));
+  return value;
+}
+
 struct ComposePass
     : public foldsim::impl::ComposeBase<ComposePass> {
   using ComposeBase::ComposeBase;
@@ -540,6 +550,8 @@ Value Composer::tokenMemory(Producer &producer, unsigned low, unsigned width,
         b, loc, type, /*readLatency=*/0, /*writeLatency=*/1,
         seq::RUW::Undefined, seq::WUW::Undefined, b.getStringAttr(name),
         hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, StringAttr{});
+    if (producer.relay)
+      onSide(mem, 2);
     Value data = producer.writeData;
     if (width != producer.width)
       data = b.createOrFold<comb::ExtractOp>(loc, b.getIntegerType(width), data,
@@ -785,10 +797,11 @@ LogicalResult Composer::build() {
           continue;
         }
         auto &producer = producers[piece.producer];
-        deq.push_back(counter(consumer.name +
+        Value count = counter(consumer.name +
                                   (producer.relay ? "_rdeq" : "_deq") +
                                   Twine(t) + "_" + Twine(j),
-                              llvm::Log2_32(producer.depth) + 1));
+                              llvm::Log2_32(producer.depth) + 1);
+        deq.push_back(producer.relay ? onSide(count, 2) : count);
       }
     }
   }
@@ -798,10 +811,12 @@ LogicalResult Composer::build() {
     auto source = sourceOf(p);
     unsigned numSlots = producer.depth;
     unsigned countBits = llvm::Log2_32(numSlots) + 1;
-    for (unsigned k = 0; k < producer.threads; ++k)
-      producer.enq.push_back(
+    for (unsigned k = 0; k < producer.threads; ++k) {
+      Value count =
           counter(producer.name + (producer.relay ? "_renq" : "_enq") + Twine(k),
-                  countBits));
+                  countBits);
+      producer.enq.push_back(producer.relay ? onSide(count, 1) : count);
+    }
     // Ready while every reader of the thread has read all but one token; with
     // a relay, while the reader's count of a host cycle ago leaves a slot.
     SmallVector<SmallVector<Value>> notFull(producer.threads);
@@ -810,8 +825,9 @@ LogicalResult Composer::build() {
       auto &piece = consumer.pieces[read.thread][read.piece];
       Value deq = consumer.deq[read.thread][read.piece];
       if (producer.relay)
-        deq = delayed(deq, consumer.name + "_deqd" + Twine(read.thread) + "_" +
-                               Twine(read.piece));
+        deq = onSide(delayed(deq, consumer.name + "_deqd" + Twine(read.thread) +
+                                      "_" + Twine(read.piece)),
+                     1);
       Value count = comb::SubOp::create(b, producer.enq[piece.thread], deq);
       notFull[piece.thread].push_back(
           comb::ICmpOp::create(b, comb::ICmpPredicate::ne, count,
@@ -842,12 +858,15 @@ LogicalResult Composer::build() {
     if (producer.memory || producer.relay || producer.staged)
       writeSlot = slotOf(select(producer.enq, source.thread));
     if (producer.relay || producer.staged) {
-      writeFire = delayed(fire, producer.name + "_stg_fire");
+      writeFire = onSide(delayed(fire, producer.name + "_stg_fire"), 1);
       if (source.thread)
-        writeThread = delayed(source.thread, producer.name + "_stg_thread");
-      writeSlot = delayed(writeSlot, producer.name + "_stg_slot");
-      writeBits = seq::FirRegOp::create(b, source.bits, hostClock,
-                                        b.getStringAttr(producer.name + "_stg_bits"));
+        writeThread =
+            onSide(delayed(source.thread, producer.name + "_stg_thread"), 1);
+      writeSlot = onSide(delayed(writeSlot, producer.name + "_stg_slot"), 1);
+      writeBits = onSide(seq::FirRegOp::create(
+                             b, source.bits, hostClock,
+                             b.getStringAttr(producer.name + "_stg_bits")),
+                         1);
     }
     if (producer.staged) {
       producer.stagedFire = writeFire;
@@ -880,7 +899,7 @@ LogicalResult Composer::build() {
                 : Value(comb::XorOp::create(b, slot, bit(true)));
         Value here = comb::AndOp::create(b, write, at);
         next.setValue(comb::MuxOp::create(b, here, writeBits, reg));
-        slots.push_back(reg);
+        slots.push_back(producer.relay ? onSide(reg, 2) : Value(reg));
       }
     }
   }
@@ -894,8 +913,9 @@ LogicalResult Composer::build() {
       return producer.enq[k];
     auto &copy = enqCopies[{c, p, k}];
     if (!copy)
-      copy = delayed(producer.enq[k], consumers[c].name + "_enqd_" +
-                                          producer.name + "_" + Twine(k));
+      copy = onSide(delayed(producer.enq[k], consumers[c].name + "_enqd_" +
+                                                 producer.name + "_" + Twine(k)),
+                    2);
     return copy;
   };
 
@@ -1186,9 +1206,8 @@ LogicalResult Composer::emitDomains() {
   for (auto &op : body->without_terminator())
     ops.push_back(&op);
 
-  // The models an op is connected to: through anything but a model
-  // (`throughState`), or through combinational logic only.
-  auto cones = [&](bool throughState, auto stops, DenseMap<Operation *, Mask> &in,
+  // The models an op is connected to, through whatever `stops` does not stop.
+  auto cones = [&](auto stops, DenseMap<Operation *, Mask> &in,
                    DenseMap<Operation *, Mask> &out) {
     auto sourceMask = [&](Value v, DenseMap<Operation *, Mask> &table) -> Mask {
       if (v == clock || v == reset)
@@ -1233,7 +1252,6 @@ LogicalResult Composer::emitDomains() {
         }
       }
     }
-    (void)throughState;
   };
   // A memory goes with its ports.
   DenseMap<Operation *, Operation *> memoryOf;
@@ -1249,7 +1267,7 @@ LogicalResult Composer::emitDomains() {
   // Through the state: a channel's state and logic go to the LCA of the
   // models it connects.
   DenseMap<Operation *, Mask> fanIn, fanOut;
-  cones(true, [](Operation *) { return false; }, fanIn, fanOut);
+  cones([](Operation *) { return false; }, fanIn, fanOut);
   DenseMap<Operation *, Mask> groupMask;
   for (auto *op : ops)
     if (auto *memory = memoryOf.lookup(op))
@@ -1266,21 +1284,16 @@ LogicalResult Composer::emitDomains() {
   // Behind a relay, a channel's state is on its producer's or its
   // consumer's side, and logic goes next to what it drives; a staged token's
   // staging is on its producer's.
-  auto relaySide = [](StringRef name) -> int {
-    for (auto key : {"_renq", "_deqd", "_stg_"})
-      if (name.contains(key))
-        return 1;
-    for (auto key : {"_rdeq", "_enqd_", "_rslot", "_rtokens"})
-      if (name.contains(key))
-        return 2;
-    return 0;
+  auto relaySide = [](Operation *op) -> int {
+    auto side = op->getAttrOfType<IntegerAttr>(kRelaySide);
+    return side ? side.getInt() : 0;
   };
   // Staged tokens stage their producer's side the same way.
   bool anyRelay =
       llvm::any_of(producers, [](auto &p) { return p.relay || p.staged; });
   if (anyRelay) {
     DenseMap<Operation *, Mask> combIn, combOut;
-    cones(false, [&](Operation *op) { return isState(op) && !isa<seq::FirMemReadOp>(op); },
+    cones([&](Operation *op) { return isState(op) && !isa<seq::FirMemReadOp>(op); },
           combIn, combOut);
     auto combSources = [&](Operation *op) {
       Mask m = 0;
@@ -1313,12 +1326,12 @@ LogicalResult Composer::emitDomains() {
       auto reg = dyn_cast<seq::FirRegOp>(op);
       if (!reg)
         continue;
-      if (int side = relaySide(reg.getName()))
+      if (int side = relaySide(op))
         domainOf[op] = lca(side == 1 ? combSources(op) : combSinks(op));
     }
     for (auto *op : ops) {
       auto memory = dyn_cast<seq::FirMemOp>(op);
-      if (!memory || !relaySide(memory.getName().value_or("")))
+      if (!memory || !relaySide(op))
         continue;
       Mask m = 0;
       for (auto *user : memory->getUsers())
@@ -1335,10 +1348,10 @@ LogicalResult Composer::emitDomains() {
     DenseSet<Operation *> relayState;
     for (auto *op : ops) {
       if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
-        if (relaySide(reg.getName()))
+        if (relaySide(reg))
           relayState.insert(op);
       } else if (auto *memory = memoryOf.lookup(op)) {
-        if (relaySide(cast<seq::FirMemOp>(memory).getName().value_or("")))
+        if (relaySide(memory))
           relayState.insert(op);
       }
     }
@@ -1612,6 +1625,7 @@ LogicalResult Composer::run() {
   netlist.erase();
   for (auto *op : inlined)
     op->erase();
+  top.walk([](Operation *op) { op->removeAttr(kRelaySide); });
   return success();
 }
 
