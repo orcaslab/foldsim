@@ -29,6 +29,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SetVector.h"
 #include "llvm/Support/Debug.h"
 #include <map>
 #include <numeric>
@@ -290,7 +291,7 @@ private:
   DenseSet<Operation *> physical;
   /// In a model of one thread, the black boxes with a pipeline contract: they
   /// stay instances, on the host clock and enabled on the target's edges.
-  DenseSet<Operation *> keptBoxes;
+  SetVector<Operation *> keptBoxes;
   std::unique_ptr<BackedgeBuilder> foldEdges;
   Backedge physClock, foldThread, foldEdge, foldReset;
   /// Whether the scheduler built never makes a thread that finishes current
