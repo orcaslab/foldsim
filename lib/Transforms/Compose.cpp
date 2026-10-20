@@ -165,8 +165,11 @@ struct NestOptions {
   int skew = -1;
   ArrayRef<std::string> offsets, copies;
   bool bankedTokens = false;
-  /// Turns from the parents' controllers rather than counters of their own.
-  bool tree = true;
+  /// Turns as the control tree plans them (each class's from its parent's
+  /// position), rather than counters of their own on a rotated numbering;
+  /// `wired`: brought by the parents' controllers, rather than counted by
+  /// each class from the start the tree plans.
+  bool tree = true, wired = false;
 };
 
 class Composer {
@@ -180,7 +183,8 @@ public:
         readySchedule(readySchedule), threadOptions(threadOptions),
         stagedTokens(stagedTokens), channelDepth(channelDepth),
         emitDomainTree(domains), nest(nesting.nest), nestSkew(nesting.skew),
-        bankedTokens(nesting.bankedTokens), treeControl(nesting.tree) {
+        bankedTokens(nesting.bankedTokens), treeControl(nesting.tree),
+        wiredControl(nesting.tree && nesting.wired) {
     for (auto &name : relay)
       relayModels.insert(name);
     for (auto &entry : nesting.offsets) {
@@ -243,6 +247,11 @@ private:
   /// With `nest`: whether the turns come from a control tree, each class's
   /// from its parent's controller, rather than from counters of their own.
   bool treeControl;
+  /// Whether the control tree's turns are wired, each class's position
+  /// brought by its parent's controller, rather than counted by each class
+  /// itself from the position the tree plans for it (the same positions on
+  /// the fixed, in-turn schedule nested folding has).
+  bool wiredControl;
   /// The threads and idle phases of each copy of a class of `threads`.
   unsigned copyThreads(StringRef base, unsigned threads) const {
     unsigned k = copiesOf.lookup(base);
@@ -258,7 +267,7 @@ private:
   /// state with several threads, or with idle phases under the control tree.
   unsigned leadOf(unsigned threads) const {
     return threadOptions.registeredState &&
-                   (threads > 1 || (treeControl && onePhases > 1))
+                   (threads > 1 || (wiredControl && onePhases > 1))
                ? 1
                : 0;
   }
@@ -453,6 +462,7 @@ LogicalResult Composer::collect() {
     auto name = StringAttr::get(top.getContext(), cls.name + "_threaded");
     if (!schedules.empty()) {
       options.externalSchedule = schedules[c].external;
+      options.localSchedule = !wiredControl && schedules[c].positions > 1;
       options.scheduleStart = schedules[c].start;
     }
     auto threaded = foldsim::threadModel(cls.model, cls.instances.size(), name,
@@ -842,7 +852,7 @@ LogicalResult Composer::alignThreads() {
                     : relayed(classes[pc].name, cls.name) ? 2 : 1;
       // The control tree's hop: a register per level, from the parent's
       // position register to the child's.
-      if (treeControl)
+      if (wiredControl)
         hop = std::max<int64_t>(
             hop, controlHop(classes[pc].name, classes[pc].instances.size(),
                             cls.name, n));
@@ -932,7 +942,7 @@ LogicalResult Composer::planSchedules() {
     plan.positions = uint64_t(n) * (n > 1 ? phasesOf(n) : onePhases);
     plan.lead = leadOf(n);
     plan.threads = n;
-    plan.external = plan.positions > 1;
+    plan.external = wiredControl && plan.positions > 1;
     auto parent = parentBaseOf.find(cls.base);
     if (parent == parentBaseOf.end())
       continue;
@@ -955,12 +965,12 @@ LogicalResult Composer::planSchedules() {
     auto &parent = schedules[plan.parent];
     int64_t delta = offset - offsetOf.lookup(classes[plan.parent].base);
     int64_t stages = delta + int64_t(parent.lead) - int64_t(plan.lead) - 1;
-    if (stages < 0)
+    if (wiredControl && stages < 0)
       return cls.instances[0].emitError("nest: the offset of '")
              << cls.name << "' from '" << classes[plan.parent].name << "' ("
              << delta << ") is shorter than the control's hop ("
              << delta - stages << ")";
-    plan.stages = stages;
+    plan.stages = std::max<int64_t>(stages, 0);
     if (plan.positions % parent.positions && parent.positions % plan.positions)
       return cls.instances[0].emitError("nest: the turn of '")
              << cls.name << "' (" << plan.positions
@@ -2494,12 +2504,14 @@ void ComposePass::runOnOperation() {
   nesting.offsets = nestOffsets;
   nesting.copies = copies;
   nesting.bankedTokens = bankedTokens;
-  if (nestControl != "tree" && nestControl != "counters") {
-    top.emitError("nest-control: '") << nestControl
-                                     << "' is neither tree nor counters";
+  if (nestControl != "local" && nestControl != "wired" &&
+      nestControl != "counters") {
+    top.emitError("nest-control: '")
+        << nestControl << "' is none of local, wired and counters";
     return signalPassFailure();
   }
-  nesting.tree = nestControl == "tree";
+  nesting.tree = nestControl != "counters";
+  nesting.wired = nestControl == "wired";
   if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
                           threadOptions, stagedTokens, channelDepth, domains,
                           nesting)

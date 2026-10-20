@@ -156,6 +156,7 @@ public:
         foldPipelines(options.foldPipelines),
         blockStateDepth(options.registeredState ? options.blockStateDepth : 0),
         externalSchedule(options.externalSchedule),
+        startGiven(options.externalSchedule || options.localSchedule),
         scheduleStart(options.scheduleStart),
         phases(threads == 1
                    ? (options.commitEnable && options.registeredState &&
@@ -299,6 +300,9 @@ private:
   /// Whether the turns come in on `schedule_next`, and the position on the
   /// host cycle after reset.
   bool externalSchedule;
+  /// Whether the position on the host cycle after reset is `scheduleStart`,
+  /// the model's turns brought from outside or counted from it.
+  bool startGiven;
   uint64_t scheduleStart;
   /// The bits of a position: the thread index's, then the phase's.
   unsigned positionWidth() const {
@@ -2498,7 +2502,7 @@ LogicalResult Threader::run() {
   if (threads > 1) {
     auto idxType = b.getIntegerType(llvm::Log2_32_Ceil(threads));
     idxNext = backedges.get(idxType);
-    idxReset = externalSchedule ? threadOfPosition(startNow) : 0;
+    idxReset = startGiven ? threadOfPosition(startNow) : 0;
     threadIdx = seq::FirRegOp::create(
         b, idxNext, hostClock, b.getStringAttr("threadIdx"), hostReset,
         hw::ConstantOp::create(b, idxType, idxReset), hw::InnerSymAttr{},
@@ -2528,7 +2532,7 @@ LogicalResult Threader::run() {
     auto phaseNext = backedges.get(i1);
     // Outside turns must start idle too: the state's preset is committed on
     // the host cycle after reset.
-    if (externalSchedule && phaseOfPosition(startNow) != 1) {
+    if (startGiven && phaseOfPosition(startNow) != 1) {
       model.emitError("a one-thread model committing by enable starts its "
                       "turns idle (schedule start ")
           << scheduleStart << ")";
@@ -2559,7 +2563,7 @@ LogicalResult Threader::run() {
     auto idxType = b.getIntegerType(llvm::Log2_32_Ceil(threads));
     // With idle slots the host cycle after the first is the first thread's
     // too, idle.
-    aheadReset = externalSchedule ? threadOfPosition(startNext)
+    aheadReset = startGiven ? threadOfPosition(startNext)
                  : phases > 1     ? 0
                                   : 1;
     aheadNext = backedges.get(idxType);
@@ -2570,8 +2574,8 @@ LogicalResult Threader::run() {
     if (phases > 1) {
       auto phaseType = b.getIntegerType(llvm::Log2_32(phases));
       aheadPhaseNext = backedges.get(phaseType);
-      aheadPhaseReset = externalSchedule ? phaseOfPosition(startNext) : 1;
-      uint64_t phaseReset = externalSchedule ? phaseOfPosition(startNow) : 0;
+      aheadPhaseReset = startGiven ? phaseOfPosition(startNext) : 1;
+      uint64_t phaseReset = startGiven ? phaseOfPosition(startNow) : 0;
       aheadPhase = seq::FirRegOp::create(
           b, aheadPhaseNext, hostClock, b.getStringAttr("phase_ahead"),
           hostReset, hw::ConstantOp::create(b, phaseType, aheadPhaseReset),

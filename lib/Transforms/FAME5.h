@@ -47,6 +47,10 @@ struct ThreadOptions {
   /// one's) out on `schedule`; `scheduleStart` is the position on the host
   /// cycle after reset.
   bool externalSchedule = false;
+  /// The model counts its turns itself, in turn, from `scheduleStart`: on a
+  /// fixed schedule the same positions outside turns would bring, with
+  /// nothing from outside feeding them.
+  bool localSchedule = false;
   uint64_t scheduleStart = 0;
 };
 /// How a register is written: never (it only holds its value), or with

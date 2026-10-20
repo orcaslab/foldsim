@@ -182,9 +182,11 @@ def main():
     ap.add_argument('--banked-tokens', action='store_true',
                     help="keep slots read per thread from several producers in memories "
                          "(foldsim-compose)")
-    ap.add_argument('--nest-control', choices=('tree', 'counters'), default='tree',
-                    help="with --nest: turns from the parents' controllers (a control tree) or "
-                         "from each class's own counter (foldsim-compose)")
+    ap.add_argument('--nest-control', choices=('local', 'wired', 'counters'), default='local',
+                    help="with --nest: the control tree's turns counted by each class from the "
+                         "position the tree plans (local), brought by the parents' controllers "
+                         "(wired), or each class's own counter on a rotated numbering "
+                         "(counters) (foldsim-compose)")
     ap.add_argument('--nest-offsets', default='',
                     help='with --nest: <model>:<cycles>,...: models current this many host '
                          'cycles after the nested order (foldsim-compose)')
@@ -307,7 +309,7 @@ def main():
         compose += ' nest'
         if a.nest_skew >= 0:
             compose += f' nest-skew={a.nest_skew}'
-        if a.nest_control != 'tree':
+        if a.nest_control != 'local':
             compose += f' nest-control={a.nest_control}'
         if a.nest_offsets:
             compose += f' nest-offsets={a.nest_offsets}'
