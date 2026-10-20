@@ -18,11 +18,14 @@
 // CHECK-DAG:     comb.mux [[XHIT]], %x_stg_bits, {{%.+}} : i8
 // A threaded producer read the same way by every thread of its reader keeps
 // its slots in a memory, written from the staged token, thread and slot; the
-// reader compares them with its own thread and slot.
+// reader compares them with its own thread and slot. Each copy of the memory
+// stages its own write enable and address, kept.
 // CHECK-DAG:     %Child_y_stg_fire = seq.firreg {{.*}} : i1
 // CHECK-DAG:     %Child_y_stg_thread = seq.firreg %Child_i.threadIdx clock %hostClock reset sync %hostReset, {{.*}} : i1
 // CHECK-DAG:     %Child_y_stg_bits = seq.firreg %Child_i.y_source_bits clock %hostClock : i8
-// CHECK-DAG:     seq.firmem.write_port %Child_y_tokens[{{%.+}}] = %Child_y_stg_bits, clock %hostClock enable %Child_y_stg_fire : <4 x 8>
+// CHECK-DAG:     %Child_y_tokens_we = seq.firreg {{%.+}} clock %hostClock reset sync %hostReset, {{%.+}} {sv.attributes = [#sv.attribute<"keep" = "\22true\22">]} : i1
+// CHECK-DAG:     %Child_y_tokens_wa = seq.firreg {{%.+}} clock %hostClock reset sync %hostReset, {{%.+}} {sv.attributes = [#sv.attribute<"keep" = "\22true\22">]} : i2
+// CHECK-DAG:     seq.firmem.write_port %Child_y_tokens[%Child_y_tokens_wa] = %Child_y_stg_bits, clock %hostClock enable %Child_y_tokens_we : <4 x 8>
 // CHECK-DAG:     [[READ:%.+]] = seq.firmem.read_port %Child_y_tokens[{{%.+}}], clock %hostClock enable {{%.+}} : <4 x 8>
 // CHECK-DAG:     [[YEQ:%.+]] = comb.icmp eq %Child_y_stg_slot, {{%.+}} : i1
 // CHECK-DAG:     [[YSLOT:%.+]] = comb.and %Child_y_stg_fire, [[YEQ]] : i1

@@ -119,6 +119,9 @@ struct Producer {
   };
   std::map<std::tuple<unsigned, unsigned, int>, Memories> mems;
   Value writeAddress, writeEnable, writeData;
+  /// Built, with slots in a memory written a host cycle late: the fire and
+  /// the address as the token is taken, from which each copy stages its own.
+  Value fireNow, addressNow;
   /// Behind a relay: the token as it is taken, from which a reader of some of
   /// its bits gets a staging register of its own bits.
   Value relayBits;
@@ -177,7 +180,7 @@ private:
 
   /// The read ports of a copy of a token memory.
   static constexpr unsigned kMaxReadPorts = 8;
-  Value hostClock;
+  Value hostClock, hostReset;
 
   ModuleOp top;
   hw::HWModuleOp netlist;
@@ -594,8 +597,26 @@ Value Composer::tokenMemory(Producer &producer, unsigned low, unsigned width,
       data = b.createOrFold<comb::ExtractOp>(loc, b.getIntegerType(width), data,
                                              low);
     }
-    seq::FirMemWriteOp::create(b, loc, mem, producer.writeAddress, hostClock,
-                               producer.writeEnable, data, Value{});
+    Value address = producer.writeAddress, enable = producer.writeEnable;
+    if (producer.fireNow) {
+      // Each copy stages its own write, kept: one staged write would drive
+      // every copy's write port, and the equal staged threads of every
+      // channel of a class merge into one register.
+      auto keep = sv::SVAttributeAttr::get(b.getContext(), "keep", R"("true")",
+                                           /*emitAsComment=*/false);
+      auto stage = [&](Value value, const Twine &stageName) -> Value {
+        auto type = value.getType();
+        auto reg = seq::FirRegOp::create(
+            b, loc, value, hostClock, b.getStringAttr(stageName), hostReset,
+            hw::ConstantOp::create(b, loc, type, 0));
+        sv::addSVAttributes(reg, {keep});
+        return onSide(reg, 1);
+      };
+      enable = stage(producer.fireNow, name + "_we");
+      address = stage(producer.addressNow, name + "_wa");
+    }
+    seq::FirMemWriteOp::create(b, loc, mem, address, hostClock, enable, data,
+                               Value{});
     memories.copies.push_back(mem);
   }
   return memories.copies.back();
@@ -691,7 +712,7 @@ LogicalResult Composer::build() {
   auto b = ImplicitLocOpBuilder::atBlockEnd(netlist.getLoc(), body);
   BackedgeBuilder backedges(b, netlist.getLoc());
   hostClock = body->getArgument(0);
-  Value hostReset = body->getArgument(1);
+  hostReset = body->getArgument(1);
   SmallVector<Value> outputs(numOut);
 
   auto constant = [&](const APInt &value) -> Value {
@@ -939,6 +960,10 @@ LogicalResult Composer::build() {
           writeBits = source.bits, writeSlot;
     if (producer.memory || producer.relay || producer.staged)
       writeSlot = slotOf(select(producer.enq, source.thread));
+    if (producer.memory && (producer.relay || producer.staged)) {
+      producer.fireNow = fire;
+      producer.addressNow = comb::ConcatOp::create(b, source.thread, writeSlot);
+    }
     if (producer.relay || producer.staged) {
       writeFire = onSide(delayed(fire, producer.name + "_stg_fire"), 1);
       if (source.thread)
