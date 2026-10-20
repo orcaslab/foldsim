@@ -119,6 +119,10 @@ struct Producer {
   };
   std::map<std::tuple<unsigned, unsigned, int>, Memories> mems;
   Value writeAddress, writeEnable, writeData;
+  /// Behind a relay: the token as it is taken, from which a reader of some of
+  /// its bits gets a staging register of its own bits.
+  Value relayBits;
+  std::map<std::pair<unsigned, unsigned>, Value> relaySlices;
   /// Built, with a staged write: the token being written, and its thread
   /// and slot.
   Value stagedFire, stagedThread, stagedSlot, stagedBits;
@@ -418,6 +422,19 @@ LogicalResult Composer::collect() {
                         return consumers[read.consumer].regular;
                       });
 
+  // A relayed model, or each of a pair, is a model of the netlist: a name
+  // that is not would leave the channels it means without their relay.
+  for (auto &entry : relayModels)
+    for (auto name : llvm::split(entry.getKey(), ':'))
+      if (llvm::none_of(classes, [&](auto &cls) { return cls.name == name; })) {
+        std::string known;
+        for (auto &cls : classes)
+          known += " " + cls.name;
+        return netlist.emitError("relay: '")
+               << name << "' is not a model of the netlist (models:" << known
+               << ")";
+      }
+
   // A channel between two models, one of them relayed, gets a relay stage.
   for (auto &producer : producers) {
     if (producer.cls < 0 || producer.direct || producer.reads.empty() ||
@@ -553,9 +570,26 @@ Value Composer::tokenMemory(Producer &producer, unsigned low, unsigned width,
     if (producer.relay)
       onSide(mem, 2);
     Value data = producer.writeData;
-    if (width != producer.width)
+    if (width != producer.width && producer.relayBits) {
+      // Behind a relay, the reader's bits are staged on the producer's side
+      // on their own: the relay carries them, not the whole token.
+      auto &staged = producer.relaySlices[{low, width}];
+      if (!staged)
+        staged = onSide(
+            seq::FirRegOp::create(
+                b, loc,
+                b.createOrFold<comb::ExtractOp>(loc, b.getIntegerType(width),
+                                                producer.relayBits, low),
+                hostClock,
+                b.getStringAttr(producer.name + "_stg_bits_" +
+                                std::to_string(low + width - 1) + "_" +
+                                std::to_string(low))),
+            1);
+      data = staged;
+    } else if (width != producer.width) {
       data = b.createOrFold<comb::ExtractOp>(loc, b.getIntegerType(width), data,
                                              low);
+    }
     seq::FirMemWriteOp::create(b, loc, mem, producer.writeAddress, hostClock,
                                producer.writeEnable, data, Value{});
     memories.copies.push_back(mem);
@@ -867,6 +901,8 @@ LogicalResult Composer::build() {
                              b, source.bits, hostClock,
                              b.getStringAttr(producer.name + "_stg_bits")),
                          1);
+      if (producer.relay)
+        producer.relayBits = source.bits;
     }
     if (producer.staged) {
       producer.stagedFire = writeFire;

@@ -32,6 +32,10 @@ hw.module @Top(in %clk : !seq.clock, in %reset : i1, in %x : i8, out z : i8) {
 }
 
 // RUN: foldsim-opt %s --foldsim-extract-models="module=Top models=Child netlist" --foldsim-compose="module=Top relay=Top_model:Child" | FileCheck %s --check-prefix=PAIR
+// A relay names models: a netlist's own is `<netlist>_model`, and a name
+// that is none is an error rather than a channel left without its relay.
+// RUN: not foldsim-opt %s --foldsim-extract-models="module=Top models=Child netlist" --foldsim-compose="module=Top relay=Top:Child" 2>&1 | FileCheck %s --check-prefix=BAD
+// BAD: relay: 'Top' is not a model of the netlist (models:
 // A pair relays the channels between the two models.
 // PAIR: %Top_model_a_a_renq0 = seq.firreg
 // PAIR: %Child_y_renq0 = seq.firreg
