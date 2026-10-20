@@ -30,10 +30,21 @@
 // and every threaded producer's slots are in memories.
 // RUN: FileCheck %s --check-prefix=BANK < %t/n/sim.mlir
 // BANK-NOT: L{{[12]}}_model_u{{[0-9]}}_x_slot
-// The relay is on the copies of L3 too.
+// The relay is on the copies of L3 too. With banked tokens as without, each
+// reading class has its own memories and slots on its side, a copy apart from
+// its original; the netlist's reset, read by relayed models, is relayed too.
 // RUN: FileCheck %s --check-prefix=RELAY < %t/d/sim.mlir
 // RELAY-DAG: L3_copy1_threaded
-// RELAY-DAG: _rtokens
+// RELAY-DAG: %L2_model_u0_x_rtokens_L3 = seq.firmem
+// RELAY-DAG: %L2_model_u1_x_rtokens_L3_copy1 = seq.firmem
+// RELAY-DAG: %L3_copy1_y_rtokens_L2_model = seq.firmem
+// RELAY-DAG: %L3_y_rtokens_L2_model = seq.firmem
+// RELAY-DAG: %reset_renq0 = seq.firreg
+// RELAY-DAG: %reset_rslot0_L3_0 = seq.firreg
+// RELAY-DAG: %reset_rslot0_L3_copy1_0 = seq.firreg
+// RELAY-DAG: %reset_rslot0_L2_model_0 = seq.firreg
+// RUN: FileCheck %s --check-prefix=SHARED < %t/d/sim.mlir
+// SHARED-NOT: {{%(reset|L3_y|L3_copy1_y)_slot}}
 
 // Three levels of two instances each; a level grants each child from all its
 // children's outputs of the same cycle, so a child's cycle depends on its
