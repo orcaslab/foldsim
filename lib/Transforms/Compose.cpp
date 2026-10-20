@@ -123,6 +123,12 @@ struct Producer {
   /// its bits gets a staging register of its own bits.
   Value relayBits;
   std::map<std::pair<unsigned, unsigned>, Value> relaySlices;
+  /// Built, behind a relay: the staged write, the whole token's bits, and
+  /// with slots in registers, each reading class's copies of the slots of the
+  /// bits it reads, by class, thread, low bit and width.
+  Value relayFire, relayThread, relaySlot, relayStaged;
+  std::map<std::tuple<int, unsigned, unsigned, unsigned>, SmallVector<Value>>
+      readerSlots;
   /// Built, with a staged write: the token being written, and its thread
   /// and slot.
   Value stagedFire, stagedThread, stagedSlot, stagedBits;
@@ -166,6 +172,8 @@ private:
   LogicalResult build();
   Value tokenMemory(Producer &producer, unsigned low, unsigned width,
                     int reader);
+  Value relaySlice(OpBuilder &b, Location loc, Producer &producer, unsigned low,
+                   unsigned width);
 
   /// The read ports of a copy of a token memory.
   static constexpr unsigned kMaxReadPorts = 8;
@@ -435,19 +443,29 @@ LogicalResult Composer::collect() {
                << ")";
       }
 
-  // A channel between two models, one of them relayed, gets a relay stage.
+  // A channel between two models, one of them relayed, gets a relay stage;
+  // so does one from the netlist's inputs a model named by a relay reads, alone
+  // or in a pair, which would otherwise reach it from the top unregistered.
+  llvm::StringSet<> relayNamed;
+  for (auto &entry : relayModels)
+    for (auto name : llvm::split(entry.getKey(), ':'))
+      relayNamed.insert(name);
   for (auto &producer : producers) {
-    if (producer.cls < 0 || producer.direct || producer.reads.empty() ||
+    if (producer.direct || producer.reads.empty() ||
         llvm::any_of(producer.reads, [&](auto &read) {
           return consumers[read.consumer].cls < 0;
         }))
       continue;
-    bool mine = relayModels.contains(classes[producer.cls].name);
+    bool mine =
+        producer.cls >= 0 && relayModels.contains(classes[producer.cls].name);
     producer.relay = llvm::any_of(producer.reads, [&](auto &read) {
       int c = consumers[read.consumer].cls;
       if (c == producer.cls)
         return false;
-      auto &p = classes[producer.cls].name, &q = classes[c].name;
+      auto &q = classes[c].name;
+      if (producer.cls < 0)
+        return relayNamed.contains(q);
+      auto &p = classes[producer.cls].name;
       return mine || relayModels.contains(q) ||
              relayModels.contains(p + ":" + q) ||
              relayModels.contains(q + ":" + p);
@@ -570,22 +588,8 @@ Value Composer::tokenMemory(Producer &producer, unsigned low, unsigned width,
     if (producer.relay)
       onSide(mem, 2);
     Value data = producer.writeData;
-    if (width != producer.width && producer.relayBits) {
-      // Behind a relay, the reader's bits are staged on the producer's side
-      // on their own: the relay carries them, not the whole token.
-      auto &staged = producer.relaySlices[{low, width}];
-      if (!staged)
-        staged = onSide(
-            seq::FirRegOp::create(
-                b, loc,
-                b.createOrFold<comb::ExtractOp>(loc, b.getIntegerType(width),
-                                                producer.relayBits, low),
-                hostClock,
-                b.getStringAttr(producer.name + "_stg_bits_" +
-                                std::to_string(low + width - 1) + "_" +
-                                std::to_string(low))),
-            1);
-      data = staged;
+    if (producer.relay) {
+      data = relaySlice(b, loc, producer, low, width);
     } else if (width != producer.width) {
       data = b.createOrFold<comb::ExtractOp>(loc, b.getIntegerType(width), data,
                                              low);
@@ -595,6 +599,28 @@ Value Composer::tokenMemory(Producer &producer, unsigned low, unsigned width,
     memories.copies.push_back(mem);
   }
   return memories.copies.back();
+}
+
+/// Behind a relay, the staged bits a reader reads: the whole token's, or the
+/// reader's bits staged on the producer's side on their own, so the relay
+/// carries them, not the whole token.
+Value Composer::relaySlice(OpBuilder &b, Location loc, Producer &producer,
+                           unsigned low, unsigned width) {
+  if (width == producer.width)
+    return producer.relayStaged;
+  auto &staged = producer.relaySlices[{low, width}];
+  if (!staged)
+    staged = onSide(
+        seq::FirRegOp::create(
+            b, loc,
+            b.createOrFold<comb::ExtractOp>(loc, b.getIntegerType(width),
+                                            producer.relayBits, low),
+            hostClock,
+            b.getStringAttr(producer.name + "_stg_bits_" +
+                            std::to_string(low + width - 1) + "_" +
+                            std::to_string(low))),
+        1);
+  return staged;
 }
 
 LogicalResult Composer::build() {
@@ -839,6 +865,28 @@ LogicalResult Composer::build() {
       }
     }
   }
+  // `numSlots` slot registers `<name>_<s>`, slot `slot` written with `data`
+  // on `write`.
+  auto slotRegisters = [&](const Twine &name, unsigned numSlots, Value write,
+                           Value slot, Value data) {
+    SmallVector<Value> slots;
+    unsigned slotBits = llvm::Log2_32(numSlots);
+    for (unsigned s = 0; s < numSlots; ++s) {
+      auto next = backedges.get(data.getType());
+      auto reg = seq::FirRegOp::create(b, next, hostClock,
+                                       b.getStringAttr(name + "_" + Twine(s)));
+      Value at =
+          numSlots > 2
+              ? Value(comb::ICmpOp::create(b, comb::ICmpPredicate::eq, slot,
+                                           constant(APInt(slotBits, s))))
+          : s ? slot
+              : Value(comb::XorOp::create(b, slot, bit(true)));
+      Value here = comb::AndOp::create(b, write, at);
+      next.setValue(comb::MuxOp::create(b, here, data, reg));
+      slots.push_back(reg);
+    }
+    return slots;
+  };
   for (auto [p, producer] : llvm::enumerate(producers)) {
     if (producer.direct)
       continue;
@@ -901,8 +949,13 @@ LogicalResult Composer::build() {
                              b, source.bits, hostClock,
                              b.getStringAttr(producer.name + "_stg_bits")),
                          1);
-      if (producer.relay)
+      if (producer.relay) {
         producer.relayBits = source.bits;
+        producer.relayStaged = writeBits;
+        producer.relayFire = writeFire;
+        producer.relayThread = source.thread ? writeThread : Value();
+        producer.relaySlot = writeSlot;
+      }
     }
     if (producer.staged) {
       producer.stagedFire = writeFire;
@@ -916,29 +969,37 @@ LogicalResult Composer::build() {
       producer.writeData = writeBits;
       continue;
     }
+    // Behind a relay, the slots are each reading class's own, built as read.
+    if (producer.relay)
+      continue;
     for (unsigned k = 0; k < producer.threads; ++k) {
-      auto &slots = producer.slots.emplace_back();
       Value write = comb::AndOp::create(b, writeFire, isThread(writeThread, k));
-      Value slot = producer.relay || producer.staged ? writeSlot
-                                                     : slotOf(producer.enq[k]);
-      for (unsigned s = 0; s < numSlots; ++s) {
-        auto next = backedges.get(writeBits.getType());
-        auto reg = seq::FirRegOp::create(
-            b, next, hostClock,
-            b.getStringAttr(producer.name + (producer.relay ? "_rslot" : "_slot") +
-                            Twine(k) + "_" + Twine(s)));
-        Value at =
-            numSlots > 2
-                ? Value(comb::ICmpOp::create(b, comb::ICmpPredicate::eq, slot,
-                                             constant(APInt(slotBits, s))))
-            : s ? slot
-                : Value(comb::XorOp::create(b, slot, bit(true)));
-        Value here = comb::AndOp::create(b, write, at);
-        next.setValue(comb::MuxOp::create(b, here, writeBits, reg));
-        slots.push_back(producer.relay ? onSide(reg, 2) : Value(reg));
-      }
+      Value slot = producer.staged ? writeSlot : slotOf(producer.enq[k]);
+      producer.slots.push_back(slotRegisters(producer.name + "_slot" + Twine(k),
+                                             numSlots, write, slot, writeBits));
     }
   }
+
+  // Behind a relay, a reading class's slots of thread `k`, of the bits from
+  // `low`: written from the staged token, on the reader's side.
+  auto readerSlots = [&](Producer &producer, int reader, unsigned k,
+                         unsigned low, unsigned width) -> ArrayRef<Value> {
+    auto &slots = producer.readerSlots[{reader, k, low, width}];
+    if (slots.empty()) {
+      Value data = relaySlice(b, b.getLoc(), producer, low, width);
+      Value write = comb::AndOp::create(b, producer.relayFire,
+                                        isThread(producer.relayThread, k));
+      std::string name = producer.name + "_rslot" + std::to_string(k);
+      if (width != producer.width)
+        name += "_" + std::to_string(low + width - 1) + "_" + std::to_string(low);
+      name += "_" + classes[reader].name;
+      slots = slotRegisters(name, producer.depth, write, producer.relaySlot,
+                            data);
+      for (auto reg : slots)
+        onSide(reg, 2);
+    }
+    return slots;
+  };
 
   // With a relay, each reader sees a producer thread's count a host cycle
   // late, from its own copy.
@@ -991,7 +1052,12 @@ LogicalResult Composer::build() {
       if (piece.producer < 0)
         return constant(piece.constant);
       auto &producer = producers[piece.producer];
-      auto &slots = producer.slots[piece.thread];
+      // A relay's slots are the reader's own, of the bits it reads.
+      unsigned low = producer.relay ? 0 : piece.low;
+      ArrayRef<Value> slots =
+          producer.relay ? readerSlots(producer, consumer.cls, piece.thread,
+                                       piece.low, piece.width)
+                         : ArrayRef<Value>(producer.slots[piece.thread]);
       Value data;
       if (producer.depth > 2) {
         Value slot = comb::ExtractOp::create(
@@ -1023,7 +1089,7 @@ LogicalResult Composer::build() {
         }
       }
       return b.createOrFold<comb::ExtractOp>(b.getIntegerType(piece.width),
-                                             data, piece.low);
+                                             data, low);
     };
     auto concat = [&](SmallVector<Value> parts) -> Value {
       if (parts.empty())
@@ -1627,7 +1693,7 @@ LogicalResult Composer::emitDomains() {
       for (auto &producer : producers) {
         if (!producer.relay)
           continue;
-        int pd = classDomain[producer.cls];
+        int pd = producer.cls < 0 ? topDomain : classDomain[producer.cls];
         for (auto &read : producer.reads) {
           int cd = classDomain[consumers[read.consumer].cls];
           auto inside = [&](int x) {

@@ -12,11 +12,15 @@
 // CHECK-DAG:     comb.icmp ne [[COUNT]], %c-4_i3{{.*}} : i3
 // CHECK-DAG:     %Top_model_a_a_stg_fire = seq.firreg
 // CHECK-DAG:     %Top_model_a_a_stg_bits = seq.firreg %Top_model_i.a_a_source_bits clock %hostClock : i8
-// CHECK-DAG:     %Top_model_a_a_rslot0_3 = seq.firreg {{.*}} : i8
+// The reading class has its own slots.
+// CHECK-DAG:     %Top_model_a_a_rslot0_Child_3 = seq.firreg {{.*}} : i8
 // CHECK-DAG:     %Child_a_enqd_Top_model_a_a_0 = seq.firreg %Top_model_a_a_renq0 clock %hostClock reset sync %hostReset, {{.*}} : i3
 // CHECK-DAG:     comb.icmp ne %Child_a_enqd_Top_model_a_a_0, %Child_a_rdeq0_0 : i3
-// A channel from the netlist's inputs is not relayed.
-// CHECK-DAG:     %reset_enq0 = seq.firreg {{.*}} : i2
+// So is a channel from the netlist's inputs a relayed model reads: it would
+// otherwise reach the model from the top unregistered.
+// CHECK-DAG:     %reset_renq0 = seq.firreg {{.*}} : i3
+// CHECK-DAG:     %reset_stg_bits = seq.firreg %reset_bits clock %hostClock : i1
+// CHECK-DAG:     %reset_rslot0_Child_3 = seq.firreg {{.*}} : i1
 hw.module @Child(in %clk : !seq.clock, in %reset : i1, in %a : i8, out y : i8) {
   %c0 = hw.constant 0 : i8
   %s = comb.add %a, %r : i8
@@ -37,5 +41,6 @@ hw.module @Top(in %clk : !seq.clock, in %reset : i1, in %x : i8, out z : i8) {
 // RUN: not foldsim-opt %s --foldsim-extract-models="module=Top models=Child netlist" --foldsim-compose="module=Top relay=Top:Child" 2>&1 | FileCheck %s --check-prefix=BAD
 // BAD: relay: 'Top' is not a model of the netlist (models:
 // A pair relays the channels between the two models.
-// PAIR: %Top_model_a_a_renq0 = seq.firreg
-// PAIR: %Child_y_renq0 = seq.firreg
+// PAIR-DAG: %reset_renq0 = seq.firreg
+// PAIR-DAG: %Top_model_a_a_renq0 = seq.firreg
+// PAIR-DAG: %Child_y_renq0 = seq.firreg
