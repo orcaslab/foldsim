@@ -1370,7 +1370,9 @@ LogicalResult Composer::build() {
     if (!delivered) {
       // A parent of one host cycle per turn: it wraps on every one.
       next = step(position, plan.positions - 1);
-    } else if (plan.positions <= parentPositions) {
+    } else if (plan.positions == parentPositions) {
+      next = delivered;
+    } else if (plan.positions < parentPositions) {
       // A shorter turn (a copy): the parent's position modulo it.
       next = b.createOrFold<comb::ExtractOp>(
           type,
