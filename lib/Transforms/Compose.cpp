@@ -1773,7 +1773,7 @@ void ComposePass::runOnOperation() {
                                        stateStages, commitSelect,
                                        stagedRamWrites, pipelineMultipliers,
                                        compactStaging, foldPipelines,
-                                       idleSlots};
+                                       idleSlots, pipelineDepth};
   if (channelDepth < 2 || !llvm::isPowerOf2_32(channelDepth)) {
     top.emitError("a channel's depth is a power of two, at least two");
     return signalPassFailure();

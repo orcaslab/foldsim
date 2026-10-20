@@ -183,6 +183,9 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
            "Thread each model picked in turn with idle host cycles in its "
            "turns where it has too few threads, as `foldsim-fame5`'s "
            "`idle-slots`">,
+    Option<"pipelineDepth", "pipeline-depth", "unsigned", "0",
+           "Thread each model with its deep state cones split over two host "
+           "cycles, as `foldsim-fame5`'s `pipeline-depth`">,
     Option<"channelDepth", "channel-depth", "unsigned", "2",
            "Slots per producer thread of a channel without a relay, a power of "
            "two: deeper channels give producers slack ahead of their readers "
@@ -316,6 +319,13 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
            "thread's host cycle with idle ones, which finish nothing and "
            "take or offer no token, rather than forwarding the write to the "
            "read ahead -- a select per state bit">,
+    Option<"pipelineDepth", "pipeline-depth", "unsigned", "0",
+           "With `registered-state` and `state-stages=2`: a thread state whose "
+           "next value's cone is deeper than this many logic levels takes its "
+           "first stage inside the cone, where neither host cycle computes "
+           "more than this many levels if it can and the fewest bits are "
+           "registered, and computes the rest on the next host cycle rather "
+           "than registering the next value; 0 does not">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

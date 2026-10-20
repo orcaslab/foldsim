@@ -32,6 +32,7 @@ struct ThreadOptions {
   bool compactStaging = false;
   bool foldPipelines = false;
   bool idleSlots = false;
+  unsigned pipelineDepth = 0;
 };
 /// How a register is written: never (it only holds its value), or with
 /// `data` when `enable` (always, if null).

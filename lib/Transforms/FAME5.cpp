@@ -151,6 +151,7 @@ public:
         stateStages(options.stateStages), commitSelect(options.commitSelect),
         stagedRamWrites(options.stagedRamWrites),
         pipelineMultipliers(options.pipelineMultipliers),
+        pipelineDepth(options.pipelineDepth),
         compactStaging(options.compactStaging),
         foldPipelines(options.foldPipelines),
         phases(options.idleSlots && options.registeredState && !readySchedule
@@ -276,6 +277,9 @@ private:
   /// With state written two host cycles late: whether a state computed by
   /// a multiplier takes its first stage at its next value's inputs.
   bool pipelineMultipliers;
+  /// With two state stages: the logic levels of a state cone above which it
+  /// is split over the two host cycles, or 0.
+  unsigned pipelineDepth;
   /// With regions: whether staging takes the location of the state it
   /// stages, and a staged write enable has no preset value.
   bool compactStaging;
@@ -327,9 +331,24 @@ private:
     return ns == "comb" || ns == "hw";
   }
   bool coneHasMultiplier(Value value);
+  /// The logic levels of `op` as synthesized, roughly: wiring takes none.
+  static unsigned levelsOf(Operation *op) {
+    if (isa<hw::ConstantOp, hw::AggregateConstantOp, hw::BitcastOp,
+            comb::ExtractOp, comb::ConcatOp, comb::ReplicateOp,
+            hw::ArrayCreateOp, hw::ArrayConcatOp, hw::StructCreateOp,
+            hw::StructExtractOp>(op))
+      return 0;
+    return isa<comb::MulOp>(op) ? 4 : 1;
+  }
+  /// The logic levels of each op of a cone, from its inputs, memoized.
+  DenseMap<Operation *, unsigned> coneLevelsOf;
+  unsigned coneLevels(Value value);
   Value pipelinedCone(ImplicitLocOpBuilder &b, Value value);
-  /// The cone inputs registered for `pipelineMultipliers`, shared by cones.
-  DenseMap<Value, Value> coneInputs;
+  /// The cone inputs registered for `pipelineMultipliers` and
+  /// `pipelineDepth`, and the values computed from them on the second host
+  /// cycle, each shared by cones: a value is the same whichever cut computes
+  /// it.
+  DenseMap<Value, Value> coneInputs, coneLate;
   bool deepState() const {
     return registeredState && stateStages > 1 && threads * phases >= 3;
   }
@@ -1192,12 +1211,44 @@ bool Threader::coneHasMultiplier(Value value) {
   return false;
 }
 
-/// `value`'s cone computed a host cycle late, cut where its multipliers start:
-/// the logic computed from a multiplier's result (the multipliers and what
-/// reads them) is cloned on registers of the values it reads that are not
-/// (the multipliers' operands, the selects around them, the cone's inputs),
-/// each registered once for every cone. The rest of the cone is computed on
-/// the host cycle before, as the logic that feeds a block's input registers.
+unsigned Threader::coneLevels(Value value) {
+  auto *root = value.getDefiningOp();
+  if (!inCone(root))
+    return 0;
+  if (auto it = coneLevelsOf.find(root); it != coneLevelsOf.end())
+    return it->second;
+  // Post-order, operands first.
+  SmallVector<std::pair<Operation *, unsigned>> stack = {{root, 0}};
+  while (!stack.empty()) {
+    auto &[op, next] = stack.back();
+    if (next < op->getNumOperands()) {
+      auto *def = op->getOperand(next++).getDefiningOp();
+      if (inCone(def) && !coneLevelsOf.count(def))
+        stack.push_back({def, 0});
+      continue;
+    }
+    unsigned levels = 0;
+    for (auto operand : op->getOperands())
+      if (auto *def = operand.getDefiningOp(); inCone(def))
+        levels = std::max(levels, coneLevelsOf.lookup(def));
+    coneLevelsOf[op] = levels + levelsOf(op);
+    stack.pop_back();
+  }
+  return coneLevelsOf.lookup(root);
+}
+
+/// `value`'s cone computed a host cycle late, cut in two: the logic after the
+/// cut is cloned on registers of the values it reads that are not (the cone's
+/// inputs among them), each registered once for every cone, and computed on
+/// the second host cycle. The rest of the cone is computed on the host cycle
+/// before, as the logic that feeds a block's input registers.
+/// - With `pipelineMultipliers`, the cut is where the multipliers start: the
+///   multipliers and what reads them are after it.
+/// - With `pipelineDepth`, a cone deeper than that is cut at a level: the ops
+///   deeper than it are after it. The level leaves neither host cycle more
+///   than `pipelineDepth` levels if it can, and of those registers the fewest
+///   bits; a cone too deep for that is cut in the middle.
+/// Both make the cut the union of the two.
 Value Threader::pipelinedCone(ImplicitLocOpBuilder &b, Value value) {
   auto input = [&](Value leaf) -> Value {
     auto &reg = coneInputs[leaf];
@@ -1240,25 +1291,77 @@ Value Threader::pipelinedCone(ImplicitLocOpBuilder &b, Value value) {
     stack.pop_back();
   }
   // The ops computed from a multiplier's result, operands before users.
-  DenseSet<Operation *> after;
-  for (auto *op : order)
-    if (isa<comb::MulOp>(op) ||
-        llvm::any_of(op->getOperands(), [&](Value operand) {
-          return after.contains(operand.getDefiningOp());
-        }))
-      after.insert(op);
-  if (!after.contains(root))
+  DenseSet<Operation *> multiplied;
+  if (pipelineMultipliers)
+    for (auto *op : order)
+      if (isa<comb::MulOp>(op) ||
+          llvm::any_of(op->getOperands(), [&](Value operand) {
+            return multiplied.contains(operand.getDefiningOp());
+          }))
+        multiplied.insert(op);
+  // After a cut at level `cut`: the multiplied ops and those deeper than it.
+  // A user is never shallower than its operands, so both are closed under
+  // users, and so is their union.
+  unsigned levels = coneLevels(value);
+  auto isAfter = [&](Operation *op, unsigned cut) {
+    return op && (multiplied.contains(op) ||
+                  (cut && coneLevelsOf.lookup(op) > cut));
+  };
+  unsigned cut = 0;
+  if (pipelineDepth && levels > pipelineDepth) {
+    // The bits a cut registers that no other cone has registered already.
+    auto cost = [&](unsigned at) {
+      uint64_t bits = 0;
+      DenseSet<Value> counted;
+      for (auto *op : order) {
+        if (!isAfter(op, at))
+          continue;
+        for (auto operand : op->getOperands())
+          if (!isAfter(operand.getDefiningOp(), at) &&
+              !operand.getDefiningOp<hw::ConstantOp>() &&
+              !coneInputs.count(operand) && counted.insert(operand).second)
+            bits += hw::getBitWidth(operand.getType());
+      }
+      return bits;
+    };
+    unsigned lo = levels > 2 * pipelineDepth ? (levels + 1) / 2
+                                             : std::max(1u, levels - pipelineDepth);
+    unsigned hi = levels > 2 * pipelineDepth ? (levels + 1) / 2
+                                             : std::min(levels - 1, pipelineDepth);
+    // The cheapest, and of those the nearest the middle.
+    uint64_t best = UINT64_MAX;
+    for (unsigned at = lo; at <= hi; ++at) {
+      uint64_t bits = cost(at);
+      auto offMiddle = [&](unsigned x) {
+        return std::abs(int(2 * x) - int(levels));
+      };
+      if (bits < best || (bits == best && offMiddle(at) < offMiddle(cut))) {
+        best = bits;
+        cut = at;
+      }
+    }
+  }
+  if (!isAfter(root, cut))
     return input(value);
   IRMapping map;
   for (auto *op : order) {
-    if (!after.contains(op))
+    if (!isAfter(op, cut))
       continue;
     for (auto operand : op->getOperands())
-      if (!after.contains(operand.getDefiningOp()) && !map.contains(operand))
+      if (!isAfter(operand.getDefiningOp(), cut) && !map.contains(operand))
         map.map(operand, operand.getDefiningOp<hw::ConstantOp>()
                              ? operand
                              : input(operand));
-    b.clone(*op, map);
+    // Computed on the second host cycle by another cone already.
+    if (llvm::all_of(op->getResults(),
+                     [&](Value result) { return coneLate.count(result); })) {
+      for (auto result : op->getResults())
+        map.map(result, coneLate.lookup(result));
+      continue;
+    }
+    auto *clone = b.clone(*op, map);
+    for (auto [result, late] : llvm::zip(op->getResults(), clone->getResults()))
+      coneLate[result] = late;
   }
   return map.lookup(value);
 }
@@ -1481,8 +1584,9 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
         bool deep = deepState() && state.state && !write.low;
         // A multiplier's cone takes the first stage at its inputs: Vivado
         // cannot retime the stage into the DSPs that compute it.
-        bool pipelined = deep && pipelineMultipliers &&
-                         coneHasMultiplier(unstagedData);
+        bool pipelined =
+            deep && ((pipelineMultipliers && coneHasMultiplier(unstagedData)) ||
+                     (pipelineDepth && coneLevels(unstagedData) > pipelineDepth));
         Value data = pipelined ? pipelinedCone(b, unstagedData)
                                : staged(unstagedData, memoryName + "_wdata");
         Value mask = staged(write.op.getMask(), memoryName + "_wmask");
@@ -3053,7 +3157,8 @@ void FAME5Pass::runOnOperation() {
     return signalPassFailure();
   }
   if ((regionLoads || registeredState || commitSelect || stagedRamWrites ||
-       pipelineMultipliers || compactStaging || foldPipelines || idleSlots) &&
+       pipelineMultipliers || compactStaging || foldPipelines || idleSlots ||
+       pipelineDepth) &&
       !clockEnable) {
     model.emitError("regions are for state written with `clock-enable`");
     return signalPassFailure();
@@ -3066,7 +3171,7 @@ void FAME5Pass::runOnOperation() {
                                              stagedRamWrites,
                                              pipelineMultipliers,
                                              compactStaging, foldPipelines,
-                                             idleSlots})
+                                             idleSlots, pipelineDepth})
                  .run()))
     return signalPassFailure();
 }

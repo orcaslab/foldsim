@@ -149,6 +149,10 @@ def main():
                     help='with --registered-state, picked in turn: idle host cycles in the '
                          'turns of models with too few threads, rather than forwarding '
                          'their writes to the read ahead (foldsim-fame5)')
+    ap.add_argument('--pipeline-depth', type=int, default=0,
+                    help='with --registered-state and --state-stages 2: split state cones '
+                         'deeper than this many logic levels over two host cycles '
+                         '(foldsim-fame5)')
     ap.add_argument('--channel-depth', type=int, default=2,
                     help='slots per producer thread of each channel (foldsim-compose)')
     ap.add_argument('--staged-tokens', action='store_true',
@@ -260,6 +264,8 @@ def main():
         compose += ' fold-pipelines'
     if a.idle_slots:
         compose += ' idle-slots'
+    if a.pipeline_depth:
+        compose += f' pipeline-depth={a.pipeline_depth}'
     if a.channel_depth != 2:
         compose += f' channel-depth={a.channel_depth}'
     if a.domains:
