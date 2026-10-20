@@ -87,6 +87,10 @@
 // RUN: FileCheck %s --check-prefix=LOCAL < %t/n/sim.mlir
 // LOCAL-NOT: schedule_next
 // LOCAL: "L1_model=u0_logic u1_logic"
+// Each token memory read counts its reader's thread itself too.
+// RUN: FileCheck %s --check-prefix=READ < %t/n/sim.mlir
+// READ-DAG: %L2_model_u0_y_L3_y_rd0_thread = seq.firreg {{.*}} reset sync
+// READ-DAG: %L1_model_u0_y_L2_model_y_rd0_phase = seq.firreg
 // Wired, a class takes its turns from its parent's controller; beyond
 // the one hop, a register per host cycle of offset.
 // RUN: FileCheck %s --check-prefix=TREE < %t/w/sim.mlir

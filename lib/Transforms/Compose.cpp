@@ -1689,6 +1689,8 @@ LogicalResult Composer::build() {
   for (auto [c, cls] : llvm::enumerate(classes))
     readyTerms[c].resize(cls.instances.size());
 
+  // The counters of the token memory reads' threads, numbered per class.
+  std::vector<unsigned> readCounters(classes.size());
   // Each consumer reads its thread's pieces.
   for (unsigned c = 0; c < consumers.size(); ++c) {
     auto &consumer = consumers[c];
@@ -1760,6 +1762,62 @@ LogicalResult Composer::build() {
     if (consumer.cls >= 0)
       for (auto [t, v] : llvm::enumerate(validOf))
         readyTerms[consumer.cls][t].push_back(v);
+    // The thread a token memory is read at. On nested folding's fixed
+    // schedule a class's current thread is known from reset, so each read
+    // counts it itself, from the position the control tree plans: no one
+    // register addresses the class's token memories across the fabric.
+    auto readThread = [&](Producer &producer) -> Value {
+      if (schedules.empty() || consumer.cls < 0 || !sink.thread)
+        return sink.thread;
+      auto &plan = schedules[consumer.cls];
+      uint64_t n = plan.threads, k = plan.positions / n;
+      auto keep = sv::SVAttributeAttr::get(b.getContext(), "keep",
+                                           R"("true")",
+                                           /*emitAsComment=*/false);
+      std::string base =
+          consumer.name + "_" + producer.name + "_rd" +
+          std::to_string(readCounters[consumer.cls]++);
+      auto counter = [&](unsigned width, uint64_t reset,
+                         const Twine &suffix) {
+        auto type = b.getIntegerType(width);
+        auto next = backedges.get(type);
+        auto init = hw::ConstantOp::create(b, type, reset);
+        auto reg = seq::FirRegOp::create(
+            b, next, hostClock, b.getStringAttr(base + suffix), hostReset,
+            init, hw::InnerSymAttr{}, /*isAsync=*/false,
+            b.getIntegerAttr(type, reset));
+        sv::addSVAttributes(reg, {keep});
+        if (producer.relay)
+          onSide(reg, 2);
+        return std::make_pair(Value(reg), next);
+      };
+      auto step = [&](Value value, uint64_t last) -> Value {
+        auto t = value.getType();
+        return comb::MuxOp::create(
+            b,
+            comb::ICmpOp::create(b, comb::ICmpPredicate::eq, value,
+                                 hw::ConstantOp::create(b, t, last)),
+            hw::ConstantOp::create(b, t, 0),
+            comb::AddOp::create(b, value, hw::ConstantOp::create(b, t, 1)));
+      };
+      auto [thread, threadNext] =
+          counter(sink.thread.getType().getIntOrFloatBitWidth(),
+                  plan.start / k, "_thread");
+      Value advance = step(thread, n - 1);
+      if (k > 1) {
+        auto [phase, phaseNext] =
+            counter(llvm::Log2_64(k), plan.start % k, "_phase");
+        phaseNext.setValue(step(phase, k - 1));
+        advance = comb::MuxOp::create(
+            b,
+            comb::ICmpOp::create(
+                b, comb::ICmpPredicate::eq, phase,
+                hw::ConstantOp::create(b, phase.getType(), k - 1)),
+            advance, thread);
+      }
+      threadNext.setValue(advance);
+      return thread;
+    };
 
     Value bits;
     if (consumer.width > 0 && consumer.uniform && !consumer.regular) {
@@ -1810,6 +1868,7 @@ LogicalResult Composer::build() {
           auto &producer = producers[source->producer];
           unsigned threadBits = llvm::Log2_32_Ceil(producer.threads);
           unsigned slotBits = llvm::Log2_32(producer.depth);
+          Value current = readThread(producer);
           SmallVector<Value> threads, slots;
           for (unsigned t = 0; t < consumer.threads; ++t) {
             bool mine = sourceOf[t] == k;
@@ -1820,8 +1879,8 @@ LogicalResult Composer::build() {
                                        consumer.deq[t][j], 0))
                                  : constant(APInt(slotBits, 0)));
           }
-          Value thread = select(threads, sink.thread);
-          Value slot = select(slots, sink.thread);
+          Value thread = select(threads, current);
+          Value slot = select(slots, current);
           Value address = comb::ConcatOp::create(b, thread, slot);
           Value data = seq::FirMemReadOp::create(
               b, tokenMemory(producer, source->low, first.width, consumer.cls),
@@ -1853,6 +1912,7 @@ LogicalResult Composer::build() {
         if (piece.producer >= 0 && producers[piece.producer].memory) {
           auto &producer = producers[piece.producer];
           unsigned threadBits = llvm::Log2_32_Ceil(producer.threads);
+          Value current = readThread(producer);
           SmallVector<Value> threads, slots;
           for (unsigned t = 0; t < consumer.threads; ++t) {
             threads.push_back(
@@ -1861,8 +1921,8 @@ LogicalResult Composer::build() {
                 b, b.getIntegerType(llvm::Log2_32(producer.depth)),
                 consumer.deq[t][j], 0));
           }
-          Value thread = select(threads, sink.thread);
-          Value slot = select(slots, sink.thread);
+          Value thread = select(threads, current);
+          Value slot = select(slots, current);
           Value address = comb::ConcatOp::create(b, thread, slot);
           Value data = seq::FirMemReadOp::create(
               b, tokenMemory(producer, piece.low, piece.width, consumer.cls),
