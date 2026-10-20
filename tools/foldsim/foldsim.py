@@ -171,6 +171,9 @@ def main():
                          "that a thread and its parent's are current together (foldsim-compose)")
     ap.add_argument('--nest-skew', type=int, default=0,
                     help='with --nest: host cycles a thread is current after its parent\'s')
+    ap.add_argument('--block-state-depth', type=int, default=0,
+                    help='with --registered-state: thread state of models of at least this '
+                         'many threads asks for block RAM (foldsim-compose)')
     ap.add_argument('--banked-tokens', action='store_true',
                     help="keep slots read per thread from several producers in memories "
                          "(foldsim-compose)")
@@ -283,6 +286,8 @@ def main():
         compose += ' domains'
     if a.copies:
         compose += f' copies={a.copies}'
+    if a.block_state_depth:
+        compose += f' block-state-depth={a.block_state_depth}'
     if a.banked_tokens:
         compose += ' banked-tokens'
     if a.nest:

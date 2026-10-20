@@ -162,7 +162,8 @@ public:
            const foldsim::ThreadOptions &threadOptions, bool stagedTokens,
            unsigned channelDepth, bool domains, bool nest,
            unsigned nestSkew = 0, bool bankedTokens = false,
-           ArrayRef<std::string> copies = {})
+           ArrayRef<std::string> copies = {},
+           ArrayRef<std::string> offsets = {})
       : top(top), netlist(netlist), simName(simName),
         readySchedule(readySchedule), threadOptions(threadOptions),
         stagedTokens(stagedTokens), channelDepth(channelDepth),
@@ -170,6 +171,14 @@ public:
         bankedTokens(bankedTokens) {
     for (auto &name : relay)
       relayModels.insert(name);
+    for (auto &entry : offsets) {
+      auto [name, count] = StringRef(entry).rsplit(':');
+      int64_t phi = 0;
+      if (!count.getAsInteger(10, phi))
+        nestOffsets[name] = phi;
+      else
+        badCopies.push_back(entry);
+    }
     for (auto &entry : copies) {
       auto [name, count] = StringRef(entry).rsplit(':');
       unsigned k = 0;
@@ -210,6 +219,7 @@ private:
   /// Classes simulated by several copies, each a contiguous range of its
   /// threads (the high digits of the thread index).
   llvm::StringMap<unsigned> copiesOf;
+  llvm::StringMap<int64_t> nestOffsets;
   SmallVector<std::string> badCopies;
   LogicalResult splitCopies();
   /// The netlist instances each instance is inside, as the path of their
@@ -643,7 +653,7 @@ LogicalResult Composer::alignThreads() {
     // The parent's thread each thread must be the child of.
     SmallVector<int> need(n, -1);
     for (uint64_t h = period; h < 2 * period; ++h) {
-      uint64_t hp = h - nestSkew % period;
+      uint64_t hp = h;
       if (h % kc || hp % kp)
         continue;
       unsigned t = (h / kc) % n, p = (hp / kp) % np;
@@ -682,12 +692,34 @@ LogicalResult Composer::alignThreads() {
       threadOf[instance] = {c, unsigned(t)};
       threadNow[instance] = t;
     }
-    LLVM_DEBUG({
-      llvm::dbgs() << "foldsim-nest " << cls.name << ":";
-      for (auto instance : cls.instances)
-        llvm::dbgs() << " " << instance.getInstanceName();
-      llvm::dbgs() << "\n";
-    });
+  }
+  // Each class current `offset` host cycles after the order above: its
+  // parent's offset and the skew, or the offset asked for. The parent of the
+  // thread current at h is then current at h minus the difference.
+  SmallVector<int64_t> offset(classes.size(), 0);
+  for (auto c : order) {
+    auto &cls = classes[c];
+    int pc = parentClass[c];
+    auto it = nestOffsets.find(cls.name);
+    offset[c] = it != nestOffsets.end() ? it->second
+                : pc >= 0               ? offset[pc] + nestSkew
+                                        : 0;
+    unsigned n = cls.instances.size();
+    if (n == 1)
+      continue;
+    unsigned k = phasesOf(n);
+    if (offset[c] % k)
+      return cls.instances[0].emitError("nest: the offset of '")
+             << cls.name << "' (" << offset[c]
+             << ") is not a multiple of its turn's " << k << " host cycles";
+    int64_t shift = (offset[c] / k) % n;
+    SmallVector<hw::InstanceOp> canonical(cls.instances.begin(),
+                                          cls.instances.end());
+    for (unsigned t = 0; t < n; ++t) {
+      auto instance = canonical[((int64_t(t) - shift) % n + n) % n];
+      cls.instances[t] = instance;
+      threadOf[instance] = {c, t};
+    }
   }
   return success();
 }
@@ -2110,14 +2142,14 @@ void ComposePass::runOnOperation() {
                                        stateStages, commitSelect,
                                        stagedRamWrites, pipelineMultipliers,
                                        compactStaging, foldPipelines,
-                                       idleSlots, pipelineDepth};
+                                       idleSlots, pipelineDepth, blockStateDepth};
   if (channelDepth < 2 || !llvm::isPowerOf2_32(channelDepth)) {
     top.emitError("a channel's depth is a power of two, at least two");
     return signalPassFailure();
   }
   if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
                           threadOptions, stagedTokens, channelDepth, domains,
-                          nest, nestSkew, bankedTokens, copies)
+                          nest, nestSkew, bankedTokens, copies, nestOffsets)
                      .run()))
     signalPassFailure();
 }

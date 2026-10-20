@@ -154,6 +154,7 @@ public:
         pipelineDepth(options.pipelineDepth),
         compactStaging(options.compactStaging),
         foldPipelines(options.foldPipelines),
+        blockStateDepth(options.registeredState ? options.blockStateDepth : 0),
         phases(options.idleSlots && options.registeredState && !readySchedule
                    ? turnPhases(threads, options.stateStages)
                    : 1) {}
@@ -286,6 +287,8 @@ private:
   /// Whether fixed-latency pipelines are simulated by an unthreaded copy and
   /// a per-thread store of their results rather than threaded.
   bool foldPipelines;
+  /// Thread state of at least this many threads asks for block RAM.
+  unsigned blockStateDepth;
   /// A folded pipeline's store and its write from the unthreaded copy.
   struct Fold {
     seq::FirMemOp store;
@@ -966,6 +969,13 @@ Value Threader::createThreadState(ImplicitLocOpBuilder &b, StringRef stateName,
       b, memType, /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined,
       seq::WUW::Undefined, b.getStringAttr(stateName), hw::InnerSymAttr{},
       seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+  // Read at a registered index into the read-ahead register, deep thread
+  // state is a block RAM read synchronously.
+  if (blockStateDepth && threads >= blockStateDepth)
+    sv::addSVAttributes(memory.getDefiningOp(),
+                        {sv::SVAttributeAttr::get(b.getContext(), "ram_style",
+                                                  R"("block")",
+                                                  /*emitAsComment=*/false)});
   Value data =
       seq::FirMemReadOp::create(b, memory, threadIdx, hostClock,
                                 hw::ConstantOp::create(b, b.getI1Type(), 1));

@@ -33,6 +33,9 @@ struct ThreadOptions {
   bool foldPipelines = false;
   bool idleSlots = false;
   unsigned pipelineDepth = 0;
+  /// With registered state: thread state of at least this many threads asks
+  /// for block RAM, its read-ahead register the RAM's output (0: never).
+  unsigned blockStateDepth = 0;
 };
 /// How a register is written: never (it only holds its value), or with
 /// `data` when `enable` (always, if null).

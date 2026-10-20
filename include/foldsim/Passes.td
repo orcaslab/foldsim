@@ -199,11 +199,18 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"nestSkew", "nest-skew", "unsigned", "0",
            "With `nest`: a child's thread is current this many host cycles "
            "after its parent's">,
+    ListOption<"nestOffsets", "nest-offsets", "std::string",
+               "With `nest`: models current this many host cycles after "
+               "the nested order, as <model>:<cycles>, rather than their "
+               "parent's offset and `nest-skew`">,
     ListOption<"copies", "copies", "std::string",
                "Models simulated by several threaded copies, as "
                "<model>:<count>: each copy simulates a contiguous range of "
                "the instances (with `nest`, the high digits of the thread "
                "index), so a turn takes fewer host cycles">,
+    Option<"blockStateDepth", "block-state-depth", "unsigned", "0",
+           "With `registered-state`: the thread state of models of at least "
+           "this many threads asks for block RAM (0: never)">,
     Option<"bankedTokens", "banked-tokens", "bool", "false",
            "Keep a producer's slots in a memory also when a reader takes, by "
            "thread, the same bits from different producers (a parent's port "
