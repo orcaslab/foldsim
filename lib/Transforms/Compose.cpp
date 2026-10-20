@@ -254,10 +254,13 @@ private:
   }
   /// The idle phases of a one-thread model (two when it commits by enable).
   unsigned onePhases = 1;
-  /// Whether a model's position register is a host cycle ahead (registered
-  /// state with several threads).
+  /// Whether a model's position register is a host cycle ahead: registered
+  /// state with several threads, or with idle phases under the control tree.
   unsigned leadOf(unsigned threads) const {
-    return threads > 1 && threadOptions.registeredState ? 1 : 0;
+    return threadOptions.registeredState &&
+                   (threads > 1 || (treeControl && onePhases > 1))
+               ? 1
+               : 0;
   }
   /// The least offset between a parent and a child whose turns the parent
   /// issues: one register from the parent's position register to the
@@ -275,7 +278,7 @@ private:
     uint64_t positions = 1, start = 0;
     int parent = -1;
     unsigned stages = 0;
-    unsigned lead = 0;
+    unsigned lead = 0, threads = 1;
   };
   SmallVector<Schedule> schedules;
   int64_t globalStart = 0;
@@ -843,10 +846,17 @@ LogicalResult Composer::alignThreads() {
         hop = std::max<int64_t>(
             hop, controlHop(classes[pc].name, classes[pc].instances.size(),
                             cls.name, n));
-      offset[c] = llvm::alignTo(offset[pc] + hop, k);
+      // Under the control tree any offset keeps a class's idle phases in
+      // step with its parent, but a one-thread model's turn starts idle; with
+      // counters of their own, the offset is a whole number of turns' threads.
+      offset[c] = offset[pc] + hop;
+      if (!treeControl)
+        offset[c] = llvm::alignTo(offset[c], k);
+      else if (copyThreads(cls.name, n) == 1 && k > 1)
+        offset[c] = llvm::alignTo(offset[c], k);
     }
     offsetOf[cls.name] = offset[c];
-    if (offset[c] % k)
+    if (!treeControl && offset[c] % k)
       return cls.instances[0].emitError("nest: the offset of '")
              << cls.name << "' (" << offset[c]
              << ") is not a multiple of its turn's " << k << " host cycles";
@@ -921,6 +931,7 @@ LogicalResult Composer::planSchedules() {
     unsigned n = cls.instances.size();
     plan.positions = uint64_t(n) * (n > 1 ? phasesOf(n) : onePhases);
     plan.lead = leadOf(n);
+    plan.threads = n;
     plan.external = plan.positions > 1;
     auto parent = parentBaseOf.find(cls.base);
     if (parent == parentBaseOf.end())
@@ -932,7 +943,7 @@ LogicalResult Composer::planSchedules() {
   // A one-thread root committing by enable starts its turns idle.
   globalStart = 0;
   for (auto &plan : schedules)
-    if (plan.parent < 0 && plan.positions == 2 && plan.lead == 0)
+    if (plan.parent < 0 && plan.positions == 2 && plan.threads == 1)
       globalStart = 1;
   for (auto [c, cls] : llvm::enumerate(classes)) {
     auto &plan = schedules[c];

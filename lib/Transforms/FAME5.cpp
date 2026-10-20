@@ -2534,14 +2534,25 @@ LogicalResult Threader::run() {
           << scheduleStart << ")";
       return failure();
     }
-    phase = seq::FirRegOp::create(
-        b, phaseNext, hostClock, b.getStringAttr("phase"), hostReset,
-        hw::ConstantOp::create(b, i1, 1), hw::InnerSymAttr{},
-        /*isAsync=*/false, b.getIntegerAttr(i1, 1));
-    phaseNext.setValue(scheduleNext ? scheduleNext
-                                    : Value(comb::XorOp::create(
-                                          b, phase,
-                                          hw::ConstantOp::create(b, i1, 1))));
+    if (scheduleNext) {
+      // Outside turns: the next host cycle's phase in a register of its own,
+      // as a model of several threads has.
+      aheadPhase = seq::FirRegOp::create(
+          b, scheduleNext, hostClock, b.getStringAttr("phase_ahead"),
+          hostReset, hw::ConstantOp::create(b, i1, 0), hw::InnerSymAttr{},
+          /*isAsync=*/false, b.getIntegerAttr(i1, 0));
+      phase = seq::FirRegOp::create(
+          b, aheadPhase, hostClock, b.getStringAttr("phase"), hostReset,
+          hw::ConstantOp::create(b, i1, 1), hw::InnerSymAttr{},
+          /*isAsync=*/false, b.getIntegerAttr(i1, 1));
+    } else {
+      phase = seq::FirRegOp::create(
+          b, phaseNext, hostClock, b.getStringAttr("phase"), hostReset,
+          hw::ConstantOp::create(b, i1, 1), hw::InnerSymAttr{},
+          /*isAsync=*/false, b.getIntegerAttr(i1, 1));
+      phaseNext.setValue(
+          comb::XorOp::create(b, phase, hw::ConstantOp::create(b, i1, 1)));
+    }
     idle = phase;
   }
   if (threads > 1 && registeredState) {
