@@ -13,21 +13,29 @@
 // RUN: %t/m/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 // RUN: %t/m/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
 
-// Four threads of r <- r * 3 + a, reset in their first cycle.
-// CHECK: y0: [[Y:.*]]
-// CHECK: y1: [[Y]]
-// CHECK: y2: [[Y]]
-// CHECK: y3: [[Y]]
-// The product's operands are registered, not the product.
+// Four threads of r <- ((r + a) * 3) ^ a, reset in their first cycle, as the
+// unthreaded target computes them.
+// CHECK: y0: 00 04 16 4a e8
+// CHECK: y1: 00 04 16 4a e8
+// CHECK: y2: 00 04 16 4a e8
+// CHECK: y3: 00 04 16 4a e8
+// The stage is where the multiplier starts: the sum it multiplies is
+// computed on the host cycle before and registered, as are the values the
+// logic after it reads; constants are not.
 // CONE-NOT: %r_wdata =
-// CONE-DAG: %r_in = seq.firreg %r_state clock %hostClock : i8
-// CONE-DAG: [[P:%.+]] = comb.mul %r_in, {{%.+}} : i8
+// CONE-NOT: seq.firreg %c
+// CONE-DAG: [[SUM:%.+]] = comb.add %r_state, %a_sink_bits : i8
+// CONE-DAG: %cone_in = seq.firreg [[SUM]] clock %hostClock : i8
+// CONE-DAG: [[P:%.+]] = comb.mul %cone_in, %c3_i8 : i8
+// CONE-DAG: %a_sink_bits_in = seq.firreg %a_sink_bits clock %hostClock : i8
+// CONE-DAG: comb.xor [[P]], %a_sink_bits_in : i8
 // CONE-DAG: %r_wdata2 = seq.firreg
 hw.module private @Mac(in %clk : !seq.clock, in %reset : i1, in %a : i8, out y : i8) {
   %c0 = hw.constant 0 : i8
   %c3 = hw.constant 3 : i8
-  %p = comb.mul %r, %c3 : i8
-  %s = comb.add %p, %a : i8
+  %q = comb.add %r, %a : i8
+  %p = comb.mul %q, %c3 : i8
+  %s = comb.xor %p, %a : i8
   %r = seq.firreg %s clock %clk reset sync %reset, %c0 : i8
   hw.output %r : i8
 }

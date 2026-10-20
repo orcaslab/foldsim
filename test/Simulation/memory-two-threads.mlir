@@ -27,6 +27,13 @@
 // RUN: firtool --format=mlir %t/f/sim.mlir -o %t/f/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal --top-module tb -DTWO -Mdir %t/f/obj %S/Inputs/tb_memory.sv %t/f/sim.sv > %t/f/build.log 2>&1
 // RUN: %t/f/obj/Vtb | FileCheck %s
+// In turn with idle host cycles, the state options of the image flow: the
+// read data's per-thread buffer is read a host cycle ahead too.
+// RUN: mkdir -p %t/i && foldsim-opt %s --foldsim-extract-models="module=Top models=Mem netlist" --foldsim-compose="module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 staged-ram-writes staged-tokens idle-slots" -o %t/i/sim.mlir
+// RUN: grep -q _rdata_state %t/i/sim.mlir
+// RUN: firtool --format=mlir %t/i/sim.mlir -o %t/i/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --top-module tb -DTWO -Mdir %t/i/obj %S/Inputs/tb_memory.sv %t/i/sim.sv > %t/i/build.log 2>&1
+// RUN: %t/i/obj/Vtb | FileCheck %s
 // As with one thread (memory-one-thread.mlir), each thread's own.
 // CHECK: r 2 = a1
 // CHECK: r 3 = b2

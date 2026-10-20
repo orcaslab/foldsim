@@ -1192,9 +1192,12 @@ bool Threader::coneHasMultiplier(Value value) {
   return false;
 }
 
-/// `value`'s cone computed from its inputs a host cycle late: each input (a
-/// port, a register, a memory's read data) registered once for every cone,
-/// the cone's logic cloned on the registered inputs.
+/// `value`'s cone computed a host cycle late, cut where its multipliers start:
+/// the logic computed from a multiplier's result (the multipliers and what
+/// reads them) is cloned on registers of the values it reads that are not
+/// (the multipliers' operands, the selects around them, the cone's inputs),
+/// each registered once for every cone. The rest of the cone is computed on
+/// the host cycle before, as the logic that feeds a block's input registers.
 Value Threader::pipelinedCone(ImplicitLocOpBuilder &b, Value value) {
   auto input = [&](Value leaf) -> Value {
     auto &reg = coneInputs[leaf];
@@ -1236,13 +1239,27 @@ Value Threader::pipelinedCone(ImplicitLocOpBuilder &b, Value value) {
     order.push_back(op);
     stack.pop_back();
   }
+  // The ops computed from a multiplier's result, operands before users.
+  DenseSet<Operation *> after;
+  for (auto *op : order)
+    if (isa<comb::MulOp>(op) ||
+        llvm::any_of(op->getOperands(), [&](Value operand) {
+          return after.contains(operand.getDefiningOp());
+        }))
+      after.insert(op);
+  if (!after.contains(root))
+    return input(value);
   IRMapping map;
-  for (auto *op : order)
+  for (auto *op : order) {
+    if (!after.contains(op))
+      continue;
     for (auto operand : op->getOperands())
-      if (!inCone(operand.getDefiningOp()) && !map.contains(operand))
-        map.map(operand, input(operand));
-  for (auto *op : order)
+      if (!after.contains(operand.getDefiningOp()) && !map.contains(operand))
+        map.map(operand, operand.getDefiningOp<hw::ConstantOp>()
+                             ? operand
+                             : input(operand));
     b.clone(*op, map);
+  }
   return map.lookup(value);
 }
 
@@ -2536,6 +2553,18 @@ LogicalResult Threader::run() {
           data = comb::MuxOp::create(b, capture, dout, data);
           writeThreadState(b, buffer, hostClock, data);
         } else {
+          // In turn, with registered state, the buffer is read a host cycle
+          // ahead too: filled on the host cycle after its thread's edge, it
+          // holds the data from the second, and its thread is read ahead
+          // `threads * phases - 1` host cycles after the edge.
+          if (regions && aheadIdx && !readySchedule && threads * phases >= 3) {
+            auto &state = regionMemory(buffer);
+            state.state = true;
+            state.loc = memory.getLoc();
+            for (auto *user : buffer.getUsers())
+              if (auto port = dyn_cast<seq::FirMemReadOp>(user))
+                state.reads.push_back({port, {}, /*registered=*/false, {}});
+          }
           auto readThread = seq::FirRegOp::create(
               b, threadIdx, targetClock, b.getStringAttr("read_thread"));
           seq::FirMemWriteOp::create(b, buffer, readThread, hostClock, capture,
