@@ -43,6 +43,18 @@
 // RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/f/obj %S/Inputs/tb_threads.sv %t/f/sim.sv > %t/f/build.log 2>&1
 // RUN: %t/f/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 // RUN: %t/f/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+// Picked in turn, a thread's write is in the memory before its state is read
+// ahead again, with one stage and with two: nothing is forwarded.
+// RUN: mkdir -p %t/i && foldsim-opt %s --foldsim-extract-models="module=Top models=Acc netlist" --foldsim-compose="module=Top ready-schedule=false region-loads=1 registered-state" -o %t/i/sim.mlir
+// RUN: firtool --format=mlir %t/i/sim.mlir -o %t/i/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/i/obj %S/Inputs/tb_threads.sv %t/i/sim.sv > %t/i/build.log 2>&1
+// RUN: %t/i/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/i/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+// RUN: mkdir -p %t/j && foldsim-opt %s --foldsim-extract-models="module=Top models=Acc netlist" --foldsim-compose="module=Top ready-schedule=false region-loads=1 registered-state state-stages=2 staged-tokens" -o %t/j/sim.mlir
+// RUN: firtool --format=mlir %t/j/sim.mlir -o %t/j/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/j/obj %S/Inputs/tb_threads.sv %t/j/sim.sv > %t/j/build.log 2>&1
+// RUN: %t/j/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/j/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
 // Four threads, whose state starts out random, initialized by a reset of one
 // host cycle: each takes every token of `reset` and `x`, and gives every one
 // of its `y`.

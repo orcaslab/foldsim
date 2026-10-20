@@ -1484,9 +1484,15 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
         continue;
       // The next thread's state, read a host cycle ahead into registers. The
       // write landing on this cycle's edge is the only one not in the memory
-      // yet: it is forwarded when it is that thread's.
+      // yet: it is forwarded when it is that thread's. In turn, a thread is
+      // current once every `threads` host cycles, its state read ahead
+      // `threads - 1` after its edge, by when the write is in the memory (from
+      // the second host cycle after the edge, the third with two stages)
+      // unless there are fewer threads: nothing is forwarded. Picked by
+      // readiness, a thread may run again sooner.
+      bool mayHit = readySchedule || threads < (deepState() ? 4u : 3u);
       Value hit;
-      if (pendingEnable)
+      if (pendingEnable && mayHit)
         hit = comb::AndOp::create(
             b, pendingEnable,
             comb::ICmpOp::create(b, comb::ICmpPredicate::eq,
