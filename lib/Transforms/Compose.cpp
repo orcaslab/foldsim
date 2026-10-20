@@ -31,6 +31,7 @@
 #include "llvm/Support/Debug.h"
 #include <functional>
 #include <map>
+#include <numeric>
 
 namespace foldsim {
 #define GEN_PASS_DEF_COMPOSE
@@ -146,8 +147,10 @@ struct Consumer {
   unsigned threads = 1, width = 0;
   /// Each thread's bits, the low ones first.
   SmallVector<Pieces> pieces;
-  /// Whether every thread reads the same bits of the same producers.
-  bool regular = false, direct = false;
+  /// Whether every thread reads the same bits of the same producers; or,
+  /// `uniform`, bits of the same positions and widths, each from producers
+  /// that may differ by thread.
+  bool regular = false, direct = false, uniform = false;
   /// Built: for each thread, for each piece, the count of tokens read.
   SmallVector<SmallVector<Value>> deq;
 };
@@ -157,13 +160,24 @@ public:
   Composer(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
            bool readySchedule, ArrayRef<std::string> relay,
            const foldsim::ThreadOptions &threadOptions, bool stagedTokens,
-           unsigned channelDepth, bool domains)
+           unsigned channelDepth, bool domains, bool nest,
+           unsigned nestSkew = 0, bool bankedTokens = false,
+           ArrayRef<std::string> copies = {})
       : top(top), netlist(netlist), simName(simName),
         readySchedule(readySchedule), threadOptions(threadOptions),
         stagedTokens(stagedTokens), channelDepth(channelDepth),
-        emitDomainTree(domains) {
+        emitDomainTree(domains), nest(nest), nestSkew(nestSkew),
+        bankedTokens(bankedTokens) {
     for (auto &name : relay)
       relayModels.insert(name);
+    for (auto &entry : copies) {
+      auto [name, count] = StringRef(entry).rsplit(':');
+      unsigned k = 0;
+      if (!count.getAsInteger(10, k))
+        copiesOf[name] = k;
+      else
+        badCopies.push_back(entry);
+    }
   }
   LogicalResult run();
 
@@ -190,6 +204,22 @@ private:
   bool stagedTokens;
   unsigned channelDepth;
   bool emitDomainTree;
+  bool nest;
+  unsigned nestSkew;
+  bool bankedTokens;
+  /// Classes simulated by several copies, each a contiguous range of its
+  /// threads (the high digits of the thread index).
+  llvm::StringMap<unsigned> copiesOf;
+  SmallVector<std::string> badCopies;
+  LogicalResult splitCopies();
+  /// The netlist instances each instance is inside, as the path of their
+  /// names, and the instances of a netlist's own logic.
+  DenseMap<Operation *, std::string> containerOf;
+  DenseSet<Operation *> logicInstances;
+  /// With `nest`: numbers each class's instances so that, every model picked
+  /// in turn, the thread current on a host cycle is a child of the parent's
+  /// thread current then.
+  LogicalResult alignThreads();
   llvm::StringSet<> relayModels;
   hw::HWModuleOp sim;
   /// The netlist each model instance and each netlist instance comes from,
@@ -222,8 +252,12 @@ private:
 
 void Composer::inlineNetlists() {
   auto *body = netlist.getBodyBlock();
-  for (auto instance : body->getOps<hw::InstanceOp>())
+  for (auto instance : body->getOps<hw::InstanceOp>()) {
     ownerOf[instance] = netlist.getModuleName().str();
+    containerOf[instance] = "";
+    if (instance.getInstanceName() == "logic")
+      logicInstances.insert(instance);
+  }
   for (bool changed = true; changed;) {
     changed = false;
     for (auto instance :
@@ -248,6 +282,10 @@ void Composer::inlineNetlists() {
       for (auto &op : calleeBody->without_terminator()) {
         auto *clone = builder.clone(op, map);
         if (auto inner = dyn_cast<hw::InstanceOp>(clone)) {
+          containerOf[inner] =
+              containerOf[instance] + "/" + instance.getInstanceName().str();
+          if (inner.getInstanceName() == "logic")
+            logicInstances.insert(inner);
           inner.setInstanceNameAttr(builder.getStringAttr(
               instance.getInstanceName() + "_" + inner.getInstanceName()));
           ownerOf[inner] = calleeName;
@@ -298,6 +336,10 @@ LogicalResult Composer::collect() {
     threadOf[instance] = {it->second, cls.instances.size()};
     cls.instances.push_back(instance);
   }
+  if (nest && failed(alignThreads()))
+    return failure();
+  if (failed(splitCopies()))
+    return failure();
 
   // Each class threaded, its channels found by name.
   for (auto &cls : classes) {
@@ -425,13 +467,57 @@ LogicalResult Composer::collect() {
     consumer.direct = producer.direct = true;
   }
 
+  // With banked tokens, a consumer reads uniformly if each piece has, for
+  // every thread, the same position and width, from a producer or, for every
+  // thread, a constant.
+  if (bankedTokens)
+    for (auto &consumer : consumers) {
+      auto &first = consumer.pieces[0];
+      consumer.uniform =
+          !consumer.direct &&
+          llvm::all_of(consumer.pieces, [&](const Pieces &pieces) {
+            if (pieces.size() != first.size())
+              return false;
+            for (auto [piece, base] : llvm::zip(pieces, first))
+              if ((piece.producer < 0) != (base.producer < 0) ||
+                  piece.low != base.low || piece.width != base.width)
+                return false;
+            return true;
+          });
+    }
+
   // A producer read only regularly, for every thread, keeps its slots in a
-  // memory read at the reader's thread.
+  // memory read at the reader's thread; with banked tokens, one read
+  // uniformly too, the reader selecting among the memories of its piece's
+  // producers.
   for (auto &producer : producers)
     producer.memory = producer.threads > 1 && producer.width > 0 &&
                       llvm::all_of(producer.reads, [&](auto &read) {
-                        return consumers[read.consumer].regular;
+                        auto &consumer = consumers[read.consumer];
+                        return consumer.regular || consumer.uniform;
                       });
+  // A uniform piece reads memories only if every producer of it keeps one.
+  for (bool changed = bankedTokens; changed;) {
+    changed = false;
+    for (auto &consumer : consumers) {
+      if (!consumer.uniform || consumer.regular)
+        continue;
+      for (unsigned j = 0; j < consumer.pieces[0].size(); ++j) {
+        if (consumer.pieces[0][j].producer < 0)
+          continue;
+        bool all = llvm::all_of(consumer.pieces, [&](const Pieces &pieces) {
+          return producers[pieces[j].producer].memory;
+        });
+        if (all)
+          continue;
+        for (auto &pieces : consumer.pieces)
+          if (producers[pieces[j].producer].memory) {
+            producers[pieces[j].producer].memory = false;
+            changed = true;
+          }
+      }
+    }
+  }
 
   // A relayed model, or each of a pair, is a model of the netlist: a name
   // that is not would leave the channels it means without their relay.
@@ -481,6 +567,174 @@ LogicalResult Composer::collect() {
                       producer.width > 0 && !producer.reads.empty();
     producer.depth = producer.relay ? 4 : channelDepth;
   }
+  return success();
+}
+
+LogicalResult Composer::alignThreads() {
+  // Each model instance's parent: the logic of the netlist it is in, or, for
+  // a netlist's logic, that of the netlist that netlist is in.
+  llvm::StringMap<Operation *> logicAt;
+  for (auto &cls : classes)
+    for (auto instance : cls.instances)
+      if (logicInstances.contains(instance))
+        logicAt[containerOf[instance]] = instance;
+  auto up = [](StringRef path) {
+    auto pos = path.rfind('/');
+    return pos == StringRef::npos ? StringRef() : path.substr(0, pos);
+  };
+  DenseMap<Operation *, Operation *> parentOf;
+  DenseMap<Operation *, unsigned> classOfInstance;
+  for (auto [c, cls] : llvm::enumerate(classes))
+    for (auto instance : cls.instances) {
+      classOfInstance[instance] = c;
+      StringRef path = containerOf[instance];
+      if (logicInstances.contains(instance)) {
+        if (path.empty())
+          continue;
+        path = up(path);
+      }
+      if (auto *parent = logicAt.lookup(path); parent && parent != instance)
+        parentOf[instance] = parent;
+    }
+  // Each class's parent class, the same for all its instances, and its depth.
+  SmallVector<int> parentClass(classes.size(), -1);
+  for (auto [c, cls] : llvm::enumerate(classes))
+    for (auto instance : cls.instances) {
+      auto *parent = parentOf.lookup(instance);
+      int pc = parent ? int(classOfInstance[parent]) : -1;
+      if (instance != cls.instances.front() && pc != parentClass[c])
+        return cls.instances[0].emitError("nest: the instances of '")
+               << cls.name << "' have parents of different classes";
+      parentClass[c] = pc;
+    }
+  SmallVector<unsigned> depth(classes.size(), 0), order;
+  for (unsigned c = 0; c < classes.size(); ++c) {
+    unsigned d = 0;
+    for (int p = parentClass[c]; p >= 0; p = parentClass[p])
+      if (++d > classes.size())
+        return netlist.emitError("nest: classes nested in a cycle");
+    depth[c] = d;
+    order.push_back(c);
+  }
+  llvm::stable_sort(order, [&](unsigned x, unsigned y) { return depth[x] < depth[y]; });
+  // A class's turn: `phases` host cycles per thread, the first its own.
+  auto phasesOf = [&](unsigned threads) {
+    return threadOptions.idleSlots && threadOptions.registeredState &&
+                   !readySchedule
+               ? foldsim::turnPhases(threads, threadOptions.stateStages)
+               : 1u;
+  };
+  DenseMap<Operation *, unsigned> threadNow;
+  for (auto c : order) {
+    auto &cls = classes[c];
+    unsigned n = cls.instances.size();
+    int pc = parentClass[c];
+    unsigned np = pc >= 0 ? classes[pc].instances.size() : 1;
+    auto keep = [&]() {
+      for (auto [t, instance] : llvm::enumerate(cls.instances))
+        threadNow[instance] = t;
+    };
+    if (n == 1 || np == 1) {
+      keep();
+      continue;
+    }
+    unsigned kc = phasesOf(n), kp = phasesOf(np);
+    uint64_t period = std::lcm(uint64_t(n) * kc, uint64_t(np) * kp);
+    // The parent's thread each thread must be the child of.
+    SmallVector<int> need(n, -1);
+    for (uint64_t h = period; h < 2 * period; ++h) {
+      uint64_t hp = h - nestSkew % period;
+      if (h % kc || hp % kp)
+        continue;
+      unsigned t = (h / kc) % n, p = (hp / kp) % np;
+      if (need[t] >= 0 && need[t] != int(p))
+        return cls.instances[0].emitError("nest: '")
+               << cls.name << "' (" << n << " threads, " << kc
+               << " phases) cannot follow its parent's turns (" << np
+               << " threads, " << kp << " phases)";
+      need[t] = p;
+    }
+    std::vector<SmallVector<hw::InstanceOp>> byParent(np);
+    for (auto instance : cls.instances)
+      byParent[threadNow.lookup(parentOf.lookup(instance))].push_back(instance);
+    SmallVector<unsigned> next(np, 0);
+    SmallVector<hw::InstanceOp> numbered(n);
+    for (unsigned t = 0; t < n; ++t) {
+      if (need[t] < 0)
+        continue;
+      auto &kids = byParent[need[t]];
+      if (next[need[t]] >= kids.size())
+        return cls.instances[0].emitError("nest: '")
+               << cls.name << "' has too few instances per parent to follow "
+               << "its parent's turns";
+      numbered[t] = kids[next[need[t]]++];
+    }
+    unsigned p = 0;
+    for (unsigned t = 0; t < n; ++t) {
+      if (numbered[t])
+        continue;
+      while (next[p] >= byParent[p].size())
+        p = (p + 1) % np;
+      numbered[t] = byParent[p][next[p]++];
+    }
+    cls.instances.assign(numbered.begin(), numbered.end());
+    for (auto [t, instance] : llvm::enumerate(cls.instances)) {
+      threadOf[instance] = {c, unsigned(t)};
+      threadNow[instance] = t;
+    }
+    LLVM_DEBUG({
+      llvm::dbgs() << "foldsim-nest " << cls.name << ":";
+      for (auto instance : cls.instances)
+        llvm::dbgs() << " " << instance.getInstanceName();
+      llvm::dbgs() << "\n";
+    });
+  }
+  return success();
+}
+
+LogicalResult Composer::splitCopies() {
+  if (!badCopies.empty())
+    return netlist.emitError("copies: '") << badCopies[0]
+                                           << "' is not <model>:<count>";
+  unsigned numClasses = classes.size();
+  for (unsigned c = 0; c < numClasses; ++c) {
+    auto it = copiesOf.find(classes[c].name);
+    if (it == copiesOf.end() || it->second <= 1)
+      continue;
+    unsigned k = it->second, n = classes[c].instances.size();
+    if (n % k)
+      return classes[c].instances[0].emitError("copies: ")
+             << n << " instances of '" << classes[c].name
+             << "' do not split into " << k << " copies";
+    unsigned per = n / k;
+    auto instances = classes[c].instances;
+    classes[c].instances.assign(instances.begin(), instances.begin() + per);
+    for (unsigned j = 1; j < k; ++j) {
+      // Each copy threads a model of its own.
+      auto model = classes[c].model;
+      OpBuilder b(model);
+      b.setInsertionPointAfter(model);
+      auto clone = cast<hw::HWModuleOp>(b.clone(*model));
+      std::string name = classes[c].name + "_copy" + std::to_string(j);
+      clone.setSymName(name);
+      Class copy;
+      copy.model = clone;
+      copy.name = name;
+      copy.inputNames = classes[c].inputNames;
+      copy.outputNames = classes[c].outputNames;
+      unsigned index = classes.size();
+      for (unsigned t = 0; t < per; ++t) {
+        auto instance = instances[j * per + t];
+        copy.instances.push_back(instance);
+        threadOf[instance] = {index, t};
+      }
+      classes.push_back(std::move(copy));
+    }
+    copiesOf.erase(it);
+  }
+  if (!copiesOf.empty())
+    return netlist.emitError("copies: no model '")
+           << copiesOf.begin()->getKey() << "'";
   return success();
 }
 
@@ -1139,7 +1393,73 @@ LogicalResult Composer::build() {
         readyTerms[consumer.cls][t].push_back(v);
 
     Value bits;
-    if (consumer.width > 0 && consumer.regular) {
+    if (consumer.width > 0 && consumer.uniform && !consumer.regular) {
+      // Piece by piece: a uniform piece of memory producers reads each of
+      // them at the thread and slot the current thread reads it at, and
+      // takes the one the current thread reads.
+      SmallVector<Value> parts;
+      for (auto [j, first] : llvm::enumerate(consumer.pieces[0])) {
+        bool fromMemories =
+            first.producer >= 0 &&
+            llvm::all_of(consumer.pieces, [&](const Pieces &pieces) {
+              return producers[pieces[j].producer].memory;
+            });
+        if (!fromMemories) {
+          SmallVector<Value> perThread;
+          for (unsigned t = 0; t < consumer.threads; ++t)
+            perThread.push_back(bitsOf(t, j));
+          parts.push_back(select(perThread, sink.thread));
+          continue;
+        }
+        SmallVector<int> sources;
+        SmallVector<unsigned> sourceOf;
+        for (auto &pieces : consumer.pieces) {
+          auto *it = llvm::find(sources, pieces[j].producer);
+          sourceOf.push_back(it - sources.begin());
+          if (it == sources.end())
+            sources.push_back(pieces[j].producer);
+        }
+        SmallVector<Value> values;
+        for (auto [k, q] : llvm::enumerate(sources)) {
+          auto &producer = producers[q];
+          unsigned threadBits = llvm::Log2_32_Ceil(producer.threads);
+          unsigned slotBits = llvm::Log2_32(producer.depth);
+          SmallVector<Value> threads, slots;
+          for (unsigned t = 0; t < consumer.threads; ++t) {
+            bool mine = sourceOf[t] == k;
+            threads.push_back(constant(
+                APInt(threadBits, mine ? consumer.pieces[t][j].thread : 0)));
+            slots.push_back(mine ? Value(comb::ExtractOp::create(
+                                       b, b.getIntegerType(slotBits),
+                                       consumer.deq[t][j], 0))
+                                 : constant(APInt(slotBits, 0)));
+          }
+          Value thread = select(threads, sink.thread);
+          Value slot = select(slots, sink.thread);
+          Value address = comb::ConcatOp::create(b, thread, slot);
+          Value data = seq::FirMemReadOp::create(
+              b, tokenMemory(producer, first.low, first.width, consumer.cls),
+              address, hostClock, bit(true));
+          values.push_back(
+              forwarded(producer, thread, slot, first.low, first.width, data));
+        }
+        if (values.size() == 1) {
+          parts.push_back(values[0]);
+          continue;
+        }
+        unsigned indexBits = llvm::Log2_32_Ceil(values.size());
+        while (values.size() < (1u << indexBits))
+          values.push_back(values.back());
+        SmallVector<Value> indices;
+        for (unsigned t = 0; t < consumer.threads; ++t)
+          indices.push_back(constant(APInt(indexBits, sourceOf[t])));
+        Value index = select(indices, sink.thread);
+        SmallVector<Value> elements(values.rbegin(), values.rend());
+        parts.push_back(hw::ArrayGetOp::create(
+            b, hw::ArrayCreateOp::create(b, elements), index));
+      }
+      bits = concat(parts);
+    } else if (consumer.width > 0 && consumer.regular) {
       // Piece by piece, at the current thread.
       SmallVector<Value> parts;
       for (auto [j, piece] : llvm::enumerate(consumer.pieces[0])) {
@@ -1217,6 +1537,18 @@ LogicalResult Composer::build() {
     threads.push_back(
         b.getStringAttr(cls.name + "=" + Twine(cls.instances.size())));
   sim->setAttr("foldsim.threads", b.getArrayAttr(threads));
+  // Nested, which instance each thread simulates, for the runtime's view of
+  // the target and for tests.
+  if (nest) {
+    SmallVector<Attribute> order;
+    for (auto &cls : classes) {
+      std::string list = cls.name + "=";
+      for (auto [t, instance] : llvm::enumerate(cls.instances))
+        list += (t ? " " : "") + instance.getInstanceName().str();
+      order.push_back(b.getStringAttr(list));
+    }
+    sim->setAttr("foldsim.thread_order", b.getArrayAttr(order));
+  }
   return success();
 }
 
@@ -1753,6 +2085,11 @@ LogicalResult Composer::run() {
   for (auto *op : inlined)
     op->erase();
   top.walk([](Operation *op) { op->removeAttr(kRelaySide); });
+  // Kept, nested, for the scheduling analysis of the composed simulator.
+  if (!nest)
+    for (auto &cls : classes)
+      if (cls.threaded)
+        cls.threaded->removeAttr("foldsim.output_deps");
   return success();
 }
 
@@ -1779,7 +2116,8 @@ void ComposePass::runOnOperation() {
     return signalPassFailure();
   }
   if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
-                          threadOptions, stagedTokens, channelDepth, domains)
+                          threadOptions, stagedTokens, channelDepth, domains,
+                          nest, nestSkew, bankedTokens, copies)
                      .run()))
     signalPassFailure();
 }

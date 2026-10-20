@@ -297,12 +297,7 @@ private:
   /// host cycles as a thread's write takes to land and one more.
   unsigned phases;
   static unsigned turnPhases(unsigned threads, unsigned stateStages) {
-    if (threads < 2)
-      return 1;
-    unsigned slots = stateStages > 1 ? 4 : 3, k = 1;
-    while (threads * k < slots)
-      k *= 2;
-    return k;
+    return foldsim::turnPhases(threads, stateStages);
   }
   /// With idle slots, the host cycle of the current thread's turn, and that
   /// of the next host cycle; and whether this one is idle.
@@ -3064,10 +3059,31 @@ LogicalResult Threader::run() {
     if (channel.eager)
       eager.push_back(channel.name);
   threaded->setAttr("foldsim.eager_channels", b.getArrayAttr(eager));
+  // The inputs each other output depends on combinationally: the order in
+  // which a target cycle's tokens can flow between models.
+  SmallVector<NamedAttribute> outputDeps;
+  for (auto &channel : outputs) {
+    if (channel.eager)
+      continue;
+    SmallVector<Attribute> on;
+    for (auto dep : channel.deps.set_bits())
+      on.push_back(inputs[dep].name);
+    outputDeps.push_back(b.getNamedAttr(channel.name, b.getArrayAttr(on)));
+  }
+  threaded->setAttr("foldsim.output_deps", b.getDictionaryAttr(outputDeps));
   if (!bypasses.empty())
     threaded->setAttr("foldsim.bypass", b.getArrayAttr(bypasses));
   model.erase();
   return success();
+}
+
+unsigned foldsim::turnPhases(unsigned threads, unsigned stateStages) {
+  if (threads < 2)
+    return 1;
+  unsigned slots = stateStages > 1 ? 4 : 3, k = 1;
+  while (threads * k < slots)
+    k *= 2;
+  return k;
 }
 
 FailureOr<hw::HWModuleOp>
@@ -3174,4 +3190,8 @@ void FAME5Pass::runOnOperation() {
                                              idleSlots, pipelineDepth})
                  .run()))
     return signalPassFailure();
+  // The dependences are for the simulator around the model.
+  if (auto threaded = dyn_cast_or_null<hw::HWModuleOp>(
+          SymbolTable::lookupSymbolIn(getOperation(), name)))
+    threaded->removeAttr("foldsim.output_deps");
 }

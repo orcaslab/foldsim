@@ -45,6 +45,11 @@ struct HeldWrite {
 HeldWrite peelHolds(mlir::ImplicitLocOpBuilder &b, mlir::Value next,
                     mlir::Value reg);
 
+/// The host cycles of a thread's turn in a model picked in turn with idle
+/// slots: the first its own, the others idle (`foldsim-fame5`'s
+/// `idle-slots`).
+unsigned turnPhases(unsigned threads, unsigned stateStages);
+
 mlir::FailureOr<circt::hw::HWModuleOp>
 threadModel(circt::hw::HWModuleOp model, unsigned threads, mlir::StringAttr name,
             bool readySchedule, const ThreadOptions &options = {});

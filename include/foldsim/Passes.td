@@ -190,6 +190,26 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
            "Slots per producer thread of a channel without a relay, a power of "
            "two: deeper channels give producers slack ahead of their readers "
            "at the cost of slot memory">,
+    Option<"nest", "nest", "bool", "false",
+           "Fold nested classes recursively: number each class's threads so "
+           "that, picked in turn, a thread is current on the host cycles its "
+           "parent's thread is (the parent's thread index the low digits of "
+           "its children's), so that a parent and its children always "
+           "simulate the same instance of the parent">,
+    Option<"nestSkew", "nest-skew", "unsigned", "0",
+           "With `nest`: a child's thread is current this many host cycles "
+           "after its parent's">,
+    ListOption<"copies", "copies", "std::string",
+               "Models simulated by several threaded copies, as "
+               "<model>:<count>: each copy simulates a contiguous range of "
+               "the instances (with `nest`, the high digits of the thread "
+               "index), so a turn takes fewer host cycles">,
+    Option<"bankedTokens", "banked-tokens", "bool", "false",
+           "Keep a producer's slots in a memory also when a reader takes, by "
+           "thread, the same bits from different producers (a parent's port "
+           "per child instance): the reader reads each producer's memory and "
+           "selects the one of its thread, rather than every producer "
+           "thread's slots being registers">,
     Option<"stagedTokens", "staged-tokens", "bool", "false",
            "Write each token into its slot a host cycle after it is taken, "
            "from registers of the token, its thread and slot, and forward it "
