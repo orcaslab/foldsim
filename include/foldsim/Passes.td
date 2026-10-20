@@ -208,6 +208,11 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
                "<model>:<count>: each copy simulates a contiguous range of "
                "the instances (with `nest`, the high digits of the thread "
                "index), so a turn takes fewer host cycles">,
+    Option<"commitEnable", "commit-enable", "bool", "false",
+           "With `registered-state` and `commit-select`: a model of one "
+           "thread takes every other host cycle and commits its state with "
+           "the registered edge as clock enable, rather than by a select per "
+           "bit">,
     Option<"blockStateDepth", "block-state-depth", "unsigned", "0",
            "With `registered-state`: the thread state of models of at least "
            "this many threads asks for block RAM (0: never)">,

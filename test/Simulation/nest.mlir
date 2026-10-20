@@ -51,6 +51,14 @@
 // RUN: %t/q/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
 // RUN: FileCheck %s --check-prefix=BRAM < %t/q/sim.sv
 // BRAM: (* ram_style = "block" *)
+// Nested, the one-thread top model idle every other host cycle and its
+// state committed by clock enable rather than by select.
+// RUN: mkdir -p %t/e && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest nest-skew=2 banked-tokens commit-enable})" -o %t/e/sim.mlir
+// RUN: firtool --format=mlir %t/e/sim.mlir -o %t/e/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/e/obj %S/Inputs/tb_nest.sv %t/target.sv %t/e/sim.sv > %t/e/build.log 2>&1
+// RUN: %t/e/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
+// RUN: %t/e/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
+// RUN: %t/e/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s
 // A parent's thread index is the low digits of its children's: L1's thread is
 // current on even host cycles for u0, odd for u1, and so on down.
 // RUN: FileCheck %s --check-prefix=ORDER < %t/m/sim.mlir

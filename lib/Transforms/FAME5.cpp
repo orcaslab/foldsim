@@ -155,7 +155,12 @@ public:
         compactStaging(options.compactStaging),
         foldPipelines(options.foldPipelines),
         blockStateDepth(options.registeredState ? options.blockStateDepth : 0),
-        phases(options.idleSlots && options.registeredState && !readySchedule
+        phases(threads == 1
+                   ? (options.commitEnable && options.registeredState &&
+                              options.commitSelect && !readySchedule
+                          ? 2
+                          : 1)
+               : options.idleSlots && options.registeredState && !readySchedule
                    ? turnPhases(threads, options.stateStages)
                    : 1) {}
 
@@ -1761,7 +1766,9 @@ void Threader::commitBySelect(ImplicitLocOpBuilder &b, Value edge,
         b, reg.getResult(), hostClock, reg.getNameAttr(), hw::InnerSymAttr{},
         reg.getPresetAttr());
     Value value = comb::MuxOp::create(b, enable, single.candidate, committed);
-    reg.getResult().replaceAllUsesWith(value);
+    // Idle on the host cycle after an edge, the model reads the committed
+    // register itself: the enable is the register's clock enable.
+    reg.getResult().replaceAllUsesWith(phases > 1 ? Value(committed) : value);
     committed.getNextMutable().assign(value);
     reg.erase();
   }
@@ -2484,6 +2491,19 @@ LogicalResult Threader::run() {
   // With registered state the next thread is chosen a host cycle earlier: the
   // thread after the current one is a register too.
   Backedge aheadNext, aheadPhaseNext;
+  // A model of one thread committing by enable is idle every other host
+  // cycle, from the first after reset: its state, written on the host cycle
+  // after the edge, is read on the one after that.
+  if (threads == 1 && phases > 1) {
+    auto phaseNext = backedges.get(i1);
+    phase = seq::FirRegOp::create(
+        b, phaseNext, hostClock, b.getStringAttr("phase"), hostReset,
+        hw::ConstantOp::create(b, i1, 1), hw::InnerSymAttr{},
+        /*isAsync=*/false, b.getIntegerAttr(i1, 1));
+    phaseNext.setValue(
+        comb::XorOp::create(b, phase, hw::ConstantOp::create(b, i1, 1)));
+    idle = phase;
+  }
   if (threads > 1 && registeredState) {
     auto idxType = b.getIntegerType(llvm::Log2_32_Ceil(threads));
     // With idle slots the host cycle after the first is the first thread's

@@ -36,6 +36,10 @@ struct ThreadOptions {
   /// With registered state: thread state of at least this many threads asks
   /// for block RAM, its read-ahead register the RAM's output (0: never).
   unsigned blockStateDepth = 0;
+  /// With registered state and commit by select: a model of one thread takes
+  /// every other host cycle and commits its state by the registered edge as
+  /// a clock enable, rather than by a select per bit.
+  bool commitEnable = false;
 };
 /// How a register is written: never (it only holds its value), or with
 /// `data` when `enable` (always, if null).

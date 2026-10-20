@@ -171,6 +171,10 @@ def main():
                          "that a thread and its parent's are current together (foldsim-compose)")
     ap.add_argument('--nest-skew', type=int, default=0,
                     help='with --nest: host cycles a thread is current after its parent\'s')
+    ap.add_argument('--commit-enable', action='store_true',
+                    help='with --registered-state and --commit-select: one-thread models take '
+                         'every other host cycle and commit by clock enable, without a select '
+                         'per bit (foldsim-compose)')
     ap.add_argument('--block-state-depth', type=int, default=0,
                     help='with --registered-state: thread state of models of at least this '
                          'many threads asks for block RAM (foldsim-compose)')
@@ -286,6 +290,8 @@ def main():
         compose += ' domains'
     if a.copies:
         compose += f' copies={a.copies}'
+    if a.commit_enable:
+        compose += ' commit-enable'
     if a.block_state_depth:
         compose += f' block-state-depth={a.block_state_depth}'
     if a.banked_tokens:

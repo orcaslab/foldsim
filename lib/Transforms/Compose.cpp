@@ -31,6 +31,7 @@
 #include "llvm/Support/Debug.h"
 #include <functional>
 #include <map>
+#include <set>
 #include <numeric>
 
 namespace foldsim {
@@ -431,6 +432,41 @@ LogicalResult Composer::collect() {
       return failure();
   }
 
+  // With banked tokens, every thread of a consumer splits its pieces at the
+  // boundaries any thread's pieces have, so that a piece position is the
+  // same bits for every thread, whatever producer it comes from.
+  if (bankedTokens)
+    for (auto &consumer : consumers) {
+      if (consumer.pieces.size() < 2)
+        continue;
+      std::set<unsigned> cuts;
+      for (auto &pieces : consumer.pieces) {
+        unsigned at = 0;
+        for (auto &piece : pieces)
+          cuts.insert(at += piece.width);
+      }
+      for (auto &pieces : consumer.pieces) {
+        Pieces split;
+        unsigned at = 0;
+        for (auto &piece : pieces) {
+          unsigned end = at + piece.width;
+          for (auto it = cuts.upper_bound(at); at < end; ++it) {
+            unsigned next = std::min(end, *it);
+            Piece part = piece;
+            unsigned offset = at - (end - piece.width);
+            part.width = next - at;
+            if (piece.producer >= 0)
+              part.low = piece.low + offset;
+            else
+              part.constant = piece.constant.extractBits(part.width, offset);
+            split.push_back(part);
+            at = next;
+          }
+        }
+        pieces = std::move(split);
+      }
+    }
+
   // Who reads what.
   for (auto [c, consumer] : llvm::enumerate(consumers))
     for (auto [t, pieces] : llvm::enumerate(consumer.pieces))
@@ -489,8 +525,7 @@ LogicalResult Composer::collect() {
             if (pieces.size() != first.size())
               return false;
             for (auto [piece, base] : llvm::zip(pieces, first))
-              if ((piece.producer < 0) != (base.producer < 0) ||
-                  piece.low != base.low || piece.width != base.width)
+              if (piece.width != base.width)
                 return false;
             return true;
           });
@@ -513,15 +548,13 @@ LogicalResult Composer::collect() {
       if (!consumer.uniform || consumer.regular)
         continue;
       for (unsigned j = 0; j < consumer.pieces[0].size(); ++j) {
-        if (consumer.pieces[0][j].producer < 0)
-          continue;
         bool all = llvm::all_of(consumer.pieces, [&](const Pieces &pieces) {
-          return producers[pieces[j].producer].memory;
+          return pieces[j].producer < 0 || producers[pieces[j].producer].memory;
         });
         if (all)
           continue;
         for (auto &pieces : consumer.pieces)
-          if (producers[pieces[j].producer].memory) {
+          if (pieces[j].producer >= 0 && producers[pieces[j].producer].memory) {
             producers[pieces[j].producer].memory = false;
             changed = true;
           }
@@ -1432,9 +1465,13 @@ LogicalResult Composer::build() {
       SmallVector<Value> parts;
       for (auto [j, first] : llvm::enumerate(consumer.pieces[0])) {
         bool fromMemories =
-            first.producer >= 0 &&
+            llvm::any_of(consumer.pieces,
+                         [&](const Pieces &pieces) {
+                           return pieces[j].producer >= 0;
+                         }) &&
             llvm::all_of(consumer.pieces, [&](const Pieces &pieces) {
-              return producers[pieces[j].producer].memory;
+              return pieces[j].producer < 0 ||
+                     producers[pieces[j].producer].memory;
             });
         if (!fromMemories) {
           SmallVector<Value> perThread;
@@ -1443,17 +1480,29 @@ LogicalResult Composer::build() {
           parts.push_back(select(perThread, sink.thread));
           continue;
         }
-        SmallVector<int> sources;
+        // A source: a producer's bits from a low bit, or a constant.
+        SmallVector<const Piece *> sources;
         SmallVector<unsigned> sourceOf;
+        auto same = [](const Piece *x, const Piece &y) {
+          if (x->producer != y.producer)
+            return false;
+          return x->producer >= 0 ? x->low == y.low
+                                  : x->constant == y.constant;
+        };
         for (auto &pieces : consumer.pieces) {
-          auto *it = llvm::find(sources, pieces[j].producer);
+          auto *it = llvm::find_if(
+              sources, [&](const Piece *x) { return same(x, pieces[j]); });
           sourceOf.push_back(it - sources.begin());
           if (it == sources.end())
-            sources.push_back(pieces[j].producer);
+            sources.push_back(&pieces[j]);
         }
         SmallVector<Value> values;
-        for (auto [k, q] : llvm::enumerate(sources)) {
-          auto &producer = producers[q];
+        for (auto [k, source] : llvm::enumerate(sources)) {
+          if (source->producer < 0) {
+            values.push_back(constant(source->constant));
+            continue;
+          }
+          auto &producer = producers[source->producer];
           unsigned threadBits = llvm::Log2_32_Ceil(producer.threads);
           unsigned slotBits = llvm::Log2_32(producer.depth);
           SmallVector<Value> threads, slots;
@@ -1470,10 +1519,10 @@ LogicalResult Composer::build() {
           Value slot = select(slots, sink.thread);
           Value address = comb::ConcatOp::create(b, thread, slot);
           Value data = seq::FirMemReadOp::create(
-              b, tokenMemory(producer, first.low, first.width, consumer.cls),
+              b, tokenMemory(producer, source->low, first.width, consumer.cls),
               address, hostClock, bit(true));
-          values.push_back(
-              forwarded(producer, thread, slot, first.low, first.width, data));
+          values.push_back(forwarded(producer, thread, slot, source->low,
+                                     first.width, data));
         }
         if (values.size() == 1) {
           parts.push_back(values[0]);
@@ -2142,7 +2191,8 @@ void ComposePass::runOnOperation() {
                                        stateStages, commitSelect,
                                        stagedRamWrites, pipelineMultipliers,
                                        compactStaging, foldPipelines,
-                                       idleSlots, pipelineDepth, blockStateDepth};
+                                       idleSlots, pipelineDepth, blockStateDepth,
+                                       commitEnable};
   if (channelDepth < 2 || !llvm::isPowerOf2_32(channelDepth)) {
     top.emitError("a channel's depth is a power of two, at least two");
     return signalPassFailure();
