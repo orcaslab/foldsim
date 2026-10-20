@@ -165,6 +165,8 @@ struct NestOptions {
   int skew = -1;
   ArrayRef<std::string> offsets, copies;
   bool bankedTokens = false;
+  /// Turns from the parents' controllers rather than counters of their own.
+  bool tree = true;
 };
 
 class Composer {
@@ -178,7 +180,7 @@ public:
         readySchedule(readySchedule), threadOptions(threadOptions),
         stagedTokens(stagedTokens), channelDepth(channelDepth),
         emitDomainTree(domains), nest(nesting.nest), nestSkew(nesting.skew),
-        bankedTokens(nesting.bankedTokens) {
+        bankedTokens(nesting.bankedTokens), treeControl(nesting.tree) {
     for (auto &name : relay)
       relayModels.insert(name);
     for (auto &entry : nesting.offsets) {
@@ -234,8 +236,49 @@ private:
   llvm::StringMap<int64_t> nestOffsets, offsetOf;
   SmallVector<std::string> badOptions;
   LogicalResult splitCopies();
-  /// With `nest`: each model instance's parent model instance.
+  /// With `nest`: each model instance's parent model instance, and each
+  /// class's parent class, by base name.
   DenseMap<Operation *, Operation *> parentOf;
+  llvm::StringMap<std::string> parentBaseOf;
+  /// With `nest`: whether the turns come from a control tree, each class's
+  /// from its parent's controller, rather than from counters of their own.
+  bool treeControl;
+  /// The threads and idle phases of each copy of a class of `threads`.
+  unsigned copyThreads(StringRef base, unsigned threads) const {
+    unsigned k = copiesOf.lookup(base);
+    return k > 1 ? threads / k : threads;
+  }
+  unsigned copyPhases(StringRef base, unsigned threads) const {
+    unsigned n = copyThreads(base, threads);
+    return n > 1 ? phasesOf(n) : onePhases;
+  }
+  /// The idle phases of a one-thread model (two when it commits by enable).
+  unsigned onePhases = 1;
+  /// Whether a model's position register is a host cycle ahead (registered
+  /// state with several threads).
+  unsigned leadOf(unsigned threads) const {
+    return threads > 1 && threadOptions.registeredState ? 1 : 0;
+  }
+  /// The least offset between a parent and a child whose turns the parent
+  /// issues: one register from the parent's position register to the
+  /// child's, which lead their host cycles by their `leadOf`.
+  int64_t controlHop(StringRef parent, unsigned parentThreads, StringRef child,
+                     unsigned childThreads) const {
+    return 1 + int64_t(leadOf(copyThreads(child, childThreads))) -
+           int64_t(leadOf(copyThreads(parent, parentThreads)));
+  }
+  /// The control tree: each class's turn on the host cycle after reset, the
+  /// root's free-running.
+  LogicalResult planSchedules();
+  struct Schedule {
+    bool external = false;
+    uint64_t positions = 1, start = 0;
+    int parent = -1;
+    unsigned stages = 0;
+    unsigned lead = 0;
+  };
+  SmallVector<Schedule> schedules;
+  int64_t globalStart = 0;
   /// The host cycles of a turn of each thread of a class of `threads`.
   unsigned phasesOf(unsigned threads) const {
     return threadOptions.idleSlots && threadOptions.registeredState &&
@@ -384,21 +427,31 @@ LogicalResult Composer::collect() {
     return netlist.emitError(
         "nest: the nested order is a static order; it needs every model "
         "picked in turn (ready-schedule=false)");
-  if (nest && failed(alignThreads()))
-    return failure();
-  if (failed(splitCopies()))
-    return failure();
-  if (nest && failed(verifyNesting()))
-    return failure();
-
   // Committing by enable makes a one-thread model take every other host
   // cycle: only where a class of several threads sets the pace.
   auto options = threadOptions;
   options.commitEnable &= llvm::any_of(
       classes, [](auto &cls) { return cls.instances.size() > 1; });
+  onePhases = options.commitEnable && options.registeredState &&
+                      options.commitSelect && !readySchedule
+                  ? 2
+                  : 1;
+  if (nest && failed(alignThreads()))
+    return failure();
+  if (failed(splitCopies()))
+    return failure();
+  if (nest && treeControl && failed(planSchedules()))
+    return failure();
+  if (nest && failed(verifyNesting()))
+    return failure();
+
   // Each class threaded, its channels found by name.
-  for (auto &cls : classes) {
+  for (auto [c, cls] : llvm::enumerate(classes)) {
     auto name = StringAttr::get(top.getContext(), cls.name + "_threaded");
+    if (!schedules.empty()) {
+      options.externalSchedule = schedules[c].external;
+      options.scheduleStart = schedules[c].start;
+    }
     auto threaded = foldsim::threadModel(cls.model, cls.instances.size(), name,
                                         readySchedule, options);
     if (failed(threaded))
@@ -775,22 +828,32 @@ LogicalResult Composer::alignThreads() {
   for (auto c : order) {
     auto &cls = classes[c];
     int pc = parentClass[c];
-    unsigned n = cls.instances.size(), k = phasesOf(n);
+    if (pc >= 0)
+      parentBaseOf[cls.name] = classes[pc].name;
+    unsigned n = cls.instances.size(), k = copyPhases(cls.name, n);
     auto it = nestOffsets.find(cls.name);
     if (it != nestOffsets.end()) {
       offset[c] = it->second;
     } else if (pc >= 0) {
       int64_t hop = nestSkew >= 0 ? nestSkew
                     : relayed(classes[pc].name, cls.name) ? 2 : 1;
+      // The control tree's hop: a register per level, from the parent's
+      // position register to the child's.
+      if (treeControl)
+        hop = std::max<int64_t>(
+            hop, controlHop(classes[pc].name, classes[pc].instances.size(),
+                            cls.name, n));
       offset[c] = llvm::alignTo(offset[pc] + hop, k);
     }
     offsetOf[cls.name] = offset[c];
-    if (n == 1)
-      continue;
     if (offset[c] % k)
       return cls.instances[0].emitError("nest: the offset of '")
              << cls.name << "' (" << offset[c]
              << ") is not a multiple of its turn's " << k << " host cycles";
+    // Under the control tree the offset is the control's own delay; with
+    // counters of their own, the numbering is rotated by it.
+    if (n == 1 || treeControl)
+      continue;
     int64_t shift = (offset[c] / k) % n;
     SmallVector<hw::InstanceOp> canonical(cls.instances.begin(),
                                           cls.instances.end());
@@ -846,33 +909,97 @@ LogicalResult Composer::splitCopies() {
   return success();
 }
 
+LogicalResult Composer::planSchedules() {
+  // A class's position on host cycle h: its thread and idle phase, (h +
+  // globalStart - offset) modulo its turn. The root's controller counts
+  // freely; every other class's position is its parent's, a register per
+  // level of offset later, with a digit of its own above it that advances
+  // when the parent's position wraps.
+  schedules.assign(classes.size(), Schedule{});
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    auto &plan = schedules[c];
+    unsigned n = cls.instances.size();
+    plan.positions = uint64_t(n) * (n > 1 ? phasesOf(n) : onePhases);
+    plan.lead = leadOf(n);
+    plan.external = plan.positions > 1;
+    auto parent = parentBaseOf.find(cls.base);
+    if (parent == parentBaseOf.end())
+      continue;
+    for (auto [p, other] : llvm::enumerate(classes))
+      if (other.name == parent->second)
+        plan.parent = p;
+  }
+  // A one-thread root committing by enable starts its turns idle.
+  globalStart = 0;
+  for (auto &plan : schedules)
+    if (plan.parent < 0 && plan.positions == 2 && plan.lead == 0)
+      globalStart = 1;
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    auto &plan = schedules[c];
+    int64_t offset = offsetOf.lookup(cls.base);
+    int64_t positions = plan.positions;
+    plan.start = ((globalStart - offset) % positions + positions) % positions;
+    if (plan.parent < 0)
+      continue;
+    auto &parent = schedules[plan.parent];
+    int64_t delta = offset - offsetOf.lookup(classes[plan.parent].base);
+    int64_t stages = delta + int64_t(parent.lead) - int64_t(plan.lead) - 1;
+    if (stages < 0)
+      return cls.instances[0].emitError("nest: the offset of '")
+             << cls.name << "' from '" << classes[plan.parent].name << "' ("
+             << delta << ") is shorter than the control's hop ("
+             << delta - stages << ")";
+    plan.stages = stages;
+    if (plan.positions % parent.positions && parent.positions % plan.positions)
+      return cls.instances[0].emitError("nest: the turn of '")
+             << cls.name << "' (" << plan.positions
+             << " host cycles) and its parent's (" << parent.positions
+             << ") are not multiples of one another";
+  }
+  return success();
+}
+
 LogicalResult Composer::verifyNesting() {
   // On every host cycle where a child's copy and its parent's are current,
   // the child's thread is a child of the parent's, their offsets apart.
+  auto phases = [&](const Class &cls) {
+    unsigned n = cls.instances.size();
+    return n > 1 ? phasesOf(n) : onePhases;
+  };
   auto turn = [&](const Class &cls) {
-    return uint64_t(cls.instances.size()) * phasesOf(cls.instances.size());
+    return uint64_t(cls.instances.size()) * phases(cls);
   };
   uint64_t period = 1;
   for (auto &cls : classes)
     period = std::lcm(period, turn(cls));
-  for (auto &cls : classes) {
-    unsigned k = phasesOf(cls.instances.size());
-    for (uint64_t h = 0; h < period; h += k) {
-      auto instance = cls.instances[(h / k) % cls.instances.size()];
-      auto *parentInstance = parentOf.lookup(instance);
+  // The thread a class's copy is current with on host cycle h, if any: from
+  // the control tree's positions, or from a counter of its own.
+  auto current = [&](unsigned c, int64_t h) -> int64_t {
+    auto &cls = classes[c];
+    int64_t k = phases(cls), at = h;
+    if (!schedules.empty())
+      at = h + globalStart - offsetOf.lookup(cls.base);
+    at = (at % int64_t(period) + int64_t(period)) % int64_t(period);
+    if (at % k)
+      return -1;
+    return (at / k) % int64_t(cls.instances.size());
+  };
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    for (uint64_t h = 0; h < period; ++h) {
+      int64_t t = current(c, h);
+      if (t < 0)
+        continue;
+      auto *parentInstance = parentOf.lookup(cls.instances[t]);
       if (!parentInstance)
         continue;
       auto [pc, pt] = threadOf.lookup(parentInstance);
-      auto &parent = classes[pc];
-      unsigned kp = phasesOf(parent.instances.size());
-      int64_t delta = offsetOf.lookup(cls.base) - offsetOf.lookup(parent.base);
-      int64_t at = ((int64_t(h) - delta) % int64_t(period) + int64_t(period)) %
-                   int64_t(period);
-      if (at % kp)
-        continue;
-      if ((at / kp) % parent.instances.size() != pt)
+      int64_t delta = offsetOf.lookup(cls.base) -
+                      offsetOf.lookup(classes[pc].base);
+      int64_t tp = current(pc, int64_t(h) - delta);
+      if (tp >= 0 && tp != int64_t(pt))
         return cls.instances[0].emitError("nest: the threads of '")
-               << cls.name << "' do not follow the turns of '" << parent.name
+               << cls.name << "' do not follow the turns of '"
+               << classes[pc].name
                << "': copies must split a class at a multiple of its "
                   "parent's turn";
     }
@@ -1192,6 +1319,83 @@ LogicalResult Composer::build() {
     auto it = models[c].inputs.find(name.str());
     return it == models[c].inputs.end() ? nullptr : &it->second;
   };
+
+  // The control tree. A class's position (thread and idle phase) comes from
+  // its parent's controller: the parent's position register, a register per
+  // level of offset later, with a digit of the class's own above it that
+  // advances when the parent's position wraps. The root's controller counts.
+  for (auto [c, plan] : llvm::enumerate(schedules)) {
+    if (!plan.external)
+      continue;
+    auto *nextPort = modelInput(c, "schedule_next");
+    Value position = modelOutput(c, "schedule");
+    unsigned width = position.getType().getIntOrFloatBitWidth();
+    auto type = b.getIntegerType(width);
+    auto constant = [&](Type t, uint64_t v) -> Value {
+      return hw::ConstantOp::create(b, t, v);
+    };
+    // `value` plus one, back to zero after `last`.
+    auto step = [&](Value value, uint64_t last) -> Value {
+      auto t = value.getType();
+      return comb::MuxOp::create(
+          b, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, value,
+                                  constant(t, last)),
+          constant(t, 0), comb::AddOp::create(b, value, constant(t, 1)));
+    };
+    if (plan.parent < 0) {
+      nextPort->setValue(step(position, plan.positions - 1));
+      continue;
+    }
+    auto &parent = schedules[plan.parent];
+    auto &parentClass = classes[plan.parent];
+    // The parent's position, delayed by the stages beyond the hop.
+    Value delivered;
+    uint64_t parentPositions = parent.positions;
+    if (parent.external) {
+      delivered = modelOutput(plan.parent, "schedule");
+      int64_t now = int64_t(parent.lead) + globalStart -
+                    offsetOf.lookup(parentClass.base);
+      auto parentType = delivered.getType();
+      for (unsigned i = 1; i <= plan.stages; ++i) {
+        int64_t at = now - int64_t(i), pp = int64_t(parentPositions);
+        uint64_t reset = uint64_t((at % pp + pp) % pp);
+        delivered = seq::FirRegOp::create(
+            b, delivered, hostClock,
+            b.getStringAttr(classes[c].name + "_turn" + Twine(i)), hostReset,
+            constant(parentType, reset), hw::InnerSymAttr{},
+            /*isAsync=*/false, b.getIntegerAttr(parentType, reset));
+      }
+    }
+    Value next;
+    if (!delivered) {
+      // A parent of one host cycle per turn: it wraps on every one.
+      next = step(position, plan.positions - 1);
+    } else if (plan.positions <= parentPositions) {
+      // A shorter turn (a copy): the parent's position modulo it.
+      next = b.createOrFold<comb::ExtractOp>(
+          type,
+          b.createOrFold<comb::ModUOp>(
+              delivered, constant(delivered.getType(), plan.positions)),
+          0);
+    } else {
+      // Above the parent's position, a digit that advances as it wraps.
+      unsigned parentWidth = delivered.getType().getIntOrFloatBitWidth();
+      uint64_t digits = plan.positions / parentPositions;
+      Value digit = comb::DivUOp::create(
+          b, position, constant(type, parentPositions));
+      Value wrapped = comb::ICmpOp::create(
+          b, comb::ICmpPredicate::eq, delivered,
+          constant(delivered.getType(), 0));
+      Value nextDigit =
+          comb::MuxOp::create(b, wrapped, step(digit, digits - 1), digit);
+      Value low = b.createOrFold<comb::ConcatOp>(
+          constant(b.getIntegerType(width - parentWidth), 0), delivered);
+      next = comb::AddOp::create(
+          b, comb::MulOp::create(b, nextDigit, constant(type, parentPositions)),
+          low);
+    }
+    nextPort->setValue(next);
+  }
 
   // The producers' and consumers' handshakes.
   struct Source {
@@ -1540,7 +1744,8 @@ LogicalResult Composer::build() {
       // them at the thread and slot the current thread reads it at, and
       // takes the one the current thread reads.
       SmallVector<Value> parts;
-      for (auto [j, first] : llvm::enumerate(consumer.pieces[0])) {
+      for (unsigned j = 0, e = consumer.pieces[0].size(); j < e; ++j) {
+        auto &first = consumer.pieces[0][j];
         bool fromMemories =
             llvm::any_of(consumer.pieces,
                          [&](const Pieces &pieces) {
@@ -2276,6 +2481,12 @@ void ComposePass::runOnOperation() {
   nesting.offsets = nestOffsets;
   nesting.copies = copies;
   nesting.bankedTokens = bankedTokens;
+  if (nestControl != "tree" && nestControl != "counters") {
+    top.emitError("nest-control: '") << nestControl
+                                     << "' is neither tree nor counters";
+    return signalPassFailure();
+  }
+  nesting.tree = nestControl == "tree";
   if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
                           threadOptions, stagedTokens, channelDepth, domains,
                           nesting)

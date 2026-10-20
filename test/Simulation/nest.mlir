@@ -7,12 +7,18 @@
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/f/obj %S/Inputs/tb_nest.sv %t/target.sv %t/f/sim.sv > %t/f/build.log 2>&1
 // RUN: %t/f/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
 // RUN: %t/f/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
-// Nested, offsets a hop of the channels apart (rounded to idle phases).
+// Nested folding: turns from the control tree, offsets a hop apart (rounded to idle phases).
 // RUN: mkdir -p %t/n && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest})" -o %t/n/sim.mlir
 // RUN: firtool --format=mlir %t/n/sim.mlir -o %t/n/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/n/obj %S/Inputs/tb_nest.sv %t/target.sv %t/n/sim.sv > %t/n/build.log 2>&1
 // RUN: %t/n/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
 // RUN: %t/n/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
+// Nested numbering with counters of their own instead of the control tree.
+// RUN: mkdir -p %t/o && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest nest-control=counters})" -o %t/o/sim.mlir
+// RUN: firtool --format=mlir %t/o/sim.mlir -o %t/o/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/o/obj %S/Inputs/tb_nest.sv %t/target.sv %t/o/sim.sv > %t/o/build.log 2>&1
+// RUN: %t/o/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
+// RUN: %t/o/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
 // Nested, children two host cycles after their parent.
 // RUN: mkdir -p %t/k && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest nest-skew=2})" -o %t/k/sim.mlir
 // RUN: firtool --format=mlir %t/k/sim.mlir -o %t/k/sim.sv
@@ -54,10 +60,17 @@
 // current on even host cycles for u0, odd for u1, and so on down.
 // RUN: FileCheck %s --check-prefix=ORDER < %t/m/sim.mlir
 // ORDER: "L2_model=u0_u0_logic u1_u0_logic u0_u1_logic u1_u1_logic", "L3=u0_u0_u0 u1_u0_u0 u0_u1_u0 u1_u1_u0 u0_u0_u1 u1_u0_u1 u0_u1_u1 u1_u1_u1"
-// With the default offsets each level is rotated one host cycle past its
-// parent (L1, with idle phases, two).
-// RUN: FileCheck %s --check-prefix=OFFSET < %t/n/sim.mlir
+// With counters of their own, the classes' numbering is rotated by their
+// offsets (L1, with idle phases, two host cycles: one thread).
+// RUN: FileCheck %s --check-prefix=OFFSET < %t/o/sim.mlir
 // OFFSET: "L1_model=u1_logic u0_logic"
+// Under the control tree a class takes its turns from its parent's
+// controller; beyond the one hop, a register per host cycle of offset.
+// RUN: FileCheck %s --check-prefix=TREE < %t/n/sim.mlir
+// TREE: hw.module @L3_threaded({{.*}}out schedule : i3, in %schedule_next : i3)
+// TREE: "L1_model=u0_logic u1_logic"
+// RUN: FileCheck %s --check-prefix=STAGE < %t/k/sim.mlir
+// STAGE: %L2_model_turn1 = seq.firreg
 // The banked memories replace the per-child slot registers.
 // RUN: FileCheck %s --check-prefix=BANK < %t/b/sim.mlir
 // BANK-NOT: L1_model_u0_x_slot

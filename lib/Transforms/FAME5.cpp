@@ -155,6 +155,8 @@ public:
         compactStaging(options.compactStaging),
         foldPipelines(options.foldPipelines),
         blockStateDepth(options.registeredState ? options.blockStateDepth : 0),
+        externalSchedule(options.externalSchedule),
+        scheduleStart(options.scheduleStart),
         phases(threads == 1
                    ? (options.commitEnable && options.registeredState &&
                               options.commitSelect && !readySchedule
@@ -294,6 +296,15 @@ private:
   bool foldPipelines;
   /// Thread state of at least this many threads asks for block RAM.
   unsigned blockStateDepth;
+  /// Whether the turns come in on `schedule_next`, and the position on the
+  /// host cycle after reset.
+  bool externalSchedule;
+  uint64_t scheduleStart;
+  /// The bits of a position: the thread index's, then the phase's.
+  unsigned positionWidth() const {
+    return (threads > 1 ? llvm::Log2_32_Ceil(threads) : 0) +
+           (phases > 1 ? llvm::Log2_32(phases) : 0);
+  }
   /// A folded pipeline's store and its write from the unthreaded copy.
   struct Fold {
     seq::FirMemOp store;
@@ -311,8 +322,8 @@ private:
   /// of the next host cycle; and whether this one is idle.
   Value phase, aheadPhase, idle;
   /// The reset value of `aheadIdx`: the thread of the host cycle after the
-  /// first.
-  uint64_t aheadReset = 1;
+  /// first; and of `threadIdx`.
+  uint64_t aheadReset = 1, idxReset = 0, aheadPhaseReset = 1;
   SmallVector<Fold> folds;
   DenseMap<Operation *, unsigned> foldOfStore;
   /// The ops of the unthreaded copies: on the host clock, not target state.
@@ -1469,7 +1480,7 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
   };
   auto countTurns = [&](unsigned r, Value &current, Value &ahead) {
     if (!aheadIdx) {
-      auto idx = counter(idxType, "threadIdx_r" + Twine(r), 0);
+      auto idx = counter(idxType, "threadIdx_r" + Twine(r), idxReset);
       setNext(idx, inTurnAfter(idx));
       current = idx;
       return;
@@ -1478,7 +1489,7 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
     Value next = inTurnAfter(idx);
     if (aheadPhase) {
       auto phaseType = aheadPhase.getType();
-      auto phaseReg = counter(phaseType, "phase_a" + Twine(r), 1);
+      auto phaseReg = counter(phaseType, "phase_a" + Twine(r), aheadPhaseReset);
       setNext(phaseReg, comb::AddOp::create(
                             b, phaseReg, hw::ConstantOp::create(b, phaseType, 1)));
       next = comb::MuxOp::create(
@@ -1489,7 +1500,7 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
     }
     setNext(idx, next);
     ahead = idx;
-    auto now = counter(idxType, "threadIdx_r" + Twine(r), 0);
+    auto now = counter(idxType, "threadIdx_r" + Twine(r), idxReset);
     setNext(now, idx);
     current = now;
   };
@@ -1504,7 +1515,8 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
         aheadCopy = {};
     } else {
       readIdx = copy(idxNext, "threadIdx_r" + Twine(r), hostReset,
-                     hw::ConstantOp::create(b, idxType, 0));
+                     hw::ConstantOp::create(b, idxType, idxReset),
+                     /*initial=*/idxReset);
       // With registered state, the thread state is read for the next thread.
       if (readsState)
         aheadCopy =
@@ -2377,6 +2389,11 @@ LogicalResult Threader::run() {
   // own accounting.
   if (threadIndexPort)
     addPort("finish", i1, false);
+  bool schedulePorts = externalSchedule && positionWidth() > 0;
+  if (schedulePorts) {
+    addPort("schedule", IntegerType::get(context, positionWidth()), false);
+    addPort("schedule_next", IntegerType::get(context, positionWidth()), true);
+  }
 
   OpBuilder top(model);
   auto threaded = hw::HWModuleOp::create(top, model.getLoc(), name,
@@ -2410,6 +2427,16 @@ LogicalResult Threader::run() {
   Value threadReady;
   if (readySchedule && threads > 1)
     threadReady = body->getArgument(arg++);
+  Value scheduleNext;
+  if (schedulePorts)
+    scheduleNext = body->getArgument(arg++);
+  // Where the turns come from outside, the position on the host cycle after
+  // reset, and on the one after that.
+  uint64_t positions = uint64_t(threads) * phases;
+  uint64_t startNow = scheduleStart % positions,
+           startNext = (scheduleStart + 1) % positions;
+  auto threadOfPosition = [&](uint64_t position) { return position / phases; };
+  auto phaseOfPosition = [&](uint64_t position) { return position % phases; };
 
   // The target logic moves into the threaded module as is, reading the
   // input channels' bits.
@@ -2471,18 +2498,21 @@ LogicalResult Threader::run() {
   if (threads > 1) {
     auto idxType = b.getIntegerType(llvm::Log2_32_Ceil(threads));
     idxNext = backedges.get(idxType);
+    idxReset = externalSchedule ? threadOfPosition(startNow) : 0;
     threadIdx = seq::FirRegOp::create(
         b, idxNext, hostClock, b.getStringAttr("threadIdx"), hostReset,
-        hw::ConstantOp::create(b, idxType, 0), hw::InnerSymAttr{},
-        /*isAsync=*/false, b.getIntegerAttr(idxType, 0));
+        hw::ConstantOp::create(b, idxType, idxReset), hw::InnerSymAttr{},
+        /*isAsync=*/false, b.getIntegerAttr(idxType, idxReset));
     auto sweepNext = backedges.get(i1);
     sweeping = seq::FirRegOp::create(
         b, sweepNext, hostClock, b.getStringAttr("init_sweep"), hostReset,
         hw::ConstantOp::create(b, i1, 1), hw::InnerSymAttr{},
         /*isAsync=*/false, b.getIntegerAttr(i1, 1));
+    // Every thread once, from the first after reset.
     Value last = comb::ICmpOp::create(
         b, comb::ICmpPredicate::eq, threadIdx,
-        hw::ConstantOp::create(b, idxType, threads - 1));
+        hw::ConstantOp::create(b, idxType,
+                               (idxReset + threads - 1) % threads));
     sweepNext.setValue(comb::AndOp::create(
         b, sweeping,
         comb::XorOp::create(b, last, hw::ConstantOp::create(b, i1, 1))));
@@ -2496,19 +2526,31 @@ LogicalResult Threader::run() {
   // after the edge, is read on the one after that.
   if (threads == 1 && phases > 1) {
     auto phaseNext = backedges.get(i1);
+    // Outside turns must start idle too: the state's preset is committed on
+    // the host cycle after reset.
+    if (externalSchedule && phaseOfPosition(startNow) != 1) {
+      model.emitError("a one-thread model committing by enable starts its "
+                      "turns idle (schedule start ")
+          << scheduleStart << ")";
+      return failure();
+    }
     phase = seq::FirRegOp::create(
         b, phaseNext, hostClock, b.getStringAttr("phase"), hostReset,
         hw::ConstantOp::create(b, i1, 1), hw::InnerSymAttr{},
         /*isAsync=*/false, b.getIntegerAttr(i1, 1));
-    phaseNext.setValue(
-        comb::XorOp::create(b, phase, hw::ConstantOp::create(b, i1, 1)));
+    phaseNext.setValue(scheduleNext ? scheduleNext
+                                    : Value(comb::XorOp::create(
+                                          b, phase,
+                                          hw::ConstantOp::create(b, i1, 1))));
     idle = phase;
   }
   if (threads > 1 && registeredState) {
     auto idxType = b.getIntegerType(llvm::Log2_32_Ceil(threads));
     // With idle slots the host cycle after the first is the first thread's
     // too, idle.
-    aheadReset = phases > 1 ? 0 : 1;
+    aheadReset = externalSchedule ? threadOfPosition(startNext)
+                 : phases > 1     ? 0
+                                  : 1;
     aheadNext = backedges.get(idxType);
     aheadIdx = seq::FirRegOp::create(
         b, aheadNext, hostClock, b.getStringAttr("threadIdx_ahead"), hostReset,
@@ -2517,15 +2559,17 @@ LogicalResult Threader::run() {
     if (phases > 1) {
       auto phaseType = b.getIntegerType(llvm::Log2_32(phases));
       aheadPhaseNext = backedges.get(phaseType);
+      aheadPhaseReset = externalSchedule ? phaseOfPosition(startNext) : 1;
+      uint64_t phaseReset = externalSchedule ? phaseOfPosition(startNow) : 0;
       aheadPhase = seq::FirRegOp::create(
           b, aheadPhaseNext, hostClock, b.getStringAttr("phase_ahead"),
-          hostReset, hw::ConstantOp::create(b, phaseType, 1),
+          hostReset, hw::ConstantOp::create(b, phaseType, aheadPhaseReset),
           hw::InnerSymAttr{}, /*isAsync=*/false,
-          b.getIntegerAttr(phaseType, 1));
+          b.getIntegerAttr(phaseType, aheadPhaseReset));
       phase = seq::FirRegOp::create(
           b, aheadPhase, hostClock, b.getStringAttr("phase"), hostReset,
-          hw::ConstantOp::create(b, phaseType, 0), hw::InnerSymAttr{},
-          /*isAsync=*/false, b.getIntegerAttr(phaseType, 0));
+          hw::ConstantOp::create(b, phaseType, phaseReset), hw::InnerSymAttr{},
+          /*isAsync=*/false, b.getIntegerAttr(phaseType, phaseReset));
       idle = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, phase,
                                   hw::ConstantOp::create(b, phaseType, 0));
     }
@@ -2865,7 +2909,16 @@ LogicalResult Threader::run() {
     if (aheadIdx)
       idxNext.setValue(aheadIdx);
     auto &chosen = aheadIdx ? aheadNext : idxNext;
-    if (!threadReady && aheadPhase) {
+    if (scheduleNext) {
+      // The position from outside: the thread in the high bits.
+      unsigned phaseBits = phases > 1 ? llvm::Log2_32(phases) : 0;
+      chosen.setValue(b.createOrFold<comb::ExtractOp>(idxType, scheduleNext,
+                                                      phaseBits));
+      if (aheadPhase)
+        aheadPhaseNext.setValue(b.createOrFold<comb::ExtractOp>(
+            aheadPhase.getType(), scheduleNext, 0));
+      separatesFinishes = true;
+    } else if (!threadReady && aheadPhase) {
       // The next in turn is another thread once the turn's idle host cycles
       // are over.
       auto phaseType = aheadPhase.getType();
@@ -3064,6 +3117,15 @@ LogicalResult Threader::run() {
     results.push_back(threadIdx);
   if (threadIndexPort)
     results.push_back(enable);
+  if (scheduleNext) {
+    // The position register: the next host cycle's with registered state.
+    SmallVector<Value> position;
+    if (threads > 1)
+      position.push_back(aheadIdx ? aheadIdx : threadIdx);
+    if (phases > 1)
+      position.push_back(aheadPhase ? aheadPhase : phase);
+    results.push_back(b.createOrFold<comb::ConcatOp>(position));
+  }
   auto output = hw::OutputOp::create(b, results);
   // Regions and registered state replace values the outputs may be, so they
   // come last.

@@ -202,6 +202,12 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
            "(negative: a hop of the channels between them, one host cycle, "
            "two behind a relay), rounded up to a multiple of the children's "
            "idle phases">,
+    Option<"nestControl", "nest-control", "std::string", "\"tree\"",
+           "With `nest`: where a class's turns come from: `tree`, its "
+           "parent's controller (the root's counts; a child's position is its "
+           "parent's, registered once per level, with a digit of its own "
+           "above it that advances when the parent's wraps), or `counters`, "
+           "a counter of each class's own, the order kept by the numbering">,
     ListOption<"nestOffsets", "nest-offsets", "std::string",
                "With `nest`: models current this many host cycles after "
                "the nested order, as <model>:<cycles> (a multiple of the "

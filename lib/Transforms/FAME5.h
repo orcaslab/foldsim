@@ -40,6 +40,14 @@ struct ThreadOptions {
   /// every other host cycle and commits its state by the registered edge as
   /// a clock enable, rather than by a select per bit.
   bool commitEnable = false;
+  /// The model's turns come from outside rather than from a counter of its
+  /// own: its position (thread and idle phase, `thread * phases + phase`)
+  /// for the host cycle after next in on `schedule_next`, the register
+  /// holding the next host cycle's (or, without registered state, this
+  /// one's) out on `schedule`; `scheduleStart` is the position on the host
+  /// cycle after reset.
+  bool externalSchedule = false;
+  uint64_t scheduleStart = 0;
 };
 /// How a register is written: never (it only holds its value), or with
 /// `data` when `enable` (always, if null).
