@@ -152,7 +152,10 @@ public:
         stagedRamWrites(options.stagedRamWrites),
         pipelineMultipliers(options.pipelineMultipliers),
         compactStaging(options.compactStaging),
-        foldPipelines(options.foldPipelines) {}
+        foldPipelines(options.foldPipelines),
+        phases(options.idleSlots && options.registeredState && !readySchedule
+                   ? turnPhases(threads, options.stateStages)
+                   : 1) {}
 
   LogicalResult run();
 
@@ -285,6 +288,24 @@ private:
     Value threadedStore;
     Value slot, thread, valid, data;
   };
+  /// With `idleSlots`: the host cycles of each thread's turn, the first its
+  /// own and the others idle, so that the threads' turns are at least as many
+  /// host cycles as a thread's write takes to land and one more.
+  unsigned phases;
+  static unsigned turnPhases(unsigned threads, unsigned stateStages) {
+    if (threads < 2)
+      return 1;
+    unsigned slots = stateStages > 1 ? 4 : 3, k = 1;
+    while (threads * k < slots)
+      k *= 2;
+    return k;
+  }
+  /// With idle slots, the host cycle of the current thread's turn, and that
+  /// of the next host cycle; and whether this one is idle.
+  Value phase, aheadPhase, idle;
+  /// The reset value of `aheadIdx`: the thread of the host cycle after the
+  /// first.
+  uint64_t aheadReset = 1;
   SmallVector<Fold> folds;
   DenseMap<Operation *, unsigned> foldOfStore;
   /// The ops of the unthreaded copies: on the host clock, not target state.
@@ -310,7 +331,7 @@ private:
   /// The cone inputs registered for `pipelineMultipliers`, shared by cones.
   DenseMap<Value, Value> coneInputs;
   bool deepState() const {
-    return registeredState && stateStages > 1 && threads >= 3;
+    return registeredState && stateStages > 1 && threads * phases >= 3;
   }
   /// Whether the state is split into regions with their own control.
   bool hasRegions() const {
@@ -1304,7 +1325,8 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
       aheadCopy =
           copy(aheadIdx.getDefiningOp<seq::FirRegOp>().getNext(),
                "threadIdx_a" + Twine(r), hostReset,
-               hw::ConstantOp::create(b, idxType, 1), /*initial=*/1);
+               hw::ConstantOp::create(b, idxType, aheadReset),
+               /*initial=*/aheadReset);
     // Only a region with writes has their control.
     Value writeIdx, edgeLate;
     if (!readOnly(region.front())) {
@@ -1488,9 +1510,11 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
       // current once every `threads` host cycles, its state read ahead
       // `threads - 1` after its edge, by when the write is in the memory (from
       // the second host cycle after the edge, the third with two stages)
-      // unless there are fewer threads: nothing is forwarded. Picked by
-      // readiness, a thread may run again sooner.
-      bool mayHit = readySchedule || threads < (deepState() ? 4u : 3u);
+      // unless there are fewer threads and idle host cycles in their turns:
+      // nothing is forwarded. Picked by readiness, a thread may run again
+      // sooner.
+      bool mayHit =
+          readySchedule || threads * phases < (deepState() ? 4u : 3u);
       Value hit;
       if (pendingEnable && mayHit)
         hit = comb::AndOp::create(
@@ -2077,6 +2101,12 @@ LogicalResult Threader::finishFolds(ImplicitLocOpBuilder &b, Value edge,
   Value again = comb::AndOp::create(
       b, lastEdge,
       comb::ICmpOp::create(b, comb::ICmpPredicate::eq, lastThread, threadIdx));
+  // An idle host cycle of the thread's turn neither finishes nor uses a
+  // result.
+  if (idle)
+    again = comb::AndOp::create(
+        b, again,
+        comb::XorOp::create(b, idle, hw::ConstantOp::create(b, i1, 1)));
   Value clock = seq::FromClockOp::create(b, hostClock);
   sv::IfDefOp::create(
       b, "SYNTHESIS", [] {},
@@ -2271,14 +2301,32 @@ LogicalResult Threader::run() {
   }
   // With registered state the next thread is chosen a host cycle earlier: the
   // thread after the current one is a register too.
-  Backedge aheadNext;
+  Backedge aheadNext, aheadPhaseNext;
   if (threads > 1 && registeredState) {
     auto idxType = b.getIntegerType(llvm::Log2_32_Ceil(threads));
+    // With idle slots the host cycle after the first is the first thread's
+    // too, idle.
+    aheadReset = phases > 1 ? 0 : 1;
     aheadNext = backedges.get(idxType);
     aheadIdx = seq::FirRegOp::create(
         b, aheadNext, hostClock, b.getStringAttr("threadIdx_ahead"), hostReset,
-        hw::ConstantOp::create(b, idxType, 1), hw::InnerSymAttr{},
-        /*isAsync=*/false, b.getIntegerAttr(idxType, 1));
+        hw::ConstantOp::create(b, idxType, aheadReset), hw::InnerSymAttr{},
+        /*isAsync=*/false, b.getIntegerAttr(idxType, aheadReset));
+    if (phases > 1) {
+      auto phaseType = b.getIntegerType(llvm::Log2_32(phases));
+      aheadPhaseNext = backedges.get(phaseType);
+      aheadPhase = seq::FirRegOp::create(
+          b, aheadPhaseNext, hostClock, b.getStringAttr("phase_ahead"),
+          hostReset, hw::ConstantOp::create(b, phaseType, 1),
+          hw::InnerSymAttr{}, /*isAsync=*/false,
+          b.getIntegerAttr(phaseType, 1));
+      phase = seq::FirRegOp::create(
+          b, aheadPhase, hostClock, b.getStringAttr("phase"), hostReset,
+          hw::ConstantOp::create(b, phaseType, 0), hw::InnerSymAttr{},
+          /*isAsync=*/false, b.getIntegerAttr(phaseType, 0));
+      idle = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, phase,
+                                  hw::ConstantOp::create(b, phaseType, 0));
+    }
   }
 
   // An output that depends on no input fires eagerly, with the next cycle's
@@ -2551,6 +2599,9 @@ LogicalResult Threader::run() {
   SmallVector<Value> outValid, firedOrFiring, finishTerms;
   for (auto [i, channel] : llvm::enumerate(outputs)) {
     Value fired = outFired[i], ready = sourceReady[i];
+    // An idle host cycle offers no token, so none fires on it.
+    if (idle)
+      ready = comb::AndOp::create(b, ready, notOf(idle));
     Value valid, fof;
     if (channel.eager) {
       valid = comb::OrOp::create(b, notOf(fired),
@@ -2570,8 +2621,11 @@ LogicalResult Threader::run() {
     finishTerms.push_back(fof);
   }
   finishTerms.append(sinkValid.begin(), sinkValid.end());
-  // No thread finishes, takes or offers a token while they are initialized.
+  // No thread finishes, takes or offers a token while they are initialized,
+  // nor on an idle host cycle of its turn.
   Value running = notOf(initializing);
+  if (idle)
+    running = comb::AndOp::create(b, running, notOf(idle));
   finishTerms.push_back(running);
   finishing.setValue(
       finishTerms.size() == 1
@@ -2597,7 +2651,19 @@ LogicalResult Threader::run() {
     if (aheadIdx)
       idxNext.setValue(aheadIdx);
     auto &chosen = aheadIdx ? aheadNext : idxNext;
-    if (!threadReady) {
+    if (!threadReady && aheadPhase) {
+      // The next in turn is another thread once the turn's idle host cycles
+      // are over.
+      auto phaseType = aheadPhase.getType();
+      aheadPhaseNext.setValue(
+          comb::AddOp::create(b, aheadPhase, constant(phaseType, 1)));
+      chosen.setValue(comb::MuxOp::create(
+          b,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::eq, aheadPhase,
+                               constant(phaseType, phases - 1)),
+          inTurn, aheadIdx));
+      separatesFinishes = true;
+    } else if (!threadReady) {
       // The next in turn is another thread.
       chosen.setValue(inTurn);
       separatesFinishes = true;
@@ -2902,7 +2968,7 @@ void FAME5Pass::runOnOperation() {
     return signalPassFailure();
   }
   if ((regionLoads || registeredState || commitSelect || stagedRamWrites ||
-       pipelineMultipliers || compactStaging || foldPipelines) &&
+       pipelineMultipliers || compactStaging || foldPipelines || idleSlots) &&
       !clockEnable) {
     model.emitError("regions are for state written with `clock-enable`");
     return signalPassFailure();
@@ -2914,7 +2980,8 @@ void FAME5Pass::runOnOperation() {
                                              stateStages, commitSelect,
                                              stagedRamWrites,
                                              pipelineMultipliers,
-                                             compactStaging, foldPipelines})
+                                             compactStaging, foldPipelines,
+                                             idleSlots})
                  .run()))
     return signalPassFailure();
 }

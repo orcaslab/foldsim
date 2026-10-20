@@ -1645,7 +1645,8 @@ void ComposePass::runOnOperation() {
   foldsim::ThreadOptions threadOptions{regionLoads, registeredState,
                                        stateStages, commitSelect,
                                        stagedRamWrites, pipelineMultipliers,
-                                       compactStaging, foldPipelines};
+                                       compactStaging, foldPipelines,
+                                       idleSlots};
   if (channelDepth < 2 || !llvm::isPowerOf2_32(channelDepth)) {
     top.emitError("a channel's depth is a power of two, at least two");
     return signalPassFailure();

@@ -179,6 +179,10 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"foldPipelines", "fold-pipelines", "bool", "false",
            "Thread each model with its fixed-latency pipelines folded, as "
            "`foldsim-fame5`'s `fold-pipelines`">,
+    Option<"idleSlots", "idle-slots", "bool", "false",
+           "Thread each model picked in turn with idle host cycles in its "
+           "turns where it has too few threads, as `foldsim-fame5`'s "
+           "`idle-slots`">,
     Option<"channelDepth", "channel-depth", "unsigned", "2",
            "Slots per producer thread of a channel without a relay, a power of "
            "two: deeper channels give producers slack ahead of their readers "
@@ -305,6 +309,13 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
            "count of enabled edges, rather than by threading its registers. "
            "A black box with a pipeline contract is simulated this way, by "
            "an instance of itself">,
+    Option<"idleSlots", "idle-slots", "bool", "false",
+           "With `registered-state`, picked in turn, and too few threads for "
+           "a thread's write to land before its state is read ahead again "
+           "(fewer than three, four with two state stages): follow each "
+           "thread's host cycle with idle ones, which finish nothing and "
+           "take or offer no token, rather than forwarding the write to the "
+           "read ahead -- a select per state bit">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

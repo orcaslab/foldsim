@@ -3,6 +3,7 @@
 // RUN: foldsim-opt %s --foldsim-fame5="module=Hold threads=4 clock-enable region-loads=16 registered-state state-stages=2" | FileCheck %s --check-prefix=DEEP
 // RUN: foldsim-opt %s --foldsim-fame5="module=Hold threads=2 clock-enable region-loads=16 registered-state" | FileCheck %s --check-prefix=TWO
 // RUN: foldsim-opt %s --foldsim-fame5="module=Hold threads=3 clock-enable region-loads=16 registered-state state-stages=2" | FileCheck %s --check-prefix=DEEP3
+// RUN: foldsim-opt %s --foldsim-fame5="module=Hold threads=2 clock-enable region-loads=16 registered-state state-stages=2 idle-slots" | FileCheck %s --check-prefix=IDLE
 // RUN: not foldsim-opt %s --foldsim-fame5="module=Hold threads=4 clock-enable registered-state state-stages=3" 2>&1 | FileCheck %s --check-prefix=BAD
 
 // With two stages to the state's write, the write data, enable and index go
@@ -21,6 +22,16 @@
 // DEEP3-DAG: [[DHIT:%.+]] = comb.and %r_wen2, [[DSAME]] : i1
 // DEEP3-DAG: [[DNEXT:%.+]] = comb.mux [[DHIT]], %r_wdata2, {{%.+}} : i8
 // DEEP3-DAG: %r_state = seq.firreg [[DNEXT]] clock %hostClock : i8
+// With idle slots, two threads take two host cycles each, the second idle:
+// the turn moves on when the ahead phase wraps, and with four host cycles a
+// turn the write, two late, has landed by the read ahead.
+// IDLE-LABEL: hw.module @Hold_threaded_Hold(
+// IDLE-DAG: %threadIdx_ahead = seq.firreg {{%.+}} clock %hostClock reset sync %hostReset, {{%.+}} preset 0 : i1
+// IDLE-DAG: %phase_ahead = seq.firreg {{%.+}} clock %hostClock reset sync %hostReset, {{%.+}} preset 1 : i1
+// IDLE-DAG: %phase = seq.firreg %phase_ahead clock %hostClock reset sync %hostReset, {{%.+}} preset 0 : i1
+// IDLE-DAG: seq.firmem.write_port %r[%threadIdx_v0] = %r_wdata2, clock %hostClock enable %r_wen2 :
+// IDLE-DAG: [[IREAD:%.+]] = seq.firmem.read_port %r[%threadIdx_a0]
+// IDLE-DAG: %r_state = seq.firreg [[IREAD]] clock %hostClock : i8
 // BAD: a thread's state is written one or two host cycles after its edge
 
 // With registered state the next thread is chosen a host cycle earlier: the

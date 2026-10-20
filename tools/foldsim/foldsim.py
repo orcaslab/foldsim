@@ -145,6 +145,10 @@ def main():
     ap.add_argument('--fold-pipelines', action='store_true',
                     help='simulate fixed-latency pipelines by an unthreaded copy and a '
                          'per-thread store of their results (foldsim-fame5)')
+    ap.add_argument('--idle-slots', action='store_true',
+                    help='with --registered-state, picked in turn: idle host cycles in the '
+                         'turns of models with too few threads, rather than forwarding '
+                         'their writes to the read ahead (foldsim-fame5)')
     ap.add_argument('--channel-depth', type=int, default=2,
                     help='slots per producer thread of each channel (foldsim-compose)')
     ap.add_argument('--staged-tokens', action='store_true',
@@ -254,6 +258,8 @@ def main():
         compose += ' compact-staging'
     if a.fold_pipelines:
         compose += ' fold-pipelines'
+    if a.idle_slots:
+        compose += ' idle-slots'
     if a.channel_depth != 2:
         compose += f' channel-depth={a.channel_depth}'
     if a.domains:

@@ -24,6 +24,23 @@
 // RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/t/obj %S/Inputs/tb_threads.sv %t/t/sim.sv > %t/t/build.log 2>&1
 // RUN: %t/t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 // RUN: %t/t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+// With idle host cycles in each thread's turn, nothing is forwarded either
+// way, three threads with two stages or two threads.
+// RUN: mkdir -p %t/u && foldsim-opt %s --foldsim-extract-models="module=Top models=Acc,Acc1 netlist" --foldsim-compose="module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 staged-tokens idle-slots" -o %t/u/sim.mlir
+// RUN: firtool --format=mlir %t/u/sim.mlir -o %t/u/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/u/obj %S/Inputs/tb_threads.sv %t/u/sim.sv > %t/u/build.log 2>&1
+// RUN: %t/u/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/u/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+// RUN: mkdir -p %t/v && foldsim-opt %t/two.mlir --foldsim-extract-models="module=Top models=Acc,Acc1 netlist" --foldsim-compose="module=Top ready-schedule=false region-loads=1 registered-state commit-select idle-slots" -o %t/v/sim.mlir
+// RUN: firtool --format=mlir %t/v/sim.mlir -o %t/v/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/v/obj %S/Inputs/tb_threads.sv %t/v/sim.sv > %t/v/build.log 2>&1
+// RUN: %t/v/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/v/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+// RUN: mkdir -p %t/w && foldsim-opt %t/two.mlir --foldsim-extract-models="module=Top models=Acc,Acc1 netlist" --foldsim-compose="module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 staged-tokens idle-slots" -o %t/w/sim.mlir
+// RUN: firtool --format=mlir %t/w/sim.mlir -o %t/w/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal --x-initial unique --top-module tb -Mdir %t/w/obj %S/Inputs/tb_threads.sv %t/w/sim.sv > %t/w/build.log 2>&1
+// RUN: %t/w/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/w/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
 // CHECK: y0: 00 02 05 09 0e
 // CHECK: y1: 00 02 05 09 0e
 // CHECK: y2: 00 02 05 09 0e
