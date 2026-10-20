@@ -73,9 +73,10 @@ using Pieces = SmallVector<Piece>;
 
 /// A model and its instances, one thread each.
 struct Class {
-  /// The model, erased once threaded, and its name.
+  /// The model, erased once threaded, and its name; `base`, the class a copy
+  /// was split from, or its own name.
   hw::HWModuleOp model;
-  std::string name;
+  std::string name, base;
   SmallVector<hw::InstanceOp> instances;
   SmallVector<std::string> inputNames, outputNames;
   hw::HWModuleOp threaded;
@@ -156,37 +157,46 @@ struct Consumer {
   SmallVector<SmallVector<Value>> deq;
 };
 
+/// The options of nested folding (see `foldsim-compose`).
+struct NestOptions {
+  bool nest = false;
+  /// Host cycles from a parent's thread to its children's; negative: the
+  /// channels' hop.
+  int skew = -1;
+  ArrayRef<std::string> offsets, copies;
+  bool bankedTokens = false;
+};
+
 class Composer {
 public:
   Composer(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
            bool readySchedule, ArrayRef<std::string> relay,
            const foldsim::ThreadOptions &threadOptions, bool stagedTokens,
-           unsigned channelDepth, bool domains, bool nest,
-           unsigned nestSkew = 0, bool bankedTokens = false,
-           ArrayRef<std::string> copies = {},
-           ArrayRef<std::string> offsets = {})
+           unsigned channelDepth, bool domains,
+           const NestOptions &nesting = {})
       : top(top), netlist(netlist), simName(simName),
         readySchedule(readySchedule), threadOptions(threadOptions),
         stagedTokens(stagedTokens), channelDepth(channelDepth),
-        emitDomainTree(domains), nest(nest), nestSkew(nestSkew),
-        bankedTokens(bankedTokens) {
+        emitDomainTree(domains), nest(nesting.nest), nestSkew(nesting.skew),
+        bankedTokens(nesting.bankedTokens) {
     for (auto &name : relay)
       relayModels.insert(name);
-    for (auto &entry : offsets) {
+    for (auto &entry : nesting.offsets) {
       auto [name, count] = StringRef(entry).rsplit(':');
-      int64_t phi = 0;
-      if (!count.getAsInteger(10, phi))
-        nestOffsets[name] = phi;
+      int64_t cycles = 0;
+      if (name.empty() || count.getAsInteger(10, cycles) || cycles < 0)
+        badOptions.push_back("nest-offsets: '" + entry +
+                             "' is not <model>:<host cycles>");
       else
-        badCopies.push_back(entry);
+        nestOffsets[name] = cycles;
     }
-    for (auto &entry : copies) {
+    for (auto &entry : nesting.copies) {
       auto [name, count] = StringRef(entry).rsplit(':');
       unsigned k = 0;
-      if (!count.getAsInteger(10, k))
-        copiesOf[name] = k;
+      if (name.empty() || count.getAsInteger(10, k) || k == 0)
+        badOptions.push_back("copies: '" + entry + "' is not <model>:<count>");
       else
-        badCopies.push_back(entry);
+        copiesOf[name] = k;
     }
   }
   LogicalResult run();
@@ -215,14 +225,34 @@ private:
   unsigned channelDepth;
   bool emitDomainTree;
   bool nest;
-  unsigned nestSkew;
+  int nestSkew;
   bool bankedTokens;
   /// Classes simulated by several copies, each a contiguous range of its
   /// threads (the high digits of the thread index).
   llvm::StringMap<unsigned> copiesOf;
-  llvm::StringMap<int64_t> nestOffsets;
-  SmallVector<std::string> badCopies;
+  /// Offsets asked for, and each class's offset, by base name.
+  llvm::StringMap<int64_t> nestOffsets, offsetOf;
+  SmallVector<std::string> badOptions;
   LogicalResult splitCopies();
+  /// With `nest`: each model instance's parent model instance.
+  DenseMap<Operation *, Operation *> parentOf;
+  /// The host cycles of a turn of each thread of a class of `threads`.
+  unsigned phasesOf(unsigned threads) const {
+    return threadOptions.idleSlots && threadOptions.registeredState &&
+                   !readySchedule
+               ? foldsim::turnPhases(threads, threadOptions.stateStages)
+               : 1u;
+  }
+  /// Whether the channels between two models have a relay stage.
+  bool relayed(StringRef p, StringRef q) const {
+    return relayModels.contains(p) || relayModels.contains(q) ||
+           relayModels.contains((p + ":" + q).str()) ||
+           relayModels.contains((q + ":" + p).str());
+  }
+  /// With `nest`: whether every thread current on a host cycle is a child of
+  /// the thread its parent's copy is current on, the offsets apart; after
+  /// copies split classes.
+  LogicalResult verifyNesting();
   /// The netlist instances each instance is inside, as the path of their
   /// names, and the instances of a netlist's own logic.
   DenseMap<Operation *, std::string> containerOf;
@@ -338,6 +368,7 @@ LogicalResult Composer::collect() {
       auto &cls = classes.emplace_back();
       cls.model = model;
       cls.name = model.getModuleName().str();
+      cls.base = cls.name;
       for (auto name : instance.getArgNames())
         cls.inputNames.push_back(cast<StringAttr>(name).getValue().str());
       for (auto name : instance.getResultNames())
@@ -347,16 +378,29 @@ LogicalResult Composer::collect() {
     threadOf[instance] = {it->second, cls.instances.size()};
     cls.instances.push_back(instance);
   }
+  if (!badOptions.empty())
+    return netlist.emitError(badOptions.front());
+  if (nest && readySchedule)
+    return netlist.emitError(
+        "nest: the nested order is a static order; it needs every model "
+        "picked in turn (ready-schedule=false)");
   if (nest && failed(alignThreads()))
     return failure();
   if (failed(splitCopies()))
     return failure();
+  if (nest && failed(verifyNesting()))
+    return failure();
 
+  // Committing by enable makes a one-thread model take every other host
+  // cycle: only where a class of several threads sets the pace.
+  auto options = threadOptions;
+  options.commitEnable &= llvm::any_of(
+      classes, [](auto &cls) { return cls.instances.size() > 1; });
   // Each class threaded, its channels found by name.
   for (auto &cls : classes) {
     auto name = StringAttr::get(top.getContext(), cls.name + "_threaded");
     auto threaded = foldsim::threadModel(cls.model, cls.instances.size(), name,
-                                        readySchedule, threadOptions);
+                                        readySchedule, options);
     if (failed(threaded))
       return failure();
     cls.threaded = *threaded;
@@ -566,7 +610,7 @@ LogicalResult Composer::collect() {
   // that is not would leave the channels it means without their relay.
   for (auto &entry : relayModels)
     for (auto name : llvm::split(entry.getKey(), ':'))
-      if (llvm::none_of(classes, [&](auto &cls) { return cls.name == name; })) {
+      if (llvm::none_of(classes, [&](auto &cls) { return cls.base == name; })) {
         std::string known;
         for (auto &cls : classes)
           known += " " + cls.name;
@@ -589,15 +633,15 @@ LogicalResult Composer::collect() {
         }))
       continue;
     bool mine =
-        producer.cls >= 0 && relayModels.contains(classes[producer.cls].name);
+        producer.cls >= 0 && relayModels.contains(classes[producer.cls].base);
     producer.relay = llvm::any_of(producer.reads, [&](auto &read) {
       int c = consumers[read.consumer].cls;
       if (c == producer.cls)
         return false;
-      auto &q = classes[c].name;
+      auto &q = classes[c].base;
       if (producer.cls < 0)
         return relayNamed.contains(q);
-      auto &p = classes[producer.cls].name;
+      auto &p = classes[producer.cls].base;
       return mine || relayModels.contains(q) ||
              relayModels.contains(p + ":" + q) ||
              relayModels.contains(q + ":" + p);
@@ -625,7 +669,6 @@ LogicalResult Composer::alignThreads() {
     auto pos = path.rfind('/');
     return pos == StringRef::npos ? StringRef() : path.substr(0, pos);
   };
-  DenseMap<Operation *, Operation *> parentOf;
   DenseMap<Operation *, unsigned> classOfInstance;
   for (auto [c, cls] : llvm::enumerate(classes))
     for (auto instance : cls.instances) {
@@ -661,12 +704,6 @@ LogicalResult Composer::alignThreads() {
   }
   llvm::stable_sort(order, [&](unsigned x, unsigned y) { return depth[x] < depth[y]; });
   // A class's turn: `phases` host cycles per thread, the first its own.
-  auto phasesOf = [&](unsigned threads) {
-    return threadOptions.idleSlots && threadOptions.registeredState &&
-                   !readySchedule
-               ? foldsim::turnPhases(threads, threadOptions.stateStages)
-               : 1u;
-  };
   DenseMap<Operation *, unsigned> threadNow;
   for (auto c : order) {
     auto &cls = classes[c];
@@ -686,10 +723,9 @@ LogicalResult Composer::alignThreads() {
     // The parent's thread each thread must be the child of.
     SmallVector<int> need(n, -1);
     for (uint64_t h = period; h < 2 * period; ++h) {
-      uint64_t hp = h;
-      if (h % kc || hp % kp)
+      if (h % kc || h % kp)
         continue;
-      unsigned t = (h / kc) % n, p = (hp / kp) % np;
+      unsigned t = (h / kc) % n, p = (h / kp) % np;
       if (need[t] >= 0 && need[t] != int(p))
         return cls.instances[0].emitError("nest: '")
                << cls.name << "' (" << n << " threads, " << kc
@@ -726,21 +762,31 @@ LogicalResult Composer::alignThreads() {
       threadNow[instance] = t;
     }
   }
-  // Each class current `offset` host cycles after the order above: its
-  // parent's offset and the skew, or the offset asked for. The parent of the
-  // thread current at h is then current at h minus the difference.
+  // Each class current `offset` host cycles after the order above, so the
+  // parent of the thread current at h is current at h minus the difference:
+  // the offset asked for, or the parent's plus a hop of the channels between
+  // them (a host cycle, two behind a relay) rounded up to the class's turn,
+  // so that what a parent sends on a host cycle is there when the children
+  // are current.
+  for (auto name : nestOffsets.keys())
+    if (llvm::none_of(classes, [&](auto &cls) { return cls.name == name; }))
+      return netlist.emitError("nest-offsets: no model '") << name << "'";
   SmallVector<int64_t> offset(classes.size(), 0);
   for (auto c : order) {
     auto &cls = classes[c];
     int pc = parentClass[c];
+    unsigned n = cls.instances.size(), k = phasesOf(n);
     auto it = nestOffsets.find(cls.name);
-    offset[c] = it != nestOffsets.end() ? it->second
-                : pc >= 0               ? offset[pc] + nestSkew
-                                        : 0;
-    unsigned n = cls.instances.size();
+    if (it != nestOffsets.end()) {
+      offset[c] = it->second;
+    } else if (pc >= 0) {
+      int64_t hop = nestSkew >= 0 ? nestSkew
+                    : relayed(classes[pc].name, cls.name) ? 2 : 1;
+      offset[c] = llvm::alignTo(offset[pc] + hop, k);
+    }
+    offsetOf[cls.name] = offset[c];
     if (n == 1)
       continue;
-    unsigned k = phasesOf(n);
     if (offset[c] % k)
       return cls.instances[0].emitError("nest: the offset of '")
              << cls.name << "' (" << offset[c]
@@ -758,15 +804,15 @@ LogicalResult Composer::alignThreads() {
 }
 
 LogicalResult Composer::splitCopies() {
-  if (!badCopies.empty())
-    return netlist.emitError("copies: '") << badCopies[0]
-                                           << "' is not <model>:<count>";
+  for (auto name : copiesOf.keys())
+    if (llvm::none_of(classes, [&](auto &cls) { return cls.name == name; }))
+      return netlist.emitError("copies: no model '") << name << "'";
   unsigned numClasses = classes.size();
   for (unsigned c = 0; c < numClasses; ++c) {
-    auto it = copiesOf.find(classes[c].name);
-    if (it == copiesOf.end() || it->second <= 1)
+    unsigned k = copiesOf.lookup(classes[c].name);
+    if (k <= 1)
       continue;
-    unsigned k = it->second, n = classes[c].instances.size();
+    unsigned n = classes[c].instances.size();
     if (n % k)
       return classes[c].instances[0].emitError("copies: ")
              << n << " instances of '" << classes[c].name
@@ -785,6 +831,7 @@ LogicalResult Composer::splitCopies() {
       Class copy;
       copy.model = clone;
       copy.name = name;
+      copy.base = classes[c].base;
       copy.inputNames = classes[c].inputNames;
       copy.outputNames = classes[c].outputNames;
       unsigned index = classes.size();
@@ -795,11 +842,41 @@ LogicalResult Composer::splitCopies() {
       }
       classes.push_back(std::move(copy));
     }
-    copiesOf.erase(it);
   }
-  if (!copiesOf.empty())
-    return netlist.emitError("copies: no model '")
-           << copiesOf.begin()->getKey() << "'";
+  return success();
+}
+
+LogicalResult Composer::verifyNesting() {
+  // On every host cycle where a child's copy and its parent's are current,
+  // the child's thread is a child of the parent's, their offsets apart.
+  auto turn = [&](const Class &cls) {
+    return uint64_t(cls.instances.size()) * phasesOf(cls.instances.size());
+  };
+  uint64_t period = 1;
+  for (auto &cls : classes)
+    period = std::lcm(period, turn(cls));
+  for (auto &cls : classes) {
+    unsigned k = phasesOf(cls.instances.size());
+    for (uint64_t h = 0; h < period; h += k) {
+      auto instance = cls.instances[(h / k) % cls.instances.size()];
+      auto *parentInstance = parentOf.lookup(instance);
+      if (!parentInstance)
+        continue;
+      auto [pc, pt] = threadOf.lookup(parentInstance);
+      auto &parent = classes[pc];
+      unsigned kp = phasesOf(parent.instances.size());
+      int64_t delta = offsetOf.lookup(cls.base) - offsetOf.lookup(parent.base);
+      int64_t at = ((int64_t(h) - delta) % int64_t(period) + int64_t(period)) %
+                   int64_t(period);
+      if (at % kp)
+        continue;
+      if ((at / kp) % parent.instances.size() != pt)
+        return cls.instances[0].emitError("nest: the threads of '")
+               << cls.name << "' do not follow the turns of '" << parent.name
+               << "': copies must split a class at a multiple of its "
+                  "parent's turn";
+    }
+  }
   return success();
 }
 
@@ -2166,11 +2243,7 @@ LogicalResult Composer::run() {
   for (auto *op : inlined)
     op->erase();
   top.walk([](Operation *op) { op->removeAttr(kRelaySide); });
-  // Kept, nested, for the scheduling analysis of the composed simulator.
-  if (!nest)
-    for (auto &cls : classes)
-      if (cls.threaded)
-        cls.threaded->removeAttr("foldsim.output_deps");
+
   return success();
 }
 
@@ -2197,9 +2270,15 @@ void ComposePass::runOnOperation() {
     top.emitError("a channel's depth is a power of two, at least two");
     return signalPassFailure();
   }
+  NestOptions nesting;
+  nesting.nest = nest;
+  nesting.skew = nestSkew;
+  nesting.offsets = nestOffsets;
+  nesting.copies = copies;
+  nesting.bankedTokens = bankedTokens;
   if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
                           threadOptions, stagedTokens, channelDepth, domains,
-                          nest, nestSkew, bankedTokens, copies, nestOffsets)
+                          nesting)
                      .run()))
     signalPassFailure();
 }

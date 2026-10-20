@@ -169,8 +169,9 @@ def main():
     ap.add_argument('--nest', action='store_true',
                     help="fold nested classes recursively: each class's threads numbered so "
                          "that a thread and its parent's are current together (foldsim-compose)")
-    ap.add_argument('--nest-skew', type=int, default=0,
-                    help='with --nest: host cycles a thread is current after its parent\'s')
+    ap.add_argument('--nest-skew', type=int, default=-1,
+                    help='with --nest: host cycles a thread is current after its parent\'s '
+                         '(default: a hop of the channels between them)')
     ap.add_argument('--commit-enable', action='store_true',
                     help='with --registered-state and --commit-select: one-thread models take '
                          'every other host cycle and commit by clock enable, without a select '
@@ -181,6 +182,9 @@ def main():
     ap.add_argument('--banked-tokens', action='store_true',
                     help="keep slots read per thread from several producers in memories "
                          "(foldsim-compose)")
+    ap.add_argument('--nest-offsets', default='',
+                    help='with --nest: <model>:<cycles>,...: models current this many host '
+                         'cycles after the nested order (foldsim-compose)')
     ap.add_argument('--copies', default='',
                     help='<model>:<count>,...: models simulated by several threaded copies '
                          '(foldsim-compose)')
@@ -298,8 +302,10 @@ def main():
         compose += ' banked-tokens'
     if a.nest:
         compose += ' nest'
-        if a.nest_skew:
+        if a.nest_skew >= 0:
             compose += f' nest-skew={a.nest_skew}'
+        if a.nest_offsets:
+            compose += f' nest-offsets={a.nest_offsets}'
     if a.relay:
         compose += f' relay={a.relay}'
     if a.staged_tokens:

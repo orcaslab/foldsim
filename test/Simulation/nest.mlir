@@ -1,59 +1,50 @@
 // REQUIRES: verilator
 // RUN: rm -rf %t && mkdir -p %t
 // RUN: firtool --format=mlir %s -o %t/target.sv
-// Flat, in turn, the image flow's state options: the reference for the rest.
+// Flat, in turn, the image flow's state options: the reference.
 // RUN: mkdir -p %t/f && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots})" -o %t/f/sim.mlir
 // RUN: firtool --format=mlir %t/f/sim.mlir -o %t/f/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/f/obj %S/Inputs/tb_nest.sv %t/target.sv %t/f/sim.sv > %t/f/build.log 2>&1
 // RUN: %t/f/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
 // RUN: %t/f/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
-// Nested: each class's threads numbered after its parent's turns.
+// Nested, offsets a hop of the channels apart (rounded to idle phases).
 // RUN: mkdir -p %t/n && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest})" -o %t/n/sim.mlir
 // RUN: firtool --format=mlir %t/n/sim.mlir -o %t/n/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/n/obj %S/Inputs/tb_nest.sv %t/target.sv %t/n/sim.sv > %t/n/build.log 2>&1
 // RUN: %t/n/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
 // RUN: %t/n/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
-// Nested, children current two host cycles after their parent.
+// Nested, children two host cycles after their parent.
 // RUN: mkdir -p %t/k && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest nest-skew=2})" -o %t/k/sim.mlir
 // RUN: firtool --format=mlir %t/k/sim.mlir -o %t/k/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/k/obj %S/Inputs/tb_nest.sv %t/target.sv %t/k/sim.sv > %t/k/build.log 2>&1
 // RUN: %t/k/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
 // RUN: %t/k/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
-// Banked tokens: a parent's port per child kept in memories.
+// Banked tokens alone: a parent's port per child kept in memories.
 // RUN: mkdir -p %t/b && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots banked-tokens})" -o %t/b/sim.mlir
 // RUN: firtool --format=mlir %t/b/sim.mlir -o %t/b/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/b/obj %S/Inputs/tb_nest.sv %t/target.sv %t/b/sim.sv > %t/b/build.log 2>&1
 // RUN: %t/b/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
 // RUN: %t/b/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
-// Nested with banked tokens, plain threading.
-// RUN: mkdir -p %t/m && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false nest banked-tokens})" -o %t/m/sim.mlir
+// Nested with banked tokens, plain threading, no offset.
+// RUN: mkdir -p %t/m && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false nest nest-skew=0 banked-tokens})" -o %t/m/sim.mlir
 // RUN: firtool --format=mlir %t/m/sim.mlir -o %t/m/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/m/obj %S/Inputs/tb_nest.sv %t/target.sv %t/m/sim.sv > %t/m/build.log 2>&1
 // RUN: %t/m/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
 // RUN: %t/m/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
-// Nested with banked tokens, the leaves and the middle level in two copies each.
-// RUN: mkdir -p %t/c && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest nest-skew=2 banked-tokens copies=L3:2,L1_model:2})" -o %t/c/sim.mlir
+// Nested with banked tokens, the leaves and the middle level in copies.
+// RUN: mkdir -p %t/c && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest banked-tokens copies=L3:2,L1_model:2})" -o %t/c/sim.mlir
 // RUN: firtool --format=mlir %t/c/sim.mlir -o %t/c/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/c/obj %S/Inputs/tb_nest.sv %t/target.sv %t/c/sim.sv > %t/c/build.log 2>&1
 // RUN: %t/c/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
 // RUN: %t/c/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
-// Nested by readiness: the numbering only, schedules free.
-// RUN: mkdir -p %t/r && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest banked-tokens})" -o %t/r/sim.mlir
-// RUN: firtool --format=mlir %t/r/sim.mlir -o %t/r/sim.sv
-// RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/r/obj %S/Inputs/tb_nest.sv %t/target.sv %t/r/sim.sv > %t/r/build.log 2>&1
-// RUN: %t/r/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
-// RUN: %t/r/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
-// Nested, the thread state of models of 8 threads or more in block RAM.
-// RUN: mkdir -p %t/q && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest nest-skew=2 banked-tokens block-state-depth=8})" -o %t/q/sim.mlir
+// Nested, thread state of 8 threads or more in block RAM.
+// RUN: mkdir -p %t/q && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest banked-tokens block-state-depth=8})" -o %t/q/sim.mlir
 // RUN: firtool --format=mlir %t/q/sim.mlir -o %t/q/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/q/obj %S/Inputs/tb_nest.sv %t/target.sv %t/q/sim.sv > %t/q/build.log 2>&1
 // RUN: %t/q/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
 // RUN: %t/q/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
-// RUN: FileCheck %s --check-prefix=BRAM < %t/q/sim.sv
-// BRAM: (* ram_style = "block" *)
-// Nested, the one-thread top model idle every other host cycle and its
-// state committed by clock enable rather than by select.
-// RUN: mkdir -p %t/e && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest nest-skew=2 banked-tokens commit-enable})" -o %t/e/sim.mlir
+// Nested, the one-thread top model committing by clock enable.
+// RUN: mkdir -p %t/e && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest banked-tokens commit-enable})" -o %t/e/sim.mlir
 // RUN: firtool --format=mlir %t/e/sim.mlir -o %t/e/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/e/obj %S/Inputs/tb_nest.sv %t/target.sv %t/e/sim.sv > %t/e/build.log 2>&1
 // RUN: %t/e/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
@@ -63,6 +54,10 @@
 // current on even host cycles for u0, odd for u1, and so on down.
 // RUN: FileCheck %s --check-prefix=ORDER < %t/m/sim.mlir
 // ORDER: "L2_model=u0_u0_logic u1_u0_logic u0_u1_logic u1_u1_logic", "L3=u0_u0_u0 u1_u0_u0 u0_u1_u0 u1_u1_u0 u0_u0_u1 u1_u0_u1 u0_u1_u1 u1_u1_u1"
+// With the default offsets each level is rotated one host cycle past its
+// parent (L1, with idle phases, two).
+// RUN: FileCheck %s --check-prefix=OFFSET < %t/n/sim.mlir
+// OFFSET: "L1_model=u1_logic u0_logic"
 // The banked memories replace the per-child slot registers.
 // RUN: FileCheck %s --check-prefix=BANK < %t/b/sim.mlir
 // BANK-NOT: L1_model_u0_x_slot
@@ -71,6 +66,8 @@
 // COPY-DAG: hw.module @L3_threaded(
 // COPY-DAG: hw.module @L3_copy1_threaded(
 // COPY-DAG: hw.module @L1_model_copy1_threaded(
+// RUN: FileCheck %s --check-prefix=BRAM < %t/q/sim.sv
+// BRAM: (* ram_style = "block" *)
 
 // Three levels of two instances each, every level with state of its own;
 // a level's output depends combinationally on its input and its children's

@@ -191,28 +191,33 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
            "two: deeper channels give producers slack ahead of their readers "
            "at the cost of slot memory">,
     Option<"nest", "nest", "bool", "false",
-           "Fold nested classes recursively: number each class's threads so "
-           "that, picked in turn, a thread is current on the host cycles its "
-           "parent's thread is (the parent's thread index the low digits of "
-           "its children's), so that a parent and its children always "
-           "simulate the same instance of the parent">,
-    Option<"nestSkew", "nest-skew", "unsigned", "0",
-           "With `nest`: a child's thread is current this many host cycles "
-           "after its parent's">,
+           "Fold nested classes recursively, with every model picked in "
+           "turn: number each class's threads so that the thread current on "
+           "a host cycle is a child of its parent's current thread, a fixed "
+           "offset of host cycles earlier (the parent's thread index the low "
+           "digits of its children's); the order is recorded as "
+           "`foldsim.thread_order`">,
+    Option<"nestSkew", "nest-skew", "int", "-1",
+           "With `nest`: host cycles from a parent's thread to its children's "
+           "(negative: a hop of the channels between them, one host cycle, "
+           "two behind a relay), rounded up to a multiple of the children's "
+           "idle phases">,
     ListOption<"nestOffsets", "nest-offsets", "std::string",
                "With `nest`: models current this many host cycles after "
-               "the nested order, as <model>:<cycles>, rather than their "
-               "parent's offset and `nest-skew`">,
+               "the nested order, as <model>:<cycles> (a multiple of the "
+               "model's idle phases), rather than their parent's offset and "
+               "the skew">,
     ListOption<"copies", "copies", "std::string",
                "Models simulated by several threaded copies, as "
                "<model>:<count>: each copy simulates a contiguous range of "
                "the instances (with `nest`, the high digits of the thread "
-               "index), so a turn takes fewer host cycles">,
+               "index, so each copy's turn must be a multiple of the "
+               "parent's), so a turn takes fewer host cycles">,
     Option<"commitEnable", "commit-enable", "bool", "false",
-           "With `registered-state` and `commit-select`: a model of one "
-           "thread takes every other host cycle and commits its state with "
-           "the registered edge as clock enable, rather than by a select per "
-           "bit">,
+           "With `registered-state` and `commit-select`, and a class of "
+           "several threads: a model of one thread takes every other host "
+           "cycle and commits its state with the registered edge as clock "
+           "enable, rather than by a select per bit">,
     Option<"blockStateDepth", "block-state-depth", "unsigned", "0",
            "With `registered-state`: the thread state of models of at least "
            "this many threads asks for block RAM (0: never)">,
