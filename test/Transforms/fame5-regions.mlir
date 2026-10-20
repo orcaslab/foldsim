@@ -19,13 +19,18 @@
 // CHECK: seq.firmem.write_port %s[%threadIdx_w1] = %s_wdata, clock %hostClock enable [[SEN:%.+]] :
 // CHECK: seq.firmem.read_port %reset_fired[%threadIdx]
 // CHECK: seq.firmem.write_port %reset_fired[%threadIdx]
-// CHECK: %threadIdx_r0 = seq.firreg [[NEXT]] clock %hostClock reset sync %hostReset, %{{.+}} preset 0 {sv.attributes = [#sv.attribute<"keep" = "\22true\22">]} : i2
+// In turn, a region counts the threads itself rather than copying the index.
+// CHECK: %threadIdx_r0 = seq.firreg [[R0NEXT:%.+]] clock %hostClock reset sync %hostReset, %{{.+}} preset 0 {sv.attributes = [#sv.attribute<"keep" = "\22true\22">]} : i2
+// CHECK: [[R0LAST:%.+]] = comb.icmp eq %threadIdx_r0, %c-1_i2
+// CHECK: [[R0INC:%.+]] = comb.add %threadIdx_r0, %c1_i2
+// CHECK: [[R0NEXT]] = comb.mux [[R0LAST]], %{{.+}}, [[R0INC]] : i2
 // CHECK: %threadIdx_w0 = seq.firreg %threadIdx_r0 clock %hostClock preset 0 {sv.attributes = [#sv.attribute<"keep" = "\22true\22">]} : i2
 // CHECK: %edge_r0 = seq.firreg [[EDGE:%.+]] clock %hostClock preset 0 {sv.attributes = [#sv.attribute<"keep" = "\22true\22">]} : i1
 // CHECK: %r_wdata = seq.firreg %d_sink_bits clock %hostClock : i8
 // CHECK: %r_wen = seq.firreg %en_sink_bits clock %hostClock preset 0 : i1
 // CHECK: [[REN]] = comb.and %r_wen, %edge_r0 : i1
-// CHECK: %threadIdx_r1 = seq.firreg [[NEXT]]
+// CHECK: %threadIdx_r1 = seq.firreg [[R1NEXT:%.+]] clock %hostClock reset sync %hostReset
+// CHECK: comb.icmp eq %threadIdx_r1,
 // CHECK: %edge_r1 = seq.firreg [[EDGE]]
 // A register with a preset is also written while the threads are initialized,
 // from the region's copy of that a cycle late.

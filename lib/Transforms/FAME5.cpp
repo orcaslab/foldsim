@@ -1331,19 +1331,75 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
     return seq::FirRegOp::create(b, value, hostClock,
                                  b.getStringAttr(stagedName));
   };
+  // In turn, the thread index is a function of the host cycles since reset: a
+  // region counts it itself rather than copying the model's, so nothing far
+  // feeds its index and it is placed by the memories it addresses.
+  // A kept register reset to `initial`, its next value set by the caller.
+  auto counter = [&](Type type, const Twine &counterName, uint64_t initial) {
+    Value init = hw::ConstantOp::create(b, type, initial);
+    seq::FirRegOp reg = seq::FirRegOp::create(
+        b, init, hostClock, b.getStringAttr(counterName), hostReset, init,
+        hw::InnerSymAttr{}, /*isAsync=*/false, b.getIntegerAttr(type, initial));
+    sv::addSVAttributes(reg, {keep});
+    return reg;
+  };
+  auto setNext = [](seq::FirRegOp reg, Value next) {
+    reg.getNextMutable().assign(next);
+  };
+  auto inTurnAfter = [&](Value index) -> Value {
+    return comb::MuxOp::create(
+        b,
+        comb::ICmpOp::create(b, comb::ICmpPredicate::eq, index,
+                             hw::ConstantOp::create(b, idxType, threads - 1)),
+        hw::ConstantOp::create(b, idxType, 0),
+        comb::AddOp::create(b, index, hw::ConstantOp::create(b, idxType, 1)));
+  };
+  auto countTurns = [&](unsigned r, Value &current, Value &ahead) {
+    if (!aheadIdx) {
+      auto idx = counter(idxType, "threadIdx_r" + Twine(r), 0);
+      setNext(idx, inTurnAfter(idx));
+      current = idx;
+      return;
+    }
+    auto idx = counter(idxType, "threadIdx_a" + Twine(r), aheadReset);
+    Value next = inTurnAfter(idx);
+    if (aheadPhase) {
+      auto phaseType = aheadPhase.getType();
+      auto phaseReg = counter(phaseType, "phase_a" + Twine(r), 1);
+      setNext(phaseReg, comb::AddOp::create(
+                            b, phaseReg, hw::ConstantOp::create(b, phaseType, 1)));
+      next = comb::MuxOp::create(
+          b,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::eq, phaseReg,
+                               hw::ConstantOp::create(b, phaseType, phases - 1)),
+          next, idx);
+    }
+    setNext(idx, next);
+    ahead = idx;
+    auto now = counter(idxType, "threadIdx_r" + Twine(r), 0);
+    setNext(now, idx);
+    current = now;
+  };
   for (auto [r, region] : llvm::enumerate(regions)) {
-    Value readIdx = copy(idxNext, "threadIdx_r" + Twine(r), hostReset,
-                         hw::ConstantOp::create(b, idxType, 0));
-    // With registered state, the thread state is read for the next thread.
-    Value aheadCopy;
-    if (aheadIdx && llvm::any_of(region, [&](unsigned i) {
-          return regionMemories[i].state;
-        }))
-      aheadCopy =
-          copy(aheadIdx.getDefiningOp<seq::FirRegOp>().getNext(),
-               "threadIdx_a" + Twine(r), hostReset,
-               hw::ConstantOp::create(b, idxType, aheadReset),
-               /*initial=*/aheadReset);
+    bool readsState = aheadIdx && llvm::any_of(region, [&](unsigned i) {
+                        return regionMemories[i].state;
+                      });
+    Value readIdx, aheadCopy;
+    if (!readySchedule) {
+      countTurns(r, readIdx, aheadCopy);
+      if (!readsState)
+        aheadCopy = {};
+    } else {
+      readIdx = copy(idxNext, "threadIdx_r" + Twine(r), hostReset,
+                     hw::ConstantOp::create(b, idxType, 0));
+      // With registered state, the thread state is read for the next thread.
+      if (readsState)
+        aheadCopy =
+            copy(aheadIdx.getDefiningOp<seq::FirRegOp>().getNext(),
+                 "threadIdx_a" + Twine(r), hostReset,
+                 hw::ConstantOp::create(b, idxType, aheadReset),
+                 /*initial=*/aheadReset);
+    }
     // Only a region with writes has their control.
     Value writeIdx, edgeLate;
     if (!readOnly(region.front())) {
