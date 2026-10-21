@@ -170,6 +170,8 @@ struct NestOptions {
   /// `wired`: brought by the parents' controllers, rather than counted by
   /// each class from the start the tree plans.
   bool tree = true, wired = false;
+  /// The most loads of a token memory, wider ones split; 0 for no limit.
+  unsigned memoryLoads = 0;
 };
 
 class Composer {
@@ -185,6 +187,7 @@ public:
         emitDomainTree(domains), nest(nesting.nest), nestSkew(nesting.skew),
         bankedTokens(nesting.bankedTokens), treeControl(nesting.tree),
         wiredControl(nesting.tree && nesting.wired) {
+    memoryLoads = nesting.memoryLoads;
     for (auto &name : relay)
       relayModels.insert(name);
     for (auto &entry : nesting.offsets) {
@@ -213,6 +216,12 @@ private:
   LogicalResult decompose(Value value, unsigned low, unsigned width,
                           Pieces &pieces);
   LogicalResult build();
+  /// The bits [low, low + width) of `producer`'s token in the slot at
+  /// `address`, read from token memories of at most `memory-loads` loads
+  /// each: a wider memory's write registers would drive too many of its
+  /// LUTs.
+  Value readTokens(OpBuilder &b, Producer &producer, unsigned low,
+                   unsigned width, int reader, Value address);
   Value tokenMemory(Producer &producer, unsigned low, unsigned width,
                     int reader);
   Value relaySlice(OpBuilder &b, Location loc, Producer &producer, unsigned low,
@@ -227,6 +236,8 @@ private:
   StringRef simName;
   bool readySchedule;
   foldsim::ThreadOptions threadOptions;
+  /// The most loads of a token memory, wider ones split; 0 for no limit.
+  unsigned memoryLoads = 0;
   bool stagedTokens;
   unsigned channelDepth;
   bool emitDomainTree;
@@ -1109,6 +1120,27 @@ LogicalResult Composer::decompose(Value value, unsigned low, unsigned width,
 /// distributed RAM has a copy per read port, and a port of the whole token
 /// would keep every bit in it. FPGA tools map a memory of up to 16 ports to
 /// distributed RAM, so a range with many readers has several copies.
+Value Composer::readTokens(OpBuilder &b, Producer &producer, unsigned low,
+                           unsigned width, int reader, Value address) {
+  unsigned chunk = width;
+  if (unsigned loads = memoryLoads) {
+    unsigned depth = producer.depth << llvm::Log2_32_Ceil(producer.threads);
+    chunk = std::max(1u, loads / unsigned(llvm::divideCeil(depth, 32)));
+  }
+  // The high bits first, as a concatenation takes them.
+  SmallVector<Value> parts;
+  for (unsigned high = low + width; high > low;) {
+    unsigned piece = std::min(chunk, high - low);
+    high -= piece;
+    parts.push_back(seq::FirMemReadOp::create(
+        b, address.getLoc(), tokenMemory(producer, high, piece, reader),
+        address, hostClock, hw::ConstantOp::create(b, address.getLoc(), b.getI1Type(), 1)));
+  }
+  return parts.size() == 1
+             ? parts[0]
+             : b.createOrFold<comb::ConcatOp>(address.getLoc(), parts);
+}
+
 Value Composer::tokenMemory(Producer &producer, unsigned low, unsigned width,
                             int reader) {
   // Behind a relay, each reading class has copies of its own, next to it.
@@ -1882,9 +1914,8 @@ LogicalResult Composer::build() {
           Value thread = select(threads, current);
           Value slot = select(slots, current);
           Value address = comb::ConcatOp::create(b, thread, slot);
-          Value data = seq::FirMemReadOp::create(
-              b, tokenMemory(producer, source->low, first.width, consumer.cls),
-              address, hostClock, bit(true));
+          Value data = readTokens(b, producer, source->low, first.width,
+                                  consumer.cls, address);
           values.push_back(forwarded(producer, thread, slot, source->low,
                                      first.width, data));
         }
@@ -1924,9 +1955,8 @@ LogicalResult Composer::build() {
           Value thread = select(threads, current);
           Value slot = select(slots, current);
           Value address = comb::ConcatOp::create(b, thread, slot);
-          Value data = seq::FirMemReadOp::create(
-              b, tokenMemory(producer, piece.low, piece.width, consumer.cls),
-              address, hostClock, bit(true));
+          Value data = readTokens(b, producer, piece.low, piece.width,
+                                  consumer.cls, address);
           parts.push_back(forwarded(producer, thread, slot, piece.low,
                                     piece.width, data));
           continue;
@@ -2572,6 +2602,7 @@ void ComposePass::runOnOperation() {
   }
   nesting.tree = nestControl != "counters";
   nesting.wired = nestControl == "wired";
+  nesting.memoryLoads = memoryLoads;
   if (failed(Composer(top, netlist, simName, readySchedule, relayModels,
                           threadOptions, stagedTokens, channelDepth, domains,
                           nesting)

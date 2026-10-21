@@ -90,10 +90,10 @@ hw.module @Hold(in %clk : !seq.clock, in %reset : i1, in %en : i1, in %d : i8, o
 // MEM: seq.firmem.read_port %lut[[[LREAD:%.+]]], clock %hostClock
 // MEM: seq.firmem.write_port %ram[[[RADDR:%.+]]] = %ram_wdata, clock %hostClock enable [[REN:%.+]] :
 // MEM: [[RDATA:%.+]] = seq.firmem.read_port %ram[{{%.+}}], clock %hostClock enable %true :
-// MEM: seq.firmem.write_port %ram_rdata[%read_thread] = [[RDATA]],
+// MEM: seq.firmem.write_port %ram_rdata[%ram_read_thread] = [[RDATA]],
 // MEM: seq.firmem.write_port %ram2[{{%.+}}] = %ram2_wdata, clock %hostClock enable {{%.+}} :
 // MEM: [[NDATA:%.+]] = seq.firmem.read_port %ram2[{{%.+}}], clock %hostClock enable %true :
-// MEM: seq.firmem.write_port %ram2_rdata[%read_thread{{.*}}] = [[FWD:%[0-9]+]],
+// MEM: seq.firmem.write_port %ram2_rdata[%ram2_read_thread] = [[FWD:%[0-9]+]],
 // MEM: %threadIdx_r0 = seq.firreg
 // MEM-DAG: [[LREAD]] = comb.concat %raddr_sink_bits, %threadIdx_r0 : i3, i2
 // MEM-DAG: %lut_waddr = seq.firreg %waddr_sink_bits clock %hostClock : i3

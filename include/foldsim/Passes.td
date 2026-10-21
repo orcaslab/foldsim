@@ -186,6 +186,12 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"pipelineDepth", "pipeline-depth", "unsigned", "0",
            "Thread each model with its deep state cones split over two host "
            "cycles, as `foldsim-fame5`'s `pipeline-depth`">,
+    Option<"memoryLoads", "memory-loads", "unsigned", "0",
+           "Split a token memory of more than this many loads (bits read and "
+           "written, times its depth in 32-entry LUTs) by bits into memories "
+           "of at most that many, each with write registers of its own: one "
+           "register no longer drives the address and enable pins of "
+           "thousands of LUTs. 0: no split">,
     Option<"channelDepth", "channel-depth", "unsigned", "2",
            "Slots per producer thread of a channel without a relay, a power of "
            "two: deeper channels give producers slack ahead of their readers "

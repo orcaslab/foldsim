@@ -9,10 +9,10 @@
 // ONE: [[DOUT:%.+]] = seq.firmem.read_port %ram[%raddr_sink_bits], clock %clk_buffer.O
 // ONE: %read_edge = seq.firreg %true clock %clk_buffer.O : i1
 // ONE: %ram_rdata = seq.firreg [[R:%.+]] clock %hostClock : i8
-// ONE: [[EDGE:%.+]] = comb.xor %target_toggle, %target_toggle_seen : i1
+// ONE: [[EDGE:%.+]] = comb.xor %ram_read_toggle, %ram_read_toggle_seen : i1
 // ONE: [[FRESH:%.+]] = comb.and [[EDGE]], %read_edge : i1
 // ONE: [[R]] = comb.mux [[FRESH]], [[DOUT]], %ram_rdata : i8
-// ONE-NOT: read_thread
+// ONE-NOT: _read_thread
 // ONE: hw.output {{.*}}, [[R]], {{%.+}} : i1, i1, i1, i1, i1, i8, i1, i8, i1
 
 // `unused` is not read, so it has no channel; `t` has no bits, so its channel
@@ -40,12 +40,14 @@
 // CHECK: %read_edge = seq.firreg %true clock %clk_buffer.O : i1
 // CHECK: %ram_rdata = seq.firmem 0, 1, undefined, undefined : <4 x 8, mask 1>
 // CHECK: [[R:%.+]] = seq.firmem.read_port %ram_rdata[%threadIdx], clock %hostClock
-// CHECK: %target_toggle = seq.firreg {{%.+}} clock %clk_buffer.O preset 0 : i1
-// CHECK: %target_toggle_seen = seq.firreg %target_toggle clock %hostClock preset 0 : i1
-// CHECK: [[EDGE:%.+]] = comb.xor %target_toggle, %target_toggle_seen : i1
+// Each memory sees the target's edges and counts its read's thread by
+// registers of its own, kept.
+// CHECK: %ram_read_toggle = seq.firreg {{%.+}} clock %clk_buffer.O preset 0 {sv.attributes = [#sv.attribute<"keep" = "\22true\22">]} : i1
+// CHECK: %ram_read_toggle_seen = seq.firreg %ram_read_toggle clock %hostClock preset 0 {sv.attributes = [#sv.attribute<"keep" = "\22true\22">]} : i1
+// CHECK: [[EDGE:%.+]] = comb.xor %ram_read_toggle, %ram_read_toggle_seen : i1
 // CHECK: [[WRITE:%.+]] = comb.and [[EDGE]], %read_edge : i1
-// CHECK: %read_thread = seq.firreg %threadIdx clock %clk_buffer.O : i2
-// CHECK: seq.firmem.write_port %ram_rdata[%read_thread] = [[DOUT]], clock %hostClock enable [[WRITE]]
+// CHECK: %ram_read_thread = seq.firreg %threadIdx clock %clk_buffer.O {sv.attributes = [#sv.attribute<"keep" = "\22true\22">]} : i2
+// CHECK: seq.firmem.write_port %ram_rdata[%ram_read_thread] = [[DOUT]], clock %hostClock enable [[WRITE]]
 
 // CHECK: hw.output {{.*}}, [[Q]], {{.*}}, [[R]], {{%.+}} : i1, i1, i1, i1, i1, i8, i1, i8, i1
 hw.module @Mem(in %clk : !seq.clock, in %reset : i1, in %waddr : i3, in %wdata : i8, in %we : i1, in %raddr : i3, in %unused : i8, out q : i8, out r : i8, out t : i0) {

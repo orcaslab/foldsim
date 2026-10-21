@@ -2694,22 +2694,27 @@ LogicalResult Threader::run() {
   // bits, and is written on the target clock. A registered read reads on the
   // target clock too, and its data is kept per thread in a buffer filled on
   // the next host cycle, so that the memory stays a block RAM.
-  Value edgeSeen;
-  auto getEdgeSeen = [&]() {
-    if (edgeSeen)
-      return edgeSeen;
+  // Each memory sees the target's edges by registers of its own, kept, as
+  // it counts its read's thread: one model-wide pair would drive every
+  // buffer's write enable.
+  auto keepReg = [&](seq::FirRegOp reg) {
+    sv::addSVAttributes(reg, {sv::SVAttributeAttr::get(
+                                 b.getContext(), "keep", R"("true")",
+                                 /*emitAsComment=*/false)});
+    return reg;
+  };
+  auto getEdgeSeen = [&](const Twine &prefix) -> Value {
     auto zero = b.getIntegerAttr(i1, 0);
     auto toggleNext = backedges.get(i1);
-    auto toggle = seq::FirRegOp::create(b, toggleNext, targetClock,
-                                        b.getStringAttr("target_toggle"),
-                                        hw::InnerSymAttr{}, zero);
+    auto toggle = keepReg(seq::FirRegOp::create(
+        b, toggleNext, targetClock, b.getStringAttr(prefix + "_toggle"),
+        hw::InnerSymAttr{}, zero));
     toggleNext.setValue(
         comb::XorOp::create(b, toggle, hw::ConstantOp::create(b, i1, 1)));
-    auto seen = seq::FirRegOp::create(b, toggle, hostClock,
-                                      b.getStringAttr("target_toggle_seen"),
-                                      hw::InnerSymAttr{}, zero);
-    edgeSeen = comb::XorOp::create(b, toggle, seen);
-    return edgeSeen;
+    auto seen = keepReg(seq::FirRegOp::create(
+        b, toggle, hostClock, b.getStringAttr(prefix + "_toggle_seen"),
+        hw::InnerSymAttr{}, zero));
+    return comb::XorOp::create(b, toggle, seen);
   };
   auto idxWidth = threads > 1 ? threadIdx.getType().getIntOrFloatBitWidth() : 0;
   for (auto memory : memories) {
@@ -2789,7 +2794,9 @@ LogicalResult Threader::run() {
         data = createThreadState(
             b, (memory.getName().value_or("mem") + "_rdata").str(),
             dout.getType(), buffer);
-        Value capture = comb::AndOp::create(b, getEdgeSeen(), readEdge);
+        std::string readName = (memory.getName().value_or("mem") + "_read").str();
+        Value capture =
+            comb::AndOp::create(b, getEdgeSeen(readName), readEdge);
         if (threads == 1) {
           // The thread runs again on the host cycle that fills the buffer, so
           // it reads the data as it comes. With more threads, that cycle is
@@ -2809,8 +2816,9 @@ LogicalResult Threader::run() {
               if (auto port = dyn_cast<seq::FirMemReadOp>(user))
                 state.reads.push_back({port, {}, /*registered=*/false, {}});
           }
-          auto readThread = seq::FirRegOp::create(
-              b, threadIdx, targetClock, b.getStringAttr("read_thread"));
+          auto readThread = keepReg(seq::FirRegOp::create(
+              b, threadIdx, targetClock,
+              b.getStringAttr(readName + "_thread")));
           seq::FirMemWriteOp::create(b, buffer, readThread, hostClock, capture,
                                      dout, Value{});
         }
