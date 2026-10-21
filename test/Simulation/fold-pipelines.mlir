@@ -23,6 +23,14 @@
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/i/obj %S/Inputs/tb_fold.sv %S/Inputs/xbox.sv %t/target.sv %t/i/sim.sv > %t/i/build.log 2>&1
 // RUN: %t/i/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 // RUN: %t/i/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 | FileCheck %s
+// The same with the memories and thread state split into parts of at most 4
+// loads, the folded pipelines' stores among them.
+// RUN: mkdir -p %t/k && foldsim-opt %t/in.mlir --foldsim-extract-models="module=Top models=Model netlist" --foldsim-compose="module=Top ready-schedule=false region-loads=16 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens fold-pipelines memory-loads=4" -o %t/k/sim.mlir
+// RUN: grep -q '_p1 = seq.firmem' %t/k/sim.mlir
+// RUN: firtool --format=mlir %t/k/sim.mlir -o %t/k/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/k/obj %S/Inputs/tb_fold.sv %S/Inputs/xbox.sv %t/target.sv %t/k/sim.sv > %t/k/build.log 2>&1
+// RUN: %t/k/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/k/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 | FileCheck %s
 // The whole target one model of one thread: the black box stays an instance,
 // on the host clock and enabled on the target's edges.
 // RUN: mkdir -p %t/u && foldsim-opt %t/in.mlir --hw-flatten-modules --foldsim-extract-models="module=Top netlist" --foldsim-compose="module=Top" -o %t/u/sim.mlir

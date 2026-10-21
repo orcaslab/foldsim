@@ -191,7 +191,9 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
            "written, times its depth in 32-entry LUTs) by bits into memories "
            "of at most that many, each with write registers of its own: one "
            "register no longer drives the address and enable pins of "
-           "thousands of LUTs. 0: no split">,
+           "thousands of LUTs. Each model's memories and thread state are "
+           "split the same way, as `foldsim-fame5`'s `memory-loads`. 0: no "
+           "split">,
     Option<"channelDepth", "channel-depth", "unsigned", "2",
            "Slots per producer thread of a channel without a relay, a power of "
            "two: deeper channels give producers slack ahead of their readers "
@@ -379,6 +381,14 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
            "more than this many levels if it can and the fewest bits are "
            "registered, and computes the rest on the next host cycle rather "
            "than registering the next value; 0 does not">,
+    Option<"memoryLoads", "memory-loads", "unsigned", "0",
+           "With `region-loads`: split a memory or thread state of more than "
+           "this many loads (bits, times its depth in 32-entry LUTs) by bits "
+           "into memories of at most that many, in whole mask bits, each in "
+           "a region of its own with its own staging and thread index, the "
+           "ports no region controls with copies of what drives their "
+           "address and enable last: no one register drives the address and "
+           "enable pins of thousands of LUTs. 0: no split">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

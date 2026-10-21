@@ -13,6 +13,14 @@
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/n/obj %S/Inputs/tb_nest.sv %t/target.sv %t/n/sim.sv > %t/n/build.log 2>&1
 // RUN: %t/n/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
 // RUN: %t/n/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
+// The same with the memories and thread state split into parts of at most 4
+// loads.
+// RUN: mkdir -p %t/m && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest banked-tokens commit-enable memory-loads=4})" -o %t/m/sim.mlir
+// RUN: grep -q '_p1 = seq.firmem' %t/m/sim.mlir
+// RUN: firtool --format=mlir %t/m/sim.mlir -o %t/m/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/m/obj %S/Inputs/tb_nest.sv %t/target.sv %t/m/sim.sv > %t/m/build.log 2>&1
+// RUN: %t/m/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=50 | FileCheck %s
+// RUN: %t/m/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=50 | FileCheck %s
 // The same as a tree of domains, with a relay between L2 and L3 and the leaves in two copies.
 // RUN: mkdir -p %t/d && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=L2 models=L3 netlist},foldsim-extract-models{module=L1 models=L2 netlist},foldsim-extract-models{module=Top models=L1 netlist},foldsim-compose{module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens compact-staging idle-slots nest banked-tokens commit-enable domains relay=L2_model:L3 copies=L3:2})" -o %t/d/sim.mlir
 // RUN: firtool --format=mlir %t/d/sim.mlir -o %t/d/sim.sv

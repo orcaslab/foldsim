@@ -2584,6 +2584,7 @@ void ComposePass::runOnOperation() {
                                        compactStaging, foldPipelines,
                                        idleSlots, pipelineDepth, blockStateDepth,
                                        commitEnable};
+  threadOptions.memoryLoads = memoryLoads;
   if (channelDepth < 2 || !llvm::isPowerOf2_32(channelDepth)) {
     top.emitError("a channel's depth is a power of two, at least two");
     return signalPassFailure();

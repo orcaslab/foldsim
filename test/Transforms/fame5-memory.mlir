@@ -46,7 +46,7 @@
 // CHECK: %ram_read_toggle_seen = seq.firreg %ram_read_toggle clock %hostClock preset 0 {sv.attributes = [#sv.attribute<"keep" = "\22true\22">]} : i1
 // CHECK: [[EDGE:%.+]] = comb.xor %ram_read_toggle, %ram_read_toggle_seen : i1
 // CHECK: [[WRITE:%.+]] = comb.and [[EDGE]], %read_edge : i1
-// CHECK: %ram_read_thread = seq.firreg %threadIdx clock %clk_buffer.O {sv.attributes = [#sv.attribute<"keep" = "\22true\22">]} : i2
+// CHECK: %ram_read_thread = seq.firreg %threadIdx clock %clk_buffer.O preset 0 {sv.attributes = [#sv.attribute<"keep" = "\22true\22">]} : i2
 // CHECK: seq.firmem.write_port %ram_rdata[%ram_read_thread] = [[DOUT]], clock %hostClock enable [[WRITE]]
 
 // CHECK: hw.output {{.*}}, [[Q]], {{.*}}, [[R]], {{%.+}} : i1, i1, i1, i1, i1, i8, i1, i8, i1

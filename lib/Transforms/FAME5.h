@@ -40,6 +40,10 @@ struct ThreadOptions {
   /// every other host cycle and commits its state by the registered edge as
   /// a clock enable, rather than by a select per bit.
   bool commitEnable = false;
+  /// With regions: a memory of more than this many loads (bits, times its
+  /// depth in 32-entry LUTs) is split by bits into memories of at most that
+  /// many, each in a region of its own (0: never).
+  unsigned memoryLoads = 0;
   /// The model's turns come from outside rather than from a counter of its
   /// own: its position (thread and idle phase, `thread * phases + phase`)
   /// for the host cycle after next in on `schedule_next`, the register

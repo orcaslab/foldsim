@@ -152,6 +152,7 @@ public:
         stagedRamWrites(options.stagedRamWrites),
         pipelineMultipliers(options.pipelineMultipliers),
         pipelineDepth(options.pipelineDepth),
+        memoryLoads(options.memoryLoads),
         compactStaging(options.compactStaging),
         foldPipelines(options.foldPipelines),
         blockStateDepth(options.registeredState ? options.blockStateDepth : 0),
@@ -245,6 +246,9 @@ private:
   /// value or the candidate, by the registered enable.
   void commitBySelect(ImplicitLocOpBuilder &b, Value edge, Value initializing);
   RegionMemory &regionMemory(Value memory);
+  /// Splits each recorded memory of more than `memoryLoads` loads by bits into
+  /// memories of at most that many, in regions of their own.
+  void splitWideMemories(ImplicitLocOpBuilder &b);
   /// Splits the recorded state into regions of at most `regionLoads` loads,
   /// in name order so that a region is a submodule's state, and gives each
   /// its control.
@@ -289,6 +293,8 @@ private:
   /// With two state stages: the logic levels of a state cone above which it
   /// is split over the two host cycles, or 0.
   unsigned pipelineDepth;
+  /// With regions: the loads above which a memory is split by bits, or 0.
+  unsigned memoryLoads;
   /// With regions: whether staging takes the location of the state it
   /// stages, and a staged write enable has no preset value.
   bool compactStaging;
@@ -1391,8 +1397,153 @@ Value Threader::pipelinedCone(ImplicitLocOpBuilder &b, Value value) {
   return map.lookup(value);
 }
 
+void Threader::splitWideMemories(ImplicitLocOpBuilder &b) {
+  auto keep = sv::SVAttributeAttr::get(b.getContext(), "keep", R"("true")",
+                                       /*emitAsComment=*/false);
+  // A port the regions do not control keeps its address and enable, each
+  // part a copy of the gates and registers that drive them last, so that no
+  // one of them drives every part. A register is copied only with a preset:
+  // the copy then holds its value on every host cycle.
+  std::function<Value(Value, unsigned)> copyOf = [&](Value value,
+                                                     unsigned depth) -> Value {
+    auto *op = value ? value.getDefiningOp() : nullptr;
+    if (!op || !depth || op->getNumResults() != 1)
+      return value;
+    auto reg = dyn_cast<seq::FirRegOp>(op);
+    if (reg ? !reg.getPreset() || reg.getInnerSymAttr()
+            : !isa<comb::CombDialect>(op->getDialect()))
+      return value;
+    auto *clone = b.clone(*op);
+    if (reg) {
+      sv::addSVAttributes(clone, {keep});
+    } else {
+      for (auto &operand : clone->getOpOperands())
+        operand.set(copyOf(operand.get(), depth - 1));
+    }
+    return clone->getResult(0);
+  };
+  SmallVector<RegionMemory> split;
+  for (auto &state : regionMemories) {
+    auto memory = state.memory.getDefiningOp<seq::FirMemOp>();
+    auto type = memory.getType();
+    uint64_t width = type.getWidth();
+    // The bits of a mask bit.
+    uint64_t grain = type.getMaskWidth() && *type.getMaskWidth()
+                         ? width / *type.getMaskWidth()
+                         : 1;
+    // The widest part of at most `memoryLoads` loads: whole mask bits, or
+    // the bits of one.
+    uint64_t part = std::max<uint64_t>(
+        1, memoryLoads / llvm::divideCeil(type.getDepth(), 32));
+    if (grain <= part)
+      part = part / grain * grain;
+    if (width <= part || memory.getInitAttr() ||
+        !llvm::all_of(memory->getUsers(), [](Operation *user) {
+          return isa<seq::FirMemReadOp, seq::FirMemWriteOp>(user);
+        })) {
+      split.push_back(std::move(state));
+      continue;
+    }
+    auto loc = b.getLoc();
+    b.setLoc(memory.getLoc());
+    struct Part {
+      uint64_t low, width;
+      RegionMemory state;
+    };
+    SmallVector<Part> parts;
+    for (uint64_t low = 0, bits; low < width; low += bits) {
+      bits = std::min(part, width - low);
+      if (grain > part)
+        bits = std::min(bits, (low / grain + 1) * grain - low);
+      auto partType = seq::FirMemType::get(
+          b.getContext(), type.getDepth(), bits,
+          type.getMaskWidth()
+              ? std::optional<uint32_t>(std::max<uint64_t>(1, bits / grain))
+              : std::nullopt);
+      auto partMemory = seq::FirMemOp::create(
+          b, partType, memory.getReadLatency(), memory.getWriteLatency(),
+          memory.getRuw(), memory.getWuw(),
+          b.getStringAttr(memory.getName().value_or("mem") + "_p" +
+                          Twine(parts.size())),
+          hw::InnerSymAttr{}, seq::FirMemInitAttr{}, memory.getPrefixAttr(),
+          memory.getOutputFileAttr());
+      partMemory->setDialectAttrs(memory->getDialectAttrs());
+      parts.push_back({low, bits, {partMemory, {}, {}, state.state, state.loc}});
+    }
+    auto readOf = [&](seq::FirMemReadOp op) {
+      return llvm::find_if(state.reads,
+                           [&](auto &read) { return read.op == op; });
+    };
+    auto writeOf = [&](seq::FirMemWriteOp op) {
+      return llvm::find_if(state.writes,
+                           [&](auto &write) { return write.op == op; });
+    };
+    // In the order of the ports, which the parts' ports keep.
+    SmallVector<Operation *> users(memory->getUsers());
+    llvm::sort(users, [](Operation *x, Operation *y) {
+      return x->isBeforeInBlock(y);
+    });
+    for (auto *user : users) {
+      if (auto read = dyn_cast<seq::FirMemReadOp>(user)) {
+        auto recorded = readOf(read);
+        bool own = recorded == state.reads.end();
+        SmallVector<Value> data;
+        for (auto [i, p] : llvm::enumerate(parts)) {
+          auto port = seq::FirMemReadOp::create(
+              b, p.state.memory,
+              own && i ? copyOf(read.getAddress(), 2) : read.getAddress(),
+              read.getClk(),
+              own && i ? copyOf(read.getEnable(), 2) : read.getEnable());
+          if (!own)
+            p.state.reads.push_back(
+                {port, recorded->low, recorded->registered, recorded->enable});
+          data.push_back(port);
+        }
+        std::reverse(data.begin(), data.end());
+        read.getData().replaceAllUsesWith(
+            b.createOrFold<comb::ConcatOp>(data));
+        read.erase();
+        continue;
+      }
+      auto write = cast<seq::FirMemWriteOp>(user);
+      auto recorded = writeOf(write);
+      bool own = recorded == state.writes.end();
+      for (auto [i, p] : llvm::enumerate(parts)) {
+        Value mask = write.getMask();
+        if (mask)
+          mask = b.createOrFold<comb::ExtractOp>(
+              b.getIntegerType(std::max<uint64_t>(1, p.width / grain)), mask,
+              p.low / grain);
+        auto port = seq::FirMemWriteOp::create(
+            b, p.state.memory,
+            own && i ? copyOf(write.getAddress(), 2) : write.getAddress(),
+            write.getClk(),
+            own && i ? copyOf(write.getEnable(), 2) : write.getEnable(),
+            b.createOrFold<comb::ExtractOp>(b.getIntegerType(p.width),
+                                            write.getData(), p.low),
+            mask);
+        if (!own)
+          p.state.writes.push_back({port, recorded->low, recorded->term,
+                                    recorded->edge, recorded->preset,
+                                    recorded->staged});
+      }
+      write.erase();
+    }
+    memory.erase();
+    for (auto &p : parts)
+      split.push_back(std::move(p.state));
+    b.setLoc(loc);
+  }
+  regionMemories = std::move(split);
+  regionMemoryIndex.clear();
+  for (auto [i, state] : llvm::enumerate(regionMemories))
+    regionMemoryIndex[state.memory] = i;
+}
+
 void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
                             Value initializing, Value hostReset) {
+  if (memoryLoads)
+    splitWideMemories(b);
   auto *context = b.getContext();
   auto i1 = b.getI1Type();
   auto idxType = threadIdx.getType();
@@ -1420,14 +1571,14 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
   SmallVector<SmallVector<unsigned>> regions;
   uint64_t loads = 0;
   for (auto i : order) {
-    auto memoryLoads = loadsOf(regionMemories[i]);
+    auto stateLoads = loadsOf(regionMemories[i]);
     if (regions.empty() || readOnly(i) != readOnly(regions.back().front()) ||
-        (regionLoads && loads && loads + memoryLoads > regionLoads)) {
+        (regionLoads && loads && loads + stateLoads > regionLoads)) {
       regions.emplace_back();
       loads = 0;
     }
     regions.back().push_back(i);
-    loads += memoryLoads;
+    loads += stateLoads;
   }
 
   // Each region's copies are registers with the same next value as the one
@@ -2816,9 +2967,11 @@ LogicalResult Threader::run() {
               if (auto port = dyn_cast<seq::FirMemReadOp>(user))
                 state.reads.push_back({port, {}, /*registered=*/false, {}});
           }
+          // With a preset, so that a split memory's parts can copy it.
           auto readThread = keepReg(seq::FirRegOp::create(
               b, threadIdx, targetClock,
-              b.getStringAttr(readName + "_thread")));
+              b.getStringAttr(readName + "_thread"), hw::InnerSymAttr{},
+              b.getIntegerAttr(threadIdx.getType(), 0)));
           seq::FirMemWriteOp::create(b, buffer, readThread, hostClock, capture,
                                      dout, Value{});
         }
@@ -3277,20 +3430,21 @@ void FAME5Pass::runOnOperation() {
   }
   if ((regionLoads || registeredState || commitSelect || stagedRamWrites ||
        pipelineMultipliers || compactStaging || foldPipelines || idleSlots ||
-       pipelineDepth) &&
+       pipelineDepth || memoryLoads) &&
       !clockEnable) {
     model.emitError("regions are for state written with `clock-enable`");
     return signalPassFailure();
   }
+  foldsim::ThreadOptions threadOptions{regionLoads,         registeredState,
+                                       stateStages,         commitSelect,
+                                       stagedRamWrites,     pipelineMultipliers,
+                                       compactStaging,      foldPipelines,
+                                       idleSlots,           pipelineDepth};
+  threadOptions.memoryLoads = memoryLoads;
   if (failed(Threader(model, threads, name, gate, slices, channelFields,
                       clockChannel, threadIndex, /*tickFromFirst=*/false,
                       /*readySchedule=*/false,
-                      foldsim::ThreadOptions{regionLoads, registeredState,
-                                             stateStages, commitSelect,
-                                             stagedRamWrites,
-                                             pipelineMultipliers,
-                                             compactStaging, foldPipelines,
-                                             idleSlots, pipelineDepth})
+                      threadOptions)
                  .run()))
     return signalPassFailure();
 }

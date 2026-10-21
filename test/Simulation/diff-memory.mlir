@@ -38,10 +38,11 @@
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/i/obj %S/Inputs/tb_diffmem.sv %t/target.sv %t/i/sim.sv > %t/i/build.log 2>&1
 // RUN: %t/i/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 // RUN: %t/i/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
-// The same with token memories split into pieces of at most 4 loads, each
-// written by registers of its own.
+// The same with token memories, memories and thread state split into pieces
+// of at most 4 loads, each written by registers of its own.
 // RUN: mkdir -p %t/k && foldsim-opt %s --foldsim-extract-models="module=Top models=MemModel,Post netlist" --foldsim-compose="module=Top ready-schedule=false region-loads=1 registered-state commit-select state-stages=2 pipeline-multipliers staged-ram-writes staged-tokens memory-loads=4" -o %t/k/sim.mlir
 // RUN: grep -q '_tokens_3_0_we = seq.firreg' %t/k/sim.mlir
+// RUN: grep -q 'ram_rdata_p1 = seq.firmem' %t/k/sim.mlir
 // RUN: firtool --format=mlir %t/k/sim.mlir -o %t/k/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/k/obj %S/Inputs/tb_diffmem.sv %t/target.sv %t/k/sim.sv > %t/k/build.log 2>&1
 // RUN: %t/k/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
