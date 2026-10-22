@@ -414,8 +414,41 @@ void Composer::inlineNetlists() {
   }
 }
 
+/// The bits of an aggregate constant of `type`: fields and elements in the
+/// order they are listed, the first the most significant, as `hw.bitcast` lays
+/// them out.
+static APInt aggregateBits(Attribute attr, Type type) {
+  if (auto integer = dyn_cast<IntegerAttr>(attr))
+    return integer.getValue().zextOrTrunc(hw::getBitWidth(type));
+  auto fields = cast<ArrayAttr>(attr);
+  SmallVector<Type> types;
+  if (auto structType = hw::type_dyn_cast<hw::StructType>(type))
+    for (auto field : structType.getElements())
+      types.push_back(field.type);
+  else
+    types.assign(fields.size(),
+                 hw::type_cast<hw::ArrayType>(type).getElementType());
+  std::optional<APInt> bits;
+  for (auto [field, fieldType] : llvm::zip(fields, types)) {
+    auto fieldBits = aggregateBits(field, fieldType);
+    bits = bits ? bits->concat(fieldBits) : fieldBits;
+  }
+  return *bits;
+}
+
 LogicalResult Composer::collect() {
   auto *body = netlist.getBodyBlock();
+  // An aggregate constant is a constant's bits, cast.
+  for (auto aggregate :
+       llvm::make_early_inc_range(body->getOps<hw::AggregateConstantOp>())) {
+    OpBuilder builder(aggregate);
+    auto bits = aggregateBits(aggregate.getFieldsAttr(), aggregate.getType());
+    Value value = hw::ConstantOp::create(builder, aggregate.getLoc(), bits);
+    value = hw::BitcastOp::create(builder, aggregate.getLoc(),
+                                  aggregate.getType(), value);
+    aggregate.replaceAllUsesWith(value);
+    aggregate.erase();
+  }
   DenseMap<Operation *, unsigned> classOf;
   for (auto &op : body->without_terminator()) {
     auto instance = dyn_cast<hw::InstanceOp>(op);
