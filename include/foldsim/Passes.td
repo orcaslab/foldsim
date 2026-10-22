@@ -260,6 +260,55 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
   ];
 }
 
+def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
+  let summary = "Fold a netlist of models into a statically scheduled simulator";
+  let description = [{
+    Builds the simulator `sim` of the netlist `module` (as
+    `foldsim-extract-models` with `netlist` leaves it) on a schedule fixed at
+    compile time. A target cycle is a frame of II host cycles; in each slot of
+    the frame each class's copy evaluates one instance in one pass, in an
+    order the compiler fixes. Each model must register its outputs: an
+    output that depends on the model's inputs in the same cycle is a ready
+    (or the root's own path to the environment), and orders evaluations
+    within the frame.
+
+    - A copy is the class's logic once, its registers memories of one entry
+      per instance read into registers (read registers) at the slot's
+      instance, and written straight from the logic at their write port. A
+      class of one instance keeps its registers, enabled at its slot.
+    - An output that depends only on the model's state (early) is written
+      into its link at the producer's state pass with its next value, into
+      the bank of the next frame. One that depends on an input, or on a
+      memory's read data (late), is written in the frame it belongs to, at
+      a pass of the producer placed before its readers: a ready pass that
+      writes no state, or the state pass.
+    - Every input of a copy is a read register: a link's read at the
+      consumer's slot, a constant of the instance, or the netlist input of
+      the frame.
+    - The netlist's inputs and outputs are token channels
+      (`<port>_valid`, `_ready`, `_bits`): a frame starts when every input
+      has its token and every output has room.
+
+    Writes the schedule to `report` if given.
+  }];
+  let options = [
+    Option<"moduleName", "module", "std::string", "",
+           "The netlist to simulate">,
+    Option<"simName", "sim", "std::string", "\"foldsim_sim\"",
+           "The name of the simulator module">,
+    Option<"regionBits", "region-bits", "unsigned", "2048",
+           "The most state bits a region's copy of the slot controls drives">,
+    Option<"report", "report", "std::string", "",
+           "A file to write the schedule to">,
+  ];
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect",
+    "circt::seq::SeqDialect",
+    "circt::sv::SVDialect"
+  ];
+}
+
 def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
   let summary = "Thread a flat model's state for FAME-5 simulation";
   let description = [{

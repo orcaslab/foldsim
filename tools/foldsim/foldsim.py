@@ -199,6 +199,13 @@ def main():
     ap.add_argument('--relay', default='',
                     help='models, or <model>:<model> pairs, whose channels get a relay stage, '
                          'comma-separated (foldsim-compose)')
+    ap.add_argument('--static', action='store_true',
+                    help='a statically scheduled simulator: every target cycle a frame of '
+                         'host cycles fixed at compile time (foldsim-fold-static); the '
+                         'options of the token fabric do not apply')
+    ap.add_argument('--region-bits', type=int, default=0,
+                    help="with --static: the most state bits a region's copy of the slot "
+                         'controls drives (foldsim-fold-static)')
     ap.add_argument('classes', nargs='*',
                     help='none: the whole target one model of one thread, unthreaded')
     a = ap.parse_args()
@@ -322,8 +329,15 @@ def main():
         compose += f' relay={a.relay}'
     if a.staged_tokens:
         compose += ' staged-tokens'
-    pipeline = passes + OPTIMIZE + [f'foldsim-compose{{{compose}}}',
-                                    'canonicalize', 'foldsim-sort', 'cse']
+    if a.static:
+        fold = f'module={a.top} sim=foldsim_sim report={out("schedule.txt")}'
+        if a.region_bits:
+            fold += f' region-bits={a.region_bits}'
+        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}',
+                                        'canonicalize', 'foldsim-sort', 'cse']
+    else:
+        pipeline = passes + OPTIMIZE + [f'foldsim-compose{{{compose}}}',
+                                        'canonicalize', 'foldsim-sort', 'cse']
     sim = out('foldsim_sim.mlir')
     run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(pipeline)})', '-o', sim])
     sim_text = open(sim).read()
