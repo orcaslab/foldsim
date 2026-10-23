@@ -34,6 +34,7 @@ VIVADO_CELL = re.compile(
 FOLD_SUFFIX = re.compile(
     r'(_ext(_\d+)?|_fold|_read(_\d+)?|_[fb]ret(_\d+)?|_replica(_\d+)?)+$')
 FOLD_SHELL = re.compile(r'^fold\d+_')
+DSP_SUBCELL = re.compile(r'^DSP\w*(<\d+>)?_INST$')
 
 
 def norm(s):
@@ -51,9 +52,12 @@ def ep_key(cell_path, native):
     if native:
         cls = parts[0]
         hier = parts[1:-1]
-        # Distributed RAM primitives below the memory cell.
+        # Distributed RAM primitives below the memory cell, and the sub-cells
+        # of a DSP macro (DSP58C<0>_INST/DSP_M_DATA58_INST,
+        # DSP_OUTPUT_INST) below the register it absorbed.
         for i, p in enumerate(hier):
-            if p.startswith('Memory_reg') or re.match(r'RAM[A-H]', p):
+            if (p.startswith('Memory_reg') or re.match(r'RAM[A-H]', p)
+                    or DSP_SUBCELL.match(p)):
                 hier = hier[:i]
                 break
     else:
