@@ -406,21 +406,30 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
   let summary = "Rank every register-to-register path by its logic levels";
   let description = [{
     Estimates, for every end point of the design elaborated from `top`, the
-    logic levels of its longest path the way Vivado counts them on the V80:
-    LUTs, CARRY8s and distributed-RAM reads. The input is a LUT-mapped design
-    in which `comb.truth_table` ops are LUTs and adders, subtracters,
-    comparators and multipliers are still word-level ops:
+    logic levels of its longest path the way Vivado counts them on the
+    device `family`: LUTs, CARRY8s, DSP cells and distributed-RAM reads. The input is a LUT-mapped design in which
+    `comb.truth_table` ops are LUTs and adders, subtracters, comparators,
+    multipliers and dividers are still word-level ops:
 
     - `comb.truth_table`: one level.
     - `comb.add`/`comb.sub`: a LUT and the CARRY8s from an input bit's
       8-bit block to the output bit's.
     - `comb.icmp` of order: a LUT and the CARRY8s from the input bit to the
       most significant one. Of equality: a LUT6 tree over the bits.
-    - `comb.mul`: one level, a DSP.
-    - `comb.divu`/`divs`/`modu`/`mods`: a ripple of one subtracter per
-      quotient bit, from every input bit to every output bit.
+    - `comb.mul`: a table in LUTs if its operands have at most ten variable
+      bits; otherwise a cascade of DSPs over their significant bits (27 x 24
+      each on the V80, 27 x 18 on the U55C): the cells up to the first
+      product, then each further DSP. A register the product feeds, with
+      its enable logic, is the DSP's own; any other load adds the DSP's
+      output stage.
+    - `comb.divu`/`divs`/`modu`/`mods`: a table over the bits the operands
+      depend on if there are at most ten of them; otherwise a ripple of one
+      subtracter per quotient bit, from every input bit to every output bit.
     - `seq.firmem` read of latency 0 (distributed RAM): one level, plus one
       per doubling of the depth past 64 words, from the address.
+
+    `family` is `versal` (the V80) or `virtexuplusHBM` (the U55C), as
+    hw/syn/xilinx/platforms names them; the two differ only in their DSPs.
 
     End points are register inputs (data, reset, clock enable), the address,
     data, enable and mask of memory writes, the address and enable of
@@ -463,6 +472,8 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
                "instance path and name contain one of these">,
     ListOption<"blackBoxes", "black-boxes", "std::string",
                "Modules to treat as external, as a harness stubs them">,
+    Option<"family", "family", "std::string", "\"versal\"",
+           "The FPGA family whose logic levels to count">,
     Option<"retimeLevels", "retime-levels", "unsigned", "0",
            "Also estimate each end point's depth after Vivado's retiming "
            "to a period of this many levels (0: off)">,

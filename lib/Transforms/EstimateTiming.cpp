@@ -22,6 +22,7 @@
 #include "mlir/Support/FileUtilities.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/ToolOutputFile.h"
@@ -50,6 +51,7 @@ enum class Kind : uint8_t {
   Equal,
   Mul,
   Div,
+  Table,
   AsyncRead,
   Other,
   // Start points.
@@ -82,6 +84,8 @@ StringRef kindName(Kind kind) {
     return "dsp";
   case Kind::Div:
     return "div";
+  case Kind::Table:
+    return "table";
   case Kind::AsyncRead:
     return "lutram";
   case Kind::Other:
@@ -124,7 +128,8 @@ struct Context {
 
 /// An end point bit; `reg` is the register it is the input of, if Vivado can
 /// retime that register. A `boundary` end point is a top output or an input
-/// of a stub, which the harness registers.
+/// of a stub, which the harness registers. A `registered` end point is a
+/// register's data input, which a DSP absorbs when a product feeds it.
 struct EndPoint {
   unsigned node;
   unsigned ctx;
@@ -133,6 +138,8 @@ struct EndPoint {
   uint32_t bit;
   unsigned reg;
   bool boundary = false;
+  bool registered = false;
+  int16_t levels = 0;
   int16_t retimed = 0;
 };
 
@@ -161,9 +168,36 @@ unsigned lut6Depth(unsigned n) {
 }
 
 /// Levels from an input bit of an adder or comparator to an output bit: the
-/// LUT that computes propagate and generate, and the CARRY8s between the
-/// input's 8-bit block and the output's.
+/// LUT that computes propagate and generate, and the 8-bit carry blocks
+/// (CARRY8 or LOOKAHEAD8) between the input's block and the output's.
 int carryLevels(unsigned in, unsigned out) { return 2 + out / 8 - in / 8; }
+
+/// The DSPs of a device's family, as Vivado counts their levels. The two
+/// families differ only there: both have LUT6s, 8-bit carry blocks and
+/// 64-word distributed RAMs.
+struct Device {
+  /// The operand widths of a DSP's multiplier.
+  unsigned dspA, dspB;
+  /// Levels from the fabric to a product the DSP registers, from there out
+  /// to the fabric, and through each further DSP of a cascade.
+  int dspIn, dspOut, dspCascade;
+};
+
+/// The V80 (Versal, DSP58): from a registered product, Vivado counts M_DATA,
+/// ALUMUX, ALUADD, OUTPUT and the cells before the multiplier it does not
+/// absorb; a cascaded DSP adds ALUMUX, ALUADD and OUTPUT. The U55C
+/// (Virtex UltraScale+ HBM, DSP48E2) has one ALU cell and an 18-bit B port.
+const Device kVersal = {27, 24, 1, 6, 3};
+const Device kVirtexUltraScalePlusHBM = {27, 18, 1, 5, 2};
+
+/// The device of a family, by the names of hw/syn/xilinx/platforms: the V80's
+/// and the U55C's.
+const Device *lookupDevice(StringRef family) {
+  return llvm::StringSwitch<const Device *>(family)
+      .Case("versal", &kVersal)
+      .Case("virtexuplusHBM", &kVirtexUltraScalePlusHBM)
+      .Default(nullptr);
+}
 
 /// The most bits a divider can depend on for synthesis to write it out as a
 /// table over them; also the dividend widths whose quotient and remainder by
@@ -177,10 +211,27 @@ constexpr unsigned kMaxSupportCone = 4096;
 /// multiplexers per two more.
 int tableLevels(unsigned bits) { return bits <= 6 ? 1 : 1 + (bits - 5) / 2; }
 
+/// The low bits of `value` that are not known zero: a zero-extension is a
+/// concatenation under a zero constant.
+unsigned significantBits(Value value) {
+  unsigned width = widthOf(value);
+  if (auto concat = value.getDefiningOp<comb::ConcatOp>())
+    if (auto top = concat.getInputs().front().getDefiningOp<hw::ConstantOp>())
+      if (top.getValue().isZero())
+        return width - widthOf(top);
+  return width;
+}
+
+/// The bits of `value` a product depends on: none for a constant.
+unsigned variableBits(Value value) {
+  return value.getDefiningOp<hw::ConstantOp>() ? 0 : significantBits(value);
+}
+
 class Timing {
 public:
   /// Instances of `blackBoxes` are external modules, as a harness's stubs.
-  Timing(ModuleOp top, ArrayRef<std::string> blackBoxes) {
+  Timing(ModuleOp top, ArrayRef<std::string> blackBoxes, const Device &device)
+      : device(device) {
     for (auto module : top.getOps<hw::HWModuleLike>()) {
       if (llvm::is_contained(blackBoxes, module.getModuleName()))
         stubs.insert(module.getModuleNameAttr());
@@ -200,6 +251,7 @@ private:
   unsigned node(unsigned ctx, Value value, unsigned bit, Kind kind);
   unsigned resolve(unsigned ctx, Value value, unsigned bit);
   Kind classify(Operation *op);
+  void operands(unsigned id, SmallVectorImpl<Edge> &edges);
   void inputs(unsigned id, SmallVectorImpl<Edge> &edges);
   ArrayRef<unsigned> support(unsigned ctx, Operation *op, bool &small);
   void evaluate(unsigned root);
@@ -216,6 +268,7 @@ private:
   void printPath(raw_ostream &os, const EndPoint &end, unsigned rank);
   const std::string &path(unsigned ctx);
 
+  const Device &device;
   DenseMap<StringAttr, Operation *> modules;
   DenseSet<StringAttr> stubs;
   std::vector<Context> contexts;
@@ -229,6 +282,8 @@ private:
   /// The input node of each register bit Vivado can retime (kNone for a
   /// constant).
   DenseMap<unsigned, unsigned> regInputs;
+  /// The LUTs that read the register they feed.
+  DenseSet<unsigned> feedbacks;
   /// The bits each divider depends on, if there are at most kMaxTableBits.
   DenseMap<std::pair<unsigned, Operation *>,
            std::optional<SmallVector<unsigned>>>
@@ -281,8 +336,14 @@ Kind Timing::classify(Operation *op) {
       return Kind::Order;
     }
   }
-  if (isa<comb::MulOp>(op))
-    return Kind::Mul;
+  if (isa<comb::MulOp>(op)) {
+    // A product of few variable bits, as an index times a constant, is a
+    // table of constants in LUTs; synthesis narrows it before choosing DSPs.
+    unsigned bits = 0;
+    for (auto operand : op->getOperands())
+      bits += variableBits(operand);
+    return bits <= kMaxTableBits ? Kind::Table : Kind::Mul;
+  }
   if (isa<comb::DivUOp, comb::DivSOp, comb::ModUOp, comb::ModSOp>(op))
     return Kind::Div;
   if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(op))
@@ -365,8 +426,21 @@ unsigned Timing::resolve(unsigned ctx, Value value, unsigned bit) {
 }
 
 /// The inputs of a node that is not a start point, each with the levels from
-/// it to the node.
+/// it to the node. A product reaches the fabric through its DSP's output
+/// stage, unless the node is the enable or feedback logic of a register the
+/// DSP absorbs with it.
 void Timing::inputs(unsigned id, SmallVectorImpl<Edge> &edges) {
+  size_t first = edges.size();
+  operands(id, edges);
+  bool absorbed = feedbacks.contains(id);
+  for (auto &edge : llvm::drop_begin(edges, first))
+    if (nodes[edge.in].kind == Kind::Mul)
+      edge.levels = absorbed ? 0 : edge.levels + device.dspOut;
+}
+
+/// The inputs of a node as its operation sees them, before its DSP inputs'
+/// output stages.
+void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
   Node n = nodes[id];
   Operation *op = n.value.getDefiningOp();
   auto add = [&](Value operand, unsigned bit, int levels, bool load = true) {
@@ -414,11 +488,40 @@ void Timing::inputs(unsigned id, SmallVectorImpl<Edge> &edges) {
       edge.levels = levels;
     return;
   }
-  case Kind::Mul:
-    for (auto operand : op->getOperands())
-      for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit)
-        add(operand, bit, 1);
+  case Kind::Mul: {
+    // A product wider than one DSP's multiplier is a cascade of DSPs over
+    // the significant bits of the two widest operands, in the orientation
+    // that takes fewer. Constant bits above the others, and copies of the
+    // bit below (a sign extension), are not significant.
+    size_t first = edges.size();
+    unsigned a = 1, b = 1;
+    for (auto operand : op->getOperands()) {
+      unsigned bits = 0, below = kNone;
+      for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit) {
+        unsigned in = resolve(n.ctx, operand, bit);
+        if (in != kNone && in != below) {
+          edges.push_back({in, 0, true});
+          bits = bit + 1;
+        }
+        below = in;
+      }
+      if (bits > a) {
+        b = a;
+        a = bits;
+      } else if (bits > b) {
+        b = bits;
+      }
+    }
+    auto dsps = [](unsigned x, unsigned y, unsigned dx, unsigned dy) {
+      return llvm::divideCeil(x, dx) * llvm::divideCeil(y, dy);
+    };
+    unsigned count = std::min(dsps(a, b, device.dspA, device.dspB),
+                              dsps(a, b, device.dspB, device.dspA));
+    int levels = device.dspIn + (count - 1) * device.dspCascade;
+    for (auto &edge : llvm::drop_begin(edges, first))
+      edge.levels = levels;
     return;
+  }
   case Kind::Div: {
     // A divider whose operands depend on few bits, as a quotient of
     // functions of a format field, is a table over them after synthesis.
@@ -449,6 +552,16 @@ void Timing::inputs(unsigned id, SmallVectorImpl<Edge> &edges) {
       }
     int levels = constantDivisor ? tableLevels(bits)
                                  : bits * carryLevels(0, bits ? bits - 1 : 0);
+    for (auto &edge : llvm::drop_begin(edges, first))
+      edge.levels = levels;
+    return;
+  }
+  case Kind::Table: {
+    size_t first = edges.size();
+    for (auto operand : op->getOperands())
+      for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit)
+        add(operand, bit, 0);
+    int levels = tableLevels(edges.size() - first);
     for (auto &edge : llvm::drop_begin(edges, first))
       edge.levels = levels;
     return;
@@ -599,8 +712,21 @@ void Timing::addRegister(unsigned ctx, Operation *op, Value reg, Value next,
         retimable && retimeLevels ? node(ctx, reg, bit, Kind::Reg) : kNone;
     if (r != kNone)
       regInputs[r] = id;
-    if (id != kNone)
-      endPoints.push_back({id, ctx, op, "d", bit, r});
+    if (id == kNone)
+      continue;
+    endPoints.push_back({id, ctx, op, "d", bit, r, false, true});
+    // A LUT that reads the register it feeds is its clock-enable
+    // multiplexer or feedback, which a DSP absorbs with the register.
+    if (nodes[id].kind != Kind::Lut)
+      continue;
+    for (auto operand : nodes[id].value.getDefiningOp()->getOperands()) {
+      unsigned in = resolve(nodes[id].ctx, operand, 0);
+      if (in != kNone && nodes[in].value == reg && nodes[in].bit == bit &&
+          nodes[in].ctx == ctx) {
+        feedbacks.insert(id);
+        break;
+      }
+    }
   }
 }
 
@@ -666,11 +792,17 @@ LogicalResult Timing::run(hw::HWModuleOp top, unsigned retimeLevels) {
   collect(0);
   for (auto &end : endPoints)
     evaluate(end.node);
+  for (auto &end : endPoints) {
+    auto &n = nodes[end.node];
+    end.levels = n.levels;
+    if (n.kind == Kind::Mul && !end.registered)
+      end.levels += device.dspOut;
+  }
   if (retimeLevels)
     retime(retimeLevels);
   else
     for (auto &end : endPoints)
-      end.retimed = nodes[end.node].levels;
+      end.retimed = end.levels;
   return success();
 }
 
@@ -699,7 +831,7 @@ void Timing::retime(unsigned period) {
   }
 
   for (auto &end : endPoints) {
-    int a = nodes[end.node].levels;
+    int a = end.levels;
     end.retimed = a;
     if (a <= c)
       continue;
@@ -812,13 +944,12 @@ void Timing::writeEndPoints(raw_ostream &os, unsigned minLevels) {
   os << "levels,retimed,kind,start_kind,fanout,crossings,start_inst,start,"
         "end_inst,end\n";
   for (auto &end : endPoints) {
-    auto &n = nodes[end.node];
-    if ((unsigned)n.levels < minLevels)
+    if ((unsigned)end.levels < minLevels)
       continue;
     uint32_t fanout;
     unsigned crossings;
     unsigned start = startOf(end.ctx, end.node, fanout, crossings);
-    os << n.levels << ',' << end.retimed << ',' << end.port << ','
+    os << end.levels << ',' << end.retimed << ',' << end.port << ','
        << kindName(nodes[start].kind)
        << ',' << fanout << ',' << crossings << ',' << nodes[start].ctx << ',';
     printName(os, start);
@@ -839,7 +970,7 @@ void Timing::writeInstances(raw_ostream &os) {
 }
 
 void Timing::printPath(raw_ostream &os, const EndPoint &end, unsigned rank) {
-  os << "#" << rank << " levels " << nodes[end.node].levels << ": "
+  os << "#" << rank << " levels " << end.levels << ": "
      << path(end.ctx) << '/';
   printOp(os, end.op, end.port, end.bit);
   os << " (" << contexts[end.ctx].module.getModuleName() << ")\n";
@@ -860,7 +991,7 @@ void Timing::writeReport(raw_ostream &os, unsigned topPaths,
   for (auto &n : nodes)
     computed += n.state == 2;
   for (auto &end : endPoints)
-    ++histogram[nodes[end.node].levels];
+    ++histogram[end.levels];
   os << "instances " << contexts.size() << ", bits " << nodes.size()
      << " (evaluated " << computed << "), end points " << endPoints.size()
      << ", combinational loops " << loops << "\n";
@@ -896,7 +1027,7 @@ void Timing::writeReport(raw_ostream &os, unsigned topPaths,
   for (unsigned i = 0, e = order.size(); i < e; ++i)
     order[i] = i;
   std::stable_sort(order.begin(), order.end(), [&](unsigned a, unsigned b) {
-    return nodes[endPoints[a].node].levels > nodes[endPoints[b].node].levels;
+    return endPoints[a].levels > endPoints[b].levels;
   });
   for (unsigned i = 0, e = std::min<size_t>(topPaths, order.size()); i < e;
        ++i)
@@ -942,17 +1073,6 @@ struct FoldZeroWidthPass
     });
   }
 };
-
-/// The low bits of `value` that are not known zero: a zero-extension is a
-/// concatenation under a zero constant.
-unsigned significantBits(Value value) {
-  unsigned width = widthOf(value);
-  if (auto concat = value.getDefiningOp<comb::ConcatOp>())
-    if (auto top = concat.getInputs().front().getDefiningOp<hw::ConstantOp>())
-      if (top.getValue().isZero())
-        return width - widthOf(top);
-  return width;
-}
 
 struct LowerConstantDivisionPass
     : public foldsim::impl::LowerConstantDivisionBase<
@@ -1092,7 +1212,12 @@ void EstimateTimingPass::runOnOperation() {
     }
   }
 
-  Timing timing(design, blackBoxes);
+  const Device *device = lookupDevice(family);
+  if (!device) {
+    design.emitError("unknown FPGA family '") << family << "'";
+    return signalPassFailure();
+  }
+  Timing timing(design, blackBoxes, *device);
   if (failed(timing.run(top, retimeLevels)))
     return signalPassFailure();
 

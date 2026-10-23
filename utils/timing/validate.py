@@ -211,6 +211,12 @@ def main():
             v[2] += 1
 
     keys = sorted(viv)
+    if not keys:
+        print(f'ep rows {rows}: fold shell / channels {shell_rows}, '
+              f'unmatched {unmatched_rows}, matched 0')
+        for (cls, k), n in unmatched.most_common(args.top):
+            print(f'  {n:6d} {cls}: {k}')
+        return
     a = np.array([ours[k][0] for k in keys])
     lv = np.array([viv[k][0] for k in keys])
     sl = np.array([viv[k][1] for k in keys])

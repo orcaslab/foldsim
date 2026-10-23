@@ -17,6 +17,9 @@ column by default, or `retimed` (`--metric retimed`, or a last argument for
 candidates that Vivado's retiming is unlikely to absorb; plain `levels` stays
 the ranking.
 
+The screen counts levels for the V80 (`family=versal`), or for the U55C
+with `family=virtexuplusHBM`. The two differ only in their DSPs.
+
 ```bash
 utils/timing/screen.sh gen/design.mlir runs/full
 utils/timing/screen.sh runs/full/mapped.mlirbc runs/socket \
