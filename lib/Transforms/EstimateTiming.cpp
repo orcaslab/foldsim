@@ -32,7 +32,7 @@ namespace foldsim {
 #define GEN_PASS_DEF_ESTIMATETIMING
 #define GEN_PASS_DEF_FOLDZEROWIDTH
 #define GEN_PASS_DEF_LOWEREQUALITY
-#define GEN_PASS_DEF_LOWERPOWEROFTWODIVISION
+#define GEN_PASS_DEF_LOWERCONSTANTDIVISION
 #include "foldsim/Passes.h.inc"
 } // namespace foldsim
 
@@ -403,13 +403,30 @@ void Timing::inputs(unsigned id, SmallVectorImpl<Edge> &edges) {
         add(operand, bit, 1);
     return;
   case Kind::Div: {
-    // A combinational divider subtracts once per quotient bit, each a carry
-    // chain over the operand width.
-    unsigned width = widthOf(op->getResult(0));
-    int levels = width * carryLevels(0, width ? width - 1 : 0);
-    for (auto operand : op->getOperands())
-      for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit)
-        add(operand, bit, levels);
+    // Only the dividend's bits that are not constant count. Synthesis
+    // propagates a constant divisor, leaving a function of those bits: a
+    // LUT6 for six, and a level of 4:1 multiplexers per two more. A variable
+    // divisor is a ripple of one subtracter per quotient bit, each a carry
+    // chain over them.
+    size_t first = edges.size();
+    unsigned bits = 0;
+    bool constantDivisor = true;
+    for (auto [index, operand] : llvm::enumerate(op->getOperands()))
+      for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit) {
+        unsigned in = resolve(n.ctx, operand, bit);
+        if (in == kNone)
+          continue;
+        edges.push_back({in, 0, true});
+        if (index == 0)
+          bits = std::max(bits, bit + 1);
+        else
+          constantDivisor = false;
+      }
+    int levels = constantDivisor
+                     ? (bits <= 6 ? 1 : 1 + (bits - 5) / 2)
+                     : bits * carryLevels(0, bits ? bits - 1 : 0);
+    for (auto &edge : llvm::drop_begin(edges, first))
+      edge.levels = levels;
     return;
   }
   case Kind::AsyncRead: {
@@ -853,39 +870,81 @@ struct FoldZeroWidthPass
       OpBuilder b(op);
       for (auto result : op->getResults())
         result.replaceAllUsesWith(
-            hw::ConstantOp::create(b, op->getLoc(), APInt::getZero(0)).getResult());
+            hw::ConstantOp::create(b, op->getLoc(), APInt::getZero(0)));
       op->erase();
     });
   }
 };
 
-struct LowerPowerOfTwoDivisionPass
-    : public foldsim::impl::LowerPowerOfTwoDivisionBase<
-          LowerPowerOfTwoDivisionPass> {
+/// The dividend widths whose quotient and remainder by a constant are
+/// written out as a table.
+constexpr unsigned kMaxTableBits = 10;
+
+/// The low bits of `value` that are not known zero: a zero-extension is a
+/// concatenation under a zero constant.
+unsigned significantBits(Value value) {
+  unsigned width = widthOf(value);
+  if (auto concat = value.getDefiningOp<comb::ConcatOp>())
+    if (auto top = concat.getInputs().front().getDefiningOp<hw::ConstantOp>())
+      if (top.getValue().isZero())
+        return width - widthOf(top);
+  return width;
+}
+
+struct LowerConstantDivisionPass
+    : public foldsim::impl::LowerConstantDivisionBase<
+          LowerConstantDivisionPass> {
   void runOnOperation() override {
     getOperation().walk([](Operation *op) {
       if (!isa<comb::DivUOp, comb::ModUOp>(op))
         return;
       auto divisor = op->getOperand(1).getDefiningOp<hw::ConstantOp>();
-      if (!divisor || !divisor.getValue().isPowerOf2())
+      if (!divisor || divisor.getValue().isZero())
         return;
+      bool quotient = isa<comb::DivUOp>(op);
       unsigned width = widthOf(op->getResult(0));
-      unsigned k = divisor.getValue().logBase2();
+      const APInt &d = divisor.getValue();
       Value x = op->getOperand(0);
       OpBuilder b(op);
       auto loc = op->getLoc();
-      // The kept bits: above k for a quotient, below k for a remainder.
-      unsigned low = isa<comb::DivUOp>(op) ? k : 0;
-      unsigned kept = isa<comb::DivUOp>(op) ? width - k : k;
+      auto zeros = [&](unsigned n) {
+        return hw::ConstantOp::create(b, loc, APInt::getZero(n));
+      };
       Value result;
-      if (kept == 0) {
-        result = hw::ConstantOp::create(b, loc, APInt::getZero(width));
+      if (d.isPowerOf2()) {
+        // The kept bits: above k for a quotient, below k for a remainder.
+        unsigned k = d.logBase2();
+        unsigned low = quotient ? k : 0;
+        unsigned kept = quotient ? width - k : k;
+        if (kept == 0) {
+          result = zeros(width);
+        } else {
+          result = b.createOrFold<comb::ExtractOp>(loc, x, low, kept);
+          if (kept < width)
+            result =
+                b.createOrFold<comb::ConcatOp>(loc, zeros(width - kept), result);
+        }
       } else {
-        result = b.createOrFold<comb::ExtractOp>(loc, x, low, kept);
-        if (kept < width)
-          result = b.createOrFold<comb::ConcatOp>(
-              loc, hw::ConstantOp::create(b, loc, APInt::getZero(width - kept)),
-              result);
+        unsigned bits = significantBits(x);
+        if (bits > kMaxTableBits)
+          return;
+        // Entry i is the result for dividend i; each level of muxes halves
+        // the table on one dividend bit, the lowest first.
+        SmallVector<Value> table;
+        for (uint64_t i = 0, e = uint64_t(1) << bits; i < e; ++i) {
+          APInt n(width, i);
+          table.push_back(hw::ConstantOp::create(
+              b, loc, quotient ? n.udiv(d) : n.urem(d)));
+        }
+        for (unsigned bit = 0; bit < bits; ++bit) {
+          Value sel = b.createOrFold<comb::ExtractOp>(loc, x, bit, 1);
+          SmallVector<Value> half;
+          for (unsigned i = 0, e = table.size(); i < e; i += 2)
+            half.push_back(b.createOrFold<comb::MuxOp>(loc, sel, table[i + 1],
+                                                       table[i], true));
+          table = std::move(half);
+        }
+        result = table.front();
       }
       op->getResult(0).replaceAllUsesWith(result);
       op->erase();

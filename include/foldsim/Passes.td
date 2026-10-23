@@ -384,13 +384,20 @@ def FoldZeroWidth : Pass<"foldsim-fold-zero-width", "::circt::hw::HWModuleOp"> {
   let dependentDialects = ["circt::hw::HWDialect"];
 }
 
-def LowerPowerOfTwoDivision
-    : Pass<"foldsim-lower-pow2-division", "::circt::hw::HWModuleOp"> {
-  let summary = "Lower unsigned division by a power of two to bit selects";
+def LowerConstantDivision
+    : Pass<"foldsim-lower-constant-division", "::circt::hw::HWModuleOp"> {
+  let summary = "Lower unsigned division by a constant as synthesis does";
   let description = [{
-    Rewrites `comb.divu` and `comb.modu` by a constant power of two 2^k as
-    the bits above k, zero-extended, and the low k bits, zero-extended: the
-    wiring synthesis makes of them. Division by any other value stays.
+    Rewrites `comb.divu` and `comb.modu` by a constant the way synthesis
+    propagates it:
+
+    - by a power of two 2^k: the bits above k and the low k bits,
+      zero-extended;
+    - of a dividend with at most 10 significant bits (the rest zero, as a
+      zero-extended index): a table of the results, selected by the dividend
+      with a tree of `comb.mux`, which LUT mapping folds into logic.
+
+    Any other division stays.
   }];
   let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
 }

@@ -38,7 +38,7 @@ static const char *const timingMapPipeline =
     "hw-flatten-modules{hw-inline-all=false hw-inline-small "
     "hw-inline-with-state hw-small-threshold=300},"
     "hw.module(hw-bypass-inner-symbols,canonicalize,cse,comb-balance-mux,"
-    "foldsim-lower-equality,foldsim-lower-pow2-division,hw-aggregate-to-comb,"
+    "foldsim-lower-equality,foldsim-lower-constant-division,hw-aggregate-to-comb,"
     "cse,foldsim-fold-zero-width,"
     "convert-comb-to-synth{additional-legal-ops=comb.add,comb.sub,comb.icmp,"
     "comb.mul,comb.divu,comb.divs,comb.modu,comb.mods},"
