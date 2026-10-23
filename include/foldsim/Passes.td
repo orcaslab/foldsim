@@ -431,6 +431,16 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     `family` is `versal` (the V80) or `virtexuplusHBM` (the U55C), as
     hw/syn/xilinx/platforms names them; the two differ only in their DSPs.
 
+    `family=asap7` counts cell stages of an ASAP7 netlist mapped by
+    `foldsim-timing-map-asic` (3-input cuts) instead: a cell
+    (`comb.truth_table`, or an and-inverter gate) is a stage; an adder bit from bit j to
+    bit i is a prefix adder, 2 + ceil(log2(i - j + 1)); a compare,
+    1 + ceil(log2(span)); a product, its partial products, a Dadda tree of
+    full adders and a prefix adder; a memory of flops, a decoder and a
+    multiplexer tree. The report converts the deepest path to a period with
+    the library's cell, clock-to-output and setup delays and a per-path
+    overhead fitted on OpenSTA.
+
     End points are register inputs (data, reset, clock enable), the address,
     data, enable and mask of memory writes, the address and enable of
     registered memory reads, the inputs of external modules (vendor IPs) and

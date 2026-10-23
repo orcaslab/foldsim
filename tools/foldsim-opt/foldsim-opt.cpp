@@ -27,6 +27,22 @@
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "mlir/Transforms/Passes.h"
 
+// The netlist the timing screen counts: an and-inverter graph balanced for
+// depth, with adders, compares, multipliers and dividers kept word-level.
+#define TIMING_MAP_PREFIX \
+  "hw-flatten-modules{hw-inline-all=false hw-inline-small " \
+    "hw-inline-with-state hw-small-threshold=300}," \
+    "hw.module(hw-bypass-inner-symbols,canonicalize,cse,comb-balance-mux," \
+    "foldsim-lower-equality,foldsim-lower-constant-division,hw-aggregate-to-comb," \
+    "cse,foldsim-fold-zero-width," \
+    "convert-comb-to-synth{additional-legal-ops=comb.add,comb.sub,comb.icmp," \
+    "comb.mul,comb.divu,comb.divs,comb.modu,comb.mods}," \
+    "cse,canonicalize,synth-lower-word-to-bits,cse," \
+    "synth-lower-variadic{timing-aware},synth-structural-hash,canonicalize," \
+    "synth-maximum-and-cover,synth-lower-variadic{timing-aware}," \
+    "synth-structural-hash,synth-sop-balancing{strategy=timing}," \
+    "synth-structural-hash,"
+
 /// Maps a design to LUT6 for `foldsim-estimate-timing`, as Vivado maps a
 /// flattened design: modules of fewer than 300 ops (buffers, arbiters,
 /// switches) are inlined so LUTs pack across their boundaries; the mapping
@@ -35,19 +51,15 @@
 /// into LUTs with their neighbours; adders, order comparisons and multipliers
 /// stay word-level, as carry chains and DSPs.
 static const char *const timingMapPipeline =
-    "hw-flatten-modules{hw-inline-all=false hw-inline-small "
-    "hw-inline-with-state hw-small-threshold=300},"
-    "hw.module(hw-bypass-inner-symbols,canonicalize,cse,comb-balance-mux,"
-    "foldsim-lower-equality,foldsim-lower-constant-division,hw-aggregate-to-comb,"
-    "cse,foldsim-fold-zero-width,"
-    "convert-comb-to-synth{additional-legal-ops=comb.add,comb.sub,comb.icmp,"
-    "comb.mul,comb.divu,comb.divs,comb.modu,comb.mods},"
-    "cse,canonicalize,synth-lower-word-to-bits,cse,"
-    "synth-lower-variadic{timing-aware},synth-structural-hash,canonicalize,"
-    "synth-maximum-and-cover,synth-lower-variadic{timing-aware},"
-    "synth-structural-hash,synth-sop-balancing{strategy=timing},"
-    "synth-structural-hash,"
+    TIMING_MAP_PREFIX
     "synth-generic-lut-mapper{max-lut-size=6 strategy=timing},cse)";
+/// The same netlist mapped to 3-input cuts, for an ASIC library: a cut is one
+/// cell (NAND, AOI, MAJ, XOR). Against OpenSTA on five ASAP7 DUTs, 3-input
+/// cuts convert at the library's own cell delay; raw and-inverter gates and
+/// 4-input cuts do not.
+static const char *const timingMapAsicPipeline =
+    TIMING_MAP_PREFIX
+    "synth-generic-lut-mapper{max-lut-size=3 strategy=timing},cse)";
 
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
@@ -71,6 +83,14 @@ int main(int argc, char **argv) {
       [](mlir::OpPassManager &pm) {
         if (failed(mlir::parsePassPipeline(timingMapPipeline, pm)))
           llvm::report_fatal_error("invalid foldsim-timing-map pipeline");
+      });
+  mlir::PassPipelineRegistration<>(
+      "foldsim-timing-map-asic",
+      "Map a design to 3-input cells for foldsim-estimate-timing on an ASIC "
+      "library",
+      [](mlir::OpPassManager &pm) {
+        if (failed(mlir::parsePassPipeline(timingMapAsicPipeline, pm)))
+          llvm::report_fatal_error("invalid foldsim-timing-map-asic pipeline");
       });
   llvm::cl::AddExtraVersionPrinter([](llvm::raw_ostream &os) {
     os << circt::getCirctVersion() << '\n';

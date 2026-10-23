@@ -17,6 +17,7 @@
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "circt/Dialect/Synth/SynthOps.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/FileUtilities.h"
@@ -46,6 +47,7 @@ namespace {
 /// point of a path.
 enum class Kind : uint8_t {
   Lut,
+  Gate,
   Arith,
   Order,
   Equal,
@@ -74,6 +76,8 @@ StringRef kindName(Kind kind) {
   switch (kind) {
   case Kind::Lut:
     return "lut";
+  case Kind::Gate:
+    return "gate";
   case Kind::Arith:
     return "carry";
   case Kind::Order:
@@ -172,15 +176,22 @@ unsigned lut6Depth(unsigned n) {
 /// (CARRY8 or LOOKAHEAD8) between the input's block and the output's.
 int carryLevels(unsigned in, unsigned out) { return 2 + out / 8 - in / 8; }
 
-/// The DSPs of a device's family, as Vivado counts their levels. The two
-/// families differ only there: both have LUT6s, 8-bit carry blocks and
-/// 64-word distributed RAMs.
+/// A device's family. On an FPGA, levels are as Vivado counts them, and the
+/// two families differ only in their DSPs: both have LUT6s, 8-bit carry
+/// blocks and 64-word distributed RAMs. On an ASIC library, levels are gate
+/// stages of the and-inverter graph.
 struct Device {
   /// The operand widths of a DSP's multiplier.
   unsigned dspA, dspB;
   /// Levels from the fabric to a product the DSP registers, from there out
   /// to the fabric, and through each further DSP of a cascade.
   int dspIn, dspOut, dspCascade;
+  /// An ASIC library, and its delays in ps: a stage, a flip-flop's clock to
+  /// output and setup (hw/syn/yosys/liberty_stage.py), and what a path adds
+  /// beyond its stages, fitted on OpenSTA (buffering, the inverter after a
+  /// flip-flop's QN, slew).
+  bool asic = false;
+  int stagePs = 0, clk2qPs = 0, setupPs = 0, pathPs = 0;
 };
 
 /// The V80 (Versal, DSP58): from a registered product, Vivado counts M_DATA,
@@ -189,13 +200,19 @@ struct Device {
 /// (Virtex UltraScale+ HBM, DSP48E2) has one ALU cell and an 18-bit B port.
 const Device kVersal = {27, 24, 1, 6, 3};
 const Device kVirtexUltraScalePlusHBM = {27, 18, 1, 5, 2};
+/// ASAP7 7.5-track RVT at the TT corner, as hw/syn/yosys builds with it: a
+/// cell at fanout 3 and its own slew, a DFFHQNx1's clock to output and setup,
+/// and 167 ps per path, the median over five asic_gate DUTs. Products are
+/// multipliers of cells, not DSPs.
+const Device kAsap7 = {0, 0, 0, 0, 0, true, 24, 58, 6, 167};
 
-/// The device of a family, by the names of hw/syn/xilinx/platforms: the V80's
-/// and the U55C's.
+/// The device of a family, by the names of hw/syn/xilinx/platforms (the V80's
+/// and the U55C's) and of hw/syn/yosys's PDK (asap7).
 const Device *lookupDevice(StringRef family) {
   return llvm::StringSwitch<const Device *>(family)
       .Case("versal", &kVersal)
       .Case("virtexuplusHBM", &kVirtexUltraScalePlusHBM)
+      .Case("asap7", &kAsap7)
       .Default(nullptr);
 }
 
@@ -251,6 +268,9 @@ private:
   unsigned node(unsigned ctx, Value value, unsigned bit, Kind kind);
   unsigned resolve(unsigned ctx, Value value, unsigned bit);
   Kind classify(Operation *op);
+  int arith(unsigned in, unsigned out) const;
+  int table(unsigned bits) const;
+  int multiplier(unsigned a, unsigned b) const;
   void operands(unsigned id, SmallVectorImpl<Edge> &edges);
   void inputs(unsigned id, SmallVectorImpl<Edge> &edges);
   ArrayRef<unsigned> support(unsigned ctx, Operation *op, bool &small);
@@ -321,6 +341,8 @@ unsigned Timing::node(unsigned ctx, Value value, unsigned bit, Kind kind) {
 Kind Timing::classify(Operation *op) {
   if (isa<comb::TruthTableOp>(op))
     return Kind::Lut;
+  if (isa<synth::aig::AndInverterOp>(op))
+    return Kind::Gate;
   if (isa<comb::AddOp, comb::SubOp>(op))
     return Kind::Arith;
   if (auto cmp = dyn_cast<comb::ICmpOp>(op)) {
@@ -435,6 +457,31 @@ static void fitLut(SmallVectorImpl<Edge> &edges, size_t first) {
     edge.levels = 1;
 }
 
+/// Levels from an input bit of an adder to an output bit: on an FPGA a LUT
+/// and the carry blocks; on an ASIC a prefix adder, a propagate-generate
+/// gate, a prefix tree over the bits between them and the sum gate.
+int Timing::arith(unsigned in, unsigned out) const {
+  if (device.asic)
+    return 2 + (int)llvm::Log2_32_Ceil(out - in + 1);
+  return carryLevels(in, out);
+}
+
+/// Levels of a table over `bits` inputs: LUTs on an FPGA, a tree of 2:1
+/// multiplexers on an ASIC.
+int Timing::table(unsigned bits) const {
+  return device.asic ? std::max(1u, bits) : tableLevels(bits);
+}
+
+/// Levels of an ASIC multiplier of `a` x `b` bits: the partial products, a
+/// Dadda tree of full adders (two gates each) over the narrower operand's
+/// rows, and a prefix adder over the product.
+int Timing::multiplier(unsigned a, unsigned b) const {
+  unsigned rows = std::min(a, b), stages = 0;
+  for (unsigned height = 2; height < rows; height = height * 3 / 2)
+    ++stages;
+  return 1 + 2 * stages + arith(0, a + b - 1);
+}
+
 /// The inputs of a node that is not a start point, each with the levels from
 /// it to the node. A product reaches the fabric through its DSP's output
 /// stage, unless the node is the enable or feedback logic of a register the
@@ -463,12 +510,17 @@ void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
     for (auto operand : op->getOperands())
       add(operand, 0, 1);
     return;
+  case Kind::Gate:
+    for (auto operand : op->getOperands())
+      add(operand, n.bit, 1);
+    return;
   case Kind::Arith: {
     size_t first = edges.size();
     for (auto operand : op->getOperands())
       for (unsigned bit = 0; bit <= n.bit; ++bit)
-        add(operand, bit, carryLevels(bit, n.bit), bit == n.bit);
-    fitLut(edges, first);
+        add(operand, bit, arith(bit, n.bit), bit == n.bit);
+    if (!device.asic)
+      fitLut(edges, first);
     return;
   }
   case Kind::Order: {
@@ -487,8 +539,9 @@ void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
       }
     size_t first = edges.size();
     for (auto [in, bit] : bits)
-      edges.push_back({in, carryLevels(bit, top), true});
-    fitLut(edges, first);
+      edges.push_back({in, arith(bit, top) - device.asic, true});
+    if (!device.asic)
+      fitLut(edges, first);
     return;
   }
   case Kind::Equal: {
@@ -530,9 +583,14 @@ void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
     auto dsps = [](unsigned x, unsigned y, unsigned dx, unsigned dy) {
       return llvm::divideCeil(x, dx) * llvm::divideCeil(y, dy);
     };
-    unsigned count = std::min(dsps(a, b, device.dspA, device.dspB),
-                              dsps(a, b, device.dspB, device.dspA));
-    int levels = device.dspIn + (count - 1) * device.dspCascade;
+    int levels;
+    if (device.asic) {
+      levels = multiplier(a, b);
+    } else {
+      unsigned count = std::min(dsps(a, b, device.dspA, device.dspB),
+                                dsps(a, b, device.dspB, device.dspA));
+      levels = device.dspIn + (count - 1) * device.dspCascade;
+    }
     for (auto &edge : llvm::drop_begin(edges, first))
       edge.levels = levels;
     return;
@@ -541,10 +599,10 @@ void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
     // A divider whose operands depend on few bits, as a quotient of
     // functions of a format field, is a table over them after synthesis.
     bool small;
-    ArrayRef<unsigned> table = support(n.ctx, op, small);
+    ArrayRef<unsigned> bitsIn = support(n.ctx, op, small);
     if (small) {
-      for (unsigned in : table)
-        edges.push_back({in, tableLevels(table.size()), true});
+      for (unsigned in : bitsIn)
+        edges.push_back({in, table(bitsIn.size()), true});
       return;
     }
     // Otherwise only the dividend's bits that are not constant count.
@@ -565,8 +623,8 @@ void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
         else
           constantDivisor = false;
       }
-    int levels = constantDivisor ? tableLevels(bits)
-                                 : bits * carryLevels(0, bits ? bits - 1 : 0);
+    int levels = constantDivisor ? table(bits)
+                                 : bits * arith(0, bits ? bits - 1 : 0);
     for (auto &edge : llvm::drop_begin(edges, first))
       edge.levels = levels;
     return;
@@ -576,7 +634,7 @@ void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
     for (auto operand : op->getOperands())
       for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit)
         add(operand, bit, 0);
-    int levels = tableLevels(edges.size() - first);
+    int levels = table(edges.size() - first);
     for (auto &edge : llvm::drop_begin(edges, first))
       edge.levels = levels;
     return;
@@ -586,7 +644,9 @@ void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
     // per doubling.
     auto read = cast<seq::FirMemReadOp>(op);
     uint64_t depth = read.getMemory().getType().getDepth();
-    int levels = 1 + std::max(0, (int)llvm::Log2_64_Ceil(depth) - 6);
+    int levels = device.asic
+                     ? 1 + (int)llvm::Log2_64_Ceil(depth)
+                     : 1 + std::max(0, (int)llvm::Log2_64_Ceil(depth) - 6);
     for (unsigned bit = 0, e = widthOf(read.getAddress()); bit < e; ++bit)
       add(read.getAddress(), bit, levels);
     if (auto enable = read.getEnable())
@@ -1027,6 +1087,15 @@ void Timing::writeReport(raw_ostream &os, unsigned topPaths,
   for (auto [levels, count] : histogram)
     os << ' ' << levels << ':' << count;
   os << '\n';
+  if (device.asic && !histogram.empty()) {
+    int stages = histogram.rbegin()->first;
+    int period = device.clk2qPs + device.pathPs + stages * device.stagePs +
+                 device.setupPs;
+    os << "deepest path " << stages << " stages: " << device.clk2qPs << " + "
+       << device.pathPs << " + " << stages << " x " << device.stagePs << " + "
+       << device.setupPs << " = " << period << " ps ("
+       << llvm::format("%.0f", 1e6 / period) << " MHz)\n";
+  }
   if (retimeLevels) {
     std::map<int, uint64_t> retimed;
     for (auto &end : endPoints)
