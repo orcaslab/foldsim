@@ -13,6 +13,9 @@
 // CHECK: 5,5,x,reg,{{[0-9]+}},0,0,a[0],0,ip.x[0]
 // An 8-bit divider: eight subtracters of a LUT and one CARRY8 each.
 // CHECK: 16,16,d,reg,{{[0-9]+}},0,0,{{[ab]}}[{{[0-9]+}}],0,q8.d[0]
+// A 3-bit sum of two 2-bit counts: each bit reads at most six input bits,
+// so it is one LUT, not a LUT and a CARRY8.
+// CHECK: 1,1,d,reg,{{[0-9]+}},0,0,{{[ab]}}[{{[0-9]+}}],0,n3.d[2]
 // A 32-bit divider whose operands are functions of a 3-bit field is a table
 // over the field: one LUT, not a ripple of 32 subtracters.
 // CHECK: 1,1,d,reg,{{[0-9]+}},0,0,f[{{[0-2]}}],0,qf.d[0]
@@ -40,6 +43,13 @@ hw.module @Top(in %clk : !seq.clock, in %d : i16) {
   %b8 = comb.extract %b from 0 : (i16) -> i8
   %div = comb.divu %a8, %b8 : i8
   %q8 = seq.firreg %div clock %clk : i8
+  %a2 = comb.extract %a from 0 : (i16) -> i2
+  %b2 = comb.extract %b from 0 : (i16) -> i2
+  %z1 = hw.constant 0 : i1
+  %a3 = comb.concat %z1, %a2 : i1, i2
+  %b3 = comb.concat %z1, %b2 : i1, i2
+  %s3 = comb.add %a3, %b3 : i3
+  %n3 = seq.firreg %s3 clock %clk : i3
   %f = seq.firreg %a8 clock %clk : i8
   %f3 = comb.extract %f from 0 : (i8) -> i3
   %c0_i29 = hw.constant 0 : i29

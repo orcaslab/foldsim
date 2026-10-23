@@ -425,6 +425,16 @@ unsigned Timing::resolve(unsigned ctx, Value value, unsigned bit) {
   }
 }
 
+/// An adder or comparator bit of at most six input bits is one LUT6, not a
+/// carry chain: the bits of a popcount's narrow adders, or a compare of two
+/// 3-bit counts.
+static void fitLut(SmallVectorImpl<Edge> &edges, size_t first) {
+  if (edges.size() - first > 6)
+    return;
+  for (auto &edge : llvm::drop_begin(edges, first))
+    edge.levels = 1;
+}
+
 /// The inputs of a node that is not a start point, each with the levels from
 /// it to the node. A product reaches the fabric through its DSP's output
 /// stage, unless the node is the enable or feedback logic of a register the
@@ -453,11 +463,14 @@ void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
     for (auto operand : op->getOperands())
       add(operand, 0, 1);
     return;
-  case Kind::Arith:
+  case Kind::Arith: {
+    size_t first = edges.size();
     for (auto operand : op->getOperands())
       for (unsigned bit = 0; bit <= n.bit; ++bit)
         add(operand, bit, carryLevels(bit, n.bit), bit == n.bit);
+    fitLut(edges, first);
     return;
+  }
   case Kind::Order: {
     // The chain ends at the highest bit that is not constant in both
     // operands: constant bits above it fold away (a compare of a
@@ -472,8 +485,10 @@ void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
         bits.push_back({in, bit});
         top = std::max(top, bit);
       }
+    size_t first = edges.size();
     for (auto [in, bit] : bits)
       edges.push_back({in, carryLevels(bit, top), true});
+    fitLut(edges, first);
     return;
   }
   case Kind::Equal: {
