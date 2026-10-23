@@ -13,6 +13,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "foldsim/Passes.h"
+#include "foldsim/Version.inc"
 #include "circt/Conversion/Passes.h"
 #include "circt/Dialect/Comb/CombPasses.h"
 #include "circt/Dialect/HW/HWPasses.h"
@@ -70,8 +71,10 @@ int main(int argc, char **argv) {
         if (failed(mlir::parsePassPipeline(timingMapPipeline, pm)))
           llvm::report_fatal_error("invalid foldsim-timing-map pipeline");
       });
-  llvm::cl::AddExtraVersionPrinter(
-      [](llvm::raw_ostream &os) { os << circt::getCirctVersion() << '\n'; });
+  llvm::cl::AddExtraVersionPrinter([](llvm::raw_ostream &os) {
+    os << circt::getCirctVersion() << '\n';
+    os << "foldsim " << FOLDSIM_REVISION << '\n';
+  });
 
   return mlir::failed(
       mlir::MlirOptMain(argc, argv, "foldsim modular optimizer", registry));
