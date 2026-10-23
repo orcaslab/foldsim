@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Compare a timing screen with Vivado's routed end points.
 
-usage: validate.py <screen dir> <ep.csv> [--classes folded|native=<prefix>]
+usage: validate.py <screen dir> <ep.csv> [--native MODULE=PREFIX[:SUBPATH]]
+                   [--metric levels|retimed] [--json FILE]
 
 Matches per RTL register or memory: the instance path inside its fold class
 (or below the gate's harness prefix) and the register name, with Vivado's
@@ -83,6 +84,12 @@ def spearman(a, b):
     return float(np.corrcoef(ra, rb)[0, 1])
 
 
+def endpoints(screen):
+    """The rows of a screen's end point table, as dicts."""
+    with open(f'{screen}/endpoints.csv') as f:
+        yield from csv.DictReader(f)
+
+
 def load_instances(path):
     inst = {}
     with open(path) as f:
@@ -125,6 +132,8 @@ def main():
                     'SUBPATH, only the screened end points below it, which '
                     'the harness instantiates as PREFIX')
     ap.add_argument('--json', help='also write the agreement to this file')
+    ap.add_argument('--metric', default='levels', choices=['levels', 'retimed'],
+                    help="the screen's column to compare")
     args = ap.parse_args()
 
     inst = load_instances(f'{args.screen}/instances.csv')
@@ -141,26 +150,24 @@ def main():
     # that place a register in the generate scope that assigns it rather
     # than the one that declares it.
     by_dir = collections.defaultdict(dict)
-    with open(f'{args.screen}/endpoints.csv') as f:
-        r = csv.reader(f)
-        next(r)
-        for levels, kind, skind, fo, cross, sctx, start, ectx, end in r:
-            cls, p = paths[int(ectx)]
-            if cls is None:
+    for row in endpoints(args.screen):
+        cls, p = paths[int(row['end_inst'])]
+        if cls is None:
+            continue
+        # Registers of inlined modules are named <instance path>/<name>.
+        base = row['end'].rsplit('.', 1)[0]
+        full = f'{p}/{base}' if p else base
+        if sub:
+            if not full.startswith(sub + '/'):
                 continue
-            # Registers of inlined modules are named <instance path>/<name>.
-            full = f'{p}/{end.rsplit(".", 1)[0]}' if p else end.rsplit('.', 1)[0]
-            if sub:
-                if not full.startswith(sub + '/'):
-                    continue
-                full = full[len(sub) + 1:]
-            key = (cls, norm(full))
-            v = ours[key]
-            if not v[1]:
-                d, _, base = full.rpartition('/')
-                by_dir[(cls, norm(d))][norm(base.rsplit('.', 1)[-1])] = key
-            v[0] = max(v[0], int(levels))
-            v[1] += 1
+            full = full[len(sub) + 1:]
+        key = (cls, norm(full))
+        v = ours[key]
+        if not v[1]:
+            d, _, base = full.rpartition('/')
+            by_dir[(cls, norm(d))][norm(base.rsplit('.', 1)[-1])] = key
+        v[0] = max(v[0], int(row[args.metric]))
+        v[1] += 1
 
     def fallback(key):
         cls, k = key

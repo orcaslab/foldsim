@@ -2,9 +2,9 @@
 
 // An equality compare of two bits and the AND after it pack into one LUT6,
 // across the boundary of the inlined `Eq`.
-// CHECK: 1,d,reg,{{[0-9]+}},0,0,{{[ab]\[[01]\]}},0,e.d[0]
+// CHECK: 1,1,d,reg,{{[0-9]+}},0,0,{{[ab]\[[01]\]}},0,e.d[0]
 // A 16-bit adder stays a carry chain: bit 15 is a LUT and two CARRY8s away.
-// CHECK: 3,d,reg,{{[0-9]+}},0,0,a[0],0,s.d[15]
+// CHECK: 3,3,d,reg,{{[0-9]+}},0,0,a[0],0,s.d[15]
 hw.module private @Eq(in %x : i2, in %y : i2, out o : i1) {
   %eq = comb.icmp eq %x, %y : i2
   hw.output %eq : i1

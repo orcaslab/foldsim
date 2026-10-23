@@ -399,10 +399,19 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     Paths are computed per bit over the elaborated instances, keeping only
     the worst input of each bit, so time and memory grow linearly with the
     design. Writes one row per end point bit of at least `min-levels` levels
-    to `output` (levels, end kind, maximum fanout and module crossings on the
-    path, then start and end as an instance id and a name), the instances to
-    `instances` (id, parent, instance name, module), and the `top-paths`
-    deepest paths, op by op, to `report`. Leaves the design as it is.
+    to `output` (levels, retimed levels, end kind, maximum fanout and module
+    crossings on the path, then start and end as an instance id and a name),
+    the instances to `instances` (id, parent, instance name, module), and
+    the `top-paths` deepest paths, op by op, to `report`. Leaves the design
+    as it is.
+
+    With `retime-levels`, the `retimed` column estimates the depth after
+    Vivado's global retiming to a period of that many levels: an end point
+    deeper than the period borrows the room of its neighbour stages, its
+    register moving backward and its start register forward, neither
+    through a distributed RAM or a DSP. Top ports and the pins of
+    `black-boxes` count as registers with empty neighbour stages, as a gate
+    harness registers them. Without it, `retimed` is the depth.
   }];
   let options = [
     Option<"topName", "top", "std::string", "",
@@ -422,6 +431,9 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
                "instance path and name contain one of these">,
     ListOption<"blackBoxes", "black-boxes", "std::string",
                "Modules to treat as external, as a harness stubs them">,
+    Option<"retimeLevels", "retime-levels", "unsigned", "0",
+           "Also estimate each end point's depth after Vivado's retiming "
+           "to a period of this many levels (0: off)">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

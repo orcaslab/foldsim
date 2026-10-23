@@ -1,16 +1,16 @@
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-estimate-timing{output=- report= top=Top})' -o /dev/null | FileCheck %s
 
-// CHECK: levels,kind,start_kind,fanout,crossings,start_inst,start,end_inst,end
+// CHECK: levels,retimed,kind,start_kind,fanout,crossings,start_inst,start,end_inst,end
 // The adder's bit 15: a LUT and the CARRY8s of blocks 0 and 1 from bit 0.
-// CHECK: 3,d,reg,{{[0-9]+}},0,0,a[0],0,s.d[15]
+// CHECK: 3,3,d,reg,{{[0-9]+}},0,0,a[0],0,s.d[15]
 // The comparator after it: the carry from its input bit to bit 15.
-// CHECK: 5,d,reg,{{[0-9]+}},0,0,a[0],0,c.d[0]
+// CHECK: 5,5,d,reg,{{[0-9]+}},0,0,a[0],0,c.d[0]
 // A LUT in an instance of `Leaf`, two boundaries away from `a`.
-// CHECK: 6,d,reg,{{[0-9]+}},2,0,a[0],0,q.d[0]
+// CHECK: 6,6,d,reg,{{[0-9]+}},2,0,a[0],0,q.d[0]
 // A 128-deep distributed-RAM read: the RAM64 and a MUXF7.
-// CHECK: 2,d,reg,{{[0-9]+}},0,0,a[0],0,z.d[0]
+// CHECK: 2,2,d,reg,{{[0-9]+}},0,0,a[0],0,z.d[0]
 // An external module's input ends a path.
-// CHECK: 5,x,reg,{{[0-9]+}},0,0,a[0],0,ip.x[0]
+// CHECK: 5,5,x,reg,{{[0-9]+}},0,0,a[0],0,ip.x[0]
 hw.module.extern private @Ip(in %clk : !seq.clock, in %x : i1)
 hw.module private @Leaf(in %a : i1, in %b : i1, out o : i1) {
   %o = comb.truth_table %a, %b -> [false, true, true, false]

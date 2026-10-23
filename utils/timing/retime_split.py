@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Screen vs Vivado levels, split by whether Vivado retimed the paths.
 
-usage: retime_split.py <screen dir> <ep.csv> MODULE=PREFIX
+usage: retime_split.py <screen dir> <ep.csv> MODULE=PREFIX [levels|retimed]
 
 A register's Vivado paths count as retimed when the start or end cell of
 any of its failing paths is a retiming register (_fret/_bret).
@@ -20,18 +20,16 @@ RETIMED = re.compile(r'_[fb]ret')
 
 def main():
     screen, ep, native = sys.argv[1:4]
+    metric = sys.argv[4] if len(sys.argv) > 4 else 'levels'
     module, prefix = native.split('=')
     inst = validate.load_instances(f'{screen}/instances.csv')
     paths = validate.class_paths(inst, {module: prefix})
     ours = collections.defaultdict(int)
-    with open(f'{screen}/endpoints.csv') as f:
-        r = csv.reader(f)
-        next(r)
-        for levels, kind, skind, fo, cross, sctx, start, ectx, end in r:
-            cls, p = paths[int(ectx)]
-            base = end.rsplit('.', 1)[0]
-            key = (cls, validate.norm(f'{p}/{base}' if p else base))
-            ours[key] = max(ours[key], int(levels))
+    for row in validate.endpoints(screen):
+        cls, p = paths[int(row['end_inst'])]
+        base = row['end'].rsplit('.', 1)[0]
+        key = (cls, validate.norm(f'{p}/{base}' if p else base))
+        ours[key] = max(ours[key], int(row[metric]))
     viv = collections.defaultdict(lambda: [0, False])
     with open(ep) as f:
         r = csv.reader(f)

@@ -52,11 +52,17 @@ enum class Kind : uint8_t {
   Reg,
   SyncRead,
   Extern,
+  Stub,
   Port,
   Clock,
 };
 
 bool isStart(Kind kind) { return kind >= Kind::Reg; }
+
+/// Vivado does not retime registers through distributed RAMs and DSPs.
+bool isPinned(Kind kind) {
+  return kind == Kind::AsyncRead || kind == Kind::Mul;
+}
 
 StringRef kindName(Kind kind) {
   switch (kind) {
@@ -80,6 +86,8 @@ StringRef kindName(Kind kind) {
     return "bram";
   case Kind::Extern:
     return "ip";
+  case Kind::Stub:
+    return "stub";
   case Kind::Port:
     return "port";
   case Kind::Clock:
@@ -108,13 +116,18 @@ struct Context {
   unsigned depth;
 };
 
-/// An end point bit.
+/// An end point bit; `reg` is the register it is the input of, if Vivado can
+/// retime that register. A `boundary` end point is a top output or an input
+/// of a stub, which the harness registers.
 struct EndPoint {
   unsigned node;
   unsigned ctx;
   Operation *op;
   StringRef port;
   uint32_t bit;
+  unsigned reg;
+  bool boundary = false;
+  int16_t retimed = 0;
 };
 
 /// An input of a node: the levels from it to the node, and whether the node
@@ -150,12 +163,15 @@ class Timing {
 public:
   /// Instances of `blackBoxes` are external modules, as a harness's stubs.
   Timing(ModuleOp top, ArrayRef<std::string> blackBoxes) {
-    for (auto module : top.getOps<hw::HWModuleLike>())
-      if (!llvm::is_contained(blackBoxes, module.getModuleName()))
+    for (auto module : top.getOps<hw::HWModuleLike>()) {
+      if (llvm::is_contained(blackBoxes, module.getModuleName()))
+        stubs.insert(module.getModuleNameAttr());
+      else
         modules[module.getModuleNameAttr()] = module;
+    }
   }
 
-  LogicalResult run(hw::HWModuleOp top);
+  LogicalResult run(hw::HWModuleOp top, unsigned retimeLevels);
   void writeEndPoints(raw_ostream &os, unsigned minLevels);
   void writeInstances(raw_ostream &os);
   void writeReport(raw_ostream &os, unsigned topPaths,
@@ -169,7 +185,11 @@ private:
   void inputs(unsigned id, SmallVectorImpl<Edge> &edges);
   void evaluate(unsigned root);
   void collect(unsigned ctx);
-  void addEndPoints(unsigned ctx, Operation *op, StringRef port, Value value);
+  void addEndPoints(unsigned ctx, Operation *op, StringRef port, Value value,
+                    bool boundary = false);
+  void addRegister(unsigned ctx, Operation *op, Value reg, Value next,
+                   bool retimable);
+  void retime(unsigned levels);
   unsigned startOf(unsigned ctx, unsigned id, uint32_t &fanout,
                    unsigned &crossings);
   void printName(raw_ostream &os, unsigned id);
@@ -178,12 +198,19 @@ private:
   const std::string &path(unsigned ctx);
 
   DenseMap<StringAttr, Operation *> modules;
+  DenseSet<StringAttr> stubs;
   std::vector<Context> contexts;
   DenseMap<std::pair<unsigned, Operation *>, unsigned> children;
   std::vector<std::string> paths;
   std::vector<Node> nodes;
   DenseMap<std::tuple<unsigned, void *, unsigned>, unsigned> ids;
   std::vector<EndPoint> endPoints;
+  /// Evaluated nodes, each after its inputs.
+  std::vector<unsigned> order;
+  /// The input node of each register bit Vivado can retime (kNone for a
+  /// constant).
+  DenseMap<unsigned, unsigned> regInputs;
+  unsigned retimeLevels = 0;
   llvm::StringMap<uint64_t> otherOps;
   uint64_t loops = 0;
   SmallVector<std::pair<unsigned, unsigned>> loopSamples;
@@ -296,7 +323,10 @@ unsigned Timing::resolve(unsigned ctx, Value value, unsigned bit) {
       auto module = dyn_cast_or_null<hw::HWModuleOp>(
           modules.lookup(inst.getModuleNameAttr().getAttr()));
       if (!module)
-        return node(ctx, value, bit, Kind::Extern);
+        return node(ctx, value, bit,
+                    stubs.contains(inst.getModuleNameAttr().getAttr())
+                        ? Kind::Stub
+                        : Kind::Extern);
       ctx = child(ctx, inst, module);
       value = module.getBodyBlock()->getTerminator()->getOperand(
           cast<OpResult>(value).getResultNumber());
@@ -402,6 +432,8 @@ void Timing::evaluate(unsigned root) {
     }
     if (isStart(nodes[id].kind)) {
       nodes[id].state = 2;
+      if (retimeLevels)
+        order.push_back(id);
       stack.pop_back();
       continue;
     }
@@ -438,18 +470,35 @@ void Timing::evaluate(unsigned root) {
     nodes[id].levels = best;
     nodes[id].pred = pred;
     nodes[id].state = 2;
+    if (retimeLevels)
+      order.push_back(id);
     stack.pop_back();
   }
 }
 
 void Timing::addEndPoints(unsigned ctx, Operation *op, StringRef port,
-                          Value value) {
+                          Value value, bool boundary) {
   if (!value)
     return;
   for (unsigned bit = 0, e = widthOf(value); bit < e; ++bit) {
     unsigned id = resolve(ctx, value, bit);
     if (id != kNone)
-      endPoints.push_back({id, ctx, op, port, bit});
+      endPoints.push_back({id, ctx, op, port, bit, kNone, boundary});
+  }
+}
+
+/// Adds the end points of the input `next` of register `reg`, and records
+/// each bit's input node if the register can be retimed.
+void Timing::addRegister(unsigned ctx, Operation *op, Value reg, Value next,
+                         bool retimable) {
+  for (unsigned bit = 0, e = widthOf(next); bit < e; ++bit) {
+    unsigned id = resolve(ctx, next, bit);
+    unsigned r =
+        retimable && retimeLevels ? node(ctx, reg, bit, Kind::Reg) : kNone;
+    if (r != kNone)
+      regInputs[r] = id;
+    if (id != kNone)
+      endPoints.push_back({id, ctx, op, "d", bit, r});
   }
 }
 
@@ -457,16 +506,18 @@ void Timing::addEndPoints(unsigned ctx, Operation *op, StringRef port,
 void Timing::collect(unsigned ctx) {
   auto module = contexts[ctx].module;
   for (auto &op : *module.getBodyBlock()) {
+    // Vivado retimes registers with a synchronous reset, not an
+    // asynchronous one.
     if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
-      addEndPoints(ctx, reg, "d", reg.getNext());
+      addRegister(ctx, reg, reg, reg.getNext(), !reg.getIsAsync());
       if (auto reset = reg.getReset())
         addEndPoints(ctx, reg, "rst", reset);
     } else if (auto reg = dyn_cast<seq::CompRegOp>(op)) {
-      addEndPoints(ctx, reg, "d", reg.getInput());
+      addRegister(ctx, reg, reg, reg.getInput(), true);
       if (auto reset = reg.getReset())
         addEndPoints(ctx, reg, "rst", reset);
     } else if (auto reg = dyn_cast<seq::CompRegClockEnabledOp>(op)) {
-      addEndPoints(ctx, reg, "d", reg.getInput());
+      addRegister(ctx, reg, reg, reg.getInput(), true);
       addEndPoints(ctx, reg, "ce", reg.getClockEnable());
       if (auto reset = reg.getReset())
         addEndPoints(ctx, reg, "rst", reset);
@@ -492,24 +543,94 @@ void Timing::collect(unsigned ctx) {
         collect(child(ctx, inst, module));
         continue;
       }
+      bool stub = stubs.contains(inst.getModuleNameAttr().getAttr());
       for (auto [operand, name] :
            llvm::zip(inst.getOperands(), inst.getArgNames()))
         if (!isa<seq::ClockType>(operand.getType()))
-          addEndPoints(ctx, inst, cast<StringAttr>(name).getValue(), operand);
+          addEndPoints(ctx, inst, cast<StringAttr>(name).getValue(), operand,
+                       stub);
     } else if (ctx == 0 && isa<hw::OutputOp>(op)) {
       for (auto [operand, name] :
            llvm::zip(op.getOperands(), module.getOutputNames()))
-        addEndPoints(ctx, &op, cast<StringAttr>(name).getValue(), operand);
+        addEndPoints(ctx, &op, cast<StringAttr>(name).getValue(), operand,
+                     true);
     }
   }
 }
 
-LogicalResult Timing::run(hw::HWModuleOp top) {
+LogicalResult Timing::run(hw::HWModuleOp top, unsigned retimeLevels) {
+  this->retimeLevels = retimeLevels;
   contexts.push_back({0, {}, top, 0});
   collect(0);
   for (auto &end : endPoints)
     evaluate(end.node);
+  if (retimeLevels)
+    retime(retimeLevels);
+  else
+    for (auto &end : endPoints)
+      end.retimed = nodes[end.node].levels;
   return success();
+}
+
+/// The depth of each end point's worst path after one hop of balancing with
+/// its neighbour stages, as Vivado's global retiming does with a period of
+/// `period` levels: the end register moves backward into the room its
+/// output stage leaves, and the start register forward into the room its
+/// input stage leaves. Neither crosses a distributed RAM or a DSP, and only
+/// a register Vivado can retime moves. Top ports and the pins of stubs are
+/// registers with nothing beyond them, as a gate harness or the fold's links
+/// make them.
+void Timing::retime(unsigned period) {
+  int c = period;
+  // The deepest path from each node to an end point, consumers first.
+  std::vector<int16_t> depart(nodes.size(), -1);
+  for (auto &end : endPoints)
+    depart[end.node] = std::max<int16_t>(depart[end.node], 0);
+  SmallVector<Edge> edges;
+  for (unsigned id : llvm::reverse(order)) {
+    if (depart[id] < 0 || isStart(nodes[id].kind))
+      continue;
+    edges.clear();
+    inputs(id, edges);
+    for (auto [in, levels, load] : edges)
+      depart[in] = std::max<int>(depart[in], depart[id] + levels);
+  }
+
+  for (auto &end : endPoints) {
+    int a = nodes[end.node].levels;
+    end.retimed = a;
+    if (a <= c)
+      continue;
+    // The levels after the last pinned node of the path and before the
+    // first.
+    int trail = a, lead = a;
+    unsigned start = end.node;
+    bool pinned = false;
+    for (unsigned id = end.node; id != kNone; id = nodes[id].pred) {
+      start = id;
+      if (!isPinned(nodes[id].kind))
+        continue;
+      if (!pinned)
+        trail = a - nodes[id].levels;
+      pinned = true;
+      unsigned pred = nodes[id].pred;
+      lead = pred == kNone ? 0 : nodes[pred].levels;
+    }
+    int borrowEnd = 0, borrowStart = 0;
+    if (end.reg != kNone)
+      borrowEnd = std::min(trail, std::max(0, c - std::max<int>(
+                                                  depart[end.reg], 0)));
+    else if (end.boundary)
+      borrowEnd = std::min(trail, c);
+    if (auto it = regInputs.find(start); it != regInputs.end()) {
+      int in = it->second == kNone ? 0 : nodes[it->second].levels;
+      borrowStart = std::min(lead, std::max(0, c - in));
+    } else if (nodes[start].kind == Kind::Port ||
+               nodes[start].kind == Kind::Stub) {
+      borrowStart = std::min(lead, c);
+    }
+    end.retimed = std::max(c, a - borrowEnd - borrowStart);
+  }
 }
 
 const std::string &Timing::path(unsigned ctx) {
@@ -586,8 +707,8 @@ void Timing::printName(raw_ostream &os, unsigned id) {
 }
 
 void Timing::writeEndPoints(raw_ostream &os, unsigned minLevels) {
-  os << "levels,kind,start_kind,fanout,crossings,start_inst,start,end_inst,"
-        "end\n";
+  os << "levels,retimed,kind,start_kind,fanout,crossings,start_inst,start,"
+        "end_inst,end\n";
   for (auto &end : endPoints) {
     auto &n = nodes[end.node];
     if ((unsigned)n.levels < minLevels)
@@ -595,7 +716,8 @@ void Timing::writeEndPoints(raw_ostream &os, unsigned minLevels) {
     uint32_t fanout;
     unsigned crossings;
     unsigned start = startOf(end.ctx, end.node, fanout, crossings);
-    os << n.levels << ',' << end.port << ',' << kindName(nodes[start].kind)
+    os << n.levels << ',' << end.retimed << ',' << end.port << ','
+       << kindName(nodes[start].kind)
        << ',' << fanout << ',' << crossings << ',' << nodes[start].ctx << ',';
     printName(os, start);
     os << ',' << end.ctx << ',';
@@ -656,7 +778,17 @@ void Timing::writeReport(raw_ostream &os, unsigned topPaths,
   os << "end points by levels:";
   for (auto [levels, count] : histogram)
     os << ' ' << levels << ':' << count;
-  os << "\n\n";
+  os << '\n';
+  if (retimeLevels) {
+    std::map<int, uint64_t> retimed;
+    for (auto &end : endPoints)
+      ++retimed[end.retimed];
+    os << "end points by levels after retiming to " << retimeLevels << ":";
+    for (auto [levels, count] : retimed)
+      os << ' ' << levels << ':' << count;
+    os << '\n';
+  }
+  os << '\n';
 
   SmallVector<unsigned> order(endPoints.size());
   for (unsigned i = 0, e = order.size(); i < e; ++i)
@@ -768,7 +900,7 @@ void EstimateTimingPass::runOnOperation() {
   }
 
   Timing timing(design, blackBoxes);
-  if (failed(timing.run(top)))
+  if (failed(timing.run(top, retimeLevels)))
     return signalPassFailure();
 
   auto write = [&](StringRef file, auto fn) -> LogicalResult {

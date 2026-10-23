@@ -32,6 +32,8 @@ def main():
     ap.add_argument('--ep')
     ap.add_argument('--native', metavar='MODULE=PREFIX')
     ap.add_argument('--top', type=int, default=40)
+    ap.add_argument('--metric', default='levels', choices=['levels', 'retimed'],
+                    help="the screen's column to group by")
     args = ap.parse_args()
 
     inst = validate.load_instances(f'{args.screen}/instances.csv')
@@ -44,22 +46,20 @@ def main():
     groups = collections.defaultdict(
         lambda: {'n': 0, 'max': -1, 'hist': collections.Counter(),
                  'worst': None})
-    with open(f'{args.screen}/endpoints.csv') as f:
-        r = csv.reader(f)
-        next(r)
-        for levels, kind, skind, fo, cross, sctx, start, ectx, end in r:
-            levels = int(levels)
-            if levels < args.min_levels:
-                continue
-            cls, p = paths[int(ectx)]
-            full = f'{p}/{end}' if p else end
-            g = groups[(cls, unit(validate.norm(full)))]
-            g['n'] += 1
-            g['hist'][levels] += 1
-            if levels > g['max']:
-                sp = paths[int(sctx)][1]
-                g['max'] = levels
-                g['worst'] = (f'{sp}/{start}' if sp else start, full, fo)
+    for row in validate.endpoints(args.screen):
+        levels = int(row[args.metric])
+        if levels < args.min_levels:
+            continue
+        cls, p = paths[int(row['end_inst'])]
+        end, start = row['end'], row['start']
+        full = f'{p}/{end}' if p else end
+        g = groups[(cls, unit(validate.norm(full)))]
+        g['n'] += 1
+        g['hist'][levels] += 1
+        if levels > g['max']:
+            sp = paths[int(row['start_inst'])][1]
+            g['max'] = levels
+            g['worst'] = (f'{sp}/{start}' if sp else start, full, row['fanout'])
 
     viv = collections.defaultdict(lambda: [0, 0])  # n, max levels
     if args.ep:

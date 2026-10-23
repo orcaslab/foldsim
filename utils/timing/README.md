@@ -10,6 +10,13 @@ Vivado. `foldsim-opt` comes from the `PATH`, or from `FOLDSIM_OPT`.
 | `validate.py <outdir> <ep.csv>` | Agreement per register with a Vivado end point table (`slack,levels,logic,net,start,end`) |
 | `retime_split.py <outdir> <ep.csv> MODULE=PREFIX` | The same agreement, split by whether Vivado retimed the register's paths |
 
+`summarize.py`, `validate.py` and `retime_split.py` compare the `levels`
+column by default, or `retimed` (`--metric retimed`, or a last argument for
+`retime_split.py`) for a screen run with `retime-levels=N`. With
+`retime-levels=10`, end points at `retimed` ≥ 12 are a short list of fix
+candidates that Vivado's retiming is unlikely to absorb; plain `levels` stays
+the ranking.
+
 ```bash
 utils/timing/screen.sh gen/design.mlir runs/full
 utils/timing/screen.sh runs/full/mapped.mlirbc runs/socket \
