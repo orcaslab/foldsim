@@ -361,4 +361,73 @@ def FindPipelines : Pass<"foldsim-find-pipelines", "::mlir::ModuleOp"> {
   ];
 }
 
+def LowerEquality : Pass<"foldsim-lower-equality", "::circt::hw::HWModuleOp"> {
+  let summary = "Lower equality comparisons to logic";
+  let description = [{
+    Rewrites `comb.icmp` of equality and inequality as the OR of the bits
+    of the operands' XOR, so that LUT mapping packs a comparison with the
+    logic around it, as Vivado does. Order comparisons stay: they are carry
+    chains, not LUT logic.
+  }];
+  let dependentDialects = ["circt::comb::CombDialect"];
+}
+
+def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
+  let summary = "Rank every register-to-register path by its logic levels";
+  let description = [{
+    Estimates, for every end point of the design elaborated from `top`, the
+    logic levels of its longest path the way Vivado counts them on the V80:
+    LUTs, CARRY8s and distributed-RAM reads. The input is a LUT-mapped design
+    in which `comb.truth_table` ops are LUTs and adders, subtracters,
+    comparators and multipliers are still word-level ops:
+
+    - `comb.truth_table`: one level.
+    - `comb.add`/`comb.sub`: a LUT and the CARRY8s from an input bit's
+      8-bit block to the output bit's.
+    - `comb.icmp` of order: a LUT and the CARRY8s from the input bit to the
+      most significant one. Of equality: a LUT6 tree over the bits.
+    - `comb.mul`: one level, a DSP.
+    - `seq.firmem` read of latency 0 (distributed RAM): one level, plus one
+      per doubling of the depth past 64 words, from the address.
+
+    End points are register inputs (data, reset, clock enable), the address,
+    data, enable and mask of memory writes, the address and enable of
+    registered memory reads, the inputs of external modules (vendor IPs) and
+    the outputs of `top`. Start points are registers, registered memory
+    reads, outputs of external modules and inputs of `top`.
+
+    Paths are computed per bit over the elaborated instances, keeping only
+    the worst input of each bit, so time and memory grow linearly with the
+    design. Writes one row per end point bit of at least `min-levels` levels
+    to `output` (levels, end kind, maximum fanout and module crossings on the
+    path, then start and end as an instance id and a name), the instances to
+    `instances` (id, parent, instance name, module), and the `top-paths`
+    deepest paths, op by op, to `report`. Leaves the design as it is.
+  }];
+  let options = [
+    Option<"topName", "top", "std::string", "",
+           "The top module (the one no other instantiates if empty)">,
+    Option<"output", "output", "std::string", "",
+           "End point table (CSV)">,
+    Option<"instances", "instances", "std::string", "",
+           "Instance table (CSV)">,
+    Option<"report", "report", "std::string", "\"-\"",
+           "Summary and deepest paths (text)">,
+    Option<"minLevels", "min-levels", "unsigned", "0",
+           "Only write end points of at least this many levels">,
+    Option<"topPaths", "top-paths", "unsigned", "50",
+           "Deepest paths to print op by op">,
+    ListOption<"trace", "trace", "std::string",
+               "Also print the deepest path of each end point whose "
+               "instance path and name contain one of these">,
+    ListOption<"blackBoxes", "black-boxes", "std::string",
+               "Modules to treat as external, as a harness stubs them">,
+  ];
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect",
+    "circt::seq::SeqDialect"
+  ];
+}
+
 #endif // FOLDSIM_PASSES

@@ -3,6 +3,7 @@ llvm_update_compile_flags(foldsim-opt)
 target_link_libraries(foldsim-opt PRIVATE
   FoldsimTransforms
   CIRCTComb
+  CIRCTCombToSynth
   CIRCTCombTransforms
   CIRCTHW
   CIRCTHWTransforms
@@ -11,6 +12,8 @@ target_link_libraries(foldsim-opt PRIVATE
   CIRCTSV
   CIRCTSVTransforms
   CIRCTSupport
+  CIRCTSynth
+  CIRCTSynthTransforms
   MLIROptLib
   MLIRTransforms
 )

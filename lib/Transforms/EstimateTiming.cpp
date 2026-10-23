@@ -1,0 +1,797 @@
+//===- EstimateTiming.cpp - rank register-to-register paths by depth ------===//
+//
+// Part of the foldsim project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+// A timing screen: the logic levels of the longest path to every end point
+// of an elaborated, LUT-mapped design, counted as Vivado counts them on the
+// V80. It finds the depth outliers before a Vivado run; it predicts neither
+// slack nor wire delay.
+//
+//===----------------------------------------------------------------------===//
+
+#include "foldsim/Passes.h"
+#include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/Seq/SeqOps.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Support/FileUtilities.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/Support/Format.h"
+#include "llvm/Support/MathExtras.h"
+#include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/raw_ostream.h"
+#include <map>
+
+namespace foldsim {
+#define GEN_PASS_DEF_ESTIMATETIMING
+#define GEN_PASS_DEF_LOWEREQUALITY
+#include "foldsim/Passes.h.inc"
+} // namespace foldsim
+
+using namespace mlir;
+using namespace circt;
+
+namespace {
+
+/// What drives a bit: logic whose levels follow from its inputs, or a start
+/// point of a path.
+enum class Kind : uint8_t {
+  Lut,
+  Arith,
+  Order,
+  Equal,
+  Mul,
+  AsyncRead,
+  Other,
+  // Start points.
+  Reg,
+  SyncRead,
+  Extern,
+  Port,
+  Clock,
+};
+
+bool isStart(Kind kind) { return kind >= Kind::Reg; }
+
+StringRef kindName(Kind kind) {
+  switch (kind) {
+  case Kind::Lut:
+    return "lut";
+  case Kind::Arith:
+    return "carry";
+  case Kind::Order:
+    return "cmp";
+  case Kind::Equal:
+    return "eq";
+  case Kind::Mul:
+    return "dsp";
+  case Kind::AsyncRead:
+    return "lutram";
+  case Kind::Other:
+    return "other";
+  case Kind::Reg:
+    return "reg";
+  case Kind::SyncRead:
+    return "bram";
+  case Kind::Extern:
+    return "ip";
+  case Kind::Port:
+    return "port";
+  case Kind::Clock:
+    return "clock";
+  }
+  llvm_unreachable("unknown kind");
+}
+
+/// A bit driven by `value` in the elaborated instance `ctx`.
+struct Node {
+  Value value;
+  unsigned ctx;
+  unsigned pred = ~0u;
+  uint32_t fanout = 0;
+  uint32_t bit;
+  int16_t levels = 0;
+  Kind kind;
+  uint8_t state = 0; // 0: new, 1: waiting for its inputs, 2: done.
+};
+
+/// An elaborated instance; 0 is the top.
+struct Context {
+  unsigned parent;
+  hw::InstanceOp inst;
+  hw::HWModuleOp module;
+  unsigned depth;
+};
+
+/// An end point bit.
+struct EndPoint {
+  unsigned node;
+  unsigned ctx;
+  Operation *op;
+  StringRef port;
+  uint32_t bit;
+};
+
+/// An input of a node: the levels from it to the node, and whether the node
+/// loads it (an adder bit reaches the lower bits' inputs over the carry
+/// chain, not as their load).
+struct Edge {
+  unsigned in;
+  int levels;
+  bool load;
+};
+
+constexpr unsigned kNone = ~0u;
+
+unsigned widthOf(Value value) {
+  int64_t width = hw::getBitWidth(value.getType());
+  return width < 0 ? 0 : width;
+}
+
+/// ceil(log6(n)): the levels of a LUT6 tree over n signals.
+unsigned lut6Depth(unsigned n) {
+  unsigned levels = 0;
+  for (unsigned reach = 1; reach < n; reach *= 6)
+    ++levels;
+  return levels;
+}
+
+/// Levels from an input bit of an adder or comparator to an output bit: the
+/// LUT that computes propagate and generate, and the CARRY8s between the
+/// input's 8-bit block and the output's.
+int carryLevels(unsigned in, unsigned out) { return 2 + out / 8 - in / 8; }
+
+class Timing {
+public:
+  /// Instances of `blackBoxes` are external modules, as a harness's stubs.
+  Timing(ModuleOp top, ArrayRef<std::string> blackBoxes) {
+    for (auto module : top.getOps<hw::HWModuleLike>())
+      if (!llvm::is_contained(blackBoxes, module.getModuleName()))
+        modules[module.getModuleNameAttr()] = module;
+  }
+
+  LogicalResult run(hw::HWModuleOp top);
+  void writeEndPoints(raw_ostream &os, unsigned minLevels);
+  void writeInstances(raw_ostream &os);
+  void writeReport(raw_ostream &os, unsigned topPaths,
+                   ArrayRef<std::string> trace);
+
+private:
+  unsigned child(unsigned ctx, hw::InstanceOp inst, hw::HWModuleOp module);
+  unsigned node(unsigned ctx, Value value, unsigned bit, Kind kind);
+  unsigned resolve(unsigned ctx, Value value, unsigned bit);
+  Kind classify(Operation *op);
+  void inputs(unsigned id, SmallVectorImpl<Edge> &edges);
+  void evaluate(unsigned root);
+  void collect(unsigned ctx);
+  void addEndPoints(unsigned ctx, Operation *op, StringRef port, Value value);
+  unsigned startOf(unsigned ctx, unsigned id, uint32_t &fanout,
+                   unsigned &crossings);
+  void printName(raw_ostream &os, unsigned id);
+  void printOp(raw_ostream &os, Operation *op, StringRef port, uint32_t bit);
+  void printPath(raw_ostream &os, const EndPoint &end, unsigned rank);
+  const std::string &path(unsigned ctx);
+
+  DenseMap<StringAttr, Operation *> modules;
+  std::vector<Context> contexts;
+  DenseMap<std::pair<unsigned, Operation *>, unsigned> children;
+  std::vector<std::string> paths;
+  std::vector<Node> nodes;
+  DenseMap<std::tuple<unsigned, void *, unsigned>, unsigned> ids;
+  std::vector<EndPoint> endPoints;
+  llvm::StringMap<uint64_t> otherOps;
+  uint64_t loops = 0;
+  SmallVector<std::pair<unsigned, unsigned>> loopSamples;
+};
+
+} // namespace
+
+unsigned Timing::child(unsigned ctx, hw::InstanceOp inst,
+                       hw::HWModuleOp module) {
+  auto [it, inserted] = children.try_emplace({ctx, inst}, contexts.size());
+  if (inserted)
+    contexts.push_back({ctx, inst, module, contexts[ctx].depth + 1});
+  return it->second;
+}
+
+unsigned Timing::node(unsigned ctx, Value value, unsigned bit, Kind kind) {
+  auto [it, inserted] = ids.try_emplace(
+      {ctx, value.getAsOpaquePointer(), bit}, (unsigned)nodes.size());
+  if (inserted) {
+    Node n;
+    n.value = value;
+    n.ctx = ctx;
+    n.bit = bit;
+    n.kind = kind;
+    nodes.push_back(n);
+  }
+  return it->second;
+}
+
+Kind Timing::classify(Operation *op) {
+  if (isa<comb::TruthTableOp>(op))
+    return Kind::Lut;
+  if (isa<comb::AddOp, comb::SubOp>(op))
+    return Kind::Arith;
+  if (auto cmp = dyn_cast<comb::ICmpOp>(op)) {
+    switch (cmp.getPredicate()) {
+    case comb::ICmpPredicate::eq:
+    case comb::ICmpPredicate::ne:
+    case comb::ICmpPredicate::ceq:
+    case comb::ICmpPredicate::cne:
+    case comb::ICmpPredicate::weq:
+    case comb::ICmpPredicate::wne:
+      return Kind::Equal;
+    default:
+      return Kind::Order;
+    }
+  }
+  if (isa<comb::MulOp>(op))
+    return Kind::Mul;
+  if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(op))
+    return Kind::Reg;
+  if (auto read = dyn_cast<seq::FirMemReadOp>(op))
+    return read.getMemory().getDefiningOp<seq::FirMemOp>().getReadLatency()
+               ? Kind::SyncRead
+               : Kind::AsyncRead;
+  if (isa<seq::FirMemReadWriteOp>(op))
+    return Kind::SyncRead;
+  if (isa<seq::FromClockOp>(op))
+    return Kind::Clock;
+  ++otherOps[op->getName().getStringRef()];
+  return Kind::Other;
+}
+
+/// The node of the bit `bit` of `value` in instance `ctx`, seen through
+/// wiring, extracts, concatenations and instance boundaries; kNone for a
+/// constant.
+unsigned Timing::resolve(unsigned ctx, Value value, unsigned bit) {
+  while (true) {
+    if (auto arg = dyn_cast<BlockArgument>(value)) {
+      if (ctx == 0)
+        return node(ctx, value, bit, Kind::Port);
+      auto &c = contexts[ctx];
+      value = c.inst.getOperand(arg.getArgNumber());
+      ctx = c.parent;
+      continue;
+    }
+    Operation *op = value.getDefiningOp();
+    if (op->hasTrait<OpTrait::ConstantLike>())
+      return kNone;
+    if (auto extract = dyn_cast<comb::ExtractOp>(op)) {
+      value = extract.getInput();
+      bit += extract.getLowBit();
+      continue;
+    }
+    if (auto concat = dyn_cast<comb::ConcatOp>(op)) {
+      for (auto input : llvm::reverse(concat.getInputs())) {
+        unsigned width = widthOf(input);
+        if (bit < width) {
+          value = input;
+          break;
+        }
+        bit -= width;
+      }
+      continue;
+    }
+    if (auto replicate = dyn_cast<comb::ReplicateOp>(op)) {
+      value = replicate.getInput();
+      bit %= widthOf(value);
+      continue;
+    }
+    if (auto bitcast = dyn_cast<hw::BitcastOp>(op)) {
+      value = bitcast.getInput();
+      continue;
+    }
+    if (auto wire = dyn_cast<hw::WireOp>(op)) {
+      value = wire.getInput();
+      continue;
+    }
+    if (auto inst = dyn_cast<hw::InstanceOp>(op)) {
+      auto module = dyn_cast_or_null<hw::HWModuleOp>(
+          modules.lookup(inst.getModuleNameAttr().getAttr()));
+      if (!module)
+        return node(ctx, value, bit, Kind::Extern);
+      ctx = child(ctx, inst, module);
+      value = module.getBodyBlock()->getTerminator()->getOperand(
+          cast<OpResult>(value).getResultNumber());
+      continue;
+    }
+    auto key = std::make_tuple(ctx, value.getAsOpaquePointer(), bit);
+    if (auto it = ids.find(key); it != ids.end())
+      return it->second;
+    return node(ctx, value, bit, classify(op));
+  }
+}
+
+/// The inputs of a node that is not a start point, each with the levels from
+/// it to the node.
+void Timing::inputs(unsigned id, SmallVectorImpl<Edge> &edges) {
+  Node n = nodes[id];
+  Operation *op = n.value.getDefiningOp();
+  auto add = [&](Value operand, unsigned bit, int levels, bool load = true) {
+    unsigned in = resolve(n.ctx, operand, bit);
+    if (in != kNone)
+      edges.push_back({in, levels, load});
+  };
+  switch (n.kind) {
+  case Kind::Lut:
+    for (auto operand : op->getOperands())
+      add(operand, 0, 1);
+    return;
+  case Kind::Arith:
+    for (auto operand : op->getOperands())
+      for (unsigned bit = 0; bit <= n.bit; ++bit)
+        add(operand, bit, carryLevels(bit, n.bit), bit == n.bit);
+    return;
+  case Kind::Order: {
+    // The chain ends at the highest bit that is not constant in both
+    // operands: constant bits above it fold away (a compare of a
+    // zero-extended index against a bound is a narrow compare).
+    SmallVector<std::pair<unsigned, unsigned>> bits;
+    unsigned top = 0;
+    for (auto operand : op->getOperands())
+      for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit) {
+        unsigned in = resolve(n.ctx, operand, bit);
+        if (in == kNone)
+          continue;
+        bits.push_back({in, bit});
+        top = std::max(top, bit);
+      }
+    for (auto [in, bit] : bits)
+      edges.push_back({in, carryLevels(bit, top), true});
+    return;
+  }
+  case Kind::Equal: {
+    // Each LUT6 compares three bit pairs, or six bits with a constant.
+    size_t first = edges.size();
+    for (auto operand : op->getOperands())
+      for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit)
+        add(operand, bit, 0);
+    unsigned bits = edges.size() - first;
+    int levels = 1 + lut6Depth(llvm::divideCeil(bits, 6));
+    for (auto &edge : llvm::drop_begin(edges, first))
+      edge.levels = levels;
+    return;
+  }
+  case Kind::Mul:
+    for (auto operand : op->getOperands())
+      for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit)
+        add(operand, bit, 1);
+    return;
+  case Kind::AsyncRead: {
+    // RAM64X1D is one level; deeper memories add a MUXF7/MUXF8 or LUT level
+    // per doubling.
+    auto read = cast<seq::FirMemReadOp>(op);
+    uint64_t depth = read.getMemory().getType().getDepth();
+    int levels = 1 + std::max(0, (int)llvm::Log2_64_Ceil(depth) - 6);
+    for (unsigned bit = 0, e = widthOf(read.getAddress()); bit < e; ++bit)
+      add(read.getAddress(), bit, levels);
+    if (auto enable = read.getEnable())
+      add(enable, 0, 1);
+    return;
+  }
+  case Kind::Other:
+    for (auto operand : op->getOperands())
+      for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit)
+        add(operand, bit, 1);
+    return;
+  default:
+    return;
+  }
+}
+
+/// Computes the levels of `root` and of everything it depends on, depth
+/// first without recursion. An input still waiting for its own inputs closes
+/// a combinational loop; that edge is left out and counted.
+void Timing::evaluate(unsigned root) {
+  if (nodes[root].state == 2)
+    return;
+  SmallVector<unsigned> stack{root};
+  SmallVector<Edge> edges;
+  while (!stack.empty()) {
+    unsigned id = stack.back();
+    if (nodes[id].state == 2) {
+      stack.pop_back();
+      continue;
+    }
+    if (isStart(nodes[id].kind)) {
+      nodes[id].state = 2;
+      stack.pop_back();
+      continue;
+    }
+    edges.clear();
+    inputs(id, edges);
+    bool ready = true;
+    if (nodes[id].state == 0) {
+      nodes[id].state = 1;
+      for (auto [in, levels, load] : edges) {
+        if (nodes[in].state == 0) {
+          stack.push_back(in);
+          ready = false;
+        } else if (nodes[in].state == 1) {
+          if (loopSamples.size() < 8)
+            loopSamples.push_back({id, in});
+          ++loops;
+        }
+      }
+      if (!ready)
+        continue;
+    }
+    int best = 0;
+    unsigned pred = kNone;
+    for (auto [in, levels, load] : edges) {
+      nodes[in].fanout += load;
+      if (nodes[in].state != 2)
+        continue;
+      int total = nodes[in].levels + levels;
+      if (pred == kNone || total > best) {
+        best = total;
+        pred = in;
+      }
+    }
+    nodes[id].levels = best;
+    nodes[id].pred = pred;
+    nodes[id].state = 2;
+    stack.pop_back();
+  }
+}
+
+void Timing::addEndPoints(unsigned ctx, Operation *op, StringRef port,
+                          Value value) {
+  if (!value)
+    return;
+  for (unsigned bit = 0, e = widthOf(value); bit < e; ++bit) {
+    unsigned id = resolve(ctx, value, bit);
+    if (id != kNone)
+      endPoints.push_back({id, ctx, op, port, bit});
+  }
+}
+
+/// Collects the end points of instance `ctx` and of everything below it.
+void Timing::collect(unsigned ctx) {
+  auto module = contexts[ctx].module;
+  for (auto &op : *module.getBodyBlock()) {
+    if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
+      addEndPoints(ctx, reg, "d", reg.getNext());
+      if (auto reset = reg.getReset())
+        addEndPoints(ctx, reg, "rst", reset);
+    } else if (auto reg = dyn_cast<seq::CompRegOp>(op)) {
+      addEndPoints(ctx, reg, "d", reg.getInput());
+      if (auto reset = reg.getReset())
+        addEndPoints(ctx, reg, "rst", reset);
+    } else if (auto reg = dyn_cast<seq::CompRegClockEnabledOp>(op)) {
+      addEndPoints(ctx, reg, "d", reg.getInput());
+      addEndPoints(ctx, reg, "ce", reg.getClockEnable());
+      if (auto reset = reg.getReset())
+        addEndPoints(ctx, reg, "rst", reset);
+    } else if (auto write = dyn_cast<seq::FirMemWriteOp>(op)) {
+      addEndPoints(ctx, write, "wa", write.getAddress());
+      addEndPoints(ctx, write, "wd", write.getData());
+      addEndPoints(ctx, write, "we", write.getEnable());
+      addEndPoints(ctx, write, "wm", write.getMask());
+    } else if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+      if (read.getMemory().getDefiningOp<seq::FirMemOp>().getReadLatency()) {
+        addEndPoints(ctx, read, "ra", read.getAddress());
+        addEndPoints(ctx, read, "re", read.getEnable());
+      }
+    } else if (auto rw = dyn_cast<seq::FirMemReadWriteOp>(op)) {
+      addEndPoints(ctx, rw, "a", rw.getAddress());
+      addEndPoints(ctx, rw, "en", rw.getEnable());
+      addEndPoints(ctx, rw, "mode", rw.getMode());
+      addEndPoints(ctx, rw, "wd", rw.getWriteData());
+      addEndPoints(ctx, rw, "wm", rw.getMask());
+    } else if (auto inst = dyn_cast<hw::InstanceOp>(op)) {
+      auto *callee = modules.lookup(inst.getModuleNameAttr().getAttr());
+      if (auto module = dyn_cast_or_null<hw::HWModuleOp>(callee)) {
+        collect(child(ctx, inst, module));
+        continue;
+      }
+      for (auto [operand, name] :
+           llvm::zip(inst.getOperands(), inst.getArgNames()))
+        if (!isa<seq::ClockType>(operand.getType()))
+          addEndPoints(ctx, inst, cast<StringAttr>(name).getValue(), operand);
+    } else if (ctx == 0 && isa<hw::OutputOp>(op)) {
+      for (auto [operand, name] :
+           llvm::zip(op.getOperands(), module.getOutputNames()))
+        addEndPoints(ctx, &op, cast<StringAttr>(name).getValue(), operand);
+    }
+  }
+}
+
+LogicalResult Timing::run(hw::HWModuleOp top) {
+  contexts.push_back({0, {}, top, 0});
+  collect(0);
+  for (auto &end : endPoints)
+    evaluate(end.node);
+  return success();
+}
+
+const std::string &Timing::path(unsigned ctx) {
+  if (paths.size() < contexts.size())
+    paths.resize(contexts.size());
+  auto &p = paths[ctx];
+  if (p.empty() && ctx != 0) {
+    auto &c = contexts[ctx];
+    p = path(c.parent);
+    if (!p.empty())
+      p += '/';
+    p += c.inst.getInstanceName();
+  }
+  return paths[ctx];
+}
+
+/// Walks the worst path back from `id`, the bit an end point in instance
+/// `ctx` takes, to its start point, with the largest fanout of a bit on it
+/// and the instance boundaries it crosses.
+unsigned Timing::startOf(unsigned ctx, unsigned id, uint32_t &fanout,
+                         unsigned &crossings) {
+  fanout = 0;
+  crossings = 0;
+  while (true) {
+    auto &n = nodes[id];
+    fanout = std::max(fanout, n.fanout);
+    // Up from one and down to the other, through their common parent.
+    for (unsigned a = ctx, b = n.ctx; a != b; ++crossings) {
+      if (contexts[a].depth >= contexts[b].depth)
+        a = contexts[a].parent;
+      else
+        b = contexts[b].parent;
+    }
+    if (n.pred == kNone)
+      return id;
+    ctx = n.ctx;
+    id = n.pred;
+  }
+}
+
+void Timing::printOp(raw_ostream &os, Operation *op, StringRef port,
+                     uint32_t bit) {
+  if (auto name = op->getAttrOfType<StringAttr>("name"))
+    os << name.getValue();
+  else if (auto inst = dyn_cast<hw::InstanceOp>(op))
+    os << inst.getInstanceName();
+  else if (auto read = dyn_cast<seq::FirMemReadOp>(op))
+    os << read.getMemory().getDefiningOp<seq::FirMemOp>().getName();
+  else if (auto write = dyn_cast<seq::FirMemWriteOp>(op))
+    os << write.getMemory().getDefiningOp<seq::FirMemOp>().getName();
+  else if (auto rw = dyn_cast<seq::FirMemReadWriteOp>(op))
+    os << rw.getMemory().getDefiningOp<seq::FirMemOp>().getName();
+  else if (auto hint = op->getAttrOfType<StringAttr>("sv.namehint"))
+    os << hint.getValue();
+  else
+    os << op->getName().getStringRef();
+  if (!port.empty())
+    os << '.' << port;
+  os << '[' << bit << ']';
+}
+
+void Timing::printName(raw_ostream &os, unsigned id) {
+  auto &n = nodes[id];
+  if (auto arg = dyn_cast<BlockArgument>(n.value)) {
+    os << contexts[n.ctx].module.getInputName(arg.getArgNumber()) << '['
+       << n.bit << ']';
+    return;
+  }
+  Operation *op = n.value.getDefiningOp();
+  StringRef port;
+  if (auto inst = dyn_cast<hw::InstanceOp>(op))
+    port = inst.getOutputName(cast<OpResult>(n.value).getResultNumber());
+  printOp(os, op, port, n.bit);
+}
+
+void Timing::writeEndPoints(raw_ostream &os, unsigned minLevels) {
+  os << "levels,kind,start_kind,fanout,crossings,start_inst,start,end_inst,"
+        "end\n";
+  for (auto &end : endPoints) {
+    auto &n = nodes[end.node];
+    if ((unsigned)n.levels < minLevels)
+      continue;
+    uint32_t fanout;
+    unsigned crossings;
+    unsigned start = startOf(end.ctx, end.node, fanout, crossings);
+    os<< n.levels << ',' << end.port << ',' << kindName(nodes[start].kind)
+       << ',' << fanout << ',' << crossings << ',' << nodes[start].ctx << ',';
+    printName(os, start);
+    os << ',' << end.ctx << ',';
+    printOp(os, end.op, end.port, end.bit);
+    os << '\n';
+  }
+}
+
+void Timing::writeInstances(raw_ostream &os) {
+  os << "id,parent,instance,module\n";
+  for (unsigned i = 0, e = contexts.size(); i < e; ++i) {
+    auto &c = contexts[i];
+    os << i << ',' << c.parent << ','
+       << (i ? c.inst.getInstanceName() : StringRef("")) << ','
+       << c.module.getModuleName() << '\n';
+  }
+}
+
+void Timing::printPath(raw_ostream &os, const EndPoint &end, unsigned rank) {
+  os << "#" << rank << " levels " << nodes[end.node].levels << ": "
+     << path(end.ctx) << '/';
+  printOp(os, end.op, end.port, end.bit);
+  os << " (" << contexts[end.ctx].module.getModuleName() << ")\n";
+  for (unsigned id = end.node; id != kNone; id = nodes[id].pred) {
+    auto &n = nodes[id];
+    os << llvm::format("  %4d %-6s fo %-5u ", n.levels, kindName(n.kind).data(),
+                       n.fanout)
+       << path(n.ctx) << '/';
+    printName(os, id);
+    os << '\n';
+  }
+}
+
+void Timing::writeReport(raw_ostream &os, unsigned topPaths,
+                         ArrayRef<std::string> trace) {
+  uint64_t computed = 0;
+  std::map<int, uint64_t> histogram;
+  for (auto &n : nodes)
+    computed += n.state == 2;
+  for (auto &end : endPoints)
+    ++histogram[nodes[end.node].levels];
+  os << "instances " << contexts.size() << ", bits " << nodes.size()
+     << " (evaluated " << computed << "), end points " << endPoints.size()
+     << ", combinational loops " << loops << "\n";
+  for (auto [id, in] : loopSamples) {
+    os << "  loop: " << path(nodes[id].ctx) << '/';
+    printName(os, id);
+    os << " <- " << path(nodes[in].ctx) << '/';
+    printName(os, in);
+    os << '\n';
+  }
+  if (!otherOps.empty()) {
+    os << "ops without a delay model (one level each):";
+    for (auto &entry : otherOps)
+      os << ' ' << entry.getKey() << '=' << entry.getValue();
+    os << '\n';
+  }
+  os << "end points by levels:";
+  for (auto [levels, count] : histogram)
+    os << ' ' << levels << ':' << count;
+  os << "\n\n";
+
+  SmallVector<unsigned> order(endPoints.size());
+  for (unsigned i = 0, e = order.size(); i < e; ++i)
+    order[i] = i;
+  std::stable_sort(order.begin(), order.end(), [&](unsigned a, unsigned b) {
+    return nodes[endPoints[a].node].levels > nodes[endPoints[b].node].levels;
+  });
+  for (unsigned i = 0, e = std::min<size_t>(topPaths, order.size()); i < e;
+       ++i)
+    printPath(os, endPoints[order[i]], i + 1);
+
+  // The deepest end point bit matching each trace string.
+  for (auto &pattern : trace) {
+    os << "\ntrace '" << pattern << "':\n";
+    unsigned found = 0;
+    for (unsigned i = 0, e = order.size(); i < e; ++i) {
+      auto &end = endPoints[order[i]];
+      std::string name;
+      llvm::raw_string_ostream s(name);
+      s << path(end.ctx) << '/';
+      printOp(s, end.op, end.port, end.bit);
+      if (!StringRef(name).contains(pattern))
+        continue;
+      printPath(os, end, i + 1);
+      ++found;
+      break;
+    }
+    if (!found)
+      os << "  no end point\n";
+  }
+}
+
+namespace {
+struct LowerEqualityPass
+    : public foldsim::impl::LowerEqualityBase<LowerEqualityPass> {
+  void runOnOperation() override {
+    getOperation().walk([](comb::ICmpOp cmp) {
+      bool equal;
+      switch (cmp.getPredicate()) {
+      case comb::ICmpPredicate::eq:
+      case comb::ICmpPredicate::ceq:
+      case comb::ICmpPredicate::weq:
+        equal = true;
+        break;
+      case comb::ICmpPredicate::ne:
+      case comb::ICmpPredicate::cne:
+      case comb::ICmpPredicate::wne:
+        equal = false;
+        break;
+      default:
+        return;
+      }
+      OpBuilder b(cmp);
+      auto loc = cmp.getLoc();
+      Value diff = b.createOrFold<comb::XorOp>(loc, cmp.getLhs(), cmp.getRhs(),
+                                               true);
+      unsigned width = widthOf(diff);
+      if (width == 0) {
+        cmp.replaceAllUsesWith(
+            hw::ConstantOp::create(b, loc, APInt(1, equal)).getResult());
+        cmp.erase();
+        return;
+      }
+      SmallVector<Value> bits;
+      for (unsigned i = 0; i < width; ++i)
+        bits.push_back(b.createOrFold<comb::ExtractOp>(loc, diff, i, 1));
+      Value any = width == 1
+                      ? bits[0]
+                      : b.createOrFold<comb::OrOp>(loc, bits, true);
+      if (equal)
+        any = b.createOrFold<comb::XorOp>(
+            loc, any, hw::ConstantOp::create(b, loc, APInt(1, 1)), true);
+      cmp.replaceAllUsesWith(any);
+      cmp.erase();
+    });
+  }
+};
+
+struct EstimateTimingPass
+    : public foldsim::impl::EstimateTimingBase<EstimateTimingPass> {
+  using EstimateTimingBase::EstimateTimingBase;
+  void runOnOperation() override;
+};
+} // namespace
+
+void EstimateTimingPass::runOnOperation() {
+  auto design = getOperation();
+  hw::HWModuleOp top;
+  if (!topName.empty()) {
+    top = design.lookupSymbol<hw::HWModuleOp>(topName);
+    if (!top) {
+      design.emitError("no module '") << topName << "'";
+      return signalPassFailure();
+    }
+  } else {
+    DenseSet<StringAttr> instantiated;
+    design.walk([&](hw::InstanceOp inst) {
+      instantiated.insert(inst.getModuleNameAttr().getAttr());
+    });
+    for (auto module : design.getOps<hw::HWModuleOp>())
+      if (!instantiated.contains(module.getNameAttr())) {
+        top = module;
+        break;
+      }
+    if (!top) {
+      design.emitError("no top module");
+      return signalPassFailure();
+    }
+  }
+
+  Timing timing(design, blackBoxes);
+  if (failed(timing.run(top)))
+    return signalPassFailure();
+
+  auto write = [&](StringRef file, auto fn) -> LogicalResult {
+    if (file.empty())
+      return success();
+    std::string error;
+    auto out = openOutputFile(file, &error);
+    if (!out) {
+      design.emitError(error);
+      return failure();
+    }
+    fn(out->os());
+    out->keep();
+    return success();
+  };
+  if (failed(write(output, [&](raw_ostream &os) {
+        timing.writeEndPoints(os, minLevels);
+      })) ||
+      failed(write(instances,
+                   [&](raw_ostream &os) { timing.writeInstances(os); })) ||
+      failed(write(report, [&](raw_ostream &os) {
+        timing.writeReport(os, topPaths, trace);
+      })))
+    return signalPassFailure();
+  markAllAnalysesPreserved();
+}

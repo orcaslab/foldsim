@@ -7,16 +7,20 @@
 //===----------------------------------------------------------------------===//
 //
 // Runs foldsim's passes, with the CIRCT HW, Comb, Seq and SV dialects and
-// passes a simulator's pipeline uses between them.
+// passes a simulator's pipeline uses between them, and the Synth passes that
+// map a design to LUTs for `foldsim-estimate-timing`.
 //
 //===----------------------------------------------------------------------===//
 
 #include "foldsim/Passes.h"
+#include "circt/Conversion/Passes.h"
 #include "circt/Dialect/Comb/CombPasses.h"
 #include "circt/Dialect/HW/HWPasses.h"
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/SV/SVPasses.h"
 #include "circt/Dialect/Seq/SeqPasses.h"
+#include "circt/Dialect/Synth/SynthDialect.h"
+#include "circt/Dialect/Synth/Transforms/SynthPasses.h"
 #include "circt/Support/Version.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "mlir/Transforms/Passes.h"
@@ -24,13 +28,16 @@
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
   registry.insert<circt::comb::CombDialect, circt::hw::HWDialect,
-                  circt::seq::SeqDialect, circt::sv::SVDialect>();
+                  circt::seq::SeqDialect, circt::sv::SVDialect,
+                  circt::synth::SynthDialect>();
 
   foldsim::registerFoldsimPasses();
   circt::comb::registerPasses();
   circt::hw::registerPasses();
   circt::seq::registerPasses();
   circt::sv::registerPasses();
+  circt::synth::registerPasses();
+  circt::registerConvertCombToSynth();
   mlir::registerCanonicalizerPass();
   mlir::registerCSEPass();
   mlir::registerSymbolDCEPass();
