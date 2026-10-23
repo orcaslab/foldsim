@@ -22,8 +22,30 @@
 #include "circt/Dialect/Synth/SynthDialect.h"
 #include "circt/Dialect/Synth/Transforms/SynthPasses.h"
 #include "circt/Support/Version.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "mlir/Transforms/Passes.h"
+
+/// Maps a design to LUT6 for `foldsim-estimate-timing`, as Vivado maps a
+/// flattened design: modules of fewer than 300 ops (buffers, arbiters,
+/// switches) are inlined so LUTs pack across their boundaries; the mapping
+/// is depth-oriented, as Vivado restructures chains of associative logic and
+/// priority muxes into trees; equality comparisons become logic so they pack
+/// into LUTs with their neighbours; adders, order comparisons and multipliers
+/// stay word-level, as carry chains and DSPs.
+static const char *const timingMapPipeline =
+    "hw-flatten-modules{hw-inline-all=false hw-inline-small "
+    "hw-inline-with-state hw-small-threshold=300},"
+    "hw.module(hw-bypass-inner-symbols,canonicalize,cse,comb-balance-mux,"
+    "foldsim-lower-equality,hw-aggregate-to-comb,cse,"
+    "convert-comb-to-synth{additional-legal-ops=comb.add,comb.sub,comb.icmp,"
+    "comb.mul},"
+    "cse,canonicalize,synth-lower-word-to-bits,cse,"
+    "synth-lower-variadic{timing-aware},synth-structural-hash,canonicalize,"
+    "synth-maximum-and-cover,synth-lower-variadic{timing-aware},"
+    "synth-structural-hash,synth-sop-balancing{strategy=timing},"
+    "synth-structural-hash,"
+    "synth-generic-lut-mapper{max-lut-size=6 strategy=timing},cse)";
 
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
@@ -42,6 +64,12 @@ int main(int argc, char **argv) {
   mlir::registerCSEPass();
   mlir::registerSymbolDCEPass();
   mlir::registerTopologicalSortPass();
+  mlir::PassPipelineRegistration<>(
+      "foldsim-timing-map", "Map a design to LUT6 for foldsim-estimate-timing",
+      [](mlir::OpPassManager &pm) {
+        if (failed(mlir::parsePassPipeline(timingMapPipeline, pm)))
+          llvm::report_fatal_error("invalid foldsim-timing-map pipeline");
+      });
   llvm::cl::AddExtraVersionPrinter(
       [](llvm::raw_ostream &os) { os << circt::getCirctVersion() << '\n'; });
 

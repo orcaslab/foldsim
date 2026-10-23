@@ -595,7 +595,7 @@ void Timing::writeEndPoints(raw_ostream &os, unsigned minLevels) {
     uint32_t fanout;
     unsigned crossings;
     unsigned start = startOf(end.ctx, end.node, fanout, crossings);
-    os<< n.levels << ',' << end.port << ',' << kindName(nodes[start].kind)
+    os << n.levels << ',' << end.port << ',' << kindName(nodes[start].kind)
        << ',' << fanout << ',' << crossings << ',' << nodes[start].ctx << ',';
     printName(os, start);
     os << ',' << end.ctx << ',';
