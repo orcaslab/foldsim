@@ -372,6 +372,29 @@ def LowerEquality : Pass<"foldsim-lower-equality", "::circt::hw::HWModuleOp"> {
   let dependentDialects = ["circt::comb::CombDialect"];
 }
 
+def FoldZeroWidth : Pass<"foldsim-fold-zero-width", "::circt::hw::HWModuleOp"> {
+  let summary = "Replace zero-width combinational values with constants";
+  let description = [{
+    A zero-width value carries no information, so every combinational op
+    whose results are all zero-width integers is replaced by the constant 0
+    of that width. Elaborated designs keep such ops (a `comb.mux` of `i0`
+    from a parameter that sizes a field to nothing), and lowerings that
+    expect a bit to exist do not handle them.
+  }];
+  let dependentDialects = ["circt::hw::HWDialect"];
+}
+
+def LowerPowerOfTwoDivision
+    : Pass<"foldsim-lower-pow2-division", "::circt::hw::HWModuleOp"> {
+  let summary = "Lower unsigned division by a power of two to bit selects";
+  let description = [{
+    Rewrites `comb.divu` and `comb.modu` by a constant power of two 2^k as
+    the bits above k, zero-extended, and the low k bits, zero-extended: the
+    wiring synthesis makes of them. Division by any other value stays.
+  }];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
+}
+
 def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
   let summary = "Rank every register-to-register path by its logic levels";
   let description = [{
@@ -387,6 +410,8 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     - `comb.icmp` of order: a LUT and the CARRY8s from the input bit to the
       most significant one. Of equality: a LUT6 tree over the bits.
     - `comb.mul`: one level, a DSP.
+    - `comb.divu`/`divs`/`modu`/`mods`: a ripple of one subtracter per
+      quotient bit, from every input bit to every output bit.
     - `seq.firmem` read of latency 0 (distributed RAM): one level, plus one
       per doubling of the depth past 64 words, from the address.
 

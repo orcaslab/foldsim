@@ -11,6 +11,8 @@
 // CHECK: 2,2,d,reg,{{[0-9]+}},0,0,a[0],0,z.d[0]
 // An external module's input ends a path.
 // CHECK: 5,5,x,reg,{{[0-9]+}},0,0,a[0],0,ip.x[0]
+// An 8-bit divider: eight subtracters of a LUT and one CARRY8 each.
+// CHECK: 16,16,d,reg,{{[0-9]+}},0,0,{{[ab]}}[{{[0-9]+}}],0,q8.d[0]
 hw.module.extern private @Ip(in %clk : !seq.clock, in %x : i1)
 hw.module private @Leaf(in %a : i1, in %b : i1, out o : i1) {
   %o = comb.truth_table %a, %b -> [false, true, true, false]
@@ -31,5 +33,9 @@ hw.module @Top(in %clk : !seq.clock, in %d : i16) {
   %rd = seq.firmem.read_port %ram[%addr], clock %clk : <128 x 4>
   %z = seq.firreg %rd clock %clk : i4
   hw.instance "ip" @Ip(clk: %clk: !seq.clock, x: %lt: i1) -> ()
+  %a8 = comb.extract %a from 0 : (i16) -> i8
+  %b8 = comb.extract %b from 0 : (i16) -> i8
+  %div = comb.divu %a8, %b8 : i8
+  %q8 = seq.firreg %div clock %clk : i8
   hw.output
 }

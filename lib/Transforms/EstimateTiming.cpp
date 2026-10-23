@@ -17,6 +17,7 @@
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/FileUtilities.h"
 #include "llvm/ADT/DenseMap.h"
@@ -29,7 +30,9 @@
 
 namespace foldsim {
 #define GEN_PASS_DEF_ESTIMATETIMING
+#define GEN_PASS_DEF_FOLDZEROWIDTH
 #define GEN_PASS_DEF_LOWEREQUALITY
+#define GEN_PASS_DEF_LOWERPOWEROFTWODIVISION
 #include "foldsim/Passes.h.inc"
 } // namespace foldsim
 
@@ -46,6 +49,7 @@ enum class Kind : uint8_t {
   Order,
   Equal,
   Mul,
+  Div,
   AsyncRead,
   Other,
   // Start points.
@@ -76,6 +80,8 @@ StringRef kindName(Kind kind) {
     return "eq";
   case Kind::Mul:
     return "dsp";
+  case Kind::Div:
+    return "div";
   case Kind::AsyncRead:
     return "lutram";
   case Kind::Other:
@@ -260,6 +266,8 @@ Kind Timing::classify(Operation *op) {
   }
   if (isa<comb::MulOp>(op))
     return Kind::Mul;
+  if (isa<comb::DivUOp, comb::DivSOp, comb::ModUOp, comb::ModSOp>(op))
+    return Kind::Div;
   if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(op))
     return Kind::Reg;
   if (auto read = dyn_cast<seq::FirMemReadOp>(op))
@@ -394,6 +402,16 @@ void Timing::inputs(unsigned id, SmallVectorImpl<Edge> &edges) {
       for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit)
         add(operand, bit, 1);
     return;
+  case Kind::Div: {
+    // A combinational divider subtracts once per quotient bit, each a carry
+    // chain over the operand width.
+    unsigned width = widthOf(op->getResult(0));
+    int levels = width * carryLevels(0, width ? width - 1 : 0);
+    for (auto operand : op->getOperands())
+      for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit)
+        add(operand, bit, levels);
+    return;
+  }
   case Kind::AsyncRead: {
     // RAM64X1D is one level; deeper memories add a MUXF7/MUXF8 or LUT level
     // per doubling.
@@ -822,6 +840,59 @@ void Timing::writeReport(raw_ostream &os, unsigned topPaths,
 }
 
 namespace {
+struct FoldZeroWidthPass
+    : public foldsim::impl::FoldZeroWidthBase<FoldZeroWidthPass> {
+  void runOnOperation() override {
+    getOperation().walk([](Operation *op) {
+      if (!isa_and_nonnull<comb::CombDialect>(op->getDialect()) ||
+          op->getNumResults() == 0 || !isMemoryEffectFree(op))
+        return;
+      for (auto type : op->getResultTypes())
+        if (!type.isInteger(0))
+          return;
+      OpBuilder b(op);
+      for (auto result : op->getResults())
+        result.replaceAllUsesWith(
+            hw::ConstantOp::create(b, op->getLoc(), APInt::getZero(0)).getResult());
+      op->erase();
+    });
+  }
+};
+
+struct LowerPowerOfTwoDivisionPass
+    : public foldsim::impl::LowerPowerOfTwoDivisionBase<
+          LowerPowerOfTwoDivisionPass> {
+  void runOnOperation() override {
+    getOperation().walk([](Operation *op) {
+      if (!isa<comb::DivUOp, comb::ModUOp>(op))
+        return;
+      auto divisor = op->getOperand(1).getDefiningOp<hw::ConstantOp>();
+      if (!divisor || !divisor.getValue().isPowerOf2())
+        return;
+      unsigned width = widthOf(op->getResult(0));
+      unsigned k = divisor.getValue().logBase2();
+      Value x = op->getOperand(0);
+      OpBuilder b(op);
+      auto loc = op->getLoc();
+      // The kept bits: above k for a quotient, below k for a remainder.
+      unsigned low = isa<comb::DivUOp>(op) ? k : 0;
+      unsigned kept = isa<comb::DivUOp>(op) ? width - k : k;
+      Value result;
+      if (kept == 0) {
+        result = hw::ConstantOp::create(b, loc, APInt::getZero(width));
+      } else {
+        result = b.createOrFold<comb::ExtractOp>(loc, x, low, kept);
+        if (kept < width)
+          result = b.createOrFold<comb::ConcatOp>(
+              loc, hw::ConstantOp::create(b, loc, APInt::getZero(width - kept)),
+              result);
+      }
+      op->getResult(0).replaceAllUsesWith(result);
+      op->erase();
+    });
+  }
+};
+
 struct LowerEqualityPass
     : public foldsim::impl::LowerEqualityBase<LowerEqualityPass> {
   void runOnOperation() override {
