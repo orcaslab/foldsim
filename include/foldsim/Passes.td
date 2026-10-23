@@ -372,6 +372,22 @@ def LowerEquality : Pass<"foldsim-lower-equality", "::circt::hw::HWModuleOp"> {
   let dependentDialects = ["circt::comb::CombDialect"];
 }
 
+def KeepModules : Pass<"foldsim-keep-modules", "::mlir::ModuleOp"> {
+  let summary = "Keep the instances of named modules through inlining";
+  let description = [{
+    Makes the modules named in `modules` public, so that
+    `hw-flatten-modules`, which inlines only private modules, keeps their
+    instances. A name also matches its specializations (`VX_elastic_buffer`
+    matches `VX_elastic_buffer_12`). Run before `foldsim-timing-map` to read
+    the depth at those instances' ports (`foldsim-estimate-timing`'s
+    `ports`); LUTs then no longer pack across their boundaries.
+  }];
+  let options = [
+    ListOption<"modules", "modules", "std::string",
+               "Modules whose instances to keep">,
+  ];
+}
+
 def FoldZeroWidth : Pass<"foldsim-fold-zero-width", "::circt::hw::HWModuleOp"> {
   let summary = "Replace zero-width combinational values with constants";
   let description = [{
@@ -484,6 +500,11 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
                "Modules to treat as external, as a harness stubs them">,
     Option<"family", "family", "std::string", "\"versal\"",
            "The FPGA family whose logic levels to count">,
+    Option<"ports", "ports", "std::string", "",
+           "Port depth table (CSV) of the instances of `port-modules`">,
+    ListOption<"portModules", "port-modules", "std::string",
+               "Modules (and their specializations) whose instances' ports "
+               "to report: the levels at each input and behind each output">,
     Option<"retimeLevels", "retime-levels", "unsigned", "0",
            "Also estimate each end point's depth after Vivado's retiming "
            "to a period of this many levels (0: off)">,

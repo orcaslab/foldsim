@@ -33,6 +33,7 @@
 namespace foldsim {
 #define GEN_PASS_DEF_ESTIMATETIMING
 #define GEN_PASS_DEF_FOLDZEROWIDTH
+#define GEN_PASS_DEF_KEEPMODULES
 #define GEN_PASS_DEF_LOWEREQUALITY
 #define GEN_PASS_DEF_LOWERCONSTANTDIVISION
 #include "foldsim/Passes.h.inc"
@@ -164,6 +165,18 @@ unsigned widthOf(Value value) {
 }
 
 /// ceil(log6(n)): the levels of a LUT6 tree over n signals.
+/// Whether module `name` is `wanted` or one of its specializations
+/// (`<wanted>_<n>`).
+bool matchesModule(StringRef name, ArrayRef<std::string> wanted) {
+  for (auto &w : wanted)
+    if (name == w || (name.starts_with(w) && name.size() > w.size() &&
+                      name[w.size()] == '_' &&
+                      llvm::all_of(name.drop_front(w.size() + 1),
+                                   llvm::isDigit)))
+      return true;
+  return false;
+}
+
 unsigned lut6Depth(unsigned n) {
   unsigned levels = 0;
   for (unsigned reach = 1; reach < n; reach *= 6)
@@ -260,6 +273,7 @@ public:
   LogicalResult run(hw::HWModuleOp top, unsigned retimeLevels);
   void writeEndPoints(raw_ostream &os, unsigned minLevels);
   void writeInstances(raw_ostream &os);
+  void writePorts(raw_ostream &os, ArrayRef<std::string> modules);
   void writeReport(raw_ostream &os, unsigned topPaths,
                    ArrayRef<std::string> trace);
 
@@ -1044,6 +1058,39 @@ void Timing::writeInstances(raw_ostream &os) {
   }
 }
 
+/// For every instance of `modules`, the deepest bit of each port: the
+/// levels at which an input arrives, and the levels behind an output.
+void Timing::writePorts(raw_ostream &os, ArrayRef<std::string> modules) {
+  os << "instance,module,direction,port,width,levels\n";
+  auto deepest = [&](unsigned ctx, Value value) {
+    int levels = -1;
+    for (unsigned bit = 0, e = widthOf(value); bit < e; ++bit) {
+      unsigned id = resolve(ctx, value, bit);
+      if (id == kNone)
+        continue;
+      evaluate(id);
+      levels = std::max<int>(levels, nodes[id].levels);
+    }
+    return levels;
+  };
+  for (unsigned ctx = 1, e = contexts.size(); ctx < e; ++ctx) {
+    auto c = contexts[ctx];
+    if (!matchesModule(c.module.getModuleName(), modules))
+      continue;
+    auto write = [&](StringRef dir, StringRef name, Value value, int levels) {
+      os << path(ctx) << ',' << c.module.getModuleName() << ',' << dir << ','
+         << name << ',' << widthOf(value) << ',' << levels << '\n';
+    };
+    for (auto [i, operand] : llvm::enumerate(c.inst.getOperands()))
+      if (!isa<seq::ClockType>(operand.getType()))
+        write("in", c.module.getInputName(i), operand,
+              deepest(c.parent, operand));
+    auto *output = c.module.getBodyBlock()->getTerminator();
+    for (auto [i, operand] : llvm::enumerate(output->getOperands()))
+      write("out", c.module.getOutputName(i), operand, deepest(ctx, operand));
+  }
+}
+
 void Timing::printPath(raw_ostream &os, const EndPoint &end, unsigned rank) {
   os << "#" << rank << " levels " << end.levels << ": "
      << path(end.ctx) << '/';
@@ -1155,6 +1202,17 @@ struct FoldZeroWidthPass
             hw::ConstantOp::create(b, op->getLoc(), APInt::getZero(0)));
       op->erase();
     });
+  }
+};
+
+struct KeepModulesPass
+    : public foldsim::impl::KeepModulesBase<KeepModulesPass> {
+  using KeepModulesBase::KeepModulesBase;
+  void runOnOperation() override {
+    for (auto module : getOperation().getOps<hw::HWModuleOp>())
+      if (matchesModule(module.getModuleName(), modules))
+        SymbolTable::setSymbolVisibility(module,
+                                         SymbolTable::Visibility::Public);
   }
 };
 
@@ -1323,6 +1381,9 @@ void EstimateTimingPass::runOnOperation() {
       })) ||
       failed(write(instances,
                    [&](raw_ostream &os) { timing.writeInstances(os); })) ||
+      failed(write(ports, [&](raw_ostream &os) {
+        timing.writePorts(os, portModules);
+      })) ||
       failed(write(report, [&](raw_ostream &os) {
         timing.writeReport(os, topPaths, trace);
       })))
