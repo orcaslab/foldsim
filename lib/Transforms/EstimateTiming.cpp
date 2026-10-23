@@ -165,6 +165,18 @@ unsigned lut6Depth(unsigned n) {
 /// input's 8-bit block and the output's.
 int carryLevels(unsigned in, unsigned out) { return 2 + out / 8 - in / 8; }
 
+/// The most bits a divider can depend on for synthesis to write it out as a
+/// table over them; also the dividend widths whose quotient and remainder by
+/// a constant foldsim-lower-constant-division writes out.
+constexpr unsigned kMaxTableBits = 10;
+
+/// The most nodes searched for the bits a divider depends on.
+constexpr unsigned kMaxSupportCone = 4096;
+
+/// Levels of a table over `bits` inputs: a LUT6 for six, and a level of 4:1
+/// multiplexers per two more.
+int tableLevels(unsigned bits) { return bits <= 6 ? 1 : 1 + (bits - 5) / 2; }
+
 class Timing {
 public:
   /// Instances of `blackBoxes` are external modules, as a harness's stubs.
@@ -189,6 +201,7 @@ private:
   unsigned resolve(unsigned ctx, Value value, unsigned bit);
   Kind classify(Operation *op);
   void inputs(unsigned id, SmallVectorImpl<Edge> &edges);
+  ArrayRef<unsigned> support(unsigned ctx, Operation *op, bool &small);
   void evaluate(unsigned root);
   void collect(unsigned ctx);
   void addEndPoints(unsigned ctx, Operation *op, StringRef port, Value value,
@@ -216,6 +229,10 @@ private:
   /// The input node of each register bit Vivado can retime (kNone for a
   /// constant).
   DenseMap<unsigned, unsigned> regInputs;
+  /// The bits each divider depends on, if there are at most kMaxTableBits.
+  DenseMap<std::pair<unsigned, Operation *>,
+           std::optional<SmallVector<unsigned>>>
+      supports;
   unsigned retimeLevels = 0;
   llvm::StringMap<uint64_t> otherOps;
   uint64_t loops = 0;
@@ -403,11 +420,19 @@ void Timing::inputs(unsigned id, SmallVectorImpl<Edge> &edges) {
         add(operand, bit, 1);
     return;
   case Kind::Div: {
-    // Only the dividend's bits that are not constant count. Synthesis
-    // propagates a constant divisor, leaving a function of those bits: a
-    // LUT6 for six, and a level of 4:1 multiplexers per two more. A variable
-    // divisor is a ripple of one subtracter per quotient bit, each a carry
-    // chain over them.
+    // A divider whose operands depend on few bits, as a quotient of
+    // functions of a format field, is a table over them after synthesis.
+    bool small;
+    ArrayRef<unsigned> table = support(n.ctx, op, small);
+    if (small) {
+      for (unsigned in : table)
+        edges.push_back({in, tableLevels(table.size()), true});
+      return;
+    }
+    // Otherwise only the dividend's bits that are not constant count.
+    // Synthesis propagates a constant divisor, leaving a table over those
+    // bits. A variable divisor is a ripple of one subtracter per quotient
+    // bit, each a carry chain over them.
     size_t first = edges.size();
     unsigned bits = 0;
     bool constantDivisor = true;
@@ -422,9 +447,8 @@ void Timing::inputs(unsigned id, SmallVectorImpl<Edge> &edges) {
         else
           constantDivisor = false;
       }
-    int levels = constantDivisor
-                     ? (bits <= 6 ? 1 : 1 + (bits - 5) / 2)
-                     : bits * carryLevels(0, bits ? bits - 1 : 0);
+    int levels = constantDivisor ? tableLevels(bits)
+                                 : bits * carryLevels(0, bits ? bits - 1 : 0);
     for (auto &edge : llvm::drop_begin(edges, first))
       edge.levels = levels;
     return;
@@ -449,6 +473,49 @@ void Timing::inputs(unsigned id, SmallVectorImpl<Edge> &edges) {
   default:
     return;
   }
+}
+
+/// The bits the divider `op` of instance `ctx` depends on: the start points
+/// and distributed-RAM reads its operands' cones reach. `small` is false if
+/// there are more than kMaxTableBits of them.
+ArrayRef<unsigned> Timing::support(unsigned ctx, Operation *op, bool &small) {
+  auto key = std::make_pair(ctx, op);
+  if (auto it = supports.find(key); it != supports.end()) {
+    small = it->second.has_value();
+    return small ? ArrayRef<unsigned>(*it->second) : ArrayRef<unsigned>();
+  }
+  // A divider met again inside its own cone closes a loop: not small.
+  supports[key] = std::nullopt;
+  SmallVector<unsigned> found, stack;
+  DenseSet<unsigned> seen;
+  for (auto operand : op->getOperands())
+    for (unsigned bit = 0, e = widthOf(operand); bit < e; ++bit) {
+      unsigned in = resolve(ctx, operand, bit);
+      if (in != kNone && seen.insert(in).second)
+        stack.push_back(in);
+    }
+  SmallVector<Edge> edges;
+  small = true;
+  while (small && !stack.empty()) {
+    unsigned id = stack.pop_back_val();
+    Kind kind = nodes[id].kind;
+    if (isStart(kind) || kind == Kind::AsyncRead) {
+      found.push_back(id);
+      small = found.size() <= kMaxTableBits;
+      continue;
+    }
+    edges.clear();
+    inputs(id, edges);
+    for (auto &edge : edges)
+      if (seen.insert(edge.in).second)
+        stack.push_back(edge.in);
+    small = seen.size() <= kMaxSupportCone;
+  }
+  if (!small)
+    return {};
+  auto &entry = supports[key];
+  entry = std::move(found);
+  return *entry;
 }
 
 /// Computes the levels of `root` and of everything it depends on, depth
@@ -876,10 +943,6 @@ struct FoldZeroWidthPass
   }
 };
 
-/// The dividend widths whose quotient and remainder by a constant are
-/// written out as a table.
-constexpr unsigned kMaxTableBits = 10;
-
 /// The low bits of `value` that are not known zero: a zero-extension is a
 /// concatenation under a zero constant.
 unsigned significantBits(Value value) {
@@ -921,8 +984,8 @@ struct LowerConstantDivisionPass
         } else {
           result = b.createOrFold<comb::ExtractOp>(loc, x, low, kept);
           if (kept < width)
-            result =
-                b.createOrFold<comb::ConcatOp>(loc, zeros(width - kept), result);
+            result = b.createOrFold<comb::ConcatOp>(loc, zeros(width - kept),
+                                                    result);
         }
       } else {
         unsigned bits = significantBits(x);
