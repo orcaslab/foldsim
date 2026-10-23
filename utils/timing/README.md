@@ -9,6 +9,13 @@ Vivado. `foldsim-opt` comes from the `PATH`, or from `FOLDSIM_OPT`.
 | `summarize.py <outdir>` | End points by RTL unit, optionally beside Vivado's (`--ep`) |
 | `validate.py <outdir> <ep.csv>` | Agreement per register with a Vivado end point table (`slack,levels,logic,net,start,end`) |
 | `retime_split.py <outdir> <ep.csv> MODULE=PREFIX` | The same agreement, split by whether Vivado retimed the register's paths |
+| `cone_dump.tcl <dcp> <out> <pattern>...` | Vivado: the worst path into each register pattern, cell by cell, following retimed (`_fret`/`_bret`) start registers back and summing their levels |
+| `cone_probe.tcl <dcp> <out> <from> <to>...` | Vivado: whether paths exist between two register patterns (`-` for any), their level histogram and the deepest, cell by cell |
+| `wire_probe.tcl <dcp> <out.csv> [N]` | Vivado: for the worst path of N end points, its length in tiles, bounding box and largest fanout beside its logic and net delay |
+
+The Tcl probes run on a checkpoint (`vivado -mode batch -source <probe>
+-tclargs ...`); they answer what the screen's levels cannot, such as whether
+a deep RTL cone survives synthesis or how much of a path is wire.
 
 `summarize.py`, `validate.py` and `retime_split.py` compare the `levels`
 column by default, or `retimed` (`--metric retimed`, or a last argument for
