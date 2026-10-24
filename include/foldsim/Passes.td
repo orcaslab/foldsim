@@ -494,4 +494,173 @@ def FindPipelines : Pass<"foldsim-find-pipelines", "::mlir::ModuleOp"> {
   ];
 }
 
+def LowerEquality : Pass<"foldsim-lower-equality", "::circt::hw::HWModuleOp"> {
+  let summary = "Lower equality comparisons to logic";
+  let description = [{
+    Rewrites `comb.icmp` of equality and inequality as the OR of the bits
+    of the operands' XOR, so that LUT mapping packs a comparison with the
+    logic around it, as Vivado does. Order comparisons stay: they are carry
+    chains, not LUT logic.
+  }];
+  let dependentDialects = ["circt::comb::CombDialect"];
+}
+
+def KeepModules : Pass<"foldsim-keep-modules", "::mlir::ModuleOp"> {
+  let summary = "Keep the instances of named modules through inlining";
+  let description = [{
+    Makes the modules named in `modules` public, so that
+    `hw-flatten-modules`, which inlines only private modules, keeps their
+    instances. A name also matches its specializations (`VX_elastic_buffer`
+    matches `VX_elastic_buffer_12`). Run before `foldsim-screen-map` to read
+    the depth at those instances' ports (`foldsim-estimate-timing`'s
+    `ports`); LUTs then no longer pack across their boundaries.
+  }];
+  let options = [
+    ListOption<"modules", "modules", "std::string",
+               "Modules whose instances to keep">,
+  ];
+}
+
+def FoldZeroWidth : Pass<"foldsim-fold-zero-width", "::circt::hw::HWModuleOp"> {
+  let summary = "Replace zero-width combinational values with constants";
+  let description = [{
+    A zero-width value carries no information, so every combinational op
+    whose results are all zero-width integers is replaced by the constant 0
+    of that width. Elaborated designs keep such ops (a `comb.mux` of `i0`
+    from a parameter that sizes a field to nothing), and lowerings that
+    expect a bit to exist do not handle them.
+  }];
+  let dependentDialects = ["circt::hw::HWDialect"];
+}
+
+def LowerConstantDivision
+    : Pass<"foldsim-lower-constant-division", "::circt::hw::HWModuleOp"> {
+  let summary = "Lower unsigned division by a constant as synthesis does";
+  let description = [{
+    Rewrites `comb.divu` and `comb.modu` by a constant the way synthesis
+    propagates it:
+
+    - by a power of two 2^k: the bits above k and the low k bits,
+      zero-extended;
+    - of a dividend with at most 10 significant bits (the rest zero, as a
+      zero-extended index): a table of the results, selected by the dividend
+      with a tree of `comb.mux`, which LUT mapping folds into logic.
+
+    Any other division stays.
+  }];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
+}
+
+def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
+  let summary = "Rank every register-to-register path by its logic levels";
+  let description = [{
+    Estimates, for every end point of the design elaborated from `top`, the
+    logic levels of its longest path the way Vivado counts them on the
+    device `family`: LUTs, CARRY8s, DSP cells and distributed-RAM reads. The input is a LUT-mapped design in which
+    `comb.truth_table` ops are LUTs and adders, subtracters, comparators,
+    multipliers and dividers are still word-level ops:
+
+    - `comb.truth_table`: one level.
+    - `comb.add`/`comb.sub`: a LUT and the CARRY8s from an input bit's
+      8-bit block to the output bit's.
+    - `comb.icmp` of order: a LUT and the CARRY8s from the input bit to the
+      most significant one. Of equality: a LUT6 tree over the bits.
+    - `comb.mul`: a table in LUTs if its operands have at most ten variable
+      bits; otherwise a cascade of DSPs over their significant bits (27 x 24
+      each on the V80, 27 x 18 on the U55C): the cells up to the first
+      product, then each further DSP. A register the product feeds, with
+      its enable logic, is the DSP's own; any other load adds the DSP's
+      output stage.
+    - `comb.divu`/`divs`/`modu`/`mods`: a table over the bits the operands
+      depend on if there are at most ten of them; otherwise a ripple of one
+      subtracter per quotient bit, from every input bit to every output bit.
+    - `seq.firmem` read of latency 0 (distributed RAM): one level, plus one
+      per doubling of the depth past 64 words, from the address.
+
+    `family` is `versal` (the V80) or `virtexuplusHBM` (the U55C), as
+    hw/syn/xilinx/platforms names them; the two differ only in their DSPs.
+
+    `family=asap7` counts cell stages of an ASAP7 netlist mapped by
+    `foldsim-screen-map-asic` (3-input cuts) instead: a cell
+    (`comb.truth_table`, or an and-inverter gate) is a stage; an adder bit from bit j to
+    bit i is a prefix adder, 2 + ceil(log2(i - j + 1)); a compare,
+    1 + ceil(log2(span)); a product, its partial products, a Dadda tree of
+    full adders and a prefix adder; a memory of flops, a decoder and a
+    multiplexer tree. The report converts the deepest path to a period with
+    the library's cell, clock-to-output and setup delays and a per-path
+    overhead fitted on OpenSTA.
+
+    End points are register inputs (data, reset, clock enable), the address,
+    data, enable and mask of memory writes, the address and enable of
+    registered memory reads, the inputs of external modules (vendor IPs) and
+    the outputs of `top`. Start points are registers, registered memory
+    reads, outputs of external modules and inputs of `top`.
+
+    Paths are computed per bit over the elaborated instances, keeping only
+    the worst input of each bit, so time and memory grow linearly with the
+    design. Writes one row per end point bit of at least `min-levels` levels
+    to `output` (levels, retimed levels, end kind, maximum fanout and module
+    crossings on the path, then start and end as an instance id and a name),
+    the instances to `instances` (id, parent, instance name, module), and
+    the `top-paths` deepest paths, op by op, to `report`. Leaves the design
+    as it is.
+
+    `paths` lists every deep path once per pair of start and end registers,
+    as JSON lines, deepest first: the pair's deepest bit, if it has at least
+    `path-levels` levels, with its levels, retimed levels, end kind, start
+    and end (instance id and name), the number of end point bits the pair
+    has, and `ops`, the path from the end point back to its start as
+    [levels, kind, fanout, instance id, name, source]: the source is the
+    first file:line of the op's location, which names mapped logic.
+
+    With `retime-levels`, the `retimed` column estimates the depth after
+    Vivado's global retiming to a period of that many levels: an end point
+    deeper than the period borrows the room of its neighbour stages, its
+    register moving backward and its start register forward, neither
+    through a distributed RAM or a DSP. Top ports and the pins of
+    `black-boxes` count as registers with empty neighbour stages, as a gate
+    harness registers them. Without it, `retimed` is the depth.
+  }];
+  let options = [
+    Option<"topName", "top", "std::string", "",
+           "The top module (the one no other instantiates if empty)">,
+    Option<"output", "output", "std::string", "",
+           "End point table (CSV)">,
+    Option<"instances", "instances", "std::string", "",
+           "Instance table (CSV)">,
+    Option<"report", "report", "std::string", "\"-\"",
+           "Summary and deepest paths (text)">,
+    Option<"minLevels", "min-levels", "unsigned", "0",
+           "Only write end points of at least this many levels">,
+    Option<"topPaths", "top-paths", "unsigned", "50",
+           "Deepest paths to print op by op">,
+    ListOption<"trace", "trace", "std::string",
+               "Also print the deepest path of each end point whose "
+               "instance path and name contain one of these">,
+    ListOption<"blackBoxes", "black-boxes", "std::string",
+               "Modules to treat as external, as a harness stubs them">,
+    Option<"family", "family", "std::string", "\"versal\"",
+           "The FPGA family whose logic levels to count">,
+    Option<"ports", "ports", "std::string", "",
+           "Port depth table (CSV) of the instances of `port-modules`">,
+    ListOption<"portModules", "port-modules", "std::string",
+               "Modules (and their specializations) whose instances' ports "
+               "to report: the levels at each input and behind each output">,
+    Option<"paths", "paths", "std::string", "",
+           "Deep paths, op by op, one per pair of start and end registers "
+           "(JSON lines)">,
+    Option<"pathLevels", "path-levels", "unsigned", "12",
+           "Only write the paths of pairs whose deepest bit has at least "
+           "this many levels">,
+    Option<"retimeLevels", "retime-levels", "unsigned", "0",
+           "Also estimate each end point's depth after Vivado's retiming "
+           "to a period of this many levels (0: off)">,
+  ];
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect",
+    "circt::seq::SeqDialect"
+  ];
+}
+
 #endif // FOLDSIM_PASSES

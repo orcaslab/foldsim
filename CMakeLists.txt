@@ -27,6 +27,15 @@ include_directories(${PROJECT_SOURCE_DIR}/include ${PROJECT_BINARY_DIR}/include)
 link_directories(${LLVM_BUILD_LIBRARY_DIR})
 add_definitions(${LLVM_DEFINITIONS})
 
+# The revision foldsim-opt --version prints, refreshed on every build.
+set(FOLDSIM_VERSION_INC ${PROJECT_BINARY_DIR}/include/foldsim/Version.inc)
+add_custom_target(foldsim-version
+  COMMAND ${CMAKE_COMMAND} -DSRC=${PROJECT_SOURCE_DIR}
+          -DOUT=${FOLDSIM_VERSION_INC}
+          -P ${PROJECT_SOURCE_DIR}/cmake/GenerateVersion.cmake
+  BYPRODUCTS ${FOLDSIM_VERSION_INC}
+  COMMENT "Checking the foldsim revision")
+
 add_subdirectory(include/foldsim)
 add_subdirectory(lib)
 add_subdirectory(tools)
