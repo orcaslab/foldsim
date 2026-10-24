@@ -1298,6 +1298,9 @@ static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
 // A class's copy
 //===----------------------------------------------------------------------===//
 
+/// The regions sharing a copy of the slot controls two host cycles ahead.
+static constexpr unsigned kRegionsPerGroup = 16;
+
 static seq::FirRegOp keep(seq::FirRegOp reg) {
   sv::addSVAttributes(reg, {sv::SVAttributeAttr::get(reg.getContext(), "keep",
                                                      R"("true")",
@@ -1403,7 +1406,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     results.push_back(cls.late[o] ? value : nextValue(mb, value, nexts));
 
   // The copy's ports: the host clock, the slot's instance and whether it is a
-  // state pass two host cycles ahead, then the model's inputs and outputs.
+  // state pass three host cycles ahead, then the model's inputs and outputs.
   SmallVector<hw::PortInfo> ports;
   size_t numIn = 0, numOut = 0;
   auto addPort = [&](const Twine &portName, Type type, bool isInput) {
@@ -1416,9 +1419,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     ports.push_back(port);
   };
   addPort("hostClock", seq::ClockType::get(context), true);
-  addPort("state2", IntegerType::get(context, 1), true);
+  addPort("state3", IntegerType::get(context, 1), true);
   if (threads > 1)
-    addPort("inst2", IntegerType::get(context, idxWidth), true);
+    addPort("inst3", IntegerType::get(context, idxWidth), true);
   SmallVector<unsigned> inputArg(cls.inputNames.size(), 0);
   for (auto [i, name] : llvm::enumerate(cls.inputNames)) {
     if (int(i) == cls.clockInput)
@@ -1438,8 +1441,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                modelBody->begin(),
                                Block::iterator(modelOutput));
   Value hostClock = body->getArgument(0);
-  Value state2 = body->getArgument(1);
-  Value inst2 = threads > 1 ? body->getArgument(2) : Value();
+  Value state3 = body->getArgument(1);
+  Value inst3 = threads > 1 ? body->getArgument(2) : Value();
   DenseMap<Value, Value> replaced;
   for (auto [i, arg] : llvm::enumerate(modelBody->getArguments())) {
     Value to = int(i) == cls.clockInput ? Value(hostClock)
@@ -1452,23 +1455,48 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   auto one = [&]() { return hw::ConstantOp::create(b, i1, 1); };
 
   // Regions of state, in name order so that a region is a submodule's: each
-  // its own copy of the slot's controls, from the copy's.
+  // its own copy of the slot's controls, from the copy's, so that no control
+  // drives more than about `regionBits` bits of state; a memory larger than
+  // that has a region of its own.
+  // The controls two host cycles ahead, a copy for each group of
+  // `kRegionsPerGroup` regions, so that the ports drive only the groups.
+  struct Ahead {
+    Value state2, inst2;
+    unsigned regions = 0;
+  };
+  SmallVector<Ahead> aheads;
+  auto aheadFor = [&]() -> Ahead & {
+    if (aheads.empty() || aheads.back().regions == kRegionsPerGroup) {
+      Ahead ahead;
+      std::string prefix = ("ahead" + Twine(aheads.size())).str();
+      ahead.state2 = keep(seq::FirRegOp::create(
+          b, state3, hostClock, b.getStringAttr(prefix + "_state2")));
+      if (threads > 1)
+        ahead.inst2 = keep(seq::FirRegOp::create(
+            b, inst3, hostClock, b.getStringAttr(prefix + "_inst2")));
+      aheads.push_back(ahead);
+    }
+    ++aheads.back().regions;
+    return aheads.back();
+  };
+
   struct Region {
     Value inst1, inst, state;
   };
   SmallVector<Region> regions;
-  unsigned regionUsed = regionBits;
+  uint64_t regionUsed = regionBits;
   auto regionFor = [&](uint64_t bits) -> Region & {
     if (regions.empty() || regionUsed + bits > regionBits) {
       Region region;
-      auto prefix = "region" + Twine(regions.size());
+      auto &ahead = aheadFor();
+      std::string prefix = ("region" + Twine(regions.size())).str();
       Value state1 = keep(seq::FirRegOp::create(
-          b, state2, hostClock, b.getStringAttr(prefix + "_state1")));
+          b, ahead.state2, hostClock, b.getStringAttr(prefix + "_state1")));
       region.state = keep(seq::FirRegOp::create(
           b, state1, hostClock, b.getStringAttr(prefix + "_state")));
       if (threads > 1) {
         region.inst1 = keep(seq::FirRegOp::create(
-            b, inst2, hostClock, b.getStringAttr(prefix + "_inst1")));
+            b, ahead.inst2, hostClock, b.getStringAttr(prefix + "_inst1")));
         region.inst = keep(seq::FirRegOp::create(
             b, region.inst1, hostClock, b.getStringAttr(prefix + "_inst")));
       }
@@ -1552,7 +1580,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     b.setLoc(memory.getLoc());
     auto memType = memory.getType();
     uint64_t bits = uint64_t(memType.getWidth()) * memType.getDepth();
-    auto &region = regionFor(std::min<uint64_t>(bits, regionBits));
+    auto &region = regionFor(bits);
     auto threadedType = seq::FirMemType::get(
         context, memType.getDepth() * threads, memType.getWidth(),
         memType.getMaskWidth());
@@ -1643,11 +1671,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // slot's state pass for its instance; their results reach each store
   // without the state pass's enable, as they come back.
   if (folding) {
-    Value state1 = keep(seq::FirRegOp::create(b, state2, hostClock,
+    auto &ahead = aheadFor();
+    Value state1 = keep(seq::FirRegOp::create(b, ahead.state2, hostClock,
                                               b.getStringAttr("fold_state1")));
     Value state = keep(seq::FirRegOp::create(b, state1, hostClock,
                                              b.getStringAttr("fold_state")));
-    Value inst1 = keep(seq::FirRegOp::create(b, inst2, hostClock,
+    Value inst1 = keep(seq::FirRegOp::create(b, ahead.inst2, hostClock,
                                              b.getStringAttr("fold_inst1")));
     Value inst = keep(seq::FirRegOp::create(b, inst1, hostClock,
                                             b.getStringAttr("fold_inst")));
@@ -1758,6 +1787,11 @@ LogicalResult StaticFolder::buildSim() {
   auto reg = [&](Value next, const Twine &regName) -> Value {
     return seq::FirRegOp::create(b, next, hostClock, b.getStringAttr(regName));
   };
+  // A copy of a register, kept apart from the register it copies.
+  auto copyReg = [&](Value next, const Twine &regName) -> Value {
+    return keep(
+        seq::FirRegOp::create(b, next, hostClock, b.getStringAttr(regName)));
+  };
   auto resetReg = [&](Value next, const Twine &regName, uint64_t init) -> Value {
     auto type = next.getType();
     return seq::FirRegOp::create(
@@ -1789,12 +1823,12 @@ LogicalResult StaticFolder::buildSim() {
   par3Next.setValue(comb::MuxOp::create(b, starting, notOf(par3), par3));
   Value pos2 = resetReg(pos3, "pos2", ii), par2 = reg(par3, "parity2");
   Value pos1 = resetReg(pos2, "pos1", ii), par1 = reg(par2, "parity1");
-  Value pos0 = resetReg(pos1, "pos0", ii), par0 = reg(par1, "parity0");
-  (void)par2;
+  Value pos0 = resetReg(pos1, "pos0", ii);
 
-  // Each class's slot table, its instance and passes two host cycles ahead,
-  // then one, then now.
+  // Each class's slot table, its instance and passes three host cycles ahead
+  // (the table's), two, one, then now.
   struct Controls {
+    Value inst3, state3;
     Value inst2, state2, ready2;
     Value inst1, inst, state, ready;
   };
@@ -1814,14 +1848,16 @@ LogicalResult StaticFolder::buildSim() {
     }
     auto &ctl = controls[c];
     auto prefix = cls.name;
-    ctl.state2 = reg(table(b, pos3, stateRow, 1), prefix + "_state2");
+    ctl.state3 = table(b, pos3, stateRow, 1);
+    ctl.state2 = reg(ctl.state3, prefix + "_state2");
     ctl.ready2 = reg(table(b, pos3, readyRow, 1), prefix + "_ready2");
     Value state1 = reg(ctl.state2, prefix + "_state1");
     Value ready1 = reg(ctl.ready2, prefix + "_ready1");
     ctl.state = reg(state1, prefix + "_state0");
     ctl.ready = reg(ready1, prefix + "_ready0");
     if (threads > 1) {
-      ctl.inst2 = reg(table(b, pos3, instRow, idxWidth), prefix + "_inst2");
+      ctl.inst3 = table(b, pos3, instRow, idxWidth);
+      ctl.inst2 = reg(ctl.inst3, prefix + "_inst2");
       ctl.inst1 = reg(ctl.inst2, prefix + "_inst1");
       ctl.inst = reg(ctl.inst1, prefix + "_inst0");
     }
@@ -1858,14 +1894,24 @@ LogicalResult StaticFolder::buildSim() {
     frameInput[p] = x;
     frameInputNext[p] = taken;
   }
+  // A class's own copy of a frame's input (as a reset, it drives much of the
+  // class's state).
+  std::map<std::pair<unsigned, unsigned>, Value> classFrameInputs;
+  auto classFrameInput = [&](unsigned p, unsigned c) -> Value {
+    Value &copy = classFrameInputs[{p, c}];
+    if (!copy)
+      copy = copyReg(frameInputNext[p],
+                     producers[p].name + "_frame_" + classes[c].name);
+    return copy;
+  };
 
   // The copies, their inputs backedges until the links are built.
   SmallVector<hw::InstanceOp> copies(classes.size());
   SmallVector<SmallVector<Backedge>> copyInputs(classes.size());
   for (auto [c, cls] : llvm::enumerate(classes)) {
-    SmallVector<Value> operands{hostClock, controls[c].state2};
+    SmallVector<Value> operands{hostClock, controls[c].state3};
     if (cls.threads() > 1)
-      operands.push_back(controls[c].inst2);
+      operands.push_back(controls[c].inst3);
     for (auto [i, type] : llvm::enumerate(cls.inputTypes)) {
       if (int(i) == cls.clockInput)
         continue;
@@ -1877,48 +1923,98 @@ LogicalResult StaticFolder::buildSim() {
                                        operands);
   }
 
+  // Groups of links, each with its own copy of its producer's controls and of
+  // the frame's parity, so that no control drives more than about
+  // `regionBits` bits of links.
+  struct LinkGroup {
+    std::string prefix;
+    Value state, ready, inst, bank;
+    uint64_t used = 0;
+  };
+  SmallVector<SmallVector<LinkGroup>> linkGroups(classes.size());
+  auto linkGroupFor = [&](unsigned c, uint64_t bits) -> LinkGroup & {
+    auto &groups = linkGroups[c];
+    if (groups.empty() || groups.back().used + bits > regionBits) {
+      LinkGroup group;
+      group.prefix = (classes[c].name + "_links" + Twine(groups.size())).str();
+      groups.push_back(group);
+    }
+    groups.back().used += bits;
+    return groups.back();
+  };
+
   // A link: a memory per read of a producer's bits, written by the producer
   // at its pass, at its instance (and an early one's next frame's bank), and
-  // read at an address the reader gives.
-  auto linkRead = [&](unsigned p, unsigned low, unsigned width, Value address,
-                      Value bank, const Twine &linkName) -> Value {
+  // read at an address the reader gives. A wide link is cut in pieces of at
+  // most `regionBits` bits, each in a group and read at its own copy of the
+  // address and the bank.
+  auto linkRead = [&](unsigned p, unsigned low, unsigned width,
+                      function_ref<Value()> address, function_ref<Value()> bank,
+                      const Twine &linkName) -> Value {
     auto &producer = producers[p];
-    auto &cls = classes[producer.cls];
-    auto &ctl = controls[producer.cls];
-    unsigned threads = cls.threads();
-    Value data = b.createOrFold<comb::ExtractOp>(
-        b.getIntegerType(width),
-        asBits(b, copies[producer.cls].getResult(producer.port)), low);
-    Value enable = producer.atReady ? ctl.ready : ctl.state;
+    unsigned c = producer.cls;
+    auto &ctl = controls[c];
+    unsigned threads = classes[c].threads();
     bool banked = !producer.late;
-    if (threads == 1 && !banked) {
-      auto next = backedges.get(data.getType());
-      Value r = reg(next, linkName);
-      next.setValue(comb::MuxOp::create(b, enable, data, r));
-      return r;
+    Value bits = asBits(b, copies[c].getResult(producer.port));
+    std::string baseName = linkName.str();
+    SmallVector<Value> pieces;
+    for (unsigned at = 0; at < width; at += regionBits) {
+      unsigned w = std::min<unsigned>(regionBits, width - at);
+      std::string name =
+          width > regionBits ? baseName + "_" + std::to_string(at) : baseName;
+      Value data = b.createOrFold<comb::ExtractOp>(b.getIntegerType(w), bits,
+                                                   low + at);
+      auto &group = linkGroupFor(c, w);
+      Value &enable = producer.atReady ? group.ready : group.state;
+      if (!enable) {
+        auto pass = producer.atReady ? "_ready" : "_state";
+        enable = copyReg(
+            copyReg(producer.atReady ? ctl.ready2 : ctl.state2,
+                    group.prefix + pass + "1"),
+            group.prefix + pass + "0");
+      }
+      if (threads == 1 && !banked) {
+        auto next = backedges.get(data.getType());
+        Value r = reg(next, name);
+        next.setValue(comb::MuxOp::create(b, enable, data, r));
+        pieces.push_back(r);
+        continue;
+      }
+      unsigned depth = threads * (banked ? 2 : 1);
+      auto memType = seq::FirMemType::get(context, depth, w, 1);
+      auto memory = seq::FirMemOp::create(
+          b, memType, /*readLatency=*/0, /*writeLatency=*/1,
+          seq::RUW::Undefined, seq::WUW::Undefined, b.getStringAttr(name),
+          hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+      // The bank in the high bit, the instance in the low ones.
+      SmallVector<Value> writeAddress, readAddress;
+      if (banked) {
+        if (!group.bank)
+          group.bank = notOf(copyReg(par1, group.prefix + "_parity0"));
+        writeAddress.push_back(group.bank);
+        readAddress.push_back(bank());
+      }
+      if (threads > 1) {
+        if (!group.inst)
+          group.inst = copyReg(copyReg(ctl.inst2, group.prefix + "_inst1"),
+                               group.prefix + "_inst0");
+        writeAddress.push_back(group.inst);
+        readAddress.push_back(address());
+      }
+      seq::FirMemWriteOp::create(b, memory,
+                                 b.createOrFold<comb::ConcatOp>(writeAddress),
+                                 hostClock, enable, data, Value{});
+      pieces.push_back(seq::FirMemReadOp::create(
+          b, memory, b.createOrFold<comb::ConcatOp>(readAddress), hostClock,
+          constant(1, 1)));
     }
-    unsigned depth = threads * (banked ? 2 : 1);
-    auto memType = seq::FirMemType::get(context, depth, width, 1);
-    auto memory = seq::FirMemOp::create(
-        b, memType, /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined,
-        seq::WUW::Undefined, b.getStringAttr(linkName), hw::InnerSymAttr{},
-        seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
-    // The bank in the high bit, the instance in the low ones.
-    SmallVector<Value> writeAddress, readAddress;
-    if (banked) {
-      writeAddress.push_back(notOf(par0));
-      readAddress.push_back(bank);
-    }
-    if (threads > 1) {
-      writeAddress.push_back(ctl.inst);
-      readAddress.push_back(address);
-    }
-    seq::FirMemWriteOp::create(b, memory,
-                               b.createOrFold<comb::ConcatOp>(writeAddress),
-                               hostClock, enable, data, Value{});
-    return seq::FirMemReadOp::create(b, memory,
-                                     b.createOrFold<comb::ConcatOp>(readAddress),
-                                     hostClock, constant(1, 1));
+    if (pieces.empty())
+      return constant(0, 0);
+    if (pieces.size() == 1)
+      return pieces[0];
+    return b.createOrFold<comb::ConcatOp>(
+        SmallVector<Value>(pieces.rbegin(), pieces.rend()));
   };
 
   // Each model input: its pieces at positions common to every instance; at
@@ -1989,7 +2085,8 @@ LogicalResult StaticFolder::buildSim() {
         }
         if (frame) {
           parts.push_back(b.createOrFold<comb::ExtractOp>(
-              b.getIntegerType(width), frameInput[key.first], key.second));
+              b.getIntegerType(width), classFrameInput(key.first, c),
+              key.second));
           at = end;
           continue;
         }
@@ -2020,20 +2117,29 @@ LogicalResult StaticFolder::buildSim() {
           continue;
         }
         unsigned pThreads = classes[producer.cls].threads();
-        Value address;
-        if (pThreads > 1) {
-          SmallVector<uint64_t> rows(threads, 0);
-          for (unsigned i = 0; i < threads; ++i)
-            if (sourceOf[i] == key)
-              rows[i] = producerInst[i];
-          unsigned w = llvm::Log2_32_Ceil(pThreads);
-          address = threads > 1 ? reg(table(b, ctl.inst2, rows, w),
-                                      consumer.name + "_addr" + Twine(at))
-                                : hw::ConstantOp::create(b, b.getIntegerType(w),
-                                                         rows[0]);
-        }
+        SmallVector<uint64_t> rows(threads, 0);
+        for (unsigned i = 0; i < threads; ++i)
+          if (sourceOf[i] == key)
+            rows[i] = producerInst[i];
+        unsigned w = llvm::Log2_32_Ceil(pThreads);
+        // Each piece of the link reads at its own copy of the address and
+        // the bank.
+        unsigned addressCopies = 0, bankCopies = 0;
+        auto address = [&]() -> Value {
+          if (pThreads <= 1)
+            return Value();
+          if (threads == 1)
+            return constant(w, rows[0]);
+          return copyReg(table(b, ctl.inst2, rows, w),
+                         consumer.name + "_addr" + Twine(at) + "_" +
+                             Twine(addressCopies++));
+        };
+        auto bank = [&]() -> Value {
+          return copyReg(par2, consumer.name + "_parity1_" + Twine(at) + "_" +
+                                   Twine(bankCopies++));
+        };
         sourceData[index] =
-            linkRead(key.first, key.second, width, address, par1,
+            linkRead(key.first, key.second, width, address, bank,
                      producer.name + "_to_" + consumer.name + "_" + Twine(at));
       }
       Value data = sourceData[0];
@@ -2042,13 +2148,26 @@ LogicalResult StaticFolder::buildSim() {
         for (unsigned i = 0; i < threads; ++i)
           rows[i] = sources[sourceOf[i]];
         unsigned w = llvm::Log2_32_Ceil(sources.size());
-        Value select = reg(table(b, ctl.inst2, rows, w),
-                           consumer.name + "_select" + Twine(at));
-        SmallVector<Value> elements;
-        for (uint64_t s = (uint64_t(1) << w); s-- > 0;)
-          elements.push_back(sourceData[std::min<uint64_t>(s, sources.size() - 1)]);
-        data = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elements),
-                                      select);
+        // The choice, in pieces of at most `regionBits` bits, each chosen by
+        // its own copy of the select.
+        SmallVector<Value> chosen;
+        for (unsigned low = 0; low < width; low += regionBits) {
+          unsigned n = std::min<unsigned>(regionBits, width - low);
+          Value select = copyReg(table(b, ctl.inst2, rows, w),
+                                 consumer.name + "_select" + Twine(at) + "_" +
+                                     Twine(low));
+          SmallVector<Value> elements;
+          for (uint64_t s = (uint64_t(1) << w); s-- > 0;)
+            elements.push_back(b.createOrFold<comb::ExtractOp>(
+                b.getIntegerType(n),
+                sourceData[std::min<uint64_t>(s, sources.size() - 1)], low));
+          chosen.push_back(hw::ArrayGetOp::create(
+              b, hw::ArrayCreateOp::create(b, elements), select));
+        }
+        data = chosen.size() == 1
+                   ? chosen[0]
+                   : b.createOrFold<comb::ConcatOp>(
+                         SmallVector<Value>(chosen.rbegin(), chosen.rend()));
       }
       registeredAt.push_back({unsigned(parts.size()), width});
       registered.push_back(data);
@@ -2100,13 +2219,20 @@ LogicalResult StaticFolder::buildSim() {
             piece.low));
         continue;
       }
-      Value address;
       unsigned pThreads = classes[producer.cls].threads();
-      if (pThreads > 1)
-        address = constant(llvm::Log2_32_Ceil(pThreads), piece.inst);
+      unsigned bankCopies = 0;
+      unsigned inst = piece.inst;
+      std::string bankName = consumer.name + "_parity0_";
+      auto address = [&]() -> Value {
+        if (pThreads <= 1)
+          return Value();
+        return constant(llvm::Log2_32_Ceil(pThreads), inst);
+      };
+      auto bank = [&]() -> Value {
+        return notOf(copyReg(par1, bankName + Twine(bankCopies++)));
+      };
       bits.push_back(linkRead(piece.producer, piece.low, piece.width, address,
-                              notOf(par0),
-                              producer.name + "_to_" + consumer.name));
+                              bank, producer.name + "_to_" + consumer.name));
     }
     Value data = bits.empty() ? constant(0, 0)
                  : bits.size() == 1

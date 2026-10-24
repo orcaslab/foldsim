@@ -296,8 +296,8 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "The netlist to simulate">,
     Option<"simName", "sim", "std::string", "\"foldsim_sim\"",
            "The name of the simulator module">,
-    Option<"regionBits", "region-bits", "unsigned", "2048",
-           "The most state bits a region's copy of the slot controls drives">,
+    Option<"regionBits", "region-bits", "unsigned", "512",
+           "The most state or link bits a copy of the slot controls drives">,
     Option<"report", "report", "std::string", "",
            "A file to write the schedule to">,
   ];
