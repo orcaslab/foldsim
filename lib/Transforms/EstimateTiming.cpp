@@ -25,7 +25,9 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/Path.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
@@ -274,6 +276,7 @@ public:
   void writeEndPoints(raw_ostream &os, unsigned minLevels);
   void writeInstances(raw_ostream &os);
   void writePorts(raw_ostream &os, ArrayRef<std::string> modules);
+  void writePaths(raw_ostream &os, unsigned minLevels);
   void writeReport(raw_ostream &os, unsigned topPaths,
                    ArrayRef<std::string> trace);
 
@@ -1091,6 +1094,94 @@ void Timing::writePorts(raw_ostream &os, ArrayRef<std::string> modules) {
   }
 }
 
+/// One JSON line per pair of start and end registers whose deepest bit has
+/// at least `minLevels` levels, deepest first: that bit's path op by op, from
+/// the end point back to its start, and the pair's end point bits. The bits
+/// of a register from one start register share their path's shape, so the
+/// pair is what there is to read.
+void Timing::writePaths(raw_ostream &os, unsigned minLevels) {
+  SmallVector<unsigned> deep;
+  for (unsigned i = 0, e = endPoints.size(); i < e; ++i)
+    if ((unsigned)endPoints[i].levels >= minLevels)
+      deep.push_back(i);
+  std::stable_sort(deep.begin(), deep.end(), [&](unsigned a, unsigned b) {
+    return endPoints[a].levels > endPoints[b].levels;
+  });
+
+  struct Pair {
+    unsigned end, start, bits;
+  };
+  SmallVector<Pair> pairs;
+  DenseMap<std::tuple<unsigned, Operation *, StringRef, unsigned, Value>,
+           unsigned>
+      index;
+  for (unsigned i : deep) {
+    auto &end = endPoints[i];
+    uint32_t fanout;
+    unsigned crossings;
+    unsigned start = startOf(end.ctx, end.node, fanout, crossings);
+    auto [it, inserted] = index.try_emplace(
+        {end.ctx, end.op, end.port, nodes[start].ctx, nodes[start].value},
+        pairs.size());
+    if (inserted)
+      pairs.push_back({i, start, 0});
+    ++pairs[it->second].bits;
+  }
+
+  auto str = [](auto print) {
+    std::string s;
+    llvm::raw_string_ostream os(s);
+    print(os);
+    return s;
+  };
+  // Mapped logic has no name; the first source line it came from names it.
+  auto source = [&](unsigned id) {
+    std::string s;
+    nodes[id].value.getLoc()->walk([&](Location loc) {
+      auto file = dyn_cast<FileLineColLoc>(loc);
+      if (!file)
+        return WalkResult::advance();
+      s = (llvm::sys::path::filename(file.getFilename().getValue()) + ":" +
+           Twine(file.getLine()))
+              .str();
+      return WalkResult::interrupt();
+    });
+    return s;
+  };
+  for (auto [i, start, bits] : pairs) {
+    auto &end = endPoints[i];
+    llvm::json::OStream j(os);
+    j.object([&] {
+      j.attribute("levels", end.levels);
+      j.attribute("retimed", end.retimed);
+      j.attribute("bits", bits);
+      j.attribute("kind", end.port);
+      j.attribute("start_kind", kindName(nodes[start].kind));
+      j.attribute("start_inst", nodes[start].ctx);
+      j.attribute("start",
+                  str([&](raw_ostream &s) { printName(s, start); }));
+      j.attribute("end_inst", end.ctx);
+      j.attribute("end", str([&](raw_ostream &s) {
+                    printOp(s, end.op, end.port, end.bit);
+                  }));
+      j.attributeArray("ops", [&] {
+        for (unsigned id = end.node; id != kNone; id = nodes[id].pred) {
+          auto &n = nodes[id];
+          j.array([&] {
+            j.value(n.levels);
+            j.value(kindName(n.kind));
+            j.value(n.fanout);
+            j.value(n.ctx);
+            j.value(str([&](raw_ostream &s) { printName(s, id); }));
+            j.value(source(id));
+          });
+        }
+      });
+    });
+    os << '\n';
+  }
+}
+
 void Timing::printPath(raw_ostream &os, const EndPoint &end, unsigned rank) {
   os << "#" << rank << " levels " << end.levels << ": "
      << path(end.ctx) << '/';
@@ -1383,6 +1474,9 @@ void EstimateTimingPass::runOnOperation() {
                    [&](raw_ostream &os) { timing.writeInstances(os); })) ||
       failed(write(ports, [&](raw_ostream &os) {
         timing.writePorts(os, portModules);
+      })) ||
+      failed(write(paths, [&](raw_ostream &os) {
+        timing.writePaths(os, pathLevels);
       })) ||
       failed(write(report, [&](raw_ostream &os) {
         timing.writeReport(os, topPaths, trace);

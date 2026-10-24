@@ -472,6 +472,14 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     the `top-paths` deepest paths, op by op, to `report`. Leaves the design
     as it is.
 
+    `paths` lists every deep path once per pair of start and end registers,
+    as JSON lines, deepest first: the pair's deepest bit, if it has at least
+    `path-levels` levels, with its levels, retimed levels, end kind, start
+    and end (instance id and name), the number of end point bits the pair
+    has, and `ops`, the path from the end point back to its start as
+    [levels, kind, fanout, instance id, name, source]: the source is the
+    first file:line of the op's location, which names mapped logic.
+
     With `retime-levels`, the `retimed` column estimates the depth after
     Vivado's global retiming to a period of that many levels: an end point
     deeper than the period borrows the room of its neighbour stages, its
@@ -505,6 +513,12 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     ListOption<"portModules", "port-modules", "std::string",
                "Modules (and their specializations) whose instances' ports "
                "to report: the levels at each input and behind each output">,
+    Option<"paths", "paths", "std::string", "",
+           "Deep paths, op by op, one per pair of start and end registers "
+           "(JSON lines)">,
+    Option<"pathLevels", "path-levels", "unsigned", "12",
+           "Only write the paths of pairs whose deepest bit has at least "
+           "this many levels">,
     Option<"retimeLevels", "retime-levels", "unsigned", "0",
            "Also estimate each end point's depth after Vivado's retiming "
            "to a period of this many levels (0: off)">,
