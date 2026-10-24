@@ -683,7 +683,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     length = std::max(length, slotOf[n] + 1);
   }
 
-  // Across frames: an instance's next read of its state after its write; an
+  // Across frames: an instance's next read of its state after its write (a
+  // threaded class's registers written a host cycle late, from a stage); an
   // early output's reads in the next frame after its write.
   auto first = [&](unsigned c, unsigned i) {
     int s = slots[c * 2 + kState][i];
@@ -693,7 +694,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
   for (auto [c, cls] : llvm::enumerate(classes))
     for (unsigned i = 0; i < cls.threads(); ++i) {
       int s = slots[c * 2 + kState][i];
-      length = std::max(length, s - first(c, i) + (cls.syncReads ? 3 : 2));
+      int latency = (cls.syncReads ? 3 : 2) + (cls.threads() > 1 ? 1 : 0);
+      length = std::max(length, s - first(c, i) + latency);
     }
   for (auto &consumer : consumers) {
     if (consumer.cls < 0)
@@ -1481,7 +1483,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   };
 
   struct Region {
-    Value inst1, inst, state;
+    std::string prefix;
+    Value inst1, inst, state, instStaged;
   };
   SmallVector<Region> regions;
   uint64_t regionUsed = regionBits;
@@ -1490,6 +1493,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       Region region;
       auto &ahead = aheadFor();
       std::string prefix = ("region" + Twine(regions.size())).str();
+      region.prefix = prefix;
       Value state1 = keep(seq::FirRegOp::create(
           b, ahead.state2, hostClock, b.getStringAttr(prefix + "_state1")));
       region.state = keep(seq::FirRegOp::create(
@@ -1564,11 +1568,23 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             b, data, hostClock, b.getStringAttr(reg.getName() + "_read"));
         value = b.createOrFold<hw::BitcastOp>(reg.getType(), read);
         if (!write.holds) {
+          // Written a host cycle after the state pass, from a stage, so that
+          // the register's next value ends at a flop, not at the memory's
+          // write port.
           Value enable = region.state;
           if (write.enable)
             enable = comb::AndOp::create(b, enable, write.enable);
-          seq::FirMemWriteOp::create(b, memory, region.inst, hostClock, enable,
-                                     asBits(b, write.data), Value{});
+          if (!region.instStaged)
+            region.instStaged = keep(seq::FirRegOp::create(
+                b, region.inst, hostClock,
+                b.getStringAttr(region.prefix + "_inst_staged")));
+          Value stagedEnable = seq::FirRegOp::create(
+              b, enable, hostClock, b.getStringAttr(reg.getName() + "_wen"));
+          Value stagedData =
+              seq::FirRegOp::create(b, asBits(b, write.data), hostClock,
+                                    b.getStringAttr(reg.getName() + "_wdata"));
+          seq::FirMemWriteOp::create(b, memory, region.instStaged, hostClock,
+                                     stagedEnable, stagedData, Value{});
         }
       }
       reg.getResult().replaceAllUsesWith(value);
