@@ -16,7 +16,7 @@ LLVM: CIRCT imports and lowers the design (`circt-verilog`, `circt-opt`,
 
 | Path | What |
 |---|---|
-| `lib/Transforms` | the passes: `foldsim-extract-models`, `foldsim-fuse-models`, `foldsim-fame5`, `foldsim-compose`, and the timing screen `foldsim-estimate-timing` |
+| `lib/Transforms` | the passes: `foldsim-extract-models`, `foldsim-fuse-models`, `foldsim-fame5`, `foldsim-compose`, and the logic screen `foldsim-estimate-timing` |
 | `tools/foldsim-opt` | runs them, with CIRCT's HW, Comb, Seq and SV passes |
 | `tools/foldsim` | the driver: design in, simulator out |
 | `test` | lit tests (`check-foldsim`): the passes' output, and simulators run with Verilator |

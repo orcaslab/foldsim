@@ -1,4 +1,4 @@
-// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-timing-map,foldsim-estimate-timing{output=- report= top=Top})' -o /dev/null | FileCheck %s
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-screen-map,foldsim-estimate-timing{output=- report= top=Top})' -o /dev/null | FileCheck %s
 
 // An equality compare of two bits and the AND after it pack into one LUT6,
 // across the boundary of the inlined `Eq`.

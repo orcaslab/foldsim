@@ -378,7 +378,7 @@ def KeepModules : Pass<"foldsim-keep-modules", "::mlir::ModuleOp"> {
     Makes the modules named in `modules` public, so that
     `hw-flatten-modules`, which inlines only private modules, keeps their
     instances. A name also matches its specializations (`VX_elastic_buffer`
-    matches `VX_elastic_buffer_12`). Run before `foldsim-timing-map` to read
+    matches `VX_elastic_buffer_12`). Run before `foldsim-screen-map` to read
     the depth at those instances' ports (`foldsim-estimate-timing`'s
     `ports`); LUTs then no longer pack across their boundaries.
   }];
@@ -448,7 +448,7 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     hw/syn/xilinx/platforms names them; the two differ only in their DSPs.
 
     `family=asap7` counts cell stages of an ASAP7 netlist mapped by
-    `foldsim-timing-map-asic` (3-input cuts) instead: a cell
+    `foldsim-screen-map-asic` (3-input cuts) instead: a cell
     (`comb.truth_table`, or an and-inverter gate) is a stage; an adder bit from bit j to
     bit i is a prefix adder, 2 + ceil(log2(i - j + 1)); a compare,
     1 + ceil(log2(span)); a product, its partial products, a Dadda tree of
