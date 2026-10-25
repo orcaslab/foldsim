@@ -6,22 +6,26 @@ costs k copies of its logic and k stores of its state, each n/k instances deep,
 and the frame it allows. For every choice of k per class:
 
   II      exact: the scheduler's (foldsim-fold-static schedule-only);
-  H now   max(II, the last output's slot + 8): the frame's round trip through
-          the memory endpoint's tokens, until the endpoint is scheduled in it;
   LUTs    the IR's estimate per class (foldsim_cost.py), calibrated per class
           against Vivado's hierarchical utilization of a build of the design;
-  period  a fit of the routed period against the largest copy's LUTs, over
-          the calibrated builds (constant with one build, none without).
+  sites   the LUT sites the placer needs, distributed RAM weighted, against
+          the V80 dynamic region (fits);
+  period  a fit of the routed period against the largest copy's LUTs and,
+          with a logic screen of every build, the netlist's depth.
 
-A simulated cycle takes II x period ns (H now x period today). Reports the
-Pareto front of ns per simulated cycle against LUTs and picks the fastest
-point within a LUT budget. The model ranks and prunes; it does not promise a
-clock: the period term is the weak one (retiming and routing dominate it).
+A simulated cycle takes II x period ns: since the memory endpoint is in the
+frame, H = II. Reports the Pareto front of ns per simulated cycle against LUTs,
+the fastest point that places within a LUT budget, and the unfolded target's
+area (what an unfolded simulator needs at the least). The model ranks and
+prunes; it does not promise a clock: retiming and routing dominate the period.
 
 usage:
   foldsim_degree.py calibrate --models <models.mlir> --schedule <schedule.txt>
       --util <routed_util_hier.rpt> --timing <routed_timing_summary.rpt>
-      --period <ns> --name <build> --out <calibration.json>
+      --period <ns> --name <build> --out <calibration.json> [--screen <dir>]
+  foldsim_degree.py fit --calibration <calibration.json>
+  foldsim_degree.py explore --models <models.mlir> --module <top> --workdir <dir>
+      [--calibration F] [--screen <dir>]
   foldsim.py ... --static --copies auto [--lut-budget N] [--degree-calibration F]
 """
 import argparse
@@ -36,6 +40,26 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import foldsim_cost as cost  # noqa: E402
+
+
+# The V80 dynamic region's LUT sites as the placer counts them, and what a LUT
+# of distributed RAM costs there in sites: a RAM64M8 claims its whole SLICEM
+# however few bits it holds. Fitted to the one full image that failed to
+# place (1,094,665 logic + 547,062 LUTRAM LUTs needed 3,326,213 sites of
+# 3,269,043); images at 1.9M sites placed.
+PLACE_SITES = 3269043
+LUTRAM_SITES = 4.08
+# The V80's block RAMs (RAMB36E5).
+BRAM_SITES = 3741
+# Placement is not routing: keep a margin for a design that also routes.
+PLACE_MARGIN = 0.9
+
+
+def placement(logic, lutram, bram=0.0):
+    """(LUT sites the placer needs, whether they and the block RAMs fit the
+    region with margin)."""
+    sites = logic + LUTRAM_SITES * lutram
+    return sites, sites <= PLACE_MARGIN * PLACE_SITES and bram <= PLACE_MARGIN * BRAM_SITES
 
 
 def parse_schedule(text):
@@ -102,6 +126,7 @@ def read_util(path):
         name = name.strip()
         if depth == 1:
             total = lut
+            totals = dict(logic=logic, lutram=lutram)
         if depth != 5:
             continue
         m = re.match(r'(.+?)(_copy\d+)?_copy$', name)
@@ -112,7 +137,7 @@ def read_util(path):
             c['lutram'] += lutram
             c['lut'] += lut
     rest = total - sum(c['lut'] for c in copies.values())
-    return copies, rest, total
+    return copies, rest, total, totals
 
 
 def read_wns(path):
@@ -124,10 +149,12 @@ def read_wns(path):
 def calibrate(a):
     ii, classes, _ = parse_schedule(open(a.schedule).read())
     est = class_estimates(a.models, classes)
-    copies, rest, total = read_util(a.util)
+    copies, rest, total, totals = read_util(a.util)
     period = a.period - read_wns(a.timing)
     cal = json.load(open(a.out)) if os.path.exists(a.out) else {}
-    build = dict(name=a.name, luts=total, rest=rest, period=period, classes={})
+    build = dict(name=a.name, luts=total, rest=rest, period=period, classes={}, **totals)
+    if a.screen:
+        build['depth'] = screen_depth(a.screen)
     for name, n in classes.items():
         base = re.sub(r'_copy\d+$', '', name)
         m = copies.get(base)
@@ -182,19 +209,103 @@ def rest_of(cal, est_total):
     return min(builds, key=lambda b: abs(math.log(max(size(b), 1) / max(est_total, 1))))['rest']
 
 
-def period_fit(cal):
-    """Least squares of period = p0 + p1 log2(largest copy LUTs), p1 >= 0."""
-    pts = [(math.log2(b['max_copy']), b['period']) for b in (cal or {}).get('builds', [])]
-    if not pts:
+def area(cal, est, classes, degree, rest):
+    """LUTs of one fold degree ({class: copies}, 1 when absent): logic and
+    distributed RAM apart, the sites they take, and the largest copy."""
+    logic = lutram = bram = largest = 0.0
+    for c, n in classes.items():
+        k = degree.get(c, 1)
+        kappa, lam = factors(cal, c, est[c]['lut'])
+        lr, br = state_lutram(est[c], n // k)
+        logic += k * kappa * est[c]['lut']
+        lutram += k * lam * lr
+        bram += k * br
+        largest = max(largest, kappa * est[c]['lut'] + lam * lr)
+    logic += rest
+    sites, fits = placement(logic, lutram, bram)
+    return dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
+                sites=round(sites), fits=fits, bram=round(bram, 1), largest_copy=round(largest))
+
+
+# The screen's measure of a netlist's depth for the period fit: log2 of the end
+# points at least this many levels deep. A count, not the deepest path: the
+# few deepest are what Vivado retimes or optimizes away (a modulo by a
+# constant), a unit deep throughout is not.
+DEPTH_LEVELS = 14
+
+
+def screen_depth(screen):
+    """Depth of a screened netlist (ci/logic_screen.py screen <dir>)."""
+    import csv
+    deep = sum(1 for r in csv.DictReader(open(f'{screen}/endpoints.csv'))
+               if int(r['levels']) >= DEPTH_LEVELS)
+    return round(math.log2(max(deep, 1)), 3)
+
+
+def lstsq(rows, ys):
+    """Least squares with the normal equations (few points, few terms)."""
+    n = len(rows[0])
+    a = [[sum(r[i] * r[j] for r in rows) for j in range(n)] for i in range(n)]
+    b = [sum(r[i] * y for r, y in zip(rows, ys)) for i in range(n)]
+    for i in range(n):
+        p = max(range(i, n), key=lambda r: abs(a[r][i]))
+        a[i], a[p], b[i], b[p] = a[p], a[i], b[p], b[i]
+        if abs(a[i][i]) < 1e-12:
+            return None
+        for r in range(n):
+            if r != i:
+                f = a[r][i] / a[i][i]
+                a[r] = [x - f * y for x, y in zip(a[r], a[i])]
+                b[r] -= f * b[i]
+    return [b[i] / a[i][i] for i in range(n)]
+
+
+TERMS = {'const': (), 'size': ('size',), 'size+depth': ('size', 'depth')}
+
+
+def fit_row(terms, largest, depth):
+    return [1.0] + [math.log2(max(largest, 1.0)) if t == 'size' else depth for t in terms]
+
+
+def fit_terms(builds, terms):
+    """Least squares of the period over the builds, and each build's
+    leave-one-out error (empty when the builds are too few)."""
+    rows = [fit_row(terms, b['max_copy'], b.get('depth', 0.0)) for b in builds]
+    ys = [b['period'] for b in builds]
+    coef = lstsq(rows, ys)
+    if coef is None:
         return None
-    if len(pts) == 1:
-        return pts[0][1], 0.0, pts
-    n = len(pts)
-    mx = sum(x for x, _ in pts) / n
-    my = sum(y for _, y in pts) / n
-    sxx = sum((x - mx) ** 2 for x, _ in pts)
-    p1 = max(0.0, sum((x - mx) * (y - my) for x, y in pts) / sxx) if sxx else 0.0
-    return my - p1 * mx, p1, pts
+    loo = {}
+    if len(builds) > len(coef) + 1:
+        for i, b in enumerate(builds):
+            c = lstsq(rows[:i] + rows[i + 1:], ys[:i] + ys[i + 1:])
+            if c is None:
+                return dict(coef=coef, terms=terms, loo={}, rms=None)
+            loo[b['name']] = round(sum(x * y for x, y in zip(c, rows[i])) - ys[i], 3)
+    rms = math.sqrt(sum(e * e for e in loo.values()) / len(loo)) if loo else None
+    return dict(coef=coef, terms=terms, loo=loo, rms=rms and round(rms, 3))
+
+
+def period_fit(cal, use_depth=True):
+    """The period fit over the calibrated builds: of a constant, the largest
+    copy's size, and size plus the screen's depth (with `use_depth` and a
+    screen of every build), the one with the least leave-one-out error; size
+    alone when the builds are too few to tell."""
+    builds = (cal or {}).get('builds', [])
+    if not builds:
+        return None
+    names = ['const', 'size'] + (['size+depth'] if use_depth and all(
+        'depth' in b for b in builds) else [])
+    fits = [f for f in (fit_terms(builds, TERMS[n]) for n in names) if f]
+    scored = [f for f in fits if f['rms'] is not None]
+    if scored:
+        return min(scored, key=lambda f: f['rms'])
+    return next((f for f in fits if f['terms'] == TERMS['size']), fits[0])
+
+
+def fit_period(fit, largest, depth):
+    """A candidate's period from the fit."""
+    return sum(x * y for x, y in zip(fit['coef'], fit_row(fit['terms'], largest, depth or 0.0)))
 
 
 def pow2_divisors(n):
@@ -202,16 +313,18 @@ def pow2_divisors(n):
 
 
 def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
-             jobs=4, budget=0):
-    """Every choice of copies per class: II, LUTs, period, ns per cycle; the
-    Pareto front, and the fastest point within `budget` LUTs (0: none)."""
+             jobs=4, budget=0, depth=None):
+    """Every choice of copies per class: II, LUTs, whether it places, period
+    and ns per cycle; the Pareto front, and the fastest point that places and
+    stays within `budget` LUTs (0: none). `depth` is the design's screen depth
+    (screen_depth), for a fit that has the depth term."""
     _, classes, _ = parse_schedule(base_schedule)
     est = class_estimates(models, classes)
     rest = rest_of(cal, sum(est[c]['lut'] for c in classes))
     names = [c for c, n in classes.items() if n > 1]
     choices = [pow2_divisors(classes[c]) for c in names]
     os.makedirs(workdir, exist_ok=True)
-    fit = period_fit(cal)
+    fit = period_fit(cal, use_depth=depth is not None)
 
     def one(ks):
         copies = ','.join(f'{c}:{k}' for c, k in zip(names, ks) if k > 1)
@@ -225,26 +338,13 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
                             '-o', os.devnull], capture_output=True, text=True)
         if r.returncode:
             return dict(copies=copies or '-', error=r.stderr.strip().splitlines()[-1:])
-        ii, _, out_slot = parse_schedule(open(report).read())
-        luts = bram = 0.0
-        largest = 0.0
-        for c, n in classes.items():
-            k = dict(zip(names, ks)).get(c, 1)
-            kappa, lam = factors(cal, c, est[c]['lut'])
-            lr, br = state_lutram(est[c], n // k)
-            per_copy = kappa * est[c]['lut'] + lam * lr
-            luts += k * per_copy
-            bram += k * br
-            largest = max(largest, per_copy)
-        luts += rest
-        h_now = max(ii, out_slot + 8)
-        res = dict(copies=copies or '-', ii=ii, h_now=h_now, luts=round(luts),
-                   bram=round(bram, 1), largest_copy=round(largest))
+        ii, _, _ = parse_schedule(open(report).read())
+        res = dict(copies=copies or '-', ii=ii,
+                   **area(cal, est, classes, dict(zip(names, ks)), rest))
         if fit:
-            p0, p1, _ = fit
-            period = p0 + p1 * math.log2(max(largest, 1.0))
+            period = fit_period(fit, res['largest_copy'], depth)
             res.update(period=round(period, 3), mhz=round(1000 / period, 1),
-                       ns=round(ii * period, 1), ns_now=round(h_now * period, 1))
+                       ns=round(ii * period, 1))
         return res
 
     with ThreadPoolExecutor(max_workers=jobs) as pool:
@@ -255,17 +355,20 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
     for p in sorted(good, key=lambda p: (p['luts'], p[key])):
         if not front or p[key] < front[-1][key]:
             front.append(p)
-    within = [p for p in good if not budget or p['luts'] <= budget]
+    within = [p for p in good if p['fits'] and (not budget or p['luts'] <= budget)]
     pick = min(within, key=lambda p: (p[key], p['luts'])) if within else None
-    return dict(classes=classes, points=points, front=front, pick=pick,
-                budget=budget, fit=fit and dict(p0=fit[0], p1=fit[1], points=fit[2]))
+    # Every instance its own copy and its state in flip-flops: the target's
+    # own area, which an unfolded simulator (FireSim) needs at the least.
+    unfolded = area(cal, est, classes, dict(classes), rest)
+    return dict(classes=classes, points=points, front=front, pick=pick, budget=budget,
+                unfolded=unfolded, depth=depth, fit=fit)
 
 
 def table(result):
     lines = []
     fit = result['fit']
-    cols = ['copies', 'ii', 'h_now', 'luts', 'bram', 'largest_copy'] + \
-        (['mhz', 'ns', 'ns_now'] if fit else [])
+    cols = ['copies', 'ii', 'luts', 'lutram', 'sites', 'fits', 'bram', 'largest_copy'] + \
+        (['mhz', 'ns'] if fit else [])
     lines.append(' '.join(f'{c:>12}' if c != 'copies' else f'{c:<60}' for c in cols))
     front = {id(p) for p in result['front']}
     for p in sorted(result['points'], key=lambda p: p.get('luts', 0)):
@@ -273,13 +376,22 @@ def table(result):
             lines.append(f"{p['copies']:<60} error: {' '.join(p['error'])}")
             continue
         mark = (' *' if id(p) in front else '') + (' <- pick' if p is result['pick'] else '')
-        lines.append(' '.join(f'{p[c]:>12}' if c != 'copies' else f'{p[c]:<60}'
+        lines.append(' '.join(f'{str(p[c]):>12}' if c != 'copies' else f'{p[c]:<60}'
                               for c in cols) + mark)
+    u = result['unfolded']
+    lines.append(f"{'unfolded (every instance its own copy)':<60} {'-':>12} {u['luts']:>12} "
+                 f"{u['lutram']:>12} {u['sites']:>12} {str(u['fits']):>12} {u['bram']:>12}")
     lines.append('* Pareto front (ns per simulated cycle against LUTs); '
-                 f"budget {result['budget'] or 'none'}")
+                 f"budget {result['budget'] or 'none'}; fits: {PLACE_MARGIN:.0%} of "
+                 f'{PLACE_SITES} V80 LUT sites (a LUTRAM LUT {LUTRAM_SITES} sites) and of '
+                 f'{BRAM_SITES} RAMB36')
     if fit:
-        lines.append(f"period = {fit['p0']:.3f} + {fit['p1']:.3f} log2(largest copy LUTs) ns, "
-                     f"over {len(fit['points'])} build(s)")
+        c = fit['coef']
+        terms = ' + '.join([f'{c[0]:.3f}'] + [
+            f'{x:.3f} ' + ('log2(largest copy LUTs)' if t == 'size' else
+                           f'log2(end points >= {DEPTH_LEVELS} levels) [{result["depth"]}]')
+            for x, t in zip(c[1:], fit['terms'])])
+        lines.append(f'period = {terms} ns; leave-one-out RMS {fit["rms"]} ns {fit["loo"] or ""}')
     else:
         lines.append('no calibration: LUTs uncalibrated, no period term (ranked by II)')
     return '\n'.join(lines)
@@ -296,6 +408,8 @@ def main():
     c.add_argument('--period', type=float, required=True)
     c.add_argument('--name', required=True)
     c.add_argument('--out', required=True)
+    c.add_argument('--screen', default='',
+                   help='the logic screen of the build\'s netlist (ci/logic_screen.py screen)')
     e = sub.add_parser('explore', help='the front of a models IR')
     e.add_argument('--models', required=True)
     e.add_argument('--module', required=True)
@@ -304,7 +418,19 @@ def main():
     e.add_argument('--calibration', default='')
     e.add_argument('--lut-budget', type=int, default=0)
     e.add_argument('--jobs', type=int, default=4)
+    e.add_argument('--screen', default='',
+                   help='the logic screen of the design\'s netlist, for the depth term')
+    f = sub.add_parser('fit', help='the period fit of a calibration and its leave-one-out error')
+    f.add_argument('--calibration', required=True)
     a = ap.parse_args()
+    if a.cmd == 'fit':
+        cal = json.load(open(a.calibration))
+        for name, terms in TERMS.items():
+            if 'depth' in terms and not all('depth' in b for b in cal['builds']):
+                continue
+            print(name, fit_terms(cal['builds'], terms))
+        print('chosen', period_fit(cal)['terms'] or 'const')
+        return 0
     if a.cmd == 'calibrate':
         return calibrate(a)
     cal = json.load(open(a.calibration)) if a.calibration else None
@@ -318,7 +444,7 @@ def main():
     if r.returncode:
         sys.exit(r.stderr)
     result = evaluate(a.models, open(base).read(), fold, a.foldsim_opt, a.workdir, cal,
-                      a.jobs, a.lut_budget)
+                      a.jobs, a.lut_budget, screen_depth(a.screen) if a.screen else None)
     print(table(result))
     json.dump(result, open(os.path.join(a.workdir, 'degree.json'), 'w'), indent=1,
               default=str)
