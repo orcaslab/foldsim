@@ -524,6 +524,20 @@ def KeepModules : Pass<"foldsim-keep-modules", "::mlir::ModuleOp"> {
   ];
 }
 
+def SyncAsyncResets : Pass<"foldsim-sync-async-resets", "::circt::hw::HWModuleOp"> {
+  let summary = "Simulate registers with an asynchronous reset cycle by cycle";
+  let description = [{
+    A simulator steps the target a cycle at a time, with the reset one of the
+    cycle's inputs. A register reset asynchronously then holds its reset value
+    in every cycle the reset is asserted, from that cycle's start, and its
+    value otherwise. It becomes a register reset synchronously, which holds
+    the reset value from the cycle after, read through a select on the reset:
+    the same value in every cycle. Its next value, which a reset overrides,
+    is unchanged.
+  }];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect"];
+}
+
 def FoldZeroWidth : Pass<"foldsim-fold-zero-width", "::circt::hw::HWModuleOp"> {
   let summary = "Replace zero-width combinational values with constants";
   let description = [{

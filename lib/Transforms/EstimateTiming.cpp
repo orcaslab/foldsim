@@ -38,6 +38,7 @@ namespace foldsim {
 #define GEN_PASS_DEF_KEEPMODULES
 #define GEN_PASS_DEF_LOWEREQUALITY
 #define GEN_PASS_DEF_LOWERCONSTANTDIVISION
+#define GEN_PASS_DEF_SYNCASYNCRESETS
 #include "foldsim/Passes.h.inc"
 } // namespace foldsim
 
@@ -1293,6 +1294,29 @@ struct FoldZeroWidthPass
             hw::ConstantOp::create(b, op->getLoc(), APInt::getZero(0)));
       op->erase();
     });
+  }
+};
+
+struct SyncAsyncResetsPass
+    : public foldsim::impl::SyncAsyncResetsBase<SyncAsyncResetsPass> {
+  void runOnOperation() override {
+    SmallVector<seq::FirRegOp> regs;
+    getOperation().walk([&](seq::FirRegOp reg) {
+      if (reg.getIsAsync())
+        regs.push_back(reg);
+    });
+    for (auto reg : regs) {
+      OpBuilder b(reg);
+      auto sync = seq::FirRegOp::create(
+          b, reg.getLoc(), reg.getNext(), reg.getClk(), reg.getNameAttr(),
+          reg.getReset(), reg.getResetValue(), reg.getInnerSymAttr(),
+          /*isAsync=*/false, reg.getPresetAttr());
+      b.setInsertionPointAfter(sync);
+      auto value = comb::MuxOp::create(b, reg.getLoc(), reg.getReset(),
+                                       reg.getResetValue(), sync);
+      reg.getResult().replaceAllUsesWith(value.getResult());
+      reg.erase();
+    }
   }
 };
 
