@@ -308,6 +308,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "parents', and the slot tables driven by a sequencer tree along "
            "the class tree, each class's sequencer a register from its "
            "parent's">,
+    Option<"scheduleOnly", "schedule-only", "bool", "false",
+           "Stop once the schedule is chosen and reported, building no "
+           "simulator: a search over the copies compares their frames">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

@@ -145,9 +145,10 @@ class StaticFolder {
 public:
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
                unsigned regionBits, StringRef report,
-               ArrayRef<std::string> copies, bool nest)
+               ArrayRef<std::string> copies, bool nest, bool scheduleOnly)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
-        reportPath(report), copies(copies), nest(nest) {}
+        reportPath(report), copies(copies), nest(nest),
+        scheduleOnly(scheduleOnly) {}
   LogicalResult run();
 
 private:
@@ -177,6 +178,7 @@ private:
   /// instance names), and the instances that are a netlist's own logic.
   DenseMap<Operation *, std::string> containerOf;
   DenseSet<Operation *> logicInstances;
+  bool scheduleOnly;
   std::vector<Class> classes;
   std::vector<Producer> producers;
   std::vector<Consumer> consumers;
@@ -1562,12 +1564,42 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   auto physical = [&](Operation *op) {
     return folding && folding->physical.contains(op);
   };
+  // One instance: a black box with a pipeline contract stays, stepped through
+  // its clock enable at the state pass; the clock reaches it, as a bit if its
+  // port is one, and nothing else.
+  DenseMap<Operation *, foldsim::PipelineContract> boxes;
+  auto toBoxClock = [&](seq::FromClockOp op) {
+    return llvm::all_of(op->getUses(), [&](OpOperand &use) {
+      auto it = boxes.find(use.getOwner());
+      if (it == boxes.end())
+        return false;
+      auto inst = cast<hw::InstanceOp>(use.getOwner());
+      return inst.getInputName(use.getOperandNumber()) == it->second.clock;
+    });
+  };
   for (auto &op : *modelBody) {
-    if (physical(&op))
+    auto inst = dyn_cast<hw::InstanceOp>(op);
+    if (!inst || physical(&op) || threads > 1)
+      continue;
+    auto *module = SymbolTable::lookupNearestSymbolFrom(
+        inst, inst.getReferencedModuleNameAttr());
+    auto contract =
+        module ? foldsim::getPipelineContract(module)
+               : FailureOr<std::optional<foldsim::PipelineContract>>(
+                     std::optional<foldsim::PipelineContract>{});
+    if (failed(contract))
+      return failure();
+    if (!*contract)
+      return op.emitError("a black box without a pipeline contract in a "
+                          "statically folded model of one instance");
+    boxes[inst] = **contract;
+  }
+  for (auto &op : *modelBody) {
+    if (physical(&op) || boxes.count(&op))
       continue;
     if (isa<hw::InstanceOp>(op))
-      return op.emitError("a black box in a statically folded model of one "
-                          "instance is not supported yet");
+      return op.emitError("a black box in a statically folded model of "
+                          "several instances outside a folded pipeline");
     if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
       if (reg.getIsAsync())
         return reg.emitError("asynchronous reset in a folded model");
@@ -1581,7 +1613,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         return memory.emitError("a folded memory has a read latency of 0 or "
                                 "1 and a write latency of 1");
     }
-    if (isa<seq::FromClockOp>(op))
+    if (auto clock = dyn_cast<seq::FromClockOp>(op); clock && !toBoxClock(clock))
       return op.emitError("a clock used as a bit in a folded model");
   }
 
@@ -1868,6 +1900,32 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     }
     memory.erase();
   }
+
+  // A black box of one instance takes a target edge at its state pass, which
+  // its contract makes the only edges it sees.
+  for (auto &[op, contract] : boxes) {
+    auto inst = cast<hw::InstanceOp>(op);
+    b.setLoc(inst.getLoc());
+    uint64_t bits = 0;
+    for (auto result : inst.getResults())
+      bits += hw::getBitWidth(result.getType());
+    auto &region = regionFor(bits * contract.latency);
+    for (unsigned i = 0, e = inst.getNumOperands(); i < e; ++i) {
+      auto name = inst.getInputName(i);
+      if (name == contract.clock) {
+        auto type = inst.getOperand(i).getType();
+        inst.setOperand(i, isa<seq::ClockType>(type)
+                               ? hostClock
+                               : Value(seq::FromClockOp::create(b, hostClock)));
+      } else if (name == contract.enable) {
+        inst.setOperand(i, comb::AndOp::create(b, region.state,
+                                               inst.getOperand(i)));
+      }
+    }
+  }
+  for (auto &op : llvm::make_early_inc_range(*body))
+    if (isa<seq::FromClockOp>(op) && op.use_empty())
+      op.erase();
 
   // The folded pipelines' copies run on the host clock and issue at the
   // slot's state pass for its instance; their results reach each store
@@ -2556,6 +2614,13 @@ LogicalResult StaticFolder::run() {
       return failure();
   if (failed(schedule()))
     return failure();
+  if (scheduleOnly) {
+    // Nothing is built: the folded pipelines' edges stay unresolved.
+    for (auto &cls : classes)
+      if (cls.folding && cls.folding->edges)
+        cls.folding->edges->abandon();
+    return success();
+  }
   for (auto &cls : classes)
     if (failed(buildCopy(cls)))
       return failure();
@@ -2575,7 +2640,7 @@ void FoldStaticPass::runOnOperation() {
     return signalPassFailure();
   }
   StaticFolder folder(top, netlist, simName, regionBits, report, copies,
-                      nest);
+                      nest, scheduleOnly);
   if (failed(folder.run()))
     return signalPassFailure();
 }
