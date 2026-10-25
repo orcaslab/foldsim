@@ -135,6 +135,11 @@ struct Consumer {
   SmallVector<Pieces> pieces;
 };
 
+/// Host cycles from a link's write to the first slot that reads it: the write
+/// lands at the end of its slot, and the read register is loaded a slot early.
+/// Forwarded, a write reaches a read register loaded in its own slot.
+static constexpr int kLinkLatency = 2, kForwardedLinkLatency = 1;
+
 /// One evaluation of a frame: an instance of a class in a pass.
 struct Node {
   unsigned cls, inst;
@@ -145,10 +150,13 @@ class StaticFolder {
 public:
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
                unsigned regionBits, StringRef report,
-               ArrayRef<std::string> copies, bool nest, bool scheduleOnly)
+               ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
+               bool oneCycleLinks, bool overlapFrames)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
-        scheduleOnly(scheduleOnly) {}
+        scheduleOnly(scheduleOnly), oneCycleLinks(oneCycleLinks),
+        overlapFrames(overlapFrames),
+        linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
 
 private:
@@ -179,6 +187,9 @@ private:
   DenseMap<Operation *, std::string> containerOf;
   DenseSet<Operation *> logicInstances;
   bool scheduleOnly;
+  bool oneCycleLinks, overlapFrames;
+  /// Host cycles from a producer's slot to its reader's.
+  int linkLatency;
   std::vector<Class> classes;
   std::vector<Producer> producers;
   std::vector<Consumer> consumers;
@@ -679,10 +690,6 @@ LogicalResult StaticFolder::analyze(Class &cls) {
 // The schedule
 //===----------------------------------------------------------------------===//
 
-/// Host cycles from a link's write to the first slot that reads it: the write
-/// lands at the end of its slot, and the read register is loaded a slot early.
-static constexpr int kLinkLatency = 2;
-
 unsigned StaticFolder::place(ArrayRef<bool> ready,
                              SmallVectorImpl<SmallVector<int>> &slots,
                              SmallVectorImpl<bool> &atReady) {
@@ -758,7 +765,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
         auto pass = atReady[piece.producer] ? kReady : kState;
         preds[n].push_back(
             {nodeIndex[{unsigned(producer.cls), piece.inst, pass}],
-             kLinkLatency});
+             linkLatency});
       }
     }
   }
@@ -865,13 +872,15 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
           continue;
         int written = slots[producer.cls * 2 + kState][piece.inst];
         length = std::max(length, written - first(consumer.cls, i) +
-                                      kLinkLatency);
+                                      linkLatency);
       }
   }
 
-  // Each netlist output's token: an early one's next value a slot after its
-  // producers' state passes, a late one's a slot after its writes. The next
-  // frame is decided four host cycles before this one ends, by then written.
+  // Each netlist output's token: an early one's next value at (or, without
+  // forwarding, a slot after) its producers' state passes, a late one's at
+  // its writes. The next frame is decided four host cycles before this one
+  // ends: by then written, unless the decision counts the pushes still due
+  // (overlapped frames), when a token need only be pushed within its frame.
   outputSlot.assign(consumers.size(), -1);
   outputEarly.assign(consumers.size(), true);
   for (auto [k, consumer] : llvm::enumerate(consumers)) {
@@ -889,12 +898,14 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
       if (producer.late)
         outputEarly[k] = false;
       auto pass = atReady[piece.producer] ? kReady : kState;
-      at = std::max(at, slots[producer.cls * 2 + pass][piece.inst] + 1);
+      at = std::max(at, slots[producer.cls * 2 + pass][piece.inst] +
+                            linkLatency - 1);
     }
     outputSlot[k] = at;
-    length = std::max(length, at + 5);
+    length = std::max(length, at + (overlapFrames ? 1 : 5));
   }
-  return std::max(length, 2);
+  // Overlapped, the decision for the next frame falls within this one.
+  return std::max(length, overlapFrames ? 4 : 2);
 }
 
 LogicalResult StaticFolder::schedule() {
@@ -2278,8 +2289,9 @@ LogicalResult StaticFolder::buildSim() {
       if (threads == 1 && !banked) {
         auto next = backedges.get(data.getType());
         Value r = reg(next, name);
-        next.setValue(comb::MuxOp::create(b, enable, data, r));
-        pieces.push_back(r);
+        Value written = comb::MuxOp::create(b, enable, data, r);
+        next.setValue(written);
+        pieces.push_back(oneCycleLinks ? written : r);
         continue;
       }
       unsigned depth = threads * (banked ? 2 : 1);
@@ -2303,12 +2315,20 @@ LogicalResult StaticFolder::buildSim() {
         writeAddress.push_back(group.inst);
         readAddress.push_back(address());
       }
-      seq::FirMemWriteOp::create(b, memory,
-                                 b.createOrFold<comb::ConcatOp>(writeAddress),
-                                 hostClock, enable, data, Value{});
-      pieces.push_back(seq::FirMemReadOp::create(
-          b, memory, b.createOrFold<comb::ConcatOp>(readAddress), hostClock,
-          constant(1, 1)));
+      Value writeAt = b.createOrFold<comb::ConcatOp>(writeAddress);
+      Value readAt = b.createOrFold<comb::ConcatOp>(readAddress);
+      seq::FirMemWriteOp::create(b, memory, writeAt, hostClock, enable, data,
+                                 Value{});
+      Value read =
+          seq::FirMemReadOp::create(b, memory, readAt, hostClock, constant(1, 1));
+      if (oneCycleLinks) {
+        // A write reaches a read of its entry in the same host cycle.
+        Value hit = comb::AndOp::create(
+            b, enable,
+            comb::ICmpOp::create(b, comb::ICmpPredicate::eq, writeAt, readAt));
+        read = comb::MuxOp::create(b, hit, data, read);
+      }
+      pieces.push_back(read);
     }
     if (pieces.empty())
       return constant(0, 0);
@@ -2544,6 +2564,9 @@ LogicalResult StaticFolder::buildSim() {
     Value push = eq(pos0, outputSlot[k]);
     Value readyIn = body->getArgument(outputReady[k]);
     uint64_t initCount = outputEarly[k] ? 1 : 0;
+    // Overlapped, a frame may be decided before the previous frame's token is
+    // pushed: the queue holds three, and the push still due takes one.
+    unsigned capacity = overlapFrames ? 3 : 2;
     auto countNext = backedges.get(b.getIntegerType(2));
     Value count = resetReg(countNext, consumer.name + "_count", initCount);
     Value valid = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, count,
@@ -2554,23 +2577,45 @@ LogicalResult StaticFolder::buildSim() {
     countNext.setValue(comb::MuxOp::create(
         b, push, comb::MuxOp::create(b, pop, count, plus),
         comb::MuxOp::create(b, pop, minus, count)));
-    roomTerms.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::ult, count,
-                                             constant(2, 2)));
+    Value room = comb::ICmpOp::create(b, comb::ICmpPredicate::ult, count,
+                                      constant(2, capacity));
+    if (overlapFrames) {
+      // Whether this frame's token is pushed: set by the push, cleared as a
+      // frame begins; none is due out of reset.
+      auto pushedNext = backedges.get(i1);
+      Value pushed = resetReg(pushedNext, consumer.name + "_pushed", 1);
+      pushedNext.setValue(comb::MuxOp::create(
+          b, push, constant(1, 1),
+          comb::MuxOp::create(b, eq(pos0, 0), constant(1, 0), pushed)));
+      Value due = comb::AndOp::create(b, notOf(pushed), notOf(push));
+      room = comb::MuxOp::create(
+          b, due,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::ult, count,
+                               constant(2, capacity - 1)),
+          room);
+    }
+    roomTerms.push_back(room);
     portOutputs.push_back(valid);
     if (width > 0) {
-      auto headNext = backedges.get(b.getIntegerType(width));
-      auto tailNext = backedges.get(b.getIntegerType(width));
-      Value head = resetReg(headNext, consumer.name + "_head", 0);
-      Value tail = reg(tailNext, consumer.name + "_tail");
-      // Popping moves the tail up; a push lands at the first free entry
-      // after the pop.
-      Value afterPop = comb::MuxOp::create(b, pop, tail, head);
+      // Entries from the head; popping moves them down, and a push lands at
+      // the first free entry after the pop.
       Value countAfterPop = comb::MuxOp::create(b, pop, minus, count);
-      Value toHead = comb::AndOp::create(b, push, eq(countAfterPop, 0));
-      Value toTail = comb::AndOp::create(b, push, eq(countAfterPop, 1));
-      headNext.setValue(comb::MuxOp::create(b, toHead, data, afterPop));
-      tailNext.setValue(comb::MuxOp::create(b, toTail, data, tail));
-      portOutputs.push_back(head);
+      SmallVector<Backedge> nexts;
+      SmallVector<Value> entries;
+      for (unsigned e = 0; e < capacity; ++e) {
+        nexts.push_back(backedges.get(b.getIntegerType(width)));
+        entries.push_back(e == 0 ? resetReg(nexts[e], consumer.name + "_head", 0)
+                                 : reg(nexts[e], consumer.name + "_entry" +
+                                                     Twine(e)));
+      }
+      for (unsigned e = 0; e < capacity; ++e) {
+        Value kept = e + 1 < capacity
+                         ? comb::MuxOp::create(b, pop, entries[e + 1], entries[e])
+                         : entries[e];
+        Value here = comb::AndOp::create(b, push, eq(countAfterPop, e));
+        nexts[e].setValue(comb::MuxOp::create(b, here, data, kept));
+      }
+      portOutputs.push_back(entries[0]);
     }
   }
 
@@ -2640,7 +2685,7 @@ void FoldStaticPass::runOnOperation() {
     return signalPassFailure();
   }
   StaticFolder folder(top, netlist, simName, regionBits, report, copies,
-                      nest, scheduleOnly);
+                      nest, scheduleOnly, oneCycleLinks, overlapFrames);
   if (failed(folder.run()))
     return signalPassFailure();
 }

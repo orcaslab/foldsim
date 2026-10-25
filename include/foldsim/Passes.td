@@ -311,6 +311,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"scheduleOnly", "schedule-only", "bool", "false",
            "Stop once the schedule is chosen and reported, building no "
            "simulator: a search over the copies compares their frames">,
+    Option<"oneCycleLinks", "one-cycle-links", "bool", "true",
+           "Forward a link's write to a read of the same entry in the same "
+           "host cycle, so a reader's slot may follow its producer's directly">,
+    Option<"overlapFrames", "overlap-frames", "bool", "true",
+           "Decide the next frame before this one's outputs are pushed, "
+           "counting the pushes still due, instead of after them">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

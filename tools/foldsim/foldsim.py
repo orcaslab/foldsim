@@ -118,6 +118,16 @@ def read_srcs(path, defines, incdirs, files, base=None, seen=()):
             files.append(resolve(token))
 
 
+def frame_options(a):
+    """The fold-static options that restore the earlier frame, if asked."""
+    fold = ''
+    if a.two_cycle_links:
+        fold += ' one-cycle-links=false'
+    if a.serial_frames:
+        fold += ' overlap-frames=false'
+    return fold
+
+
 def choose_copies(a, foldsim_opt, flat, passes, out):
     """The fold degree of each class: every choice scheduled, priced and the
     fastest within the LUT budget kept (foldsim_degree.py)."""
@@ -128,6 +138,7 @@ def choose_copies(a, foldsim_opt, flat, passes, out):
     fold = f'module={a.top} sim=foldsim_sim'
     if a.nest:
         fold += ' nest'
+    fold += frame_options(a)
     work = out('degree')
     os.makedirs(work, exist_ok=True)
     base = os.path.join(work, 'schedule_base.txt')
@@ -233,6 +244,10 @@ def main():
     ap.add_argument('--nest-offsets', default='',
                     help='with --nest: <model>:<cycles>,...: models current this many host '
                          'cycles after the nested order (foldsim-compose)')
+    ap.add_argument('--two-cycle-links', action='store_true',
+                    help='with --static: no forwarding into link reads (a reader two host cycles after its producer)')
+    ap.add_argument('--serial-frames', action='store_true',
+                    help='with --static: decide the next frame only after every output of this one is pushed')
     ap.add_argument('--copies', default='',
                     help='<model>:<count>,...: models simulated by several threaded copies '
                          '(foldsim-compose, foldsim-fold-static); with --static, `auto`: '
@@ -398,6 +413,7 @@ def main():
             fold += f' copies={copies}'
         if a.nest:
             fold += ' nest'
+        fold += frame_options(a)
         pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}', SPLIT,
                                         'canonicalize', 'foldsim-sort', 'cse']
         if a.copies == 'auto':
