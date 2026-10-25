@@ -193,6 +193,10 @@ def main():
     ap.add_argument('--nest-offsets', default='',
                     help='with --nest: <model>:<cycles>,...: models current this many host '
                          'cycles after the nested order (foldsim-compose)')
+    ap.add_argument('--two-cycle-links', action='store_true',
+                    help='with --static: no forwarding into link reads (a reader two host cycles after its producer)')
+    ap.add_argument('--serial-frames', action='store_true',
+                    help='with --static: decide the next frame only after every output of this one is pushed')
     ap.add_argument('--copies', default='',
                     help='<model>:<count>,...: models simulated by several threaded copies '
                          '(foldsim-compose, foldsim-fold-static)')
@@ -335,6 +339,10 @@ def main():
             fold += f' region-bits={a.region_bits}'
         if a.copies:
             fold += f' copies={a.copies}'
+        if a.two_cycle_links:
+            fold += ' one-cycle-links=false'
+        if a.serial_frames:
+            fold += ' overlap-frames=false'
         pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}',
                                         'canonicalize', 'foldsim-sort', 'cse']
     else:
