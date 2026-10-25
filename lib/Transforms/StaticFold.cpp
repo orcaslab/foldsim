@@ -2476,8 +2476,13 @@ LogicalResult StaticFolder::run() {
       return failure();
   if (failed(schedule()))
     return failure();
-  if (scheduleOnly)
+  if (scheduleOnly) {
+    // Nothing is built: the folded pipelines' edges stay unresolved.
+    for (auto &cls : classes)
+      if (cls.folding && cls.folding->edges)
+        cls.folding->edges->abandon();
     return success();
+  }
   for (auto &cls : classes)
     if (failed(buildCopy(cls)))
       return failure();

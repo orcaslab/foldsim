@@ -114,6 +114,38 @@ def read_srcs(path, defines, incdirs, files, base=None, seen=()):
             files.append(resolve(token))
 
 
+def choose_copies(a, foldsim_opt, flat, passes, out):
+    """The fold degree of each class: every choice scheduled, priced and the
+    fastest within the LUT budget kept (foldsim_degree.py)."""
+    import foldsim_degree
+    models = out('models.mlir')
+    run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
+         '-o', models])
+    fold = f'module={a.top} sim=foldsim_sim'
+    work = out('degree')
+    os.makedirs(work, exist_ok=True)
+    base = os.path.join(work, 'schedule_base.txt')
+    # The schedules compared go to <out>/degree, not to the log.
+    r = subprocess.run([foldsim_opt, models, f'--pass-pipeline=builtin.module('
+                        f'foldsim-fold-static{{{fold} report={base} schedule-only}})',
+                        '-o', os.devnull], capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(r.stderr)
+    cal = json.load(open(a.degree_calibration)) if a.degree_calibration else None
+    result = foldsim_degree.evaluate(models, open(base).read(), fold, foldsim_opt, work, cal,
+                                     a.jobs, a.lut_budget)
+    with open(out('degree.txt'), 'w') as f:
+        f.write(foldsim_degree.table(result) + '\n')
+    with open(out('degree.json'), 'w') as f:
+        json.dump(result, f, indent=1, default=str)
+    if not result['pick']:
+        sys.exit(f'--copies auto: no choice within {a.lut_budget} LUTs; see {out("degree.txt")}')
+    pick = result['pick']
+    print(f"foldsim: copies {pick['copies']}: II {pick['ii']}, about {pick['luts']} LUTs",
+          file=sys.stderr)
+    return '' if pick['copies'] == '-' else pick['copies']
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--srcs', required=True,
@@ -195,7 +227,16 @@ def main():
                          'cycles after the nested order (foldsim-compose)')
     ap.add_argument('--copies', default='',
                     help='<model>:<count>,...: models simulated by several threaded copies '
-                         '(foldsim-compose, foldsim-fold-static)')
+                         '(foldsim-compose, foldsim-fold-static); with --static, `auto`: '
+                         'the fastest choice within --lut-budget (foldsim_degree.py), '
+                         'reported in <out>/degree.txt')
+    ap.add_argument('--lut-budget', type=int, default=0,
+                    help='with --copies auto: the most LUTs the simulator may take (0: any)')
+    ap.add_argument('--degree-calibration', default='',
+                    help='with --copies auto: builds of the design that calibrate the '
+                         'estimate (foldsim_degree.py calibrate)')
+    ap.add_argument('--jobs', type=int, default=4,
+                    help='with --copies auto: schedules compared at once')
     ap.add_argument('--relay', default='',
                     help='models, or <model>:<model> pairs, whose channels get a relay stage, '
                          'comma-separated (foldsim-compose)')
@@ -329,19 +370,28 @@ def main():
         compose += f' relay={a.relay}'
     if a.staged_tokens:
         compose += ' staged-tokens'
+    sim_input = flat
+    if a.copies == 'auto' and not a.static:
+        sys.exit('--copies auto needs --static')
     if a.static:
         fold = f'module={a.top} sim=foldsim_sim report={out("schedule.txt")}'
         if a.region_bits:
             fold += f' region-bits={a.region_bits}'
-        if a.copies:
-            fold += f' copies={a.copies}'
+        copies = a.copies
+        if copies == 'auto':
+            copies = choose_copies(a, foldsim_opt, flat, passes, out)
+        if copies:
+            fold += f' copies={copies}'
         pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}',
                                         'canonicalize', 'foldsim-sort', 'cse']
+        if a.copies == 'auto':
+            sim_input = out('models.mlir')
+            pipeline = pipeline[len(passes) + len(OPTIMIZE):]
     else:
         pipeline = passes + OPTIMIZE + [f'foldsim-compose{{{compose}}}',
                                         'canonicalize', 'foldsim-sort', 'cse']
     sim = out('foldsim_sim.mlir')
-    run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(pipeline)})', '-o', sim])
+    run([foldsim_opt, sim_input, f'--pass-pipeline=builtin.module({",".join(pipeline)})', '-o', sim])
     sim_text = open(sim).read()
     # A RAM with a registered read states its read-under-write behavior to
     # Vivado, which otherwise leaves a read colliding with a write undefined.
