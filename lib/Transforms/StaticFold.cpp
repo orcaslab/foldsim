@@ -690,6 +690,12 @@ LogicalResult StaticFolder::analyze(Class &cls) {
 // The schedule
 //===----------------------------------------------------------------------===//
 
+/// Host cycles from a late netlist output's slot to the next frame's first:
+/// the token is offered at the slot, the endpoint finishes its cycle the host
+/// cycle after and offers its next tokens the one after that, and the next
+/// frame starts four host cycles after it is decided on them.
+static constexpr int kEnvRoundTrip = 6;
+
 unsigned StaticFolder::place(ArrayRef<bool> ready,
                              SmallVectorImpl<SmallVector<int>> &slots,
                              SmallVectorImpl<bool> &atReady) {
@@ -878,9 +884,11 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
 
   // Each netlist output's token: an early one's next value at (or, without
   // forwarding, a slot after) its producers' state passes, a late one's at
-  // its writes. The next frame is decided four host cycles before this one
-  // ends: by then written, unless the decision counts the pushes still due
-  // (overlapped frames), when a token need only be pushed within its frame.
+  // its writes. A late token closes the environment's cycle: offered at its
+  // slot, taken by an endpoint's staged token end a host cycle later, which
+  // finishes then and offers its next tokens the host cycle after; the next
+  // frame is decided four host cycles before this one ends, on those tokens,
+  // or, with overlapped frames, counting the pushes still due.
   outputSlot.assign(consumers.size(), -1);
   outputEarly.assign(consumers.size(), true);
   for (auto [k, consumer] : llvm::enumerate(consumers)) {
@@ -902,7 +910,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
                             linkLatency - 1);
     }
     outputSlot[k] = at;
-    length = std::max(length, at + (overlapFrames ? 1 : 5));
+    length = std::max(length, at + (outputEarly[k] ? 1 : kEnvRoundTrip));
   }
   // Overlapped, the decision for the next frame falls within this one.
   return std::max(length, overlapFrames ? 4 : 2);
@@ -2191,7 +2199,7 @@ LogicalResult StaticFolder::buildSim() {
     Value take = comb::AndOp::create(b, valid, notOf(full));
     fullNext.setValue(comb::MuxOp::create(
         b, take, constant(1, 1), comb::MuxOp::create(b, load, constant(1, 0), full)));
-    inputValid.push_back(full);
+    inputValid.push_back(comb::OrOp::create(b, full, valid));
     inputReady.push_back({unsigned(p), notOf(full)});
     if (producer.width == 0)
       continue;
@@ -2561,6 +2569,8 @@ LogicalResult StaticFolder::buildSim() {
                      : b.createOrFold<comb::ConcatOp>(
                            SmallVector<Value>(bits.rbegin(), bits.rend()));
     unsigned width = consumer.width;
+    // A token is offered the host cycle it is pushed if the queue is empty,
+    // and queued otherwise.
     Value push = eq(pos0, outputSlot[k]);
     Value readyIn = body->getArgument(outputReady[k]);
     uint64_t initCount = outputEarly[k] ? 1 : 0;
@@ -2569,14 +2579,18 @@ LogicalResult StaticFolder::buildSim() {
     unsigned capacity = overlapFrames ? 3 : 2;
     auto countNext = backedges.get(b.getIntegerType(2));
     Value count = resetReg(countNext, consumer.name + "_count", initCount);
-    Value valid = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, count,
-                                       constant(2, 0));
+    Value queued = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, count,
+                                        constant(2, 0));
+    Value valid = comb::OrOp::create(b, queued, push);
     Value pop = comb::AndOp::create(b, readyIn, valid);
+    Value popQueued = comb::AndOp::create(b, pop, queued);
+    Value pushQueued =
+        comb::AndOp::create(b, push, notOf(comb::AndOp::create(b, pop, notOf(queued))));
     Value plus = comb::AddOp::create(b, count, constant(2, 1));
     Value minus = comb::SubOp::create(b, count, constant(2, 1));
     countNext.setValue(comb::MuxOp::create(
-        b, push, comb::MuxOp::create(b, pop, count, plus),
-        comb::MuxOp::create(b, pop, minus, count)));
+        b, pushQueued, comb::MuxOp::create(b, popQueued, count, plus),
+        comb::MuxOp::create(b, popQueued, minus, count)));
     Value room = comb::ICmpOp::create(b, comb::ICmpPredicate::ult, count,
                                       constant(2, capacity));
     if (overlapFrames) {
@@ -2597,9 +2611,9 @@ LogicalResult StaticFolder::buildSim() {
     roomTerms.push_back(room);
     portOutputs.push_back(valid);
     if (width > 0) {
-      // Entries from the head; popping moves them down, and a push lands at
-      // the first free entry after the pop.
-      Value countAfterPop = comb::MuxOp::create(b, pop, minus, count);
+      // Entries from the head; popping moves them down, and a queued push
+      // lands at the first free entry after the pop.
+      Value countAfterPop = comb::MuxOp::create(b, popQueued, minus, count);
       SmallVector<Backedge> nexts;
       SmallVector<Value> entries;
       for (unsigned e = 0; e < capacity; ++e) {
@@ -2610,16 +2624,18 @@ LogicalResult StaticFolder::buildSim() {
       }
       for (unsigned e = 0; e < capacity; ++e) {
         Value kept = e + 1 < capacity
-                         ? comb::MuxOp::create(b, pop, entries[e + 1], entries[e])
+                         ? comb::MuxOp::create(b, popQueued, entries[e + 1],
+                                               entries[e])
                          : entries[e];
-        Value here = comb::AndOp::create(b, push, eq(countAfterPop, e));
+        Value here = comb::AndOp::create(b, pushQueued, eq(countAfterPop, e));
         nexts[e].setValue(comb::MuxOp::create(b, here, data, kept));
       }
-      portOutputs.push_back(entries[0]);
+      portOutputs.push_back(comb::MuxOp::create(b, queued, entries[0], data));
     }
   }
 
-  // The next frame starts when every input has its token and every output
+  // The next frame starts when every input has its token, held or offered
+  // now (taken this host cycle, so held by the frame's load), and every output
   // room for one.
   SmallVector<Value> goTerms(inputValid.begin(), inputValid.end());
   goTerms.append(roomTerms.begin(), roomTerms.end());
