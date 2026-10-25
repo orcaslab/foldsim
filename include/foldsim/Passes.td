@@ -303,6 +303,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     ListOption<"copies", "copies", "std::string",
                "Models simulated by several copies, as <model>:<count>: each "
                "copy simulates a contiguous range of the instances">,
+    Option<"scheduleOnly", "schedule-only", "bool", "false",
+           "Stop once the schedule is chosen and reported, building no "
+           "simulator: a search over the copies compares their frames">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
