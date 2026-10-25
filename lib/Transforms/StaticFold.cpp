@@ -88,6 +88,10 @@ struct Class {
   int clockInput = -1;
   /// The class it was split from by copies, or -1.
   int splitFrom = -1;
+  /// Nested folding: the class of its instances' parents (-1 for a root),
+  /// and its depth in the class tree.
+  int parent = -1;
+  unsigned depth = 0;
   /// Per input: driven by constants alone in every instance.
   SmallVector<bool> staticInput;
   /// Per output: late (depends on an input, a memory's read data or a black
@@ -141,15 +145,16 @@ class StaticFolder {
 public:
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
                unsigned regionBits, StringRef report,
-               ArrayRef<std::string> copies)
+               ArrayRef<std::string> copies, bool nest)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
-        reportPath(report), copies(copies) {}
+        reportPath(report), copies(copies), nest(nest) {}
   LogicalResult run();
 
 private:
   void inlineNetlists();
   LogicalResult collect();
   LogicalResult splitCopies();
+  LogicalResult nestInstances();
   LogicalResult decompose(Value value, unsigned low, unsigned width,
                           Pieces &pieces);
   LogicalResult analyze(Class &cls);
@@ -167,6 +172,11 @@ private:
   unsigned regionBits;
   StringRef reportPath;
   ArrayRef<std::string> copies;
+  bool nest;
+  /// Nested folding: the netlist each instance was inlined from (a path of
+  /// instance names), and the instances that are a netlist's own logic.
+  DenseMap<Operation *, std::string> containerOf;
+  DenseSet<Operation *> logicInstances;
   std::vector<Class> classes;
   std::vector<Producer> producers;
   std::vector<Consumer> consumers;
@@ -186,8 +196,17 @@ private:
 // The netlist
 //===----------------------------------------------------------------------===//
 
+/// Separates the instance names of a container path: instance names may
+/// hold '/'.
+static constexpr char kPathSeparator = '\x1f';
+
 void StaticFolder::inlineNetlists() {
   auto *body = netlist.getBodyBlock();
+  for (auto instance : body->getOps<hw::InstanceOp>()) {
+    containerOf[instance] = "";
+    if (instance.getInstanceName() == "logic")
+      logicInstances.insert(instance);
+  }
   for (bool changed = true; changed;) {
     changed = false;
     for (auto instance :
@@ -207,9 +226,14 @@ void StaticFolder::inlineNetlists() {
       SmallVector<Operation *> clones;
       for (auto &op : calleeBody->without_terminator()) {
         auto *clone = builder.clone(op, map);
-        if (auto inner = dyn_cast<hw::InstanceOp>(clone))
+        if (auto inner = dyn_cast<hw::InstanceOp>(clone)) {
+          containerOf[inner] = containerOf[instance] + kPathSeparator +
+                               instance.getInstanceName().str();
+          if (inner.getInstanceName() == "logic")
+            logicInstances.insert(inner);
           inner.setInstanceNameAttr(builder.getStringAttr(
               instance.getInstanceName() + "_" + inner.getInstanceName()));
+        }
         clones.push_back(clone);
       }
       // A graph region: an operand may be defined further down.
@@ -221,6 +245,8 @@ void StaticFolder::inlineNetlists() {
            llvm::zip(instance.getResults(),
                      calleeBody->getTerminator()->getOperands()))
         result.replaceAllUsesWith(map.lookupOrDefault(output));
+      containerOf.erase(instance);
+      logicInstances.erase(instance);
       instance.erase();
       changed = true;
     }
@@ -368,6 +394,8 @@ LogicalResult StaticFolder::collect() {
     instanceOf[instance] = {it->second, cls.instances.size()};
     cls.instances.push_back(instance);
   }
+  if (nest && failed(nestInstances()))
+    return failure();
   if (failed(splitCopies()))
     return failure();
 
@@ -474,6 +502,8 @@ LogicalResult StaticFolder::splitCopies() {
       copy.outputTypes = classes[c].outputTypes;
       copy.clockInput = classes[c].clockInput;
       copy.splitFrom = c;
+      copy.parent = classes[c].parent;
+      copy.depth = classes[c].depth;
       unsigned index = classes.size();
       for (unsigned t = 0; t < per; ++t) {
         auto instance = instances[j * per + t];
@@ -482,6 +512,68 @@ LogicalResult StaticFolder::splitCopies() {
       }
       classes.push_back(std::move(copy));
     }
+  }
+  return success();
+}
+
+LogicalResult StaticFolder::nestInstances() {
+  // Each instance's parent: the logic of the netlist it was inlined from, or,
+  // for a netlist's logic, the logic of the netlist that one was inlined from.
+  llvm::StringMap<Operation *> logicAt;
+  for (auto &cls : classes)
+    for (auto instance : cls.instances)
+      if (logicInstances.contains(instance))
+        logicAt[containerOf.lookup(instance)] = instance;
+  auto up = [](StringRef path) {
+    auto pos = path.rfind(kPathSeparator);
+    return pos == StringRef::npos ? StringRef() : path.substr(0, pos);
+  };
+  DenseMap<Operation *, Operation *> parentOf;
+  for (auto &cls : classes)
+    for (auto instance : cls.instances) {
+      std::string path = containerOf.lookup(instance);
+      if (logicInstances.contains(instance)) {
+        if (path.empty())
+          continue;
+        path = up(path).str();
+      }
+      if (auto *parent = logicAt.lookup(path); parent && parent != instance)
+        parentOf[instance] = parent;
+    }
+  // A class's parents are all of one class, and the classes form a tree.
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    for (auto [t, instance] : llvm::enumerate(cls.instances)) {
+      auto *parent = parentOf.lookup(instance);
+      int pc = parent ? int(instanceOf.lookup(parent).first) : -1;
+      if (t > 0 && pc != cls.parent)
+        return instance.emitError("nest: the instances of '")
+               << cls.name << "' have parents of different classes";
+      cls.parent = pc;
+    }
+  }
+  SmallVector<unsigned> order;
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    unsigned d = 0;
+    for (int p = cls.parent; p >= 0; p = classes[p].parent)
+      if (++d > classes.size())
+        return netlist.emitError("nest: classes nested in a cycle");
+    cls.depth = d;
+    order.push_back(c);
+  }
+  llvm::stable_sort(order, [&](unsigned x, unsigned y) {
+    return classes[x].depth < classes[y].depth;
+  });
+  // Each class's instances numbered by their parents' numbers, so that the
+  // children of a parent are contiguous (a copy takes whole parents).
+  for (auto c : order) {
+    auto &cls = classes[c];
+    if (cls.parent >= 0)
+      llvm::stable_sort(cls.instances, [&](hw::InstanceOp x, hw::InstanceOp y) {
+        return instanceOf.lookup(parentOf.lookup(x)).second <
+               instanceOf.lookup(parentOf.lookup(y)).second;
+      });
+    for (auto [t, instance] : llvm::enumerate(cls.instances))
+      instanceOf[instance] = {unsigned(c), unsigned(t)};
   }
   return success();
 }
@@ -883,7 +975,11 @@ LogicalResult StaticFolder::schedule() {
   os << "foldsim-fold-static: II = " << ii << "\n";
   for (auto &cls : classes) {
     os << "  " << cls.name << " x" << cls.threads()
-       << (cls.hasReady ? " (ready pass)" : "") << "\n";
+       << (cls.hasReady ? " (ready pass)" : "");
+    if (nest)
+      os << " depth " << cls.depth
+         << (cls.parent >= 0 ? " under " + classes[cls.parent].name : "");
+    os << "\n";
     for (auto pass : {kReady, kState}) {
       if (pass == kReady && !cls.hasReady)
         continue;
@@ -1916,14 +2012,21 @@ LogicalResult StaticFolder::buildSim() {
   // its token and every output room for one.
   unsigned posWidth = llvm::Log2_32_Ceil(ii + 1);
   auto go = backedges.get(i1);
+  // A position's next: the next slot, or at the frame's end the next frame's
+  // first if it starts, else `ii`.
+  auto nextPosition = [&](Value pos) -> Value {
+    Value end = comb::OrOp::create(b, eq(pos, ii - 1), eq(pos, ii));
+    return comb::MuxOp::create(
+        b, end,
+        comb::MuxOp::create(b, go, constant(posWidth, 0), constant(posWidth, ii)),
+        comb::AddOp::create(b, pos, constant(posWidth, 1)));
+  };
   auto pos3Next = backedges.get(b.getIntegerType(posWidth));
   Value pos3 = resetReg(pos3Next, "pos3", ii);
   Value boundary = comb::OrOp::create(b, eq(pos3, ii - 1), eq(pos3, ii));
   Value starting = comb::AndOp::create(b, boundary, go);
-  pos3Next.setValue(comb::MuxOp::create(
-      b, boundary,
-      comb::MuxOp::create(b, go, constant(posWidth, 0), constant(posWidth, ii)),
-      comb::AddOp::create(b, pos3, constant(posWidth, 1))));
+  Value rootNext = nextPosition(pos3);
+  pos3Next.setValue(rootNext);
   auto par3Next = backedges.get(i1);
   Value par3 = resetReg(par3Next, "parity3", 1);
   par3Next.setValue(comb::MuxOp::create(b, starting, notOf(par3), par3));
@@ -1939,6 +2042,39 @@ LogicalResult StaticFolder::buildSim() {
     Value inst1, inst, state, ready;
   };
   SmallVector<Controls> controls(classes.size());
+  // Nested folding: the sequencer tree. Each class has its own sequencer,
+  // the frame's position three host cycles ahead, kept in a register its
+  // parent class's sequencer loads with its next position (the root's for a
+  // class of no parent): every class's slot table reads a sequencer of its
+  // own, a parent's sequencer drives only its children's, and the frame's
+  // start (`go`) is the one control all sequencers take.
+  SmallVector<Value> sequencer(classes.size());
+  if (nest) {
+    SmallVector<unsigned> order;
+    for (unsigned c = 0; c < classes.size(); ++c)
+      order.push_back(c);
+    llvm::stable_sort(order, [&](unsigned x, unsigned y) {
+      return classes[x].depth < classes[y].depth;
+    });
+    SmallVector<Value> nextOf(classes.size());
+    for (auto c : order) {
+      auto &cls = classes[c];
+      Value load = rootNext;
+      if (cls.parent >= 0) {
+        auto &parentNext = nextOf[cls.parent];
+        if (!parentNext)
+          parentNext = nextPosition(sequencer[cls.parent]);
+        load = parentNext;
+      }
+      // Kept: equivalent to every other sequencer, it must stay a register
+      // of its own for its class.
+      auto type = load.getType();
+      sequencer[c] = keep(seq::FirRegOp::create(
+          b, load, hostClock, b.getStringAttr(cls.name + "_seq"), hostReset,
+          hw::ConstantOp::create(b, type, ii), hw::InnerSymAttr{},
+          /*isAsync=*/false, b.getIntegerAttr(type, ii)));
+    }
+  }
   for (auto [c, cls] : llvm::enumerate(classes)) {
     unsigned threads = cls.threads();
     unsigned idxWidth = threads > 1 ? llvm::Log2_32_Ceil(threads) : 0;
@@ -1952,17 +2088,18 @@ LogicalResult StaticFolder::buildSim() {
         readyRow[cls.slot[kReady][i]] = 1;
       }
     }
+    Value at = nest ? sequencer[c] : pos3;
     auto &ctl = controls[c];
     auto prefix = cls.name;
-    ctl.state3 = table(b, pos3, stateRow, 1);
+    ctl.state3 = table(b, at, stateRow, 1);
     ctl.state2 = reg(ctl.state3, prefix + "_state2");
-    ctl.ready2 = reg(table(b, pos3, readyRow, 1), prefix + "_ready2");
+    ctl.ready2 = reg(table(b, at, readyRow, 1), prefix + "_ready2");
     Value state1 = reg(ctl.state2, prefix + "_state1");
     Value ready1 = reg(ctl.ready2, prefix + "_ready1");
     ctl.state = reg(state1, prefix + "_state0");
     ctl.ready = reg(ready1, prefix + "_ready0");
     if (threads > 1) {
-      ctl.inst3 = table(b, pos3, instRow, idxWidth);
+      ctl.inst3 = table(b, at, instRow, idxWidth);
       ctl.inst2 = reg(ctl.inst3, prefix + "_inst2");
       ctl.inst1 = reg(ctl.inst2, prefix + "_inst1");
       ctl.inst = reg(ctl.inst1, prefix + "_inst0");
@@ -2437,7 +2574,8 @@ void FoldStaticPass::runOnOperation() {
     top.emitError("no netlist module '") << moduleName << "'";
     return signalPassFailure();
   }
-  StaticFolder folder(top, netlist, simName, regionBits, report, copies);
+  StaticFolder folder(top, netlist, simName, regionBits, report, copies,
+                      nest);
   if (failed(folder.run()))
     return signalPassFailure();
 }

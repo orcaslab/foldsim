@@ -171,7 +171,9 @@ def main():
                          'nested as the class tree (foldsim-compose)')
     ap.add_argument('--nest', action='store_true',
                     help="fold nested classes recursively: each class's threads numbered so "
-                         "that a thread and its parent's are current together (foldsim-compose)")
+                         "that a thread and its parent's are current together (foldsim-compose); with "
+                         "--static, instances numbered by their parents' and the slot tables "
+                         "driven by a sequencer tree along the class tree (foldsim-fold-static)")
     ap.add_argument('--nest-skew', type=int, default=-1,
                     help='with --nest: host cycles a thread is current after its parent\'s '
                          '(default: a hop of the channels between them)')
@@ -335,6 +337,8 @@ def main():
             fold += f' region-bits={a.region_bits}'
         if a.copies:
             fold += f' copies={a.copies}'
+        if a.nest:
+            fold += ' nest'
         pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}',
                                         'canonicalize', 'foldsim-sort', 'cse']
     else:

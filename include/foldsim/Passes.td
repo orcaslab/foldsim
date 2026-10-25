@@ -303,6 +303,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     ListOption<"copies", "copies", "std::string",
                "Models simulated by several copies, as <model>:<count>: each "
                "copy simulates a contiguous range of the instances">,
+    Option<"nest", "nest", "bool", "false",
+           "Nested folding: each class's instances numbered by their "
+           "parents', and the slot tables driven by a sequencer tree along "
+           "the class tree, each class's sequencer a register from its "
+           "parent's">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
