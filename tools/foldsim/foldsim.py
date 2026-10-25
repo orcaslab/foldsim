@@ -279,6 +279,12 @@ def main():
         sys.exit('a fused class is two modules, A+B')
     modules = [m for c in a.classes for m in c.split('+')]
 
+    # Registers reset asynchronously are stepped a target cycle at a time.
+    if 'reset async' in open(design).read():
+        run([foldsim_opt, design, '--pass-pipeline=builtin.module(hw.module(foldsim-sync-async-resets))',
+             '-o', design + '.tmp'])
+        os.replace(design + '.tmp', design)
+
     # Flat but for the classes.
     flat = out('flat.mlir')
     with open(flat + '.in', 'w') as f:
