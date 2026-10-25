@@ -195,7 +195,7 @@ def main():
                          'cycles after the nested order (foldsim-compose)')
     ap.add_argument('--copies', default='',
                     help='<model>:<count>,...: models simulated by several threaded copies '
-                         '(foldsim-compose)')
+                         '(foldsim-compose, foldsim-fold-static)')
     ap.add_argument('--relay', default='',
                     help='models, or <model>:<model> pairs, whose channels get a relay stage, '
                          'comma-separated (foldsim-compose)')
@@ -333,6 +333,8 @@ def main():
         fold = f'module={a.top} sim=foldsim_sim report={out("schedule.txt")}'
         if a.region_bits:
             fold += f' region-bits={a.region_bits}'
+        if a.copies:
+            fold += f' copies={a.copies}'
         pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}',
                                         'canonicalize', 'foldsim-sort', 'cse']
     else:

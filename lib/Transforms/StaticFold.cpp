@@ -86,6 +86,8 @@ struct Class {
   SmallVector<std::string> inputNames, outputNames;
   SmallVector<Type> inputTypes, outputTypes;
   int clockInput = -1;
+  /// The class it was split from by copies, or -1.
+  int splitFrom = -1;
   /// Per input: driven by constants alone in every instance.
   SmallVector<bool> staticInput;
   /// Per output: late (depends on an input, a memory's read data or a black
@@ -138,14 +140,16 @@ struct Node {
 class StaticFolder {
 public:
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
-               unsigned regionBits, StringRef report)
+               unsigned regionBits, StringRef report,
+               ArrayRef<std::string> copies)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
-        reportPath(report) {}
+        reportPath(report), copies(copies) {}
   LogicalResult run();
 
 private:
   void inlineNetlists();
   LogicalResult collect();
+  LogicalResult splitCopies();
   LogicalResult decompose(Value value, unsigned low, unsigned width,
                           Pieces &pieces);
   LogicalResult analyze(Class &cls);
@@ -162,6 +166,7 @@ private:
   StringRef simName;
   unsigned regionBits;
   StringRef reportPath;
+  ArrayRef<std::string> copies;
   std::vector<Class> classes;
   std::vector<Producer> producers;
   std::vector<Consumer> consumers;
@@ -363,6 +368,8 @@ LogicalResult StaticFolder::collect() {
     instanceOf[instance] = {it->second, cls.instances.size()};
     cls.instances.push_back(instance);
   }
+  if (failed(splitCopies()))
+    return failure();
 
   // The producers: the netlist's inputs, and the models' outputs.
   for (auto [index, arg] : llvm::enumerate(body->getArguments())) {
@@ -421,6 +428,61 @@ LogicalResult StaticFolder::collect() {
       for (auto &piece : pieces)
         if (piece.producer >= 0)
           producers[piece.producer].read = true;
+  return success();
+}
+
+LogicalResult StaticFolder::splitCopies() {
+  llvm::StringMap<unsigned> copiesOf;
+  for (auto &entry : copies) {
+    auto split = StringRef(entry).split(':');
+    StringRef name = split.first, count = split.second;
+    unsigned k = 0;
+    if (count.getAsInteger(10, k) || k == 0)
+      return netlist.emitError("copies: '") << entry
+                                            << "' is not <model>:<count>";
+    if (llvm::none_of(classes, [&](auto &cls) { return cls.name == name; }))
+      return netlist.emitError("copies: no model '") << name << "'";
+    copiesOf[name] = k;
+  }
+  unsigned numClasses = classes.size();
+  for (unsigned c = 0; c < numClasses; ++c) {
+    unsigned k = copiesOf.lookup(classes[c].name);
+    if (k <= 1)
+      continue;
+    unsigned n = classes[c].instances.size();
+    if (n % k)
+      return classes[c].instances[0].emitError("copies: ")
+             << n << " instances of '" << classes[c].name
+             << "' do not split into " << k << " copies";
+    unsigned per = n / k;
+    auto instances = classes[c].instances;
+    classes[c].instances.assign(instances.begin(), instances.begin() + per);
+    for (unsigned j = 1; j < k; ++j) {
+      // Each copy is built from a model of its own.
+      auto model = classes[c].model;
+      OpBuilder b(model);
+      b.setInsertionPointAfter(model);
+      auto clone = cast<hw::HWModuleOp>(b.clone(*model));
+      std::string name = classes[c].name + "_copy" + std::to_string(j);
+      clone.setSymName(name);
+      Class copy;
+      copy.model = clone;
+      copy.name = name;
+      copy.inputNames = classes[c].inputNames;
+      copy.outputNames = classes[c].outputNames;
+      copy.inputTypes = classes[c].inputTypes;
+      copy.outputTypes = classes[c].outputTypes;
+      copy.clockInput = classes[c].clockInput;
+      copy.splitFrom = c;
+      unsigned index = classes.size();
+      for (unsigned t = 0; t < per; ++t) {
+        auto instance = instances[j * per + t];
+        copy.instances.push_back(instance);
+        instanceOf[instance] = {index, t};
+      }
+      classes.push_back(std::move(copy));
+    }
+  }
   return success();
 }
 
@@ -743,13 +805,23 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
 
 LogicalResult StaticFolder::schedule() {
   // A ready pass for any choice of the classes with late outputs: few classes,
-  // so every choice is placed and the shortest frame kept.
+  // so every choice is placed and the shortest frame kept. Copies multiply
+  // the classes: past a dozen, every choice of the models is placed with the
+  // copies of a model alike, then single classes are flipped while the frame
+  // gets shorter.
+  auto late = [](const Class &cls) {
+    return llvm::any_of(cls.late, [](bool late) { return late; });
+  };
   SmallVector<unsigned> candidates;
   for (auto [c, cls] : llvm::enumerate(classes))
-    if (llvm::any_of(cls.late, [](bool late) { return late; }))
+    if (late(cls))
       candidates.push_back(c);
+  bool alike = candidates.size() > 12;
+  if (alike)
+    llvm::erase_if(candidates,
+                   [&](unsigned c) { return classes[c].splitFrom >= 0; });
   if (candidates.size() > 12)
-    return netlist.emitError("too many classes with late outputs to choose "
+    return netlist.emitError("too many models with late outputs to choose "
                              "their ready passes: ")
            << candidates.size();
   unsigned best = 0;
@@ -758,21 +830,39 @@ LogicalResult StaticFolder::schedule() {
   SmallVector<bool> bestAtReady;
   SmallVector<int> bestOutputSlot;
   SmallVector<bool> bestOutputEarly;
-  for (uint64_t mask = 0; mask < (uint64_t(1) << candidates.size()); ++mask) {
-    SmallVector<bool> ready(classes.size(), false);
-    for (auto [k, c] : llvm::enumerate(candidates))
-      ready[c] = (mask >> k) & 1;
+  auto tryReady = [&](const SmallVector<bool> &ready) {
     SmallVector<SmallVector<int>> slots;
     SmallVector<bool> atReady;
     unsigned length = place(ready, slots, atReady);
     if (!length || (best && length >= best))
-      continue;
+      return false;
     best = length;
     bestReady = ready;
     bestSlots = slots;
     bestAtReady = atReady;
     bestOutputSlot = outputSlot;
     bestOutputEarly = outputEarly;
+    return true;
+  };
+  for (uint64_t mask = 0; mask < (uint64_t(1) << candidates.size()); ++mask) {
+    SmallVector<bool> ready(classes.size(), false);
+    for (auto [k, c] : llvm::enumerate(candidates))
+      ready[c] = (mask >> k) & 1;
+    if (alike)
+      for (auto [c, cls] : llvm::enumerate(classes))
+        if (cls.splitFrom >= 0)
+          ready[c] = ready[cls.splitFrom];
+    tryReady(ready);
+  }
+  for (bool shorter = alike && best; shorter;) {
+    shorter = false;
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      if (!late(cls))
+        continue;
+      auto ready = bestReady;
+      ready[c] = !ready[c];
+      shorter |= tryReady(ready);
+    }
   }
   if (!best)
     return netlist.emitError("the evaluations of a frame depend on each other "
@@ -2347,7 +2437,7 @@ void FoldStaticPass::runOnOperation() {
     top.emitError("no netlist module '") << moduleName << "'";
     return signalPassFailure();
   }
-  StaticFolder folder(top, netlist, simName, regionBits, report);
+  StaticFolder folder(top, netlist, simName, regionBits, report, copies);
   if (failed(folder.run()))
     return signalPassFailure();
 }

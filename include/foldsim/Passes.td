@@ -300,6 +300,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "The most state or link bits a copy of the slot controls drives">,
     Option<"report", "report", "std::string", "",
            "A file to write the schedule to">,
+    ListOption<"copies", "copies", "std::string",
+               "Models simulated by several copies, as <model>:<count>: each "
+               "copy simulates a contiguous range of the instances">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
