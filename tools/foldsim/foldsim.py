@@ -39,6 +39,10 @@ OPTIMIZE = ['hw.module(hw-expand-array-writes)', 'hw.module(seq-reg-const-prop)'
             'hw.module(comb-share-adders)', 'canonicalize', 'hw.module(comb-low-bits-narrowing)',
             'canonicalize', 'foldsim-sort', 'cse']
 
+# The simulator's byte-masked memories as 64-bit columns, one RAM byte lane
+# per byte (foldsim-split-masked-memories).
+SPLIT = 'hw.module(foldsim-split-masked-memories)'
+
 # Logic of up to this many ops that drives a model's input from other models
 # is computed in the model, so the input comes from them directly rather than
 # through the parent's model.
@@ -394,13 +398,13 @@ def main():
             fold += f' copies={copies}'
         if a.nest:
             fold += ' nest'
-        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}',
+        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}', SPLIT,
                                         'canonicalize', 'foldsim-sort', 'cse']
         if a.copies == 'auto':
             sim_input = out('models.mlir')
             pipeline = pipeline[len(passes) + len(OPTIMIZE):]
     else:
-        pipeline = passes + OPTIMIZE + [f'foldsim-compose{{{compose}}}',
+        pipeline = passes + OPTIMIZE + [f'foldsim-compose{{{compose}}}', SPLIT,
                                         'canonicalize', 'foldsim-sort', 'cse']
     sim = out('foldsim_sim.mlir')
     run([foldsim_opt, sim_input, f'--pass-pipeline=builtin.module({",".join(pipeline)})', '-o', sim])

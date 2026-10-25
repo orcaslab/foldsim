@@ -546,6 +546,22 @@ def SyncAsyncResets : Pass<"foldsim-sync-async-resets", "::circt::hw::HWModuleOp
   let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect"];
 }
 
+def SplitMaskedMemories
+    : Pass<"foldsim-split-masked-memories", "::circt::hw::HWModuleOp"> {
+  let summary = "Split byte-masked memories into 64-bit columns";
+  let description = [{
+    A block RAM's byte lanes are 9 bits wide, so a memory masked in 8-bit
+    bytes and wider than 64 bits packs 9 of its bytes in each 72-bit RAM
+    column, the ninth in the parity bits under a write enable of its own,
+    and merges the other bytes back on a write through logic around the RAM.
+    On the V80, such columns lost the bits of one RAM half on byte-masked
+    writes, which no simulation of the netlist shows. Split into memories of
+    64 bits and 8 mask bits, each byte is one RAM byte lane and the parity
+    bits stay unused: a few more RAMs and no merge logic.
+  }];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect"];
+}
+
 def FoldZeroWidth : Pass<"foldsim-fold-zero-width", "::circt::hw::HWModuleOp"> {
   let summary = "Replace zero-width combinational values with constants";
   let description = [{

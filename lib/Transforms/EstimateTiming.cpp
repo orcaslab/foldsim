@@ -38,6 +38,7 @@ namespace foldsim {
 #define GEN_PASS_DEF_KEEPMODULES
 #define GEN_PASS_DEF_LOWEREQUALITY
 #define GEN_PASS_DEF_LOWERCONSTANTDIVISION
+#define GEN_PASS_DEF_SPLITMASKEDMEMORIES
 #define GEN_PASS_DEF_SYNCASYNCRESETS
 #include "foldsim/Passes.h.inc"
 } // namespace foldsim
@@ -1316,6 +1317,73 @@ struct SyncAsyncResetsPass
                                        reg.getResetValue(), sync);
       reg.getResult().replaceAllUsesWith(value.getResult());
       reg.erase();
+    }
+  }
+};
+
+struct SplitMaskedMemoriesPass
+    : public foldsim::impl::SplitMaskedMemoriesBase<SplitMaskedMemoriesPass> {
+  void runOnOperation() override {
+    constexpr unsigned kColumn = 64, kByte = 8;
+    SmallVector<seq::FirMemOp> memories;
+    getOperation().walk([&](seq::FirMemOp memory) {
+      auto type = memory.getType();
+      auto maskWidth = type.getMaskWidth();
+      unsigned width = type.getWidth();
+      if (!maskWidth || *maskWidth * kByte != width || width <= kColumn ||
+          width % kColumn || memory.getInnerSymAttr() || memory.getInit())
+        return;
+      bool split = llvm::all_of(memory->getUsers(), [](Operation *user) {
+        if (auto write = dyn_cast<seq::FirMemWriteOp>(user))
+          return bool(write.getMask());
+        return isa<seq::FirMemReadOp>(user);
+      });
+      if (split)
+        memories.push_back(memory);
+    });
+    for (auto memory : memories) {
+      auto type = memory.getType();
+      unsigned columns = type.getWidth() / kColumn;
+      auto columnType = seq::FirMemType::get(&getContext(), type.getDepth(),
+                                             kColumn, kColumn / kByte);
+      OpBuilder b(memory);
+      SmallVector<Value> parts;
+      for (unsigned c = 0; c < columns; ++c) {
+        StringAttr name;
+        if (auto n = memory.getNameAttr())
+          name = b.getStringAttr(n.getValue() + "_c" + Twine(c));
+        parts.push_back(seq::FirMemOp::create(
+            b, memory.getLoc(), columnType, memory.getReadLatency(),
+            memory.getWriteLatency(), memory.getRuw(), memory.getWuw(), name,
+            {}, {}, memory.getPrefixAttr(), memory.getOutputFileAttr()));
+      }
+      for (auto *user : llvm::make_early_inc_range(memory->getUsers())) {
+        OpBuilder ub(user);
+        if (auto read = dyn_cast<seq::FirMemReadOp>(user)) {
+          SmallVector<Value> data;
+          for (unsigned c = columns; c-- > 0;)
+            data.push_back(seq::FirMemReadOp::create(
+                ub, read.getLoc(), parts[c], read.getAddress(), read.getClk(),
+                read.getEnable()));
+          read.replaceAllUsesWith(
+              comb::ConcatOp::create(ub, read.getLoc(), data).getResult());
+        } else {
+          auto write = cast<seq::FirMemWriteOp>(user);
+          for (unsigned c = 0; c < columns; ++c) {
+            Value data = comb::ExtractOp::create(ub, write.getLoc(),
+                                                 write.getData(), c * kColumn,
+                                                 kColumn);
+            Value mask = comb::ExtractOp::create(
+                ub, write.getLoc(), write.getMask(), c * (kColumn / kByte),
+                kColumn / kByte);
+            seq::FirMemWriteOp::create(ub, write.getLoc(), parts[c],
+                                       write.getAddress(), write.getClk(),
+                                       write.getEnable(), data, mask);
+          }
+        }
+        user->erase();
+      }
+      memory.erase();
     }
   }
 };
