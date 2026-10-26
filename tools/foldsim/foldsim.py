@@ -161,7 +161,7 @@ def choose_copies(a, foldsim_opt, flat, passes, out):
     with open(out('degree.json'), 'w') as f:
         json.dump(result, f, indent=1, default=str)
     if not result['pick']:
-        sys.exit(f'--copies auto: no choice within {a.lut_budget} LUTs; see {out("degree.txt")}')
+        sys.exit(f'--copies auto: no choice that places within {a.lut_budget or "any"} LUTs; see {out("degree.txt")}')
     pick = result['pick']
     print(f"foldsim: copies {pick['copies']}: II {pick['ii']}, about {pick['luts']} LUTs",
           file=sys.stderr)
