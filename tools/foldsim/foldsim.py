@@ -119,12 +119,17 @@ def read_srcs(path, defines, incdirs, files, base=None, seen=()):
 
 
 def frame_options(a):
-    """The fold-static options that restore the earlier frame, if asked."""
+    """The fold-static options of the frame: the earlier one restored, or
+    consecutive frames overlapped, if asked."""
     fold = ''
     if a.two_cycle_links:
         fold += ' one-cycle-links=false'
     if a.serial_frames:
         fold += ' overlap-frames=false'
+    if a.modulo:
+        fold += ' modulo'
+    if a.interleave_copies:
+        fold += ' interleave-copies'
     return fold
 
 
@@ -248,6 +253,11 @@ def main():
                     help='with --static: no forwarding into link reads (a reader two host cycles after its producer)')
     ap.add_argument('--serial-frames', action='store_true',
                     help='with --static: decide the next frame only after every output of this one is pushed')
+    ap.add_argument('--modulo', action='store_true',
+                    help='with --static: overlap consecutive frames, a slot past the frame running in '
+                         'the next frame\'s, when that frame is shorter')
+    ap.add_argument('--interleave-copies', action='store_true',
+                    help='with --static: a copy takes every k-th instance, not a contiguous range')
     ap.add_argument('--copies', default='',
                     help='<model>:<count>,...: models simulated by several threaded copies '
                          '(foldsim-compose, foldsim-fold-static); with --static, `auto`: '

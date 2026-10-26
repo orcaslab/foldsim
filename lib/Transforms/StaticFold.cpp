@@ -151,11 +151,13 @@ public:
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
                unsigned regionBits, StringRef report,
                ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
-               bool oneCycleLinks, bool overlapFrames)
+               bool oneCycleLinks, bool overlapFrames, bool modulo,
+               bool interleaveCopies)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         scheduleOnly(scheduleOnly), oneCycleLinks(oneCycleLinks),
-        overlapFrames(overlapFrames),
+        overlapFrames(overlapFrames), modulo(modulo),
+        interleaveCopies(interleaveCopies),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
 
@@ -172,6 +174,15 @@ private:
   /// if the evaluations depend on each other in a cycle.
   unsigned place(ArrayRef<bool> ready, SmallVectorImpl<SmallVector<int>> &slots,
                  SmallVectorImpl<bool> &atReady);
+  /// Places the evaluations with consecutive frames overlapped: the shortest
+  /// frame at which every copy's evaluations fit, modulo the frame, and every
+  /// dependence across frames holds; 0 if none does.
+  unsigned placeModulo(
+      ArrayRef<Node> nodes,
+      ArrayRef<SmallVector<std::pair<unsigned, int>>> preds,
+      ArrayRef<SmallVector<std::pair<unsigned, int>>> succs,
+      ArrayRef<int> height, ArrayRef<bool> atReady,
+      SmallVectorImpl<SmallVector<int>> &slots);
   LogicalResult buildCopy(Class &cls);
   LogicalResult buildSim();
 
@@ -187,7 +198,7 @@ private:
   DenseMap<Operation *, std::string> containerOf;
   DenseSet<Operation *> logicInstances;
   bool scheduleOnly;
-  bool oneCycleLinks, overlapFrames;
+  bool oneCycleLinks, overlapFrames, modulo, interleaveCopies;
   /// Host cycles from a producer's slot to its reader's.
   int linkLatency;
   std::vector<Class> classes;
@@ -497,7 +508,15 @@ LogicalResult StaticFolder::splitCopies() {
              << "' do not split into " << k << " copies";
     unsigned per = n / k;
     auto instances = classes[c].instances;
-    classes[c].instances.assign(instances.begin(), instances.begin() + per);
+    // Copy j's t-th instance: contiguous, or every k-th.
+    auto pick = [&](unsigned j, unsigned t) {
+      return instances[interleaveCopies ? t * k + j : j * per + t];
+    };
+    classes[c].instances.clear();
+    for (unsigned t = 0; t < per; ++t) {
+      classes[c].instances.push_back(pick(0, t));
+      instanceOf[pick(0, t)] = {c, t};
+    }
     for (unsigned j = 1; j < k; ++j) {
       // Each copy is built from a model of its own.
       auto model = classes[c].model;
@@ -519,7 +538,7 @@ LogicalResult StaticFolder::splitCopies() {
       copy.depth = classes[c].depth;
       unsigned index = classes.size();
       for (unsigned t = 0; t < per; ++t) {
-        auto instance = instances[j * per + t];
+        auto instance = pick(j, t);
         copy.instances.push_back(instance);
         instanceOf[instance] = {index, t};
       }
@@ -807,6 +826,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     return 0;
   std::reverse(order.begin(), order.end());
 
+
   // List scheduling: in topological order, highest first among the ready.
   SmallVector<int> slotOf(nodes.size(), -1);
   std::vector<std::set<int>> busy(classes.size());
@@ -914,7 +934,208 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
   }
   // Overlapped, the decision for the next frame may fall before this one
   // begins: the inputs' and outputs' queues count the frames decided ahead.
-  return std::max(length, 2);
+  length = std::max(length, 2);
+  // Consecutive frames overlapped, if that frame is shorter: a frame placed
+  // alone is one of them, at its own length.
+  if (modulo) {
+    SmallVector<SmallVector<int>> overlapped;
+    SmallVector<int> aloneSlot = outputSlot;
+    SmallVector<bool> aloneEarly = outputEarly;
+    unsigned period = placeModulo(nodes, preds, succs, height, atReady, overlapped);
+    if (period && period < unsigned(length)) {
+      slots = std::move(overlapped);
+      return period;
+    }
+    outputSlot = aloneSlot;
+    outputEarly = aloneEarly;
+  }
+  return length;
+}
+
+unsigned StaticFolder::placeModulo(
+    ArrayRef<Node> nodes, ArrayRef<SmallVector<std::pair<unsigned, int>>> preds,
+    ArrayRef<SmallVector<std::pair<unsigned, int>>> succs, ArrayRef<int> height,
+    ArrayRef<bool> atReady, SmallVectorImpl<SmallVector<int>> &slots) {
+  // No frame is shorter than a copy's evaluations of it.
+  SmallVector<unsigned> evaluations(classes.size(), 0);
+  for (auto &node : nodes)
+    ++evaluations[node.cls];
+  unsigned lower = 2;
+  for (auto count : evaluations)
+    lower = std::max(lower, count);
+  auto cmp = [&](unsigned a, unsigned b) {
+    if (height[a] != height[b])
+      return height[a] < height[b];
+    return a > b;
+  };
+  SmallVector<bool> feedsOutput(producers.size(), false);
+  for (auto &consumer : consumers)
+    if (consumer.cls < 0)
+      for (auto &piece : consumer.pieces[0])
+        if (piece.producer >= 0)
+          feedsOutput[piece.producer] = true;
+  for (unsigned period = lower; period <= 4 * lower + 64; ++period) {
+    // List scheduling, a copy's slots taken modulo the frame; an evaluation
+    // runs at most one frame late.
+    SmallVector<int> slotOf(nodes.size(), -1);
+    std::vector<std::set<int>> busy(classes.size());
+    SmallVector<unsigned> waiting(nodes.size(), 0);
+    for (unsigned n = 0; n < nodes.size(); ++n)
+      waiting[n] = preds[n].size();
+    std::vector<unsigned> heap;
+    for (unsigned n = 0; n < nodes.size(); ++n)
+      if (!waiting[n])
+        heap.push_back(n);
+    std::make_heap(heap.begin(), heap.end(), cmp);
+    bool fits = true;
+    while (fits && !heap.empty()) {
+      std::pop_heap(heap.begin(), heap.end(), cmp);
+      unsigned n = heap.back();
+      heap.pop_back();
+      int earliest = 0;
+      for (auto [p, latency] : preds[n])
+        earliest = std::max(earliest, slotOf[p] + latency);
+      auto &taken = busy[nodes[n].cls];
+      while (taken.count(earliest % period))
+        ++earliest;
+      if (earliest >= int(2 * period)) {
+        fits = false;
+        break;
+      }
+      taken.insert(earliest % period);
+      slotOf[n] = earliest;
+      for (auto [s, latency] : succs[n])
+        if (!--waiting[s]) {
+          heap.push_back(s);
+          std::push_heap(heap.begin(), heap.end(), cmp);
+        }
+    }
+    if (!fits)
+      continue;
+
+    // Then each evaluation as late as its readers allow, latest readers
+    // first: a ready pass close to its readers shortens the span from an
+    // instance's first evaluation to its state write, which bounds the frame.
+    // A state pass after a ready pass stays, since moving it lengthens that
+    // span.
+    SmallVector<unsigned> byStart(nodes.size());
+    for (unsigned n = 0; n < nodes.size(); ++n)
+      byStart[n] = n;
+    llvm::stable_sort(byStart,
+                      [&](unsigned a, unsigned b) { return slotOf[a] > slotOf[b]; });
+    for (auto n : byStart) {
+      auto &node = nodes[n];
+      if (node.pass == kState &&
+          llvm::any_of(preds[n], [&](auto pred) {
+            return nodes[pred.first].cls == node.cls &&
+                   nodes[pred.first].inst == node.inst;
+          }))
+        continue;
+      int latest = INT_MAX;
+      for (auto [s, latency] : succs[n])
+        latest = std::min(latest, slotOf[s] - latency);
+      // A netlist output's token leaves in time for the environment.
+      for (auto port : classes[node.cls].producerOf) {
+        auto &producer = producers[port];
+        bool at = producer.late && atReady[port] ? node.pass == kReady
+                                                  : node.pass == kState;
+        if (!feedsOutput[port] || !at)
+          continue;
+        latest = std::min<int>(latest, int(period) - linkLatency + 1 -
+                                           (producer.late ? kEnvRoundTrip : 1));
+      }
+      if (latest == INT_MAX)
+        continue;
+      auto &taken = busy[node.cls];
+      taken.erase(slotOf[n] % period);
+      int at = slotOf[n];
+      for (int t = latest; t > slotOf[n]; --t)
+        if (!taken.count(t % period)) {
+          at = t;
+          break;
+        }
+      taken.insert(at % period);
+      slotOf[n] = at;
+    }
+
+    slots.assign(classes.size() * 2, {});
+    for (auto [c, cls] : llvm::enumerate(classes))
+      for (auto pass : {kReady, kState})
+        slots[c * 2 + pass].assign(cls.threads(), -1);
+    for (auto [n, node] : llvm::enumerate(nodes))
+      slots[node.cls * 2 + node.pass][node.inst] = slotOf[n];
+    auto first = [&](unsigned c, unsigned i) {
+      int s = slots[c * 2 + kState][i];
+      int r = slots[c * 2 + kReady][i];
+      return r >= 0 ? std::min(r, s) : s;
+    };
+    auto last = [&](unsigned c, unsigned i) {
+      return std::max(slots[c * 2 + kState][i], slots[c * 2 + kReady][i]);
+    };
+    bool ok = true;
+    // An instance's next frame reads its state after this one's write.
+    for (auto [c, cls] : llvm::enumerate(classes))
+      for (unsigned i = 0; ok && i < cls.threads(); ++i) {
+        int latency = (cls.syncReads ? 3 : 2) + (cls.threads() > 1 ? 1 : 0);
+        ok = slots[c * 2 + kState][i] - first(c, i) + latency <= int(period);
+      }
+    // A late link holds one frame's value: its readers read it before its
+    // producer writes the next frame's.
+    for (unsigned n = 0; ok && n < nodes.size(); ++n)
+      for (auto [p, latency] : preds[n])
+        if (slotOf[n] - slotOf[p] >= int(period))
+          ok = false;
+    // An early link holds two, by frame: the next frame's write lands after
+    // its reads of this frame's, and before them in the next.
+    for (auto &consumer : consumers) {
+      if (!ok || consumer.cls < 0)
+        continue;
+      for (auto [i, pieces] : llvm::enumerate(consumer.pieces))
+        for (auto &piece : pieces) {
+          if (piece.producer < 0)
+            continue;
+          auto &producer = producers[piece.producer];
+          if (producer.cls < 0 || producer.late)
+            continue;
+          int written = slots[producer.cls * 2 + kState][piece.inst];
+          if (written - first(consumer.cls, i) + linkLatency > int(period) ||
+              last(consumer.cls, i) - written >= int(period))
+            ok = false;
+        }
+    }
+    if (!ok)
+      continue;
+
+    // The netlist's outputs leave within their own frame, a late one in time
+    // for the environment's round trip.
+    outputSlot.assign(consumers.size(), -1);
+    outputEarly.assign(consumers.size(), true);
+    for (auto [k, consumer] : llvm::enumerate(consumers)) {
+      if (consumer.cls >= 0)
+        continue;
+      int at = 0;
+      for (auto &piece : consumer.pieces[0]) {
+        if (piece.producer < 0)
+          continue;
+        auto &producer = producers[piece.producer];
+        if (producer.cls < 0) {
+          outputEarly[k] = false;
+          continue;
+        }
+        if (producer.late)
+          outputEarly[k] = false;
+        auto pass = atReady[piece.producer] ? kReady : kState;
+        at = std::max(at, slots[producer.cls * 2 + pass][piece.inst] +
+                              linkLatency - 1);
+      }
+      outputSlot[k] = at;
+      if (at + (outputEarly[k] ? 1 : kEnvRoundTrip) > int(period))
+        ok = false;
+    }
+    if (ok)
+      return period;
+  }
+  return 0;
 }
 
 LogicalResult StaticFolder::schedule() {
@@ -2116,7 +2337,7 @@ LogicalResult StaticFolder::buildSim() {
   // (the table's), two, one, then now.
   struct Controls {
     Value inst3, state3;
-    Value inst2, state2, ready2;
+    Value inst2, state2, ready2, tail2;
     Value inst1, inst, state, ready;
   };
   SmallVector<Controls> controls(classes.size());
@@ -2153,25 +2374,51 @@ LogicalResult StaticFolder::buildSim() {
           /*isAsync=*/false, b.getIntegerAttr(type, ii)));
     }
   }
+  // Overlapped frames: a slot past the frame runs in the next frame's, for
+  // the frame before it, so none runs until a frame has finished.
+  bool overlapped = llvm::any_of(classes, [&](const Class &cls) {
+    return llvm::any_of(cls.slot[kState], [&](int s) { return s >= int(ii); }) ||
+           llvm::any_of(cls.slot[kReady], [&](int s) { return s >= int(ii); });
+  });
+  Value primed;
+  if (overlapped) {
+    auto startedNext = backedges.get(i1);
+    Value started = resetReg(startedNext, "started", 0);
+    startedNext.setValue(comb::OrOp::create(b, started, starting));
+    auto primedNext = backedges.get(i1);
+    primed = resetReg(primedNext, "primed", 0);
+    primedNext.setValue(comb::OrOp::create(
+        b, primed, comb::AndOp::create(b, starting, started)));
+  }
   for (auto [c, cls] : llvm::enumerate(classes)) {
     unsigned threads = cls.threads();
     unsigned idxWidth = threads > 1 ? llvm::Log2_32_Ceil(threads) : 0;
     SmallVector<uint64_t> instRow(ii + 1, 0), stateRow(ii + 1, 0),
-        readyRow(ii + 1, 0);
-    for (unsigned i = 0; i < threads; ++i) {
-      instRow[cls.slot[kState][i]] = i;
-      stateRow[cls.slot[kState][i]] = 1;
-      if (cls.hasReady) {
-        instRow[cls.slot[kReady][i]] = i;
-        readyRow[cls.slot[kReady][i]] = 1;
+        readyRow(ii + 1, 0), tailRow(ii + 1, 0);
+    for (unsigned i = 0; i < threads; ++i)
+      for (auto pass : {kReady, kState}) {
+        if (pass == kReady && !cls.hasReady)
+          continue;
+        unsigned s = cls.slot[pass][i];
+        instRow[s % ii] = i;
+        (pass == kReady ? readyRow : stateRow)[s % ii] = 1;
+        tailRow[s % ii] = s >= ii;
       }
-    }
     Value at = nest ? sequencer[c] : pos3;
     auto &ctl = controls[c];
     auto prefix = cls.name;
     ctl.state3 = table(b, at, stateRow, 1);
+    Value ready3 = table(b, at, readyRow, 1);
+    if (overlapped) {
+      // A slot of the frame before runs once a frame has finished.
+      Value tail3 = table(b, at, tailRow, 1);
+      Value runs = comb::OrOp::create(b, notOf(tail3), primed);
+      ctl.state3 = comb::AndOp::create(b, ctl.state3, runs);
+      ready3 = comb::AndOp::create(b, ready3, runs);
+      ctl.tail2 = reg(tail3, prefix + "_tail2");
+    }
     ctl.state2 = reg(ctl.state3, prefix + "_state2");
-    ctl.ready2 = reg(table(b, at, readyRow, 1), prefix + "_ready2");
+    ctl.ready2 = reg(ready3, prefix + "_ready2");
     Value state1 = reg(ctl.state2, prefix + "_state1");
     Value ready1 = reg(ctl.ready2, prefix + "_ready1");
     ctl.state = reg(state1, prefix + "_state0");
@@ -2277,13 +2524,32 @@ LogicalResult StaticFolder::buildSim() {
     frameInput[p] = x;
     frameInputNext[p] = taken;
   }
+  // The frame's input as a class's evaluation a host cycle ahead reads it:
+  // in a slot past the frame, the frame before's.
+  DenseMap<unsigned, Value> prevFrameInputNext;
+  DenseMap<unsigned, Value> classTail1;
+  auto frameInputFor = [&](unsigned p, unsigned c) -> Value {
+    if (!controls[c].tail2)
+      return frameInputNext[p];
+    Value &prevNext = prevFrameInputNext[p];
+    if (!prevNext) {
+      auto next = backedges.get(frameInput[p].getType());
+      Value prev = reg(next, producers[p].name + "_prev");
+      prevNext = comb::MuxOp::create(b, load, frameInput[p], prev);
+      next.setValue(prevNext);
+    }
+    Value &tail1 = classTail1[c];
+    if (!tail1)
+      tail1 = reg(controls[c].tail2, classes[c].name + "_tail1");
+    return comb::MuxOp::create(b, tail1, prevNext, frameInputNext[p]);
+  };
   // A class's own copy of a frame's input (as a reset, it drives much of the
   // class's state).
   std::map<std::pair<unsigned, unsigned>, Value> classFrameInputs;
   auto classFrameInput = [&](unsigned p, unsigned c) -> Value {
     Value &copy = classFrameInputs[{p, c}];
     if (!copy)
-      copy = copyReg(frameInputNext[p],
+      copy = copyReg(frameInputFor(p, c),
                      producers[p].name + "_frame_" + classes[c].name);
     return copy;
   };
@@ -2374,8 +2640,16 @@ LogicalResult StaticFolder::buildSim() {
       // The bank in the high bit, the instance in the low ones.
       SmallVector<Value> writeAddress, readAddress;
       if (banked) {
-        if (!group.bank)
-          group.bank = notOf(copyReg(par1, group.prefix + "_parity0"));
+        if (!group.bank) {
+          // The frame the write belongs to: the one before in a slot past it.
+          Value parity = copyReg(par1, group.prefix + "_parity0");
+          if (ctl.tail2)
+            parity = comb::XorOp::create(
+                b, parity,
+                copyReg(copyReg(ctl.tail2, group.prefix + "_tail1"),
+                        group.prefix + "_tail0"));
+          group.bank = notOf(parity);
+        }
         writeAddress.push_back(group.bank);
         readAddress.push_back(bank());
       }
@@ -2505,7 +2779,7 @@ LogicalResult StaticFolder::buildSim() {
           // The frame's input as the read register will hold it: the token
           // being taken before the frame's first slot.
           sourceData[index] = b.createOrFold<comb::ExtractOp>(
-              b.getIntegerType(width), frameInputNext[key.first], key.second);
+              b.getIntegerType(width), frameInputFor(key.first, c), key.second);
           continue;
         }
         unsigned pThreads = classes[producer.cls].threads();
@@ -2527,8 +2801,14 @@ LogicalResult StaticFolder::buildSim() {
                              Twine(addressCopies++));
         };
         auto bank = [&]() -> Value {
-          return copyReg(par2, consumer.name + "_parity1_" + Twine(at) + "_" +
-                                   Twine(bankCopies++));
+          std::string name = (consumer.name + "_parity1_" + Twine(at) + "_" +
+                              Twine(bankCopies++))
+                                 .str();
+          Value parity = copyReg(par2, name);
+          if (ctl.tail2)
+            parity = comb::XorOp::create(b, parity,
+                                         copyReg(ctl.tail2, name + "_tail"));
+          return parity;
         };
         sourceData[index] =
             linkRead(key.first, key.second, width, address, bank,
@@ -2771,7 +3051,8 @@ void FoldStaticPass::runOnOperation() {
     return signalPassFailure();
   }
   StaticFolder folder(top, netlist, simName, regionBits, report, copies,
-                      nest, scheduleOnly, oneCycleLinks, overlapFrames);
+                      nest, scheduleOnly, oneCycleLinks, overlapFrames,
+                      modulo, interleaveCopies);
   if (failed(folder.run()))
     return signalPassFailure();
 }

@@ -317,6 +317,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"overlapFrames", "overlap-frames", "bool", "true",
            "Decide the next frame before this one's outputs are pushed, "
            "counting the pushes still due, instead of after them">,
+    Option<"interleaveCopies", "interleave-copies", "bool", "false",
+           "Copies of a model take every k-th instance instead of a "
+           "contiguous range, so a parent's children run on all copies at "
+           "once rather than one after another on one">,
+    Option<"modulo", "modulo", "bool", "false",
+           "Overlap consecutive frames' evaluations: a slot past the frame "
+           "runs in the next frame's, so the frame is bounded by each copy's "
+           "evaluations and the dependences across frames, not by the "
+           "longest chain within one">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
