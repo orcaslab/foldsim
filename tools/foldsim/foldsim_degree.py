@@ -260,6 +260,57 @@ def lstsq(rows, ys):
     return [b[i] / a[i][i] for i in range(n)]
 
 
+def firesim_factors(cal):
+    """FireSim's LUTs against our estimate of the unfolded target, logic and
+    distributed RAM apart: the least over the FireSim builds calibrated, so a
+    projection is what FireSim needs at the least."""
+    fs = (cal or {}).get('firesim', [])
+    if not fs:
+        return None
+    return dict(logic=min(b['logic'] / b['est_logic'] for b in fs),
+                lutram=min(b['lutram'] / max(b['est_lutram'], 1) for b in fs),
+                builds=[b['name'] for b in fs])
+
+
+def firesim_area(cal, unfolded):
+    """FireSim's projected LUTs and sites for a design: the unfolded target
+    scaled by the FireSim factors (None without FireSim builds)."""
+    f = firesim_factors(cal)
+    if not f:
+        return None
+    logic, lutram = f['logic'] * unfolded['logic'], f['lutram'] * unfolded['lutram']
+    sites, fits = placement(logic, lutram, unfolded['bram'])
+    return dict(luts=round(logic + lutram), lutram=round(lutram), sites=round(sites), fits=fits)
+
+
+def calibrate_firesim(a):
+    """Add a FireSim build of a design: its LUTs from Vivado's utilization
+    (the kernel's row) and its period, against the unfolded target's estimate
+    from the design's models IR (calibrated as the Foldsim builds are)."""
+    row = [a.luts, a.logic, a.lutram] if a.luts else None
+    cols = None
+    for line in ([] if row else open(a.util)):
+        f = [x.strip() for x in line.split('|')]
+        if 'Total LUTs' in f:
+            cols = [f.index(c) for c in ('Total LUTs', 'Logic LUTs', 'LUTRAMs')]
+        elif cols and len(f) > max(cols) and f[1] == a.instance:
+            row = [int(f[c].split('(')[0]) for c in cols]
+            break
+    if row is None:
+        sys.exit(f'no row {a.instance} in {a.util}')
+    cal = json.load(open(a.out)) if os.path.exists(a.out) else {}
+    _, classes, _ = parse_schedule(open(a.schedule).read())
+    est = class_estimates(a.models, classes)
+    unf = area(cal, est, classes, dict(classes), rest_of(cal, sum(e['lut'] for e in est.values())))
+    b = dict(name=a.name, luts=row[0], logic=row[1], lutram=row[2], period=a.period,
+             est_logic=unf['logic'], est_lutram=unf['lutram'])
+    cal['firesim'] = [x for x in cal.get('firesim', []) if x['name'] != a.name] + [b]
+    json.dump(cal, open(a.out, 'w'), indent=1)
+    print(f"{a.name}: {row[0]} LUTs (logic {row[1]}, lutram {row[2]}) against the unfolded "
+          f"target's {unf['logic']} + {unf['lutram']}: x{row[1] / unf['logic']:.2f} logic, "
+          f"x{row[2] / max(unf['lutram'], 1):.2f} lutram, period {a.period} ns")
+
+
 TERMS = {'const': (), 'size': ('size',), 'size+depth': ('size', 'depth')}
 
 
@@ -361,7 +412,7 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
     # own area, which an unfolded simulator (FireSim) needs at the least.
     unfolded = area(cal, est, classes, dict(classes), rest)
     return dict(classes=classes, points=points, front=front, pick=pick, budget=budget,
-                unfolded=unfolded, depth=depth, fit=fit)
+                unfolded=unfolded, firesim=firesim_area(cal, unfolded), depth=depth, fit=fit)
 
 
 def table(result):
@@ -381,6 +432,10 @@ def table(result):
     u = result['unfolded']
     lines.append(f"{'unfolded (every instance its own copy)':<60} {'-':>12} {u['luts']:>12} "
                  f"{u['lutram']:>12} {u['sites']:>12} {str(u['fits']):>12} {u['bram']:>12}")
+    fs = result.get('firesim')
+    if fs:
+        lines.append(f"{'FireSim, projected (at least: unfolded x FireSim builds)':<60} {'-':>12} "
+                     f"{fs['luts']:>12} {fs['lutram']:>12} {fs['sites']:>12} {str(fs['fits']):>12}")
     lines.append('* Pareto front (ns per simulated cycle against LUTs); '
                  f"budget {result['budget'] or 'none'}; fits: {PLACE_MARGIN:.0%} of "
                  f'{PLACE_SITES} V80 LUT sites (a LUTRAM LUT {LUTRAM_SITES} sites) and of '
@@ -400,6 +455,18 @@ def table(result):
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     sub = ap.add_subparsers(dest='cmd', required=True)
+    g = sub.add_parser('calibrate-firesim', help='add a FireSim build of a design')
+    g.add_argument('--models', required=True)
+    g.add_argument('--schedule', required=True,
+                   help='a schedule report of the design (any fold degree): its classes')
+    g.add_argument('--util', default='', help="FireSim's report_utilization_firesim.txt")
+    g.add_argument('--luts', type=int, default=0, help='instead of --util: total LUTs')
+    g.add_argument('--logic', type=int, default=0)
+    g.add_argument('--lutram', type=int, default=0)
+    g.add_argument('--instance', default='top_i')
+    g.add_argument('--period', type=float, required=True, help='the routed period, ns')
+    g.add_argument('--name', required=True)
+    g.add_argument('--out', required=True)
     c = sub.add_parser('calibrate', help='add a build to a calibration file')
     c.add_argument('--models', required=True)
     c.add_argument('--schedule', required=True)
@@ -431,6 +498,8 @@ def main():
             print(name, fit_terms(cal['builds'], terms))
         print('chosen', period_fit(cal)['terms'] or 'const')
         return 0
+    if a.cmd == 'calibrate-firesim':
+        return calibrate_firesim(a)
     if a.cmd == 'calibrate':
         return calibrate(a)
     cal = json.load(open(a.calibration)) if a.calibration else None
