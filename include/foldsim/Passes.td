@@ -330,6 +330,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     ListOption<"envSinks", "env-sinks", "std::string",
                "Outputs of the netlist that none of the environment's tokens "
                "depend on: they close no round trip through it">,
+    Option<"zeroLatencyChains", "zero-latency-chains", "bool", "false",
+           "With zero-latency-links, every late link too, also where its "
+           "reader's input reaches an output combinationally: links then "
+           "chain across classes within a host cycle, as the native design "
+           "evaluates them within a cycle (the logic screen checks the depth "
+           "against the native netlist's)">,
     Option<"zeroLatencyLinks", "zero-latency-links", "bool", "false",
            "A late link a reader takes in its producer's own host cycle, "
            "around its read register, where the reader's input reaches no "

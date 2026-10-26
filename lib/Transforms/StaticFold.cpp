@@ -161,6 +161,7 @@ public:
                ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
                bool oneCycleLinks, bool overlapFrames, bool modulo,
                bool interleaveCopies, bool zeroLatencyLinks,
+               bool zeroLatencyChains,
                ArrayRef<std::string> specGroups,
                ArrayRef<std::string> envSinks)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
@@ -169,6 +170,7 @@ public:
         scheduleOnly(scheduleOnly), oneCycleLinks(oneCycleLinks),
         overlapFrames(overlapFrames), modulo(modulo),
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
+        zeroLatencyChains(zeroLatencyChains),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
 
@@ -228,7 +230,7 @@ private:
   DenseSet<Operation *> logicInstances;
   bool scheduleOnly;
   bool oneCycleLinks, overlapFrames, modulo, interleaveCopies;
-  bool zeroLatencyLinks;
+  bool zeroLatencyLinks, zeroLatencyChains;
   /// Whether producer `p`'s link to class `c`'s input may be taken in the
   /// producer's own host cycle.
   bool zeroLink(unsigned p, unsigned c, unsigned input) const;
@@ -817,6 +819,8 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   auto &producer = producers[p];
   if (!zeroLatencyLinks || producer.cls < 0 || !producer.late)
     return false;
+  if (zeroLatencyChains)
+    return true;
   auto &cls = classes[c];
   if (cls.inputToOutput.test(input))
     return false;
@@ -3424,7 +3428,8 @@ void FoldStaticPass::runOnOperation() {
   }
   StaticFolder folder(top, netlist, simName, regionBits, report, copies,
                       nest, scheduleOnly, oneCycleLinks, overlapFrames,
-                      modulo, interleaveCopies, zeroLatencyLinks, specGroups,
+                      modulo, interleaveCopies, zeroLatencyLinks, zeroLatencyChains,
+                      specGroups,
                       envSinks);
   if (failed(folder.run()))
     return signalPassFailure();

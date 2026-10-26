@@ -136,6 +136,8 @@ def frame_options(a):
         fold += f' env-sinks={a.env_sinks}'
     if a.zero_latency_links:
         fold += ' zero-latency-links'
+    if a.zero_latency_chains:
+        fold += ' zero-latency-chains'
     return fold
 
 
@@ -298,6 +300,9 @@ def main():
                          'separated: they close no round trip through the environment')
     ap.add_argument('--interleave-copies', action='store_true',
                     help='with --static: a copy takes every k-th instance, not a contiguous range')
+    ap.add_argument('--zero-latency-chains', action='store_true',
+                    help='with --zero-latency-links: every late link, chaining across models within '
+                         'a host cycle as the native design does within a cycle')
     ap.add_argument('--zero-latency-links', action='store_true',
                     help='with --static: a reader may take a shallow late link in its '
                          'producer\'s own host cycle')
