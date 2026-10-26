@@ -311,17 +311,32 @@ def calibrate_firesim(a):
           f"x{row[2] / max(unf['lutram'], 1):.2f} lutram, period {a.period} ns")
 
 
-TERMS = {'const': (), 'size': ('size',), 'size+depth': ('size', 'depth')}
+TERMS = {'const': (), 'size': ('size',), 'size+depth': ('size', 'depth'),
+         'copies': ('copies',), 'span': ('span',), 'size+copies': ('size', 'copies'),
+         'size+span': ('size', 'span')}
 
 
-def fit_row(terms, largest, depth):
-    return [1.0] + [math.log2(max(largest, 1.0)) if t == 'size' else depth for t in terms]
+def features(largest, depth, copies, luts):
+    """A design's terms for the period fit: log2 of its largest copy's LUTs,
+    the screen's depth, its copies over every class, and the share of the
+    V80's placement capacity its LUTs take (how far it spreads over the dies)."""
+    return dict(size=math.log2(max(largest, 1.0)), depth=depth or 0.0,
+                copies=float(copies), span=luts / PLACE_SITES)
+
+
+def build_features(b):
+    return features(b['max_copy'], b.get('depth', 0.0),
+                    sum(c['copies'] for c in b['classes'].values()), b['luts'])
+
+
+def fit_row(terms, feats):
+    return [1.0] + [feats[t] for t in terms]
 
 
 def fit_terms(builds, terms):
     """Least squares of the period over the builds, and each build's
     leave-one-out error (empty when the builds are too few)."""
-    rows = [fit_row(terms, b['max_copy'], b.get('depth', 0.0)) for b in builds]
+    rows = [fit_row(terms, build_features(b)) for b in builds]
     ys = [b['period'] for b in builds]
     coef = lstsq(rows, ys)
     if coef is None:
@@ -334,7 +349,11 @@ def fit_terms(builds, terms):
                 return dict(coef=coef, terms=terms, loo={}, rms=None)
             loo[b['name']] = round(sum(x * y for x, y in zip(c, rows[i])) - ys[i], 3)
     rms = math.sqrt(sum(e * e for e in loo.values()) / len(loo)) if loo else None
-    return dict(coef=coef, terms=terms, loo=loo, rms=rms and round(rms, 3))
+    # A design is priced within the range the builds cover: no term is
+    # extrapolated past them.
+    span = {t: (min(build_features(b)[t] for b in builds),
+                max(build_features(b)[t] for b in builds)) for t in terms}
+    return dict(coef=coef, terms=terms, loo=loo, rms=rms and round(rms, 3), range=span)
 
 
 def period_fit(cal, use_depth=True):
@@ -345,8 +364,8 @@ def period_fit(cal, use_depth=True):
     builds = (cal or {}).get('builds', [])
     if not builds:
         return None
-    names = ['const', 'size'] + (['size+depth'] if use_depth and all(
-        'depth' in b for b in builds) else [])
+    names = [n for n, t in TERMS.items()
+             if 'depth' not in t or (use_depth and all('depth' in b for b in builds))]
     fits = [f for f in (fit_terms(builds, TERMS[n]) for n in names) if f]
     scored = [f for f in fits if f['rms'] is not None]
     if scored:
@@ -354,9 +373,10 @@ def period_fit(cal, use_depth=True):
     return next((f for f in fits if f['terms'] == TERMS['size']), fits[0])
 
 
-def fit_period(fit, largest, depth):
-    """A candidate's period from the fit."""
-    return sum(x * y for x, y in zip(fit['coef'], fit_row(fit['terms'], largest, depth or 0.0)))
+def fit_period(fit, feats):
+    """A candidate's period from the fit, each term held to the builds' range."""
+    held = {t: min(max(feats[t], lo), hi) for t, (lo, hi) in fit.get('range', {}).items()}
+    return sum(x * y for x, y in zip(fit['coef'], fit_row(fit['terms'], {**feats, **held})))
 
 
 def pow2_divisors(n):
@@ -393,7 +413,8 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
         res = dict(copies=copies or '-', ii=ii,
                    **area(cal, est, classes, dict(zip(names, ks)), rest))
         if fit:
-            period = fit_period(fit, res['largest_copy'], depth)
+            period = fit_period(fit, features(res['largest_copy'], depth, sum(ks),
+                                              res['luts']))
             res.update(period=round(period, 3), mhz=round(1000 / period, 1),
                        ns=round(ii * period, 1))
         return res

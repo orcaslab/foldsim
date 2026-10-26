@@ -1,0 +1,358 @@
+{
+ "builds": [
+  {
+   "name": "full_lkg",
+   "luts": 875500,
+   "rest": 49461,
+   "period": 4.585,
+   "classes": {
+    "foldsim_target_model": {
+     "copies": 1,
+     "threads": 1,
+     "logic": 74786.0,
+     "lutram": 4448.0,
+     "est_logic": 119470.66666666667,
+     "est_lutram": 5412.499999999998,
+     "kappa": 0.6259779248462662,
+     "lam": 0.8218013856812936
+    },
+    "VX_socket__lift_model": {
+     "copies": 1,
+     "threads": 2,
+     "logic": 185917.0,
+     "lutram": 155634.0,
+     "est_logic": 267194.6666666665,
+     "est_lutram": 202371.66000000012,
+     "kappa": 0.6958110441326179,
+     "lam": 0.7690503699974587
+    },
+    "VX_core__lift_model": {
+     "copies": 1,
+     "threads": 4,
+     "logic": 99642.0,
+     "lutram": 51542.0,
+     "est_logic": 127695.8333333332,
+     "est_lutram": 48037.590000000026,
+     "kappa": 0.7803073710314231,
+     "lam": 1.0729514115924628
+    },
+    "VX_compute_slice__lift": {
+     "copies": 1,
+     "threads": 16,
+     "logic": 176199.0,
+     "lutram": 74154.0,
+     "est_logic": 303891.8333333333,
+     "est_lutram": 75459.76,
+     "kappa": 0.5798082760806889,
+     "lam": 0.9826959428442392
+    }
+   },
+   "max_copy": 341551.0,
+   "depth": 12.778
+  },
+  {
+   "name": "mini_slc4o",
+   "luts": 369931,
+   "rest": 36421,
+   "period": 4.7,
+   "classes": {
+    "foldsim_target_model": {
+     "copies": 1,
+     "threads": 1,
+     "logic": 120712.0,
+     "lutram": 7498.0,
+     "est_logic": 205689.49999999994,
+     "est_lutram": 13187.833333333336,
+     "kappa": 0.5868651535445418,
+     "lam": 0.5685543493371414
+    },
+    "VX_compute_slice__lift": {
+     "copies": 4,
+     "threads": 2,
+     "logic": 34287.0,
+     "lutram": 16341.0,
+     "est_logic": 63187.333333333336,
+     "est_lutram": 16938.119999999995,
+     "kappa": 0.5426245766556588,
+     "lam": 0.9647469730997303
+    }
+   },
+   "max_copy": 128210.0,
+   "depth": 13.429
+  },
+  {
+   "name": "mid_c8o",
+   "luts": 671623,
+   "rest": 56227,
+   "period": 4.453,
+   "classes": {
+    "foldsim_target_model": {
+     "copies": 1,
+     "threads": 1,
+     "logic": 67121.0,
+     "lutram": 4420.0,
+     "est_logic": 118873.33333333333,
+     "est_lutram": 5281.399999999999,
+     "kappa": 0.5646430374067635,
+     "lam": 0.8368993070019315
+    },
+    "VX_socket__lift_model": {
+     "copies": 1,
+     "threads": 2,
+     "logic": 64183.0,
+     "lutram": 53774.0,
+     "est_logic": 116197.50000000003,
+     "est_lutram": 67243.47000000002,
+     "kappa": 0.5523612814389293,
+     "lam": 0.7996910331962344
+    },
+    "VX_core__lift_model": {
+     "copies": 1,
+     "threads": 4,
+     "logic": 10319.0,
+     "lutram": 4782.0,
+     "est_logic": 15538.5,
+     "est_lutram": 4211.590000000001,
+     "kappa": 0.6640924156128326,
+     "lam": 1.1354381599348462
+    },
+    "VX_compute_slice__lift": {
+     "copies": 8,
+     "threads": 2,
+     "logic": 34238.625,
+     "lutram": 16414.0,
+     "est_logic": 63195.5,
+     "est_lutram": 16956.359999999997,
+     "kappa": 0.5417889723160668,
+     "lam": 0.9680143615728849
+    }
+   },
+   "max_copy": 117957.0,
+   "depth": 13.724
+  },
+  {
+   "name": "full_fo",
+   "luts": 890562,
+   "rest": 50888,
+   "period": 4.879,
+   "classes": {
+    "foldsim_target_model": {
+     "copies": 1,
+     "threads": 1,
+     "logic": 73540.0,
+     "lutram": 4448.0,
+     "est_logic": 119470.66666666667,
+     "est_lutram": 5412.499999999998,
+     "kappa": 0.6155485865428613,
+     "lam": 0.8218013856812936
+    },
+    "VX_socket__lift_model": {
+     "copies": 1,
+     "threads": 2,
+     "logic": 192465.0,
+     "lutram": 156444.0,
+     "est_logic": 267194.6666666665,
+     "est_lutram": 202371.66000000012,
+     "kappa": 0.7203175213078109,
+     "lam": 0.7730529067162858
+    },
+    "VX_core__lift_model": {
+     "copies": 1,
+     "threads": 4,
+     "logic": 103943.0,
+     "lutram": 51552.0,
+     "est_logic": 127695.8333333332,
+     "est_lutram": 48037.590000000026,
+     "kappa": 0.8139889711880454,
+     "lam": 1.073159581902422
+    },
+    "VX_compute_slice__lift": {
+     "copies": 1,
+     "threads": 16,
+     "logic": 179393.0,
+     "lutram": 74172.0,
+     "est_logic": 303891.8333333333,
+     "est_lutram": 75459.76,
+     "kappa": 0.5903185947192834,
+     "lam": 0.9829344805761376
+    }
+   },
+   "max_copy": 348909.0,
+   "depth": 12.778
+  },
+  {
+   "name": "full_s3",
+   "luts": 803458,
+   "rest": 49258,
+   "period": 5.418,
+   "classes": {
+    "foldsim_target_model": {
+     "copies": 1,
+     "threads": 1,
+     "logic": 67448.0,
+     "lutram": 4448.0,
+     "est_logic": 119470.66666666667,
+     "est_lutram": 5412.499999999998,
+     "kappa": 0.5645569902793433,
+     "lam": 0.8218013856812936
+    },
+    "VX_socket__lift_model": {
+     "copies": 1,
+     "threads": 2,
+     "logic": 174460.0,
+     "lutram": 120758.0,
+     "est_logic": 267194.6666666665,
+     "est_lutram": 202371.66000000012,
+     "kappa": 0.6529321942553747,
+     "lam": 0.5967139865334896
+    },
+    "VX_core__lift_model": {
+     "copies": 1,
+     "threads": 4,
+     "logic": 93197.0,
+     "lutram": 32544.0,
+     "est_logic": 127695.8333333332,
+     "est_lutram": 48037.590000000026,
+     "kappa": 0.7298358730055152,
+     "lam": 0.6774694567316967
+    },
+    "VX_compute_slice__lift": {
+     "copies": 1,
+     "threads": 16,
+     "logic": 184908.0,
+     "lutram": 72978.0,
+     "est_logic": 303891.8333333333,
+     "est_lutram": 75459.76,
+     "kappa": 0.6084664993191108,
+     "lam": 0.9671114776935417
+    }
+   },
+   "max_copy": 295218.0,
+   "depth": 13.45
+  },
+  {
+   "name": "f_k2",
+   "luts": 1135977,
+   "rest": 76601,
+   "period": 5.163,
+   "classes": {
+    "foldsim_target_model": {
+     "copies": 1,
+     "threads": 1,
+     "logic": 78462.0,
+     "lutram": 4448.0,
+     "est_logic": 119470.66666666667,
+     "est_lutram": 5412.499999999998,
+     "kappa": 0.6567469839179492,
+     "lam": 0.8218013856812936
+    },
+    "VX_socket__lift_model": {
+     "copies": 1,
+     "threads": 2,
+     "logic": 192792.0,
+     "lutram": 156424.0,
+     "est_logic": 267194.6666666665,
+     "est_lutram": 202371.66000000012,
+     "kappa": 0.7215413481307016,
+     "lam": 0.7729540786491542
+    },
+    "VX_core__lift_model": {
+     "copies": 1,
+     "threads": 4,
+     "logic": 95972.0,
+     "lutram": 51552.0,
+     "est_logic": 127695.8333333332,
+     "est_lutram": 48037.590000000026,
+     "kappa": 0.7515672007048007,
+     "lam": 1.073159581902422
+    },
+    "VX_compute_slice__lift": {
+     "copies": 2,
+     "threads": 8,
+     "logic": 173124.0,
+     "lutram": 63462.0,
+     "est_logic": 303891.8333333333,
+     "est_lutram": 71369.78666666665,
+     "kappa": 0.5696895441415285,
+     "lam": 0.8891997995790564
+    }
+   },
+   "logic": 752165,
+   "lutram": 377258,
+   "depth": 12.888,
+   "max_copy": 349216.0
+  },
+  {
+   "name": "m_k8",
+   "luts": 694482,
+   "rest": 65508,
+   "period": 4.331,
+   "classes": {
+    "foldsim_target_model": {
+     "copies": 1,
+     "threads": 1,
+     "logic": 69611.0,
+     "lutram": 4420.0,
+     "est_logic": 118873.33333333333,
+     "est_lutram": 5281.399999999999,
+     "kappa": 0.5855897033256688,
+     "lam": 0.8368993070019315
+    },
+    "VX_socket__lift_model": {
+     "copies": 1,
+     "threads": 2,
+     "logic": 70046.0,
+     "lutram": 53888.0,
+     "est_logic": 116197.50000000003,
+     "est_lutram": 67243.47000000002,
+     "kappa": 0.6028184771617288,
+     "lam": 0.8013863650998377
+    },
+    "VX_core__lift_model": {
+     "copies": 1,
+     "threads": 4,
+     "logic": 14716.0,
+     "lutram": 4782.0,
+     "est_logic": 15538.5,
+     "est_lutram": 4211.590000000001,
+     "kappa": 0.9470669627055378,
+     "lam": 1.1354381599348462
+    },
+    "VX_compute_slice__lift": {
+     "copies": 8,
+     "threads": 2,
+     "logic": 34331.625,
+     "lutram": 16410.0,
+     "est_logic": 63195.5,
+     "est_lutram": 16956.359999999997,
+     "kappa": 0.5432605960867467,
+     "lam": 0.9677784618868674
+    }
+   },
+   "logic": 467642,
+   "lutram": 221262,
+   "depth": 14.057,
+   "max_copy": 123934.0
+  }
+ ],
+ "firesim": [
+  {
+   "name": "firesim_mid",
+   "luts": 1156996,
+   "logic": 1058261,
+   "lutram": 97970,
+   "period": 9.653,
+   "est_logic": 821002,
+   "est_lutram": 55400
+  },
+  {
+   "name": "firesim_small",
+   "luts": 643944,
+   "logic": 567234,
+   "lutram": 76322,
+   "period": 8.747,
+   "est_logic": 427547,
+   "est_lutram": 28219
+  }
+ ]
+}
