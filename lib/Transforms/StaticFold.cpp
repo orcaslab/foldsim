@@ -845,8 +845,12 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
 static constexpr int kEnvRoundTrip = 6;
 
 int StaticFolder::envSlackOf(unsigned k, bool late, int period) const {
-  if (!late || envSink[k])
+  if (envSink[k])
     return 1;
+  // An early output's token of a frame is the next cycle's: the environment's
+  // tokens it decides load in the frame after that.
+  if (!late)
+    return std::max(1, kEnvRoundTrip - period);
   if (specSelect[k] >= 0)
     return std::max(2, kEnvRoundTrip - int(specDepth) * period);
   return kEnvRoundTrip;
@@ -1076,8 +1080,11 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
                             linkLatency - 1);
     }
     outputSlot[k] = at;
-    if (outputEarly[k] || envSink[k]) {
+    if (envSink[k]) {
       length = std::max(length, at + 1);
+    } else if (outputEarly[k]) {
+      length = std::max(length, at + 1);
+      length = std::max(length, (at + kEnvRoundTrip + 1) / 2);
     } else if (specSelect[k] >= 0) {
       // Captured before the next frame's load, and the environment's round
       // trip within the frames its offers span and the next one.
