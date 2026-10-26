@@ -824,6 +824,30 @@ void Timing::addRegister(unsigned ctx, Operation *op, Value reg, Value next,
   }
 }
 
+/// Whether a register's next value is always itself: only multiplexers (and
+/// wires) whose every data input is, in the end, the register. Whatever its
+/// selects, it holds its value forever, and Vivado removes it; its input is
+/// no end point.
+static bool holdsItself(Value next, Value reg) {
+  SmallVector<Value> work{next};
+  DenseSet<Value> seen;
+  while (!work.empty()) {
+    Value value = work.pop_back_val();
+    if (value == reg || !seen.insert(value).second)
+      continue;
+    auto *op = value.getDefiningOp();
+    if (auto mux = dyn_cast_or_null<comb::MuxOp>(op)) {
+      work.push_back(mux.getTrueValue());
+      work.push_back(mux.getFalseValue());
+    } else if (auto wire = dyn_cast_or_null<hw::WireOp>(op)) {
+      work.push_back(wire.getInput());
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
 /// Collects the end points of instance `ctx` and of everything below it.
 void Timing::collect(unsigned ctx) {
   auto module = contexts[ctx].module;
@@ -831,14 +855,20 @@ void Timing::collect(unsigned ctx) {
     // Vivado retimes registers with a synchronous reset, not an
     // asynchronous one.
     if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
+      if (holdsItself(reg.getNext(), reg))
+        continue;
       addRegister(ctx, reg, reg, reg.getNext(), !reg.getIsAsync());
       if (auto reset = reg.getReset())
         addEndPoints(ctx, reg, "rst", reset);
     } else if (auto reg = dyn_cast<seq::CompRegOp>(op)) {
+      if (holdsItself(reg.getInput(), reg))
+        continue;
       addRegister(ctx, reg, reg, reg.getInput(), true);
       if (auto reset = reg.getReset())
         addEndPoints(ctx, reg, "rst", reset);
     } else if (auto reg = dyn_cast<seq::CompRegClockEnabledOp>(op)) {
+      if (holdsItself(reg.getInput(), reg))
+        continue;
       addRegister(ctx, reg, reg, reg.getInput(), true);
       addEndPoints(ctx, reg, "ce", reg.getClockEnable());
       if (auto reset = reg.getReset())
