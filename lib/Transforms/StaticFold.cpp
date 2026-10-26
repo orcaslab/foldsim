@@ -162,11 +162,12 @@ public:
                bool oneCycleLinks, bool overlapFrames, bool modulo,
                bool interleaveCopies, bool zeroLatencyLinks,
                bool zeroLatencyChains,
-               ArrayRef<std::string> specGroups,
+               ArrayRef<std::string> specGroups, unsigned specDepth,
                ArrayRef<std::string> envSinks)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
+        specDepth(specDepth),
         scheduleOnly(scheduleOnly), oneCycleLinks(oneCycleLinks),
         overlapFrames(overlapFrames), modulo(modulo),
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
@@ -214,6 +215,9 @@ private:
   ArrayRef<std::string> copies;
   bool nest;
   ArrayRef<std::string> specGroupSpecs, envSinkNames;
+  // Frames of a group's select its offers span, and the values a token holds.
+  unsigned specDepth;
+  unsigned specValues() const { return 1u << specDepth; }
   /// A select of offered pairs: the netlist output, and the input whose
   /// value in the frame before it is ANDed with.
   struct SpecGroup {
@@ -844,7 +848,7 @@ int StaticFolder::envSlackOf(unsigned k, bool late, int period) const {
   if (!late || envSink[k])
     return 1;
   if (specSelect[k] >= 0)
-    return std::max(2, kEnvRoundTrip - period);
+    return std::max(2, kEnvRoundTrip - int(specDepth) * period);
   return kEnvRoundTrip;
 }
 
@@ -1076,9 +1080,10 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
       length = std::max(length, at + 1);
     } else if (specSelect[k] >= 0) {
       // Captured before the next frame's load, and the environment's round
-      // trip within two frames.
+      // trip within the frames its offers span and the next one.
       length = std::max(length, at + 2);
-      length = std::max(length, (at + kEnvRoundTrip + 1) / 2);
+      length = std::max(length, (at + kEnvRoundTrip + int(specDepth)) /
+                                    int(specDepth + 1));
     } else {
       length = std::max(length, at + kEnvRoundTrip);
     }
@@ -2493,11 +2498,11 @@ LogicalResult StaticFolder::buildSim() {
     inputPorts[p].valid = numIn;
     addPort(producer.name + "_valid", i1, true);
     inputPorts[p].bits = numIn;
-    // An offered pair's token holds both values.
+    // An offered group input's token holds each of its values.
     if (producer.width > 0)
       addPort(producer.name + "_bits",
               IntegerType::get(context, producer.width *
-                                            (specOf[p] >= 0 ? 2 : 1)),
+                                            (specOf[p] >= 0 ? specValues() : 1)),
               true);
   }
   SmallVector<unsigned> outputReady(consumers.size(), 0);
@@ -2694,10 +2699,23 @@ LogicalResult StaticFolder::buildSim() {
   }
   DenseMap<unsigned, Value> frameInput, frameInputNext;
   // Each group's select: its valid input and select output, both of the
-  // frame before the one loading.
+  // frame before the one loading; at depth 2, also the one of the frame
+  // before that, kept from the load before.
   SmallVector<Backedge> groupSelect;
-  for (unsigned g = 0; g < specGroups.size(); ++g)
+  SmallVector<Value> groupIndex;
+  for (unsigned g = 0; g < specGroups.size(); ++g) {
     groupSelect.push_back(backedges.get(i1));
+    Value index = groupSelect.back();
+    if (specDepth == 2) {
+      auto olderNext = backedges.get(i1);
+      Value older = resetReg(olderNext, consumers[specGroups[g].select].name +
+                                            "_select_older", 0);
+      olderNext.setValue(
+          comb::MuxOp::create(b, load, groupSelect.back(), older));
+      index = comb::ConcatOp::create(b, older, groupSelect.back());
+    }
+    groupIndex.push_back(index);
+  }
   SmallVector<Value> inputValid;
   SmallVector<std::pair<unsigned, Value>> inputReady;
   for (auto [p, producer] : llvm::enumerate(producers)) {
@@ -2705,7 +2723,7 @@ LogicalResult StaticFolder::buildSim() {
       continue;
     Value valid = body->getArgument(inputPorts[p].valid);
     Value bits = producer.width ? body->getArgument(inputPorts[p].bits) : Value();
-    unsigned tokenWidth = producer.width * (specOf[p] >= 0 ? 2 : 1);
+    unsigned tokenWidth = producer.width * (specOf[p] >= 0 ? specValues() : 1);
     Value head;
     if (holdDepth == 1) {
       auto fullNext = backedges.get(i1);
@@ -2765,14 +2783,20 @@ LogicalResult StaticFolder::buildSim() {
       continue;
     auto next = backedges.get(b.getIntegerType(producer.width));
     Value x = reg(next, producer.name + "_frame");
-    // An offered pair: the value its group's select chooses, the high one
-    // for a select set in the frame before.
+    // An offered group input: the value its group's select chooses, the
+    // high one for a select set in the frame before.
     if (specOf[p] >= 0) {
       unsigned w = producer.width;
-      head = comb::MuxOp::create(
-          b, groupSelect[specOf[p]],
-          comb::ExtractOp::create(b, b.getIntegerType(w), head, w),
-          comb::ExtractOp::create(b, b.getIntegerType(w), head, 0));
+      SmallVector<Value> values;
+      for (unsigned v = specValues(); v-- > 0;)
+        values.push_back(
+            comb::ExtractOp::create(b, b.getIntegerType(w), head, v * w));
+      if (specDepth == 1)
+        head = comb::MuxOp::create(b, groupIndex[specOf[p]], values[0],
+                                   values[1]);
+      else
+        head = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, values),
+                                      groupIndex[specOf[p]]);
     }
     Value taken = comb::MuxOp::create(b, load, head, x);
     next.setValue(taken);
@@ -3338,6 +3362,8 @@ LogicalResult StaticFolder::resolveEnvironment() {
   specOf.assign(producers.size(), -1);
   specSelect.assign(consumers.size(), -1);
   envSink.assign(consumers.size(), false);
+  if (specDepth < 1 || specDepth > 2)
+    return netlist.emitError("spec-depth: ") << specDepth << " is not 1 or 2";
   auto output = [&](StringRef name) -> int {
     for (auto [k, consumer] : llvm::enumerate(consumers))
       if (consumer.cls < 0 && consumer.name == name)
@@ -3429,7 +3455,7 @@ void FoldStaticPass::runOnOperation() {
   StaticFolder folder(top, netlist, simName, regionBits, report, copies,
                       nest, scheduleOnly, oneCycleLinks, overlapFrames,
                       modulo, interleaveCopies, zeroLatencyLinks, zeroLatencyChains,
-                      specGroups,
+                      specGroups, specDepth,
                       envSinks);
   if (failed(folder.run()))
     return signalPassFailure();

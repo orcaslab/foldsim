@@ -327,6 +327,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "two values, the high one for <valid> and <output> both set in "
                "the frame before, and the environment's next tokens do not "
                "wait for that frame's <output>">,
+    Option<"specDepth", "spec-depth", "unsigned", "1",
+           "Frames of a select the environment's offers span: at 2, each "
+           "spec-groups input's token holds four values, by the select of "
+           "the frame before (low bit) and of the one before that, and the "
+           "environment's next tokens wait for neither">,
     ListOption<"envSinks", "env-sinks", "std::string",
                "Outputs of the netlist that none of the environment's tokens "
                "depend on: they close no round trip through it">,

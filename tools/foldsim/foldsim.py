@@ -132,6 +132,8 @@ def frame_options(a):
         fold += ' interleave-copies'
     if getattr(a, 'spec_groups', ''):
         fold += f' spec-groups={a.spec_groups}'
+        if a.axi_spec == 2:
+            fold += ' spec-depth=2'
     if a.env_sinks:
         fold += f' env-sinks={a.env_sinks}'
     if a.zero_latency_links:
@@ -142,13 +144,15 @@ def frame_options(a):
 
 
 # An AXI4 port's inputs the endpoint offers for either fire of R in the
-# cycle before (the kernel's memory endpoint with FOLDSIM_MEM_SPEC).
+# cycle before (the kernel's memory endpoint with FOLDSIM_MEM_SPEC), and at
+# depth 2, by the fires of the two cycles before, also AW's and W's ready.
 AXI_SPEC_INPUTS = ('rvalid', 'rdata', 'rid', 'rresp', 'rlast', 'arready')
+AXI_SPEC2_INPUTS = AXI_SPEC_INPUTS + ('awready', 'wready')
 
 
-def axi_spec_groups(top, design_text):
+def axi_spec_groups(top, design_text, depth):
     """The fold-static spec groups of every AXI4 port of the top: each port's
-    R ready selects its offered pairs, R valid first."""
+    R ready selects its offered values, R valid first."""
     m = re.search(r'hw\.module @' + re.escape(top) + r'\((.*?)\)\s*(attributes|\{)', design_text, re.S)
     if not m:
         sys.exit(f'--axi-spec: no module {top}')
@@ -160,7 +164,7 @@ def axi_spec_groups(top, design_text):
         if not o.endswith('rready'):
             continue
         prefix = o[:-len('rready')]
-        members = [prefix + n for n in AXI_SPEC_INPUTS]
+        members = [prefix + n for n in (AXI_SPEC2_INPUTS if depth == 2 else AXI_SPEC_INPUTS)]
         if all(n in ins for n in members):
             groups.append(o + '=' + ':'.join(members))
     if not groups:
@@ -291,10 +295,13 @@ def main():
     ap.add_argument('--modulo', action='store_true',
                     help='with --static: overlap consecutive frames, a slot past the frame running in '
                          'the next frame\'s, when that frame is shorter')
-    ap.add_argument('--axi-spec', action='store_true',
+    ap.add_argument('--axi-spec', nargs='?', type=int, const=1, default=0, choices=(1, 2),
+                    metavar='DEPTH',
                     help="with --static: each AXI4 port's R and AR ready are offered by the "
                          "memory endpoint for either fire of R in the cycle before, and taken "
-                         "with the simulator's own R fire (the kernel's FOLDSIM_MEM_SPEC)")
+                         "with the simulator's own R fire (the kernel's FOLDSIM_MEM_SPEC); "
+                         "--axi-spec=2: for the fires of the two cycles before, AW's and W's "
+                         "ready too")
     ap.add_argument('--env-sinks', default='',
                     help='with --static: outputs of the top no endpoint token depends on, comma '
                          'separated: they close no round trip through the environment')
@@ -461,7 +468,7 @@ def main():
     if a.axi_spec:
         if not a.static:
             sys.exit('--axi-spec needs --static')
-        a.spec_groups = axi_spec_groups(a.top, open(flat).read())
+        a.spec_groups = axi_spec_groups(a.top, open(flat).read(), a.axi_spec)
     if a.copies == 'auto' and not a.static:
         sys.exit('--copies auto needs --static')
     if a.static:
