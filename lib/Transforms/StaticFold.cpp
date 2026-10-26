@@ -912,8 +912,9 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     outputSlot[k] = at;
     length = std::max(length, at + (outputEarly[k] ? 1 : kEnvRoundTrip));
   }
-  // Overlapped, the decision for the next frame falls within this one.
-  return std::max(length, overlapFrames ? 4 : 2);
+  // Overlapped, the decision for the next frame may fall before this one
+  // begins: the inputs' and outputs' queues count the frames decided ahead.
+  return std::max(length, 2);
 }
 
 LogicalResult StaticFolder::schedule() {
@@ -2183,10 +2184,27 @@ LogicalResult StaticFolder::buildSim() {
     }
   }
 
-  // The netlist's inputs: each token taken into a holding register as it
-  // comes, and moved into the frame's register on the host cycle before the
-  // frame's first slot.
+  // The netlist's inputs: each token taken into a holding queue as it comes,
+  // and the head moved into the frame's register on the host cycle before the
+  // frame's first slot. A frame is decided four host cycles before that slot,
+  // so below four host cycles a frame may be decided before the previous one
+  // is loaded: the queue then holds a token for each, and a token counts for
+  // the frame being decided only beyond those of the decided frames not yet
+  // loaded.
   Value load = eq(pos1, 0);
+  unsigned holdDepth = 1 + (ii < 4 ? 3 / ii : 0);
+  unsigned cntWidth = llvm::Log2_32_Ceil(holdDepth + 2);
+  Value decidedUnloaded;
+  if (holdDepth > 1) {
+    // Frames decided and not yet loaded.
+    auto pendingNext = backedges.get(b.getIntegerType(cntWidth));
+    decidedUnloaded = resetReg(pendingNext, "frames_unloaded", 0);
+    Value plus = comb::AddOp::create(b, decidedUnloaded, constant(cntWidth, 1));
+    Value minus = comb::SubOp::create(b, decidedUnloaded, constant(cntWidth, 1));
+    pendingNext.setValue(comb::MuxOp::create(
+        b, starting, comb::MuxOp::create(b, load, decidedUnloaded, plus),
+        comb::MuxOp::create(b, load, minus, decidedUnloaded)));
+  }
   DenseMap<unsigned, Value> frameInput, frameInputNext;
   SmallVector<Value> inputValid;
   SmallVector<std::pair<unsigned, Value>> inputReady;
@@ -2194,22 +2212,67 @@ LogicalResult StaticFolder::buildSim() {
     if (producer.cls >= 0)
       continue;
     Value valid = body->getArgument(inputPorts[p].valid);
-    auto fullNext = backedges.get(i1);
-    Value full = resetReg(fullNext, producer.name + "_held", 0);
-    Value take = comb::AndOp::create(b, valid, notOf(full));
-    fullNext.setValue(comb::MuxOp::create(
-        b, take, constant(1, 1), comb::MuxOp::create(b, load, constant(1, 0), full)));
-    inputValid.push_back(comb::OrOp::create(b, full, valid));
-    inputReady.push_back({unsigned(p), notOf(full)});
+    Value bits = producer.width ? body->getArgument(inputPorts[p].bits) : Value();
+    Value head;
+    if (holdDepth == 1) {
+      auto fullNext = backedges.get(i1);
+      Value full = resetReg(fullNext, producer.name + "_held", 0);
+      Value take = comb::AndOp::create(b, valid, notOf(full));
+      fullNext.setValue(comb::MuxOp::create(
+          b, take, constant(1, 1),
+          comb::MuxOp::create(b, load, constant(1, 0), full)));
+      inputValid.push_back(comb::OrOp::create(b, full, valid));
+      inputReady.push_back({unsigned(p), notOf(full)});
+      if (producer.width) {
+        auto heldNext = backedges.get(b.getIntegerType(producer.width));
+        head = reg(heldNext, producer.name + "_token");
+        heldNext.setValue(comb::MuxOp::create(b, take, bits, head));
+      }
+    } else {
+      auto countNext = backedges.get(b.getIntegerType(cntWidth));
+      Value count = resetReg(countNext, producer.name + "_held", 0);
+      Value space = comb::ICmpOp::create(b, comb::ICmpPredicate::ult, count,
+                                         constant(cntWidth, holdDepth));
+      Value take = comb::AndOp::create(b, valid, space);
+      Value pop = comb::AndOp::create(
+          b, load, comb::ICmpOp::create(b, comb::ICmpPredicate::ne, count,
+                                        constant(cntWidth, 0)));
+      Value plus = comb::AddOp::create(b, count, constant(cntWidth, 1));
+      Value minus = comb::SubOp::create(b, count, constant(cntWidth, 1));
+      countNext.setValue(comb::MuxOp::create(
+          b, take, comb::MuxOp::create(b, pop, count, plus),
+          comb::MuxOp::create(b, pop, minus, count)));
+      // Held, or offered and taken now, beyond the decided frames' tokens.
+      Value have = comb::AddOp::create(
+          b, count, comb::ConcatOp::create(b, constant(cntWidth - 1, 0), take));
+      inputValid.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::ugt,
+                                                have, decidedUnloaded));
+      inputReady.push_back({unsigned(p), space});
+      if (producer.width) {
+        Value afterPop = comb::MuxOp::create(b, pop, minus, count);
+        SmallVector<Backedge> nexts;
+        SmallVector<Value> entries;
+        for (unsigned e = 0; e < holdDepth; ++e) {
+          nexts.push_back(backedges.get(b.getIntegerType(producer.width)));
+          entries.push_back(reg(nexts[e], producer.name + "_token" + Twine(e)));
+        }
+        for (unsigned e = 0; e < holdDepth; ++e) {
+          Value kept = e + 1 < holdDepth
+                           ? comb::MuxOp::create(b, pop, entries[e + 1], entries[e])
+                           : entries[e];
+          Value here = comb::AndOp::create(
+              b, take, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, afterPop,
+                                            constant(cntWidth, e)));
+          nexts[e].setValue(comb::MuxOp::create(b, here, bits, kept));
+        }
+        head = entries[0];
+      }
+    }
     if (producer.width == 0)
       continue;
-    auto heldNext = backedges.get(b.getIntegerType(producer.width));
-    Value held = reg(heldNext, producer.name + "_token");
-    heldNext.setValue(comb::MuxOp::create(
-        b, take, body->getArgument(inputPorts[p].bits), held));
     auto next = backedges.get(b.getIntegerType(producer.width));
     Value x = reg(next, producer.name + "_frame");
-    Value taken = comb::MuxOp::create(b, load, held, x);
+    Value taken = comb::MuxOp::create(b, load, head, x);
     next.setValue(taken);
     frameInput[p] = x;
     frameInputNext[p] = taken;
@@ -2574,39 +2637,46 @@ LogicalResult StaticFolder::buildSim() {
     Value push = eq(pos0, outputSlot[k]);
     Value readyIn = body->getArgument(outputReady[k]);
     uint64_t initCount = outputEarly[k] ? 1 : 0;
-    // Overlapped, a frame may be decided before the previous frame's token is
-    // pushed: the queue holds three, and the push still due takes one.
-    unsigned capacity = overlapFrames ? 3 : 2;
-    auto countNext = backedges.get(b.getIntegerType(2));
+    // Overlapped, a frame is decided four host cycles before its first slot,
+    // so the pushes of decided frames may still be due: the queue holds one
+    // for each besides the two of a frame in turn. Below four host cycles,
+    // more than one can be due.
+    unsigned dueMax =
+        overlapFrames ? std::max<unsigned>(1, (4 + outputSlot[k] + ii - 1) / ii - 1)
+                      : 0;
+    unsigned capacity = 2 + dueMax;
+    unsigned qWidth = llvm::Log2_32_Ceil(capacity + dueMax + 1);
+    auto countNext = backedges.get(b.getIntegerType(qWidth));
     Value count = resetReg(countNext, consumer.name + "_count", initCount);
     Value queued = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, count,
-                                        constant(2, 0));
+                                        constant(qWidth, 0));
     Value valid = comb::OrOp::create(b, queued, push);
     Value pop = comb::AndOp::create(b, readyIn, valid);
     Value popQueued = comb::AndOp::create(b, pop, queued);
     Value pushQueued =
         comb::AndOp::create(b, push, notOf(comb::AndOp::create(b, pop, notOf(queued))));
-    Value plus = comb::AddOp::create(b, count, constant(2, 1));
-    Value minus = comb::SubOp::create(b, count, constant(2, 1));
+    Value plus = comb::AddOp::create(b, count, constant(qWidth, 1));
+    Value minus = comb::SubOp::create(b, count, constant(qWidth, 1));
     countNext.setValue(comb::MuxOp::create(
         b, pushQueued, comb::MuxOp::create(b, popQueued, count, plus),
         comb::MuxOp::create(b, popQueued, minus, count)));
     Value room = comb::ICmpOp::create(b, comb::ICmpPredicate::ult, count,
-                                      constant(2, capacity));
+                                      constant(qWidth, capacity));
     if (overlapFrames) {
-      // Whether this frame's token is pushed: set by the push, cleared as a
-      // frame begins; none is due out of reset.
-      auto pushedNext = backedges.get(i1);
-      Value pushed = resetReg(pushedNext, consumer.name + "_pushed", 1);
-      pushedNext.setValue(comb::MuxOp::create(
-          b, push, constant(1, 1),
-          comb::MuxOp::create(b, eq(pos0, 0), constant(1, 0), pushed)));
-      Value due = comb::AndOp::create(b, notOf(pushed), notOf(push));
-      room = comb::MuxOp::create(
-          b, due,
-          comb::ICmpOp::create(b, comb::ICmpPredicate::ult, count,
-                               constant(2, capacity - 1)),
-          room);
+      // The decided frames whose token is not pushed yet: counted up as a
+      // frame is decided, down at its push; none is due out of reset. A push
+      // this host cycle is no longer due.
+      auto dueNext = backedges.get(b.getIntegerType(qWidth));
+      Value due = resetReg(dueNext, consumer.name + "_due", 0);
+      Value duePlus = comb::AddOp::create(b, due, constant(qWidth, 1));
+      Value dueMinus = comb::SubOp::create(b, due, constant(qWidth, 1));
+      dueNext.setValue(comb::MuxOp::create(
+          b, starting, comb::MuxOp::create(b, push, due, duePlus),
+          comb::MuxOp::create(b, push, dueMinus, due)));
+      Value dueNow = comb::MuxOp::create(b, push, dueMinus, due);
+      room = comb::ICmpOp::create(b, comb::ICmpPredicate::ult,
+                                  comb::AddOp::create(b, count, dueNow),
+                                  constant(qWidth, capacity));
     }
     roomTerms.push_back(room);
     portOutputs.push_back(valid);
