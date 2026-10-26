@@ -130,6 +130,8 @@ def frame_options(a):
         fold += ' modulo'
     if a.interleave_copies:
         fold += ' interleave-copies'
+    if a.zero_latency_links:
+        fold += ' zero-latency-links'
     return fold
 
 
@@ -258,6 +260,9 @@ def main():
                          'the next frame\'s, when that frame is shorter')
     ap.add_argument('--interleave-copies', action='store_true',
                     help='with --static: a copy takes every k-th instance, not a contiguous range')
+    ap.add_argument('--zero-latency-links', action='store_true',
+                    help='with --static: a reader may take a shallow late link in its '
+                         'producer\'s own host cycle')
     ap.add_argument('--copies', default='',
                     help='<model>:<count>,...: models simulated by several threaded copies '
                          '(foldsim-compose, foldsim-fold-static); with --static, `auto`: '

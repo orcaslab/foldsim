@@ -321,6 +321,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "Copies of a model take every k-th instance instead of a "
            "contiguous range, so a parent's children run on all copies at "
            "once rather than one after another on one">,
+    Option<"zeroLatencyLinks", "zero-latency-links", "bool", "false",
+           "A late link a reader takes in its producer's own host cycle, "
+           "around its read register, where the reader's input reaches no "
+           "output combinationally and the logic estimated on both sides "
+           "stays shallow">,
     Option<"modulo", "modulo", "bool", "false",
            "Overlap consecutive frames' evaluations: a slot past the frame "
            "runs in the next frame's, so the frame is bounded by each copy's "

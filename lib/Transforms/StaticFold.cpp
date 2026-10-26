@@ -100,6 +100,11 @@ struct Class {
   SmallVector<llvm::BitVector> deps;
   /// Per output, its producer; per input, its consumer (-1 for the clock).
   SmallVector<int> producerOf, consumerOf;
+  /// Logic levels, estimated: from each input to the state it reaches, and
+  /// to each output from the state and inputs it comes from; and whether an
+  /// input reaches an output combinationally.
+  SmallVector<int> inputDepth, outputDepth;
+  llvm::BitVector inputToOutput;
   /// Whether its memories include a registered read: its state is then read
   /// a host cycle later after a state pass.
   bool syncReads = false;
@@ -152,12 +157,12 @@ public:
                unsigned regionBits, StringRef report,
                ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
                bool oneCycleLinks, bool overlapFrames, bool modulo,
-               bool interleaveCopies)
+               bool interleaveCopies, bool zeroLatencyLinks)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         scheduleOnly(scheduleOnly), oneCycleLinks(oneCycleLinks),
         overlapFrames(overlapFrames), modulo(modulo),
-        interleaveCopies(interleaveCopies),
+        interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
 
@@ -199,6 +204,10 @@ private:
   DenseSet<Operation *> logicInstances;
   bool scheduleOnly;
   bool oneCycleLinks, overlapFrames, modulo, interleaveCopies;
+  bool zeroLatencyLinks;
+  /// Whether producer `p`'s link to class `c`'s input may be taken in the
+  /// producer's own host cycle.
+  bool zeroLink(unsigned p, unsigned c, unsigned input) const;
   /// Host cycles from a producer's slot to its reader's.
   int linkLatency;
   std::vector<Class> classes;
@@ -614,6 +623,32 @@ LogicalResult StaticFolder::nestInstances() {
 // What each output depends on
 //===----------------------------------------------------------------------===//
 
+/// The logic levels a link taken in its producer's host cycle may span: the
+/// logic screen's gate.
+static constexpr int kZeroLinkLevels = 12;
+
+/// An operation's logic levels, estimated: none for wiring, two for an adder
+/// or a wide comparison, four for a multiplier or divider, one otherwise.
+static int logicLevels(Operation *op) {
+  if (isa<hw::ConstantOp, hw::AggregateConstantOp, comb::ExtractOp,
+          comb::ConcatOp, comb::ReplicateOp, hw::BitcastOp, hw::StructCreateOp,
+          hw::StructExtractOp, hw::StructExplodeOp, hw::ArrayCreateOp,
+          hw::ArraySliceOp, hw::ArrayConcatOp, hw::WireOp>(op))
+    return 0;
+  if (isa<comb::MulOp, comb::DivUOp, comb::DivSOp, comb::ModUOp,
+          comb::ModSOp>(op))
+    return 4;
+  if (isa<comb::AddOp, comb::SubOp>(op))
+    return 2;
+  if (auto cmp = dyn_cast<comb::ICmpOp>(op))
+    return hw::getBitWidth(cmp.getLhs().getType()) > 6 ? 2 : 1;
+  if (auto get = dyn_cast<hw::ArrayGetOp>(op)) {
+    auto size = hw::type_cast<hw::ArrayType>(get.getInput().getType()).getNumElements();
+    return std::max(1u, (llvm::Log2_64_Ceil(size) + 1) / 2);
+  }
+  return 1;
+}
+
 LogicalResult StaticFolder::analyze(Class &cls) {
   auto *body = cls.model.getBodyBlock();
   unsigned numInputs = cls.inputNames.size();
@@ -702,7 +737,69 @@ LogicalResult StaticFolder::analyze(Class &cls) {
         cls.syncReads = true;
   for (auto [o, late] : llvm::enumerate(cls.late))
     producers[cls.producerOf[o]].late = late;
+
+  // Logic levels, estimated, on each side of the ports.
+  cls.inputToOutput.resize(numInputs);
+  for (auto &deps : cls.deps)
+    cls.inputToOutput |= deps;
+  DenseMap<Value, int> toOutput;
+  std::function<int(Value)> levelsTo = [&](Value value) -> int {
+    if (auto it = toOutput.find(value); it != toOutput.end())
+      return it->second;
+    toOutput[value] = 0;
+    int levels = 0;
+    if (auto *op = value.getDefiningOp()) {
+      auto read = dyn_cast<seq::FirMemReadOp>(op);
+      auto memory = read ? read.getMemory().getDefiningOp<seq::FirMemOp>()
+                         : seq::FirMemOp();
+      if (read && (!memory || memory.getReadLatency() == 0))
+        levels = 1 + levelsTo(read.getAddress());
+      else if (!read && !isa<seq::FirRegOp, hw::InstanceOp>(op))
+        for (auto operand : op->getOperands())
+          levels = std::max(levels, logicLevels(op) + levelsTo(operand));
+    }
+    return toOutput[value] = levels;
+  };
+  for (auto operand : output->getOperands())
+    cls.outputDepth.push_back(levelsTo(operand));
+  DenseMap<Value, int> toState;
+  std::function<int(Value)> levelsFrom = [&](Value value) -> int {
+    if (auto it = toState.find(value); it != toState.end())
+      return it->second;
+    toState[value] = 0;
+    int levels = 0;
+    for (auto &use : value.getUses()) {
+      auto *user = use.getOwner();
+      if (isa<seq::FirRegOp, seq::FirMemWriteOp, hw::InstanceOp, hw::OutputOp>(
+              user))
+        continue;
+      if (auto read = dyn_cast<seq::FirMemReadOp>(user)) {
+        auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+        if (!memory || memory.getReadLatency() == 0)
+          levels = std::max(levels, 1 + levelsFrom(read.getData()));
+        continue;
+      }
+      for (auto result : user->getResults())
+        levels = std::max(levels, logicLevels(user) + levelsFrom(result));
+    }
+    return toState[value] = levels;
+  };
+  for (auto arg : body->getArguments())
+    cls.inputDepth.push_back(levelsFrom(arg));
   return success();
+}
+
+bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
+  auto &producer = producers[p];
+  if (!zeroLatencyLinks || producer.cls < 0 || !producer.late)
+    return false;
+  auto &cls = classes[c];
+  if (cls.inputToOutput.test(input))
+    return false;
+  // The link's choice of source and the read register's bypass, between.
+  return classes[producer.cls].outputDepth[producer.port] +
+             cls.inputDepth[input] + 3 <=
+         kZeroLinkLevels;
 }
 
 //===----------------------------------------------------------------------===//
@@ -714,6 +811,12 @@ LogicalResult StaticFolder::analyze(Class &cls) {
 /// cycle after and offers its next tokens the one after that, and the next
 /// frame starts four host cycles after it is decided on them.
 static constexpr int kEnvRoundTrip = 6;
+
+/// Host cycles from an instance's state pass to its next evaluation's first:
+/// its registers, written at the end of the state pass, reach the next one's
+/// read register through a bypass (`buildCopy`); a registered read's data,
+/// out of the memory a host cycle after the state pass, a host cycle later.
+static int writeBackLatency(const Class &cls) { return cls.syncReads ? 2 : 1; }
 
 unsigned StaticFolder::place(ArrayRef<bool> ready,
                              SmallVectorImpl<SmallVector<int>> &slots,
@@ -790,7 +893,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
         auto pass = atReady[piece.producer] ? kReady : kState;
         preds[n].push_back(
             {nodeIndex[{unsigned(producer.cls), piece.inst, pass}],
-             linkLatency});
+             zeroLink(piece.producer, node.cls, input) ? 0 : linkLatency});
       }
     }
   }
@@ -883,8 +986,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
   for (auto [c, cls] : llvm::enumerate(classes))
     for (unsigned i = 0; i < cls.threads(); ++i) {
       int s = slots[c * 2 + kState][i];
-      int latency = (cls.syncReads ? 3 : 2) + (cls.threads() > 1 ? 1 : 0);
-      length = std::max(length, s - first(c, i) + latency);
+      length = std::max(length, s - first(c, i) + writeBackLatency(cls));
     }
   for (auto &consumer : consumers) {
     if (consumer.cls < 0)
@@ -1076,8 +1178,8 @@ unsigned StaticFolder::placeModulo(
     // An instance's next frame reads its state after this one's write.
     for (auto [c, cls] : llvm::enumerate(classes))
       for (unsigned i = 0; ok && i < cls.threads(); ++i) {
-        int latency = (cls.syncReads ? 3 : 2) + (cls.threads() > 1 ? 1 : 0);
-        ok = slots[c * 2 + kState][i] - first(c, i) + latency <= int(period);
+        ok = slots[c * 2 + kState][i] - first(c, i) + writeBackLatency(cls) <=
+             int(period);
       }
     // A late link holds one frame's value: its readers read it before its
     // producer writes the next frame's.
@@ -2023,9 +2125,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         Value data = seq::FirMemReadOp::create(b, memory, region.inst1,
                                                hostClock, one());
         // The read register: the memory's output register.
+        auto readEdges = BackedgeBuilder(b, reg.getLoc());
+        auto readNext = readEdges.get(data.getType());
         Value read = seq::FirRegOp::create(
-            b, data, hostClock, b.getStringAttr(reg.getName() + "_read"));
+            b, readNext, hostClock, b.getStringAttr(reg.getName() + "_read"));
         value = b.createOrFold<hw::BitcastOp>(reg.getType(), read);
+        Value loaded = data;
         if (!write.holds) {
           // Written a host cycle after the state pass, from a stage, so that
           // the register's next value ends at a flop, not at the memory's
@@ -2044,7 +2149,24 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                     b.getStringAttr(reg.getName() + "_wdata"));
           seq::FirMemWriteOp::create(b, memory, region.instStaged, hostClock,
                                      stagedEnable, stagedData, Value{});
+          // The next slot's instance may be written but not yet stored: a
+          // staged write lands at the end of this host cycle, and a state pass
+          // now writes a host cycle later. The read register takes the newest.
+          Value staged = comb::AndOp::create(
+              b, stagedEnable,
+              comb::ICmpOp::create(b, comb::ICmpPredicate::eq,
+                                   region.instStaged, region.inst1));
+          loaded = comb::MuxOp::create(b, staged, stagedData, loaded);
+          Value now = comb::AndOp::create(
+              b, region.state,
+              comb::ICmpOp::create(b, comb::ICmpPredicate::eq, region.inst,
+                                   region.inst1));
+          Value next = asBits(b, write.data);
+          if (write.enable)
+            next = comb::MuxOp::create(b, write.enable, next, read);
+          loaded = comb::MuxOp::create(b, now, next, loaded);
         }
+        readNext.setValue(loaded);
       }
       reg.getResult().replaceAllUsesWith(value);
       replaced[reg.getResult()] = value;
@@ -2130,6 +2252,13 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                      asBits(b, dout), Value{});
           Value bufferData = seq::FirMemReadOp::create(b, buffer, region.inst1,
                                                        hostClock, one());
+          // The next slot's instance's data, out of the memory now, is not
+          // yet in the buffer.
+          Value fresh = comb::AndOp::create(
+              b, capture,
+              comb::ICmpOp::create(b, comb::ICmpPredicate::eq, readInst,
+                                   region.inst1));
+          bufferData = comb::MuxOp::create(b, fresh, asBits(b, dout), bufferData);
           data = seq::FirRegOp::create(b, bufferData, hostClock,
                                        b.getStringAttr(readName + "_read"));
           data = b.createOrFold<hw::BitcastOp>(dout.getType(), data);
@@ -2597,9 +2726,12 @@ LogicalResult StaticFolder::buildSim() {
   // read at an address the reader gives. A wide link is cut in pieces of at
   // most `regionBits` bits, each in a group and read at its own copy of the
   // address and the bank.
+  // With `now`, also what the producer writes in this host cycle and whether
+  // that is the entry a reader in this host cycle's slot takes (a late link).
   auto linkRead = [&](unsigned p, unsigned low, unsigned width,
                       function_ref<Value()> address, function_ref<Value()> bank,
-                      const Twine &linkName) -> Value {
+                      const Twine &linkName,
+                      std::pair<Value, Value> *now = nullptr) -> Value {
     auto &producer = producers[p];
     unsigned c = producer.cls;
     auto &ctl = controls[c];
@@ -2607,7 +2739,7 @@ LogicalResult StaticFolder::buildSim() {
     bool banked = !producer.late;
     Value bits = asBits(b, copies[c].getResult(producer.port));
     std::string baseName = linkName.str();
-    SmallVector<Value> pieces;
+    SmallVector<Value> pieces, nowPieces;
     for (unsigned at = 0; at < width; at += regionBits) {
       unsigned w = std::min<unsigned>(regionBits, width - at);
       std::string name =
@@ -2622,6 +2754,11 @@ LogicalResult StaticFolder::buildSim() {
             copyReg(producer.atReady ? ctl.ready2 : ctl.state2,
                     group.prefix + pass + "1"),
             group.prefix + pass + "0");
+      }
+      if (now && !banked) {
+        if (!now->first)
+          now->first = enable;
+        nowPieces.push_back(data);
       }
       if (threads == 1 && !banked) {
         auto next = backedges.get(data.getType());
@@ -2666,6 +2803,15 @@ LogicalResult StaticFolder::buildSim() {
                                  Value{});
       Value read =
           seq::FirMemReadOp::create(b, memory, readAt, hostClock, constant(1, 1));
+      if (now && !banked && nowPieces.size() == 1) {
+        // The address is the next slot's reader's; this slot's, a cycle on.
+        Value readNow = readAt.getDefiningOp<hw::ConstantOp>()
+                            ? readAt
+                            : copyReg(readAt, name + "_now");
+        now->first = comb::AndOp::create(
+            b, enable,
+            comb::ICmpOp::create(b, comb::ICmpPredicate::eq, writeAt, readNow));
+      }
       if (oneCycleLinks) {
         // A write reaches a read of its entry in the same host cycle.
         Value hit = comb::AndOp::create(
@@ -2675,6 +2821,11 @@ LogicalResult StaticFolder::buildSim() {
       }
       pieces.push_back(read);
     }
+    if (now && !nowPieces.empty())
+      now->second = nowPieces.size() == 1
+                        ? nowPieces[0]
+                        : b.createOrFold<comb::ConcatOp>(SmallVector<Value>(
+                              nowPieces.rbegin(), nowPieces.rend()));
     if (pieces.empty())
       return constant(0, 0);
     if (pieces.size() == 1)
@@ -2715,6 +2866,7 @@ LogicalResult StaticFolder::buildSim() {
     SmallVector<Value> parts;
     SmallVector<Value> registered;
     SmallVector<std::pair<unsigned, unsigned>> registeredAt;
+    SmallVector<std::pair<Value, Value>> takenAt;
     unsigned at = 0;
     for (unsigned end : cuts) {
       if (end == at)
@@ -2758,6 +2910,7 @@ LogicalResult StaticFolder::buildSim() {
         }
       }
       SmallVector<Value> sourceData(sources.size());
+      SmallVector<std::pair<Value, Value>> sourceNow(sources.size());
       for (auto &[key, index] : sources) {
         if (key.first < 0) {
           SmallVector<uint64_t> rows(threads, 0);
@@ -2812,8 +2965,38 @@ LogicalResult StaticFolder::buildSim() {
         };
         sourceData[index] =
             linkRead(key.first, key.second, width, address, bank,
-                     producer.name + "_to_" + consumer.name + "_" + Twine(at));
+                     producer.name + "_to_" + consumer.name + "_" + Twine(at),
+                     zeroLink(key.first, c, consumer.port) ? &sourceNow[index]
+                                                           : nullptr);
       }
+      // Taken around the read register when written in the reader's slot:
+      // the source of this slot's instance, a host cycle after the read's.
+      std::pair<Value, Value> taken;
+      if (llvm::any_of(sourceNow, [](auto &v) { return bool(v.first); })) {
+        if (sources.size() == 1) {
+          taken = sourceNow[0];
+        } else {
+          SmallVector<uint64_t> rows(threads, 0);
+          for (unsigned i = 0; i < threads; ++i)
+            rows[i] = sources[sourceOf[i]];
+          unsigned w = llvm::Log2_32_Ceil(sources.size());
+          Value select = copyReg(
+              copyReg(table(b, ctl.inst2, rows, w),
+                      consumer.name + "_select_now1_" + Twine(at)),
+              consumer.name + "_select_now0_" + Twine(at));
+          SmallVector<Value> hits, lives;
+          for (uint64_t s = (uint64_t(1) << w); s-- > 0;) {
+            auto &v = sourceNow[std::min<uint64_t>(s, sources.size() - 1)];
+            hits.push_back(v.first ? v.first : constant(1, 0));
+            lives.push_back(v.second ? v.second : constant(width, 0));
+          }
+          taken = {hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, hits),
+                                          select),
+                   hw::ArrayGetOp::create(
+                       b, hw::ArrayCreateOp::create(b, lives), select)};
+        }
+      }
+      takenAt.push_back(taken);
       Value data = sourceData[0];
       if (sources.size() > 1) {
         SmallVector<uint64_t> rows(threads, 0);
@@ -2852,9 +3035,12 @@ LogicalResult StaticFolder::buildSim() {
       Value readReg = reg(b.createOrFold<comb::ConcatOp>(high),
                           consumer.name + "_read");
       unsigned low = 0;
-      for (auto [index, width] : registeredAt) {
+      for (auto [r, entry] : llvm::enumerate(registeredAt)) {
+        auto [index, width] = entry;
         parts[index] = b.createOrFold<comb::ExtractOp>(b.getIntegerType(width),
                                                        readReg, low);
+        if (auto [hit, live] = takenAt[r]; hit)
+          parts[index] = comb::MuxOp::create(b, hit, live, parts[index]);
         low += width;
       }
     }
@@ -3052,7 +3238,7 @@ void FoldStaticPass::runOnOperation() {
   }
   StaticFolder folder(top, netlist, simName, regionBits, report, copies,
                       nest, scheduleOnly, oneCycleLinks, overlapFrames,
-                      modulo, interleaveCopies);
+                      modulo, interleaveCopies, zeroLatencyLinks);
   if (failed(folder.run()))
     return signalPassFailure();
 }
