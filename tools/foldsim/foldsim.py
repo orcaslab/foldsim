@@ -128,6 +128,12 @@ def frame_options(a):
     return fold
 
 
+# The V80 builds that calibrate --copies auto by default (foldsim_degree.py
+# calibrate): area, placement capacity and the period fit.
+DEGREE_CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  'foldsim_v80.json')
+
+
 def choose_copies(a, foldsim_opt, flat, passes, out):
     """The fold degree of each class: every choice scheduled, priced and the
     fastest within the LUT budget kept (foldsim_degree.py)."""
@@ -148,7 +154,8 @@ def choose_copies(a, foldsim_opt, flat, passes, out):
                         '-o', os.devnull], capture_output=True, text=True)
     if r.returncode:
         sys.exit(r.stderr)
-    cal = json.load(open(a.degree_calibration)) if a.degree_calibration else None
+    path = a.degree_calibration or DEGREE_CALIBRATION
+    cal = json.load(open(path)) if path != 'none' and os.path.exists(path) else None
     result = foldsim_degree.evaluate(models, open(base).read(), fold, foldsim_opt, work, cal,
                                      a.jobs, a.lut_budget)
     with open(out('degree.txt'), 'w') as f:
@@ -158,8 +165,9 @@ def choose_copies(a, foldsim_opt, flat, passes, out):
     if not result['pick']:
         sys.exit(f'--copies auto: no choice that places within {a.lut_budget or "any"} LUTs; see {out("degree.txt")}')
     pick = result['pick']
-    print(f"foldsim: copies {pick['copies']}: II {pick['ii']}, about {pick['luts']} LUTs",
-          file=sys.stderr)
+    timing = (f", {pick['mhz']} MHz, {pick['ns']} ns per cycle" if 'ns' in pick else '')
+    print(f"foldsim: copies {pick['copies']}: II {pick['ii']}, about {pick['luts']} LUTs"
+          f"{timing} ({os.path.basename(path) if cal else 'uncalibrated'})", file=sys.stderr)
     return '' if pick['copies'] == '-' else pick['copies']
 
 
@@ -256,8 +264,9 @@ def main():
     ap.add_argument('--lut-budget', type=int, default=0,
                     help='with --copies auto: the most LUTs the simulator may take (0: any)')
     ap.add_argument('--degree-calibration', default='',
-                    help='with --copies auto: builds of the design that calibrate the '
-                         'estimate (foldsim_degree.py calibrate)')
+                    help='with --copies auto: builds that calibrate the estimate '
+                         '(foldsim_degree.py calibrate); the V80\'s, foldsim_v80.json, '
+                         'by default, `none` for none')
     ap.add_argument('--jobs', type=int, default=4,
                     help='with --copies auto: schedules compared at once')
     ap.add_argument('--relay', default='',

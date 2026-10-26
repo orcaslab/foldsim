@@ -463,9 +463,12 @@ def table(result):
                  f'{BRAM_SITES} RAMB36')
     if fit:
         c = fit['coef']
+        label = dict(size='log2(largest copy LUTs)',
+                     depth=f'log2(end points >= {DEPTH_LEVELS} levels) [{result["depth"]}]',
+                     copies='copies', span='share of the V80\'s LUT sites')
+        held = fit.get('range', {})
         terms = ' + '.join([f'{c[0]:.3f}'] + [
-            f'{x:.3f} ' + ('log2(largest copy LUTs)' if t == 'size' else
-                           f'log2(end points >= {DEPTH_LEVELS} levels) [{result["depth"]}]')
+            f'{x:.3f} {label[t]}' + (f' (held to {held[t][0]:g}..{held[t][1]:g})' if t in held else '')
             for x, t in zip(c[1:], fit['terms'])])
         lines.append(f'period = {terms} ns; leave-one-out RMS {fit["rms"]} ns {fit["loo"] or ""}')
     else:
@@ -508,6 +511,9 @@ def main():
     e.add_argument('--jobs', type=int, default=4)
     e.add_argument('--screen', default='',
                    help='the logic screen of the design\'s netlist, for the depth term')
+    e.add_argument('--fold-options', default='',
+                   help='more foldsim-fold-static options, as the driver gives them '
+                        '(nest, modulo, ...)')
     f = sub.add_parser('fit', help='the period fit of a calibration and its leave-one-out error')
     f.add_argument('--calibration', required=True)
     a = ap.parse_args()
@@ -525,6 +531,8 @@ def main():
         return calibrate(a)
     cal = json.load(open(a.calibration)) if a.calibration else None
     fold = f'module={a.module} sim=foldsim_sim'
+    if a.fold_options:
+        fold += ' ' + a.fold_options
     base = os.path.join(a.workdir, 'schedule_base.txt')
     os.makedirs(a.workdir, exist_ok=True)
     r = subprocess.run([a.foldsim_opt, a.models,

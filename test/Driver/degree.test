@@ -1,0 +1,12 @@
+# --copies auto prices every fold degree with the V80 calibration by default
+# (area, placement capacity, the period fit) and picks the fastest that
+# places; with `none`, uncalibrated LUTs and II alone.
+# RUN: rm -rf %t && cd %S/Inputs/source-list
+# RUN: foldsim --srcs top.f --top Top --out %t/cal --static --copies auto Leaf 2>&1 | FileCheck %s --check-prefix=CAL
+# RUN: FileCheck %s --check-prefix=TABLE < %t/cal/degree.txt
+# RUN: foldsim --srcs top.f --top Top --out %t/none --static --copies auto --degree-calibration none Leaf 2>&1 | FileCheck %s --check-prefix=NONE
+# CAL: foldsim: copies {{.*}}: II {{[0-9]+}}, about {{[0-9]+}} LUTs, {{[0-9.]+}} MHz, {{[0-9.]+}} ns per cycle (foldsim_v80.json)
+# TABLE: copies ii luts {{.*}} mhz ns
+# TABLE: <- pick
+# TABLE: period = {{[0-9.]+}} + {{.*}} copies (held to
+# NONE: foldsim: copies {{.*}}: II {{[0-9]+}}, about {{[0-9]+}} LUTs (uncalibrated)
