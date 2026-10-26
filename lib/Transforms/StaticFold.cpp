@@ -27,6 +27,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
@@ -2012,8 +2013,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   };
   // One instance: a black box with a pipeline contract stays, stepped through
   // its clock enable at the state pass; the clock reaches it, as a bit if its
-  // port is one, and nothing else.
-  DenseMap<Operation *, foldsim::PipelineContract> boxes;
+  // port is one, and nothing else. The boxes are kept in body order, so that
+  // the regions their clock enables take, and so the output, are the same run
+  // to run.
+  llvm::MapVector<Operation *, foldsim::PipelineContract> boxes;
   auto toBoxClock = [&](seq::FromClockOp op) {
     return llvm::all_of(op->getUses(), [&](OpOperand &use) {
       auto it = boxes.find(use.getOwner());
