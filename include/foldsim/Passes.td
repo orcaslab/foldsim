@@ -321,6 +321,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "Copies of a model take every k-th instance instead of a "
            "contiguous range, so a parent's children run on all copies at "
            "once rather than one after another on one">,
+    ListOption<"specGroups", "spec-groups", "std::string",
+               "Inputs the environment offers for either value of a select, "
+               "as <output>=<valid>:<input>:...: each such input's token holds "
+               "two values, the high one for <valid> and <output> both set in "
+               "the frame before, and the environment's next tokens do not "
+               "wait for that frame's <output>">,
+    ListOption<"envSinks", "env-sinks", "std::string",
+               "Outputs of the netlist that none of the environment's tokens "
+               "depend on: they close no round trip through it">,
     Option<"modulo", "modulo", "bool", "false",
            "Overlap consecutive frames' evaluations: a slot past the frame "
            "runs in the next frame's, so the frame is bounded by each copy's "

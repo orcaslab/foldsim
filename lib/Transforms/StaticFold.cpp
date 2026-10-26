@@ -152,9 +152,11 @@ public:
                unsigned regionBits, StringRef report,
                ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
                bool oneCycleLinks, bool overlapFrames, bool modulo,
-               bool interleaveCopies)
+               bool interleaveCopies, ArrayRef<std::string> specGroups,
+               ArrayRef<std::string> envSinks)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
+        specGroupSpecs(specGroups), envSinkNames(envSinks),
         scheduleOnly(scheduleOnly), oneCycleLinks(oneCycleLinks),
         overlapFrames(overlapFrames), modulo(modulo),
         interleaveCopies(interleaveCopies),
@@ -164,6 +166,13 @@ public:
 private:
   void inlineNetlists();
   LogicalResult collect();
+  LogicalResult resolveEnvironment();
+  /// Host cycles from a netlist output's slot to the end of the frame it
+  /// must precede: 1 for an early token or one the environment never waits
+  /// for, the environment's round trip for a late one, and for a select of
+  /// offered pairs the slack of a round trip spread over two frames.
+  int envSlack(unsigned k, int period) const;
+  int envSlackOf(unsigned k, bool late, int period) const;
   LogicalResult splitCopies();
   LogicalResult nestInstances();
   LogicalResult decompose(Value value, unsigned low, unsigned width,
@@ -193,6 +202,17 @@ private:
   StringRef reportPath;
   ArrayRef<std::string> copies;
   bool nest;
+  ArrayRef<std::string> specGroupSpecs, envSinkNames;
+  /// A select of offered pairs: the netlist output, and the input whose
+  /// value in the frame before it is ANDed with.
+  struct SpecGroup {
+    unsigned select, valid;
+  };
+  SmallVector<SpecGroup> specGroups;
+  /// Per netlist input, its group's index, or -1; per netlist output, the
+  /// group it selects for, or -1, and whether it closes no round trip.
+  SmallVector<int> specOf, specSelect;
+  SmallVector<bool> envSink;
   /// Nested folding: the netlist each instance was inlined from (a path of
   /// instance names), and the instances that are a netlist's own logic.
   DenseMap<Operation *, std::string> containerOf;
@@ -715,6 +735,18 @@ LogicalResult StaticFolder::analyze(Class &cls) {
 /// frame starts four host cycles after it is decided on them.
 static constexpr int kEnvRoundTrip = 6;
 
+int StaticFolder::envSlackOf(unsigned k, bool late, int period) const {
+  if (!late || envSink[k])
+    return 1;
+  if (specSelect[k] >= 0)
+    return std::max(2, kEnvRoundTrip - period);
+  return kEnvRoundTrip;
+}
+
+int StaticFolder::envSlack(unsigned k, int period) const {
+  return envSlackOf(k, !outputEarly[k], period);
+}
+
 unsigned StaticFolder::place(ArrayRef<bool> ready,
                              SmallVectorImpl<SmallVector<int>> &slots,
                              SmallVectorImpl<bool> &atReady) {
@@ -930,7 +962,16 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
                             linkLatency - 1);
     }
     outputSlot[k] = at;
-    length = std::max(length, at + (outputEarly[k] ? 1 : kEnvRoundTrip));
+    if (outputEarly[k] || envSink[k]) {
+      length = std::max(length, at + 1);
+    } else if (specSelect[k] >= 0) {
+      // Captured before the next frame's load, and the environment's round
+      // trip within two frames.
+      length = std::max(length, at + 2);
+      length = std::max(length, (at + kEnvRoundTrip + 1) / 2);
+    } else {
+      length = std::max(length, at + kEnvRoundTrip);
+    }
   }
   // Overlapped, the decision for the next frame may fall before this one
   // begins: the inputs' and outputs' queues count the frames decided ahead.
@@ -969,11 +1010,21 @@ unsigned StaticFolder::placeModulo(
     return a > b;
   };
   SmallVector<bool> feedsOutput(producers.size(), false);
-  for (auto &consumer : consumers)
+  // The netlist outputs each producer feeds, for its slack.
+  SmallVector<SmallVector<unsigned>> outputsFed(producers.size());
+  for (auto [k, consumer] : llvm::enumerate(consumers))
     if (consumer.cls < 0)
       for (auto &piece : consumer.pieces[0])
-        if (piece.producer >= 0)
+        if (piece.producer >= 0) {
           feedsOutput[piece.producer] = true;
+          outputsFed[piece.producer].push_back(k);
+        }
+  auto outputSlack = [&](unsigned port, bool late, int period) {
+    int slack = 1;
+    for (unsigned k : outputsFed[port])
+      slack = std::max(slack, envSlackOf(k, late, period));
+    return slack;
+  };
   for (unsigned period = lower; period <= 4 * lower + 64; ++period) {
     // List scheduling, a copy's slots taken modulo the frame; an evaluation
     // runs at most one frame late.
@@ -1042,7 +1093,7 @@ unsigned StaticFolder::placeModulo(
         if (!feedsOutput[port] || !at)
           continue;
         latest = std::min<int>(latest, int(period) - linkLatency + 1 -
-                                           (producer.late ? kEnvRoundTrip : 1));
+                                           outputSlack(port, producer.late, period));
       }
       if (latest == INT_MAX)
         continue;
@@ -1129,7 +1180,7 @@ unsigned StaticFolder::placeModulo(
                               linkLatency - 1);
       }
       outputSlot[k] = at;
-      if (at + (outputEarly[k] ? 1 : kEnvRoundTrip) > int(period))
+      if (at + envSlack(k, period) > int(period))
         ok = false;
     }
     if (ok)
@@ -2256,8 +2307,11 @@ LogicalResult StaticFolder::buildSim() {
     inputPorts[p].valid = numIn;
     addPort(producer.name + "_valid", i1, true);
     inputPorts[p].bits = numIn;
+    // An offered pair's token holds both values.
     if (producer.width > 0)
-      addPort(producer.name + "_bits", IntegerType::get(context, producer.width),
+      addPort(producer.name + "_bits",
+              IntegerType::get(context, producer.width *
+                                            (specOf[p] >= 0 ? 2 : 1)),
               true);
   }
   SmallVector<unsigned> outputReady(consumers.size(), 0);
@@ -2453,6 +2507,11 @@ LogicalResult StaticFolder::buildSim() {
         comb::MuxOp::create(b, load, minus, decidedUnloaded)));
   }
   DenseMap<unsigned, Value> frameInput, frameInputNext;
+  // Each group's select: its valid input and select output, both of the
+  // frame before the one loading.
+  SmallVector<Backedge> groupSelect;
+  for (unsigned g = 0; g < specGroups.size(); ++g)
+    groupSelect.push_back(backedges.get(i1));
   SmallVector<Value> inputValid;
   SmallVector<std::pair<unsigned, Value>> inputReady;
   for (auto [p, producer] : llvm::enumerate(producers)) {
@@ -2460,6 +2519,7 @@ LogicalResult StaticFolder::buildSim() {
       continue;
     Value valid = body->getArgument(inputPorts[p].valid);
     Value bits = producer.width ? body->getArgument(inputPorts[p].bits) : Value();
+    unsigned tokenWidth = producer.width * (specOf[p] >= 0 ? 2 : 1);
     Value head;
     if (holdDepth == 1) {
       auto fullNext = backedges.get(i1);
@@ -2471,7 +2531,7 @@ LogicalResult StaticFolder::buildSim() {
       inputValid.push_back(comb::OrOp::create(b, full, valid));
       inputReady.push_back({unsigned(p), notOf(full)});
       if (producer.width) {
-        auto heldNext = backedges.get(b.getIntegerType(producer.width));
+        auto heldNext = backedges.get(b.getIntegerType(tokenWidth));
         head = reg(heldNext, producer.name + "_token");
         heldNext.setValue(comb::MuxOp::create(b, take, bits, head));
       }
@@ -2500,7 +2560,7 @@ LogicalResult StaticFolder::buildSim() {
         SmallVector<Backedge> nexts;
         SmallVector<Value> entries;
         for (unsigned e = 0; e < holdDepth; ++e) {
-          nexts.push_back(backedges.get(b.getIntegerType(producer.width)));
+          nexts.push_back(backedges.get(b.getIntegerType(tokenWidth)));
           entries.push_back(reg(nexts[e], producer.name + "_token" + Twine(e)));
         }
         for (unsigned e = 0; e < holdDepth; ++e) {
@@ -2519,6 +2579,15 @@ LogicalResult StaticFolder::buildSim() {
       continue;
     auto next = backedges.get(b.getIntegerType(producer.width));
     Value x = reg(next, producer.name + "_frame");
+    // An offered pair: the value its group's select chooses, the high one
+    // for a select set in the frame before.
+    if (specOf[p] >= 0) {
+      unsigned w = producer.width;
+      head = comb::MuxOp::create(
+          b, groupSelect[specOf[p]],
+          comb::ExtractOp::create(b, b.getIntegerType(w), head, w),
+          comb::ExtractOp::create(b, b.getIntegerType(w), head, 0));
+    }
     Value taken = comb::MuxOp::create(b, load, head, x);
     next.setValue(taken);
     frameInput[p] = x;
@@ -2915,6 +2984,16 @@ LogicalResult StaticFolder::buildSim() {
     // A token is offered the host cycle it is pushed if the queue is empty,
     // and queued otherwise.
     Value push = eq(pos0, outputSlot[k]);
+    // A group's select output, kept from its push to the next frame's load:
+    // set with the group's valid input of the same frame, it chooses the high
+    // values of the pairs that frame loads. None is set out of reset.
+    if (int g = specSelect[k]; g >= 0) {
+      auto selNext = backedges.get(i1);
+      Value sel = resetReg(selNext, consumer.name + "_select", 0);
+      selNext.setValue(comb::MuxOp::create(b, push, data, sel));
+      groupSelect[g].setValue(comb::AndOp::create(
+          b, frameInput[specGroups[g].valid], sel));
+    }
     Value readyIn = body->getArgument(outputReady[k]);
     uint64_t initCount = outputEarly[k] ? 1 : 0;
     // Overlapped, a frame is decided four host cycles before its first slot,
@@ -3012,9 +3091,63 @@ LogicalResult StaticFolder::buildSim() {
   return success();
 }
 
+LogicalResult StaticFolder::resolveEnvironment() {
+  specOf.assign(producers.size(), -1);
+  specSelect.assign(consumers.size(), -1);
+  envSink.assign(consumers.size(), false);
+  auto output = [&](StringRef name) -> int {
+    for (auto [k, consumer] : llvm::enumerate(consumers))
+      if (consumer.cls < 0 && consumer.name == name)
+        return k;
+    return -1;
+  };
+  auto input = [&](StringRef name) -> int {
+    for (auto [p, producer] : llvm::enumerate(producers))
+      if (producer.cls < 0 && producer.name == name)
+        return p;
+    return -1;
+  };
+  for (auto &name : envSinkNames) {
+    int k = output(name);
+    if (k < 0)
+      return netlist.emitError("env-sinks: no netlist output '") << name << "'";
+    envSink[k] = true;
+  }
+  for (auto &spec : specGroupSpecs) {
+    auto [selectName, rest] = StringRef(spec).split('=');
+    SmallVector<StringRef> names;
+    rest.split(names, ':', -1, false);
+    int select = output(selectName);
+    if (select < 0 || names.empty())
+      return netlist.emitError("spec-groups: bad group '") << spec << "'";
+    if (consumers[select].width != 1)
+      return netlist.emitError("spec-groups: select '")
+             << selectName << "' is not one bit";
+    unsigned g = specGroups.size();
+    int valid = -1;
+    for (auto name : names) {
+      int p = input(name);
+      if (p < 0)
+        return netlist.emitError("spec-groups: no netlist input '") << name << "'";
+      if (specOf[p] >= 0)
+        return netlist.emitError("spec-groups: input '") << name
+               << "' in two groups";
+      specOf[p] = g;
+      if (valid < 0)
+        valid = p;
+    }
+    if (producers[valid].width != 1)
+      return netlist.emitError("spec-groups: valid '")
+             << names.front() << "' is not one bit";
+    specSelect[select] = g;
+    specGroups.push_back({unsigned(select), unsigned(valid)});
+  }
+  return success();
+}
+
 LogicalResult StaticFolder::run() {
   inlineNetlists();
-  if (failed(collect()))
+  if (failed(collect()) || failed(resolveEnvironment()))
     return failure();
   for (auto &cls : classes)
     if (cls.threads() > 1 &&
@@ -3052,7 +3185,7 @@ void FoldStaticPass::runOnOperation() {
   }
   StaticFolder folder(top, netlist, simName, regionBits, report, copies,
                       nest, scheduleOnly, oneCycleLinks, overlapFrames,
-                      modulo, interleaveCopies);
+                      modulo, interleaveCopies, specGroups, envSinks);
   if (failed(folder.run()))
     return signalPassFailure();
 }
