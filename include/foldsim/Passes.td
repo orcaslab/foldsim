@@ -335,6 +335,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     ListOption<"envSinks", "env-sinks", "std::string",
                "Outputs of the netlist that none of the environment's tokens "
                "depend on: they close no round trip through it">,
+    Option<"shortLead", "short-lead", "bool", "false",
+           "Decide a frame three host cycles before its first slot instead "
+           "of four: the slot tables read the frame's position as the "
+           "decision makes it, not a register of it">,
+    Option<"stagedEnv", "staged-env", "bool", "true",
+           "The environment's endpoints take a token a host cycle after it "
+           "is offered (registered token ends), not in that host cycle">,
     Option<"zeroLatencyChains", "zero-latency-chains", "bool", "false",
            "With zero-latency-links, every late link too, also where its "
            "reader's input reaches an output combinationally: links then "

@@ -140,6 +140,10 @@ def frame_options(a):
         fold += ' zero-latency-links'
     if a.zero_latency_chains:
         fold += ' zero-latency-chains'
+    if a.short_lead:
+        fold += ' short-lead'
+    if a.unstaged_env:
+        fold += ' staged-env=false'
     return fold
 
 
@@ -307,6 +311,12 @@ def main():
                          'separated: they close no round trip through the environment')
     ap.add_argument('--interleave-copies', action='store_true',
                     help='with --static: a copy takes every k-th instance, not a contiguous range')
+    ap.add_argument('--short-lead', action='store_true',
+                    help='with --static: decide a frame three host cycles before its first slot, '
+                         'not four (the slot tables read the decided position combinationally)')
+    ap.add_argument('--unstaged-env', action='store_true',
+                    help="with --static: the endpoints take a token in the host cycle it is offered "
+                         "(the kernel's memory endpoints unstaged)")
     ap.add_argument('--zero-latency-chains', action='store_true',
                     help='with --zero-latency-links: every late link, chaining across models within '
                          'a host cycle as the native design does within a cycle')

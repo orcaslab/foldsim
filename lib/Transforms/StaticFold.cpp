@@ -161,7 +161,7 @@ public:
                ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
                bool oneCycleLinks, bool overlapFrames, bool modulo,
                bool interleaveCopies, bool zeroLatencyLinks,
-               bool zeroLatencyChains,
+               bool zeroLatencyChains, bool shortLead, bool stagedEnv,
                ArrayRef<std::string> specGroups, unsigned specDepth,
                ArrayRef<std::string> envSinks)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
@@ -171,7 +171,8 @@ public:
         scheduleOnly(scheduleOnly), oneCycleLinks(oneCycleLinks),
         overlapFrames(overlapFrames), modulo(modulo),
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
-        zeroLatencyChains(zeroLatencyChains),
+        zeroLatencyChains(zeroLatencyChains), shortLead(shortLead),
+        envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
 
@@ -235,6 +236,9 @@ private:
   bool scheduleOnly;
   bool oneCycleLinks, overlapFrames, modulo, interleaveCopies;
   bool zeroLatencyLinks, zeroLatencyChains;
+  bool shortLead;
+  // Host cycles from a late netlist output's slot to the next frame's first.
+  int envRoundTrip;
   /// Whether producer `p`'s link to class `c`'s input may be taken in the
   /// producer's own host cycle.
   bool zeroLink(unsigned p, unsigned c, unsigned input) const;
@@ -839,10 +843,10 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
 //===----------------------------------------------------------------------===//
 
 /// Host cycles from a late netlist output's slot to the next frame's first:
-/// the token is offered at the slot, the endpoint finishes its cycle the host
-/// cycle after and offers its next tokens the one after that, and the next
-/// frame starts four host cycles after it is decided on them.
-static constexpr int kEnvRoundTrip = 6;
+/// the token is offered at the slot, a staged endpoint takes it the host cycle
+/// after (an unstaged one in that host cycle), finishes its cycle and offers
+/// its next tokens the host cycle after that, and the next frame starts four
+/// host cycles after it is decided on them (three with short-lead).
 
 int StaticFolder::envSlackOf(unsigned k, bool late, int period) const {
   if (envSink[k])
@@ -850,10 +854,10 @@ int StaticFolder::envSlackOf(unsigned k, bool late, int period) const {
   // An early output's token of a frame is the next cycle's: the environment's
   // tokens it decides load in the frame after that.
   if (!late)
-    return std::max(1, kEnvRoundTrip - period);
+    return std::max(1, envRoundTrip - period);
   if (specSelect[k] >= 0)
-    return std::max(2, kEnvRoundTrip - int(specDepth) * period);
-  return kEnvRoundTrip;
+    return std::max(2, envRoundTrip - int(specDepth) * period);
+  return envRoundTrip;
 }
 
 int StaticFolder::envSlack(unsigned k, int period) const {
@@ -1084,15 +1088,15 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
       length = std::max(length, at + 1);
     } else if (outputEarly[k]) {
       length = std::max(length, at + 1);
-      length = std::max(length, (at + kEnvRoundTrip + 1) / 2);
+      length = std::max(length, (at + envRoundTrip + 1) / 2);
     } else if (specSelect[k] >= 0) {
       // Captured before the next frame's load, and the environment's round
       // trip within the frames its offers span and the next one.
       length = std::max(length, at + 2);
-      length = std::max(length, (at + kEnvRoundTrip + int(specDepth)) /
+      length = std::max(length, (at + envRoundTrip + int(specDepth)) /
                                     int(specDepth + 1));
     } else {
-      length = std::max(length, at + kEnvRoundTrip);
+      length = std::max(length, at + envRoundTrip);
     }
   }
   // Overlapped, the decision for the next frame may fall before this one
@@ -2572,16 +2576,23 @@ LogicalResult StaticFolder::buildSim() {
         comb::MuxOp::create(b, go, constant(posWidth, 0), constant(posWidth, ii)),
         comb::AddOp::create(b, pos, constant(posWidth, 1)));
   };
-  auto pos3Next = backedges.get(b.getIntegerType(posWidth));
-  Value pos3 = resetReg(pos3Next, "pos3", ii);
-  Value boundary = comb::OrOp::create(b, eq(pos3, ii - 1), eq(pos3, ii));
+  // With a short lead the frame is decided a host cycle later, on the
+  // position two host cycles ahead: the one three ahead is its next, which
+  // the slot tables read as the decision makes it.
+  auto posDNext = backedges.get(b.getIntegerType(posWidth));
+  Value posD = resetReg(posDNext, shortLead ? "pos2" : "pos3", ii);
+  Value boundary = comb::OrOp::create(b, eq(posD, ii - 1), eq(posD, ii));
   Value starting = comb::AndOp::create(b, boundary, go);
-  Value rootNext = nextPosition(pos3);
-  pos3Next.setValue(rootNext);
-  auto par3Next = backedges.get(i1);
-  Value par3 = resetReg(par3Next, "parity3", 1);
-  par3Next.setValue(comb::MuxOp::create(b, starting, notOf(par3), par3));
-  Value pos2 = resetReg(pos3, "pos2", ii), par2 = reg(par3, "parity2");
+  Value posDN = nextPosition(posD);
+  posDNext.setValue(posDN);
+  auto parDNext = backedges.get(i1);
+  Value parD = resetReg(parDNext, shortLead ? "parity2" : "parity3", 1);
+  Value parDN = comb::MuxOp::create(b, starting, notOf(parD), parD);
+  parDNext.setValue(parDN);
+  Value pos3 = shortLead ? posDN : posD;
+  Value rootNext = posDN;
+  Value pos2 = shortLead ? posD : resetReg(pos3, "pos2", ii);
+  Value par2 = shortLead ? parD : reg(parD, "parity2");
   Value pos1 = resetReg(pos2, "pos1", ii), par1 = reg(par2, "parity1");
   Value pos0 = resetReg(pos1, "pos0", ii);
 
@@ -2656,7 +2667,9 @@ LogicalResult StaticFolder::buildSim() {
         (pass == kReady ? readyRow : stateRow)[s % ii] = 1;
         tailRow[s % ii] = s >= ii;
       }
-    Value at = nest ? sequencer[c] : pos3;
+    // A sequencer is the position the decision is made on; with a short
+    // lead the tables read its next.
+    Value at = !nest ? pos3 : shortLead ? nextPosition(sequencer[c]) : sequencer[c];
     auto &ctl = controls[c];
     auto prefix = cls.name;
     ctl.state3 = table(b, at, stateRow, 1);
@@ -3462,6 +3475,7 @@ void FoldStaticPass::runOnOperation() {
   StaticFolder folder(top, netlist, simName, regionBits, report, copies,
                       nest, scheduleOnly, oneCycleLinks, overlapFrames,
                       modulo, interleaveCopies, zeroLatencyLinks, zeroLatencyChains,
+                      shortLead, stagedEnv,
                       specGroups, specDepth,
                       envSinks);
   if (failed(folder.run()))
