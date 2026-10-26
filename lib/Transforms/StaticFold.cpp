@@ -105,6 +105,9 @@ struct Class {
   /// input reaches an output combinationally.
   SmallVector<int> inputDepth, outputDepth;
   llvm::BitVector inputToOutput;
+  /// Host cycles from an instance's state pass to its next evaluation's
+  /// first, the fewest over its instances: what the state bypass must cover.
+  int stateGap = 0;
   /// Whether its memories include a registered read: its state is then read
   /// a host cycle later after a state pass.
   bool syncReads = false;
@@ -1313,14 +1316,42 @@ LogicalResult StaticFolder::schedule() {
     cls.hasReady = bestReady[c];
     cls.slot[kReady] = bestSlots[c * 2 + kReady];
     cls.slot[kState] = bestSlots[c * 2 + kState];
+    cls.stateGap = std::numeric_limits<int>::max();
+    for (unsigned i = 0; i < cls.threads(); ++i) {
+      int s = cls.slot[kState][i];
+      int r = cls.hasReady ? cls.slot[kReady][i] : -1;
+      int first = r >= 0 ? std::min(r, s) : s;
+      cls.stateGap = std::min(cls.stateGap, first + int(ii) - s);
+    }
   }
 
   std::string text;
   llvm::raw_string_ostream os(text);
   os << "foldsim-fold-static: II = " << ii << "\n";
+  if (zeroLatencyLinks) {
+    // Each class input fed by a late link, and those taken in its producer's
+    // host cycle.
+    unsigned links = 0, zero = 0;
+    for (auto &consumer : consumers) {
+      if (consumer.cls < 0)
+        continue;
+      std::set<int> fed;
+      for (auto &pieces : consumer.pieces)
+        for (auto &piece : pieces)
+          if (piece.producer >= 0 && producers[piece.producer].cls >= 0 &&
+              producers[piece.producer].late)
+            fed.insert(piece.producer);
+      for (int p : fed) {
+        ++links;
+        zero += zeroLink(p, consumer.cls, consumer.port);
+      }
+    }
+    os << "  zero-latency links: " << zero << " of " << links << "\n";
+  }
   for (auto &cls : classes) {
     os << "  " << cls.name << " x" << cls.threads()
-       << (cls.hasReady ? " (ready pass)" : "");
+       << (cls.hasReady ? " (ready pass)" : "") << " state gap "
+       << cls.stateGap;
     if (nest)
       os << " depth " << cls.depth
          << (cls.parent >= 0 ? " under " + classes[cls.parent].name : "");
@@ -2151,20 +2182,25 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                      stagedEnable, stagedData, Value{});
           // The next slot's instance may be written but not yet stored: a
           // staged write lands at the end of this host cycle, and a state pass
-          // now writes a host cycle later. The read register takes the newest.
-          Value staged = comb::AndOp::create(
-              b, stagedEnable,
-              comb::ICmpOp::create(b, comb::ICmpPredicate::eq,
-                                   region.instStaged, region.inst1));
-          loaded = comb::MuxOp::create(b, staged, stagedData, loaded);
-          Value now = comb::AndOp::create(
-              b, region.state,
-              comb::ICmpOp::create(b, comb::ICmpPredicate::eq, region.inst,
-                                   region.inst1));
-          Value next = asBits(b, write.data);
-          if (write.enable)
-            next = comb::MuxOp::create(b, write.enable, next, read);
-          loaded = comb::MuxOp::create(b, now, next, loaded);
+          // now writes a host cycle later. The read register takes the newest;
+          // only the bypasses the schedule needs are built.
+          if (cls.stateGap < 3) {
+            Value staged = comb::AndOp::create(
+                b, stagedEnable,
+                comb::ICmpOp::create(b, comb::ICmpPredicate::eq,
+                                     region.instStaged, region.inst1));
+            loaded = comb::MuxOp::create(b, staged, stagedData, loaded);
+          }
+          if (cls.stateGap < 2) {
+            Value now = comb::AndOp::create(
+                b, region.state,
+                comb::ICmpOp::create(b, comb::ICmpPredicate::eq, region.inst,
+                                     region.inst1));
+            Value next = asBits(b, write.data);
+            if (write.enable)
+              next = comb::MuxOp::create(b, write.enable, next, read);
+            loaded = comb::MuxOp::create(b, now, next, loaded);
+          }
         }
         readNext.setValue(loaded);
       }
@@ -2254,11 +2290,14 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                                        hostClock, one());
           // The next slot's instance's data, out of the memory now, is not
           // yet in the buffer.
-          Value fresh = comb::AndOp::create(
-              b, capture,
-              comb::ICmpOp::create(b, comb::ICmpPredicate::eq, readInst,
-                                   region.inst1));
-          bufferData = comb::MuxOp::create(b, fresh, asBits(b, dout), bufferData);
+          if (cls.stateGap < 4) {
+            Value fresh = comb::AndOp::create(
+                b, capture,
+                comb::ICmpOp::create(b, comb::ICmpPredicate::eq, readInst,
+                                     region.inst1));
+            bufferData =
+                comb::MuxOp::create(b, fresh, asBits(b, dout), bufferData);
+          }
           data = seq::FirRegOp::create(b, bufferData, hostClock,
                                        b.getStringAttr(readName + "_read"));
           data = b.createOrFold<hw::BitcastOp>(dout.getType(), data);
