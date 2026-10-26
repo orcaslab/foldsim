@@ -1,0 +1,17 @@
+# Copies need not divide a model's instances: the first copies take one more,
+# and the frame holds the deepest copy. Three leaves in two copies: two and one.
+# RUN: rm -rf %t && cd %S/Inputs/three
+# RUN: foldsim --srcs top.f --top Top --out %t/two --static --copies Leaf:2 Leaf 2>&1 | FileCheck %s --check-prefix=TWO
+# RUN: foldsim --srcs top.f --top Top --out %t/inter --static --interleave-copies --copies Leaf:2 Leaf 2>&1 | FileCheck %s --check-prefix=TWO
+# RUN: not foldsim --srcs top.f --top Top --out %t/four --static --copies Leaf:4 Leaf 2>&1 | FileCheck %s --check-prefix=FOUR
+# TWO: II = {{[0-9]+}}
+# TWO: Leaf x2
+# TWO: Leaf_copy1 x1
+# FOUR: copies: 3 instances of 'Leaf' do not make 4 copies
+# --copies auto tries the fewest copies for each depth of the deepest copy:
+# of three leaves, one, two (two and one) and three.
+# RUN: foldsim --srcs top.f --top Top --out %t/auto --static --copies auto Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=AUTO < %t/auto/degree.txt
+# AUTO-DAG: {{^}}-{{ }}
+# AUTO-DAG: {{^}}Leaf:2{{ }}
+# AUTO-DAG: {{^}}Leaf:3{{ }}

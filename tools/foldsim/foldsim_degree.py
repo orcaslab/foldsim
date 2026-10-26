@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Choosing the fold degree: how many copies each class is folded into.
 
-A class of n instances folded into k copies (k a power of two dividing n)
-costs k copies of its logic and k stores of its state, each n/k instances deep,
-and the frame it allows. For every choice of k per class:
+A class of n instances folded into k copies costs k copies of its logic and
+k stores of its state, each about n/k instances deep (the first n mod k one
+deeper), and the frame it allows: the deepest copy's. For every choice of k per class:
 
   II      exact: the scheduler's (foldsim-fold-static schedule-only);
   LUTs    the IR's estimate per class (foldsim_cost.py), calibrated per class
@@ -99,7 +99,9 @@ def class_estimates(models, names):
 def state_lutram(est, threads):
     """Distributed-RAM LUTs of a copy's state at `threads` instances: its
     registers as memories of one entry per instance (flip-flops for one), and
-    its memories `threads` times deeper."""
+    its memories `threads` times deeper, an entry for each instance index (a
+    power of two)."""
+    threads = 1 << (threads - 1).bit_length() if threads > 1 else 1
     luts = 0.0 if threads == 1 else cost.mem_cost(threads, est['ff'], 1, 0)[0]
     bram = 0.0
     for (_, d, w, r, _, rl, st) in est['mems']:
@@ -216,11 +218,12 @@ def area(cal, est, classes, degree, rest):
     for c, n in classes.items():
         k = degree.get(c, 1)
         kappa, lam = factors(cal, c, est[c]['lut'])
-        lr, br = state_lutram(est[c], n // k)
         logic += k * kappa * est[c]['lut']
-        lutram += k * lam * lr
-        bram += k * br
-        largest = max(largest, kappa * est[c]['lut'] + lam * lr)
+        for j in range(k):
+            lr, br = state_lutram(est[c], copy_threads(n, k, j))
+            lutram += lam * lr
+            bram += br
+            largest = max(largest, kappa * est[c]['lut'] + lam * lr)
     logic += rest
     sites, fits = placement(logic, lutram, bram)
     return dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
@@ -379,8 +382,21 @@ def fit_period(fit, feats):
     return sum(x * y for x, y in zip(fit['coef'], fit_row(fit['terms'], {**feats, **held})))
 
 
-def pow2_divisors(n):
-    return [k for k in (1 << j for j in range(n.bit_length())) if n % k == 0]
+def copy_threads(n, k, j):
+    """Instances of copy j of a class of n folded into k copies."""
+    return n // k + (1 if j < n % k else 0)
+
+
+def degrees(n):
+    """The copy counts worth trying for a class of n instances: the fewest
+    copies for each depth of the deepest copy, which bounds the frame."""
+    ks, seen = [], set()
+    for k in range(1, n + 1):
+        deepest = -(-n // k)
+        if deepest not in seen:
+            seen.add(deepest)
+            ks.append(k)
+    return ks
 
 
 def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
@@ -393,7 +409,7 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
     est = class_estimates(models, classes)
     rest = rest_of(cal, sum(est[c]['lut'] for c in classes))
     names = [c for c, n in classes.items() if n > 1]
-    choices = [pow2_divisors(classes[c]) for c in names]
+    choices = [degrees(classes[c]) for c in names]
     os.makedirs(workdir, exist_ok=True)
     fit = period_fit(cal, use_depth=depth is not None)
 

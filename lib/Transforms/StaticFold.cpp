@@ -546,18 +546,20 @@ LogicalResult StaticFolder::splitCopies() {
     if (k <= 1)
       continue;
     unsigned n = classes[c].instances.size();
-    if (n % k)
+    if (k > n)
       return classes[c].instances[0].emitError("copies: ")
              << n << " instances of '" << classes[c].name
-             << "' do not split into " << k << " copies";
-    unsigned per = n / k;
+             << "' do not make " << k << " copies";
+    // Copies of k not dividing n: the first n % k take one instance more.
+    auto count = [&](unsigned j) { return n / k + (j < n % k ? 1 : 0); };
+    auto start = [&](unsigned j) { return j * (n / k) + std::min(j, n % k); };
     auto instances = classes[c].instances;
     // Copy j's t-th instance: contiguous, or every k-th.
     auto pick = [&](unsigned j, unsigned t) {
-      return instances[interleaveCopies ? t * k + j : j * per + t];
+      return instances[interleaveCopies ? t * k + j : start(j) + t];
     };
     classes[c].instances.clear();
-    for (unsigned t = 0; t < per; ++t) {
+    for (unsigned t = 0; t < count(0); ++t) {
       classes[c].instances.push_back(pick(0, t));
       instanceOf[pick(0, t)] = {c, t};
     }
@@ -581,7 +583,7 @@ LogicalResult StaticFolder::splitCopies() {
       copy.parent = classes[c].parent;
       copy.depth = classes[c].depth;
       unsigned index = classes.size();
-      for (unsigned t = 0; t < per; ++t) {
+      for (unsigned t = 0; t < count(j); ++t) {
         auto instance = pick(j, t);
         copy.instances.push_back(instance);
         instanceOf[instance] = {index, t};
@@ -2003,10 +2005,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   auto *modelBody = model.getBodyBlock();
   unsigned threads = cls.threads();
   unsigned idxWidth = threads > 1 ? llvm::Log2_32_Ceil(threads) : 0;
-  if (threads > 1 && !llvm::isPowerOf2_32(threads))
-    return model.emitError("a class of ") << threads
-                                          << " instances: a copy needs a "
-                                             "power of two";
+  // The entries a per-instance store keeps: every instance index, so a copy
+  // of instances not a power of two leaves the last entries unused.
+  unsigned entries = 1u << idxWidth;
   auto *folding = cls.folding.get();
   auto physical = [&](Operation *op) {
     return folding && folding->physical.contains(op);
@@ -2222,7 +2223,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                             b, enable, write.data, kept)));
         value = kept;
       } else {
-        auto memType = seq::FirMemType::get(context, threads, width, 1);
+        auto memType = seq::FirMemType::get(context, entries, width, 1);
         auto memory = seq::FirMemOp::create(
             b, memType, /*readLatency=*/0, /*writeLatency=*/1,
             seq::RUW::Undefined, seq::WUW::Undefined, reg.getNameAttr(),
@@ -2290,7 +2291,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     uint64_t bits = uint64_t(memType.getWidth()) * memType.getDepth();
     auto &region = regionFor(bits);
     auto threadedType = seq::FirMemType::get(
-        context, memType.getDepth() * threads, memType.getWidth(),
+        context, memType.getDepth() * entries, memType.getWidth(),
         memType.getMaskWidth());
     auto threadedMemory = seq::FirMemOp::create(
         b, threadedType, memory.getReadLatency(), memory.getWriteLatency(),
@@ -2355,7 +2356,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             data = comb::MuxOp::create(b, capture, dout, buffer);
         } else {
           auto width = hw::getBitWidth(dout.getType());
-          auto bufferType = seq::FirMemType::get(context, threads, width, 1);
+          auto bufferType = seq::FirMemType::get(context, entries, width, 1);
           auto buffer = seq::FirMemOp::create(
               b, bufferType, /*readLatency=*/0, /*writeLatency=*/1,
               seq::RUW::Undefined, seq::WUW::Undefined,
