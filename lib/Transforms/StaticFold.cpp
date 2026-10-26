@@ -849,10 +849,10 @@ int StaticFolder::envSlack(unsigned k, int period) const {
 }
 
 /// Host cycles from an instance's state pass to its next evaluation's first:
-/// its registers, written at the end of the state pass, reach the next one's
-/// read register through a bypass (`buildCopy`); a registered read's data,
-/// out of the memory a host cycle after the state pass, a host cycle later.
-static int writeBackLatency(const Class &cls) { return cls.syncReads ? 2 : 1; }
+/// its registers, written at the end of the state pass, and a registered
+/// read's data, out of the memory the host cycle after, both reach the next
+/// evaluation through a bypass (`buildCopy`).
+static int writeBackLatency(const Class &) { return 1; }
 
 unsigned StaticFolder::place(ArrayRef<bool> ready,
                              SmallVectorImpl<SmallVector<int>> &slots,
@@ -2326,6 +2326,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                               b.getStringAttr(readName));
           nextEdge.setValue(comb::MuxOp::create(b, capture, dout, buffer));
           data = buffer;
+          // The data out of the memory now, before the buffer holds it: read
+          // at the state pass just before this slot.
+          if (cls.stateGap < 2)
+            data = comb::MuxOp::create(b, capture, dout, buffer);
         } else {
           auto width = hw::getBitWidth(dout.getType());
           auto bufferType = seq::FirMemType::get(context, threads, width, 1);
@@ -2352,6 +2356,15 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           }
           data = seq::FirRegOp::create(b, bufferData, hostClock,
                                        b.getStringAttr(readName + "_read"));
+          // This slot's instance's data, out of the memory now, read at its
+          // state pass just before.
+          if (cls.stateGap < 2) {
+            Value now = comb::AndOp::create(
+                b, capture,
+                comb::ICmpOp::create(b, comb::ICmpPredicate::eq, readInst,
+                                     region.inst));
+            data = comb::MuxOp::create(b, now, asBits(b, dout), data);
+          }
           data = b.createOrFold<hw::BitcastOp>(dout.getType(), data);
         }
       }
