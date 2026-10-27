@@ -1,0 +1,14 @@
+# --slr-groups keeps each threaded copy whole in one SLR: one placement group
+# per copy instance of foldsim_sim, the SLR left to the placer.
+# RUN: rm -rf %t && cd %S/Inputs/source-list
+# RUN: foldsim --srcs top.f --top Top --out %t/two --static --copies Leaf:2 --slr-groups Leaf
+# RUN: FileCheck %s --check-prefix=TWO < %t/two/foldsim_floorplan.tcl
+# RUN: foldsim --srcs top.f --top Top --out %t/off --static Leaf
+# RUN: not test -e %t/off/foldsim_floorplan.tcl
+# RUN: not foldsim --srcs top.f --top Top --out %t/dyn --slr-groups Leaf 2>&1 | FileCheck %s --check-prefix=DYN
+# TWO: set c [get_cells -quiet -hierarchical Leaf_copy]
+# TWO-NEXT: set_property USER_SLR_ASSIGNMENT fs_Leaf_copy $c
+# TWO: get_cells -quiet -hierarchical Leaf_copy1_copy]
+# TWO-NEXT: USER_SLR_ASSIGNMENT fs_Leaf_copy1_copy $c
+# TWO: get_cells -quiet -hierarchical Top_model_copy]
+# DYN: --slr-groups needs --static

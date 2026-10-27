@@ -164,7 +164,7 @@ public:
                bool interleaveCopies, bool zeroLatencyLinks,
                bool zeroLatencyChains, bool shortLead, bool stagedEnv,
                ArrayRef<std::string> specGroups, unsigned specDepth,
-               ArrayRef<std::string> envSinks)
+               ArrayRef<std::string> envSinks, unsigned registerStateEntries)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -173,6 +173,7 @@ public:
         overlapFrames(overlapFrames), modulo(modulo),
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
         zeroLatencyChains(zeroLatencyChains), shortLead(shortLead),
+        registerStateEntries(registerStateEntries),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -238,6 +239,7 @@ private:
   bool oneCycleLinks, overlapFrames, modulo, interleaveCopies;
   bool zeroLatencyLinks, zeroLatencyChains;
   bool shortLead;
+  unsigned registerStateEntries;
   // Host cycles from a late netlist output's slot to the next frame's first.
   int envRoundTrip;
   /// Whether producer `p`'s link to class `c`'s input may be taken in the
@@ -2008,6 +2010,15 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // The entries a per-instance store keeps: every instance index, so a copy
   // of instances not a power of two leaves the last entries unused.
   unsigned entries = 1u << idxWidth;
+  // A per-instance store this shallow is flops: Vivado would otherwise spend
+  // a distributed RAM LUT's whole depth on a few words, and with two entries
+  // the read folds into the bypass mux's LUT.
+  auto keepShallowInFlops = [&](seq::FirMemOp store) {
+    if (entries <= registerStateEntries)
+      sv::addSVAttributes(store, {sv::SVAttributeAttr::get(
+                                     context, "ram_style", R"("registers")",
+                                     /*emitAsComment=*/false)});
+  };
   auto *folding = cls.folding.get();
   auto physical = [&](Operation *op) {
     return folding && folding->physical.contains(op);
@@ -2229,6 +2240,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             seq::RUW::Undefined, seq::WUW::Undefined, reg.getNameAttr(),
             hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{},
             Attribute{});
+        keepShallowInFlops(memory);
         Value data = seq::FirMemReadOp::create(b, memory, region.inst1,
                                                hostClock, one());
         // The read register: the memory's output register.
@@ -2362,6 +2374,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
               seq::RUW::Undefined, seq::WUW::Undefined,
               b.getStringAttr(readName), hw::InnerSymAttr{},
               seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+          keepShallowInFlops(buffer);
           Value readInst = seq::FirRegOp::create(
               b, region.inst, hostClock, b.getStringAttr(readName + "_inst"));
           seq::FirMemWriteOp::create(b, buffer, readInst, hostClock, capture,
@@ -3481,7 +3494,7 @@ void FoldStaticPass::runOnOperation() {
                       modulo, interleaveCopies, zeroLatencyLinks, zeroLatencyChains,
                       shortLead, stagedEnv,
                       specGroups, specDepth,
-                      envSinks);
+                      envSinks, registerStateEntries);
   if (failed(folder.run()))
     return signalPassFailure();
 }

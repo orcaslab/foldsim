@@ -1,0 +1,14 @@
+# A copy of two instances keeps their state in flops, not a two-word
+# distributed RAM; deeper copies and --register-state-entries 0 keep it in
+# distributed RAM. Three leaves: Leaf:2 gives a copy of two and one of one,
+# Leaf:1 one copy of three (four entries).
+# RUN: rm -rf %t && cd %S/Inputs/three
+# RUN: foldsim --srcs top.f --top Top --out %t/two --static --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=TWO < %t/two/foldsim_sim.sv
+# RUN: foldsim --srcs top.f --top Top --out %t/off --static --copies Leaf:2 --register-state-entries 0 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=OFF < %t/off/foldsim_sim.sv
+# RUN: foldsim --srcs top.f --top Top --out %t/deep --static --copies Leaf:1 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=OFF < %t/deep/foldsim_sim.sv
+# TWO: (* ram_style = "registers" *)
+# TWO-NEXT: reg [7:0] Memory[0:1];
+# OFF-NOT: ram_style = "registers"
