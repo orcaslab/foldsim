@@ -96,13 +96,13 @@ def class_estimates(models, names):
     return out
 
 
-def state_lutram(est, threads):
+def state_lutram(est, threads, form='lutram'):
     """Distributed-RAM LUTs of a copy's state at `threads` instances: its
-    registers as memories of one entry per instance (flip-flops for one), and
-    its memories `threads` times deeper, an entry for each instance index (a
-    power of two)."""
+    registers as memories of one entry per instance (flip-flops for one, a
+    ring or a store in flops), and its memories `threads` times deeper, an
+    entry for each instance index (a power of two)."""
     threads = 1 << (threads - 1).bit_length() if threads > 1 else 1
-    luts = 0.0 if threads == 1 else cost.mem_cost(threads, est['ff'], 1, 0)[0]
+    luts = 0.0 if form != 'lutram' else cost.mem_cost(threads, est['ff'], 1, 0)[0]
     bram = 0.0
     for (_, d, w, r, _, rl, st) in est['mems']:
         lr, br = cost.mem_cost(d * threads, w, r, rl, st)
@@ -149,7 +149,10 @@ def read_wns(path):
 
 
 def calibrate(a):
-    ii, classes, _ = parse_schedule(open(a.schedule).read())
+    text = open(a.schedule).read()
+    ii, classes, _ = parse_schedule(text)
+    sched = parse_classes(text)
+    entries = a.register_state_entries
     est = class_estimates(a.models, classes)
     copies, rest, total, totals = read_util(a.util)
     period = a.period - read_wns(a.timing)
@@ -165,11 +168,13 @@ def calibrate(a):
         k = m['copies']
         t = n
         e = est[name]
-        lr, _ = state_lutram(e, t)
+        form, bypass = state_form(t, sched.get(name), ii, entries)
+        lr, _ = state_lutram(e, t, form)
+        sl = state_logic(cal, form, bypass, e['ff'])
         build['classes'][name] = dict(
             copies=k, threads=t, logic=m['logic'] / k, lutram=m['lutram'] / k,
-            est_logic=e['lut'], est_lutram=lr,
-            kappa=(m['logic'] / k) / e['lut'] if e['lut'] else 1.0,
+            est_logic=e['lut'], est_lutram=lr, form=form, state_logic=sl,
+            kappa=max(m['logic'] / k - sl, 0) / e['lut'] if e['lut'] else 1.0,
             lam=(m['lutram'] / k) / lr if lr else 1.0)
     build['max_copy'] = max(m['lut'] / m['copies'] for m in copies.values())
     cal.setdefault('builds', [b for b in cal.get('builds', []) if b['name'] != a.name])
@@ -185,13 +190,15 @@ def calibrate(a):
 
 def factors(cal, name, est_lut):
     """A class's calibration: from the build whose estimate of it is nearest
-    (the same design at another degree, else the nearest size), else the
-    median over every class and build, else none."""
+    (the same design at another degree, else the nearest size), the latest
+    such build of a design built more than once (the compiler it reflects),
+    else the median over every class and build, else none."""
     builds = (cal or {}).get('builds', [])
-    near = [(abs(math.log(c['est_logic'] / est_lut)), c) for b in builds
-            for n, c in b['classes'].items() if n == name and c['est_logic'] and est_lut]
+    near = [(round(abs(math.log(c['est_logic'] / est_lut)), 6), -i, c)
+            for i, b in enumerate(builds) for n, c in b['classes'].items()
+            if n == name and c['est_logic'] and est_lut]
     if near:
-        c = min(near, key=lambda x: x[0])[1]
+        c = min(near, key=lambda x: x[:2])[2]
         return c['kappa'], c['lam']
     ks = sorted(c['kappa'] for b in builds for c in b['classes'].values())
     ls = sorted(c['lam'] for b in builds for c in b['classes'].values())
@@ -211,19 +218,26 @@ def rest_of(cal, est_total):
     return min(builds, key=lambda b: abs(math.log(max(size(b), 1) / max(est_total, 1))))['rest']
 
 
-def area(cal, est, classes, degree, rest):
+def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2):
     """LUTs of one fold degree ({class: copies}, 1 when absent): logic and
-    distributed RAM apart, the sites they take, and the largest copy."""
+    distributed RAM apart, the sites they take, and the largest copy. With the
+    degree's schedule report (parse_classes) each copy's state takes the form
+    the compiler gives it (state_form)."""
     logic = lutram = bram = largest = 0.0
     for c, n in classes.items():
         k = degree.get(c, 1)
         kappa, lam = factors(cal, c, est[c]['lut'])
-        logic += k * kappa * est[c]['lut']
         for j in range(k):
-            lr, br = state_lutram(est[c], copy_threads(n, k, j))
+            t = copy_threads(n, k, j)
+            info = (sched or {}).get(c if j == 0 else f'{c}_copy{j}')
+            form, bypass = state_form(t, info, ii, entries) if sched is not None else \
+                ('one' if t == 1 else 'lutram', False)
+            lr, br = state_lutram(est[c], t, form)
+            copy_logic = kappa * est[c]['lut'] + state_logic(cal, form, bypass, est[c]['ff'])
+            logic += copy_logic
             lutram += lam * lr
             bram += br
-            largest = max(largest, kappa * est[c]['lut'] + lam * lr)
+            largest = max(largest, copy_logic + lam * lr)
     logic += rest
     sites, fits = placement(logic, lutram, bram)
     return dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
@@ -363,8 +377,9 @@ def period_fit(cal, use_depth=True):
     """The period fit over the calibrated builds: of a constant, the largest
     copy's size, and size plus the screen's depth (with `use_depth` and a
     screen of every build), the one with the least leave-one-out error; size
-    alone when the builds are too few to tell."""
-    builds = (cal or {}).get('builds', [])
+    alone when the builds are too few to tell. A build marked
+    `"period_fit": false` calibrates area only."""
+    builds = [b for b in (cal or {}).get('builds', []) if b.get('period_fit', True)]
     if not builds:
         return None
     names = [n for n, t in TERMS.items()
@@ -380,6 +395,78 @@ def fit_period(fit, feats):
     """A candidate's period from the fit, each term held to the builds' range."""
     held = {t: min(max(feats[t], lo), hi) for t, (lo, hi) in fit.get('range', {}).items()}
     return sum(x * y for x, y in zip(fit['coef'], fit_row(fit['terms'], {**feats, **held})))
+
+
+def parse_classes(text):
+    """Each class of a schedule report (a copy of a class its own): its
+    instances, the state gap, and each instance's ready and state slots."""
+    out, cur = {}, None
+    for line in text.splitlines():
+        m = re.match(r'^  (\S+) x(\d+)( \(ready pass\))?(?: state gap (\d+))?', line)
+        if m:
+            cur = out[m.group(1)] = dict(n=int(m.group(2)), ready=[], state=[],
+                                         gap=int(m.group(4)) if m.group(4) else None)
+            continue
+        m = re.match(r'^    (ready|state): ([\d ]+)$', line)
+        if m and cur is not None:
+            cur[m.group(1)] = [int(x) for x in m.group(2).split()]
+    return out
+
+
+def ring_order(info, ii):
+    """Whether a copy keeps its registers in a ring (foldsim-fold-static's
+    ringOrder): every pass inside the frame, and each instance's passes after
+    the state pass of the instance before it, ending with its own."""
+    if info['n'] < 2 or len(info['state']) != info['n']:
+        return False
+    passes = sorted([(s, 1, i) for i, s in enumerate(info['state'])] +
+                    [(s, 0, i) for i, s in enumerate(info['ready'])])
+    if any(not 0 <= s < ii for s, _, _ in passes) or \
+            len({s for s, _, _ in passes}) != len(passes):
+        return False
+    start = max(n + 1 for n, (_, pass_, _) in enumerate(passes) if pass_ == 1)
+    current = None
+    for n in range(len(passes)):
+        _, pass_, inst = passes[(start + n) % len(passes)]
+        current = inst if current is None else current
+        if inst != current:
+            return False
+        if pass_ == 1:
+            current = None
+    return current is None
+
+
+def state_form(threads, info, ii, entries):
+    """How a copy of `threads` instances keeps its registers: 'one' (a flop),
+    'ring' (a flop per instance, rotated), 'flops' (a store in flops: read
+    select) or 'lutram'; and whether its state bypass is built (gap below 3)."""
+    bypass = info is not None and info['gap'] is not None and info['gap'] < 3
+    if threads == 1:
+        return 'one', bypass
+    if threads <= entries:
+        if info is not None and ring_order(info, ii):
+            return 'ring', bypass
+        return 'flops', bypass
+    return 'lutram', bypass
+
+
+# Logic LUTs per register bit of a copy's state beyond its one-instance logic,
+# by form, without and with the state bypass: the read select and the bypass
+# muxes. Routed, the mid slice copy of two instances in distributed RAM with
+# the bypass (m_rt4c8, 57.5k logic LUTs) against the small one of one instance
+# (s_rt4ro, 34.3k): 23.2k over 25,764 bits (0.90). In flops, synthesized
+# alone, 1.7k fewer (0.83). A ring has no select of its registers, but its
+# read buffers keep theirs: synthesized alone 49.0k, x0.92 routed (the
+# m_rt4c8 copy: 57.5k routed, 62.2k synthesized) 45.1k, 10.8k over the one
+# instance's (0.42). Without the bypass a flop store's select is a 2:1 mux
+# (0.5, two to a LUT); distributed RAM's read port is the select (0).
+# Overridden by a calibration's 'state_logic'.
+STATE_LOGIC = dict(one=(0.0, 0.0), ring=(0.0, 0.42), flops=(0.5, 0.83), lutram=(0.0, 0.90))
+
+
+def state_logic(cal, form, bypass, bits):
+    table = dict(STATE_LOGIC, **{k: tuple(v) for k, v in (cal or {}).get('state_logic', {}).items()})
+    return table[form][1 if bypass else 0] * bits
 
 
 def copy_threads(n, k, j):
@@ -406,6 +493,8 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
     stays within `budget` LUTs (0: none). `depth` is the design's screen depth
     (screen_depth), for a fit that has the depth term."""
     _, classes, _ = parse_schedule(base_schedule)
+    m = re.search(r'register-state-entries=(\d+)', fold_options)
+    entries = int(m.group(1)) if m else 2
     est = class_estimates(models, classes)
     rest = rest_of(cal, sum(est[c]['lut'] for c in classes))
     names = [c for c, n in classes.items() if n > 1]
@@ -425,9 +514,11 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
                             '-o', os.devnull], capture_output=True, text=True)
         if r.returncode:
             return dict(copies=copies or '-', error=r.stderr.strip().splitlines()[-1:])
-        ii, _, _ = parse_schedule(open(report).read())
+        text = open(report).read()
+        ii, _, _ = parse_schedule(text)
         res = dict(copies=copies or '-', ii=ii,
-                   **area(cal, est, classes, dict(zip(names, ks)), rest))
+                   **area(cal, est, classes, dict(zip(names, ks)), rest,
+                          parse_classes(text), ii, entries))
         if fit:
             period = fit_period(fit, features(res['largest_copy'], depth, sum(ks),
                                               res['luts']))
@@ -517,6 +608,8 @@ def main():
     c.add_argument('--out', required=True)
     c.add_argument('--screen', default='',
                    help='the logic screen of the build\'s netlist (ci/logic_screen.py screen)')
+    c.add_argument('--register-state-entries', type=int, default=2,
+                   help="the build's foldsim --register-state-entries (0 for builds before it)")
     e = sub.add_parser('explore', help='the front of a models IR')
     e.add_argument('--models', required=True)
     e.add_argument('--module', required=True)
@@ -535,10 +628,11 @@ def main():
     a = ap.parse_args()
     if a.cmd == 'fit':
         cal = json.load(open(a.calibration))
+        builds = [b for b in cal['builds'] if b.get('period_fit', True)]
         for name, terms in TERMS.items():
-            if 'depth' in terms and not all('depth' in b for b in cal['builds']):
+            if 'depth' in terms and not all('depth' in b for b in builds):
                 continue
-            print(name, fit_terms(cal['builds'], terms))
+            print(name, fit_terms(builds, terms))
         print('chosen', period_fit(cal)['terms'] or 'const')
         return 0
     if a.cmd == 'calibrate-firesim':

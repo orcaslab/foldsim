@@ -333,6 +333,126 @@
    "lutram": 221262,
    "depth": 14.057,
    "max_copy": 123934.0
+  },
+  {
+   "name": "s_rt4ro",
+   "luts": 502077,
+   "rest": 60806,
+   "period": 4.881,
+   "classes": {
+    "foldsim_target_model": {
+     "copies": 1,
+     "threads": 1,
+     "logic": 36117.0,
+     "lutram": 3058.0,
+     "est_logic": 56903.5,
+     "est_lutram": 3373.5733333333333,
+     "form": "one",
+     "state_logic": 0.0,
+     "kappa": 0.6347061252822761,
+     "lam": 0.9064572481009256
+    },
+    "VX_socket__lift_model": {
+     "copies": 1,
+     "threads": 1,
+     "logic": 73787.0,
+     "lutram": 4348.0,
+     "est_logic": 116076.49999999997,
+     "est_lutram": 9700.259999999998,
+     "form": "one",
+     "state_logic": 0.0,
+     "kappa": 0.6356756104810192,
+     "lam": 0.4482354081230813
+    },
+    "VX_core__lift_model": {
+     "copies": 2,
+     "threads": 1,
+     "logic": 14141.0,
+     "lutram": 62.0,
+     "est_logic": 15497.5,
+     "est_lutram": 56.99999999999999,
+     "form": "one",
+     "state_logic": 0.0,
+     "kappa": 0.9124697531859978,
+     "lam": 1.087719298245614
+    },
+    "VX_compute_slice__lift": {
+     "copies": 8,
+     "threads": 1,
+     "logic": 34329.0,
+     "lutram": 2072.0,
+     "est_logic": 63187.333333333336,
+     "est_lutram": 2268.6,
+     "form": "one",
+     "state_logic": 0.0,
+     "kappa": 0.5432892668361802,
+     "lam": 0.9133386229392577
+    }
+   },
+   "logic": 453772,
+   "lutram": 43958,
+   "max_copy": 78135.0,
+   "period_fit": false
+  },
+  {
+   "name": "m_rt4c8",
+   "luts": 957046,
+   "rest": 78115,
+   "period": 6.039,
+   "classes": {
+    "foldsim_target_model": {
+     "copies": 1,
+     "threads": 1,
+     "logic": 63711.0,
+     "lutram": 4420.0,
+     "est_logic": 118873.33333333333,
+     "est_lutram": 5281.399999999999,
+     "form": "one",
+     "state_logic": 0.0,
+     "kappa": 0.5359570411081824,
+     "lam": 0.8368993070019315
+    },
+    "VX_socket__lift_model": {
+     "copies": 2,
+     "threads": 1,
+     "logic": 73949.0,
+     "lutram": 4412.0,
+     "est_logic": 116197.50000000003,
+     "est_lutram": 9713.939999999995,
+     "form": "one",
+     "state_logic": 0.0,
+     "kappa": 0.6364078400998299,
+     "lam": 0.45419263450258107
+    },
+    "VX_core__lift_model": {
+     "copies": 4,
+     "threads": 1,
+     "logic": 14262.0,
+     "lutram": 70.0,
+     "est_logic": 15538.5,
+     "est_lutram": 59.84999999999999,
+     "form": "one",
+     "state_logic": 0.0,
+     "kappa": 0.9178492132445216,
+     "lam": 1.169590643274854
+    },
+    "VX_compute_slice__lift": {
+     "copies": 8,
+     "threads": 2,
+     "logic": 57483.5,
+     "lutram": 16413.25,
+     "est_logic": 63195.5,
+     "est_lutram": 16956.359999999997,
+     "form": "lutram",
+     "state_logic": 23187.600000000002,
+     "kappa": 0.5426952868479559,
+     "lam": 0.9679701303817566
+    }
+   },
+   "logic": 775282,
+   "lutram": 176188,
+   "max_copy": 78361.0,
+   "period_fit": false
   }
  ],
  "firesim": [
