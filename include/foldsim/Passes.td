@@ -358,6 +358,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "runs in the next frame's, so the frame is bounded by each copy's "
            "evaluations and the dependences across frames, not by the "
            "longest chain within one">,
+    Option<"registerStateEntries", "register-state-entries", "unsigned", "2",
+           "Per-instance state (registers and memory read buffers) of at most "
+           "this many instances is kept in flops, not distributed RAM: a "
+           "shallow distributed RAM spends a LUT's whole depth on a few words, "
+           "and a two-word read folds into the bypass LUT; 0 keeps every "
+           "store in distributed RAM">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

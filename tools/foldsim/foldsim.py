@@ -144,6 +144,8 @@ def frame_options(a):
         fold += ' short-lead'
     if a.unstaged_env:
         fold += ' staged-env=false'
+    if getattr(a, 'register_state_entries', None) is not None:
+        fold += f' register-state-entries={a.register_state_entries}'
     return fold
 
 
@@ -322,6 +324,9 @@ def main():
     ap.add_argument('--short-lead', action='store_true',
                     help='with --static: decide a frame three host cycles before its first slot, '
                          'not four (the slot tables read the decided position combinationally)')
+    ap.add_argument('--register-state-entries', type=int, metavar='N',
+                    help='with --static: per-instance state of copies with at most N instances in flops, '
+                         'deeper in distributed RAM (default 2; 0: always distributed RAM)')
     ap.add_argument('--unstaged-env', action='store_true',
                     help="with --static: the endpoints take a token in the host cycle it is offered "
                          "(the kernel's memory endpoints unstaged)")
