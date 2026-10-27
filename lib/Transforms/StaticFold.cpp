@@ -875,6 +875,47 @@ int StaticFolder::envSlack(unsigned k, int period) const {
 /// evaluation through a bypass (`buildCopy`).
 static int writeBackLatency(const Class &) { return 1; }
 
+/// Whether a copy's instances can keep their registers in a ring: every pass
+/// runs inside the frame, and each instance's passes come after the state
+/// pass of the instance before it and end with its own. The register an
+/// evaluation reads is then the ring's head, and a state pass rotates the
+/// ring, so no instance is ever selected.
+static bool ringOrder(const Class &cls, unsigned ii) {
+  if (cls.threads() < 2)
+    return false;
+  SmallVector<std::tuple<int, unsigned, unsigned>> passes;
+  for (unsigned i = 0; i < cls.threads(); ++i)
+    for (auto pass : {kReady, kState}) {
+      if (pass == kReady && !cls.hasReady)
+        continue;
+      int s = cls.slot[pass][i];
+      if (s < 0 || s >= int(ii))
+        return false;
+      passes.push_back({s, unsigned(pass), i});
+    }
+  llvm::sort(passes);
+  for (unsigned n = 1; n < passes.size(); ++n)
+    if (std::get<0>(passes[n]) == std::get<0>(passes[n - 1]))
+      return false;
+  // Walk the frame from just after its last state pass: each instance's
+  // passes must then be one run that its state pass ends.
+  unsigned start = 0;
+  for (unsigned n = 0; n < passes.size(); ++n)
+    if (std::get<1>(passes[n]) == kState)
+      start = n + 1;
+  int current = -1;
+  for (unsigned n = 0; n < passes.size(); ++n) {
+    auto [slot, pass, inst] = passes[(start + n) % passes.size()];
+    if (current < 0)
+      current = inst;
+    if (int(inst) != current)
+      return false;
+    if (pass == kState)
+      current = -1;
+  }
+  return current < 0;
+}
+
 unsigned StaticFolder::place(ArrayRef<bool> ready,
                              SmallVectorImpl<SmallVector<int>> &slots,
                              SmallVectorImpl<bool> &atReady) {
@@ -2010,6 +2051,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // The entries a per-instance store keeps: every instance index, so a copy
   // of instances not a power of two leaves the last entries unused.
   unsigned entries = 1u << idxWidth;
+  // Registers of so few instances, passed in a ring order, are a ring of
+  // flops: no store, no read select and no bypass.
+  bool ring = threads > 1 && threads <= registerStateEntries &&
+              ringOrder(cls, ii);
   // A per-instance store this shallow is flops: Vivado would otherwise spend
   // a distributed RAM LUT's whole depth on a few words, and with two entries
   // the read folds into the bypass mux's LUT.
@@ -2220,8 +2265,32 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         write.data = next;
       auto &region = regionFor(width);
       Value value;
-      if (threads == 1) {
-        // One instance: the register, enabled at its state pass.
+      if (ring && !write.holds) {
+        // The ring: the head is the evaluated instance's state; its state
+        // pass moves each register one place toward the head and puts the
+        // instance's next value at the tail.
+        auto backedge = BackedgeBuilder(b, reg.getLoc());
+        SmallVector<Backedge> nextEdges;
+        SmallVector<Value> ringRegs;
+        for (unsigned i = 0; i < threads; ++i) {
+          nextEdges.push_back(backedge.get(reg.getType()));
+          ringRegs.push_back(seq::FirRegOp::create(
+              b, nextEdges.back(), hostClock,
+              b.getStringAttr(reg.getName() + "_ring" + Twine(i))));
+        }
+        Value head = ringRegs.front();
+        Value tail = write.enable ? Value(comb::MuxOp::create(
+                                        b, write.enable, write.data, head))
+                                  : write.data;
+        for (unsigned i = 0; i < threads; ++i) {
+          Value in = i + 1 < threads ? ringRegs[i + 1] : tail;
+          nextEdges[i].setValue(
+              comb::MuxOp::create(b, region.state, in, ringRegs[i]));
+        }
+        value = head;
+      } else if (threads == 1 || ring) {
+        // One instance, or a register no instance writes: the register,
+        // enabled at its state pass.
         auto backedge = BackedgeBuilder(b, reg.getLoc());
         auto nextEdge = backedge.get(reg.getType());
         auto kept = seq::FirRegOp::create(b, nextEdge, hostClock,
