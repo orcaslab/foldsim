@@ -9,3 +9,7 @@ install(FILES foldsim_cost.py DESTINATION bin)
 # (foldsim_degree.py calibrate), the default of --copies auto.
 configure_file(foldsim_v80.json ${CMAKE_BINARY_DIR}/bin/foldsim_v80.json COPYONLY)
 install(FILES foldsim_v80.json DESTINATION bin)
+# Interface boundary lifting: plain-port wrappers that let interface-port units
+# be classes, on a rewritten copy of the sources (needs pyslang).
+configure_file(foldsim_lift.py ${CMAKE_BINARY_DIR}/bin/foldsim-lift COPYONLY)
+install(PROGRAMS foldsim_lift.py DESTINATION bin RENAME foldsim-lift)
