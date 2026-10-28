@@ -3024,7 +3024,11 @@ LogicalResult StaticFolder::buildSim() {
         pieces.push_back(oneCycleLinks ? written : r);
         continue;
       }
-      unsigned depth = threads * (banked ? 2 : 1);
+      // An early link's address is its bank above the instance's index, so
+      // the bank of 1 starts past every index: with instances not a power of
+      // two, beyond the last instance.
+      unsigned indices = threads > 1 ? llvm::PowerOf2Ceil(threads) : 1;
+      unsigned depth = banked ? 2 * indices : threads;
       auto memType = seq::FirMemType::get(context, depth, w, 1);
       auto memory = seq::FirMemOp::create(
           b, memType, /*readLatency=*/0, /*writeLatency=*/1,
