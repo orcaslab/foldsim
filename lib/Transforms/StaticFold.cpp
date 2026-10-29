@@ -1763,6 +1763,128 @@ void StaticFolder::explainCycle(ArrayRef<bool> ready,
     }
     diag.attachNote(classes[head.cls].instances[head.inst].getLoc()) << text;
   }
+
+  // Whether ready passes split by output would do: each instance's late
+  // output written once the late outputs feeding the inputs it depends on
+  // are. A cycle left then is a combinational loop through the ports.
+  std::map<std::pair<unsigned, unsigned>, unsigned> outNode;
+  SmallVector<std::pair<unsigned, unsigned>> outs;
+  for (auto [p, producer] : llvm::enumerate(producers))
+    if (producer.cls >= 0 && producer.late)
+      for (unsigned i = 0; i < classes[producer.cls].threads(); ++i) {
+        outNode[{unsigned(p), i}] = outs.size();
+        outs.push_back({unsigned(p), i});
+      }
+  // Per output node, the output nodes it waits for and through which input.
+  std::vector<SmallVector<std::pair<unsigned, unsigned>>> waits(outs.size());
+  std::vector<SmallVector<unsigned>> feeds(outs.size());
+  for (auto [n, out] : llvm::enumerate(outs)) {
+    auto [p, i] = out;
+    auto &cls = classes[producers[p].cls];
+    std::set<unsigned> from;
+    for (auto input : cls.deps[producers[p].port].set_bits()) {
+      int k = cls.consumerOf[input];
+      if (k < 0)
+        continue;
+      for (auto &piece : consumers[k].pieces[i])
+        if (piece.producer >= 0 && producers[piece.producer].cls >= 0 &&
+            producers[piece.producer].late) {
+          unsigned m = outNode[{unsigned(piece.producer), piece.inst}];
+          if (from.insert(m).second) {
+            waits[n].push_back({m, unsigned(input)});
+            feeds[m].push_back(n);
+          }
+        }
+    }
+  }
+  // A cycle, depth first without recursion, then a shortest one through it.
+  SmallVector<unsigned> color(outs.size(), 0), parent(outs.size(), 0);
+  SmallVector<unsigned> loop;
+  for (unsigned root = 0; root < outs.size() && loop.empty(); ++root) {
+    if (color[root])
+      continue;
+    SmallVector<std::pair<unsigned, unsigned>> stack{{root, 0}};
+    color[root] = 1;
+    while (!stack.empty() && loop.empty()) {
+      auto &[n, next] = stack.back();
+      if (next < feeds[n].size()) {
+        unsigned s = feeds[n][next++];
+        if (color[s] == 1) {
+          for (unsigned w = n; w != s; w = parent[w])
+            loop.push_back(w);
+          loop.push_back(s);
+        } else if (!color[s]) {
+          color[s] = 1;
+          parent[s] = n;
+          stack.push_back({s, 0});
+        }
+        continue;
+      }
+      color[n] = 2;
+      stack.pop_back();
+    }
+  }
+  if (loop.empty()) {
+    diag.attachNote(netlist.getLoc())
+        << "with a ready pass per late output instead (each written once the "
+           "outputs feeding the inputs it depends on are), the frame has no "
+           "cycle: no path through the ports is combinational, so the netlist "
+           "is legal and the schedule needs the models on the cycle to write "
+           "their ready outputs in more than one pass";
+    return;
+  }
+  // Shortest, through the found loop's outputs: breadth first back to each.
+  SmallVector<unsigned> best;
+  SmallVector<int> back(outs.size(), -1);
+  for (unsigned root : loop) {
+    std::fill(back.begin(), back.end(), -1);
+    std::deque<unsigned> queue{root};
+    back[root] = root;
+    while (!queue.empty()) {
+      unsigned u = queue.front();
+      queue.pop_front();
+      bool closed = false;
+      for (unsigned v : feeds[u]) {
+        if (v == root) {
+          SmallVector<unsigned> path;
+          for (unsigned w = u; w != root; w = back[w])
+            path.push_back(w);
+          path.push_back(root);
+          std::reverse(path.begin(), path.end());
+          if (best.empty() || path.size() < best.size())
+            best = path;
+          closed = true;
+          break;
+        }
+        if (back[v] < 0) {
+          back[v] = u;
+          queue.push_back(v);
+        }
+      }
+      if (closed)
+        break;
+    }
+  }
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  os << "even with a ready pass per late output the frame has a cycle: a "
+        "combinational loop through the ports, "
+     << best.size() << " output" << (best.size() == 1 ? "" : "s") << ":";
+  for (auto [e, n] : llvm::enumerate(best)) {
+    unsigned m = best[(e + 1) % best.size()];
+    auto [p, i] = outs[n];
+    auto &to = classes[producers[outs[m].first].cls];
+    unsigned input = 0;
+    for (auto [w, in] : waits[m])
+      if (w == n)
+        input = in;
+    os << " " << classes[producers[p].cls].name << " #" << i << " output "
+       << outputName(p) << " -> " << to.name << " #" << outs[m].second
+       << " input " << inputName(producers[outs[m].first].cls, input)
+       << ", on which its output " << outputName(outs[m].first)
+       << " depends;";
+  }
+  diag.attachNote(netlist.getLoc()) << text;
 }
 
 LogicalResult StaticFolder::schedule() {

@@ -10,6 +10,7 @@
 // COMB: note: cycle edge 1 of 2: Pass #{{[01]}} ({{[ab]}}) ready pass -> Pass #{{[01]}} ({{[ab]}}) ready pass: output 'y' -> input 'x' (1 host cycle), 8 of the input's 8 bits. 'y' is late: it depends combinationally on Pass's input 'x'. The ready pass reads it for its outputs 'y'. Through Pass: its output 'y' depends combinationally on 'x' (6 of 8 bits: [7:2] of the output): a combinational path through the model.
 // COMB: note: cycle edge 2 of 2:
 // COMB-SAME: a combinational path through the model.
+// COMB: note: even with a ready pass per late output the frame has a cycle: a combinational loop through the ports, 2 outputs: Pass #{{[01]}} output 'y' -> Pass #{{[01]}} input 'x', on which its output 'y' depends; Pass #{{[01]}} output 'y' -> Pass #{{[01]}} input 'x', on which its output 'y' depends;
 hw.module @Pass(in %clk : !seq.clock, in %x : i8, out y : i8) {
   %r = seq.firreg %x clock %clk : i8
   %hi = comb.extract %x from 2 : (i8) -> i6
@@ -32,6 +33,7 @@ hw.module @Loop(in %clk : !seq.clock, out z : i8) {
 // SHARED: note: cycle edge 1 of 2: Two #{{[01]}} ({{[ab]}}) ready pass -> Two #{{[01]}} ({{[ab]}}) ready pass: output 'y1' -> input 'x2' (1 host cycle), 8 of the input's 8 bits. 'y1' is late: it depends combinationally on Two's input 'x1'. The ready pass reads it for its outputs 'y2'. Through Two: its output 'y1' does not depend on 'x2'; the cycle closes only because one ready pass writes all of Two's ready outputs (a second ready pass would break it).
 // SHARED: note: cycle edge 2 of 2:
 // SHARED-SAME: a second ready pass would break it
+// SHARED: note: with a ready pass per late output instead {{.*}} the frame has no cycle: no path through the ports is combinational, so the netlist is legal and the schedule needs the models on the cycle to write their ready outputs in more than one pass
 hw.module @Two(in %clk : !seq.clock, in %x1 : i8, in %x2 : i8, out y1 : i8, out y2 : i8) {
   %r = seq.firreg %x1 clock %clk : i8
   %y1 = comb.xor %x1, %r : i8
