@@ -19,10 +19,10 @@
 // The same product through a LUT: out of the DSP's output stage first.
 // V80-DAG: 17,17,d,reg,{{[0-9]+}},0,0,{{[ab]}}[{{[0-9]+}}],0,l33.d[0]
 // U55C-DAG: 13,13,d,reg,{{[0-9]+}},0,0,{{[ab]}}[{{[0-9]+}}],0,l33.d[0]
-// A zero-extended bit times 10 is a table, not a DSP: through a LUT, two
-// levels.
-// V80-DAG: 2,2,d,reg,{{[0-9]+}},0,0,a[0],0,l10.d[0]
-// U55C-DAG: 2,2,d,reg,{{[0-9]+}},0,0,a[0],0,l10.d[0]
+// A zero-extended bit times 10 is a table, not a DSP; with the LUT after it,
+// a cone of two register bits: one LUT.
+// V80-DAG: 1,1,d,reg,{{[0-9]+}},0,0,{{[ab]}}[0],0,l10.d[0]
+// U55C-DAG: 1,1,d,reg,{{[0-9]+}},0,0,{{[ab]}}[0],0,l10.d[0]
 // UNKNOWN: no Beacon target 'agilex'; one of versal virtexuplus virtexuplusHBM zynquplus asap7
 hw.module @Top(in %clk : !seq.clock, in %d : i33) {
   %a = seq.firreg %d clock %clk : i33

@@ -267,6 +267,7 @@ private:
   unsigned startOf(unsigned ctx, unsigned id, uint32_t &fanout,
                    unsigned &crossings);
   uint32_t inputFanout(unsigned id);
+  void collapse(unsigned id, ArrayRef<Edge> edges, int &best, unsigned &pred);
   void printName(raw_ostream &os, unsigned id);
   void printOp(raw_ostream &os, Operation *op, StringRef port, uint32_t bit);
   void printPath(raw_ostream &os, const EndPoint &end, unsigned rank);
@@ -279,6 +280,11 @@ private:
   DenseMap<std::pair<unsigned, Operation *>, unsigned> children;
   std::vector<std::string> paths;
   std::vector<Node> nodes;
+  /// Per node, on an FPGA: the register and port bits its cone reaches if
+  /// there are at most kMaxTableBits of them, else kNone alone; and whether
+  /// the cone has a word-level operation the mapper left unmapped.
+  std::vector<SmallVector<unsigned, 4>> cones;
+  std::vector<bool> coneWords;
   DenseMap<std::tuple<unsigned, void *, unsigned>, unsigned> ids;
   std::vector<EndPoint> endPoints;
   /// Evaluated nodes, each after its inputs.
@@ -741,6 +747,8 @@ void Timing::evaluate(unsigned root) {
         pred = in;
       }
     }
+    if (!device.asic)
+      collapse(id, edges, best, pred);
     nodes[id].levels = best;
     nodes[id].pred = pred;
     nodes[id].state = 2;
@@ -748,6 +756,66 @@ void Timing::evaluate(unsigned root) {
       order.push_back(id);
     stack.pop_back();
   }
+}
+
+/// A node whose cone reaches at most kMaxTableBits register or port bits and
+/// goes through a word-level operation is a table over those bits: synthesis
+/// maps a cut of six inputs to one LUT6, where the word-level operations the
+/// mapper leaves for carry chains and DSPs count their own levels. A shift by
+/// an amount computed from a 2-bit field is one LUT per bit, not a product,
+/// compares and a shifter. Cones of LUTs alone keep the mapper's depth.
+void Timing::collapse(unsigned id, ArrayRef<Edge> edges, int &best,
+                      unsigned &pred) {
+  if (cones.size() < nodes.size()) {
+    cones.resize(nodes.size());
+    coneWords.resize(nodes.size());
+  }
+  Kind kind = nodes[id].kind;
+  // A distributed-RAM read depends on the memory's contents, not on its
+  // address alone.
+  if (kind == Kind::AsyncRead) {
+    cones[id] = {kNone};
+    return;
+  }
+  bool word = kind == Kind::Arith || kind == Kind::Order ||
+              kind == Kind::Equal || kind == Kind::Mul || kind == Kind::Div ||
+              kind == Kind::Table;
+  SmallVector<unsigned, 4> cone;
+  bool wide = false;
+  for (auto &edge : edges) {
+    unsigned in = edge.in;
+    if (nodes[in].state != 2 || nodes[in].kind == Kind::AsyncRead) {
+      wide = true;
+      break;
+    }
+    if (isStart(nodes[in].kind)) {
+      cone.push_back(in);
+    } else {
+      auto &c = cones[in];
+      if (!c.empty() && c.front() == kNone) {
+        wide = true;
+        break;
+      }
+      cone.append(c.begin(), c.end());
+      word |= coneWords[in];
+    }
+    llvm::sort(cone);
+    cone.erase(std::unique(cone.begin(), cone.end()), cone.end());
+    if (cone.size() > kMaxTableBits) {
+      wide = true;
+      break;
+    }
+  }
+  if (wide) {
+    cones[id] = {kNone};
+    return;
+  }
+  if (word && !cone.empty() && table(cone.size()) < best) {
+    best = table(cone.size());
+    pred = cone.front();
+  }
+  cones[id] = std::move(cone);
+  coneWords[id] = word;
 }
 
 void Timing::addEndPoints(unsigned ctx, Operation *op, StringRef port,
