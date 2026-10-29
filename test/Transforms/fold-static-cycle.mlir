@@ -7,7 +7,7 @@
 // a combinational loop through both.
 // COMB: error: the evaluations of a frame depend on each other in a cycle for every choice of ready passes
 // COMB-NEXT: a shortest cycle, 2 edges, with 2 of 2 models given a ready pass
-// COMB: note: cycle edge 1 of 2: Pass #{{[01]}} ({{[ab]}}) ready pass -> Pass #{{[01]}} ({{[ab]}}) ready pass: output 'y' -> input 'x' (1 host cycle), 8 of the input's 8 bits. The ready pass reads it for its outputs 'y'. Through Pass: its output 'y' depends combinationally on 'x' (6 of 8 bits: [7:2] of the output): a combinational path through the model.
+// COMB: note: cycle edge 1 of 2: Pass #{{[01]}} ({{[ab]}}) ready pass -> Pass #{{[01]}} ({{[ab]}}) ready pass: output 'y' -> input 'x' (1 host cycle), 8 of the input's 8 bits. 'y' is late: it depends combinationally on Pass's input 'x'. The ready pass reads it for its outputs 'y'. Through Pass: its output 'y' depends combinationally on 'x' (6 of 8 bits: [7:2] of the output): a combinational path through the model.
 // COMB: note: cycle edge 2 of 2:
 // COMB-SAME: a combinational path through the model.
 hw.module @Pass(in %clk : !seq.clock, in %x : i8, out y : i8) {
@@ -29,7 +29,7 @@ hw.module @Loop(in %clk : !seq.clock, out z : i8) {
 // Without a ready pass, the state passes wait on each other.
 // SHARED: error: the evaluations of a frame depend on each other in a cycle for every choice of ready passes
 // SHARED-NEXT: a shortest cycle, 2 edges, with 2 of 2 models given a ready pass
-// SHARED: note: cycle edge 1 of 2: Two #{{[01]}} ({{[ab]}}) ready pass -> Two #{{[01]}} ({{[ab]}}) ready pass: output 'y1' -> input 'x2' (1 host cycle), 8 of the input's 8 bits. The ready pass reads it for its outputs 'y2'. Through Two: its output 'y1' does not depend on 'x2'; the cycle closes only because one ready pass writes all of Two's ready outputs (a second ready pass would break it).
+// SHARED: note: cycle edge 1 of 2: Two #{{[01]}} ({{[ab]}}) ready pass -> Two #{{[01]}} ({{[ab]}}) ready pass: output 'y1' -> input 'x2' (1 host cycle), 8 of the input's 8 bits. 'y1' is late: it depends combinationally on Two's input 'x1'. The ready pass reads it for its outputs 'y2'. Through Two: its output 'y1' does not depend on 'x2'; the cycle closes only because one ready pass writes all of Two's ready outputs (a second ready pass would break it).
 // SHARED: note: cycle edge 2 of 2:
 // SHARED-SAME: a second ready pass would break it
 hw.module @Two(in %clk : !seq.clock, in %x1 : i8, in %x2 : i8, out y1 : i8, out y2 : i8) {

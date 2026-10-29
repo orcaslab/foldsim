@@ -1686,6 +1686,26 @@ void StaticFolder::explainCycle(ArrayRef<bool> ready,
         bits += piece.width;
     os << ", " << bits << " of the input's " << consumers[k2].width
        << " bits.";
+    // Why the producer writes it within the frame: what makes it late.
+    {
+      auto &producerCls = classes[tail.cls];
+      auto &deps = producerCls.deps[producers[wait.producer].port];
+      os << " " << outputName(wait.producer) << " is late: ";
+      if (deps.none()) {
+        os << "it depends on a combinational memory read or a black box, no "
+              "input.";
+      } else {
+        os << "it depends combinationally on " << classes[tail.cls].name
+           << "'s input" << (deps.count() == 1 ? "" : "s");
+        unsigned shown = 0;
+        for (auto input : deps.set_bits())
+          if (shown++ < 4)
+            os << " " << inputName(tail.cls, input);
+        if (shown > 4)
+          os << " and " << shown - 4 << " more";
+        os << ".";
+      }
+    }
     // Why the consumer's pass reads it.
     if (head.pass == kState) {
       os << " A state pass reads every input.";
@@ -3928,13 +3948,19 @@ LogicalResult StaticFolder::run() {
   for (auto &cls : classes)
     if (failed(analyze(cls)))
       return failure();
-  if (failed(schedule()))
-    return failure();
-  if (scheduleOnly) {
-    // Nothing is built: the folded pipelines' edges stay unresolved.
+  // Without a schedule, or with one only, nothing is built: the folded
+  // pipelines' edges stay unresolved.
+  auto abandonFolds = [&] {
     for (auto &cls : classes)
       if (cls.folding && cls.folding->edges)
         cls.folding->edges->abandon();
+  };
+  if (failed(schedule())) {
+    abandonFolds();
+    return failure();
+  }
+  if (scheduleOnly) {
+    abandonFolds();
     return success();
   }
   for (auto &cls : classes)
