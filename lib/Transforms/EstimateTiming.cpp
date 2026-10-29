@@ -1235,7 +1235,7 @@ void Timing::writeInstances(raw_ostream &os) {
 /// For every instance of `modules`, the deepest bit of each port: the
 /// levels at which an input arrives, and the levels behind an output.
 void Timing::writePorts(raw_ostream &os, ArrayRef<std::string> modules) {
-  os << "instance,module,direction,port,width,levels\n";
+  os << "instance,module,direction,port,width,levels,through\n";
   auto deepest = [&](unsigned ctx, Value value) {
     int levels = -1;
     for (unsigned bit = 0, e = widthOf(value); bit < e; ++bit) {
@@ -1247,21 +1247,63 @@ void Timing::writePorts(raw_ostream &os, ArrayRef<std::string> modules) {
     }
     return levels;
   };
+  auto within = [&](unsigned ctx, unsigned root) {
+    while (contexts[ctx].depth > contexts[root].depth)
+      ctx = contexts[ctx].parent;
+    return ctx == root;
+  };
+  // The bits of an output that logic outside the instance reaches without a
+  // register: a path from an input port through to an output, which leaves
+  // the instance's neighbours one combinational path.
+  auto through = [&](unsigned ctx, Value value) {
+    unsigned count = 0;
+    SmallVector<unsigned> stack;
+    DenseSet<unsigned> seen;
+    SmallVector<Edge> edges;
+    for (unsigned bit = 0, e = widthOf(value); bit < e; ++bit) {
+      unsigned id = resolve(ctx, value, bit);
+      if (id == kNone)
+        continue;
+      stack.assign({id});
+      seen.clear();
+      seen.insert(id);
+      bool found = false;
+      while (!found && !stack.empty()) {
+        unsigned n = stack.pop_back_val();
+        if (!within(nodes[n].ctx, ctx)) {
+          found = true;
+          break;
+        }
+        if (isStart(nodes[n].kind))
+          continue;
+        edges.clear();
+        operands(n, edges);
+        for (auto &edge : edges)
+          if (seen.insert(edge.in).second)
+            stack.push_back(edge.in);
+      }
+      count += found;
+    }
+    return count;
+  };
   for (unsigned ctx = 1, e = contexts.size(); ctx < e; ++ctx) {
     auto c = contexts[ctx];
     if (!matchesModule(c.module.getModuleName(), modules))
       continue;
-    auto write = [&](StringRef dir, StringRef name, Value value, int levels) {
+    auto write = [&](StringRef dir, StringRef name, Value value, int levels,
+                     unsigned bits) {
       os << path(ctx) << ',' << c.module.getModuleName() << ',' << dir << ','
-         << name << ',' << widthOf(value) << ',' << levels << '\n';
+         << name << ',' << widthOf(value) << ',' << levels << ',' << bits
+         << '\n';
     };
     for (auto [i, operand] : llvm::enumerate(c.inst.getOperands()))
       if (!isa<seq::ClockType>(operand.getType()))
         write("in", c.module.getInputName(i), operand,
-              deepest(c.parent, operand));
+              deepest(c.parent, operand), 0);
     auto *output = c.module.getBodyBlock()->getTerminator();
     for (auto [i, operand] : llvm::enumerate(output->getOperands()))
-      write("out", c.module.getOutputName(i), operand, deepest(ctx, operand));
+      write("out", c.module.getOutputName(i), operand, deepest(ctx, operand),
+            through(ctx, operand));
   }
 }
 
