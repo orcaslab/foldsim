@@ -266,6 +266,7 @@ private:
   void retime(unsigned levels);
   unsigned startOf(unsigned ctx, unsigned id, uint32_t &fanout,
                    unsigned &crossings);
+  uint32_t inputFanout(unsigned id);
   void printName(raw_ostream &os, unsigned id);
   void printOp(raw_ostream &os, Operation *op, StringRef port, uint32_t bit);
   void printPath(raw_ostream &os, const EndPoint &end, unsigned rank);
@@ -993,6 +994,22 @@ unsigned Timing::startOf(unsigned ctx, unsigned id, uint32_t &fanout,
   }
 }
 
+/// The largest fanout of a bit into the last cell before end point bit `id`:
+/// a clock enable or a select that drives the cells of every bit of a wide
+/// register has the register's width as its load, which routing, not logic
+/// depth, makes slow.
+uint32_t Timing::inputFanout(unsigned id) {
+  if (isStart(nodes[id].kind))
+    return 0;
+  SmallVector<Edge> edges;
+  inputs(id, edges);
+  uint32_t fanout = 0;
+  for (auto &edge : edges)
+    if (!isStart(nodes[edge.in].kind))
+      fanout = std::max(fanout, nodes[edge.in].fanout);
+  return fanout;
+}
+
 void Timing::printOp(raw_ostream &os, Operation *op, StringRef port,
                      uint32_t bit) {
   if (auto name = op->getAttrOfType<StringAttr>("name"))
@@ -1030,7 +1047,7 @@ void Timing::printName(raw_ostream &os, unsigned id) {
 
 void Timing::writeEndPoints(raw_ostream &os, unsigned minLevels) {
   os << "levels,retimed,kind,start_kind,fanout,crossings,start_inst,start,"
-        "end_inst,end\n";
+        "end_inst,end,in_fanout\n";
   for (auto &end : endPoints) {
     if ((unsigned)end.levels < minLevels)
       continue;
@@ -1043,7 +1060,7 @@ void Timing::writeEndPoints(raw_ostream &os, unsigned minLevels) {
     printName(os, start);
     os << ',' << end.ctx << ',';
     printOp(os, end.op, end.port, end.bit);
-    os << '\n';
+    os << ',' << inputFanout(end.node) << '\n';
   }
 }
 

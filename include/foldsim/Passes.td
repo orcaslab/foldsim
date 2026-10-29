@@ -716,7 +716,8 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     the worst input of each bit, so time and memory grow linearly with the
     design. Writes one row per end point bit of at least `min-levels` levels
     to `output` (levels, retimed levels, end kind, maximum fanout and module
-    crossings on the path, then start and end as an instance id and a name),
+    crossings on the path, then start and end as an instance id and a name,
+    and the largest fanout of a bit into the end point's last cell),
     the instances to `instances` (id, parent, instance name, module), and
     the `top-paths` deepest paths, op by op, to `report`. Leaves the design
     as it is.
