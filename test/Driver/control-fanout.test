@@ -1,0 +1,23 @@
+# --control-fanout bounds the loads of each copy of the slot controls: a
+# region's instance index and staged index, a link group's state pass and
+# instance, each over the bound, become replicas loaded from the same next
+# value, each kept (DONT_TOUCH) and driving its own stores. Three leaves in one
+# copy, the state in distributed RAM. At 0, no replicas.
+# RUN: rm -rf %t && cd %S/Inputs/three
+# RUN: foldsim --srcs top.f --top Top --out %t/four --static --copies Leaf:1 --register-state-entries 0 --control-fanout 4 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=FOUR < %t/four/foldsim_sim.sv
+# RUN: foldsim --srcs top.f --top Top --out %t/off --static --copies Leaf:1 --register-state-entries 0 --control-fanout 0 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=OFF < %t/off/foldsim_sim.sv
+# FOUR: reg Leaf_links0_state0;
+# FOUR-NEXT: (* keep = "true", DONT_TOUCH = "true" *)
+# FOUR-NEXT: reg Leaf_links0_state0_rep1;
+# FOUR: reg [1:0] region0_inst1;
+# FOUR-NEXT: (* keep = "true", DONT_TOUCH = "true" *)
+# FOUR-NEXT: reg [1:0] region0_inst1_rep1;
+# FOUR: reg [1:0] region0_inst_staged_rep1;
+# FOUR: region0_inst_staged <= region0_inst;
+# FOUR-NEXT: region0_inst_staged_rep1 <= region0_inst;
+# FOUR: .W0_addr (region0_inst_staged),
+# FOUR: .W0_addr (region0_inst_staged_rep1),
+# OFF-NOT: DONT_TOUCH
+# OFF-NOT: _rep1

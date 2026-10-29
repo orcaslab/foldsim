@@ -17,6 +17,11 @@
 
 namespace foldsim {
 
+/// The attribute `foldsim-fold-static` puts on a register it makes as a copy
+/// of a slot's controls, which `foldsim-replicate-controls` may replicate and
+/// removes.
+inline constexpr llvm::StringLiteral kControlAttrName = "foldsim.control";
+
 #define GEN_PASS_DECL
 #define GEN_PASS_REGISTRATION
 #include "foldsim/Passes.h.inc"

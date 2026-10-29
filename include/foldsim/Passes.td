@@ -615,6 +615,42 @@ def SplitMaskedMemories
   let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect"];
 }
 
+def ReplicateControls
+    : Pass<"foldsim-replicate-controls", "::circt::hw::HWModuleOp"> {
+  let summary = "Bound the loads of the static fold's slot controls by replicas";
+  let description = [{
+    `foldsim-fold-static` marks each register it makes as a copy of a slot's
+    controls (`foldsim.control`): a region's instance index, staged index and
+    state pass, a link group's state pass, instance and bank. Such a register
+    drives the address or write enable of every store its region or group
+    holds, a few hundred to thousands of LUT pins on one net with no logic
+    between: on the V80 the route alone takes most of a 4 ns period.
+
+    Each marked register whose loads exceed `loads` becomes several: replicas
+    with the same next value, clock, reset and preset, so they all hold the
+    register's value on every host cycle, each driving a group of at most
+    `loads` loads, the loads in module order so that a group is a submodule's
+    stores. A load is a pin per bit of the register: a memory port's address,
+    enable or mask is its width times its depth in 32-entry LUTs (a block
+    RAM, deeper than 64 entries: a pin per 36 bits and 1024 entries), a
+    select's condition is its width, anything else one. Concatenations,
+    extractions, bit casts, replications and inversions of the register are
+    wiring, copied with it. A memory of at most 64 entries or a select whose
+    one port is over `loads` is first split by bits into parts of at most
+    `loads` (a memory in whole mask bits). The replicas and the register get
+    `DONT_TOUCH`. The simulator's behavior is the same on every host cycle.
+
+    The marks are removed in any case; `loads` 0 replicates nothing.
+  }];
+  let options = [
+    Option<"loads", "loads", "unsigned", "96",
+           "The most loads a marked register or a replica drives; 0: none "
+           "replicated">,
+  ];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect",
+                           "circt::sv::SVDialect"];
+}
+
 def FoldZeroWidth : Pass<"foldsim-fold-zero-width", "::circt::hw::HWModuleOp"> {
   let summary = "Replace zero-width combinational values with constants";
   let description = [{
