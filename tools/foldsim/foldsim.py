@@ -48,10 +48,14 @@ SPLIT = 'hw.module(foldsim-split-masked-memories)'
 # through the parent's model.
 ABSORB_LOGIC = 64
 
+# A diagnostic of foldsim-fold-static is on the netlist: without this, MLIR
+# prints the whole netlist after it.
+NO_OP_DUMP = '--mlir-print-op-on-diagnostic=false'
 
-def run(cmd, **kw):
+
+def run(cmd, check=True, **kw):
     print('+', ' '.join(cmd), file=sys.stderr)
-    return subprocess.run(cmd, check=True, text=True, **kw)
+    return subprocess.run(cmd, check=check, text=True, **kw)
 
 
 def publish(src, public):
@@ -199,7 +203,7 @@ def choose_copies(a, foldsim_opt, flat, passes, out):
     os.makedirs(work, exist_ok=True)
     base = os.path.join(work, 'schedule_base.txt')
     # The schedules compared go to <out>/degree, not to the log.
-    r = subprocess.run([foldsim_opt, models, f'--pass-pipeline=builtin.module('
+    r = subprocess.run([foldsim_opt, models, NO_OP_DUMP, f'--pass-pipeline=builtin.module('
                         f'foldsim-fold-static{{{fold} report={base} schedule-only}})',
                         '-o', os.devnull], capture_output=True, text=True)
     if r.returncode:
@@ -373,6 +377,10 @@ def main():
                     help='a statically scheduled simulator: every target cycle a frame of '
                          'host cycles fixed at compile time (foldsim-fold-static); the '
                          'options of the token fabric do not apply')
+    ap.add_argument('--schedule-only', action='store_true',
+                    help='with --static: stop once the schedule is chosen, written to '
+                         '<out>/schedule.txt (the --copies given, or one copy per class '
+                         'for none or auto); no simulator')
     ap.add_argument('--region-bits', type=int, default=0,
                     help="with --static: the most state bits a region's copy of the slot "
                          'controls drives (foldsim-fold-static)')
@@ -512,10 +520,25 @@ def main():
         a.spec_groups = axi_spec_groups(a.top, open(flat).read(), a.axi_spec)
     if a.copies == 'auto' and not a.static:
         sys.exit('--copies auto needs --static')
+    if a.schedule_only and not a.static:
+        sys.exit('--schedule-only needs --static')
     if a.static:
         fold = f'module={a.top} sim=foldsim_sim report={out("schedule.txt")}'
         if a.region_bits:
             fold += f' region-bits={a.region_bits}'
+        if a.schedule_only:
+            models = out('models.mlir')
+            run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
+                 '-o', models])
+            if a.copies and a.copies != 'auto':
+                fold += f' copies={a.copies}'
+            if a.nest:
+                fold += ' nest'
+            fold += frame_options(a) + ' schedule-only'
+            r = run([foldsim_opt, models, NO_OP_DUMP,
+                     f'--pass-pipeline=builtin.module(foldsim-fold-static{{{fold}}})', '-o', os.devnull],
+                    check=False)
+            sys.exit(r.returncode and 'foldsim: no schedule')
         copies = a.copies
         if copies == 'auto':
             copies = choose_copies(a, foldsim_opt, flat, passes, out)
@@ -533,7 +556,8 @@ def main():
         pipeline = passes + OPTIMIZE + [f'foldsim-compose{{{compose}}}', SPLIT,
                                         'canonicalize', 'foldsim-sort', 'cse']
     sim = out('foldsim_sim.mlir')
-    run([foldsim_opt, sim_input, f'--pass-pipeline=builtin.module({",".join(pipeline)})', '-o', sim])
+    run([foldsim_opt, sim_input, NO_OP_DUMP, f'--pass-pipeline=builtin.module({",".join(pipeline)})',
+         '-o', sim])
     sim_text = open(sim).read()
     # A RAM with a registered read states its read-under-write behavior to
     # Vivado, which otherwise leaves a read colliding with a write undefined.
