@@ -280,7 +280,7 @@ private:
   DenseMap<std::pair<unsigned, Operation *>, unsigned> children;
   std::vector<std::string> paths;
   std::vector<Node> nodes;
-  /// Per node, on an FPGA: the register and port bits its cone reaches if
+  /// Per node: the register and port bits its cone reaches if
   /// there are at most kMaxTableBits of them, else kNone alone; and whether
   /// the cone has a word-level operation the mapper left unmapped.
   std::vector<SmallVector<unsigned, 4>> cones;
@@ -747,8 +747,7 @@ void Timing::evaluate(unsigned root) {
         pred = in;
       }
     }
-    if (!device.asic)
-      collapse(id, edges, best, pred);
+    collapse(id, edges, best, pred);
     nodes[id].levels = best;
     nodes[id].pred = pred;
     nodes[id].state = 2;
@@ -759,8 +758,9 @@ void Timing::evaluate(unsigned root) {
 }
 
 /// A node whose cone reaches at most kMaxTableBits register or port bits and
-/// goes through a word-level operation is a table over those bits: synthesis
-/// maps a cut of six inputs to one LUT6, where the word-level operations the
+/// goes through a word-level operation is a table over those bits (LUTs on an
+/// FPGA, a multiplexer tree on an ASIC): synthesis maps a cut of six inputs to
+/// one LUT6, where the word-level operations the
 /// mapper leaves for carry chains and DSPs count their own levels. A shift by
 /// an amount computed from a 2-bit field is one LUT per bit, not a product,
 /// compares and a shifter. Cones of LUTs alone keep the mapper's depth.
