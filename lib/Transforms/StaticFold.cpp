@@ -714,6 +714,41 @@ static int logicLevels(Operation *op) {
   return 1;
 }
 
+/// The most levels on a path from `root` along `edges` (each a successor
+/// and the levels it adds), memoized in `memo`: depth first without
+/// recursion, since a model's logic may chain far more operations than a
+/// thread's stack holds frames. A value on a cycle counts as none.
+static int longestPath(
+    Value root, DenseMap<Value, int> &memo,
+    function_ref<void(Value, SmallVectorImpl<std::pair<Value, int>> &)>
+        edges) {
+  if (auto it = memo.find(root); it != memo.end())
+    return it->second;
+  SmallVector<std::pair<Value, bool>> stack{{root, false}};
+  SmallVector<std::pair<Value, int>> next;
+  while (!stack.empty()) {
+    auto [value, expanded] = stack.pop_back_val();
+    if (!expanded && memo.count(value))
+      continue;
+    next.clear();
+    edges(value, next);
+    if (!expanded) {
+      // A placeholder against cycles, then the successors first.
+      memo[value] = 0;
+      stack.push_back({value, true});
+      for (auto [successor, levels] : next)
+        if (!memo.count(successor))
+          stack.push_back({successor, false});
+      continue;
+    }
+    int levels = 0;
+    for (auto [successor, add] : next)
+      levels = std::max(levels, add + memo.lookup(successor));
+    memo[value] = levels;
+  }
+  return memo.lookup(root);
+}
+
 LogicalResult StaticFolder::analyze(Class &cls) {
   auto *body = cls.model.getBodyBlock();
   unsigned numInputs = cls.inputNames.size();
@@ -807,32 +842,27 @@ LogicalResult StaticFolder::analyze(Class &cls) {
   cls.inputToOutput.resize(numInputs);
   for (auto &deps : cls.deps)
     cls.inputToOutput |= deps;
+  // Backward from each output, through the logic, stopping at registers,
+  // registered reads and black boxes.
   DenseMap<Value, int> toOutput;
-  std::function<int(Value)> levelsTo = [&](Value value) -> int {
-    if (auto it = toOutput.find(value); it != toOutput.end())
-      return it->second;
-    toOutput[value] = 0;
-    int levels = 0;
-    if (auto *op = value.getDefiningOp()) {
-      auto read = dyn_cast<seq::FirMemReadOp>(op);
-      auto memory = read ? read.getMemory().getDefiningOp<seq::FirMemOp>()
-                         : seq::FirMemOp();
-      if (read && (!memory || memory.getReadLatency() == 0))
-        levels = 1 + levelsTo(read.getAddress());
-      else if (!read && !isa<seq::FirRegOp, hw::InstanceOp>(op))
-        for (auto operand : op->getOperands())
-          levels = std::max(levels, logicLevels(op) + levelsTo(operand));
-    }
-    return toOutput[value] = levels;
+  auto into = [](Value value, SmallVectorImpl<std::pair<Value, int>> &edges) {
+    auto *op = value.getDefiningOp();
+    if (!op)
+      return;
+    auto read = dyn_cast<seq::FirMemReadOp>(op);
+    auto memory = read ? read.getMemory().getDefiningOp<seq::FirMemOp>()
+                       : seq::FirMemOp();
+    if (read && (!memory || memory.getReadLatency() == 0))
+      edges.push_back({read.getAddress(), 1});
+    else if (!read && !isa<seq::FirRegOp, hw::InstanceOp>(op))
+      for (auto operand : op->getOperands())
+        edges.push_back({operand, logicLevels(op)});
   };
   for (auto operand : output->getOperands())
-    cls.outputDepth.push_back(levelsTo(operand));
+    cls.outputDepth.push_back(longestPath(operand, toOutput, into));
+  // Forward from each input, up to the state it reaches.
   DenseMap<Value, int> toState;
-  std::function<int(Value)> levelsFrom = [&](Value value) -> int {
-    if (auto it = toState.find(value); it != toState.end())
-      return it->second;
-    toState[value] = 0;
-    int levels = 0;
+  auto outOf = [](Value value, SmallVectorImpl<std::pair<Value, int>> &edges) {
     for (auto &use : value.getUses()) {
       auto *user = use.getOwner();
       if (isa<seq::FirRegOp, seq::FirMemWriteOp, hw::InstanceOp, hw::OutputOp>(
@@ -841,16 +871,15 @@ LogicalResult StaticFolder::analyze(Class &cls) {
       if (auto read = dyn_cast<seq::FirMemReadOp>(user)) {
         auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
         if (!memory || memory.getReadLatency() == 0)
-          levels = std::max(levels, 1 + levelsFrom(read.getData()));
+          edges.push_back({read.getData(), 1});
         continue;
       }
       for (auto result : user->getResults())
-        levels = std::max(levels, logicLevels(user) + levelsFrom(result));
+        edges.push_back({result, logicLevels(user)});
     }
-    return toState[value] = levels;
   };
   for (auto arg : body->getArguments())
-    cls.inputDepth.push_back(levelsFrom(arg));
+    cls.inputDepth.push_back(longestPath(arg, toState, outOf));
   return success();
 }
 
