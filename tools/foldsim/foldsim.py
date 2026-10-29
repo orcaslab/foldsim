@@ -421,6 +421,10 @@ def main():
     ap.add_argument('--region-bits', type=int, default=0,
                     help="with --static: the most state bits a region's copy of the slot "
                          'controls drives (foldsim-fold-static)')
+    ap.add_argument('--control-fanout', type=int, default=96,
+                    help='with --static: the most loads (LUT pins per bit) a copy of the slot '
+                         'controls drives; one over it is replicated, the replicas loaded in '
+                         'lockstep (foldsim-replicate-controls); 0: none replicated')
     ap.add_argument('classes', nargs='*',
                     help='none: the whole target one model of one thread, unthreaded')
     a = ap.parse_args()
@@ -574,7 +578,8 @@ def main():
                 run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
                      '-o', out('models.mlir')])
             fold += slr_options(a, foldsim_opt, out('models.mlir'), fold, out)
-        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}', SPLIT,
+        replicate = f'hw.module(foldsim-replicate-controls{{loads={a.control_fanout}}})'
+        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}', SPLIT, replicate,
                                         'canonicalize', 'foldsim-sort', 'cse']
         if a.copies == 'auto' or a.slr_groups:
             sim_input = out('models.mlir')

@@ -2209,10 +2209,14 @@ static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
 /// The regions sharing a copy of the slot controls two host cycles ahead.
 static constexpr unsigned kRegionsPerGroup = 16;
 
+/// A register kept apart from the equal registers it copies; marked as a
+/// control, which foldsim-replicate-controls replicates further where it
+/// drives more loads than a net should.
 static seq::FirRegOp keep(seq::FirRegOp reg) {
   sv::addSVAttributes(reg, {sv::SVAttributeAttr::get(reg.getContext(), "keep",
                                                      R"("true")",
                                                      /*emitAsComment=*/false)});
+  reg->setAttr(foldsim::kControlAttrName, UnitAttr::get(reg.getContext()));
   return reg;
 }
 
