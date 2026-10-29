@@ -24,7 +24,7 @@
 // V80-DAG: 1,1,d,reg,{{[0-9]+}},0,0,{{[ab]}}[0],0,l10.d[0]
 // U55C-DAG: 1,1,d,reg,{{[0-9]+}},0,0,{{[ab]}}[0],0,l10.d[0]
 // UNKNOWN: no Beacon target 'agilex'; one of versal virtexuplus virtexuplusHBM zynquplus asap7
-hw.module @Top(in %clk : !seq.clock, in %d : i33) {
+hw.module @Top(in %clk : !seq.clock, in %d : i33, out p16 : i16, out p33 : i33, out p66 : i66, out l33 : i1, out l10 : i1, out q16 : i1) {
   %a = seq.firreg %d clock %clk : i33
   %b = seq.firreg %d clock %clk : i33
   %a16 = comb.extract %a from 0 : (i33) -> i16
@@ -57,5 +57,5 @@ hw.module @Top(in %clk : !seq.clock, in %d : i33) {
   %b0 = comb.extract %b from 0 : (i33) -> i1
   %t10 = comb.truth_table %m10b, %b0 -> [false, true, true, false]
   %l10 = seq.firreg %t10 clock %clk : i1
-  hw.output
+  hw.output %p16, %p33, %p66, %l33, %l10, %q16 : i16, i33, i66, i1, i1, i1
 }

@@ -12,7 +12,7 @@
 // CHECK: 8,8,d,reg,{{[0-9]+}},0,0,a[{{[0-9]+}}],0,z.d[0]
 // The report converts the deepest path with the library's delays.
 // CHECK: deepest path 20 stages: 58 + 167 + 20 x 24 + 6 = 711 ps
-hw.module @Top(in %clk : !seq.clock, in %d : i32) {
+hw.module @Top(in %clk : !seq.clock, in %d : i32, out g : i1, out p : i32, out z : i4, out s : i32) {
   %a = seq.firreg %d clock %clk : i32
   %b = seq.firreg %d clock %clk : i32
   %a0 = comb.extract %a from 0 : (i32) -> i1
@@ -34,5 +34,5 @@ hw.module @Top(in %clk : !seq.clock, in %d : i32) {
   %addr = comb.extract %a from 0 : (i32) -> i7
   %rd = seq.firmem.read_port %ram[%addr], clock %clk : <128 x 4>
   %z = seq.firreg %rd clock %clk : i4
-  hw.output
+  hw.output %g, %p, %z, %s : i1, i32, i4, i32
 }

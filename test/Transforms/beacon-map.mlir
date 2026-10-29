@@ -15,7 +15,7 @@ hw.module private @Eq(in %x : i2, in %y : i2, out o : i1) {
   %eq = comb.icmp eq %x, %y : i2
   hw.output %eq : i1
 }
-hw.module @Top(in %clk : !seq.clock, in %d : i16) {
+hw.module @Top(in %clk : !seq.clock, in %d : i16, out e : i1, out s : i16) {
   %a = seq.firreg %d clock %clk : i16
   %b = seq.firreg %d clock %clk : i16
   %a2 = comb.extract %a from 0 : (i16) -> i2
@@ -26,5 +26,5 @@ hw.module @Top(in %clk : !seq.clock, in %d : i16) {
   %e = seq.firreg %en clock %clk : i1
   %sum = comb.add %a, %b : i16
   %s = seq.firreg %sum clock %clk : i16
-  hw.output
+  hw.output %e, %s : i1, i16
 }

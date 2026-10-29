@@ -11,7 +11,7 @@
 // the compare is a LUT6 tree after the one-level mask, three levels.
 // CHECK-DAG: 3,3,d,reg,{{[0-9]+}},0,0,{{.*}},0,h.d[0]
 // ASAP7-DAG: 8,8,d,reg,{{[0-9]+}},0,0,{{.*}},0,h.d[0]
-hw.module @Top(in %clk : !seq.clock, in %lvl : i2, in %v : i27, in %w : i27) {
+hw.module @Top(in %clk : !seq.clock, in %lvl : i2, in %v : i27, in %w : i27, out m : i27, out h : i1) {
   %l = seq.firreg %lvl clock %clk : i2
   %a = seq.firreg %v clock %clk : i27
   %b = seq.firreg %w clock %clk : i27
@@ -26,5 +26,5 @@ hw.module @Top(in %clk : !seq.clock, in %lvl : i2, in %v : i27, in %w : i27) {
   %bm = comb.and %b, %mask : i27
   %eq = comb.icmp eq %am, %bm : i27
   %h = seq.firreg %eq clock %clk : i1
-  hw.output
+  hw.output %m, %h : i27, i1
 }

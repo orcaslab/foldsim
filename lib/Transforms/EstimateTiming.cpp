@@ -259,6 +259,7 @@ private:
   ArrayRef<unsigned> support(unsigned ctx, Operation *op, bool &small);
   void evaluate(unsigned root);
   void collect(unsigned ctx);
+  void sweepUnobservable();
   void addEndPoints(unsigned ctx, Operation *op, StringRef port, Value value,
                     bool boundary = false);
   void addRegister(unsigned ctx, Operation *op, Value reg, Value next,
@@ -301,6 +302,7 @@ private:
   unsigned retimeLevels = 0;
   llvm::StringMap<uint64_t> otherOps;
   uint64_t loops = 0;
+  uint64_t unobservable = 0;
   SmallVector<std::pair<unsigned, unsigned>> loopSamples;
 };
 
@@ -943,10 +945,98 @@ void Timing::collect(unsigned ctx) {
   }
 }
 
+/// The memory a read or write port belongs to; null for anything else.
+static Operation *memoryOf(Operation *op) {
+  Value memory;
+  if (auto read = dyn_cast<seq::FirMemReadOp>(op))
+    memory = read.getMemory();
+  else if (auto write = dyn_cast<seq::FirMemWriteOp>(op))
+    memory = write.getMemory();
+  else if (auto rw = dyn_cast<seq::FirMemReadWriteOp>(op))
+    memory = rw.getMemory();
+  return memory ? memory.getDefiningOp() : nullptr;
+}
+
+/// Drops the end points no top output, stub input or vendor IP input
+/// depends on, as Vivado removes unobservable logic: a counter only an
+/// assertion read, a flag nothing reads, state that feeds only itself.
+/// A register is observable bit by bit, a memory as a whole.
+void Timing::sweepUnobservable() {
+  DenseMap<std::tuple<unsigned, Operation *, unsigned>, SmallVector<unsigned, 1>>
+      regBits;
+  DenseMap<std::pair<unsigned, Operation *>, SmallVector<unsigned>> states;
+  SmallVector<unsigned> work;
+  std::vector<bool> liveEnd(endPoints.size());
+  for (unsigned i = 0, e = endPoints.size(); i < e; ++i) {
+    auto &end = endPoints[i];
+    if (isa<hw::OutputOp, hw::InstanceOp>(end.op)) {
+      liveEnd[i] = true;
+      work.push_back(end.node);
+    } else if (Operation *memory = memoryOf(end.op)) {
+      states[{end.ctx, memory}].push_back(i);
+    } else if (end.port == "d") {
+      regBits[{end.ctx, end.op, end.bit}].push_back(i);
+    } else {
+      states[{end.ctx, end.op}].push_back(i);
+    }
+  }
+
+  auto mark = [&](ArrayRef<unsigned> ends) {
+    for (unsigned i : ends)
+      if (!liveEnd[i]) {
+        liveEnd[i] = true;
+        work.push_back(endPoints[i].node);
+      }
+  };
+  DenseSet<std::pair<unsigned, Operation *>> liveStates;
+  auto markState = [&](unsigned ctx, Operation *op) {
+    if (!liveStates.insert({ctx, op}).second)
+      return;
+    if (auto it = states.find({ctx, op}); it != states.end())
+      mark(it->second);
+  };
+
+  std::vector<bool> seen(nodes.size());
+  SmallVector<Edge> edges;
+  while (!work.empty()) {
+    unsigned id = work.pop_back_val();
+    if (id >= seen.size())
+      seen.resize(nodes.size());
+    if (seen[id])
+      continue;
+    seen[id] = true;
+    Node n = nodes[id];
+    Operation *op = n.value.getDefiningOp();
+    if (n.kind == Kind::Reg) {
+      if (auto it = regBits.find({n.ctx, op, n.bit}); it != regBits.end())
+        mark(it->second);
+      markState(n.ctx, op);
+      continue;
+    }
+    if (n.kind == Kind::SyncRead || n.kind == Kind::AsyncRead)
+      markState(n.ctx, memoryOf(op));
+    if (isStart(n.kind))
+      continue;
+    edges.clear();
+    operands(id, edges);
+    for (auto &edge : edges)
+      work.push_back(edge.in);
+  }
+
+  std::vector<EndPoint> live;
+  live.reserve(endPoints.size());
+  for (unsigned i = 0, e = endPoints.size(); i < e; ++i)
+    if (liveEnd[i])
+      live.push_back(endPoints[i]);
+  unobservable = endPoints.size() - live.size();
+  endPoints = std::move(live);
+}
+
 LogicalResult Timing::run(hw::HWModuleOp top, unsigned retimeLevels) {
   this->retimeLevels = retimeLevels;
   contexts.push_back({0, {}, top, 0});
   collect(0);
+  sweepUnobservable();
   for (auto &end : endPoints)
     evaluate(end.node);
   for (auto &end : endPoints) {
@@ -1288,6 +1378,7 @@ void Timing::writeReport(raw_ostream &os, unsigned topPaths,
     ++histogram[end.levels];
   os << "instances " << contexts.size() << ", bits " << nodes.size()
      << " (evaluated " << computed << "), end points " << endPoints.size()
+     << " (" << unobservable << " unobservable left out)"
      << ", combinational loops " << loops << "\n";
   for (auto [id, in] : loopSamples) {
     os << "  loop: " << path(nodes[id].ctx) << '/';

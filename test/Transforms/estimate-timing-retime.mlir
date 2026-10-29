@@ -28,7 +28,7 @@ hw.module private @Chain5(in %x : i1, out o : i1) {
   %5 = comb.truth_table %4 -> [true, false]
   hw.output %5 : i1
 }
-hw.module @Top(in %clk : !seq.clock, in %d : i1) {
+hw.module @Top(in %clk : !seq.clock, in %d : i1, out h : i1, out n : i1) {
   %a = seq.firreg %d clock %clk : i1
   %fa = hw.instance "fa" @Chain(x: %a: i1) -> (o: i1)
   %f = seq.firreg %fa clock %clk : i1
@@ -41,5 +41,5 @@ hw.module @Top(in %clk : !seq.clock, in %d : i1) {
   %ram = seq.firmem 0, 1, undefined, undefined : <64 x 1>
   %rd = seq.firmem.read_port %ram[%addr], clock %clk : <64 x 1>
   %n = seq.firreg %rd clock %clk : i1
-  hw.output
+  hw.output %h, %n : i1, i1
 }

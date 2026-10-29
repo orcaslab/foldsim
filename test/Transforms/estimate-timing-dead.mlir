@@ -8,7 +8,7 @@
 // A register that loads a value under the same enable is live.
 // CHECK: {{[0-9]+}},{{[0-9]+}},d,reg,{{[0-9]+}},0,0,{{[a-z]+}}[{{[0-9]+}}],0,live.d[0]
 // CHECK-NOT: ,dead.d[
-hw.module @Top(in %clk : !seq.clock, in %d : i8) {
+hw.module @Top(in %clk : !seq.clock, in %d : i8, out q : i1) {
   %a = seq.firreg %d clock %clk : i8
   %b = seq.firreg %d clock %clk : i8
   %prod = comb.mul %a, %b : i8
@@ -26,4 +26,5 @@ hw.module @Top(in %clk : !seq.clock, in %d : i8) {
   %live = seq.firreg %live_in clock %clk : i1
   %o = comb.xor %dead, %dead2, %live : i1
   %out = seq.firreg %o clock %clk : i1
+  hw.output %out : i1
 }

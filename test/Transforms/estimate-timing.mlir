@@ -24,7 +24,7 @@ hw.module private @Leaf(in %a : i1, in %b : i1, out o : i1) {
   %o = comb.truth_table %a, %b -> [false, true, true, false]
   hw.output %o : i1
 }
-hw.module @Top(in %clk : !seq.clock, in %d : i16) {
+hw.module @Top(in %clk : !seq.clock, in %d : i16, out c : i1, out q : i1, out z : i4, out q8 : i8, out n3 : i3, out qf : i32, out s : i16) {
   %a = seq.firreg %d clock %clk : i16
   %b = seq.firreg %d clock %clk : i16
   %sum = comb.add %a, %b : i16
@@ -59,5 +59,5 @@ hw.module @Top(in %clk : !seq.clock, in %d : i16) {
   %n = comb.shl %wp, %wp : i32
   %fd = comb.divu %n, %wp : i32
   %qf = seq.firreg %fd clock %clk : i32
-  hw.output
+  hw.output %c, %q, %z, %q8, %n3, %qf, %s : i1, i1, i4, i8, i3, i32, i16
 }
