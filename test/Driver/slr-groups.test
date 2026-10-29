@@ -1,14 +1,52 @@
-# --slr-groups keeps each threaded copy whole in one SLR: one placement group
-# per copy instance of foldsim_sim, the SLR left to the placer.
+# --slr-groups places the copies in at most --slr-count SLR groups, each kept
+# whole in one SLR (the SLR left to the placer): within a group's capacity,
+# the shortest frame, then the fewest link bits between groups. Each group is
+# an instance `foldsim_slr<g>` of foldsim_sim, the floorplan one placement
+# group per instance. Two leaves fit one group: no link crosses.
 # RUN: rm -rf %t && cd %S/Inputs/source-list
-# RUN: foldsim --srcs top.f --top Top --out %t/two --static --copies Leaf:2 --slr-groups Leaf
-# RUN: FileCheck %s --check-prefix=TWO < %t/two/foldsim_floorplan.tcl
+# RUN: foldsim --srcs top.f --top Top --out %t/two --static --copies Leaf:2 --slr-groups Leaf 2>&1 | FileCheck %s --check-prefix=TWO
+# RUN: FileCheck %s --check-prefix=PLAN < %t/two/foldsim_floorplan.tcl
 # RUN: foldsim --srcs top.f --top Top --out %t/off --static Leaf
 # RUN: not test -e %t/off/foldsim_floorplan.tcl
 # RUN: not foldsim --srcs top.f --top Top --out %t/dyn --slr-groups Leaf 2>&1 | FileCheck %s --check-prefix=DYN
-# TWO: set c [get_cells -quiet -hierarchical Leaf_copy]
-# TWO-NEXT: set_property USER_SLR_ASSIGNMENT fs_Leaf_copy $c
-# TWO: get_cells -quiet -hierarchical Leaf_copy1_copy]
-# TWO-NEXT: USER_SLR_ASSIGNMENT fs_Leaf_copy1_copy $c
-# TWO: get_cells -quiet -hierarchical Top_model_copy]
+# TWO: slr groups: 3 of at most {{[0-9]+}} sites
+# TWO-NEXT: slr0 ({{[0-9]+}} sites): Leaf Top_model Leaf_copy1
+# TWO-NEXT: slr links registered: 0 of 3 links, 0 of 24 bits
+# PLAN: set c [get_cells -quiet -hierarchical foldsim_slr0]
+# PLAN-NEXT: set_property USER_SLR_ASSIGNMENT fs_slr0 $c
+# PLAN-NOT: foldsim_slr1
 # DYN: --slr-groups needs --static
+
+# A chain of three leaves, the first pinned apart from the other two: the
+# link from the first to the second crosses. The producer's bits are
+# registered in its group, and the link's write (enable, bank) is a host
+# cycle later in the reader's group, which then reads it a host cycle later.
+# RUN: cd %S/Inputs/three
+# RUN: foldsim --srcs top.f --top Top --out %t/split --static --copies Leaf:3 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1 Leaf 2>&1 | FileCheck %s --check-prefix=SPLIT
+# RUN: FileCheck %s --check-prefix=SIM < %t/split/foldsim_sim.mlir
+# RUN: FileCheck %s --check-prefix=PLAN2 < %t/split/foldsim_floorplan.tcl
+# SPLIT: slr0 ({{[0-9]+}} sites): Leaf
+# SPLIT-NEXT: slr1 ({{[0-9]+}} sites): Top_model Leaf_copy1 Leaf_copy2
+# SPLIT-NEXT: slr links registered: 1 of 3 links, 8 of 24 bits
+# SPLIT-NEXT: Leaf -> Leaf_copy1: 1 links, 8 bits
+# SIM: hw.module private @foldsim_sim_slr0({{.*}}out Leaf_q_slr1_0 : i8)
+# SIM: %Leaf_q_slr1_0 = seq.firreg %Leaf_copy.q clock %hostClock
+# SIM: hw.module private @foldsim_sim_slr1({{.*}}in %foldsim_slr0_Leaf_q_slr1_0 : i8
+# SIM-DAG: %Leaf_slr1_links0_state_late = seq.firreg %Leaf_slr1_links0_state0
+# SIM-DAG: %Leaf_slr1_links0_bank_late = seq.firreg
+# SIM-DAG: seq.firmem.write_port %Leaf_q_to_Leaf_copy1_d_0[%Leaf_slr1_links0_bank_late] = %foldsim_slr0_Leaf_q_slr1_0, clock %hostClock enable %Leaf_slr1_links0_state_late
+# SIM: hw.instance "foldsim_slr0" @foldsim_sim_slr0
+# SIM: hw.instance "foldsim_slr1" @foldsim_sim_slr1
+# PLAN2: USER_SLR_ASSIGNMENT fs_slr0
+# PLAN2: USER_SLR_ASSIGNMENT fs_slr1
+
+# The crossing link costs its reader a host cycle: with the frame bound by
+# the chain alone (no environment round trip), the frame grows by one.
+# RUN: foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 env-sinks=y schedule-only})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=ONE
+# RUN: foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 env-sinks=y schedule-only slr-groups=2 slr-assign=Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:1})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=ONE-SPLIT
+# ONE: II = [[II:[0-9]+]]
+# ONE-SPLIT: II = {{[0-9]+}}
+
+# No assignment within the capacity is an error.
+# RUN: not foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-groups=2 slr-sites=Leaf:5,Leaf_copy1:5,Leaf_copy2:5 slr-capacity=6 schedule-only})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=FULL
+# FULL: slr-groups: no assignment of the classes to 2 groups of at most 6 sites

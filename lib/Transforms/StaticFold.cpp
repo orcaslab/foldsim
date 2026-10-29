@@ -28,9 +28,11 @@
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
 #include <set>
@@ -164,11 +166,14 @@ public:
                bool interleaveCopies, bool zeroLatencyLinks,
                bool zeroLatencyChains, bool shortLead, bool stagedEnv,
                ArrayRef<std::string> specGroups, unsigned specDepth,
-               ArrayRef<std::string> envSinks, unsigned registerStateEntries)
+               ArrayRef<std::string> envSinks, unsigned registerStateEntries,
+               unsigned slrGroups, ArrayRef<std::string> slrSites,
+               uint64_t slrCapacity, ArrayRef<std::string> slrAssign)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
-        specDepth(specDepth),
+        specDepth(specDepth), slrGroups(slrGroups), slrSiteSpecs(slrSites),
+        slrCapacity(slrCapacity), slrAssignSpecs(slrAssign),
         scheduleOnly(scheduleOnly), oneCycleLinks(oneCycleLinks),
         overlapFrames(overlapFrames), modulo(modulo),
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
@@ -194,6 +199,31 @@ private:
                           Pieces &pieces);
   LogicalResult analyze(Class &cls);
   LogicalResult schedule();
+  /// The shortest frame over the choices of ready passes, with the links
+  /// between SLR groups as `slrOf` has them; 0 if every choice is cyclic.
+  struct Choice {
+    unsigned length = 0;
+    SmallVector<bool> ready, atReady, outputEarly;
+    SmallVector<SmallVector<int>> slots;
+    SmallVector<int> outputSlot;
+  };
+  Choice searchReady();
+  /// Assigns the classes to SLR groups (`slrOf`): within the capacity, the
+  /// shortest frame, then the fewest link bits between groups.
+  LogicalResult chooseGroups();
+  /// Bits each class's outputs send to each other class's inputs: per
+  /// consumer input, the producer bits it reads (a link of its own).
+  void linkBits(SmallVectorImpl<SmallVector<uint64_t>> &bits,
+                SmallVectorImpl<SmallVector<unsigned>> &links) const;
+  /// Moves each SLR group's logic of the simulator into a module of its
+  /// own, instantiated as `slr<g>`.
+  LogicalResult extractGroups();
+  /// Whether a link from class `p` to class `c` crosses SLR groups: it is
+  /// then registered on both sides and taken a host cycle later.
+  bool crosses(int p, int c) const {
+    return !slrOf.empty() && p >= 0 && c >= 0 && slrOf[p] != slrOf[c];
+  }
+  int crossDelay(int p, int c) const { return crosses(p, c) ? 1 : 0; }
   /// Places every evaluation of the given choice of ready passes; II, or 0
   /// if the evaluations depend on each other in a cycle.
   unsigned place(ArrayRef<bool> ready, SmallVectorImpl<SmallVector<int>> &slots,
@@ -221,6 +251,16 @@ private:
   // Frames of a group's select its offers span, and the values a token holds.
   unsigned specDepth;
   unsigned specValues() const { return 1u << specDepth; }
+  /// SLR groups: their most, each class's LUT sites, a group's most sites,
+  /// classes pinned; each class's group (empty without groups), and the
+  /// simulator built.
+  unsigned slrGroups;
+  ArrayRef<std::string> slrSiteSpecs;
+  uint64_t slrCapacity;
+  ArrayRef<std::string> slrAssignSpecs;
+  SmallVector<int> slrOf;
+  SmallVector<uint64_t> slrSites;
+  hw::HWModuleOp simModule;
   /// A select of offered pairs: the netlist output, and the input whose
   /// value in the frame before it is ANDed with.
   struct SpecGroup {
@@ -832,6 +872,9 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   auto &producer = producers[p];
   if (!zeroLatencyLinks || producer.cls < 0 || !producer.late)
     return false;
+  // Between SLR groups a link is registered on both sides of the crossing.
+  if (crosses(producer.cls, c))
+    return false;
   if (zeroLatencyChains)
     return true;
   auto &cls = classes[c];
@@ -991,7 +1034,9 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
         auto pass = atReady[piece.producer] ? kReady : kState;
         preds[n].push_back(
             {nodeIndex[{unsigned(producer.cls), piece.inst, pass}],
-             zeroLink(piece.producer, node.cls, input) ? 0 : linkLatency});
+             zeroLink(piece.producer, node.cls, input)
+                 ? 0
+                 : linkLatency + crossDelay(producer.cls, node.cls)});
       }
     }
   }
@@ -1098,7 +1143,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
           continue;
         int written = slots[producer.cls * 2 + kState][piece.inst];
         length = std::max(length, written - first(consumer.cls, i) +
-                                      linkLatency);
+                                      linkLatency +
+                                      crossDelay(producer.cls, consumer.cls));
       }
   }
 
@@ -1321,7 +1367,9 @@ unsigned StaticFolder::placeModulo(
           if (producer.cls < 0 || producer.late)
             continue;
           int written = slots[producer.cls * 2 + kState][piece.inst];
-          if (written - first(consumer.cls, i) + linkLatency > int(period) ||
+          if (written - first(consumer.cls, i) + linkLatency +
+                      crossDelay(producer.cls, consumer.cls) >
+                  int(period) ||
               last(consumer.cls, i) - written >= int(period))
             ok = false;
         }
@@ -1361,7 +1409,7 @@ unsigned StaticFolder::placeModulo(
   return 0;
 }
 
-LogicalResult StaticFolder::schedule() {
+StaticFolder::Choice StaticFolder::searchReady() {
   // A ready pass for any choice of the classes with late outputs: few classes,
   // so every choice is placed and the shortest frame kept. Copies multiply
   // the classes: past a dozen, every choice of the models is placed with the
@@ -1378,28 +1426,19 @@ LogicalResult StaticFolder::schedule() {
   if (alike)
     llvm::erase_if(candidates,
                    [&](unsigned c) { return classes[c].splitFrom >= 0; });
-  if (candidates.size() > 12)
-    return netlist.emitError("too many models with late outputs to choose "
-                             "their ready passes: ")
-           << candidates.size();
-  unsigned best = 0;
-  SmallVector<bool> bestReady;
-  SmallVector<SmallVector<int>> bestSlots;
-  SmallVector<bool> bestAtReady;
-  SmallVector<int> bestOutputSlot;
-  SmallVector<bool> bestOutputEarly;
+  Choice best;
   auto tryReady = [&](const SmallVector<bool> &ready) {
     SmallVector<SmallVector<int>> slots;
     SmallVector<bool> atReady;
     unsigned length = place(ready, slots, atReady);
-    if (!length || (best && length >= best))
+    if (!length || (best.length && length >= best.length))
       return false;
-    best = length;
-    bestReady = ready;
-    bestSlots = slots;
-    bestAtReady = atReady;
-    bestOutputSlot = outputSlot;
-    bestOutputEarly = outputEarly;
+    best.length = length;
+    best.ready = ready;
+    best.slots = std::move(slots);
+    best.atReady = std::move(atReady);
+    best.outputSlot = outputSlot;
+    best.outputEarly = outputEarly;
     return true;
   };
   for (uint64_t mask = 0; mask < (uint64_t(1) << candidates.size()); ++mask) {
@@ -1412,28 +1451,178 @@ LogicalResult StaticFolder::schedule() {
           ready[c] = ready[cls.splitFrom];
     tryReady(ready);
   }
-  for (bool shorter = alike && best; shorter;) {
+  for (bool shorter = alike && best.length; shorter;) {
     shorter = false;
     for (auto [c, cls] : llvm::enumerate(classes)) {
       if (!late(cls))
         continue;
-      auto ready = bestReady;
+      auto ready = best.ready;
       ready[c] = !ready[c];
       shorter |= tryReady(ready);
     }
   }
-  if (!best)
+  return best;
+}
+
+void StaticFolder::linkBits(SmallVectorImpl<SmallVector<uint64_t>> &bits,
+                            SmallVectorImpl<SmallVector<unsigned>> &links) const {
+  unsigned n = classes.size();
+  bits.assign(n, SmallVector<uint64_t>(n, 0));
+  links.assign(n, SmallVector<unsigned>(n, 0));
+  for (auto &consumer : consumers) {
+    if (consumer.cls < 0)
+      continue;
+    // The producer bits this input reads, of any instance: one link each
+    // producer output, holding every producer instance.
+    std::map<unsigned, std::set<unsigned>> read;
+    for (auto &pieces : consumer.pieces)
+      for (auto &piece : pieces)
+        if (piece.producer >= 0 && producers[piece.producer].cls >= 0)
+          for (unsigned bit = piece.low; bit < piece.low + piece.width; ++bit)
+            read[piece.producer].insert(bit);
+    for (auto &[p, set] : read) {
+      unsigned from = producers[p].cls;
+      if (from == unsigned(consumer.cls))
+        continue;
+      bits[from][consumer.cls] += set.size();
+      ++links[from][consumer.cls];
+    }
+  }
+}
+
+LogicalResult StaticFolder::chooseGroups() {
+  unsigned n = classes.size();
+  auto classNamed = [&](StringRef name) -> int {
+    for (auto [c, cls] : llvm::enumerate(classes))
+      if (cls.name == name)
+        return c;
+    return -1;
+  };
+  slrSites.assign(n, 0);
+  for (auto &spec : slrSiteSpecs) {
+    auto [name, count] = StringRef(spec).rsplit(':');
+    int c = classNamed(name);
+    uint64_t sites = 0;
+    if (c < 0 || count.getAsInteger(10, sites))
+      return netlist.emitError("slr-sites: '") << spec
+             << "' is not <class>:<sites> of a class";
+    slrSites[c] = sites;
+  }
+  SmallVector<int> pinned(n, -1);
+  for (auto &spec : slrAssignSpecs) {
+    auto [name, group] = StringRef(spec).rsplit(':');
+    int c = classNamed(name);
+    unsigned g = 0;
+    if (c < 0 || group.getAsInteger(10, g) || g >= slrGroups)
+      return netlist.emitError("slr-assign: '") << spec
+             << "' is not <class>:<group> of a class and a group below "
+             << slrGroups;
+    pinned[c] = g;
+  }
+  SmallVector<SmallVector<uint64_t>> bits;
+  SmallVector<SmallVector<unsigned>> links;
+  linkBits(bits, links);
+
+  // The assignments within the capacity with the fewest bits between groups,
+  // by branch and bound over the classes, the largest first; a group is
+  // opened in order (the groups are alike) unless some class is pinned.
+  constexpr unsigned kKept = 64;
+  SmallVector<unsigned> order;
+  for (unsigned c = 0; c < n; ++c)
+    order.push_back(c);
+  llvm::stable_sort(order, [&](unsigned x, unsigned y) {
+    return slrSites[x] > slrSites[y];
+  });
+  bool anyPinned = llvm::any_of(pinned, [](int g) { return g >= 0; });
+  std::vector<std::pair<uint64_t, SmallVector<int>>> kept;
+  SmallVector<int> group(n, -1);
+  SmallVector<uint64_t> used(slrGroups, 0);
+  uint64_t visited = 0;
+  std::function<void(unsigned, unsigned, uint64_t)> visit =
+      [&](unsigned k, unsigned opened, uint64_t cut) {
+        if (++visited > 20'000'000 ||
+            (kept.size() >= kKept && cut >= kept.back().first))
+          return;
+        if (k == n) {
+          auto at = llvm::upper_bound(kept, cut, [](uint64_t v, auto &e) {
+            return v < e.first;
+          });
+          kept.insert(at, {cut, group});
+          if (kept.size() > kKept)
+            kept.pop_back();
+          return;
+        }
+        unsigned c = order[k];
+        unsigned limit = anyPinned ? slrGroups : std::min(slrGroups, opened + 1);
+        for (unsigned g = 0; g < limit; ++g) {
+          if (pinned[c] >= 0 && int(g) != pinned[c])
+            continue;
+          if (slrCapacity && used[g] + slrSites[c] > slrCapacity)
+            continue;
+          uint64_t more = 0;
+          for (unsigned j = 0; j < k; ++j) {
+            unsigned d = order[j];
+            if (group[d] != int(g))
+              more += bits[c][d] + bits[d][c];
+          }
+          group[c] = g;
+          used[g] += slrSites[c];
+          visit(k + 1, std::max(opened, g + 1), cut + more);
+          used[g] -= slrSites[c];
+          group[c] = -1;
+        }
+      };
+  visit(0, 0, 0);
+  if (kept.empty())
+    return netlist.emitError("slr-groups: no assignment of the classes to ")
+           << slrGroups << " groups of at most " << slrCapacity << " sites";
+
+  // Of those, the shortest frame, then the fewest bits between groups.
+  unsigned bestLength = 0;
+  SmallVector<int> best;
+  for (auto &entry : kept) {
+    slrOf = entry.second;
+    unsigned length = searchReady().length;
+    if (length && (!bestLength || length < bestLength)) {
+      bestLength = length;
+      best = entry.second;
+    }
+  }
+  if (!bestLength)
+    return netlist.emitError("the evaluations of a frame depend on each other "
+                             "in a cycle for every assignment of SLR groups");
+  slrOf = best;
+  return success();
+}
+
+LogicalResult StaticFolder::schedule() {
+  auto late = [](const Class &cls) {
+    return llvm::any_of(cls.late, [](bool late) { return late; });
+  };
+  // Past a dozen classes with late outputs, the copies of a model choose
+  // alike (searchReady).
+  unsigned lateClasses = llvm::count_if(classes, late), lateModels = 0;
+  for (auto &cls : classes)
+    lateModels += late(cls) && (lateClasses <= 12 || cls.splitFrom < 0);
+  if (lateModels > 12)
+    return netlist.emitError("too many models with late outputs to choose "
+                             "their ready passes: ")
+           << lateModels;
+  if (slrGroups && failed(chooseGroups()))
+    return failure();
+  Choice best = searchReady();
+  if (!best.length)
     return netlist.emitError("the evaluations of a frame depend on each other "
                              "in a cycle for every choice of ready passes");
-  ii = best;
-  outputSlot = bestOutputSlot;
-  outputEarly = bestOutputEarly;
+  ii = best.length;
+  outputSlot = best.outputSlot;
+  outputEarly = best.outputEarly;
   for (auto [p, producer] : llvm::enumerate(producers))
-    producer.atReady = bestAtReady[p];
+    producer.atReady = best.atReady[p];
   for (auto [c, cls] : llvm::enumerate(classes)) {
-    cls.hasReady = bestReady[c];
-    cls.slot[kReady] = bestSlots[c * 2 + kReady];
-    cls.slot[kState] = bestSlots[c * 2 + kState];
+    cls.hasReady = best.ready[c];
+    cls.slot[kReady] = best.slots[c * 2 + kReady];
+    cls.slot[kState] = best.slots[c * 2 + kState];
     cls.stateGap = std::numeric_limits<int>::max();
     for (unsigned i = 0; i < cls.threads(); ++i) {
       int s = cls.slot[kState][i];
@@ -1465,6 +1654,43 @@ LogicalResult StaticFolder::schedule() {
       }
     }
     os << "  zero-latency links: " << zero << " of " << links << "\n";
+  }
+  if (!slrOf.empty()) {
+    SmallVector<SmallVector<uint64_t>> bits;
+    SmallVector<SmallVector<unsigned>> links;
+    linkBits(bits, links);
+    uint64_t crossBits = 0, allBits = 0;
+    unsigned crossLinks = 0, allLinks = 0;
+    for (unsigned p = 0; p < classes.size(); ++p)
+      for (unsigned c = 0; c < classes.size(); ++c) {
+        allBits += bits[p][c];
+        allLinks += links[p][c];
+        if (crosses(p, c)) {
+          crossBits += bits[p][c];
+          crossLinks += links[p][c];
+        }
+      }
+    os << "  slr groups: " << slrGroups << " of at most "
+       << (slrCapacity ? std::to_string(slrCapacity) : std::string("any"))
+       << " sites\n";
+    for (unsigned g = 0; g < slrGroups; ++g) {
+      uint64_t sites = 0;
+      std::string members;
+      for (auto [c, cls] : llvm::enumerate(classes))
+        if (slrOf[c] == int(g)) {
+          sites += slrSites[c];
+          members += " " + cls.name;
+        }
+      if (!members.empty())
+        os << "    slr" << g << " (" << sites << " sites):" << members << "\n";
+    }
+    os << "  slr links registered: " << crossLinks << " of " << allLinks
+       << " links, " << crossBits << " of " << allBits << " bits\n";
+    for (unsigned p = 0; p < classes.size(); ++p)
+      for (unsigned c = 0; c < classes.size(); ++c)
+        if (crosses(p, c) && links[p][c])
+          os << "    " << classes[p].name << " -> " << classes[c].name << ": "
+             << links[p][c] << " links, " << bits[p][c] << " bits\n";
   }
   for (auto &cls : classes) {
     os << "  " << cls.name << " x" << cls.threads()
@@ -1988,6 +2214,16 @@ static seq::FirRegOp keep(seq::FirRegOp reg) {
                                                      R"("true")",
                                                      /*emitAsComment=*/false)});
   return reg;
+}
+
+/// The SLR group an op of the simulator is built in, until `extractGroups`
+/// moves it into the group's module.
+static constexpr StringLiteral kSlrAttr = "foldsim.slr";
+
+static void tagGroup(Operation *op, int group) {
+  if (group >= 0 && !op->hasAttr(kSlrAttr))
+    op->setAttr(kSlrAttr, IntegerAttr::get(
+                              IntegerType::get(op->getContext(), 32), group));
 }
 
 static Value asBits(ImplicitLocOpBuilder &b, Value value) {
@@ -2911,12 +3147,13 @@ LogicalResult StaticFolder::buildSim() {
   }
   // The frame's input as a class's evaluation a host cycle ahead reads it:
   // in a slot past the frame, the frame before's.
-  DenseMap<unsigned, Value> prevFrameInputNext;
+  std::map<std::pair<unsigned, int>, Value> prevFrameInputNext;
   DenseMap<unsigned, Value> classTail1;
   auto frameInputFor = [&](unsigned p, unsigned c) -> Value {
     if (!controls[c].tail2)
       return frameInputNext[p];
-    Value &prevNext = prevFrameInputNext[p];
+    // One per SLR group, in the group.
+    Value &prevNext = prevFrameInputNext[{p, slrOf.empty() ? -1 : slrOf[c]}];
     if (!prevNext) {
       auto next = backedges.get(frameInput[p].getType());
       Value prev = reg(next, producers[p].name + "_prev");
@@ -2955,22 +3192,31 @@ LogicalResult StaticFolder::buildSim() {
     copies[c] = hw::InstanceOp::create(b, cls.copy,
                                        b.getStringAttr(cls.name + "_copy"),
                                        operands);
+    if (!slrOf.empty())
+      tagGroup(copies[c], slrOf[c]);
   }
 
   // Groups of links, each with its own copy of its producer's controls and of
   // the frame's parity, so that no control drives more than about
   // `regionBits` bits of links.
+  // With SLR groups, each group reading a class's links has groups of its
+  // own (`to`: the reading group, -1 for the netlist's outputs), in it; one
+  // in another group than the producer's has its controls a host cycle
+  // later, with the producer's bits registered in the producer's group.
   struct LinkGroup {
     std::string prefix;
     Value state, ready, inst, bank;
     uint64_t used = 0;
   };
-  SmallVector<SmallVector<LinkGroup>> linkGroups(classes.size());
-  auto linkGroupFor = [&](unsigned c, uint64_t bits) -> LinkGroup & {
-    auto &groups = linkGroups[c];
+  std::map<std::pair<unsigned, int>, SmallVector<LinkGroup>> linkGroups;
+  auto linkGroupFor = [&](unsigned c, int to, uint64_t bits) -> LinkGroup & {
+    auto &groups = linkGroups[{c, to}];
     if (groups.empty() || groups.back().used + bits > regionBits) {
       LinkGroup group;
-      group.prefix = (classes[c].name + "_links" + Twine(groups.size())).str();
+      group.prefix = (classes[c].name +
+                      (to >= 0 ? "_slr" + Twine(to) : Twine()) + "_links" +
+                      Twine(groups.size()))
+                         .str();
       groups.push_back(group);
     }
     groups.back().used += bits;
@@ -2984,15 +3230,20 @@ LogicalResult StaticFolder::buildSim() {
   // address and the bank.
   // With `now`, also what the producer writes in this host cycle and whether
   // that is the entry a reader in this host cycle's slot takes (a late link).
+  // The producer's bits a reading group in another SLR group takes, registered
+  // in the producer's group: one register for every link of that group.
+  std::map<std::tuple<unsigned, unsigned, unsigned, int>, Value> crossData;
   auto linkRead = [&](unsigned p, unsigned low, unsigned width,
                       function_ref<Value()> address, function_ref<Value()> bank,
-                      const Twine &linkName,
+                      const Twine &linkName, int to,
                       std::pair<Value, Value> *now = nullptr) -> Value {
     auto &producer = producers[p];
     unsigned c = producer.cls;
     auto &ctl = controls[c];
     unsigned threads = classes[c].threads();
     bool banked = !producer.late;
+    bool crossing = to >= 0 && !slrOf.empty() && slrOf[c] != to;
+    assert(!(crossing && now) && "a link between SLR groups is never zero");
     Value bits = asBits(b, copies[c].getResult(producer.port));
     std::string baseName = linkName.str();
     SmallVector<Value> pieces, nowPieces;
@@ -3002,7 +3253,18 @@ LogicalResult StaticFolder::buildSim() {
           width > regionBits ? baseName + "_" + std::to_string(at) : baseName;
       Value data = b.createOrFold<comb::ExtractOp>(b.getIntegerType(w), bits,
                                                    low + at);
-      auto &group = linkGroupFor(c, w);
+      if (crossing) {
+        Value &registered = crossData[{p, low + at, w, to}];
+        if (!registered) {
+          if (auto *op = data.getDefiningOp())
+            tagGroup(op, slrOf[c]);
+          registered = copyReg(data, producer.name + "_slr" + Twine(to) + "_" +
+                                         Twine(low + at));
+          tagGroup(registered.getDefiningOp(), slrOf[c]);
+        }
+        data = registered;
+      }
+      auto &group = linkGroupFor(c, to, w);
       Value &enable = producer.atReady ? group.ready : group.state;
       if (!enable) {
         auto pass = producer.atReady ? "_ready" : "_state";
@@ -3010,6 +3272,8 @@ LogicalResult StaticFolder::buildSim() {
             copyReg(producer.atReady ? ctl.ready2 : ctl.state2,
                     group.prefix + pass + "1"),
             group.prefix + pass + "0");
+        if (crossing)
+          enable = copyReg(enable, group.prefix + pass + "_late");
       }
       if (now && !banked) {
         if (!now->first)
@@ -3046,14 +3310,19 @@ LogicalResult StaticFolder::buildSim() {
                 copyReg(copyReg(ctl.tail2, group.prefix + "_tail1"),
                         group.prefix + "_tail0"));
           group.bank = notOf(parity);
+          if (crossing)
+            group.bank = copyReg(group.bank, group.prefix + "_bank_late");
         }
         writeAddress.push_back(group.bank);
         readAddress.push_back(bank());
       }
       if (threads > 1) {
-        if (!group.inst)
+        if (!group.inst) {
           group.inst = copyReg(copyReg(ctl.inst2, group.prefix + "_inst1"),
                                group.prefix + "_inst0");
+          if (crossing)
+            group.inst = copyReg(group.inst, group.prefix + "_inst_late");
+        }
         writeAddress.push_back(group.inst);
         readAddress.push_back(address());
       }
@@ -3106,6 +3375,18 @@ LogicalResult StaticFolder::buildSim() {
     auto &cls = classes[c];
     auto &ctl = controls[c];
     unsigned threads = cls.threads();
+    int to = slrOf.empty() ? -1 : slrOf[c];
+    // What this input builds is in its class's SLR group, but for the
+    // producers' registers of links from other groups.
+    Operation *mark = body->empty() ? nullptr : &body->back();
+    llvm::scope_exit tagBuilt([&] {
+      if (to < 0)
+        return;
+      for (auto *op = mark ? mark->getNextNode() : &body->front(); op;
+           op = op->getNextNode())
+        if (!isa<hw::ConstantOp>(op))
+          tagGroup(op, to);
+    });
     std::set<unsigned> cuts{consumer.width};
     for (auto &pieces : consumer.pieces) {
       unsigned at = 0;
@@ -3226,6 +3507,7 @@ LogicalResult StaticFolder::buildSim() {
         sourceData[index] =
             linkRead(key.first, key.second, width, address, bank,
                      producer.name + "_to_" + consumer.name + "_" + Twine(at),
+                     to,
                      zeroLink(key.first, c, consumer.port) ? &sourceNow[index]
                                                            : nullptr);
       }
@@ -3350,7 +3632,8 @@ LogicalResult StaticFolder::buildSim() {
         return notOf(copyReg(par1, bankName + Twine(bankCopies++)));
       };
       bits.push_back(linkRead(piece.producer, piece.low, piece.width, address,
-                              bank, producer.name + "_to_" + consumer.name));
+                              bank, producer.name + "_to_" + consumer.name,
+                              /*to=*/-1));
     }
     Value data = bits.empty() ? constant(0, 0)
                  : bits.size() == 1
@@ -3465,6 +3748,123 @@ LogicalResult StaticFolder::buildSim() {
         b.getStringAttr(cls.name + "=" + Twine(cls.threads())));
   sim->setAttr("foldsim.threads", b.getArrayAttr(threads));
   sim->setAttr("foldsim.frame", b.getI64IntegerAttr(ii));
+  simModule = sim;
+  return success();
+}
+
+LogicalResult StaticFolder::extractGroups() {
+  auto *context = top.getContext();
+  auto *body = simModule.getBodyBlock();
+  SmallVector<SmallVector<Operation *>> opsOf(slrGroups);
+  for (auto &op : body->without_terminator())
+    if (auto attr = op.getAttrOfType<IntegerAttr>(kSlrAttr)) {
+      opsOf[attr.getInt()].push_back(&op);
+      op.removeAttr(kSlrAttr);
+    }
+  // A name for the port of a value: its op's name, if any.
+  auto nameOf = [&](Value value) -> std::string {
+    if (auto arg = dyn_cast<BlockArgument>(value))
+      return simModule.getInputName(arg.getArgNumber()).str();
+    auto *op = value.getDefiningOp();
+    if (auto instance = dyn_cast<hw::InstanceOp>(op))
+      return (instance.getInstanceName() + "_" +
+              instance.getOutputName(cast<OpResult>(value).getResultNumber())
+                  .getValue())
+          .str();
+    if (auto name = op->getAttrOfType<StringAttr>("name"))
+      return name.getValue().str();
+    return "";
+  };
+  for (unsigned g = 0; g < slrGroups; ++g) {
+    auto &ops = opsOf[g];
+    if (ops.empty())
+      continue;
+    DenseSet<Operation *> inGroup(ops.begin(), ops.end());
+    // Inputs: values from outside but constants, which are copied in;
+    // outputs: values read outside.
+    SmallVector<Value> inputs, outputs;
+    DenseSet<Value> isInput;
+    SetVector<Operation *> constants;
+    for (auto *op : ops)
+      for (auto operand : op->getOperands()) {
+        auto *def = operand.getDefiningOp();
+        if (def && inGroup.contains(def))
+          continue;
+        if (def && isa<hw::ConstantOp>(def)) {
+          constants.insert(def);
+          continue;
+        }
+        if (isInput.insert(operand).second)
+          inputs.push_back(operand);
+      }
+    for (auto *op : ops)
+      for (auto result : op->getResults())
+        if (llvm::any_of(result.getUsers(), [&](Operation *user) {
+              return !inGroup.contains(user);
+            }))
+          outputs.push_back(result);
+
+    SmallVector<hw::PortInfo> ports;
+    llvm::StringSet<> names;
+    auto addPort = [&](Value value, bool isInput, size_t argNum) {
+      std::string base = nameOf(value);
+      if (base.empty())
+        base = isInput ? "in" : "out";
+      std::string name = base;
+      for (unsigned n = 1; !names.insert(name).second; ++n)
+        name = base + "_" + std::to_string(n);
+      hw::PortInfo port;
+      port.name = StringAttr::get(context, name);
+      port.type = value.getType();
+      port.dir = isInput ? hw::ModulePort::Direction::Input
+                         : hw::ModulePort::Direction::Output;
+      port.argNum = argNum;
+      ports.push_back(port);
+    };
+    for (auto [i, value] : llvm::enumerate(inputs))
+      addPort(value, true, i);
+    for (auto [i, value] : llvm::enumerate(outputs))
+      addPort(value, false, i);
+    OpBuilder mb(simModule);
+    auto module = hw::HWModuleOp::create(
+        mb, simModule.getLoc(),
+        StringAttr::get(context, simName + "_slr" + Twine(g)),
+        hw::ModulePortInfo(ports));
+    module.setPrivate();
+    auto *groupBody = module.getBodyBlock();
+    groupBody->getTerminator()->erase();
+    IRMapping map;
+    for (auto [value, arg] : llvm::zip(inputs, groupBody->getArguments()))
+      map.map(value, arg);
+    OpBuilder gb = OpBuilder::atBlockEnd(groupBody);
+    for (auto *constant : constants)
+      gb.clone(*constant, map);
+    SmallVector<Operation *> clones;
+    for (auto *op : ops)
+      clones.push_back(gb.clone(*op, map));
+    // A graph region: an operand may be defined further down.
+    for (auto *clone : clones)
+      for (auto &operand : clone->getOpOperands())
+        if (auto mapped = map.lookupOrNull(operand.get()))
+          operand.set(mapped);
+    SmallVector<Value> results;
+    for (auto value : outputs)
+      results.push_back(map.lookup(value));
+    hw::OutputOp::create(gb, simModule.getLoc(), results);
+
+    OpBuilder ib(body->getTerminator());
+    auto instance = hw::InstanceOp::create(
+        ib, simModule.getLoc(), module,
+        StringAttr::get(context, "foldsim_slr" + Twine(g)), inputs);
+    for (auto [value, result] : llvm::zip(outputs, instance.getResults()))
+      value.replaceUsesWithIf(result, [&](OpOperand &use) {
+        return !inGroup.contains(use.getOwner());
+      });
+    for (auto *op : ops)
+      op->dropAllUses();
+    for (auto *op : ops)
+      op->erase();
+  }
   return success();
 }
 
@@ -3549,6 +3949,8 @@ LogicalResult StaticFolder::run() {
       return failure();
   if (failed(buildSim()))
     return failure();
+  if (!slrOf.empty() && failed(extractGroups()))
+    return failure();
   netlist.erase();
   for (auto *callee : inlined)
     callee->erase();
@@ -3567,7 +3969,8 @@ void FoldStaticPass::runOnOperation() {
                       modulo, interleaveCopies, zeroLatencyLinks, zeroLatencyChains,
                       shortLead, stagedEnv,
                       specGroups, specDepth,
-                      envSinks, registerStateEntries);
+                      envSinks, registerStateEntries, slrGroups, slrSites,
+                      slrCapacity, slrAssign);
   if (failed(folder.run()))
     return signalPassFailure();
 }

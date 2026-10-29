@@ -469,6 +469,17 @@ def state_logic(cal, form, bypass, bits):
     return table[form][1 if bypass else 0] * bits
 
 
+def copy_sites(cal, est, name, threads, entries=2):
+    """LUT sites the placer needs for one copy of class `name` (`est`, its
+    class_estimates entry) at `threads` instances, calibrated: its state as
+    the compiler keeps it before a schedule is known (state_form)."""
+    kappa, lam = factors(cal, name, est['lut'])
+    form, _ = state_form(threads, None, 0, entries)
+    lr, _ = state_lutram(est, threads, form)
+    logic = kappa * est['lut'] + state_logic(cal, form, False, est['ff'])
+    return placement(logic, lam * lr)[0]
+
+
 def copy_threads(n, k, j):
     """Instances of copy j of a class of n folded into k copies."""
     return n // k + (1 if j < n % k else 0)

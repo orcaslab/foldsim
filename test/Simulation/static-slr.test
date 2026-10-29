@@ -1,0 +1,22 @@
+# REQUIRES: verilator
+# The static simulator of a chain of late links, its copies in SLR groups:
+# links between groups registered on both sides and taken a host cycle later,
+# within a group in the producer's host cycle (zero latency). Each matches
+# the target, with its channels stalled or not; without groups, the
+# reference.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/late
+# RUN: foldsim --srcs top.f --top Top --out %t/plain --static --copies Leaf:3 --zero-latency-links --zero-latency-chains Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/plain/obj %S/Inputs/tb_late.sv top.sv %t/plain/foldsim_sim.sv > %t/plain/build.log 2>&1
+# RUN: %t/plain/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/plain/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=40 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/split --static --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-count 3 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 Leaf 2>&1 | FileCheck %s --check-prefix=SPLIT
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/split/obj %S/Inputs/tb_late.sv top.sv %t/split/foldsim_sim.sv > %t/split/build.log 2>&1
+# RUN: %t/split/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/split/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=40 | FileCheck %s
+# Without forwarding into link reads: a crossing link three host cycles.
+# RUN: foldsim --srcs top.f --top Top --out %t/two --static --copies Leaf:3 --two-cycle-links --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:0,Top_model:1 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/two/obj %S/Inputs/tb_late.sv top.sv %t/two/foldsim_sim.sv > %t/two/build.log 2>&1
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=20 | FileCheck %s
+# SPLIT: zero-latency links: 1 of 3
+# SPLIT: slr links registered: 2 of 3 links, 16 of 24 bits
+# CHECK: {{^}}MATCH

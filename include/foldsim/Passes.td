@@ -358,6 +358,23 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "runs in the next frame's, so the frame is bounded by each copy's "
            "evaluations and the dependences across frames, not by the "
            "longest chain within one">,
+    Option<"slrGroups", "slr-groups", "unsigned", "0",
+           "Place the classes (each copy its own) in at most this many SLR "
+           "groups, each kept whole in one SLR: the assignment within "
+           "slr-capacity with the shortest frame, then the fewest link bits "
+           "between groups. A link between groups is taken a host cycle "
+           "later, registered at its producer's group and read into its "
+           "consumer's, never in its producer's host cycle; each group's "
+           "logic, copies and links read into it is a module instance "
+           "`foldsim_slr<g>` of the simulator. 0: no groups">,
+    ListOption<"slrSites", "slr-sites", "std::string",
+               "With slr-groups, each class's LUT sites, as <class>:<sites> "
+               "(a class not listed takes none)">,
+    Option<"slrCapacity", "slr-capacity", "uint64_t", "0",
+           "With slr-groups, the most LUT sites of a group (0: any)">,
+    ListOption<"slrAssign", "slr-assign", "std::string",
+               "With slr-groups, classes pinned to a group, as "
+               "<class>:<group>">,
     Option<"registerStateEntries", "register-state-entries", "unsigned", "2",
            "Per-instance state (registers and memory read buffers) of at most "
            "this many instances is kept in flops, not distributed RAM: a "
