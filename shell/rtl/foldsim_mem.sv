@@ -483,8 +483,10 @@ module foldsim_mem #(
     // for every whole write before it (memory answers reads and writes apart),
     // a write for those memory has taken (same-id writes complete in order,
     // but need not reach memory in it). Once offered, it stays offered.
-    function automatic [CW-1:0] off(input [PW-1:0] i);
-        off = CW'(PW'(i - awm_ack));
+    // The oldest entry is an argument: the always @(*) below is sensitive
+    // to the arguments of its calls, not to what a function reads itself.
+    function automatic [CW-1:0] off(input [PW-1:0] i, input [PW-1:0] oldest);
+        off = CW'(PW'(i - oldest));
     endfunction
     wire [CW-1:0] aw_taken = wr_out[CW-1:0] - aw_formed;
     reg ar_hit, aw_hit, ar_shown, aw_shown;
@@ -492,9 +494,9 @@ module foldsim_mem #(
         ar_hit = 1'b0;
         aw_hit = 1'b0;
         for (integer i = 0; i < DEPTH; ++i) begin
-            if ((off(PW'(i)) < wr_out[CW-1:0]) && (awm_addr[i][63:LB] == arh_addr[63:LB]))
+            if ((off(PW'(i), awm_ack) < wr_out[CW-1:0]) && (awm_addr[i][63:LB] == arh_addr[63:LB]))
                 ar_hit = 1'b1;
-            if ((off(PW'(i)) < aw_taken) && (awm_addr[i][63:LB] == awh_addr[63:LB]))
+            if ((off(PW'(i), awm_ack) < aw_taken) && (awm_addr[i][63:LB] == awh_addr[63:LB]))
                 aw_hit = 1'b1;
         end
     end
