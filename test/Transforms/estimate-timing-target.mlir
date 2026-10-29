@@ -1,6 +1,6 @@
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-estimate-timing{output=- report= top=Top})' -o /dev/null | FileCheck %s --check-prefix=V80
-// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-estimate-timing{output=- report= top=Top family=virtexuplusHBM})' -o /dev/null | FileCheck %s --check-prefix=U55C
-// RUN: not foldsim-opt %s --pass-pipeline='builtin.module(foldsim-estimate-timing{output=- report= top=Top family=zynquplus})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=UNKNOWN
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-estimate-timing{output=- report= top=Top target=virtexuplusHBM})' -o /dev/null | FileCheck %s --check-prefix=U55C
+// RUN: not foldsim-opt %s --pass-pipeline='builtin.module(foldsim-estimate-timing{output=- report= top=Top target=agilex})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=UNKNOWN
 
 // A 16 x 16 product into a register: one DSP, which absorbs the register.
 // V80-DAG: 1,1,d,reg,{{[0-9]+}},0,0,{{[ab]}}[{{[0-9]+}}],0,p16.d[0]
@@ -23,7 +23,7 @@
 // levels.
 // V80-DAG: 2,2,d,reg,{{[0-9]+}},0,0,a[0],0,l10.d[0]
 // U55C-DAG: 2,2,d,reg,{{[0-9]+}},0,0,a[0],0,l10.d[0]
-// UNKNOWN: unknown FPGA family 'zynquplus'
+// UNKNOWN: no Beacon target 'agilex'; one of versal virtexuplus virtexuplusHBM zynquplus asap7
 hw.module @Top(in %clk : !seq.clock, in %d : i33) {
   %a = seq.firreg %d clock %clk : i33
   %b = seq.firreg %d clock %clk : i33

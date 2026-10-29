@@ -346,7 +346,7 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "With zero-latency-links, every late link too, also where its "
            "reader's input reaches an output combinationally: links then "
            "chain across classes within a host cycle, as the native design "
-           "evaluates them within a cycle (the logic screen checks the depth "
+           "evaluates them within a cycle (Beacon checks the depth "
            "against the native netlist's)">,
     Option<"zeroLatencyLinks", "zero-latency-links", "bool", "false",
            "A late link a reader takes in its producer's own host cycle, "
@@ -575,7 +575,7 @@ def KeepModules : Pass<"foldsim-keep-modules", "::mlir::ModuleOp"> {
     Makes the modules named in `modules` public, so that
     `hw-flatten-modules`, which inlines only private modules, keeps their
     instances. A name also matches its specializations (`VX_elastic_buffer`
-    matches `VX_elastic_buffer_12`). Run before `foldsim-screen-map` to read
+    matches `VX_elastic_buffer_12`). Run before `foldsim-beacon-map` to read
     the depth at those instances' ports (`foldsim-estimate-timing`'s
     `ports`); LUTs then no longer pack across their boundaries.
   }];
@@ -645,12 +645,32 @@ def LowerConstantDivision
   let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
 }
 
+def BeaconMap : Pass<"foldsim-beacon-map", "::mlir::ModuleOp"> {
+  let summary = "Map a design to a Beacon target's cells";
+  let description = [{
+    Maps a design to the cells of `target` (foldsim/Beacon.h) for
+    `foldsim-estimate-timing` with the same `target`: 6-input LUTs on an FPGA
+    family, 3-input cuts, each one library cell, on an ASIC PDK. Modules of
+    fewer than 300 ops are inlined so cells pack across their boundaries, as
+    Vivado maps a flattened design; the mapping is depth-oriented, as Vivado
+    restructures chains of associative logic and priority muxes into trees;
+    equality comparisons become logic so they pack with their neighbours;
+    adders, order comparisons, multipliers and dividers stay word-level, as
+    carry chains and DSPs.
+  }];
+  let options = [
+    Option<"target", "target", "std::string", "\"versal\"",
+           "The Beacon target to map to">,
+  ];
+}
+
 def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
   let summary = "Rank every register-to-register path by its logic levels";
   let description = [{
     Estimates, for every end point of the design elaborated from `top`, the
     logic levels of its longest path the way Vivado counts them on the
-    device `family`: LUTs, CARRY8s, DSP cells and distributed-RAM reads. The input is a LUT-mapped design in which
+    `target` device: LUTs, CARRY8s, DSP cells and distributed-RAM reads. The input is a design mapped by
+    `foldsim-beacon-map` for the same `target`, in which
     `comb.truth_table` ops are LUTs and adders, subtracters, comparators,
     multipliers and dividers are still word-level ops:
 
@@ -671,11 +691,13 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     - `seq.firmem` read of latency 0 (distributed RAM): one level, plus one
       per doubling of the depth past 64 words, from the address.
 
-    `family` is `versal` (the V80) or `virtexuplusHBM` (the U55C), as
-    hw/syn/xilinx/platforms names them; the two differ only in their DSPs.
+    `target` is a Beacon target (foldsim/Beacon.h): an FPGA family as
+    hw/syn/xilinx/platforms names it (`versal`, `virtexuplus`,
+    `virtexuplusHBM`, `zynquplus`, which differ in their DSPs), or the PDK
+    of hw/syn/yosys.
 
-    `family=asap7` counts cell stages of an ASAP7 netlist mapped by
-    `foldsim-screen-map-asic` (3-input cuts) instead: a cell
+    `target=asap7` counts cell stages of an ASAP7 netlist (3-input cuts)
+    instead: a cell
     (`comb.truth_table`, or an and-inverter gate) is a stage; an adder bit from bit j to
     bit i is a prefix adder, 2 + ceil(log2(i - j + 1)); a compare,
     1 + ceil(log2(span)); a product, its partial products, a Dadda tree of
@@ -733,8 +755,8 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
                "instance path and name contain one of these">,
     ListOption<"blackBoxes", "black-boxes", "std::string",
                "Modules to treat as external, as a harness stubs them">,
-    Option<"family", "family", "std::string", "\"versal\"",
-           "The FPGA family whose logic levels to count">,
+    Option<"target", "target", "std::string", "\"versal\"",
+           "The Beacon target whose logic levels to count">,
     Option<"ports", "ports", "std::string", "",
            "Port depth table (CSV) of the instances of `port-modules`">,
     ListOption<"portModules", "port-modules", "std::string",

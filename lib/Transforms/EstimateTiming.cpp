@@ -6,13 +6,15 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// A timing screen: the logic levels of the longest path to every end point
-// of an elaborated, LUT-mapped design, counted as Vivado counts them on the
-// V80. It finds the depth outliers before a Vivado run; it predicts neither
-// slack nor wire delay.
+// Beacon: the logic levels of the longest path to every end point of an
+// elaborated design mapped to a target's cells (foldsim/Beacon.h), counted as
+// Vivado counts them on the target's FPGA, or in cell stages on an ASIC. It
+// finds the depth outliers before a Vivado run; it predicts neither slack nor
+// wire delay.
 //
 //===----------------------------------------------------------------------===//
 
+#include "foldsim/Beacon.h"
 #include "foldsim/Passes.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -23,7 +25,6 @@
 #include "mlir/Support/FileUtilities.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MathExtras.h"
@@ -45,6 +46,8 @@ namespace foldsim {
 
 using namespace mlir;
 using namespace circt;
+using foldsim::BeaconTarget;
+using foldsim::lookupBeaconTarget;
 
 namespace {
 
@@ -193,46 +196,6 @@ unsigned lut6Depth(unsigned n) {
 /// (CARRY8 or LOOKAHEAD8) between the input's block and the output's.
 int carryLevels(unsigned in, unsigned out) { return 2 + out / 8 - in / 8; }
 
-/// A device's family. On an FPGA, levels are as Vivado counts them, and the
-/// two families differ only in their DSPs: both have LUT6s, 8-bit carry
-/// blocks and 64-word distributed RAMs. On an ASIC library, levels are gate
-/// stages of the and-inverter graph.
-struct Device {
-  /// The operand widths of a DSP's multiplier.
-  unsigned dspA, dspB;
-  /// Levels from the fabric to a product the DSP registers, from there out
-  /// to the fabric, and through each further DSP of a cascade.
-  int dspIn, dspOut, dspCascade;
-  /// An ASIC library, and its delays in ps: a stage, a flip-flop's clock to
-  /// output and setup (hw/syn/yosys/liberty_stage.py), and what a path adds
-  /// beyond its stages, fitted on OpenSTA (buffering, the inverter after a
-  /// flip-flop's QN, slew).
-  bool asic = false;
-  int stagePs = 0, clk2qPs = 0, setupPs = 0, pathPs = 0;
-};
-
-/// The V80 (Versal, DSP58): from a registered product, Vivado counts M_DATA,
-/// ALUMUX, ALUADD, OUTPUT and the cells before the multiplier it does not
-/// absorb; a cascaded DSP adds ALUMUX, ALUADD and OUTPUT. The U55C
-/// (Virtex UltraScale+ HBM, DSP48E2) has one ALU cell and an 18-bit B port.
-const Device kVersal = {27, 24, 1, 6, 3};
-const Device kVirtexUltraScalePlusHBM = {27, 18, 1, 5, 2};
-/// ASAP7 7.5-track RVT at the TT corner, as hw/syn/yosys builds with it: a
-/// cell at fanout 3 and its own slew, a DFFHQNx1's clock to output and setup,
-/// and 167 ps per path, the median over five asic_gate DUTs. Products are
-/// multipliers of cells, not DSPs.
-const Device kAsap7 = {0, 0, 0, 0, 0, true, 24, 58, 6, 167};
-
-/// The device of a family, by the names of hw/syn/xilinx/platforms (the V80's
-/// and the U55C's) and of hw/syn/yosys's PDK (asap7).
-const Device *lookupDevice(StringRef family) {
-  return llvm::StringSwitch<const Device *>(family)
-      .Case("versal", &kVersal)
-      .Case("virtexuplusHBM", &kVirtexUltraScalePlusHBM)
-      .Case("asap7", &kAsap7)
-      .Default(nullptr);
-}
-
 /// The most bits a divider can depend on for synthesis to write it out as a
 /// table over them; also the dividend widths whose quotient and remainder by
 /// a constant foldsim-lower-constant-division writes out.
@@ -264,7 +227,8 @@ unsigned variableBits(Value value) {
 class Timing {
 public:
   /// Instances of `blackBoxes` are external modules, as a harness's stubs.
-  Timing(ModuleOp top, ArrayRef<std::string> blackBoxes, const Device &device)
+  Timing(ModuleOp top, ArrayRef<std::string> blackBoxes,
+         const BeaconTarget &device)
       : device(device) {
     for (auto module : top.getOps<hw::HWModuleLike>()) {
       if (llvm::is_contained(blackBoxes, module.getModuleName()))
@@ -307,7 +271,7 @@ private:
   void printPath(raw_ostream &os, const EndPoint &end, unsigned rank);
   const std::string &path(unsigned ctx);
 
-  const Device &device;
+  const BeaconTarget &device;
   DenseMap<StringAttr, Operation *> modules;
   DenseSet<StringAttr> stubs;
   std::vector<Context> contexts;
@@ -1567,9 +1531,9 @@ void EstimateTimingPass::runOnOperation() {
     }
   }
 
-  const Device *device = lookupDevice(family);
+  const BeaconTarget *device = lookupBeaconTarget(target);
   if (!device) {
-    design.emitError("unknown FPGA family '") << family << "'";
+    foldsim::emitUnknownBeaconTarget(design, target);
     return signalPassFailure();
   }
   Timing timing(design, blackBoxes, *device);

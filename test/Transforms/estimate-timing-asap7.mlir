@@ -1,4 +1,4 @@
-// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-estimate-timing{output=- report=- top=Top family=asap7})' -o /dev/null | FileCheck %s
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-estimate-timing{output=- report=- top=Top target=asap7})' -o /dev/null | FileCheck %s
 
 // Two and-inverter gates in a row: two stages.
 // CHECK: 2,2,d,reg,{{[0-9]+}},0,0,{{[ab]}}[0],0,g.d[0]

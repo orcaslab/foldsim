@@ -1,4 +1,5 @@
 add_mlir_library(FoldsimTransforms
+  Beacon.cpp
   BlackBoxes.cpp
   Compose.cpp
   EstimateTiming.cpp
