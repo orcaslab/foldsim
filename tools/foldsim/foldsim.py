@@ -150,6 +150,8 @@ def frame_options(a):
         fold += ' staged-env=false'
     if getattr(a, 'register_state_entries', None) is not None:
         fold += f' register-state-entries={a.register_state_entries}'
+    if getattr(a, 'ready_levels', 'auto') != 'auto':
+        fold += f' ready-levels={a.ready_levels}'
     return fold
 
 
@@ -344,6 +346,11 @@ def main():
     ap.add_argument('--register-state-entries', type=int, metavar='N',
                     help='with --static: per-instance state of copies with at most N instances in flops, '
                          'deeper in distributed RAM (default 2; 0: always distributed RAM)')
+    ap.add_argument('--ready-levels', choices=('off', 'auto', 'always', 'rank'), default='auto',
+                    help='with --static: split a model\'s ready outputs into ready passes by '
+                         'level where one ready pass per model leaves the frame with a cycle '
+                         '(auto), never (off), for every choice of ready passes (always), or '
+                         'for every choice a pass per rank, never merged (rank: a test)')
     ap.add_argument('--unstaged-env', action='store_true',
                     help="with --static: the endpoints take a token in the host cycle it is offered "
                          "(the kernel's memory endpoints unstaged)")

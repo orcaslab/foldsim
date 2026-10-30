@@ -1,7 +1,7 @@
 // A frame whose evaluations wait on each other in a cycle for every choice of
 // ready passes: the error names a shortest cycle, edge by edge.
 // RUN: not foldsim-opt %s --mlir-print-op-on-diagnostic=false --pass-pipeline="builtin.module(foldsim-extract-models{module=Loop models=Pass netlist},foldsim-fold-static{module=Loop schedule-only})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=COMB
-// RUN: not foldsim-opt %s --mlir-print-op-on-diagnostic=false --pass-pipeline="builtin.module(foldsim-extract-models{module=Shared models=Two netlist},foldsim-fold-static{module=Shared schedule-only})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=SHARED
+// RUN: not foldsim-opt %s --mlir-print-op-on-diagnostic=false --pass-pipeline="builtin.module(foldsim-extract-models{module=Shared models=Two netlist},foldsim-fold-static{module=Shared schedule-only ready-levels=off})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=SHARED
 
 // `y` depends on `x` in the same cycle, and two instances feed each other:
 // a combinational loop through both.
@@ -27,7 +27,9 @@ hw.module @Loop(in %clk : !seq.clock, out z : i8) {
 // `Two`'s outputs each depend on one input, so no path through the netlist
 // is combinational; but one ready pass writes both outputs, so `a`'s waits
 // for `x2`, which `b`'s ready pass writes, which waits for its own `x2`.
-// Without a ready pass, the state passes wait on each other.
+// Without a ready pass, the state passes wait on each other. (Two ready
+// passes by level schedule it: fold-static-ready-levels.mlir; here they are
+// off.)
 // SHARED: error: the evaluations of a frame depend on each other in a cycle for every choice of ready passes
 // SHARED-NEXT: a shortest cycle, 2 edges, with 2 of 2 models given a ready pass
 // SHARED: note: cycle edge 1 of 2: Two #{{[01]}} ({{[ab]}}) ready pass -> Two #{{[01]}} ({{[ab]}}) ready pass: output 'y1' -> input 'x2' (1 host cycle), 8 of the input's 8 bits. 'y1' is late: it depends combinationally on Two's input 'x1'. The ready pass reads it for its outputs 'y2'. Through Two: its output 'y1' does not depend on 'x2'; the cycle closes only because one ready pass writes all of Two's ready outputs (a second ready pass would break it).
