@@ -185,8 +185,9 @@ DEGREE_CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def choose_copies(a, foldsim_opt, flat, passes, out):
-    """The fold degree of each class: every choice scheduled, priced and the
-    fastest within the LUT budget kept (foldsim_degree.py)."""
+    """The fold degree of each class: every choice (or, past
+    --degree-max-points, a search) scheduled, priced and the fastest within
+    the LUT budget kept (foldsim_degree.py)."""
     import foldsim_degree
     models = out('models.mlir')
     run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
@@ -207,7 +208,7 @@ def choose_copies(a, foldsim_opt, flat, passes, out):
     path = a.degree_calibration or DEGREE_CALIBRATION
     cal = json.load(open(path)) if path != 'none' and os.path.exists(path) else None
     result = foldsim_degree.evaluate(models, open(base).read(), fold, foldsim_opt, work, cal,
-                                     a.jobs, a.lut_budget)
+                                     a.jobs, a.lut_budget, max_points=a.degree_max_points)
     with open(out('degree.txt'), 'w') as f:
         f.write(foldsim_degree.table(result) + '\n')
     with open(out('degree.json'), 'w') as f:
@@ -360,6 +361,9 @@ def main():
                     help='with --copies auto: builds that calibrate the estimate '
                          '(foldsim_degree.py calibrate); the V80\'s, foldsim_v80.json, '
                          'by default, `none` for none')
+    ap.add_argument('--degree-max-points', type=int, default=256,
+                    help='with --copies auto: schedule every choice up to this many, '
+                         'else search them (foldsim_degree.py evaluate)')
     ap.add_argument('--slr-groups', action='store_true',
                     help='with --static: <out>/foldsim_floorplan.tcl keeps each threaded copy '
                          'whole in one SLR (Vivado picks which), for an implementation flow to '

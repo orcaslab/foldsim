@@ -19,6 +19,9 @@ the fastest point that places within a LUT budget, and the unfolded target's
 area (what an unfolded simulator needs at the least). The model ranks and
 prunes; it does not promise a clock: retiming and routing dominate the period.
 
+Every choice is scheduled while there are few; lanes folded as classes (256
+instances each) make tens of thousands, and those are searched (evaluate).
+
 usage:
   foldsim_degree.py calibrate --models <models.mlir> --schedule <schedule.txt>
       --util <routed_util_hier.rpt> --timing <routed_timing_summary.rpt>
@@ -486,12 +489,48 @@ def degrees(n):
     return ks
 
 
+def deepest(n, k):
+    return -(-n // k)
+
+
+def by_depth(sizes, choices):
+    """One choice per frame depth: every class on the fewest copies whose
+    deepest copy is no deeper. The frame is bounded by the deepest copy of
+    any class, so a class folded finer than the others only adds copies."""
+    depths = sorted({deepest(n, k) for n, ks in zip(sizes, choices) for k in ks})
+    return list(dict.fromkeys(
+        tuple(next(k for k in ks if deepest(n, k) <= d) for n, ks in zip(sizes, choices))
+        for d in depths))
+
+
+def neighbours(point, choices):
+    """The choices one degree finer or coarser in a single class."""
+    for i, k in enumerate(point):
+        j = choices[i].index(k)
+        for m in (j - 1, j + 1):
+            if 0 <= m < len(choices[i]):
+                yield point[:i] + (choices[i][m],) + point[i + 1:]
+
+
+def pareto(points, key):
+    front = []
+    for p in sorted(points, key=lambda p: (p['luts'], p[key])):
+        if not front or p[key] < front[-1][key]:
+            front.append(p)
+    return front
+
+
 def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
-             jobs=4, budget=0, depth=None):
+             jobs=4, budget=0, depth=None, max_points=256):
     """Every choice of copies per class: II, LUTs, whether it places, period
     and ns per cycle; the Pareto front, and the fastest point that places and
     stays within `budget` LUTs (0: none). `depth` is the design's screen depth
-    (screen_depth), for a fit that has the depth term."""
+    (screen_depth), for a fit that has the depth term.
+
+    Past `max_points` choices (lanes folded as classes: 256 instances each),
+    every choice is too many to schedule; the search then schedules one choice
+    per frame depth (by_depth), then the neighbours of the front until the
+    front stops changing or `max_points` are scheduled."""
     _, classes, _ = parse_schedule(base_schedule)
     m = re.search(r'register-state-entries=(\d+)', fold_options)
     entries = int(m.group(1)) if m else 2
@@ -526,21 +565,37 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
                        ns=round(ii * period, 1))
         return res
 
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
-        points = list(pool.map(one, itertools.product(*choices)))
-    good = [p for p in points if 'ii' in p]
     key = 'ns' if fit else 'ii'
-    front = []
-    for p in sorted(good, key=lambda p: (p['luts'], p[key])):
-        if not front or p[key] < front[-1][key]:
-            front.append(p)
+    space = math.prod(len(ks) for ks in choices)
+    done = {}
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        def run(batch):
+            done.update(zip(batch, pool.map(one, batch)))
+        if space <= max_points:
+            run(list(itertools.product(*choices)))
+        else:
+            sizes = [classes[c] for c in names]
+            run(by_depth(sizes, choices)[:max_points])
+            while len(done) < max_points:
+                point = {id(p): ks for ks, p in done.items()}
+                front = pareto([p for p in done.values() if 'ii' in p], key)
+                batch = list(dict.fromkeys(
+                    q for p in front for q in neighbours(point[id(p)], choices)
+                    if q not in done))
+                if not batch:
+                    break
+                run(batch[:max_points - len(done)])
+    points = list(done.values())
+    good = [p for p in points if 'ii' in p]
+    front = pareto(good, key)
     within = [p for p in good if p['fits'] and (not budget or p['luts'] <= budget)]
     pick = min(within, key=lambda p: (p[key], p['luts'])) if within else None
     # Every instance its own copy and its state in flip-flops: the target's
     # own area, which an unfolded simulator (FireSim) needs at the least.
     unfolded = area(cal, est, classes, dict(classes), rest)
     return dict(classes=classes, points=points, front=front, pick=pick, budget=budget,
-                unfolded=unfolded, firesim=firesim_area(cal, unfolded), depth=depth, fit=fit)
+                unfolded=unfolded, firesim=firesim_area(cal, unfolded), depth=depth, fit=fit,
+                space=space)
 
 
 def table(result):
@@ -564,6 +619,10 @@ def table(result):
     if fs:
         lines.append(f"{'FireSim, projected (at least: unfolded x FireSim builds)':<60} {'-':>12} "
                      f"{fs['luts']:>12} {fs['lutram']:>12} {fs['sites']:>12} {str(fs['fits']):>12}")
+    space = result.get('space', len(result['points']))
+    if space > len(result['points']):
+        lines.append(f"searched {len(result['points'])} of {space} choices: one per frame depth, "
+                     'then the neighbours of the front')
     lines.append('* Pareto front (ns per simulated cycle against LUTs); '
                  f"budget {result['budget'] or 'none'}; fits: {PLACE_MARGIN:.0%} of "
                  f'{PLACE_SITES} V80 LUT sites (a LUTRAM LUT {LUTRAM_SITES} sites) and of '
@@ -618,6 +677,8 @@ def main():
     e.add_argument('--calibration', default='')
     e.add_argument('--lut-budget', type=int, default=0)
     e.add_argument('--jobs', type=int, default=4)
+    e.add_argument('--max-points', type=int, default=256,
+                   help='schedule every choice up to this many, else search (evaluate)')
     e.add_argument('--screen', default='',
                    help='the logic screen of the design\'s netlist, for the depth term')
     e.add_argument('--fold-options', default='',
@@ -652,7 +713,8 @@ def main():
     if r.returncode:
         sys.exit(r.stderr)
     result = evaluate(a.models, open(base).read(), fold, a.foldsim_opt, a.workdir, cal,
-                      a.jobs, a.lut_budget, screen_depth(a.screen) if a.screen else None)
+                      a.jobs, a.lut_budget, screen_depth(a.screen) if a.screen else None,
+                      a.max_points)
     print(table(result))
     json.dump(result, open(os.path.join(a.workdir, 'degree.json'), 'w'), indent=1,
               default=str)
