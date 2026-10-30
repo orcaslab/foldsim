@@ -15,3 +15,9 @@
 # AUTO-DAG: {{^}}-{{ }}
 # AUTO-DAG: {{^}}Leaf:2{{ }}
 # AUTO-DAG: {{^}}Leaf:3{{ }}
+# An early link's bank of 1 starts past every instance index, so a copy of
+# three keeps eight entries, not six: with six, the bank of 1 lost the third
+# instance's writes and read nothing.
+# RUN: foldsim --srcs top.f --top Top --out %t/three --static Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=LINK < %t/three/foldsim_sim.mlir
+# LINK: %Leaf_q_to_Leaf_d_0 = seq.firmem {{.*}} <8 x 8, mask 1>
