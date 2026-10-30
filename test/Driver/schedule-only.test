@@ -1,0 +1,14 @@
+# --schedule-only stops once the schedule is chosen: the report, no simulator.
+# RUN: rm -rf %t && cd %S/Inputs/three
+# RUN: foldsim --srcs top.f --top Top --out %t/s --static --schedule-only --copies auto Leaf 2>&1 | FileCheck %s
+# RUN: FileCheck %s < %t/s/schedule.txt
+# RUN: test ! -e %t/s/foldsim_sim.mlir && test ! -e %t/s/degree.txt
+# RUN: not foldsim --srcs top.f --top Top --out %t/n --schedule-only Leaf 2>&1 | FileCheck %s --check-prefix=STATIC
+# --ready-levels reaches the pass when not its default, auto.
+# RUN: foldsim --srcs top.f --top Top --out %t/l --static --schedule-only --ready-levels always Leaf 2>&1 | FileCheck %s --check-prefix=LEVELS
+# RUN: foldsim --srcs top.f --top Top --out %t/d --static --schedule-only Leaf 2>&1 | FileCheck %s --check-prefix=DEFAULT
+# CHECK: II = {{[0-9]+}}
+# CHECK: Leaf x3
+# STATIC: --schedule-only needs --static
+# LEVELS: foldsim-fold-static{{.*}} ready-levels=always
+# DEFAULT-NOT: ready-levels

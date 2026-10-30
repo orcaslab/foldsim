@@ -281,7 +281,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
       the bank of the next frame. One that depends on an input, or on a
       memory's read data (late), is written in the frame it belongs to, at
       a pass of the producer placed before its readers: a ready pass that
-      writes no state, or the state pass.
+      writes no state, or the state pass. With `ready-levels`, a class may
+      have several ready passes, each writing the late outputs of one level
+      once the inputs they depend on are written.
     - Every input of a copy is a read register: a link's read at the
       consumer's slot, a constant of the instance, or the netlist input of
       the frame.
@@ -390,6 +392,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     ListOption<"slrAssign", "slr-assign", "std::string",
                "With slr-groups, classes pinned to a group, as "
                "<class>:<group>">,
+    Option<"readyLevels", "ready-levels", "std::string", "\"auto\"",
+           "Ready passes split by level: a model's ready outputs written in "
+           "as many ready passes as keep the frame acyclic, each pass once "
+           "the inputs its outputs depend on are written. `auto` splits them "
+           "only where one ready pass per model leaves every choice of ready "
+           "passes with a cycle; `off` never; `always` for every choice; "
+           "`rank` for every choice, a pass per rank of a model's outputs, "
+           "never merged (a test of the split passes)">,
     Option<"registerStateEntries", "register-state-entries", "unsigned", "2",
            "Per-instance state (registers and memory read buffers) of at most "
            "this many instances is kept in flops, not distributed RAM: a "

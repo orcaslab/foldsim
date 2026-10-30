@@ -231,14 +231,19 @@ struct foldsim::PipelineAnalysis::Impl {
   DenseMap<Value, uint32_t> stateBase;
   DenseMap<Value, std::unique_ptr<BitSets>> sets;
   DenseMap<Value, unsigned> allSets;
-  // Combinational cycles, as in the threader's dependence analysis.
-  DenseMap<Value, std::pair<unsigned, unsigned>> open;
-  SmallVector<Value> stack, calls;
-  DenseSet<Value> selfCycles;
-  unsigned reached = 0;
+  /// The members of the combinational cycle being solved: their sets are
+  /// partial until it is.
+  DenseSet<Value> open;
 
   const BitSets &get(Value value);
   BitSets compute(Value value);
+  /// The values whose sets `compute` reads.
+  void operandsOf(Value value, SmallVectorImpl<Value> &out);
+  /// Computes the sets of `value` and of all it reads: the strongly connected
+  /// components of the values (Tarjan's, without recursion: a model's logic
+  /// may chain far more operations than a thread's stack holds frames), each
+  /// once its reads are, a combinational cycle's to a fixed point.
+  void solve(Value value);
   unsigned all(Value value) {
     if (auto it = allSets.find(value); it != allSets.end())
       return it->second;
@@ -272,51 +277,115 @@ foldsim::PipelineAnalysis::PipelineAnalysis(hw::HWModuleOp model)
 foldsim::PipelineAnalysis::~PipelineAnalysis() = default;
 
 const BitSets &foldsim::PipelineAnalysis::Impl::get(Value value) {
-  if (auto it = sets.find(value); it != sets.end()) {
-    if (auto o = open.find(value); o != open.end()) {
-      auto &caller = open[calls.back()].second;
-      caller = std::min(caller, o->second.first);
-      if (calls.back() == value)
-        selfCycles.insert(value);
+  auto it = sets.find(value);
+  if (it == sets.end()) {
+    solve(value);
+    it = sets.find(value);
+  }
+  return *it->second;
+}
+
+void foldsim::PipelineAnalysis::Impl::operandsOf(Value value,
+                                                SmallVectorImpl<Value> &out) {
+  if (stateBase.count(value))
+    return;
+  auto *op = value.getDefiningOp();
+  if (!op || isa<seq::FirRegOp, hw::InstanceOp, hw::ConstantOp,
+                 hw::AggregateConstantOp>(op))
+    return;
+  if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+    auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+    if (!memory || memory.getReadLatency() == 0) {
+      out.push_back(read.getAddress());
+      if (read.getEnable())
+        out.push_back(read.getEnable());
     }
-    return *it->second;
+    return;
   }
-  auto width = std::max<int64_t>(hw::getBitWidth(value.getType()), 0);
-  unsigned index = reached++;
-  open[value] = {index, index};
-  stack.push_back(value);
-  sets[value] = std::make_unique<BitSets>(width, 0);
-  calls.push_back(value);
-  *sets[value] = compute(value);
-  calls.pop_back();
-  unsigned low = open[value].second;
-  if (!calls.empty()) {
-    auto &caller = open[calls.back()].second;
-    caller = std::min(caller, low);
-  }
-  if (low != index)
-    return *sets[value];
-  SmallVector<Value> cycle;
-  do
-    cycle.push_back(stack.pop_back_val());
-  while (cycle.back() != value);
-  if (cycle.size() > 1 || selfCycles.contains(value)) {
+  out.append(op->operand_begin(), op->operand_end());
+}
+
+void foldsim::PipelineAnalysis::Impl::solve(Value root) {
+  // Each value visited: its index and lowest reachable index on the stack.
+  DenseMap<Value, std::pair<unsigned, unsigned>> link;
+  SmallVector<Value> stack;
+  DenseSet<Value> onStack;
+  struct Frame {
+    Value value;
+    SmallVector<Value, 4> reads;
+    unsigned next = 0;
+  };
+  SmallVector<Frame> frames;
+  auto visit = [&](Value value) {
+    unsigned index = link.size();
+    link[value] = {index, index};
+    stack.push_back(value);
+    onStack.insert(value);
+    Frame frame{value, {}, 0};
+    operandsOf(value, frame.reads);
+    frames.push_back(std::move(frame));
+  };
+  visit(root);
+  while (!frames.empty()) {
+    auto &frame = frames.back();
+    if (frame.next < frame.reads.size()) {
+      Value read = frame.reads[frame.next++];
+      if (sets.count(read))
+        continue;
+      auto it = link.find(read);
+      if (it == link.end()) {
+        visit(read);
+        continue;
+      }
+      if (onStack.contains(read)) {
+        auto &low = link[frame.value].second;
+        low = std::min(low, it->second.first);
+      }
+      continue;
+    }
+    Value value = frame.value;
+    frames.pop_back();
+    auto [index, low] = link[value];
+    if (!frames.empty()) {
+      auto &callerLow = link[frames.back().value].second;
+      callerLow = std::min(callerLow, low);
+    }
+    if (low != index)
+      continue;
+    SmallVector<Value> component;
+    do {
+      component.push_back(stack.pop_back_val());
+      onStack.erase(component.back());
+    } while (component.back() != value);
+    // Its reads are solved: a value alone once, a combinational cycle from
+    // empty sets until none changes.
+    bool cycle = component.size() > 1;
+    if (!cycle) {
+      SmallVector<Value, 4> reads;
+      operandsOf(value, reads);
+      cycle = llvm::is_contained(reads, value);
+    }
+    for (auto member : component) {
+      auto width = std::max<int64_t>(hw::getBitWidth(member.getType()), 0);
+      sets[member] = std::make_unique<BitSets>(width, 0);
+      if (cycle)
+        open.insert(member);
+    }
     for (bool changed = true; changed;) {
       changed = false;
-      for (auto member : cycle) {
-        calls.push_back(member);
+      for (auto member : component) {
         auto bits = compute(member);
-        calls.pop_back();
         if (bits != *sets[member]) {
           *sets[member] = std::move(bits);
           changed = true;
         }
       }
+      if (!cycle)
+        break;
     }
+    for (auto member : component)
+      open.erase(member);
   }
-  for (auto member : cycle)
-    open.erase(member);
-  return *sets[value];
 }
 
 BitSets foldsim::PipelineAnalysis::Impl::compute(Value value) {

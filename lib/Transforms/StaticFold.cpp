@@ -35,6 +35,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/raw_ostream.h"
+#include <deque>
 #include <map>
 #include <set>
 
@@ -128,9 +129,19 @@ struct Class {
   /// With virtual memories, the copy's host reset input (their pending reads
   /// clear with the controllers').
   unsigned resetInput = 0;
-  /// The schedule: whether it has a ready pass, and each instance's slots.
+  /// The schedule: its ready passes (none, one, or one per level of its late
+  /// outputs, `readyLevels`), and each instance's slots: `slot[kState]` its
+  /// state pass's, `slot[kReady]` its first ready pass's and `laterReady[l-1]`
+  /// its ready pass of level l's.
   bool hasReady = false;
+  unsigned readyLevels = 0;
   SmallVector<int> slot[2];
+  SmallVector<SmallVector<int>> laterReady;
+  /// Each instance's slots of the ready pass of level `level`.
+  ArrayRef<int> readySlots(unsigned level) const {
+    return level ? ArrayRef<int>(laterReady[level - 1])
+                 : ArrayRef<int>(slot[kReady]);
+  }
   /// Its folded pipelines, if any.
   std::unique_ptr<Folding> folding;
   /// Built: the copy and its instance in the simulator.
@@ -144,8 +155,10 @@ struct Producer {
   /// The class, or -1 for an input of the netlist; the output or input.
   int cls = -1;
   unsigned port = 0, width = 0;
-  /// For a class output: late, and then whether written at the ready pass.
+  /// For a class output: late, and then whether written at a ready pass, and
+  /// at which level's.
   bool late = false, atReady = false;
+  unsigned readyLevel = 0;
   /// Read by any consumer.
   bool read = false;
 };
@@ -173,6 +186,46 @@ static constexpr unsigned kVirtualFreeWidth = 16, kVirtualRoom = 8;
 struct Node {
   unsigned cls, inst;
   Pass pass;
+  /// A ready pass's level.
+  unsigned level = 0;
+};
+
+/// Why an evaluation waits for another: the link it reads (the producer, and
+/// the consumer's input), or, with no producer, an instance's ready pass
+/// before its state pass.
+struct Wait {
+  int producer = -1;
+  unsigned input = 0;
+};
+
+/// Which late outputs a choice of ready passes writes at them, and at which
+/// pass: one ready pass per class, or (split by level) one per level of its
+/// late outputs, each level's inputs written before it in the frame.
+struct ReadyWrites {
+  /// Per producer: written at a ready pass, and that pass's level.
+  SmallVector<bool> atReady;
+  SmallVector<unsigned> level;
+  /// Per class: its ready passes (0 for none), and the first of the slot
+  /// rows of its ready passes past the first.
+  SmallVector<unsigned> passes, laterRow;
+  unsigned rows = 0;
+  /// The row of a class's pass in the slots `place` gives: the state pass's
+  /// and the first ready pass's by class, two to a class, then the later
+  /// ready passes'.
+  unsigned row(unsigned c, Pass pass, unsigned lvl = 0) const {
+    return pass == kState || lvl == 0 ? c * 2 + pass : laterRow[c] + lvl - 1;
+  }
+  /// The pass a producer's output is written at.
+  Pass passOf(unsigned p) const { return atReady[p] ? kReady : kState; }
+};
+
+/// The evaluations of a frame for a choice of ready passes, and what each
+/// waits for within the frame: the evaluation and the host cycles after it,
+/// and (in `why`, when kept) the link.
+struct FrameGraph {
+  std::vector<Node> nodes;
+  std::vector<SmallVector<std::pair<unsigned, int>>> preds;
+  std::vector<SmallVector<Wait>> why;
 };
 
 class StaticFolder {
@@ -187,7 +240,7 @@ public:
                ArrayRef<std::string> envSinks, unsigned registerStateEntries,
                unsigned slrGroups, ArrayRef<std::string> slrSites,
                uint64_t slrCapacity, ArrayRef<std::string> slrAssign,
-               ArrayRef<std::string> storage)
+               ArrayRef<std::string> storage, StringRef readyLevels)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -198,6 +251,7 @@ public:
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
         zeroLatencyChains(zeroLatencyChains), shortLead(shortLead),
         bubbles(bubbles), virtualMemoryPattern(virtualMemories.str()),
+        readyLevelsMode(readyLevels.str()),
         registerStateEntries(registerStateEntries), storageSpecs(storage),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
@@ -223,7 +277,8 @@ private:
   /// between SLR groups as `slrOf` has them; 0 if every choice is cyclic.
   struct Choice {
     unsigned length = 0;
-    SmallVector<bool> ready, atReady, outputEarly;
+    SmallVector<bool> ready, outputEarly;
+    ReadyWrites writes;
     SmallVector<SmallVector<int>> slots;
     SmallVector<int> outputSlot;
   };
@@ -244,10 +299,32 @@ private:
     return !slrOf.empty() && p >= 0 && c >= 0 && slrOf[p] != slrOf[c];
   }
   int crossDelay(int p, int c) const { return crosses(p, c) ? 1 : 0; }
+  /// The evaluations of the given choice of ready passes and what each waits
+  /// for; which late outputs are written at ready passes in `writes`.
+  void frameGraph(ArrayRef<bool> ready, ReadyWrites &writes,
+                  FrameGraph &graph, bool keepWhy);
+  /// With `splitReady`: the levels of the late outputs written at ready
+  /// passes, as few per class as keep the passes, instance by instance, from
+  /// waiting on each other in a cycle. Left at one pass per class where the
+  /// outputs themselves wait on each other in a cycle.
+  void readyLevels(ArrayRef<bool> ready, ReadyWrites &writes);
+  /// Moves to the state pass every late output in `writes.atReady` that
+  /// depends on an input a late output not written at a ready pass feeds.
+  void settleReady(ReadyWrites &writes);
+  /// A late output `q` of instance `a` feeding an input that late output
+  /// `p` of instance `b` depends on: {q, a, b}, listed under `p`.
+  using Feed = std::tuple<unsigned, unsigned, unsigned>;
+  /// The feeds of late output `p`, every instance's; computed once.
+  ArrayRef<Feed> lateFeeds(unsigned p);
+  std::vector<SmallVector<Feed>> feeds;
   /// Places every evaluation of the given choice of ready passes; II, or 0
   /// if the evaluations depend on each other in a cycle.
   unsigned place(ArrayRef<bool> ready, SmallVectorImpl<SmallVector<int>> &slots,
-                 SmallVectorImpl<bool> &atReady);
+                 ReadyWrites &writes);
+  /// Names a shortest cycle of the evaluations of the given choice of ready
+  /// passes, edge by edge, on the diagnostic: which link each waits on, and
+  /// whether a ready pass could break it.
+  void explainCycle(ArrayRef<bool> ready, InFlightDiagnostic &diag);
   /// Places the evaluations with consecutive frames overlapped: the shortest
   /// frame at which every copy's evaluations fit, modulo the frame, and every
   /// dependence across frames holds; 0 if none does.
@@ -255,7 +332,7 @@ private:
       ArrayRef<Node> nodes,
       ArrayRef<SmallVector<std::pair<unsigned, int>>> preds,
       ArrayRef<SmallVector<std::pair<unsigned, int>>> succs,
-      ArrayRef<int> height, ArrayRef<bool> atReady,
+      ArrayRef<int> height, const ReadyWrites &writes,
       SmallVectorImpl<SmallVector<int>> &slots);
   LogicalResult buildCopy(Class &cls);
   LogicalResult buildSim();
@@ -302,6 +379,11 @@ private:
   bool bubbles;
   /// `--virtual-memories`: the names of the memories kept outside.
   std::string virtualMemoryPattern;
+  /// When a class may write its ready outputs in more than one ready pass,
+  /// by level (`ready-levels`: off, auto or always); and whether
+  /// `frameGraph` does so now.
+  std::string readyLevelsMode;
+  bool splitReady = false;
   unsigned registerStateEntries;
   /// The storage rules (`storage`): a model's stores in a given ram_style.
   struct StorageRule {
@@ -766,6 +848,41 @@ static int logicLevels(Operation *op) {
   return 1;
 }
 
+/// The most levels on a path from `root` along `edges` (each a successor
+/// and the levels it adds), memoized in `memo`: depth first without
+/// recursion, since a model's logic may chain far more operations than a
+/// thread's stack holds frames. A value on a cycle counts as none.
+static int longestPath(
+    Value root, DenseMap<Value, int> &memo,
+    function_ref<void(Value, SmallVectorImpl<std::pair<Value, int>> &)>
+        edges) {
+  if (auto it = memo.find(root); it != memo.end())
+    return it->second;
+  SmallVector<std::pair<Value, bool>> stack{{root, false}};
+  SmallVector<std::pair<Value, int>> next;
+  while (!stack.empty()) {
+    auto [value, expanded] = stack.pop_back_val();
+    if (!expanded && memo.count(value))
+      continue;
+    next.clear();
+    edges(value, next);
+    if (!expanded) {
+      // A placeholder against cycles, then the successors first.
+      memo[value] = 0;
+      stack.push_back({value, true});
+      for (auto [successor, levels] : next)
+        if (!memo.count(successor))
+          stack.push_back({successor, false});
+      continue;
+    }
+    int levels = 0;
+    for (auto [successor, add] : next)
+      levels = std::max(levels, add + memo.lookup(successor));
+    memo[value] = levels;
+  }
+  return memo.lookup(root);
+}
+
 LogicalResult StaticFolder::analyze(Class &cls) {
   auto *body = cls.model.getBodyBlock();
   unsigned numInputs = cls.inputNames.size();
@@ -859,32 +976,27 @@ LogicalResult StaticFolder::analyze(Class &cls) {
   cls.inputToOutput.resize(numInputs);
   for (auto &deps : cls.deps)
     cls.inputToOutput |= deps;
+  // Backward from each output, through the logic, stopping at registers,
+  // registered reads and black boxes.
   DenseMap<Value, int> toOutput;
-  std::function<int(Value)> levelsTo = [&](Value value) -> int {
-    if (auto it = toOutput.find(value); it != toOutput.end())
-      return it->second;
-    toOutput[value] = 0;
-    int levels = 0;
-    if (auto *op = value.getDefiningOp()) {
-      auto read = dyn_cast<seq::FirMemReadOp>(op);
-      auto memory = read ? read.getMemory().getDefiningOp<seq::FirMemOp>()
-                         : seq::FirMemOp();
-      if (read && (!memory || memory.getReadLatency() == 0))
-        levels = 1 + levelsTo(read.getAddress());
-      else if (!read && !isa<seq::FirRegOp, hw::InstanceOp>(op))
-        for (auto operand : op->getOperands())
-          levels = std::max(levels, logicLevels(op) + levelsTo(operand));
-    }
-    return toOutput[value] = levels;
+  auto into = [](Value value, SmallVectorImpl<std::pair<Value, int>> &edges) {
+    auto *op = value.getDefiningOp();
+    if (!op)
+      return;
+    auto read = dyn_cast<seq::FirMemReadOp>(op);
+    auto memory = read ? read.getMemory().getDefiningOp<seq::FirMemOp>()
+                       : seq::FirMemOp();
+    if (read && (!memory || memory.getReadLatency() == 0))
+      edges.push_back({read.getAddress(), 1});
+    else if (!read && !isa<seq::FirRegOp, hw::InstanceOp>(op))
+      for (auto operand : op->getOperands())
+        edges.push_back({operand, logicLevels(op)});
   };
   for (auto operand : output->getOperands())
-    cls.outputDepth.push_back(levelsTo(operand));
+    cls.outputDepth.push_back(longestPath(operand, toOutput, into));
+  // Forward from each input, up to the state it reaches.
   DenseMap<Value, int> toState;
-  std::function<int(Value)> levelsFrom = [&](Value value) -> int {
-    if (auto it = toState.find(value); it != toState.end())
-      return it->second;
-    toState[value] = 0;
-    int levels = 0;
+  auto outOf = [](Value value, SmallVectorImpl<std::pair<Value, int>> &edges) {
     for (auto &use : value.getUses()) {
       auto *user = use.getOwner();
       if (isa<seq::FirRegOp, seq::FirMemWriteOp, hw::InstanceOp, hw::OutputOp>(
@@ -893,16 +1005,15 @@ LogicalResult StaticFolder::analyze(Class &cls) {
       if (auto read = dyn_cast<seq::FirMemReadOp>(user)) {
         auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
         if (!memory || memory.getReadLatency() == 0)
-          levels = std::max(levels, 1 + levelsFrom(read.getData()));
+          edges.push_back({read.getData(), 1});
         continue;
       }
       for (auto result : user->getResults())
-        levels = std::max(levels, logicLevels(user) + levelsFrom(result));
+        edges.push_back({result, logicLevels(user)});
     }
-    return toState[value] = levels;
   };
   for (auto arg : body->getArguments())
-    cls.inputDepth.push_back(levelsFrom(arg));
+    cls.inputDepth.push_back(longestPath(arg, toState, outOf));
   return success();
 }
 
@@ -965,15 +1076,18 @@ static bool ringOrder(const Class &cls, unsigned ii) {
   if (cls.threads() < 2)
     return false;
   SmallVector<std::tuple<int, unsigned, unsigned>> passes;
-  for (unsigned i = 0; i < cls.threads(); ++i)
-    for (auto pass : {kReady, kState}) {
-      if (pass == kReady && !cls.hasReady)
-        continue;
-      int s = cls.slot[pass][i];
+  for (unsigned i = 0; i < cls.threads(); ++i) {
+    for (unsigned l = 0; l < cls.readyLevels; ++l) {
+      int s = cls.readySlots(l)[i];
       if (s < 0 || s >= int(ii))
         return false;
-      passes.push_back({s, unsigned(pass), i});
+      passes.push_back({s, unsigned(kReady), i});
     }
+    int s = cls.slot[kState][i];
+    if (s < 0 || s >= int(ii))
+      return false;
+    passes.push_back({s, unsigned(kState), i});
+  }
   llvm::sort(passes);
   for (unsigned n = 1; n < passes.size(); ++n)
     if (std::get<0>(passes[n]) == std::get<0>(passes[n - 1]))
@@ -997,16 +1111,11 @@ static bool ringOrder(const Class &cls, unsigned ii) {
   return current < 0;
 }
 
-unsigned StaticFolder::place(ArrayRef<bool> ready,
-                             SmallVectorImpl<SmallVector<int>> &slots,
-                             SmallVectorImpl<bool> &atReady) {
-  // Which late outputs each class writes at its ready pass: those whose
-  // inputs come from constants, the netlist's inputs, early outputs and late
+void StaticFolder::settleReady(ReadyWrites &writes) {
+  // A late output stays at its ready pass while every input it depends on
+  // comes from constants, the netlist's inputs, early outputs and late
   // outputs written at ready passes.
-  atReady.assign(producers.size(), false);
-  for (auto [p, producer] : llvm::enumerate(producers))
-    if (producer.cls >= 0 && producer.late && ready[producer.cls])
-      atReady[p] = true;
+  auto &atReady = writes.atReady;
   auto inputAtFrameStart = [&](unsigned c, unsigned input) {
     int k = classes[c].consumerOf[input];
     if (k < 0)
@@ -1035,30 +1144,261 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
         }
     }
   }
+}
+
+ArrayRef<StaticFolder::Feed> StaticFolder::lateFeeds(unsigned p) {
+  if (feeds.empty()) {
+    feeds.resize(producers.size());
+    for (auto [o, producer] : llvm::enumerate(producers)) {
+      if (producer.cls < 0 || !producer.late)
+        continue;
+      auto &cls = classes[producer.cls];
+      auto &into = feeds[o];
+      for (auto input : cls.deps[producer.port].set_bits()) {
+        int k = cls.consumerOf[input];
+        if (k < 0)
+          continue;
+        for (auto [b, pieces] : llvm::enumerate(consumers[k].pieces))
+          for (auto &piece : pieces)
+            if (piece.producer >= 0 && producers[piece.producer].cls >= 0 &&
+                producers[piece.producer].late)
+              into.push_back({unsigned(piece.producer), piece.inst, unsigned(b)});
+      }
+      llvm::sort(into);
+      into.erase(std::unique(into.begin(), into.end()), into.end());
+    }
+  }
+  return feeds[p];
+}
+
+void StaticFolder::readyLevels(ArrayRef<bool> ready, ReadyWrites &writes) {
+  auto &atReady = writes.atReady;
+  auto &level = writes.level;
+  // Each instance's output written at a ready pass, a node: `first[p] + i`.
+  // It waits for the instances' outputs that feed an input it depends on,
+  // all written at ready passes (`settleReady`).
+  SmallVector<unsigned> first(producers.size(), 0);
+  unsigned numOuts = 0;
+  for (auto [p, at] : llvm::enumerate(atReady))
+    if (at) {
+      first[p] = numOuts;
+      numOuts += classes[producers[p].cls].threads();
+    }
+  SmallVector<unsigned> waiting(numOuts, 0), outEdges(numOuts + 1, 0);
+  SmallVector<std::pair<unsigned, unsigned>> links;
+  for (auto [p, at] : llvm::enumerate(atReady)) {
+    if (!at)
+      continue;
+    for (auto [q, a, b] : lateFeeds(p)) {
+      assert(atReady[q] && "a ready output fed by one at a state pass");
+      links.push_back({first[q] + a, first[p] + b});
+      ++waiting[first[p] + b];
+    }
+  }
+  llvm::sort(links);
+  for (auto [from, to] : links)
+    ++outEdges[from + 1];
+  for (unsigned n = 0; n < numOuts; ++n)
+    outEdges[n + 1] += outEdges[n];
+  // Its rank: the longest chain of such outputs up to it. Outputs that wait
+  // on each other in a cycle form a combinational loop through the ports,
+  // which no choice of passes schedules: then one ready pass per class, and
+  // the frame's cycle is reported as such.
+  SmallVector<unsigned> rank(numOuts, 0), queue;
+  for (unsigned n = 0; n < numOuts; ++n)
+    if (!waiting[n])
+      queue.push_back(n);
+  unsigned done = 0;
+  while (!queue.empty()) {
+    unsigned n = queue.pop_back_val();
+    ++done;
+    for (unsigned e = outEdges[n]; e < outEdges[n + 1]; ++e) {
+      unsigned m = links[e].second;
+      rank[m] = std::max(rank[m], rank[n] + 1);
+      if (!--waiting[m])
+        queue.push_back(m);
+    }
+  }
+  if (done != numOuts)
+    return;
+
+  // Each of a class's outputs a level of its own, in the order of their
+  // highest rank: a pass then has the rank of its output in its instance,
+  // and every link raises it, so no pass waits on itself through others.
+  // With `rank`, the outputs of the same ranks, instance by instance, share
+  // one, for the same reason, and that is all. (Ranked by class instead, a
+  // chain through the instances of a class, a core's per-slice CSR written by
+  // the slices before, each slice's write read by the next, would be a loop.)
+  std::vector<std::map<std::vector<unsigned>, SmallVector<unsigned>>> byRanks(
+      classes.size());
+  for (auto [p, at] : llvm::enumerate(atReady)) {
+    if (!at)
+      continue;
+    unsigned threads = classes[producers[p].cls].threads();
+    std::vector<unsigned> key{0};
+    for (unsigned i = 0; i < threads; ++i) {
+      key.push_back(rank[first[p] + i]);
+      key[0] = std::max(key[0], key.back());
+    }
+    byRanks[producers[p].cls][key].push_back(p);
+  }
+  SmallVector<unsigned> levels(classes.size(), 0);
+  std::vector<SmallVector<unsigned>> outputs(classes.size());
+  bool byRank = readyLevelsMode == "rank";
+  for (auto [c, own] : llvm::enumerate(byRanks))
+    for (auto &[key, outs] : own) {
+      if (byRank) {
+        for (unsigned p : outs)
+          level[p] = levels[c];
+        ++levels[c];
+        continue;
+      }
+      for (unsigned p : outs) {
+        level[p] = levels[c]++;
+        outputs[c].push_back(p);
+      }
+    }
+
+  // Then as few levels as keep the passes acyclic, instance by instance:
+  // class by class, each output in rank order joins the first level that
+  // keeps them so, or starts its own. The classes of the most instances
+  // first, while the others' levels are still the finest: a level costs a
+  // pass per instance.
+  SmallVector<unsigned> passBase(classes.size() + 1, 0);
+  auto passOf = [&](unsigned p, unsigned i) {
+    unsigned c = producers[p].cls;
+    return passBase[c] + i * levels[c] + level[p];
+  };
+  auto acyclic = [&]() {
+    for (auto [c, cls] : llvm::enumerate(classes))
+      passBase[c + 1] = passBase[c] + cls.threads() * levels[c];
+    unsigned numPasses = passBase.back();
+    SmallVector<unsigned> waits(numPasses, 0), edges(numPasses + 1, 0);
+    SmallVector<std::pair<unsigned, unsigned>> passLinks;
+    for (auto [p, at] : llvm::enumerate(atReady)) {
+      if (!at)
+        continue;
+      for (auto [q, a, b] : lateFeeds(p)) {
+        unsigned from = passOf(q, a), to = passOf(p, b);
+        if (from == to)
+          return false;
+        passLinks.push_back({from, to});
+      }
+    }
+    llvm::sort(passLinks);
+    passLinks.erase(std::unique(passLinks.begin(), passLinks.end()),
+                    passLinks.end());
+    for (auto [from, to] : passLinks) {
+      ++edges[from + 1];
+      ++waits[to];
+    }
+    for (unsigned n = 0; n < numPasses; ++n)
+      edges[n + 1] += edges[n];
+    SmallVector<unsigned> sources;
+    for (unsigned n = 0; n < numPasses; ++n)
+      if (!waits[n])
+        sources.push_back(n);
+    unsigned placed = 0;
+    while (!sources.empty()) {
+      unsigned n = sources.pop_back_val();
+      ++placed;
+      for (unsigned e = edges[n]; e < edges[n + 1]; ++e)
+        if (!--waits[passLinks[e].second])
+          sources.push_back(passLinks[e].second);
+    }
+    return placed == numPasses;
+  };
+  SmallVector<unsigned> byThreads(classes.size());
+  for (unsigned c = 0; c < classes.size(); ++c)
+    byThreads[c] = c;
+  llvm::stable_sort(byThreads, [&](unsigned a, unsigned b) {
+    return classes[a].threads() > classes[b].threads();
+  });
+  for (unsigned c : byThreads) {
+    auto &own = outputs[c];
+    if (own.size() < 2)
+      continue;
+    auto place = [&](unsigned g, unsigned l) { level[own[g]] = l; };
+    // The outputs not yet placed past every level, each its own: a
+    // relabeling of the levels by rank, so acyclic.
+    for (unsigned g = 0; g < own.size(); ++g)
+      place(g, own.size() + g);
+    levels[c] = 2 * own.size();
+    unsigned kept = 0;
+    for (unsigned g = 0; g < own.size(); ++g) {
+      bool joined = false;
+      for (unsigned l = 0; l < kept && !joined; ++l) {
+        place(g, l);
+        joined = acyclic();
+      }
+      if (!joined)
+        place(g, kept++);
+    }
+    levels[c] = kept;
+  }
+  for (unsigned c = 0; c < classes.size(); ++c)
+    if (ready[c])
+      writes.passes[c] = std::max(1u, levels[c]);
+}
+
+void StaticFolder::frameGraph(ArrayRef<bool> ready, ReadyWrites &writes,
+                              FrameGraph &graph, bool keepWhy) {
+  // Which late outputs each class writes at its ready pass: those whose
+  // inputs come from constants, the netlist's inputs, early outputs and late
+  // outputs written at ready passes; split by level, at which.
+  auto &atReady = writes.atReady;
+  atReady.assign(producers.size(), false);
+  writes.level.assign(producers.size(), 0);
+  for (auto [p, producer] : llvm::enumerate(producers))
+    if (producer.cls >= 0 && producer.late && ready[producer.cls])
+      atReady[p] = true;
+  settleReady(writes);
+  writes.passes.assign(classes.size(), 0);
+  for (unsigned c = 0; c < classes.size(); ++c)
+    writes.passes[c] = ready[c] ? 1 : 0;
+  if (splitReady)
+    readyLevels(ready, writes);
+  writes.laterRow.assign(classes.size(), 0);
+  writes.rows = classes.size() * 2;
+  for (unsigned c = 0; c < classes.size(); ++c) {
+    writes.laterRow[c] = writes.rows;
+    if (writes.passes[c] > 1)
+      writes.rows += writes.passes[c] - 1;
+  }
 
   // The evaluations, and what each waits for within the frame.
-  std::vector<Node> nodes;
-  std::map<std::tuple<unsigned, unsigned, unsigned>, unsigned> nodeIndex;
+  auto &nodes = graph.nodes;
+  auto &preds = graph.preds;
+  nodes.clear();
+  std::map<std::tuple<unsigned, unsigned, unsigned, unsigned>, unsigned>
+      nodeIndex;
   for (auto [c, cls] : llvm::enumerate(classes))
     for (unsigned i = 0; i < cls.threads(); ++i)
-      for (auto pass : {kReady, kState}) {
-        if (pass == kReady && !ready[c])
-          continue;
-        nodeIndex[{c, i, pass}] = nodes.size();
-        nodes.push_back({unsigned(c), i, pass});
-      }
-  std::vector<SmallVector<std::pair<unsigned, int>>> preds(nodes.size());
+      for (auto pass : {kReady, kState})
+        for (unsigned l = 0; l < (pass == kReady ? writes.passes[c] : 1);
+             ++l) {
+          nodeIndex[{c, i, pass, l}] = nodes.size();
+          nodes.push_back({unsigned(c), i, pass, l});
+        }
+  preds.assign(nodes.size(), {});
+  graph.why.assign(keepWhy ? nodes.size() : 0, {});
   for (auto [n, node] : llvm::enumerate(nodes)) {
     auto &cls = classes[node.cls];
-    if (node.pass == kState && ready[node.cls])
-      preds[n].push_back({nodeIndex[{node.cls, node.inst, kReady}], 1});
+    if (node.pass == kState)
+      for (unsigned l = 0; l < writes.passes[node.cls]; ++l) {
+        preds[n].push_back({nodeIndex[{node.cls, node.inst, kReady, l}], 1});
+        if (keepWhy)
+          graph.why[n].push_back({});
+      }
     // The inputs this pass reads: all of them for the state pass, those the
-    // outputs it writes depend on for the ready pass.
+    // outputs it writes depend on for a ready pass.
     llvm::BitVector reads(cls.inputNames.size(), node.pass == kState);
     if (node.pass == kReady)
-      for (auto [o, late] : llvm::enumerate(cls.late))
-        if (atReady[cls.producerOf[o]])
+      for (auto [o, late] : llvm::enumerate(cls.late)) {
+        unsigned p = cls.producerOf[o];
+        if (atReady[p] && writes.level[p] == node.level)
           reads |= cls.deps[o];
+      }
     for (auto input : reads.set_bits()) {
       int k = cls.consumerOf[input];
       if (k < 0)
@@ -1069,47 +1409,94 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
         auto &producer = producers[piece.producer];
         if (producer.cls < 0 || !producer.late)
           continue;
-        auto pass = atReady[piece.producer] ? kReady : kState;
+        auto pass = writes.passOf(piece.producer);
+        unsigned l = pass == kReady ? writes.level[piece.producer] : 0;
         preds[n].push_back(
-            {nodeIndex[{unsigned(producer.cls), piece.inst, pass}],
+            {nodeIndex[{unsigned(producer.cls), piece.inst, pass, l}],
              zeroLink(piece.producer, node.cls, input)
                  ? 0
                  : linkLatency + crossDelay(producer.cls, node.cls)});
+        if (keepWhy)
+          graph.why[n].push_back({piece.producer, unsigned(input)});
       }
     }
   }
+}
 
-  // Longest path to a sink, as the priority; a cycle fails.
+/// The slots of the evaluations `nodes` placed at `slotOf`, by row (`ReadyWrites::row`), each instance's.
+static void assignSlots(const ReadyWrites &writes, ArrayRef<Node> nodes,
+                        ArrayRef<int> slotOf,
+                        SmallVectorImpl<SmallVector<int>> &slots,
+                        ArrayRef<Class> classes) {
+  slots.assign(writes.rows, {});
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    for (auto pass : {kReady, kState})
+      slots[c * 2 + pass].assign(cls.threads(), -1);
+    for (unsigned l = 1; l < writes.passes[c]; ++l)
+      slots[writes.row(c, kReady, l)].assign(cls.threads(), -1);
+  }
+  for (auto [n, node] : llvm::enumerate(nodes))
+    slots[writes.row(node.cls, node.pass, node.level)][node.inst] = slotOf[n];
+}
+
+/// An instance's first evaluation of the frame.
+static int firstSlot(const ReadyWrites &writes,
+                     ArrayRef<SmallVector<int>> slots, unsigned c, unsigned i) {
+  int at = slots[c * 2 + kState][i];
+  for (unsigned l = 0; l < writes.passes[c]; ++l)
+    at = std::min(at, slots[writes.row(c, kReady, l)][i]);
+  return at;
+}
+
+/// The row of the slots of the pass producer `p` is written at.
+static unsigned writeRow(const ReadyWrites &writes, const Producer &producer,
+                         unsigned p) {
+  return writes.atReady[p]
+             ? writes.row(producer.cls, kReady, writes.level[p])
+             : writes.row(producer.cls, kState);
+}
+
+unsigned StaticFolder::place(ArrayRef<bool> ready,
+                             SmallVectorImpl<SmallVector<int>> &slots,
+                             ReadyWrites &writes) {
+  FrameGraph graph;
+  frameGraph(ready, writes, graph, /*keepWhy=*/false);
+  auto &nodes = graph.nodes;
+  auto &preds = graph.preds;
+
+  // Longest path to a sink, as the priority; a cycle fails. Depth first
+  // without recursion: copies make thousands of evaluations.
   SmallVector<int> height(nodes.size(), -1), state(nodes.size(), 0);
   std::vector<SmallVector<std::pair<unsigned, int>>> succs(nodes.size());
   for (unsigned n = 0; n < nodes.size(); ++n)
     for (auto [p, latency] : preds[n])
       succs[p].push_back({n, latency});
-  SmallVector<unsigned> order;
-  bool cyclic = false;
-  std::function<void(unsigned)> dfs = [&](unsigned n) {
-    state[n] = 1;
-    int h = 0;
-    for (auto [s, latency] : succs[n]) {
-      if (state[s] == 1) {
-        cyclic = true;
+  for (unsigned root = 0; root < nodes.size(); ++root) {
+    if (state[root])
+      continue;
+    // Each entry: an evaluation and the next of its successors to visit.
+    SmallVector<std::pair<unsigned, unsigned>> stack{{root, 0}};
+    state[root] = 1;
+    while (!stack.empty()) {
+      auto &[n, next] = stack.back();
+      if (next < succs[n].size()) {
+        unsigned s = succs[n][next++].first;
+        if (state[s] == 1)
+          return 0;
+        if (state[s] == 0) {
+          state[s] = 1;
+          stack.push_back({s, 0});
+        }
         continue;
       }
-      if (state[s] == 0)
-        dfs(s);
-      h = std::max(h, height[s] + latency);
+      int h = 0;
+      for (auto [s, latency] : succs[n])
+        h = std::max(h, height[s] + latency);
+      height[n] = h;
+      state[n] = 2;
+      stack.pop_back();
     }
-    height[n] = h;
-    state[n] = 2;
-    order.push_back(n);
-  };
-  for (unsigned n = 0; n < nodes.size(); ++n)
-    if (!state[n])
-      dfs(n);
-  if (cyclic)
-    return 0;
-  std::reverse(order.begin(), order.end());
-
+  }
 
   // List scheduling: in topological order, highest first among the ready.
   SmallVector<int> slotOf(nodes.size(), -1);
@@ -1146,23 +1533,16 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
       }
   }
 
-  slots.assign(classes.size() * 2, {});
-  for (auto [c, cls] : llvm::enumerate(classes))
-    for (auto pass : {kReady, kState})
-      slots[c * 2 + pass].assign(cls.threads(), -1);
+  assignSlots(writes, nodes, slotOf, slots, classes);
   int length = 0;
-  for (auto [n, node] : llvm::enumerate(nodes)) {
-    slots[node.cls * 2 + node.pass][node.inst] = slotOf[n];
+  for (unsigned n = 0; n < nodes.size(); ++n)
     length = std::max(length, slotOf[n] + 1);
-  }
 
   // Across frames: an instance's next read of its state after its write (a
   // threaded class's registers written a host cycle late, from a stage); an
   // early output's reads in the next frame after its write.
   auto first = [&](unsigned c, unsigned i) {
-    int s = slots[c * 2 + kState][i];
-    int r = slots[c * 2 + kReady][i];
-    return r >= 0 ? std::min(r, s) : s;
+    return firstSlot(writes, slots, c, i);
   };
   for (auto [c, cls] : llvm::enumerate(classes))
     for (unsigned i = 0; i < cls.threads(); ++i) {
@@ -1209,8 +1589,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
       }
       if (producer.late)
         outputEarly[k] = false;
-      auto pass = atReady[piece.producer] ? kReady : kState;
-      at = std::max(at, slots[producer.cls * 2 + pass][piece.inst] +
+      at = std::max(at, slots[writeRow(writes, producer, piece.producer)][piece.inst] +
                             linkLatency - 1);
     }
     outputSlot[k] = at;
@@ -1238,7 +1617,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     SmallVector<SmallVector<int>> overlapped;
     SmallVector<int> aloneSlot = outputSlot;
     SmallVector<bool> aloneEarly = outputEarly;
-    unsigned period = placeModulo(nodes, preds, succs, height, atReady, overlapped);
+    unsigned period = placeModulo(nodes, preds, succs, height, writes, overlapped);
     if (period && period < unsigned(length)) {
       slots = std::move(overlapped);
       return period;
@@ -1252,7 +1631,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
 unsigned StaticFolder::placeModulo(
     ArrayRef<Node> nodes, ArrayRef<SmallVector<std::pair<unsigned, int>>> preds,
     ArrayRef<SmallVector<std::pair<unsigned, int>>> succs, ArrayRef<int> height,
-    ArrayRef<bool> atReady, SmallVectorImpl<SmallVector<int>> &slots) {
+    const ReadyWrites &writes, SmallVectorImpl<SmallVector<int>> &slots) {
+  auto &atReady = writes.atReady;
   // No frame is shorter than a copy's evaluations of it.
   SmallVector<unsigned> evaluations(classes.size(), 0);
   for (auto &node : nodes)
@@ -1344,8 +1724,9 @@ unsigned StaticFolder::placeModulo(
       // A netlist output's token leaves in time for the environment.
       for (auto port : classes[node.cls].producerOf) {
         auto &producer = producers[port];
-        bool at = producer.late && atReady[port] ? node.pass == kReady
-                                                  : node.pass == kState;
+        bool at = producer.late && atReady[port]
+                      ? node.pass == kReady && node.level == writes.level[port]
+                      : node.pass == kState;
         if (!feedsOutput[port] || !at)
           continue;
         latest = std::min<int>(latest, int(period) - linkLatency + 1 -
@@ -1365,19 +1746,15 @@ unsigned StaticFolder::placeModulo(
       slotOf[n] = at;
     }
 
-    slots.assign(classes.size() * 2, {});
-    for (auto [c, cls] : llvm::enumerate(classes))
-      for (auto pass : {kReady, kState})
-        slots[c * 2 + pass].assign(cls.threads(), -1);
-    for (auto [n, node] : llvm::enumerate(nodes))
-      slots[node.cls * 2 + node.pass][node.inst] = slotOf[n];
+    assignSlots(writes, nodes, slotOf, slots, classes);
     auto first = [&](unsigned c, unsigned i) {
-      int s = slots[c * 2 + kState][i];
-      int r = slots[c * 2 + kReady][i];
-      return r >= 0 ? std::min(r, s) : s;
+      return firstSlot(writes, slots, c, i);
     };
     auto last = [&](unsigned c, unsigned i) {
-      return std::max(slots[c * 2 + kState][i], slots[c * 2 + kReady][i]);
+      int at = slots[c * 2 + kState][i];
+      for (unsigned l = 0; l < writes.passes[c]; ++l)
+        at = std::max(at, slots[writes.row(c, kReady, l)][i]);
+      return at;
     };
     bool ok = true;
     // An instance's next frame reads its state after this one's write.
@@ -1433,8 +1810,7 @@ unsigned StaticFolder::placeModulo(
         }
         if (producer.late)
           outputEarly[k] = false;
-        auto pass = atReady[piece.producer] ? kReady : kState;
-        at = std::max(at, slots[producer.cls * 2 + pass][piece.inst] +
+        at = std::max(at, slots[writeRow(writes, producer, piece.producer)][piece.inst] +
                               linkLatency - 1);
       }
       outputSlot[k] = at;
@@ -1445,6 +1821,473 @@ unsigned StaticFolder::placeModulo(
       return period;
   }
   return 0;
+}
+
+/// The bits of a model's output `o` that depend combinationally on its input
+/// `input`, as `[low, high)` runs: the output split along its wiring
+/// (concatenations, extracts, bitcasts, array and struct creation), each
+/// piece's logic searched up to registers, registered reads and black boxes.
+static SmallVector<std::pair<unsigned, unsigned>>
+outputBitsOn(hw::HWModuleOp model, unsigned o, unsigned input) {
+  auto *body = model.getBodyBlock();
+  Value root = body->getTerminator()->getOperand(o);
+  // Whether a value reaches the input: depth first, without recursion.
+  DenseMap<Value, bool> reaches;
+  auto search = [&](Value start) {
+    SmallVector<std::pair<Value, bool>> stack{{start, false}};
+    while (!stack.empty()) {
+      auto [value, expanded] = stack.pop_back_val();
+      if (!expanded && reaches.count(value))
+        continue;
+      if (auto arg = dyn_cast<BlockArgument>(value)) {
+        reaches[value] = arg.getArgNumber() == input;
+        continue;
+      }
+      auto *op = value.getDefiningOp();
+      SmallVector<Value> operands;
+      if (isa<seq::FirRegOp, hw::ConstantOp, hw::AggregateConstantOp,
+              hw::InstanceOp>(op)) {
+        reaches[value] = false;
+        continue;
+      }
+      if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+        auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+        if (memory && memory.getReadLatency() > 0) {
+          reaches[value] = false;
+          continue;
+        }
+        operands.push_back(read.getAddress());
+        if (read.getEnable())
+          operands.push_back(read.getEnable());
+      } else {
+        operands.append(op->operand_begin(), op->operand_end());
+      }
+      if (!expanded) {
+        reaches[value] = false;
+        stack.push_back({value, true});
+        for (auto operand : operands)
+          if (!reaches.count(operand))
+            stack.push_back({operand, false});
+        continue;
+      }
+      reaches[value] = llvm::any_of(
+          operands, [&](Value operand) { return reaches.lookup(operand); });
+    }
+    return reaches.lookup(start);
+  };
+  // The output's pieces: a value's bits [low, low + width) at output bit at.
+  SmallVector<std::pair<unsigned, unsigned>> runs;
+  struct Item {
+    Value value;
+    unsigned low, width, at;
+  };
+  SmallVector<Item> work{
+      {root, 0, unsigned(hw::getBitWidth(root.getType())), 0}};
+  auto split = [&](const Item &item, ValueRange operands) {
+    // The first operand the most significant.
+    unsigned base = 0;
+    for (auto operand : llvm::reverse(operands)) {
+      unsigned w = hw::getBitWidth(operand.getType());
+      unsigned lo = std::max(item.low, base);
+      unsigned hi = std::min(item.low + item.width, base + w);
+      if (lo < hi)
+        work.push_back({operand, lo - base, hi - lo, item.at + lo - item.low});
+      base += w;
+    }
+  };
+  while (!work.empty()) {
+    auto item = work.pop_back_val();
+    auto *op = item.value.getDefiningOp();
+    if (auto concat = dyn_cast_or_null<comb::ConcatOp>(op)) {
+      split(item, concat.getInputs());
+      continue;
+    }
+    if (auto create = dyn_cast_or_null<hw::ArrayCreateOp>(op)) {
+      split(item, create.getInputs());
+      continue;
+    }
+    if (auto create = dyn_cast_or_null<hw::StructCreateOp>(op)) {
+      split(item, create.getInput());
+      continue;
+    }
+    if (auto extract = dyn_cast_or_null<comb::ExtractOp>(op)) {
+      work.push_back({extract.getInput(), item.low + extract.getLowBit(),
+                      item.width, item.at});
+      continue;
+    }
+    if (auto bitcast = dyn_cast_or_null<hw::BitcastOp>(op)) {
+      work.push_back({bitcast.getInput(), item.low, item.width, item.at});
+      continue;
+    }
+    if (search(item.value))
+      runs.push_back({item.at, item.at + item.width});
+  }
+  llvm::sort(runs);
+  SmallVector<std::pair<unsigned, unsigned>> merged;
+  for (auto run : runs)
+    if (!merged.empty() && merged.back().second >= run.first)
+      merged.back().second = std::max(merged.back().second, run.second);
+    else
+      merged.push_back(run);
+  return merged;
+}
+
+/// Bit runs as `[hi:lo]` lists, the first few.
+static std::string printRuns(ArrayRef<std::pair<unsigned, unsigned>> runs,
+                             unsigned width) {
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  if (runs.size() == 1 && runs[0].first == 0 && runs[0].second == width)
+    return "all " + std::to_string(width) + " bits";
+  unsigned bits = 0;
+  for (auto [lo, hi] : runs)
+    bits += hi - lo;
+  os << bits << " of " << width << " bits:";
+  for (auto [n, run] : llvm::enumerate(runs)) {
+    if (n == 6) {
+      os << " ...";
+      break;
+    }
+    os << " [" << run.second - 1;
+    if (run.second - 1 != run.first)
+      os << ":" << run.first;
+    os << "]";
+  }
+  return text;
+}
+
+void StaticFolder::explainCycle(ArrayRef<bool> ready,
+                                InFlightDiagnostic &diag) {
+  ReadyWrites writes;
+  FrameGraph graph;
+  frameGraph(ready, writes, graph, /*keepWhy=*/true);
+  auto &atReady = writes.atReady;
+  auto &nodes = graph.nodes;
+  auto &preds = graph.preds;
+  unsigned numNodes = nodes.size();
+  // Each edge by its head: (the evaluation that waits, its wait's index).
+  std::vector<SmallVector<std::pair<unsigned, unsigned>>> succs(numNodes);
+  for (unsigned n = 0; n < numNodes; ++n)
+    for (auto [k, pred] : llvm::enumerate(preds[n]))
+      succs[pred.first].push_back({n, unsigned(k)});
+
+  // A shortest cycle: breadth first from each evaluation back to itself.
+  SmallVector<std::pair<unsigned, unsigned>> cycle;
+  SmallVector<unsigned> seen(numNodes, 0), dist(numNodes, 0);
+  SmallVector<std::pair<unsigned, unsigned>> via(numNodes);
+  for (unsigned root = 0; root < numNodes; ++root) {
+    std::deque<unsigned> queue{root};
+    seen[root] = root + 1;
+    dist[root] = 0;
+    bool found = false;
+    while (!queue.empty() && !found) {
+      unsigned u = queue.front();
+      queue.pop_front();
+      if (!cycle.empty() && dist[u] + 1 >= cycle.size())
+        break;
+      for (auto [v, k] : succs[u]) {
+        if (v == root) {
+          cycle.assign({{v, k}});
+          for (unsigned w = u; w != root; w = preds[w][via[w].second].first)
+            cycle.push_back(via[w]);
+          std::reverse(cycle.begin(), cycle.end());
+          found = true;
+          break;
+        }
+        if (seen[v] == root + 1)
+          continue;
+        seen[v] = root + 1;
+        dist[v] = dist[u] + 1;
+        via[v] = {v, k};
+        queue.push_back(v);
+      }
+    }
+  }
+  if (cycle.empty())
+    return;
+
+  auto nodeName = [&](unsigned n) {
+    auto &node = nodes[n];
+    auto &cls = classes[node.cls];
+    std::string pass = node.pass == kReady ? "ready pass" : "state pass";
+    if (node.pass == kReady && writes.passes[node.cls] > 1)
+      pass = "ready pass " + std::to_string(node.level + 1) + " of " +
+             std::to_string(writes.passes[node.cls]);
+    return (cls.name + " #" + std::to_string(node.inst) + " (" +
+            cls.instances[node.inst].getInstanceName() + ") " + pass)
+        .str();
+  };
+  auto outputName = [&](int p) {
+    auto &producer = producers[p];
+    return "'" + classes[producer.cls].outputNames[producer.port] + "'";
+  };
+  auto inputName = [&](unsigned c, unsigned input) {
+    return "'" + classes[c].inputNames[input] + "'";
+  };
+  // The first input of a late output fed by a late output not written at a
+  // ready pass: what keeps it from its class's ready pass.
+  auto blocker = [&](int p) -> std::pair<int, int> {
+    auto &producer = producers[p];
+    auto &cls = classes[producer.cls];
+    for (auto input : cls.deps[producer.port].set_bits()) {
+      int k = cls.consumerOf[input];
+      if (k < 0)
+        continue;
+      for (auto &pieces : consumers[k].pieces)
+        for (auto &piece : pieces)
+          if (piece.producer >= 0 && producers[piece.producer].cls >= 0 &&
+              producers[piece.producer].late && !atReady[piece.producer])
+            return {int(input), piece.producer};
+    }
+    return {-1, -1};
+  };
+
+  unsigned numReady = llvm::count(ready, true);
+  diag << "\n  a shortest cycle, " << cycle.size() << " edge"
+       << (cycle.size() == 1 ? "" : "s") << ", with " << numReady << " of "
+       << classes.size() << " models given a ready pass (every model with "
+       << "late outputs: the most outputs written at ready passes)";
+  if (splitReady) {
+    diag << ", their ready outputs split by level";
+    unsigned shown = 0;
+    for (auto [c, cls] : llvm::enumerate(classes))
+      if (writes.passes[c] > 1)
+        diag << (shown++ ? ", " : " (") << cls.name << ": "
+             << writes.passes[c] << " ready passes";
+    diag << (shown ? ")" : " (one ready pass each)");
+  }
+  diag << ":";
+  for (auto [e, edge] : llvm::enumerate(cycle)) {
+    auto [v, k] = edge;
+    unsigned u = preds[v][k].first;
+    int latency = preds[v][k].second;
+    auto &wait = graph.why[v][k];
+    auto &tail = nodes[u];
+    auto &head = nodes[v];
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    os << "cycle edge " << e + 1 << " of " << cycle.size() << ": "
+       << nodeName(u) << " -> " << nodeName(v) << ": ";
+    if (wait.producer < 0) {
+      os << "an instance's ready pass precedes its state pass";
+      diag.attachNote(classes[head.cls].instances[head.inst].getLoc()) << text;
+      continue;
+    }
+    auto &consumerCls = classes[head.cls];
+    os << "output " << outputName(wait.producer) << " -> input "
+       << inputName(head.cls, wait.input) << " ("
+       << (latency == 0   ? std::string("zero-latency link")
+           : latency == 1 ? std::string("1 host cycle")
+                          : std::to_string(latency) + " host cycles")
+       << ")";
+    // Which bits of the input the producer's output drives.
+    int k2 = consumerCls.consumerOf[wait.input];
+    unsigned bits = 0;
+    for (auto &piece : consumers[k2].pieces[head.inst])
+      if (piece.producer == wait.producer && piece.inst == tail.inst)
+        bits += piece.width;
+    os << ", " << bits << " of the input's " << consumers[k2].width
+       << " bits.";
+    // Why the producer writes it within the frame: what makes it late.
+    {
+      auto &producerCls = classes[tail.cls];
+      auto &deps = producerCls.deps[producers[wait.producer].port];
+      os << " " << outputName(wait.producer) << " is late: ";
+      if (deps.none()) {
+        os << "it depends on a combinational memory read or a black box, no "
+              "input.";
+      } else {
+        os << "it depends combinationally on " << classes[tail.cls].name
+           << "'s input" << (deps.count() == 1 ? "" : "s");
+        unsigned shown = 0;
+        for (auto input : deps.set_bits())
+          if (shown++ < 4)
+            os << " " << inputName(tail.cls, input);
+        if (shown > 4)
+          os << " and " << shown - 4 << " more";
+        os << ".";
+      }
+    }
+    // Why the consumer's pass reads it.
+    if (head.pass == kState) {
+      os << " A state pass reads every input.";
+    } else {
+      os << " The ready pass reads it for its outputs";
+      unsigned shown = 0;
+      for (auto [o, deps] : llvm::enumerate(consumerCls.deps))
+        if (atReady[consumerCls.producerOf[o]] &&
+            writes.level[consumerCls.producerOf[o]] == head.level &&
+            deps.test(wait.input) && shown++ < 4)
+          os << " '" << consumerCls.outputNames[o] << "'";
+      if (shown > 4)
+        os << " and " << shown - 4 << " more";
+      os << ".";
+    }
+    // Whether the producer's pass could be a ready pass.
+    if (tail.pass == kState) {
+      if (!ready[tail.cls]) {
+        os << " Breakable: " << outputName(wait.producer)
+           << " could be written at a ready pass of " << classes[tail.cls].name
+           << ", which this choice does not give it.";
+      } else {
+        auto [input, from] = blocker(wait.producer);
+        os << " Not broken by " << classes[tail.cls].name
+           << "'s ready pass: " << outputName(wait.producer)
+           << " depends combinationally on input "
+           << (input >= 0 ? inputName(tail.cls, input) : "?") << ", fed by "
+           << (from >= 0 ? classes[producers[from].cls].name + " output " +
+                               outputName(from)
+                         : "?")
+           << ", which is written at a state pass.";
+      }
+    }
+    // Through the consumer: whether the output the cycle leaves by depends
+    // on this input.
+    auto [nv, nk] = cycle[(e + 1) % cycle.size()];
+    auto &next = graph.why[nv][nk];
+    if (head.pass == kReady && next.producer >= 0) {
+      auto &out = producers[next.producer];
+      bool through = consumerCls.deps[out.port].test(wait.input);
+      if (through) {
+        auto runs = outputBitsOn(consumerCls.model, out.port, wait.input);
+        os << " Through " << consumerCls.name << ": its output "
+           << outputName(next.producer) << " depends combinationally on "
+           << inputName(head.cls, wait.input) << " ("
+           << printRuns(runs, out.width)
+           << " of the output): a combinational path through the model.";
+      } else {
+        os << " Through " << consumerCls.name << ": its output "
+           << outputName(next.producer) << " does not depend on "
+           << inputName(head.cls, wait.input)
+           << "; the cycle closes only because one ready pass writes all of "
+           << consumerCls.name << "'s ready outputs (a second ready pass "
+           << "would break it).";
+      }
+    }
+    diag.attachNote(classes[head.cls].instances[head.inst].getLoc()) << text;
+  }
+
+  // Whether ready passes split by output would do: each instance's late
+  // output written once the late outputs feeding the inputs it depends on
+  // are. A cycle left then is a combinational loop through the ports.
+  std::map<std::pair<unsigned, unsigned>, unsigned> outNode;
+  SmallVector<std::pair<unsigned, unsigned>> outs;
+  for (auto [p, producer] : llvm::enumerate(producers))
+    if (producer.cls >= 0 && producer.late)
+      for (unsigned i = 0; i < classes[producer.cls].threads(); ++i) {
+        outNode[{unsigned(p), i}] = outs.size();
+        outs.push_back({unsigned(p), i});
+      }
+  // Per output node, the output nodes it waits for and through which input.
+  std::vector<SmallVector<std::pair<unsigned, unsigned>>> waits(outs.size());
+  std::vector<SmallVector<unsigned>> feeds(outs.size());
+  for (auto [n, out] : llvm::enumerate(outs)) {
+    auto [p, i] = out;
+    auto &cls = classes[producers[p].cls];
+    std::set<unsigned> from;
+    for (auto input : cls.deps[producers[p].port].set_bits()) {
+      int k = cls.consumerOf[input];
+      if (k < 0)
+        continue;
+      for (auto &piece : consumers[k].pieces[i])
+        if (piece.producer >= 0 && producers[piece.producer].cls >= 0 &&
+            producers[piece.producer].late) {
+          unsigned m = outNode[{unsigned(piece.producer), piece.inst}];
+          if (from.insert(m).second) {
+            waits[n].push_back({m, unsigned(input)});
+            feeds[m].push_back(n);
+          }
+        }
+    }
+  }
+  // A cycle, depth first without recursion, then a shortest one through it.
+  SmallVector<unsigned> color(outs.size(), 0), parent(outs.size(), 0);
+  SmallVector<unsigned> loop;
+  for (unsigned root = 0; root < outs.size() && loop.empty(); ++root) {
+    if (color[root])
+      continue;
+    SmallVector<std::pair<unsigned, unsigned>> stack{{root, 0}};
+    color[root] = 1;
+    while (!stack.empty() && loop.empty()) {
+      auto &[n, next] = stack.back();
+      if (next < feeds[n].size()) {
+        unsigned s = feeds[n][next++];
+        if (color[s] == 1) {
+          for (unsigned w = n; w != s; w = parent[w])
+            loop.push_back(w);
+          loop.push_back(s);
+        } else if (!color[s]) {
+          color[s] = 1;
+          parent[s] = n;
+          stack.push_back({s, 0});
+        }
+        continue;
+      }
+      color[n] = 2;
+      stack.pop_back();
+    }
+  }
+  if (loop.empty()) {
+    diag.attachNote(netlist.getLoc())
+        << "with a ready pass per late output instead (each written once the "
+           "outputs feeding the inputs it depends on are), the frame has no "
+           "cycle: no path through the ports is combinational, so the netlist "
+           "is legal and the schedule needs the models on the cycle to write "
+           "their ready outputs in more than one pass";
+    return;
+  }
+  // Shortest, through the found loop's outputs: breadth first back to each.
+  SmallVector<unsigned> best;
+  SmallVector<int> back(outs.size(), -1);
+  for (unsigned root : loop) {
+    std::fill(back.begin(), back.end(), -1);
+    std::deque<unsigned> queue{root};
+    back[root] = root;
+    while (!queue.empty()) {
+      unsigned u = queue.front();
+      queue.pop_front();
+      bool closed = false;
+      for (unsigned v : feeds[u]) {
+        if (v == root) {
+          SmallVector<unsigned> path;
+          for (unsigned w = u; w != root; w = back[w])
+            path.push_back(w);
+          path.push_back(root);
+          std::reverse(path.begin(), path.end());
+          if (best.empty() || path.size() < best.size())
+            best = path;
+          closed = true;
+          break;
+        }
+        if (back[v] < 0) {
+          back[v] = u;
+          queue.push_back(v);
+        }
+      }
+      if (closed)
+        break;
+    }
+  }
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  os << "even with a ready pass per late output the frame has a cycle: a "
+        "combinational loop through the ports, "
+     << best.size() << " output" << (best.size() == 1 ? "" : "s") << ":";
+  for (auto [e, n] : llvm::enumerate(best)) {
+    unsigned m = best[(e + 1) % best.size()];
+    auto [p, i] = outs[n];
+    auto &to = classes[producers[outs[m].first].cls];
+    unsigned input = 0;
+    for (auto [w, in] : waits[m])
+      if (w == n)
+        input = in;
+    os << " " << classes[producers[p].cls].name << " #" << i << " output "
+       << outputName(p) << " -> " << to.name << " #" << outs[m].second
+       << " input " << inputName(producers[outs[m].first].cls, input)
+       << ", on which its output " << outputName(outs[m].first)
+       << " depends;";
+  }
+  diag.attachNote(netlist.getLoc()) << text;
 }
 
 StaticFolder::Choice StaticFolder::searchReady() {
@@ -1467,40 +2310,57 @@ StaticFolder::Choice StaticFolder::searchReady() {
   Choice best;
   auto tryReady = [&](const SmallVector<bool> &ready) {
     SmallVector<SmallVector<int>> slots;
-    SmallVector<bool> atReady;
-    unsigned length = place(ready, slots, atReady);
+    ReadyWrites writes;
+    unsigned length = place(ready, slots, writes);
     if (!length || (best.length && length >= best.length))
       return false;
     best.length = length;
     best.ready = ready;
     best.slots = std::move(slots);
-    best.atReady = std::move(atReady);
+    best.writes = std::move(writes);
     best.outputSlot = outputSlot;
     best.outputEarly = outputEarly;
     return true;
   };
-  for (uint64_t mask = 0; mask < (uint64_t(1) << candidates.size()); ++mask) {
-    SmallVector<bool> ready(classes.size(), false);
-    for (auto [k, c] : llvm::enumerate(candidates))
-      ready[c] = (mask >> k) & 1;
-    if (alike)
-      for (auto [c, cls] : llvm::enumerate(classes))
-        if (cls.splitFrom >= 0)
-          ready[c] = ready[cls.splitFrom];
-    tryReady(ready);
-  }
-  for (bool shorter = alike && best.length; shorter;) {
-    shorter = false;
-    for (auto [c, cls] : llvm::enumerate(classes)) {
-      if (!late(cls))
-        continue;
-      auto ready = best.ready;
-      ready[c] = !ready[c];
-      shorter |= tryReady(ready);
+  auto search = [&] {
+    for (uint64_t mask = 0; mask < (uint64_t(1) << candidates.size());
+         ++mask) {
+      SmallVector<bool> ready(classes.size(), false);
+      for (auto [k, c] : llvm::enumerate(candidates))
+        ready[c] = (mask >> k) & 1;
+      if (alike)
+        for (auto [c, cls] : llvm::enumerate(classes))
+          if (cls.splitFrom >= 0)
+            ready[c] = ready[cls.splitFrom];
+      tryReady(ready);
     }
+    for (bool shorter = alike && best.length; shorter;) {
+      shorter = false;
+      for (auto [c, cls] : llvm::enumerate(classes)) {
+        if (!late(cls))
+          continue;
+        auto ready = best.ready;
+        ready[c] = !ready[c];
+        shorter |= tryReady(ready);
+      }
+    }
+  };
+  // With `auto`, only where one ready pass per class leaves a cycle for every
+  // choice are a class's ready outputs split by level: a schedule found
+  // without is kept as it is (for each assignment of SLR groups alike).
+  // `always` and `rank` split them from the start (schedule).
+  search();
+  if (!best.length && readyLevelsMode == "auto" && !splitReady) {
+    splitReady = true;
+    search();
+    // Split for this choice only; left split when nothing schedules, so the
+    // cycle is named for the split passes (explainCycle).
+    if (best.length)
+      splitReady = false;
   }
   return best;
 }
+
 
 void StaticFolder::linkBits(SmallVectorImpl<SmallVector<uint64_t>> &bits,
                             SmallVectorImpl<SmallVector<unsigned>> &links) const {
@@ -1646,26 +2506,51 @@ LogicalResult StaticFolder::schedule() {
     return netlist.emitError("too many models with late outputs to choose "
                              "their ready passes: ")
            << lateModels;
+  // With `auto`, a class's ready outputs are split by level only where one
+  // ready pass per class leaves a cycle for every choice (searchReady).
+  // `always` splits them from the start (a class whose levels all merge keeps
+  // one ready pass), to exercise the split passes on designs that schedule
+  // without; `rank` too, its levels never merged, a pass per rank of a
+  // class's outputs.
+  if (readyLevelsMode != "off" && readyLevelsMode != "auto" &&
+      readyLevelsMode != "always" && readyLevelsMode != "rank")
+    return netlist.emitError("ready-levels '")
+           << readyLevelsMode << "' is none of off, auto, always and rank";
+  splitReady = readyLevelsMode == "always" || readyLevelsMode == "rank";
   if (slrGroups && failed(chooseGroups()))
     return failure();
   Choice best = searchReady();
-  if (!best.length)
-    return netlist.emitError("the evaluations of a frame depend on each other "
-                             "in a cycle for every choice of ready passes");
+  if (!best.length) {
+    // Named for the choice that writes the most outputs at ready passes:
+    // every model with late outputs given one.
+    SmallVector<bool> ready(classes.size(), false);
+    for (auto [c, cls] : llvm::enumerate(classes))
+      ready[c] = late(cls);
+    auto diag = netlist.emitError("the evaluations of a frame depend on each "
+                                  "other in a cycle for every choice of ready "
+                                  "passes");
+    explainCycle(ready, diag);
+    return diag;
+  }
   ii = best.length;
   outputSlot = best.outputSlot;
   outputEarly = best.outputEarly;
-  for (auto [p, producer] : llvm::enumerate(producers))
-    producer.atReady = best.atReady[p];
+  for (auto [p, producer] : llvm::enumerate(producers)) {
+    producer.atReady = best.writes.atReady[p];
+    producer.readyLevel = best.writes.level[p];
+  }
   for (auto [c, cls] : llvm::enumerate(classes)) {
     cls.hasReady = best.ready[c];
+    cls.readyLevels = best.writes.passes[c];
     cls.slot[kReady] = best.slots[c * 2 + kReady];
     cls.slot[kState] = best.slots[c * 2 + kState];
+    cls.laterReady.clear();
+    for (unsigned l = 1; l < cls.readyLevels; ++l)
+      cls.laterReady.push_back(best.slots[best.writes.row(c, kReady, l)]);
     cls.stateGap = std::numeric_limits<int>::max();
     for (unsigned i = 0; i < cls.threads(); ++i) {
       int s = cls.slot[kState][i];
-      int r = cls.hasReady ? cls.slot[kReady][i] : -1;
-      int first = r >= 0 ? std::min(r, s) : s;
+      int first = firstSlot(best.writes, best.slots, c, i);
       cls.stateGap = std::min(cls.stateGap, first + int(ii) - s);
     }
   }
@@ -1732,26 +2617,36 @@ LogicalResult StaticFolder::schedule() {
   }
   for (auto &cls : classes) {
     os << "  " << cls.name << " x" << cls.threads()
-       << (cls.hasReady ? " (ready pass)" : "") << " state gap "
+       << (cls.readyLevels > 1
+               ? " (" + std::to_string(cls.readyLevels) + " ready passes)"
+           : cls.hasReady ? std::string(" (ready pass)")
+                          : std::string())
+       << " state gap "
        << cls.stateGap;
     if (nest)
       os << " depth " << cls.depth
          << (cls.parent >= 0 ? " under " + classes[cls.parent].name : "");
     os << "\n";
-    for (auto pass : {kReady, kState}) {
-      if (pass == kReady && !cls.hasReady)
-        continue;
-      os << (pass == kReady ? "    ready:" : "    state:");
-      for (auto s : cls.slot[pass])
+    for (unsigned l = 0; l < cls.readyLevels; ++l) {
+      os << "    ready" << (l ? std::to_string(l + 1) : "") << ":";
+      for (auto s : cls.readySlots(l))
         os << " " << s;
       os << "\n";
     }
+    os << "    state:";
+    for (auto s : cls.slot[kState])
+      os << " " << s;
+    os << "\n";
     for (auto [o, late] : llvm::enumerate(cls.late)) {
       auto &producer = producers[cls.producerOf[o]];
       if (!late || !producer.read)
         continue;
       os << "    late " << cls.outputNames[o]
-         << (producer.atReady ? " @ready" : " @state") << " <-";
+         << (!producer.atReady ? std::string(" @state")
+             : producer.readyLevel
+                 ? " @ready" + std::to_string(producer.readyLevel + 1)
+                 : std::string(" @ready"))
+         << " <-";
       for (auto input : cls.deps[o].set_bits())
         os << " " << cls.inputNames[input];
       os << "\n";
@@ -3307,6 +4202,8 @@ LogicalResult StaticFolder::buildSim() {
     Value inst3, state3;
     Value inst2, state2, ready2, tail2;
     Value inst1, inst, state, ready;
+    /// The ready passes past the first, two host cycles ahead.
+    SmallVector<Value> laterReady2;
   };
   SmallVector<Controls> controls(classes.size());
   // Nested folding: the sequencer tree. Each class has its own sequencer,
@@ -3345,8 +4242,11 @@ LogicalResult StaticFolder::buildSim() {
   // Overlapped frames: a slot past the frame runs in the next frame's, for
   // the frame before it, so none runs until a frame has finished.
   bool overlapped = llvm::any_of(classes, [&](const Class &cls) {
-    return llvm::any_of(cls.slot[kState], [&](int s) { return s >= int(ii); }) ||
-           llvm::any_of(cls.slot[kReady], [&](int s) { return s >= int(ii); });
+    auto past = [&](ArrayRef<int> slots) {
+      return llvm::any_of(slots, [&](int s) { return s >= int(ii); });
+    };
+    return past(cls.slot[kState]) || past(cls.slot[kReady]) ||
+           llvm::any_of(cls.laterReady, past);
   });
   Value primed;
   if (overlapped) {
@@ -3363,15 +4263,17 @@ LogicalResult StaticFolder::buildSim() {
     unsigned idxWidth = threads > 1 ? llvm::Log2_32_Ceil(threads) : 0;
     SmallVector<uint64_t> instRow(ii + 1, 0), stateRow(ii + 1, 0),
         readyRow(ii + 1, 0), tailRow(ii + 1, 0);
+    // The ready passes past the first, a row each.
+    SmallVector<SmallVector<uint64_t>> laterRows(cls.laterReady.size(),
+                                                 SmallVector<uint64_t>(ii + 1, 0));
     for (unsigned i = 0; i < threads; ++i)
-      for (auto pass : {kReady, kState}) {
-        if (pass == kReady && !cls.hasReady)
-          continue;
-        unsigned s = cls.slot[pass][i];
-        instRow[s % ii] = i;
-        (pass == kReady ? readyRow : stateRow)[s % ii] = 1;
-        tailRow[s % ii] = s >= ii;
-      }
+      for (auto pass : {kReady, kState})
+        for (unsigned l = 0; l < (pass == kReady ? cls.readyLevels : 1); ++l) {
+          unsigned s = pass == kState ? cls.slot[kState][i] : cls.readySlots(l)[i];
+          instRow[s % ii] = i;
+          (pass == kState ? stateRow : l ? laterRows[l - 1] : readyRow)[s % ii] = 1;
+          tailRow[s % ii] = s >= ii;
+        }
     // A sequencer is the position the decision is made on; with a short
     // lead the tables read its next.
     Value at = !nest ? pos3 : shortLead ? nextPosition(sequencer[c]) : sequencer[c];
@@ -3381,10 +4283,11 @@ LogicalResult StaticFolder::buildSim() {
     auto prefix = cls.name;
     ctl.state3 = table(b, at, stateRow, 1);
     Value ready3 = table(b, at, readyRow, 1);
+    Value runs;
     if (overlapped) {
       // A slot of the frame before runs once a frame has finished.
       Value tail3 = table(b, at, tailRow, 1);
-      Value runs = comb::OrOp::create(b, notOf(tail3), primed);
+      runs = comb::OrOp::create(b, notOf(tail3), primed);
       ctl.state3 = comb::AndOp::create(b, ctl.state3, runs);
       ready3 = comb::AndOp::create(b, ready3, runs);
       ctl.tail2 = reg(tail3, prefix + "_tail2");
@@ -3400,6 +4303,13 @@ LogicalResult StaticFolder::buildSim() {
       ctl.inst2 = reg(ctl.inst3, prefix + "_inst2");
       ctl.inst1 = reg(ctl.inst2, prefix + "_inst1");
       ctl.inst = reg(ctl.inst1, prefix + "_inst0");
+    }
+    for (auto [l, row] : llvm::enumerate(laterRows)) {
+      Value later3 = table(b, at, row, 1);
+      if (overlapped)
+        later3 = comb::AndOp::create(b, later3, runs);
+      ctl.laterReady2.push_back(
+          reg(later3, prefix + "_ready_l" + Twine(l + 1) + "_2"));
     }
   }
 
@@ -3597,6 +4507,8 @@ LogicalResult StaticFolder::buildSim() {
   struct LinkGroup {
     std::string prefix;
     Value state, ready, inst, bank;
+    /// The enables of the ready passes past the first.
+    SmallVector<Value> laterReady;
     uint64_t used = 0;
   };
   std::map<std::pair<unsigned, int>, SmallVector<LinkGroup>> linkGroups;
@@ -3656,11 +4568,20 @@ LogicalResult StaticFolder::buildSim() {
         data = registered;
       }
       auto &group = linkGroupFor(c, to, w);
-      Value &enable = producer.atReady ? group.ready : group.state;
+      unsigned level = producer.atReady ? producer.readyLevel : 0;
+      if (level && group.laterReady.size() < level)
+        group.laterReady.resize(level);
+      Value &enable = !producer.atReady ? group.state
+                      : level           ? group.laterReady[level - 1]
+                                        : group.ready;
       if (!enable) {
-        auto pass = producer.atReady ? "_ready" : "_state";
+        std::string pass = !producer.atReady ? "_state"
+                           : level ? "_ready_l" + std::to_string(level) + "_"
+                                   : "_ready";
         enable = copyReg(
-            copyReg(producer.atReady ? ctl.ready2 : ctl.state2,
+            copyReg(!producer.atReady ? ctl.state2
+                    : level           ? ctl.laterReady2[level - 1]
+                                      : ctl.ready2,
                     group.prefix + pass + "1"),
             group.prefix + pass + "0");
         if (crossing)
@@ -4395,13 +5316,19 @@ LogicalResult StaticFolder::run() {
   for (auto &cls : classes)
     if (failed(analyze(cls)))
       return failure();
-  if (failed(schedule()) || failed(parseStorage()))
-    return failure();
-  if (scheduleOnly) {
-    // Nothing is built: the folded pipelines' edges stay unresolved.
+  // Without a schedule, or with one only, nothing is built: the folded
+  // pipelines' edges stay unresolved.
+  auto abandonFolds = [&] {
     for (auto &cls : classes)
       if (cls.folding && cls.folding->edges)
         cls.folding->edges->abandon();
+  };
+  if (failed(schedule()) || failed(parseStorage())) {
+    abandonFolds();
+    return failure();
+  }
+  if (scheduleOnly) {
+    abandonFolds();
     return success();
   }
   for (auto &cls : classes)
@@ -4434,7 +5361,7 @@ void FoldStaticPass::runOnOperation() {
                       shortLead, bubbles, virtualMemories, stagedEnv,
                       specGroups, specDepth,
                       envSinks, registerStateEntries, slrGroups, slrSites,
-                      slrCapacity, slrAssign, storage);
+                      slrCapacity, slrAssign, storage, readyLevels);
   if (failed(folder.run()))
     return signalPassFailure();
 }
