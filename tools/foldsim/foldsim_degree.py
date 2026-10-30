@@ -127,6 +127,38 @@ def state_lutram(est, threads, form='lutram'):
     return luts, bram
 
 
+def split_virtual(est, pattern):
+    """The classes' estimates with the memories foldsim-fold-static keeps
+    outside the simulator (`virtual-memories`: the named memories the regex
+    finds, in HBM behind the kernel's foldsim_vmem controllers) taken off
+    chip: listed under 'vmems', no longer under 'mems'."""
+    if not pattern:
+        return est
+    rx = re.compile(pattern)
+    virtual = lambda m: m[8] and rx.search(m[0])
+    return {c: dict(e, mems=[m for m in e['mems'] if not virtual(m)],
+                    vmems=[m for m in e['mems'] if virtual(m)])
+            for c, e in est.items()}
+
+
+def vmem_bram(est, classes, degree, vmem):
+    """RAMB36 of the host caches of a fold degree's virtual memories: a
+    controller per memory of each copy, of the copy's instances times the
+    memory's rows; `vmem`: (foldsim --vmem-cache-rows, its budget), or None
+    for none (the kernel's default)."""
+    if not vmem:
+        return 0.0
+    vms = []
+    for c, n in classes.items():
+        k = degree.get(c, 1)
+        for j in range(k):
+            t = copy_threads(n, k, j)
+            for (_, d, w, *_) in est[c].get('vmems', []):
+                vms.append(dict(instances=t, row_width=max(1, (d - 1).bit_length()),
+                                data_width=w))
+    return storage.vmem_cache_bram(vms, *vmem)
+
+
 def read_util(path):
     """Measured LUTs of each class's copies (logic, distributed RAM) and of the
     rest, from a hierarchical utilization report of a foldsim_afu build."""
@@ -235,7 +267,7 @@ def rest_of(cal, est_total):
 
 
 def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fixed',
-         route=False, uram=True, slr_groups=False):
+         route=False, uram=True, slr_groups=False, vmem=None):
     """LUTs of one fold degree ({class: copies}, 1 when absent): logic and
     distributed RAM apart, the sites they take, and the largest copy. With the
     degree's schedule report (parse_classes) each copy's state takes the form
@@ -246,13 +278,18 @@ def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fi
     must also route (the routability term, foldsim_storage.congestion).
     `uram`: whether the storage may use UltraRAM. `slr_groups`: whether each
     copy is kept whole in one SLR (foldsim --slr-groups), which confines the
-    fold to as many SLRs as it has copies."""
+    fold to as many SLRs as it has copies. Virtual memories (split_virtual)
+    are off chip; their host caches (`vmem`, vmem_bram) take block RAM.
+    The kernel's controllers' logic is not priced."""
+    cache = vmem_bram(est, classes, degree, vmem)
     slrs = storage.route_slrs(sum(degree.get(c, 1) for c in classes) if slr_groups else 0)
     if store == 'auto':
         res = storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram,
-                           slrs)
+                           slrs, cache)
     else:
-        res = fixed_area(cal, est, classes, degree, rest, sched, ii, entries)
+        res = fixed_area(cal, est, classes, degree, rest, sched, ii, entries, cache)
+    if cache:
+        res['vmem_cache_bram'] = round(cache, 1)
     if route:
         c = storage.fold_congestion(res['luts'], res['bram'], res.get('uram', 0), slrs)
         res['congestion'] = round(c, 2)
@@ -260,8 +297,9 @@ def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fi
     return res
 
 
-def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2):
-    logic = lutram = bram = largest = 0.0
+def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cache=0.0):
+    logic = lutram = largest = 0.0
+    bram = cache
     for c, n in classes.items():
         k = degree.get(c, 1)
         kappa, lam = factors(cal, c, est[c]['lut'])
@@ -283,7 +321,7 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2):
 
 
 def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram=True,
-                 slrs=None):
+                 slrs=None, cache=0.0):
     """area() with a kind chosen per store (foldsim_storage.assign) against
     the V80 dynamic region: its sites, RAMB36 and URAM288 and, with `route`,
     the LUTs that route over `slrs` SLRs (the region's by default). Every
@@ -338,11 +376,12 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         for u in units:
             u['costs'].pop('ultra', None)
     caps = {p: storage.MARGIN * storage.REGION[p] for p in ('sites', 'bram', 'uram')}
-    base = dict(sites=logic, luts=logic)
+    base = dict(sites=logic, luts=storage.fold_load(logic, cache), bram=cache)
     choice, used = storage.assign(units, base, caps,
                                   dict(luts=storage.route_luts(slrs)) if route else None)
     fits = all(used[p] <= caps[p] + 1e-9 for p in ('sites', 'bram', 'uram'))
-    lutram = bram = uram = 0.0
+    lutram = uram = 0.0
+    bram = cache
     per_copy = dict(copy_logic)
     rules, floor = [], 0
     for u, ch in zip(units, choice):
@@ -691,7 +730,7 @@ def pareto(points, key):
 
 def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
              jobs=4, budget=0, depth=None, max_points=256, store='fixed', route=False,
-             cache=None, cached_only=False, uram=True, slr_groups=False):
+             cache=None, cached_only=False, uram=True, slr_groups=False, vmem=None):
     """Every choice of copies per class: II, LUTs, whether it places, period
     and ns per cycle; the Pareto front, and the fastest point that places and
     stays within `budget` LUTs (0: none). `depth` is the design's screen depth
@@ -700,7 +739,9 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
     pick must also route; `slr_groups`: each copy whole in one SLR (area).
     `cache`: a directory of schedule reports of the same models and options
     (an earlier explore's workdir), read instead of scheduling; with
-    `cached_only`, its choices are the only ones priced.
+    `cached_only`, its choices are the only ones priced. The fold options'
+    `virtual-memories` are priced off chip, their host caches by `vmem`
+    ((--vmem-cache-rows, budget), area).
 
     Past `max_points` choices (lanes folded as classes: 256 instances each),
     every choice is too many to schedule; the search then schedules one choice
@@ -709,7 +750,9 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
     _, classes, _ = parse_schedule(base_schedule)
     m = re.search(r'register-state-entries=(\d+)', fold_options)
     entries = int(m.group(1)) if m else 2
-    est = class_estimates(models, classes)
+    target = class_estimates(models, classes)
+    m = re.search(r'virtual-memories=(\S+)', fold_options)
+    est = split_virtual(target, m.group(1) if m else '')
     rest = rest_of(cal, sum(est[c]['lut'] for c in classes))
     names = [c for c, n in classes.items() if n > 1]
     choices = [degrees(classes[c]) for c in names]
@@ -736,7 +779,8 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
         ii, _, _ = parse_schedule(text)
         res = dict(copies=copies or '-', ii=ii,
                    **area(cal, est, classes, dict(zip(names, ks)), rest,
-                          parse_classes(text), ii, entries, store, route, uram, slr_groups))
+                          parse_classes(text), ii, entries, store, route, uram, slr_groups,
+                          vmem))
         if fit:
             period = fit_period(fit, features(res['largest_copy'], depth, sum(ks),
                                               res['luts']))
@@ -777,10 +821,11 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
     pick = min(within, key=lambda p: (p[key], p['luts'])) if within else None
     # Every instance its own copy and its state in flip-flops: the target's
     # own area, which an unfolded simulator (FireSim) needs at the least.
-    unfolded = area(cal, est, classes, dict(classes), rest)
+    unfolded = area(cal, target, classes, dict(classes), rest)
     return dict(classes=classes, points=points, front=front, pick=pick, budget=budget,
                 unfolded=unfolded, firesim=firesim_area(cal, unfolded), depth=depth, fit=fit,
-                space=space, store=store, route=route, uram=uram, slr_groups=slr_groups)
+                space=space, store=store, route=route, uram=uram, slr_groups=slr_groups,
+                vmems=sum(len(e.get('vmems', [])) for e in est.values()))
 
 
 def table(result):
@@ -808,6 +853,9 @@ def table(result):
     if fs:
         lines.append(f"{'FireSim, projected (at least: unfolded x FireSim builds)':<60} {'-':>12} "
                      f"{fs['luts']:>12} {fs['lutram']:>12} {fs['sites']:>12} {str(fs['fits']):>12}")
+    if result.get('vmems'):
+        lines.append(f"virtual memories off chip (in HBM): {result['vmems']}; their host "
+                     "caches' RAMB36 counted in bram, the controllers' logic not priced")
     space = result.get('space', len(result['points']))
     if space > len(result['points']):
         lines.append(f"searched {len(result['points'])} of {space} choices: one per frame depth, "
@@ -909,6 +957,11 @@ def main():
     e.add_argument('--fold-options', default='',
                    help='more foldsim-fold-static options, as the driver gives them '
                         '(nest, modulo, ...)')
+    e.add_argument('--vmem-cache-rows', default=None, metavar='N|auto',
+                   help="the fold options' virtual memories' host-cache lines, as foldsim "
+                        '--vmem-cache-rows (their block RAM; none by default)')
+    e.add_argument('--vmem-cache-budget', type=float, default=storage.VMEM_CACHE_BUDGET,
+                   metavar='RAMB36', help='as foldsim --vmem-cache-budget')
     f = sub.add_parser('fit', help='the period fit of a calibration and its leave-one-out error')
     f.add_argument('--calibration', required=True)
     a = ap.parse_args()
@@ -943,7 +996,8 @@ def main():
     result = evaluate(a.models, open(base).read(), fold, a.foldsim_opt, a.workdir, cal,
                       a.jobs, a.lut_budget, screen_depth(a.screen) if a.screen else None,
                       a.max_points, a.storage, a.routability, a.schedules or None,
-                      a.cached_only, a.uram, a.slr_groups)
+                      a.cached_only, a.uram, a.slr_groups,
+                      (a.vmem_cache_rows, a.vmem_cache_budget) if a.vmem_cache_rows else None)
     print(table(result))
     json.dump(result, open(os.path.join(a.workdir, 'degree.json'), 'w'), indent=1,
               default=str)

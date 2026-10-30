@@ -32,3 +32,12 @@
 # A single copy kept whole in one SLR (--slr-groups) is confined to it.
 # CHECK: slr groups False: luts 1100000 congestion 25.25 routes True
 # CHECK: slr groups True: luts 1100000 congestion 36.38 routes False
+# Virtual memories are off chip: a 64 MiB L2's data stores place only in
+# HBM; with --vmem-cache-rows auto their host caches take the 120-RAMB36
+# budget (a cache under 512 lines still takes 7.5 RAMB36 at 512 bits, so
+# 16 keep 512 lines and the rest none).
+# CHECK: virtual: mems 1 vmems 64
+# CHECK: on chip: fits False
+# CHECK: in hbm, no cache: fits True bram 16.0 uram 0.0 cache 0
+# CHECK: in hbm, auto cache: fits True bram 136.0 uram 0.0 cache 120.0
+# CHECK: cache rows 0..512, 120.0 RAMB36

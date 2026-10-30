@@ -49,46 +49,10 @@ SPLIT = 'hw.module(foldsim-split-masked-memories)'
 ABSORB_LOGIC = 64
 
 
-# The host caches of the virtual memories (--vmem-cache-rows auto): a
-# sixteenth of a memory's rows, at least 256 lines, and all of them within
-# this many RAMB36 (5 % of the V80 dynamic region's 2415).
-VMEM_CACHE_FRACTION = 16
-VMEM_CACHE_FLOOR = 256
-VMEM_CACHE_BUDGET = 120
-# A cache's lines live in block RAM in one port pair: RAMB36E5 in simple dual
-# port, depth x width, and its half, RAMB18E5 (foldsim_storage.py's table).
-BRAM36 = ((512, 72), (1024, 36), (2048, 18), (4096, 9), (8192, 4), (16384, 2), (32768, 1))
-BRAM18 = ((512, 36), (1024, 18), (2048, 9), (4096, 4), (8192, 2), (16384, 1))
-
-
-def bram36(depth, width):
-    """RAMB36 (18K halves at 0.5) holding depth x width in one port pair."""
-    whole = min(-(-width // w) * -(-depth // d) for d, w in BRAM36)
-    half = min(-(-width // w) * -(-depth // d) for d, w in BRAM18)
-    return min(whole, 0.5 * half)
-
-
-def pow2_floor(n):
-    return 1 << (n.bit_length() - 1) if n > 0 else 0
-
-
-def vmem_cache_rows(vmems, choice, budget):
-    """Each virtual memory's host-cache lines (VMEM_INTERFACE.md, v4): a power
-    of two (or 0) up to its rows, the largest power of two at most
-    rows x instances. `auto`: rows / 16, at least 256; while the caches' data
-    take more than `budget` RAMB36, the costliest halves (0 below 2 lines)."""
-    caps = [pow2_floor(v['instances'] << v['row_width']) for v in vmems]
-    if choice != 'auto':
-        n = int(choice)
-        if n < 0 or n == 1 or n & (n - 1):
-            sys.exit('--vmem-cache-rows: auto, 0 or a power of two of at least 2')
-        return [min(n, c) for c in caps]
-    rows = [min(c, max(VMEM_CACHE_FLOOR, pow2_floor(c // VMEM_CACHE_FRACTION))) for c in caps]
-    cost = lambda k: bram36(rows[k], vmems[k]['data_width']) if rows[k] else 0
-    while sum(cost(k) for k in range(len(rows))) > budget:
-        k = max(range(len(rows)), key=cost)
-        rows[k] = rows[k] // 2 if rows[k] > 2 else 0
-    return rows
+# The host caches of the virtual memories (--vmem-cache-rows): sized in
+# foldsim_storage.py, beside the block-RAM table they are priced by.
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from foldsim_storage import VMEM_CACHE_BUDGET, bram36, vmem_cache_rows  # noqa: E402
 
 
 def run(cmd, **kw):
@@ -258,7 +222,9 @@ def choose_copies(a, foldsim_opt, flat, passes, out):
     result = foldsim_degree.evaluate(models, open(base).read(), fold, foldsim_opt, work, cal,
                                      a.jobs, a.lut_budget, max_points=a.degree_max_points,
                                      store='auto' if a.storage == 'auto' else 'fixed',
-                                     route=a.routability, slr_groups=a.slr_groups)
+                                     route=a.routability, slr_groups=a.slr_groups,
+                                     vmem=(a.vmem_cache_rows, a.vmem_cache_budget)
+                                     if a.vmem_cache_rows is not None else None)
     with open(out('degree.txt'), 'w') as f:
         f.write(foldsim_degree.table(result) + '\n')
     with open(out('degree.json'), 'w') as f:

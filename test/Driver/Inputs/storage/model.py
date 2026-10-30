@@ -91,3 +91,24 @@ for groups in (False, True):
                1, 2, 'auto', True, slr_groups=groups)
     print(f"slr groups {groups}: luts {a['luts']} congestion {a['congestion']} "
           f"routes {a['routes']}")
+# Virtual memories (foldsim --virtual-memories): a 64 MiB L2's 64 data
+# stores (16384 x 512, a registered read) do not place on chip; taken off
+# chip by the fold options' regex they cost only their host caches: with
+# --vmem-cache-rows auto, 1024 lines each would take 64 x 14.5 RAMB36, so
+# the costliest halve until the caches fit the 120-RAMB36 budget.
+data = [[f'l2/bank{b}/data{k}', 16384, 512, 1, 1, 1, 'block', 64, True]
+        for b in range(32) for k in range(2)]
+tags = [['l2/tags', 1024, 416, 1, 1, 1, 'block', 16, True]]
+top = dict(Top=dict(lut=500000.0, ff=0, mems=data + tags, regw={}))
+on = d.split_virtual(top, '')
+off = d.split_virtual(top, 'l2/.*/data[0-9]+')
+print(f"virtual: mems {len(off['Top']['mems'])} vmems {len(off['Top']['vmems'])}")
+one_sched = dict(Top=dict(n=1, ready=[], state=[0], gap=8))
+for name, e, vmem in (('on chip', on, None), ('in hbm, no cache', off, None),
+                      ('in hbm, auto cache', off, ('auto', s.VMEM_CACHE_BUDGET))):
+    a = d.area(None, e, dict(Top=1), {}, 0, one_sched, 8, 2, 'auto', False, vmem=vmem)
+    print(f"{name}: fits {a['fits']} bram {a['bram']} uram {a['uram']} "
+          f"cache {a.get('vmem_cache_bram', 0)}")
+rows = s.vmem_cache_rows([dict(instances=1, row_width=14, data_width=512)] * 64, 'auto',
+                         s.VMEM_CACHE_BUDGET)
+print(f"cache rows {min(rows)}..{max(rows)}, {d.vmem_bram(off, dict(Top=1), {}, ('auto', 120))} RAMB36")

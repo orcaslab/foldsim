@@ -176,6 +176,48 @@ def bram36(depth, width):
     return min(best, 0.5 * half)
 
 
+# The host caches of the virtual memories (foldsim --vmem-cache-rows auto): a
+# sixteenth of a memory's rows, at least 256 lines, and all of them within
+# this many RAMB36 (5 % of the V80 dynamic region's 2415).
+VMEM_CACHE_FRACTION = 16
+VMEM_CACHE_FLOOR = 256
+VMEM_CACHE_BUDGET = 120
+
+
+def pow2_floor(n):
+    return 1 << (n.bit_length() - 1) if n > 0 else 0
+
+
+def vmem_cache_rows(vmems, choice, budget):
+    """Each virtual memory's host-cache lines (VMEM_INTERFACE.md, v4): a power
+    of two (or 0) up to its rows, the largest power of two at most
+    rows x instances. `auto`: rows / 16, at least 256; while the caches' data
+    take more than `budget` RAMB36, the costliest halves (0 below 2 lines).
+    `vmems`: dicts with instances, row_width (address bits) and data_width.
+    A cache's lines live in block RAM in one port pair (bram36)."""
+    caps = [pow2_floor(v['instances'] << v['row_width']) for v in vmems]
+    if choice != 'auto':
+        n = int(choice)
+        if n < 0 or n == 1 or n & (n - 1):
+            sys.exit('--vmem-cache-rows: auto, 0 or a power of two of at least 2')
+        return [min(n, c) for c in caps]
+    rows = [min(c, max(VMEM_CACHE_FLOOR, pow2_floor(c // VMEM_CACHE_FRACTION))) for c in caps]
+    cost = lambda k: bram36(rows[k], vmems[k]['data_width']) if rows[k] else 0
+    while sum(cost(k) for k in range(len(rows))) > budget:
+        k = max(range(len(rows)), key=cost)
+        rows[k] = rows[k] // 2 if rows[k] > 2 else 0
+    return rows
+
+
+def vmem_cache_bram(vmems, choice, budget):
+    """RAMB36 of the virtual memories' host caches (0 without a choice: the
+    kernel's default, no cache)."""
+    if choice is None or not vmems:
+        return 0.0
+    return sum(bram36(n, v['data_width']) if n else 0.0
+               for v, n in zip(vmems, vmem_cache_rows(vmems, choice, budget)))
+
+
 def uram(depth, width):
     return math.ceil(width / URAM[1]) * math.ceil(depth / URAM[0])
 
