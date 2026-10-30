@@ -31,6 +31,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
 #include <set>
@@ -164,7 +165,8 @@ public:
                bool interleaveCopies, bool zeroLatencyLinks,
                bool zeroLatencyChains, bool shortLead, bool stagedEnv,
                ArrayRef<std::string> specGroups, unsigned specDepth,
-               ArrayRef<std::string> envSinks, unsigned registerStateEntries)
+               ArrayRef<std::string> envSinks, unsigned registerStateEntries,
+               unsigned forwardAfterLevels, bool shareLinkWrites)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -174,6 +176,8 @@ public:
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
         zeroLatencyChains(zeroLatencyChains), shortLead(shortLead),
         registerStateEntries(registerStateEntries),
+        forwardAfterLevels(forwardAfterLevels),
+        shareLinkWrites(shareLinkWrites),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -240,6 +244,8 @@ private:
   bool zeroLatencyLinks, zeroLatencyChains;
   bool shortLead;
   unsigned registerStateEntries;
+  unsigned forwardAfterLevels;
+  bool shareLinkWrites;
   // Host cycles from a late netlist output's slot to the next frame's first.
   int envRoundTrip;
   /// Whether producer `p`'s link to class `c`'s input may be taken in the
@@ -2963,6 +2969,8 @@ LogicalResult StaticFolder::buildSim() {
   struct LinkGroup {
     std::string prefix;
     Value state, ready, inst, bank;
+    // A host cycle later, for the writes of registered bits.
+    Value stateLate, readyLate, instLate, bankLate;
     uint64_t used = 0;
   };
   SmallVector<SmallVector<LinkGroup>> linkGroups(classes.size());
@@ -2984,10 +2992,37 @@ LogicalResult StaticFolder::buildSim() {
   // address and the bank.
   // With `now`, also what the producer writes in this host cycle and whether
   // that is the entry a reader in this host cycle's slot takes (a late link).
+  // Without `forward`, a write is not forwarded to a read of its entry in
+  // the same host cycle: the schedule never reads it there. With `after`,
+  // it is forwarded past the read register instead of into it: each piece's
+  // hit and written bits are given there (at the piece's offset) for the
+  // reader to register and choose behind its read register, and the read
+  // is the memory's alone.
+  // With `late`, the link is written a host cycle after the pass, from a
+  // register of the producer's bits that every such link of them shares, so
+  // the producer's path into the links ends at one register, not at every
+  // reader's memory; with `forwardLate`, that write is forwarded to the read
+  // of its host cycle (from the register: shallow).
+  struct AfterForward {
+    unsigned offset, width;
+    Value hit, data;
+  };
+  // A producer's bits registered (the producer, its low bit and width).
+  std::map<std::tuple<int, unsigned, unsigned>, Value> writtenBits;
+  auto writtenOf = [&](unsigned p, unsigned low, Value data) -> Value {
+    unsigned w = data.getType().getIntOrFloatBitWidth();
+    Value &written = writtenBits[{int(p), low, w}];
+    if (!written)
+      written = reg(data, producers[p].name + "_written_" + Twine(low));
+    return written;
+  };
   auto linkRead = [&](unsigned p, unsigned low, unsigned width,
                       function_ref<Value()> address, function_ref<Value()> bank,
                       const Twine &linkName,
-                      std::pair<Value, Value> *now = nullptr) -> Value {
+                      std::pair<Value, Value> *now = nullptr,
+                      bool forward = true,
+                      SmallVectorImpl<AfterForward> *after = nullptr,
+                      bool late = false, bool forwardLate = false) -> Value {
     auto &producer = producers[p];
     unsigned c = producer.cls;
     auto &ctl = controls[c];
@@ -3016,12 +3051,33 @@ LogicalResult StaticFolder::buildSim() {
           now->first = enable;
         nowPieces.push_back(data);
       }
+      // What the link is written with, and when.
+      Value writeData = data, writeEnable = enable;
+      if (late) {
+        writeData = writtenOf(p, low + at, data);
+        Value &lateEnable = producer.atReady ? group.readyLate : group.stateLate;
+        if (!lateEnable)
+          lateEnable = copyReg(enable, group.prefix +
+                                           (producer.atReady ? "_ready" : "_state") +
+                                           "_late");
+        writeEnable = lateEnable;
+      }
       if (threads == 1 && !banked) {
         auto next = backedges.get(data.getType());
         Value r = reg(next, name);
-        Value written = comb::MuxOp::create(b, enable, data, r);
+        Value written = comb::MuxOp::create(b, writeEnable, writeData, r);
         next.setValue(written);
-        pieces.push_back(oneCycleLinks ? written : r);
+        Value value = r;
+        if (late && forwardLate)
+          value = written;
+        if (oneCycleLinks && forward) {
+          if (after)
+            after->push_back({at, w, enable, data});
+          else
+            value = late ? comb::MuxOp::create(b, enable, data, value).getResult()
+                         : written;
+        }
+        pieces.push_back(value);
         continue;
       }
       // An early link's address is its bank above the instance's index, so
@@ -3059,10 +3115,33 @@ LogicalResult StaticFolder::buildSim() {
       }
       Value writeAt = b.createOrFold<comb::ConcatOp>(writeAddress);
       Value readAt = b.createOrFold<comb::ConcatOp>(readAddress);
-      seq::FirMemWriteOp::create(b, memory, writeAt, hostClock, enable, data,
-                                 Value{});
+      Value lateAt;
+      if (late) {
+        SmallVector<Value> lateAddress;
+        if (banked) {
+          if (!group.bankLate)
+            group.bankLate = copyReg(group.bank, group.prefix + "_bank_late");
+          lateAddress.push_back(group.bankLate);
+        }
+        if (threads > 1) {
+          if (!group.instLate)
+            group.instLate = copyReg(group.inst, group.prefix + "_inst_late");
+          lateAddress.push_back(group.instLate);
+        }
+        lateAt = b.createOrFold<comb::ConcatOp>(lateAddress);
+      }
+      seq::FirMemWriteOp::create(b, memory, late ? lateAt : writeAt, hostClock,
+                                 writeEnable, writeData, Value{});
       Value read =
           seq::FirMemReadOp::create(b, memory, readAt, hostClock, constant(1, 1));
+      if (late && forwardLate) {
+        // The registered write lands a host cycle on: forwarded from the
+        // register to the read of its host cycle.
+        Value hit = comb::AndOp::create(
+            b, writeEnable,
+            comb::ICmpOp::create(b, comb::ICmpPredicate::eq, lateAt, readAt));
+        read = comb::MuxOp::create(b, hit, writeData, read);
+      }
       if (now && !banked && nowPieces.size() == 1) {
         // The address is the next slot's reader's; this slot's, a cycle on.
         Value readNow = readAt.getDefiningOp<hw::ConstantOp>()
@@ -3072,12 +3151,15 @@ LogicalResult StaticFolder::buildSim() {
             b, enable,
             comb::ICmpOp::create(b, comb::ICmpPredicate::eq, writeAt, readNow));
       }
-      if (oneCycleLinks) {
+      if (oneCycleLinks && forward) {
         // A write reaches a read of its entry in the same host cycle.
         Value hit = comb::AndOp::create(
             b, enable,
             comb::ICmpOp::create(b, comb::ICmpPredicate::eq, writeAt, readAt));
-        read = comb::MuxOp::create(b, hit, data, read);
+        if (after)
+          after->push_back({at, w, hit, data});
+        else
+          read = comb::MuxOp::create(b, hit, data, read);
       }
       pieces.push_back(read);
     }
@@ -3093,6 +3175,145 @@ LogicalResult StaticFolder::buildSim() {
     return b.createOrFold<comb::ConcatOp>(
         SmallVector<Value>(pieces.rbegin(), pieces.rend()));
   };
+
+  // What each class evaluates at each position of the frame: its instance,
+  // its passes, and whether the slot is the frame before's. Every control is
+  // a fixed delay of the position, so a link's forwarding and its reader's
+  // taking around the read register are needed only where the schedule
+  // brings a write and a read of its entry together; elsewhere they are
+  // logic on the producer's path into the read register that never decides
+  // a value (and, across a zero-latency link into the producer, a path from
+  // one class through another back into the first).
+  struct Evaluation {
+    unsigned inst = 0;
+    bool ready = false, state = false, tail = false;
+    bool runs() const { return ready || state; }
+  };
+  SmallVector<SmallVector<Evaluation>> frameAt(classes.size());
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    frameAt[c].resize(ii);
+    for (unsigned i = 0; i < cls.threads(); ++i)
+      for (auto pass : {kReady, kState}) {
+        if (pass == kReady && !cls.hasReady)
+          continue;
+        unsigned s = cls.slot[pass][i];
+        auto &at = frameAt[c][s % ii];
+        at.inst = i;
+        (pass == kReady ? at.ready : at.state) = true;
+        at.tail = s >= ii;
+      }
+  }
+  // Whether a producer writes its links at position `at`.
+  auto writesAt = [&](const Producer &producer, unsigned at) {
+    auto &e = frameAt[producer.cls][at];
+    return producer.atReady ? e.ready : e.state;
+  };
+  // Whether a read of producer `p`'s link by class `c`, for the instances
+  // `takes` holds, at producer instance `from[i]`, ever needs a write
+  // forwarded: the write lands `lands` host cycles after its position's
+  // (one, or two registered), and the read register loaded in the host cycle
+  // it lands is used in the next one, by such an instance at its entry (for
+  // an early link, in the bank that read takes: the write's frame's next).
+  // Between frames the position may idle, so each host cycle after a
+  // frame's last position is the next frame's first, or idle.
+  auto needsForward = [&](unsigned p, unsigned c, ArrayRef<bool> takes,
+                          ArrayRef<uint64_t> from, unsigned lands = 1) {
+    auto &producer = producers[p];
+    bool banked = !producer.late;
+    bool threaded = classes[producer.cls].threads() > 1;
+    for (unsigned at = 0; at < ii; ++at) {
+      if (!writesAt(producer, at))
+        continue;
+      auto &write = frameAt[producer.cls][at];
+      // The positions `lands` host cycles on (`ii` idle), and the frames
+      // they are past the write's.
+      SmallVector<std::pair<unsigned, int>> reach{{at, 0}};
+      for (unsigned step = 0; step < lands; ++step) {
+        SmallVector<std::pair<unsigned, int>> next;
+        for (auto [pos, frames] : reach) {
+          if (pos + 1 < ii) {
+            next.push_back({pos + 1, frames});
+            continue;
+          }
+          next.push_back({0, frames + 1});
+          next.push_back({ii, frames});
+        }
+        reach = std::move(next);
+      }
+      for (auto [pos, frames] : reach) {
+        if (pos >= ii)
+          continue;
+        auto &read = frameAt[c][pos];
+        if (!read.runs() || !takes[read.inst])
+          continue;
+        if (threaded && from[read.inst] != write.inst)
+          continue;
+        // The write's token is of the frame after its own, the read's of
+        // its own.
+        int written = 1 - int(write.tail);
+        int wanted = frames - int(read.tail);
+        if (banked && (wanted - written) % 2 != 0)
+          continue;
+        return true;
+      }
+    }
+    return false;
+  };
+  // Whether a reader of class `c` ever takes producer `p`'s write around its
+  // read register: a write at a position that evaluates an instance
+  // `takes` holds, at its entry.
+  auto takesNow = [&](unsigned p, unsigned c, ArrayRef<bool> takes,
+                      ArrayRef<uint64_t> from) {
+    auto &producer = producers[p];
+    bool threaded = classes[producer.cls].threads() > 1;
+    for (unsigned at = 0; at < ii; ++at) {
+      if (!writesAt(producer, at))
+        continue;
+      auto &read = frameAt[c][at];
+      if (!read.runs() || !takes[read.inst])
+        continue;
+      if (threaded && from[read.inst] != frameAt[producer.cls][at].inst)
+        continue;
+      return true;
+    }
+    return false;
+  };
+  // Whether the hit of such a take (a write at the entry the evaluated
+  // instance's row names) comes only at positions evaluating an instance
+  // `takes` holds: then no other source's instance needs it masked.
+  auto hitsOnlyTakes = [&](unsigned p, unsigned c, ArrayRef<bool> takes,
+                           ArrayRef<uint64_t> from) {
+    auto &producer = producers[p];
+    bool threaded = classes[producer.cls].threads() > 1;
+    for (unsigned at = 0; at < ii; ++at) {
+      auto &read = frameAt[c][at];
+      if (!writesAt(producer, at) || !read.runs() || takes[read.inst])
+        continue;
+      if (!threaded || from[read.inst] == frameAt[producer.cls][at].inst)
+        return false;
+    }
+    return true;
+  };
+
+  // The link reads built: those forwarded (past the read register), those
+  // taken in the producer's host cycle, and those written from a shared
+  // register (forwarded the host cycle the write lands), for the report.
+  unsigned linkReads = 0, forwardedReads = 0, forwardedAfter = 0, nowReads = 0,
+           lateReads = 0, forwardedLate = 0;
+  // The class readers of each producer: a producer's bits read by several
+  // are written to their links from one register of them.
+  SmallVector<unsigned> classReaders(producers.size(), 0);
+  for (auto &consumer : consumers) {
+    if (consumer.cls < 0)
+      continue;
+    std::set<int> read;
+    for (auto &pieces : consumer.pieces)
+      for (auto &piece : pieces)
+        if (piece.producer >= 0 && producers[piece.producer].cls >= 0)
+          read.insert(piece.producer);
+    for (int p : read)
+      ++classReaders[p];
+  }
 
   // Each model input: its pieces at positions common to every instance; at
   // each, the sources the instances take it from, each read at the slot's
@@ -3127,6 +3348,14 @@ LogicalResult StaticFolder::buildSim() {
     SmallVector<Value> registered;
     SmallVector<std::pair<unsigned, unsigned>> registeredAt;
     SmallVector<std::pair<Value, Value>> takenAt;
+    SmallVector<SmallVector<AfterForward>> afterAt;
+    // A read forwarded past its register where the reader's input stays
+    // shallow behind it and reaches no output: the producer's path ends at a
+    // register of its written bits, not at the read register through the
+    // choice.
+    bool afterForward =
+        forwardAfterLevels > 0 && !cls.inputToOutput.test(consumer.port) &&
+        cls.inputDepth[consumer.port] + 1 < int(forwardAfterLevels);
     unsigned at = 0;
     for (unsigned end : cuts) {
       if (end == at)
@@ -3171,6 +3400,34 @@ LogicalResult StaticFolder::buildSim() {
       }
       SmallVector<Value> sourceData(sources.size());
       SmallVector<std::pair<Value, Value>> sourceNow(sources.size());
+      SmallVector<bool> nowAlone(sources.size(), false);
+      SmallVector<SmallVector<AfterForward>> sourceAfter(sources.size());
+      // A source's producer instance by instance, and the instances taking it.
+      auto rowsOf = [&](std::pair<int, unsigned> key,
+                        SmallVectorImpl<uint64_t> &rows,
+                        SmallVectorImpl<bool> &takes) {
+        rows.assign(threads, 0);
+        takes.assign(threads, false);
+        for (unsigned i = 0; i < threads; ++i)
+          if (sourceOf[i] == key) {
+            rows[i] = producerInst[i];
+            takes[i] = true;
+          }
+      };
+      // Forwarded past the read register only where no source is taken in
+      // its producer's host cycle: a taken write is chosen there too, and the
+      // late value then passes one choice, not two.
+      bool after = afterForward;
+      for (auto &[key, index] : sources) {
+        if (!after || key.first < 0 || producers[key.first].cls < 0)
+          continue;
+        SmallVector<uint64_t> rows;
+        SmallVector<bool> takes;
+        rowsOf(key, rows, takes);
+        if (zeroLink(key.first, c, consumer.port) &&
+            takesNow(key.first, c, takes, rows))
+          after = false;
+      }
       for (auto &[key, index] : sources) {
         if (key.first < 0) {
           SmallVector<uint64_t> rows(threads, 0);
@@ -3196,10 +3453,9 @@ LogicalResult StaticFolder::buildSim() {
           continue;
         }
         unsigned pThreads = classes[producer.cls].threads();
-        SmallVector<uint64_t> rows(threads, 0);
-        for (unsigned i = 0; i < threads; ++i)
-          if (sourceOf[i] == key)
-            rows[i] = producerInst[i];
+        SmallVector<uint64_t> rows;
+        SmallVector<bool> takes;
+        rowsOf(key, rows, takes);
         unsigned w = llvm::Log2_32_Ceil(pThreads);
         // Each piece of the link reads at its own copy of the address and
         // the bank.
@@ -3223,18 +3479,42 @@ LogicalResult StaticFolder::buildSim() {
                                          copyReg(ctl.tail2, name + "_tail"));
           return parity;
         };
+        bool now = zeroLink(key.first, c, consumer.port) &&
+                   takesNow(key.first, c, takes, rows);
+        nowAlone[index] = now && hitsOnlyTakes(key.first, c, takes, rows);
+        bool forward =
+            oneCycleLinks && needsForward(key.first, c, takes, rows);
+        // Registered for the link writes where several classes read the
+        // bits, or where a forward past the read register registers them.
+        bool late = shareLinkWrites &&
+                    (classReaders[key.first] > 1 || (forward && after));
+        bool forwardLate = late && needsForward(key.first, c, takes, rows, 2);
+        ++linkReads;
+        forwardedReads += forward;
+        forwardedAfter += forward && after;
+        nowReads += now;
+        lateReads += late;
+        forwardedLate += forwardLate;
         sourceData[index] =
             linkRead(key.first, key.second, width, address, bank,
                      producer.name + "_to_" + consumer.name + "_" + Twine(at),
-                     zeroLink(key.first, c, consumer.port) ? &sourceNow[index]
-                                                           : nullptr);
+                     now ? &sourceNow[index] : nullptr, forward,
+                     after ? &sourceAfter[index] : nullptr, late, forwardLate);
       }
       // Taken around the read register when written in the reader's slot:
       // the source of this slot's instance, a host cycle after the read's.
       std::pair<Value, Value> taken;
-      if (llvm::any_of(sourceNow, [](auto &v) { return bool(v.first); })) {
+      unsigned nowSources =
+          llvm::count_if(sourceNow, [](auto &v) { return bool(v.first); });
+      if (nowSources) {
+        auto alone = llvm::find(nowAlone, true);
         if (sources.size() == 1) {
           taken = sourceNow[0];
+        } else if (nowSources == 1 && alone != nowAlone.end() &&
+                   sourceNow[alone - nowAlone.begin()].first) {
+          // One source is ever taken, and its hit only where it is the
+          // instance's: no select of the source.
+          taken = sourceNow[alone - nowAlone.begin()];
         } else {
           SmallVector<uint64_t> rows(threads, 0);
           for (unsigned i = 0; i < threads; ++i)
@@ -3284,6 +3564,39 @@ LogicalResult StaticFolder::buildSim() {
                    : b.createOrFold<comb::ConcatOp>(
                          SmallVector<Value>(chosen.rbegin(), chosen.rend()));
       }
+      // Forwarded past the read register: each piece's hit, of this source
+      // where the instance's source is chosen, registered with the read, and
+      // the written bits a host cycle on, one register per producer's piece
+      // whatever reads it.
+      SmallVector<AfterForward> afterRead;
+      for (auto &[key, index] : sources) {
+        if (sourceAfter[index].empty())
+          continue;
+        Value mine;
+        if (sources.size() > 1) {
+          SmallVector<uint64_t> rows(threads, 0);
+          for (unsigned i = 0; i < threads; ++i)
+            rows[i] = sources[sourceOf[i]];
+          unsigned w = llvm::Log2_32_Ceil(sources.size());
+          mine = comb::ICmpOp::create(
+              b, comb::ICmpPredicate::eq,
+              copyReg(table(b, ctl.inst2, rows, w),
+                      consumer.name + "_select_after" + Twine(at) + "_" +
+                          Twine(index)),
+              constant(w, index));
+        }
+        for (auto &piece : sourceAfter[index]) {
+          Value hit = mine ? comb::AndOp::create(b, piece.hit, mine) : piece.hit;
+          Value written =
+              writtenOf(key.first, key.second + piece.offset, piece.data);
+          afterRead.push_back(
+              {piece.offset, piece.width,
+               reg(hit, consumer.name + "_hit_" + Twine(at + piece.offset) +
+                            "_" + Twine(index)),
+               written});
+        }
+      }
+      afterAt.push_back(std::move(afterRead));
       registeredAt.push_back({unsigned(parts.size()), width});
       registered.push_back(data);
       parts.push_back({});
@@ -3299,6 +3612,25 @@ LogicalResult StaticFolder::buildSim() {
         auto [index, width] = entry;
         parts[index] = b.createOrFold<comb::ExtractOp>(b.getIntegerType(width),
                                                        readReg, low);
+        for (auto &piece : afterAt[r]) {
+          // The piece's bits chosen behind the register, the rest kept.
+          Value bits = parts[index];
+          SmallVector<Value> high;
+          if (piece.offset + piece.width < width)
+            high.push_back(b.createOrFold<comb::ExtractOp>(
+                b.getIntegerType(width - piece.offset - piece.width), bits,
+                piece.offset + piece.width));
+          high.push_back(comb::MuxOp::create(
+              b, piece.hit, piece.data,
+              b.createOrFold<comb::ExtractOp>(b.getIntegerType(piece.width),
+                                              bits, piece.offset)));
+          if (piece.offset)
+            high.push_back(b.createOrFold<comb::ExtractOp>(
+                b.getIntegerType(piece.offset), bits, 0));
+          parts[index] = high.size() == 1
+                             ? high[0]
+                             : b.createOrFold<comb::ConcatOp>(high);
+        }
         if (auto [hit, live] = takenAt[r]; hit)
           parts[index] = comb::MuxOp::create(b, hit, live, parts[index]);
         low += width;
@@ -3314,6 +3646,23 @@ LogicalResult StaticFolder::buildSim() {
         ++argIndex;
     copyInputs[c][argIndex].setValue(
         b.createOrFold<hw::BitcastOp>(cls.inputTypes[consumer.port], value));
+  }
+
+  {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    os << "  link reads: " << linkReads << ", forwarded " << forwardedReads
+       << " (past the read register " << forwardedAfter << "), taken now "
+       << nowReads << "; written from a shared register " << lateReads
+       << " (forwarded " << forwardedLate << ")\n";
+    llvm::errs() << os.str();
+    if (!reportPath.empty()) {
+      std::error_code ec;
+      llvm::raw_fd_ostream file(reportPath, ec, llvm::sys::fs::OF_Append);
+      if (ec)
+        return netlist.emitError("report: ") << ec.message();
+      file << os.str();
+    }
   }
 
   // The netlist's outputs: a queue of two tokens each, written at its slot
@@ -3567,7 +3916,8 @@ void FoldStaticPass::runOnOperation() {
                       modulo, interleaveCopies, zeroLatencyLinks, zeroLatencyChains,
                       shortLead, stagedEnv,
                       specGroups, specDepth,
-                      envSinks, registerStateEntries);
+                      envSinks, registerStateEntries, forwardAfterLevels,
+                      shareLinkWrites);
   if (failed(folder.run()))
     return signalPassFailure();
 }
