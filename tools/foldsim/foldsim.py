@@ -35,7 +35,11 @@ import sys
 # is replicated per thread. A conditional write of one array element becomes a
 # select per element, and sorting lets CSE merge duplicates whose users come
 # first in a module body.
-OPTIMIZE = ['hw.module(hw-expand-array-writes)', 'hw.module(seq-reg-const-prop)',
+# Zero-width values first (foldsim-fold-zero-width): an import keeps them where
+# a parameter sizes a field to nothing (a one-entry table indexed by a one-bit
+# number), and firtool emits neither their compares nor their constants.
+OPTIMIZE = ['hw.module(hw-expand-array-writes)', 'hw.module(foldsim-fold-zero-width)',
+            'hw.module(seq-reg-const-prop)',
             'hw.module(comb-share-adders)', 'canonicalize', 'hw.module(comb-low-bits-narrowing)',
             'canonicalize', 'foldsim-sort', 'cse']
 
