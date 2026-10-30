@@ -33,6 +33,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/Regex.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
 #include <set>
@@ -114,6 +115,19 @@ struct Class {
   /// Whether its memories include a registered read: its state is then read
   /// a host cycle later after a state pass.
   bool syncReads = false;
+  /// Its memories kept outside the simulator (`--virtual-memories`): each
+  /// one's row address, data and mask widths, read-during-write order, and
+  /// where its request and response ports start among the copy's.
+  struct VirtualMemory {
+    std::string name;
+    unsigned rowWidth, dataWidth, maskWidth;
+    bool readFirst;
+    unsigned firstInput, firstOutput;
+  };
+  SmallVector<VirtualMemory> virtualMemories;
+  /// With virtual memories, the copy's host reset input (their pending reads
+  /// clear with the controllers').
+  unsigned resetInput = 0;
   /// The schedule: whether it has a ready pass, and each instance's slots.
   bool hasReady = false;
   SmallVector<int> slot[2];
@@ -150,6 +164,10 @@ struct Consumer {
 /// lands at the end of its slot, and the read register is loaded a slot early.
 /// Forwarded, a write reaches a read register loaded in its own slot.
 static constexpr int kLinkLatency = 2, kForwardedLinkLatency = 1;
+/// A virtual memory's controller reports its free request entries in this
+/// many bits; a position runs only with `kVirtualRoom` of them, two requests
+/// for each host cycle from a decision to the requests it causes.
+static constexpr unsigned kVirtualFreeWidth = 16, kVirtualRoom = 8;
 
 /// One evaluation of a frame: an instance of a class in a pass.
 struct Node {
@@ -165,7 +183,7 @@ public:
                bool oneCycleLinks, bool overlapFrames, bool modulo,
                bool interleaveCopies, bool zeroLatencyLinks,
                bool zeroLatencyChains, bool shortLead, bool bubbles,
-               bool stagedEnv, ArrayRef<std::string> specGroups, unsigned specDepth,
+               StringRef virtualMemories, bool stagedEnv, ArrayRef<std::string> specGroups, unsigned specDepth,
                ArrayRef<std::string> envSinks, unsigned registerStateEntries,
                unsigned slrGroups, ArrayRef<std::string> slrSites,
                uint64_t slrCapacity, ArrayRef<std::string> slrAssign)
@@ -178,7 +196,8 @@ public:
         overlapFrames(overlapFrames), modulo(modulo),
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
         zeroLatencyChains(zeroLatencyChains), shortLead(shortLead),
-        bubbles(bubbles), registerStateEntries(registerStateEntries),
+        bubbles(bubbles), virtualMemoryPattern(virtualMemories.str()),
+        registerStateEntries(registerStateEntries),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -280,6 +299,8 @@ private:
   bool zeroLatencyLinks, zeroLatencyChains;
   bool shortLead;
   bool bubbles;
+  /// `--virtual-memories`: the names of the memories kept outside.
+  std::string virtualMemoryPattern;
   unsigned registerStateEntries;
   // Host cycles from a late netlist output's slot to the next frame's first.
   int envRoundTrip;
@@ -2364,6 +2385,57 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       return op.emitError("a clock used as a bit in a folded model");
   }
 
+  // Memories kept outside the simulator (`--virtual-memories`): a registered
+  // read port and at most one write port each. An instance's read is issued
+  // at its state pass and must be pending before the sequencer decides the
+  // position whose read register loads it, four host cycles before the
+  // instance's next evaluation (three with a short lead); so the state gap
+  // is at least five (four).
+  DenseMap<Operation *, unsigned> virtualOf;
+  if (!virtualMemoryPattern.empty()) {
+    llvm::Regex pattern(virtualMemoryPattern);
+    for (auto &op : *modelBody) {
+      auto memory = dyn_cast<seq::FirMemOp>(op);
+      if (!memory || physical(&op) ||
+          !pattern.match(memory.getName().value_or("")))
+        continue;
+      if (memory.getReadLatency() != 1)
+        return memory.emitError("a virtual memory needs a registered read");
+      unsigned reads = 0, writes = 0;
+      for (auto *user : memory->getUsers()) {
+        if (isa<seq::FirMemReadOp>(user))
+          ++reads;
+        else if (isa<seq::FirMemWriteOp>(user))
+          ++writes;
+        else
+          return user->emitError("a virtual memory has read and write ports "
+                                 "only");
+      }
+      if (reads != 1 || writes > 1)
+        return memory.emitError("a virtual memory has one read port and at "
+                                "most one write port");
+      int gap = shortLead ? 4 : 5;
+      if (cls.stateGap < gap)
+        return memory.emitError("a virtual memory needs a state gap of ")
+               << gap << " host cycles; class " << cls.name << " has "
+               << cls.stateGap;
+      auto type = memory.getType();
+      unsigned maskWidth = type.getMaskWidth().value_or(1);
+      unsigned width = type.getWidth();
+      // The controller takes byte enables, or none.
+      if (maskWidth > 1 && (width % maskWidth || (width / maskWidth) % 8))
+        return memory.emitError("a virtual memory's mask covers whole bytes");
+      Class::VirtualMemory vm;
+      vm.name = memory.getName().value_or("mem").str();
+      vm.rowWidth = std::max(1u, llvm::Log2_64_Ceil(type.getDepth()));
+      vm.dataWidth = width;
+      vm.maskWidth = maskWidth > 1 ? width / 8 : 1;
+      vm.readFirst = memory.getRuw() != seq::RUW::New;
+      virtualOf[memory] = cls.virtualMemories.size();
+      cls.virtualMemories.push_back(vm);
+    }
+  }
+
   // The early outputs' next values, before any register is replaced.
   auto *modelOutput = modelBody->getTerminator();
   ImplicitLocOpBuilder mb(model.getLoc(), modelOutput);
@@ -2396,8 +2468,35 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     inputArg[i] = numIn;
     addPort(name, cls.inputTypes[i], true);
   }
+  // A virtual memory's responses in, its requests and pending reads out.
+  unsigned instWidth = std::max(idxWidth, 1u);
+  auto intType = [&](unsigned width) { return IntegerType::get(context, width); };
+  if (!cls.virtualMemories.empty()) {
+    cls.resetInput = numIn;
+    addPort("hostReset", intType(1), true);
+  }
+  for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
+    std::string name = ("vm" + Twine(k) + "_").str();
+    vm.firstInput = numIn;
+    addPort(name + "rsp_valid", intType(1), true);
+    addPort(name + "rsp_inst", intType(instWidth), true);
+    addPort(name + "rsp_data", intType(vm.dataWidth), true);
+  }
   for (auto [o, name] : llvm::enumerate(cls.outputNames))
     addPort(name, cls.outputTypes[o], false);
+  for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
+    std::string name = ("vm" + Twine(k) + "_").str();
+    vm.firstOutput = numOut;
+    addPort(name + "rd_valid", intType(1), false);
+    addPort(name + "rd_inst", intType(instWidth), false);
+    addPort(name + "rd_row", intType(vm.rowWidth), false);
+    addPort(name + "wr_valid", intType(1), false);
+    addPort(name + "wr_inst", intType(instWidth), false);
+    addPort(name + "wr_row", intType(vm.rowWidth), false);
+    addPort(name + "wr_data", intType(vm.dataWidth), false);
+    addPort(name + "wr_mask", intType(vm.maskWidth), false);
+    addPort(name + "pending", intType(entries), false);
+  }
   OpBuilder tb(model);
   auto copy = hw::HWModuleOp::create(tb, model.getLoc(),
                                      StringAttr::get(context, cls.name + "_static"),
@@ -2474,6 +2573,115 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     }
     regionUsed += bits;
     return regions.back();
+  };
+
+  // A virtual memory: its read and write as requests at the state pass, each
+  // instance's read data from its responses, kept like a registered read's
+  // (no bypass: the state gap covers the buffer), and the instances whose
+  // read is pending, set as it is issued and cleared as its response comes.
+  SmallVector<SmallVector<Value>> virtualPorts(cls.virtualMemories.size());
+  auto buildVirtualMemory = [&](seq::FirMemOp memory,
+                                unsigned k) -> SmallVector<Value> {
+    auto &vm = cls.virtualMemories[k];
+    auto &region = regionFor(vm.dataWidth);
+    Location loc = memory.getLoc();
+    BackedgeBuilder edges(b, loc);
+    auto zero = [&](unsigned width) -> Value {
+      return hw::ConstantOp::create(b, intType(width), 0);
+    };
+    auto widen = [&](Value value, unsigned width) -> Value {
+      unsigned have = hw::getBitWidth(value.getType());
+      if (have == width)
+        return value;
+      if (have > width)
+        return b.createOrFold<comb::ExtractOp>(intType(width), value, 0);
+      return b.createOrFold<comb::ConcatOp>(zero(width - have), value);
+    };
+    Value inst = threads > 1 ? region.inst : zero(1);
+    Value rspValid = body->getArgument(vm.firstInput);
+    Value rspInst = body->getArgument(vm.firstInput + 1);
+    Value rspData = body->getArgument(vm.firstInput + 2);
+    Value rdValid = zero(1), rdRow = zero(vm.rowWidth);
+    Value wrValid = zero(1), wrRow = zero(vm.rowWidth);
+    Value wrData = zero(vm.dataWidth), wrMask = zero(vm.maskWidth);
+    for (auto *user : llvm::make_early_inc_range(memory->getUsers())) {
+      if (auto write = dyn_cast<seq::FirMemWriteOp>(user)) {
+        wrValid = region.state;
+        if (write.getEnable())
+          wrValid = comb::AndOp::create(b, wrValid, write.getEnable());
+        wrRow = widen(write.getAddress(), vm.rowWidth);
+        wrData = asBits(b, write.getData());
+        unsigned maskBits = memory.getType().getMaskWidth().value_or(1);
+        if (vm.maskWidth == 1 || !write.getMask()) {
+          wrMask = hw::ConstantOp::create(b, APInt::getAllOnes(vm.maskWidth));
+        } else {
+          // Each mask bit enables its whole bytes.
+          unsigned perBit = vm.maskWidth / maskBits;
+          SmallVector<Value> bytes;
+          for (unsigned i = maskBits; i-- > 0;) {
+            Value bit = b.createOrFold<comb::ExtractOp>(intType(1),
+                                                        write.getMask(), i);
+            bytes.push_back(perBit > 1
+                                ? b.createOrFold<comb::ReplicateOp>(
+                                      intType(perBit), bit)
+                                : bit);
+          }
+          wrMask = b.createOrFold<comb::ConcatOp>(bytes);
+        }
+        write.erase();
+        continue;
+      }
+      auto read = cast<seq::FirMemReadOp>(user);
+      rdValid = region.state;
+      if (read.getEnable())
+        rdValid = comb::AndOp::create(b, rdValid, read.getEnable());
+      rdRow = widen(read.getAddress(), vm.rowWidth);
+      auto readName = vm.name + "_rdata";
+      Value data;
+      if (threads == 1) {
+        auto nextEdge = edges.get(rspData.getType());
+        auto buffer = seq::FirRegOp::create(b, nextEdge, hostClock,
+                                            b.getStringAttr(readName));
+        nextEdge.setValue(comb::MuxOp::create(b, rspValid, rspData, buffer));
+        data = buffer;
+      } else {
+        auto bufferType =
+            seq::FirMemType::get(context, entries, vm.dataWidth, 1);
+        auto buffer = seq::FirMemOp::create(
+            b, bufferType, /*readLatency=*/0, /*writeLatency=*/1,
+            seq::RUW::Undefined, seq::WUW::Undefined,
+            b.getStringAttr(readName), hw::InnerSymAttr{},
+            seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+        keepShallowInFlops(buffer);
+        seq::FirMemWriteOp::create(b, buffer, rspInst, hostClock, rspValid,
+                                   rspData, Value{});
+        Value bufferData = seq::FirMemReadOp::create(b, buffer, region.inst1,
+                                                     hostClock, one());
+        data = seq::FirRegOp::create(b, bufferData, hostClock,
+                                     b.getStringAttr(readName + "_read"));
+      }
+      data = b.createOrFold<hw::BitcastOp>(read.getData().getType(), data);
+      read.getData().replaceAllUsesWith(data);
+      replaced[read.getData()] = data;
+      read.erase();
+    }
+    memory.erase();
+    auto bitOf = [&](Value index) -> Value {
+      return comb::ShlOp::create(b, hw::ConstantOp::create(b, intType(entries), 1),
+                                 widen(index, entries));
+    };
+    Value set = comb::MuxOp::create(b, rdValid, bitOf(inst), zero(entries));
+    Value clear = comb::MuxOp::create(b, rspValid, bitOf(rspInst), zero(entries));
+    auto pendingNext = edges.get(intType(entries));
+    Value pending = seq::FirRegOp::create(
+        b, pendingNext, hostClock, b.getStringAttr(vm.name + "_pending"),
+        body->getArgument(cls.resetInput), zero(entries), hw::InnerSymAttr{},
+        /*isAsync=*/false, b.getIntegerAttr(intType(entries), 0));
+    pendingNext.setValue(comb::AndOp::create(
+        b, comb::OrOp::create(b, pending, set),
+        comb::XorOp::create(b, clear,
+                            hw::ConstantOp::create(b, APInt::getAllOnes(entries)))));
+    return {rdValid, inst, rdRow, wrValid, inst, wrRow, wrData, wrMask, pending};
   };
 
   SmallVector<seq::FirRegOp> registers;
@@ -2609,6 +2817,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     }
     auto memory = cast<seq::FirMemOp>(op);
     b.setLoc(memory.getLoc());
+    if (auto it = virtualOf.find(memory); it != virtualOf.end()) {
+      virtualPorts[it->second] = buildVirtualMemory(memory, it->second);
+      continue;
+    }
     auto memType = memory.getType();
     uint64_t bits = uint64_t(memType.getWidth()) * memType.getDepth();
     auto &region = regionFor(bits);
@@ -2778,6 +2990,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     auto it = replaced.find(value);
     outputs.push_back(it == replaced.end() ? value : it->second);
   }
+  for (auto &ports : virtualPorts)
+    outputs.append(ports.begin(), ports.end());
   b.setInsertionPointToEnd(body);
   hw::OutputOp::create(b, outputs);
   cls.copy = copy;
@@ -2857,6 +3071,31 @@ LogicalResult StaticFolder::buildSim() {
   unsigned advancePort = numIn;
   if (bubbles)
     addPort("advance", i1, true);
+  // Each class's virtual memories, numbered over the netlist: a controller's
+  // responses and free request entries in, its requests out.
+  struct SimVirtual {
+    unsigned cls, k, firstInput;
+  };
+  SmallVector<SimVirtual> simVirtuals;
+  for (auto [c, cls] : llvm::enumerate(classes))
+    for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
+      std::string name = ("vm" + Twine(simVirtuals.size()) + "_").str();
+      unsigned instWidth =
+          std::max(cls.threads() > 1 ? llvm::Log2_32_Ceil(cls.threads()) : 0u, 1u);
+      simVirtuals.push_back({unsigned(c), unsigned(k), unsigned(numIn)});
+      addPort(name + "rsp_valid", i1, true);
+      addPort(name + "rsp_inst", IntegerType::get(context, instWidth), true);
+      addPort(name + "rsp_data", IntegerType::get(context, vm.dataWidth), true);
+      addPort(name + "free", IntegerType::get(context, kVirtualFreeWidth), true);
+      addPort(name + "rd_valid", i1, false);
+      addPort(name + "rd_inst", IntegerType::get(context, instWidth), false);
+      addPort(name + "rd_row", IntegerType::get(context, vm.rowWidth), false);
+      addPort(name + "wr_valid", i1, false);
+      addPort(name + "wr_inst", IntegerType::get(context, instWidth), false);
+      addPort(name + "wr_row", IntegerType::get(context, vm.rowWidth), false);
+      addPort(name + "wr_data", IntegerType::get(context, vm.dataWidth), false);
+      addPort(name + "wr_mask", IntegerType::get(context, vm.maskWidth), false);
+    }
   OpBuilder tb(netlist);
   auto sim = hw::HWModuleOp::create(tb, netlist.getLoc(),
                                     StringAttr::get(context, simName),
@@ -2902,6 +3141,13 @@ LogicalResult StaticFolder::buildSim() {
   // after the decision is a register chain of it, so the whole frame from
   // there on moves a host cycle later, and no distance shrinks.
   Value advance = bubbles ? body->getArgument(advancePort) : Value();
+  // With virtual memories, a position also waits for its instance's read.
+  Backedge virtualReady;
+  if (!simVirtuals.empty()) {
+    virtualReady = backedges.get(i1);
+    advance = advance ? Value(comb::AndOp::create(b, advance, virtualReady))
+                      : Value(virtualReady);
+  }
   // A position's next: the next slot, or at the frame's end the next frame's
   // first if it starts, else `ii`; with bubbles, itself when not advancing.
   auto nextPosition = [&](Value pos) -> Value {
@@ -3221,6 +3467,12 @@ LogicalResult StaticFolder::buildSim() {
       copyInputs[c].push_back(backedges.get(type));
       operands.push_back(copyInputs[c].back());
     }
+    if (!cls.virtualMemories.empty())
+      operands.push_back(hostReset);
+    for (auto &v : simVirtuals)
+      if (v.cls == c)
+        for (unsigned j = 0; j < 3; ++j)
+          operands.push_back(body->getArgument(v.firstInput + j));
     copies[c] = hw::InstanceOp::create(b, cls.copy,
                                        b.getStringAttr(cls.name + "_copy"),
                                        operands);
@@ -3763,6 +4015,53 @@ LogicalResult StaticFolder::buildSim() {
   go.setValue(goTerms.empty() ? constant(1, 1)
                               : comb::AndOp::create(b, goTerms, false));
 
+  // A position runs only when, for each class of virtual memories, the
+  // instance it loads has no read pending, and each controller has room for
+  // the requests the decisions in flight may issue. It is the position after
+  // the decision's, without a bubble: the one a bubble would delay.
+  if (virtualReady) {
+    Value end = comb::OrOp::create(b, eq(posD, ii - 1), eq(posD, ii));
+    Value next = comb::MuxOp::create(
+        b, end,
+        comb::MuxOp::create(b, go, constant(posWidth, 0), constant(posWidth, ii)),
+        comb::AddOp::create(b, posD, constant(posWidth, 1)));
+    SmallVector<Value> terms;
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      if (cls.virtualMemories.empty())
+        continue;
+      unsigned threads = cls.threads();
+      unsigned idxWidth = threads > 1 ? llvm::Log2_32_Ceil(threads) : 0;
+      SmallVector<uint64_t> useRow(ii + 1, 0), instRow(ii + 1, 0);
+      for (unsigned i = 0; i < threads; ++i)
+        for (auto pass : {kReady, kState}) {
+          if (pass == kReady && !cls.hasReady)
+            continue;
+          unsigned s = cls.slot[pass][i];
+          useRow[s % ii] = 1;
+          instRow[s % ii] = i;
+        }
+      Value use = table(b, next, useRow, 1);
+      Value inst = threads > 1 ? table(b, next, instRow, idxWidth) : Value();
+      for (auto &vm : cls.virtualMemories) {
+        Value pending = copies[c].getResult(vm.firstOutput + 8);
+        Value bit = pending;
+        if (inst) {
+          unsigned entries = 1u << idxWidth;
+          Value shift = b.createOrFold<comb::ConcatOp>(
+              constant(entries - idxWidth, 0), inst);
+          bit = b.createOrFold<comb::ExtractOp>(
+              i1, comb::ShrUOp::create(b, pending, shift), 0);
+        }
+        terms.push_back(comb::OrOp::create(b, notOf(use), notOf(bit)));
+      }
+    }
+    for (auto &v : simVirtuals)
+      terms.push_back(comb::ICmpOp::create(
+          b, comb::ICmpPredicate::uge, body->getArgument(v.firstInput + 3),
+          constant(kVirtualFreeWidth, kVirtualRoom)));
+    virtualReady.setValue(comb::AndOp::create(b, terms, false));
+  }
+
   // Ports out: finishes, the inputs' readies, then the outputs' channels.
   SmallVector<Value> finishes;
   for (auto &ctl : llvm::reverse(controls))
@@ -3772,6 +4071,11 @@ LogicalResult StaticFolder::buildSim() {
   for (auto &[p, ready] : inputReady)
     results.push_back(ready);
   results.append(portOutputs.begin(), portOutputs.end());
+  for (auto &v : simVirtuals) {
+    auto &vm = classes[v.cls].virtualMemories[v.k];
+    for (unsigned j = 0; j < 8; ++j)
+      results.push_back(copies[v.cls].getResult(vm.firstOutput + j));
+  }
   hw::OutputOp::create(b, results);
 
   SmallVector<Attribute> threads;
@@ -3779,6 +4083,23 @@ LogicalResult StaticFolder::buildSim() {
     threads.push_back(
         b.getStringAttr(cls.name + "=" + Twine(cls.threads())));
   sim->setAttr("foldsim.threads", b.getArrayAttr(threads));
+  // The virtual memories, for the kernel: name, class, instance index, row
+  // address, data and mask widths, read-first, instances.
+  if (!simVirtuals.empty()) {
+    SmallVector<Attribute> virtuals;
+    for (auto &v : simVirtuals) {
+      auto &cls = classes[v.cls];
+      auto &vm = cls.virtualMemories[v.k];
+      unsigned instWidth =
+          std::max(cls.threads() > 1 ? llvm::Log2_32_Ceil(cls.threads()) : 0u, 1u);
+      virtuals.push_back(b.getStringAttr(
+          vm.name + ":" + cls.name + ":" + Twine(instWidth) + ":" +
+          Twine(vm.rowWidth) + ":" + Twine(vm.dataWidth) + ":" +
+          Twine(vm.maskWidth) + ":" + Twine(vm.readFirst ? 1 : 0) + ":" +
+          Twine(cls.threads())));
+    }
+    sim->setAttr("foldsim.vmems", b.getArrayAttr(virtuals));
+  }
   sim->setAttr("foldsim.frame", b.getI64IntegerAttr(ii));
   simModule = sim;
   return success();
@@ -3999,7 +4320,7 @@ void FoldStaticPass::runOnOperation() {
   StaticFolder folder(top, netlist, simName, regionBits, report, copies,
                       nest, scheduleOnly, oneCycleLinks, overlapFrames,
                       modulo, interleaveCopies, zeroLatencyLinks, zeroLatencyChains,
-                      shortLead, bubbles, stagedEnv,
+                      shortLead, bubbles, virtualMemories, stagedEnv,
                       specGroups, specDepth,
                       envSinks, registerStateEntries, slrGroups, slrSites,
                       slrCapacity, slrAssign);

@@ -144,6 +144,10 @@ def frame_options(a):
         fold += ' short-lead'
     if a.bubbles:
         fold += ' bubbles'
+    if getattr(a, 'virtual_memories', None):
+        if re.search(r'[\s{}]', a.virtual_memories):
+            sys.exit('--virtual-memories: a regex without spaces or braces')
+        fold += f' virtual-memories={a.virtual_memories}'
     if a.unstaged_env:
         fold += ' staged-env=false'
     if getattr(a, 'register_state_entries', None) is not None:
@@ -375,6 +379,10 @@ def main():
     ap.add_argument('--bubbles', action='store_true',
                     help='with --static: an input `advance`; a host cycle it is low puts an idle '
                          'slot in the frame (for slots that wait on data, e.g. memories off-chip)')
+    ap.add_argument('--virtual-memories', metavar='REGEX',
+                    help='with --static: keep the registered-read memories whose names match outside '
+                         'the simulator, behind the kernel\'s foldsim_vmem controllers (HBM); a slot '
+                         'whose read is not back waits in a bubble')
     ap.add_argument('--register-state-entries', type=int, metavar='N',
                     help='with --static: per-instance state of copies with at most N instances in flops, '
                          'deeper in distributed RAM (default 2; 0: always distributed RAM)')
@@ -613,6 +621,14 @@ def main():
     }
     for name, n in info['threads'].items():
         info['threads'][name] = int(n)
+    # Virtual memories, in the simulator's vm<k>_ port order.
+    vmems = re.search(r'foldsim\.vmems = \[(.*?)\]', sim_text)
+    info['vmem'] = []
+    for k, entry in enumerate(re.findall(r'"([^"]*)"', vmems.group(1)) if vmems else []):
+        name, cls, iw, aw, dw, mw, rf, insts = entry.split(':')
+        info['vmem'].append({'port': f'vm{k}', 'memory': name, 'class': cls, 'inst_width': int(iw),
+                             'row_width': int(aw), 'data_width': int(dw), 'mask_width': int(mw),
+                             'read_first': rf == '1', 'instances': int(insts)})
     with open(out('foldsim_sim.json'), 'w') as f:
         json.dump(info, f, indent=1)
     # The kernel's view of it: how many classes report their finishes, bit c
@@ -623,6 +639,13 @@ def main():
                 f'`define FOLDSIM_NUM_CLASSES {len(info["threads"])}\n')
         if any(p['name'] == 'advance' for p in info['ports']):
             f.write('`define FOLDSIM_ADVANCE\n')
+        if info['vmem']:
+            f.write(f'`define FOLDSIM_VMEM_COUNT {len(info["vmem"])}\n')
+            for k, v in enumerate(info['vmem']):
+                for key, d in (('IW', 'inst_width'), ('AW', 'row_width'), ('DW', 'data_width'),
+                               ('MW', 'mask_width'), ('INSTANCES', 'instances')):
+                    f.write(f'`define FOLDSIM_VMEM_{k}_{key} {v[d]}\n')
+                f.write(f'`define FOLDSIM_VMEM_{k}_RDWRF {int(v["read_first"])}\n')
     print(f'foldsim: {", ".join(f"{k} x{v}" for k, v in info["threads"].items())}', file=sys.stderr)
 
 

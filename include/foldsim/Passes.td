@@ -346,6 +346,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "a bubble and the schedule is the same: its distances only grow. "
            "For a slot that waits on data, such as a target memory kept "
            "off-chip">,
+    Option<"virtualMemories", "virtual-memories", "std::string", "\"\"",
+           "A regex of target memory names: each such registered-read memory "
+           "of a folded class is kept outside the simulator (in HBM, behind "
+           "the kernel's foldsim_vmem controller) instead of in a threaded "
+           "RAM. A copy issues the memory's reads and writes as requests at "
+           "its state pass and keeps each instance's read data from the "
+           "responses; a slot whose instance's read has not been answered "
+           "waits in a bubble, so the target's cycles never change">,
     Option<"stagedEnv", "staged-env", "bool", "true",
            "The environment's endpoints take a token a host cycle after it "
            "is offered (registered token ends), not in that host cycle">,
