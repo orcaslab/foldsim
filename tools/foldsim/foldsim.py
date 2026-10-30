@@ -210,7 +210,7 @@ def choose_copies(a, foldsim_opt, flat, passes, out):
     result = foldsim_degree.evaluate(models, open(base).read(), fold, foldsim_opt, work, cal,
                                      a.jobs, a.lut_budget, max_points=a.degree_max_points,
                                      store='auto' if a.storage == 'auto' else 'fixed',
-                                     route=a.routability)
+                                     route=a.routability, slr_groups=a.slr_groups)
     with open(out('degree.txt'), 'w') as f:
         f.write(foldsim_degree.table(result) + '\n')
     with open(out('degree.json'), 'w') as f:
@@ -372,7 +372,8 @@ def main():
                          'else search them (foldsim_degree.py evaluate)')
     ap.add_argument('--routability', action=argparse.BooleanOptionalAction, default=True,
                     help='with --copies auto: the pick must also route (the V80 routability '
-                         'term, foldsim_storage.py)')
+                         'term, foldsim_storage.py: load and the SLRs it spreads over, fewer '
+                         'with --slr-groups when a choice has fewer copies than SLRs)')
     ap.add_argument('--storage', default='',
                     help='with --static: the storage of folded state stores, as '
                          '<model>:<store>=<kind>,... (foldsim-fold-static storage; kind a Vivado '

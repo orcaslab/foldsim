@@ -17,8 +17,9 @@ deeper), and the frame it allows: the deepest copy's. For every choice of k per 
           RAMB36 and URAM288 (foldsim_storage.py); fixed: the compiler's
           default rules against the device's RAMB36;
   routes  the routability term (foldsim_storage.py): the router's congestion
-          fitted on the V80 builds against LUTs and block RAMs; a pick must
-          route as well as place (--no-routability: place only).
+          fitted on the V80 builds against LUTs and block RAMs and the SLRs
+          they spread over (the region's, fewer with fewer SLR groups); a pick
+          must route as well as place (--no-routability: place only).
 
 A simulated cycle takes II x period ns: since the memory endpoint is in the
 frame, H = II. Reports the Pareto front of ns per simulated cycle against LUTs,
@@ -36,7 +37,7 @@ usage:
   foldsim_degree.py fit --calibration <calibration.json>
   foldsim_degree.py explore --models <models.mlir> --module <top> --workdir <dir>
       [--calibration F] [--screen <dir>] [--storage fixed|auto] [--no-routability]
-      [--no-uram] [--schedules <dir> [--cached-only]]
+      [--no-uram] [--slr-groups] [--schedules <dir> [--cached-only]]
   foldsim.py ... --static --copies auto [--storage auto] [--lut-budget N]
       [--degree-calibration F]
 """
@@ -234,7 +235,7 @@ def rest_of(cal, est_total):
 
 
 def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fixed',
-         route=False, uram=True):
+         route=False, uram=True, slr_groups=False):
     """LUTs of one fold degree ({class: copies}, 1 when absent): logic and
     distributed RAM apart, the sites they take, and the largest copy. With the
     degree's schedule report (parse_classes) each copy's state takes the form
@@ -243,13 +244,17 @@ def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fi
     against the whole device's RAMB36; 'auto', a kind per store
     (storage_area) against the V80 dynamic region. `route`: whether a point
     must also route (the routability term, foldsim_storage.congestion).
-    `uram`: whether the storage may use UltraRAM."""
+    `uram`: whether the storage may use UltraRAM. `slr_groups`: whether each
+    copy is kept whole in one SLR (foldsim --slr-groups), which confines the
+    fold to as many SLRs as it has copies."""
+    slrs = storage.route_slrs(sum(degree.get(c, 1) for c in classes) if slr_groups else 0)
     if store == 'auto':
-        res = storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram)
+        res = storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram,
+                           slrs)
     else:
         res = fixed_area(cal, est, classes, degree, rest, sched, ii, entries)
     if route:
-        c = storage.fold_congestion(res['luts'], res['bram'], res.get('uram', 0))
+        c = storage.fold_congestion(res['luts'], res['bram'], res.get('uram', 0), slrs)
         res['congestion'] = round(c, 2)
         res['routes'] = c <= storage.ROUTE_LIMIT
     return res
@@ -277,13 +282,15 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2):
                 sites=round(sites), fits=fits, bram=round(bram, 1), largest_copy=round(largest))
 
 
-def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram=True):
+def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram=True,
+                 slrs=None):
     """area() with a kind chosen per store (foldsim_storage.assign) against
     the V80 dynamic region: its sites, RAMB36 and URAM288 and, with `route`,
-    the LUTs that route. Every copy of a class takes its stores' kinds (the
-    compiler's `storage` rules are per class); a class's register stores
-    choose by width, and only where every copy of several instances keeps
-    them in distributed RAM (no flops or ring) with a state gap of 4."""
+    the LUTs that route over `slrs` SLRs (the region's by default). Every
+    copy of a class takes its stores' kinds (the compiler's `storage` rules
+    are per class); a class's register stores choose by width, and only
+    where every copy of several instances keeps them in distributed RAM (no
+    flops or ring) with a state gap of 4."""
     logic = rest
     units, copy_logic, base_lutram = [], {}, 0.0
     for c, n in classes.items():
@@ -333,7 +340,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     caps = {p: storage.MARGIN * storage.REGION[p] for p in ('sites', 'bram', 'uram')}
     base = dict(sites=logic, luts=logic)
     choice, used = storage.assign(units, base, caps,
-                                  dict(luts=storage.route_luts()) if route else None)
+                                  dict(luts=storage.route_luts(slrs)) if route else None)
     fits = all(used[p] <= caps[p] + 1e-9 for p in ('sites', 'bram', 'uram'))
     lutram = bram = uram = 0.0
     per_copy = dict(copy_logic)
@@ -673,15 +680,16 @@ def pareto(points, key):
 
 def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
              jobs=4, budget=0, depth=None, max_points=256, store='fixed', route=False,
-             cache=None, cached_only=False, uram=True):
+             cache=None, cached_only=False, uram=True, slr_groups=False):
     """Every choice of copies per class: II, LUTs, whether it places, period
     and ns per cycle; the Pareto front, and the fastest point that places and
     stays within `budget` LUTs (0: none). `depth` is the design's screen depth
     (screen_depth), for a fit that has the depth term. `store` and `route`:
     the storage choice and the routability term (area); with `route` the
-    pick must also route. `cache`: a directory of schedule reports of the
-    same models and options (an earlier explore's workdir), read instead of
-    scheduling; with `cached_only`, its choices are the only ones priced.
+    pick must also route; `slr_groups`: each copy whole in one SLR (area).
+    `cache`: a directory of schedule reports of the same models and options
+    (an earlier explore's workdir), read instead of scheduling; with
+    `cached_only`, its choices are the only ones priced.
 
     Past `max_points` choices (lanes folded as classes: 256 instances each),
     every choice is too many to schedule; the search then schedules one choice
@@ -717,7 +725,7 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
         ii, _, _ = parse_schedule(text)
         res = dict(copies=copies or '-', ii=ii,
                    **area(cal, est, classes, dict(zip(names, ks)), rest,
-                          parse_classes(text), ii, entries, store, route, uram))
+                          parse_classes(text), ii, entries, store, route, uram, slr_groups))
         if fit:
             period = fit_period(fit, features(res['largest_copy'], depth, sum(ks),
                                               res['luts']))
@@ -761,7 +769,7 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
     unfolded = area(cal, est, classes, dict(classes), rest)
     return dict(classes=classes, points=points, front=front, pick=pick, budget=budget,
                 unfolded=unfolded, firesim=firesim_area(cal, unfolded), depth=depth, fit=fit,
-                space=space, store=store, route=route, uram=uram)
+                space=space, store=store, route=route, uram=uram, slr_groups=slr_groups)
 
 
 def table(result):
@@ -810,11 +818,14 @@ def table(result):
                      f'{BRAM_SITES} RAMB36')
     if route:
         per = storage.ROUTE_PER
-        lines.append(f'routes: congestion = {storage.ROUTE_A} L + {storage.ROUTE_B} L^2 % '
+        slrs = storage.route_slrs()
+        groups = ', fewer if a choice has fewer copies (SLR groups)' \
+            if result.get('slr_groups') else ''
+        lines.append(f'routes: congestion = {storage.ROUTE_A} L + {storage.ROUTE_B} L (L / S) % '
                      f"(L = {storage.SYNTH_PER_ROUTED} LUTs + {per['bram']} RAMB36 + "
-                     f"{per['uram']} URAM288, in millions; foldsim_storage.py fit-route) "
-                     f'<= {storage.ROUTE_LIMIT} %: a load of at most '
-                     f'{storage.route_luts():.0f} LUTs')
+                     f"{per['uram']} URAM288, in millions; S = the region's {slrs:g} SLRs"
+                     f'{groups}; foldsim_storage.py fit-route) <= {storage.ROUTE_LIMIT} %: a load '
+                     f'of at most {storage.route_luts():.0f} LUTs')
     if fit:
         c = fit['coef']
         label = dict(size='log2(largest copy LUTs)',
@@ -876,6 +887,9 @@ def main():
                    help='a pick must also route (foldsim_storage.congestion)')
     e.add_argument('--uram', action=argparse.BooleanOptionalAction, default=True,
                    help='with --storage auto: whether stores may take UltraRAM')
+    e.add_argument('--slr-groups', action='store_true',
+                   help='each copy kept whole in one SLR, as foldsim --slr-groups '
+                        '(the routability term)')
     e.add_argument('--schedules', default='',
                    help='a directory of schedule reports of the same models and options '
                         '(an earlier explore\'s workdir), read instead of scheduling')
@@ -918,7 +932,7 @@ def main():
     result = evaluate(a.models, open(base).read(), fold, a.foldsim_opt, a.workdir, cal,
                       a.jobs, a.lut_budget, screen_depth(a.screen) if a.screen else None,
                       a.max_points, a.storage, a.routability, a.schedules or None,
-                      a.cached_only, a.uram)
+                      a.cached_only, a.uram, a.slr_groups)
     print(table(result))
     json.dump(result, open(os.path.join(a.workdir, 'degree.json'), 'w'), indent=1,
               default=str)

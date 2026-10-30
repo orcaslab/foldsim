@@ -33,13 +33,16 @@ placement's cost; a point it cannot bring under does not route.
 
 Routability. The router's global routing utilization (Vivado's initial
 estimate, `Global Vertical/Horizontal Routing Utilization`) against the
-design's LUTs, fitted over the V80 OOC builds and images (`fit-route`,
-foldsim_v80_route.csv: the OOC builds of fame5_work/static/ooc2x2 by
-`route-points`, and the images img_int, img_fo and img_ii8 from their
-impl_1 runme.log and place_report_utilization_0.rpt):
+design's routing load and how densely the layout packs it, fitted over the
+V80 OOC builds and images (`fit-route`, foldsim_v80_route.csv: the OOC
+builds of fame5_work/static/ooc2x2 by `route-points`, and the images
+img_int, img_fo and img_ii8 from their impl_1 runme.log and
+place_report_utilization_0.rpt):
 
-  congestion = A * L + B * L**2   (percent, L in millions)
+  congestion = A * L + B * L * (L / S)   (percent, L in millions)
   L = LUTs + 24 RAMB36 + 26 URAM288
+  S = the SLRs the fold may spread over: the region's (3 out of context,
+      1.8 for the image's dynamic region), or its SLR groups if fewer
 
 A block RAM's routing in LUTs is its signals over a LUT6's 7 pins: a RAMB36
 at 72 bits has about 165 (72 in, 72 out, two addresses, enables), a URAM288
@@ -47,13 +50,32 @@ about 180. The builds cannot fit these weights (their block RAMs hardly
 vary), so they are set, not fitted; without them, state moved out of LUTs
 into block RAM would look free of routing.
 
-The fit of the builds that routed reaches 23.8 % (f_k2, 1.18M LUTs); that
-of those that failed starts at 33.0 % (o8_t8sf, 1.43M); a fold routes when
-its estimate is below the middle, 28.4 % (a load of 1.33M). The builds count
-synthesized LUTs (placed for the images); the fold-degree model estimates
-routed ones (its calibration's), which are 3.8 % fewer (the median over the
-24 OOC builds that routed, 0.7-9.0 %), so a fold's LUTs are scaled by 1.038
-first: it routes up to a load of 1.28M in the model's LUTs.
+The layout term. At 1.42-1.48M of load the full GPU's II 8 folds split by
+layout: out of context, o8_t8n and o8_t8a spread over all three SLRs and
+route (30.5-30.7 %); o8_t8sc and o8_t8sf, whose `--slr-groups` kept each
+socket's subtree whole in one SLR (2 groups), packed into two SLRs and
+failed (35.8-37.6 %), as did img_ii8 in the image, whose dynamic region
+spans 1.8 SLRs (36.3 %). Their links do not tell them apart: t8n, t8sc and
+t8sf have the same 16 copy pairs and 75.2k link bits, t8a and img_ii8 the
+same 28 pairs (interleaved copies) and 75.3k bits. What differs is the
+SLRs the placement may use, so the second term is the load times the load
+per SLR: wires lengthen as a region fills. The region's SLRs are the slices
+of its pblock (the rectangles of the compute shell's pblock_slash: about
+195k of the device's 321,776 slices; any value from 1.5 to 2.2 classifies
+every build alike); a fold with SLR groups (foldsim --slr-groups)
+keeps each whole in one SLR, so G groups occupy at most G SLRs. Fewer
+groups than SLRs confine; one per copy, as many as the SLRs or more, do not
+(t8a's 7 spread over three).
+
+The fit of the builds that routed reaches 28.8 % (o8_t8n); that of those
+that failed starts at 34.5 % (o8_t8sf); a fold routes when its estimate is
+below the middle, 31.65 %: a load of 1.32M in the image's region, 1.58M
+over three SLRs. Leaving any build out, the fit of the rest still classifies
+it. The builds count synthesized LUTs (placed for the images); the
+fold-degree model estimates routed ones (its calibration's), which are
+3.8 % fewer (the median over the 24 OOC builds that routed, 0.7-9.0 %), so a
+fold's LUTs are scaled by 1.038 first: in the region it routes up to a load
+of 1.27M in the model's LUTs.
 
 usage:
   foldsim_storage.py fit-route [--points foldsim_v80_route.csv]
@@ -69,8 +91,11 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import foldsim_cost as cost  # noqa: E402
 
 # The SLASH dynamic region of the V80 (pblock_slash): LUT sites as the placer
-# counts them (foldsim_degree.PLACE_SITES), RAMB36 and URAM288.
-REGION = dict(sites=3269043, bram=2415, uram=1211)
+# counts them (foldsim_degree.PLACE_SITES), RAMB36, URAM288, and the SLRs its
+# slices amount to (about 195k of the device's 321,776 slices over 3 SLRs).
+REGION = dict(sites=3269043, bram=2415, uram=1211, slrs=1.8)
+# The V80's SLRs: what an out-of-context build may spread over.
+DEVICE_SLRS = 3
 # What a LUT of distributed RAM costs in sites (foldsim_degree.LUTRAM_SITES).
 LUTRAM_SITES = 4.08
 # Placement is not routing: the margin kept on every capacity.
@@ -88,13 +113,13 @@ WRITE_PORTS = dict(registers=None, distributed=1, block=2, ultra=2)
 # write and the next read (foldsim-fold-static `storage`).
 BLOCK_STATE_GAP = 4
 
-# The routability fit (fit-route over foldsim_v80_route.csv: 26 OOC builds
-# and 3 images; RMS 2.79 points, leave-one-out 3.04) and its limit: midway
-# between the fit of the most congested build that routed (23.77 %, f_k2)
-# and of the least congested that failed (33.01 %, o8_t8sf), a load of 1.33M;
-# 1.5 leave-one-out errors either side.
-ROUTE_A, ROUTE_B = 5.893, 11.673
-ROUTE_LIMIT = 28.39
+# The routability fit (fit-route over foldsim_v80_route.csv: 29 OOC builds
+# and 3 images; RMS 2.27 points, leave-one-out 2.45) and its limit: midway
+# between the fit of the most congested build that routed (28.80 %, o8_t8n)
+# and of the least congested that failed (34.51 %, o8_t8sf); 1.2
+# leave-one-out errors either side.
+ROUTE_A, ROUTE_B = 9.924, 19.211
+ROUTE_LIMIT = 31.65
 # LUT6s of routing a block RAM brings: its signals over a LUT6's 7 pins.
 ROUTE_PER = dict(bram=24, uram=26)
 # Synthesized LUTs per routed LUT: the median over the OOC builds that routed
@@ -108,10 +133,20 @@ def route_load(luts, bram=0.0, uram=0.0):
     return luts + ROUTE_PER['bram'] * bram + ROUTE_PER['uram'] * uram
 
 
-def congestion(load):
-    """The router's global routing utilization (percent) at a routing load."""
+def route_slrs(groups=0, region=None):
+    """The SLRs a fold may spread over: the region's (REGION's by default),
+    or fewer when it has fewer SLR groups, each kept whole in one SLR
+    (`groups`: their number, 0 for none)."""
+    s = REGION['slrs'] if region is None else region
+    return min(s, groups) if groups else s
+
+
+def congestion(load, slrs=None):
+    """The router's global routing utilization (percent) at a routing load
+    spread over `slrs` SLRs (route_slrs; the region's by default)."""
     m = load / 1e6
-    return ROUTE_A * m + ROUTE_B * m * m
+    s = route_slrs() if slrs is None else slrs
+    return ROUTE_A * m + ROUTE_B * m * m / s
 
 
 def fold_load(luts, bram=0.0, uram=0.0):
@@ -120,15 +155,17 @@ def fold_load(luts, bram=0.0, uram=0.0):
     return luts + route_load(0, bram, uram) / SYNTH_PER_ROUTED
 
 
-def fold_congestion(luts, bram=0.0, uram=0.0):
+def fold_congestion(luts, bram=0.0, uram=0.0, slrs=None):
     """The congestion of a fold priced by the fold-degree model."""
-    return congestion(SYNTH_PER_ROUTED * fold_load(luts, bram, uram))
+    return congestion(SYNTH_PER_ROUTED * fold_load(luts, bram, uram), slrs)
 
 
-def route_luts():
-    """The most routing load, in the model's LUTs, that routes:
-    fold_congestion(route_luts()) == ROUTE_LIMIT."""
-    a, b, c = ROUTE_B, ROUTE_A, -ROUTE_LIMIT
+def route_luts(slrs=None):
+    """The most routing load, in the model's LUTs, that routes over `slrs`
+    SLRs (the region's by default): fold_congestion(route_luts(s), slrs=s)
+    == ROUTE_LIMIT."""
+    s = route_slrs() if slrs is None else slrs
+    a, b, c = ROUTE_B / s, ROUTE_A, -ROUTE_LIMIT
     return 1e6 * (-b + math.sqrt(b * b - 4 * a * c)) / (2 * a) / SYNTH_PER_ROUTED
 
 
@@ -290,42 +327,71 @@ def read_points(path):
     return [r for r in csv.DictReader(open(path))]
 
 
-def fit_route(points):
+def point_slrs(p):
+    """The SLRs a build of the points file could spread over: the device's
+    out of context, the region's in an image, fewer with fewer SLR groups."""
+    region = DEVICE_SLRS if p['source'] == 'ooc' else REGION['slrs']
+    return route_slrs(int(p.get('groups') or 0), region)
+
+
+def fit_route(points, layout=True):
     """Least squares of the router's estimate (mean of vertical and
-    horizontal) on L and L^2, through the origin; each build's residual and
-    leave-one-out error; the routed and failed builds' ranges."""
+    horizontal) on L and L * L / S (`layout`; else L^2, the fit without the
+    layout term), through the origin; each build's residual and leave-one-out
+    error; the routed and failed builds' ranges, the limit between them, the
+    builds it misclassifies, and those the fit and limit of the others
+    misclassify (leave-one-out)."""
     sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
     from foldsim_degree import lstsq
     load = [route_load(float(p['luts']), float(p['bram']), float(p['uram'])) / 1e6 for p in points]
-    rows = [[x, x * x] for x in load]
+    slrs = [point_slrs(p) if layout else 1.0 for p in points]
+    rows = [[x, x * x / s] for x, s in zip(load, slrs)]
     ys = [(float(p['gvu']) + float(p['ghu'])) / 2 for p in points]
-    coef = lstsq(rows, ys)
+    routes = [p['routed'] == 'yes' for p in points]
+
+    def limit(est, keep):
+        # The limit separates the builds by the fit itself (what a choice is
+        # priced with): midway between the most congested routed build's fit
+        # and the least congested failed one's.
+        routed = max(est[i] for i in keep if routes[i])
+        failed = min(est[i] for i in keep if not routes[i])
+        return routed, failed, (routed + failed) / 2
+
+    def fit(keep):
+        c = lstsq([rows[i] for i in keep], [ys[i] for i in keep])
+        return c and [sum(a * b for a, b in zip(c, r)) for r in rows]
+
+    every = range(len(points))
+    est = fit(every)
+    routed, failed, lim = limit(est, every)
     out = []
     for i, p in enumerate(points):
-        c = lstsq(rows[:i] + rows[i + 1:], ys[:i] + ys[i + 1:])
-        est = sum(a * b for a, b in zip(coef, rows[i]))
-        loo = sum(a * b for a, b in zip(c, rows[i]))
+        keep = [j for j in every if j != i]
+        others = fit(keep)
+        loo = others and others[i] - ys[i]
         out.append(dict(name=p['name'], luts=int(float(p['luts'])), load=int(load[i] * 1e6),
-                        routed=p['routed'], y=ys[i],
-                        est=est, res=est - ys[i], loo=loo - ys[i]))
+                        slrs=slrs[i], routed=p['routed'], y=ys[i], est=est[i],
+                        res=est[i] - ys[i], loo=loo,
+                        wrong=(est[i] <= lim) != routes[i],
+                        loo_wrong=others is None or
+                        (others[i] <= limit(others, keep)[2]) != routes[i]))
     rms = math.sqrt(sum(o['res'] ** 2 for o in out) / len(out))
-    loo = math.sqrt(sum(o['loo'] ** 2 for o in out) / len(out))
-    # The limit separates the builds by the fit itself (what a choice is
-    # priced with): midway between the most congested routed build's fit
-    # and the least congested failed one's.
-    routed = max(o['est'] for o in out if o['routed'] == 'yes')
-    failed = min(o['est'] for o in out if o['routed'] == 'FAIL')
-    return dict(coef=coef, rms=rms, loo=loo, routed=routed, failed=failed,
-                limit=(routed + failed) / 2, points=out)
+    loo = math.sqrt(sum(o['loo'] ** 2 for o in out if o['loo'] is not None) / len(out))
+    return dict(coef=lstsq(rows, ys), rms=rms, loo=loo, routed=routed, failed=failed,
+                limit=lim, points=out, layout=layout)
 
 
 def route_point(d):
     """A points-file row of an out-of-context build directory (vivado.log,
     synth_util.rpt): synthesized LUTs, RAMB36 and URAM, whether routing
-    finished legally, and the router's global routing utilization; None if
-    the build has not reached the router."""
+    finished legally, the router's global routing utilization, and the SLR
+    groups the build applied (floorplan.txt: foldsim_floorplan.tcl's
+    assignments); None if the build has not reached the router."""
     log = open(os.path.join(d, 'vivado.log'), errors='replace').read()
     util = open(os.path.join(d, 'synth_util.rpt'), errors='replace').read()
+    plan = os.path.join(d, 'floorplan.txt')
+    groups = len({line.split()[1] for line in open(plan) if len(line.split()) > 1}) \
+        if os.path.exists(plan) else 0
 
     def row(label):
         m = re.search(r'\|\s*' + re.escape(label) + r'\s*\|\s*([\d.]+)', util)
@@ -347,7 +413,7 @@ def route_point(d):
     overlaps = last(r'There are (\d+) node overlaps') or ''
     return (f"{os.path.basename(d.rstrip('/'))},ooc,{luts:.0f},{row('LUT as Logic'):.0f},"
             f"{row('LUT as Memory'):.0f},{row('Block RAM Tile'):g},{row('URAM'):.0f},{routed},"
-            f"{gv},{gh},{overlaps}")
+            f"{gv},{gh},{overlaps},{groups}")
 
 
 def main():
@@ -366,17 +432,33 @@ def main():
             if r:
                 print(r)
         return
-    r = fit_route(read_points(a.points))
-    for o in sorted(r['points'], key=lambda o: o['luts']):
-        print(f"{o['name']:<12} {o['luts']:>9} LUTs, load {o['load']:>9} {o['routed']:>5} measured {o['y']:5.1f} "
-              f"fit {o['est']:5.1f} ({o['res']:+5.1f}) leave-one-out {o['loo']:+5.1f}")
+    points = read_points(a.points)
+    r = fit_route(points)
+    for o in sorted(r['points'], key=lambda o: o['load']):
+        loo = f"{o['loo']:+5.1f}" if o['loo'] is not None else '    -'
+        mark = (' MISCLASSIFIED' if o['wrong'] else '') + \
+            (' (leave-one-out: misclassified)' if o['loo_wrong'] else '')
+        print(f"{o['name']:<12} {o['luts']:>9} LUTs, load {o['load']:>9}, S {o['slrs']:<3g}"
+              f"{o['routed']:>5} measured {o['y']:5.1f} fit {o['est']:5.1f} ({o['res']:+5.1f}) "
+              f"leave-one-out {loo}{mark}")
     a_, b_ = r['coef']
-    print(f"congestion = {a_:.3f} L + {b_:.3f} L^2 (L in millions); RMS {r['rms']:.2f}, "
-          f"leave-one-out RMS {r['loo']:.2f} over {len(r['points'])} builds")
+
+    def load_at(slrs):
+        return 1e6 * (-a_ + math.sqrt(a_ * a_ + 4 * b_ / slrs * r['limit'])) / (2 * b_ / slrs)
+
+    def wrong(r, key):
+        return ', '.join(o['name'] for o in r['points'] if o[key]) or 'none'
+    print(f"congestion = {a_:.3f} L + {b_:.3f} L (L / S) (L in millions, S in SLRs); "
+          f"RMS {r['rms']:.2f}, leave-one-out RMS {r['loo']:.2f} over {len(r['points'])} builds")
     print(f"fit of the routed builds up to {r['routed']:.2f} %, of the failed from "
-          f"{r['failed']:.2f} %: limit "
-          f"{r['limit']:.2f} % = a load of "
-          f"{1e6 * (-a_ + math.sqrt(a_ * a_ + 4 * b_ * r['limit'])) / (2 * b_):.0f}")
+          f"{r['failed']:.2f} %: limit {r['limit']:.2f} % = a load of "
+          f"{load_at(REGION['slrs']):.0f} over the region's {REGION['slrs']:g} SLRs, "
+          f"{load_at(DEVICE_SLRS):.0f} over {DEVICE_SLRS}")
+    print(f"misclassified: {wrong(r, 'wrong')}; leave-one-out: {wrong(r, 'loo_wrong')}")
+    base = fit_route(points, layout=False)
+    print(f"without the layout term (L and L^2): RMS {base['rms']:.2f}, leave-one-out "
+          f"{base['loo']:.2f}; routed up to {base['routed']:.2f} %, failed from "
+          f"{base['failed']:.2f} %; misclassified: {wrong(base, 'wrong')}")
 
 
 if __name__ == '__main__':

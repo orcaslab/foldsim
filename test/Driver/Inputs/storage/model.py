@@ -35,13 +35,23 @@ print(f"mem 256x120 mask 8: block {s.kind_cost(mem(1, depth=256, width=120, mask
 print('mem two writes: block floor', s.kind_cost(mem(1, wports=2), 'block')['ii_floor'],
       'distributed floor', s.kind_cost(mem(1, wports=2), 'distributed')['ii_floor'])
 
-# Routability: the folds near 0.89M routed, those near 1.45M did not
-# (synthesized LUTs, RAMB36, URAM288 of f_hs, img_int, f_k2, o8_t8sf, img_ii8).
-for luts, bram, uram in ((905171, 514, 64), (908019, 514, 64), (1179619, 649, 64),
-                         (1432069, 592, 64), (1461670, 849, 64)):
-    c = s.congestion(s.route_load(luts, bram, uram))
-    print(f'luts {luts}: congestion {c:.1f} routes {c <= s.ROUTE_LIMIT}')
-print(f'route limit {s.route_luts():.0f} LUTs')
+# Routability: the load and the SLRs it may spread over (synthesized LUTs,
+# RAMB36, URAM288). Out of context (the device's 3 SLRs) f_hs, f_k2 and
+# o8_t8n route; o8_t8sf, at o8_t8n's load but held in 2 SLRs by its 2 SLR
+# groups, does not. In the image's region (1.8 SLRs) img_int routes and
+# img_ii8 (7 SLR groups: no fewer SLRs) does not.
+print('slrs: region', s.route_slrs(), 'groups 1', s.route_slrs(1), 'groups 2', s.route_slrs(2),
+      'ooc groups 2', s.route_slrs(2, s.DEVICE_SLRS),
+      'ooc groups 7', s.route_slrs(7, s.DEVICE_SLRS))
+for name, luts, bram, uram, slrs in (
+        ('f_hs', 905171, 514, 64, s.DEVICE_SLRS), ('img_int', 908019, 514, 64, s.route_slrs()),
+        ('f_k2', 1179619, 649, 64, s.DEVICE_SLRS), ('o8_t8n', 1460935, 849, 64, s.DEVICE_SLRS),
+        ('o8_t8sf', 1432069, 592, 64, s.route_slrs(2, s.DEVICE_SLRS)),
+        ('img_ii8', 1461670, 849, 64, s.route_slrs(7))):
+    c = s.congestion(s.route_load(luts, bram, uram), slrs)
+    print(f'{name} luts {luts} slrs {slrs:g}: congestion {c:.1f} routes {c <= s.ROUTE_LIMIT}')
+print(f'route limit {s.route_luts():.0f} LUTs in the region, '
+      f'{s.route_luts(s.DEVICE_SLRS):.0f} over 3 SLRs, {s.route_luts(1):.0f} in one')
 
 # A class of 256 lanes on one copy, its registers 64 to 80 bits wide, 3,000
 # of them: in distributed RAM it does not place; with a state gap of 4 the
@@ -73,3 +83,11 @@ for logic, route in ((1.15e6, False), (1.15e6, True), (1.35e6, True)):
     print(f"logic {logic:.0f} route {route}: luts {a['luts']} fits {a['fits']} bram {a['bram']} "
           f"uram {a['uram']} congestion {a.get('congestion', '-')} routes {a.get('routes', '-')} "
           f"storage {a['storage']}")
+# SLR groups: one copy of a single class kept whole in one SLR. At 1.1M of
+# logic it routes over the region's 1.8 SLRs, not in one.
+one = dict(Top=dict(lut=1.1e6, ff=0, mems=[], regw={}))
+for groups in (False, True):
+    a = d.area(None, one, dict(Top=1), {}, 0, dict(Top=dict(n=1, ready=[], state=[0], gap=1)),
+               1, 2, 'auto', True, slr_groups=groups)
+    print(f"slr groups {groups}: luts {a['luts']} congestion {a['congestion']} "
+          f"routes {a['routes']}")

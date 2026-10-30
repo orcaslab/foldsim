@@ -1,0 +1,17 @@
+# The routability fit over the V80 builds (foldsim_v80_route.csv): the
+# load and the SLRs a fold may spread over separate every build that routed
+# from every one that failed, and so does the fit of the others with each
+# left out. The full GPU's II 8 folds at 1.44-1.48M of load: o8_t8a and
+# o8_t8n spread over three SLRs and route; o8_t8sf and o8_t8sc, held in two
+# by their SLR groups, and img_ii8 in the image's 1.8 do not. By load alone
+# o8_t8n and o8_t8sf fall on the wrong sides.
+# RUN: python3 %S/Inputs/storage/route.py foldsim | FileCheck %s
+# CHECK: o8_t8a {{.*}} S 3   {{ *}}yes measured  30.7
+# CHECK: o8_t8sf {{.*}} S 2   {{ *}}FAIL measured  35.8
+# CHECK: o8_t8sc {{.*}} S 2   {{ *}}FAIL measured  37.6
+# CHECK: o8_t8n {{.*}} S 3   {{ *}}yes measured  30.5
+# CHECK: img_ii8 {{.*}} S 1.8 {{ *}}FAIL measured  36.3
+# CHECK: congestion = 9.924 L + 19.211 L (L / S) (L in millions, S in SLRs); RMS 2.27, leave-one-out RMS 2.45 over 32 builds
+# CHECK: fit of the routed builds up to 28.80 %, of the failed from 34.51 %: limit 31.65 %
+# CHECK: misclassified: none; leave-one-out: none
+# CHECK: without the layout term (L and L^2): {{.*}} misclassified: o8_t8sf, o8_t8n
