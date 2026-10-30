@@ -1,0 +1,49 @@
+# --vmem-cache-rows: each virtual memory's host-cache lines, for the kernel's
+# foldsim_vmem controllers (FOLDSIM_VMEM_<k>_CACHE_ROWS in foldsim_sim.vh, and
+# `cache_rows` in the json's `vmem` list). Leaf's RAM: 16 rows of 8 bits, 4
+# instances (64 rows of image), or 2 per copy with --copies Leaf:2 (32 each).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/vmem
+# Absent: nothing; the kernel's default applies.
+# RUN: foldsim --srcs top.f --top Top --out %t/none --static --virtual-memories ram Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=NONE < %t/none/foldsim_sim.vh
+# RUN: FileCheck %s --check-prefix=NONEJ < %t/none/foldsim_sim.json
+# NONE: `define FOLDSIM_VMEM_0_BASE 64'h0
+# NONE-NOT: CACHE_ROWS
+# NONEJ-NOT: cache_rows
+# auto: a sixteenth of the rows, at least 256 lines, but never more than the
+# memory's rows: all 64.
+# RUN: foldsim --srcs top.f --top Top --out %t/auto --static --virtual-memories ram --vmem-cache-rows auto Leaf 2> %t/auto.log > /dev/null
+# RUN: FileCheck %s --check-prefix=AUTO < %t/auto/foldsim_sim.vh
+# RUN: FileCheck %s --check-prefix=AUTOJ < %t/auto/foldsim_sim.json
+# RUN: FileCheck %s --check-prefix=AUTOL < %t/auto.log
+# AUTO: `define FOLDSIM_VMEM_0_BASE 64'h0
+# AUTO-NEXT: `define FOLDSIM_VMEM_0_CACHE_ROWS 64
+# AUTO-NEXT: `define FOLDSIM_VMEM_BYTES 64'h1000
+# AUTOJ: "cache_rows": 64
+# AUTOL: foldsim: vmem host caches: vm0 64 lines (0.5 RAMB36)
+# A number: every memory's, capped at its rows (32 per copy).
+# RUN: foldsim --srcs top.f --top Top --out %t/n16 --static --virtual-memories ram --copies Leaf:2 --vmem-cache-rows 16 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=N16 < %t/n16/foldsim_sim.vh
+# N16: `define FOLDSIM_VMEM_0_CACHE_ROWS 16
+# N16: `define FOLDSIM_VMEM_1_CACHE_ROWS 16
+# RUN: foldsim --srcs top.f --top Top --out %t/n4096 --static --virtual-memories ram --copies Leaf:2 --vmem-cache-rows 4096 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=N4096 < %t/n4096/foldsim_sim.vh
+# N4096: `define FOLDSIM_VMEM_0_CACHE_ROWS 32
+# N4096: `define FOLDSIM_VMEM_1_CACHE_ROWS 32
+# 0: no cache (the controller's direct datapath), stated.
+# RUN: foldsim --srcs top.f --top Top --out %t/n0 --static --virtual-memories ram --vmem-cache-rows 0 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=N0 < %t/n0/foldsim_sim.vh
+# N0: `define FOLDSIM_VMEM_0_CACHE_ROWS 0
+# A budget the caches do not fit: the costliest halves, to none below 2
+# lines, until they do (each 32-line cache takes a RAMB18, 0.5 RAMB36).
+# RUN: foldsim --srcs top.f --top Top --out %t/budget --static --virtual-memories ram --copies Leaf:2 --vmem-cache-rows auto --vmem-cache-budget 0.5 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=BUDGET < %t/budget/foldsim_sim.vh
+# BUDGET: `define FOLDSIM_VMEM_0_CACHE_ROWS 0
+# BUDGET: `define FOLDSIM_VMEM_1_CACHE_ROWS 32
+# Errors, before anything is compiled.
+# RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --virtual-memories ram --vmem-cache-rows 3 Leaf 2>&1 | FileCheck %s --check-prefix=BAD
+# RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --virtual-memories ram --vmem-cache-rows 1 Leaf 2>&1 | FileCheck %s --check-prefix=BAD
+# RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --virtual-memories ram --vmem-cache-rows some Leaf 2>&1 | FileCheck %s --check-prefix=BAD
+# BAD: --vmem-cache-rows: auto, 0 or a power of two of at least 2
+# RUN: not foldsim --srcs top.f --top Top --out %t/novm --static --vmem-cache-rows auto Leaf 2>&1 | FileCheck %s --check-prefix=NOVM
+# NOVM: --vmem-cache-rows needs --virtual-memories

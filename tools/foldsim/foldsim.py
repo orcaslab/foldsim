@@ -49,6 +49,48 @@ SPLIT = 'hw.module(foldsim-split-masked-memories)'
 ABSORB_LOGIC = 64
 
 
+# The host caches of the virtual memories (--vmem-cache-rows auto): a
+# sixteenth of a memory's rows, at least 256 lines, and all of them within
+# this many RAMB36 (5 % of the V80 dynamic region's 2415).
+VMEM_CACHE_FRACTION = 16
+VMEM_CACHE_FLOOR = 256
+VMEM_CACHE_BUDGET = 120
+# A cache's lines live in block RAM in one port pair: RAMB36E5 in simple dual
+# port, depth x width, and its half, RAMB18E5 (foldsim_storage.py's table).
+BRAM36 = ((512, 72), (1024, 36), (2048, 18), (4096, 9), (8192, 4), (16384, 2), (32768, 1))
+BRAM18 = ((512, 36), (1024, 18), (2048, 9), (4096, 4), (8192, 2), (16384, 1))
+
+
+def bram36(depth, width):
+    """RAMB36 (18K halves at 0.5) holding depth x width in one port pair."""
+    whole = min(-(-width // w) * -(-depth // d) for d, w in BRAM36)
+    half = min(-(-width // w) * -(-depth // d) for d, w in BRAM18)
+    return min(whole, 0.5 * half)
+
+
+def pow2_floor(n):
+    return 1 << (n.bit_length() - 1) if n > 0 else 0
+
+
+def vmem_cache_rows(vmems, choice, budget):
+    """Each virtual memory's host-cache lines (VMEM_INTERFACE.md, v4): a power
+    of two (or 0) up to its rows, the largest power of two at most
+    rows x instances. `auto`: rows / 16, at least 256; while the caches' data
+    take more than `budget` RAMB36, the costliest halves (0 below 2 lines)."""
+    caps = [pow2_floor(v['instances'] << v['row_width']) for v in vmems]
+    if choice != 'auto':
+        n = int(choice)
+        if n < 0 or n == 1 or n & (n - 1):
+            sys.exit('--vmem-cache-rows: auto, 0 or a power of two of at least 2')
+        return [min(n, c) for c in caps]
+    rows = [min(c, max(VMEM_CACHE_FLOOR, pow2_floor(c // VMEM_CACHE_FRACTION))) for c in caps]
+    cost = lambda k: bram36(rows[k], vmems[k]['data_width']) if rows[k] else 0
+    while sum(cost(k) for k in range(len(rows))) > budget:
+        k = max(range(len(rows)), key=cost)
+        rows[k] = rows[k] // 2 if rows[k] > 2 else 0
+    return rows
+
+
 def run(cmd, **kw):
     print('+', ' '.join(cmd), file=sys.stderr)
     return subprocess.run(cmd, check=True, text=True, **kw)
@@ -383,6 +425,15 @@ def main():
                     help='with --static: keep the registered-read memories whose names match outside '
                          'the simulator, behind the kernel\'s foldsim_vmem controllers (HBM); a slot '
                          'whose read is not back waits in a bubble')
+    ap.add_argument('--vmem-cache-rows', metavar='N|auto',
+                    help="with --virtual-memories: each memory's host-cache lines in the kernel "
+                         "(foldsim_sim.vh FOLDSIM_VMEM_<k>_CACHE_ROWS): N (0: none, else a power "
+                         "of two), or `auto`: a sixteenth of the memory's rows, at least 256, "
+                         "within --vmem-cache-budget; never more than the memory's rows. "
+                         "Absent: the kernel's default (FOLDSIM_VMEM_CACHE_ROWS)")
+    ap.add_argument('--vmem-cache-budget', type=float, default=VMEM_CACHE_BUDGET, metavar='RAMB36',
+                    help='with --vmem-cache-rows auto: the block RAM all the host caches\' lines may '
+                         'take, in RAMB36 (default %(default)g, 5%% of the V80 dynamic region\'s)')
     ap.add_argument('--register-state-entries', type=int, metavar='N',
                     help='with --static: per-instance state of copies with at most N instances in flops, '
                          'deeper in distributed RAM (default 2; 0: always distributed RAM)')
@@ -574,6 +625,12 @@ def main():
         a.spec_groups = axi_spec_groups(a.top, open(flat).read(), a.axi_spec)
     if a.copies == 'auto' and not a.static:
         sys.exit('--copies auto needs --static')
+    if a.vmem_cache_rows is not None:
+        if not a.virtual_memories:
+            sys.exit('--vmem-cache-rows needs --virtual-memories')
+        if a.vmem_cache_rows != 'auto' and not a.vmem_cache_rows.isdigit():
+            sys.exit('--vmem-cache-rows: auto, 0 or a power of two of at least 2')
+        vmem_cache_rows([], a.vmem_cache_rows, a.vmem_cache_budget)
     if a.static:
         fold = f'module={a.top} sim=foldsim_sim report={out("schedule.txt")}'
         if a.region_bits:
@@ -639,6 +696,13 @@ def main():
         v.update(row_bytes=row_bytes, base=offset, bytes=size)
         offset += -(-size // 4096) * 4096
     info['vmem_bytes'] = offset
+    if a.vmem_cache_rows is not None and info['vmem']:
+        for v, n in zip(info['vmem'], vmem_cache_rows(info['vmem'], a.vmem_cache_rows,
+                                                      a.vmem_cache_budget)):
+            v['cache_rows'] = n
+        print('foldsim: vmem host caches: ' + ', '.join(
+            f'{v["port"]} {v["cache_rows"]} lines ({bram36(v["cache_rows"], v["data_width"]) if v["cache_rows"] else 0:g} RAMB36)'
+            for v in info['vmem']), file=sys.stderr)
     with open(out('foldsim_sim.json'), 'w') as f:
         json.dump(info, f, indent=1)
     # The kernel's view of it: how many classes report their finishes, bit c
@@ -657,6 +721,8 @@ def main():
                     f.write(f'`define FOLDSIM_VMEM_{k}_{key} {v[d]}\n')
                 f.write(f'`define FOLDSIM_VMEM_{k}_RDWRF {int(v["read_first"])}\n')
                 f.write(f'`define FOLDSIM_VMEM_{k}_BASE 64\'h{v["base"]:x}\n')
+                if 'cache_rows' in v:
+                    f.write(f'`define FOLDSIM_VMEM_{k}_CACHE_ROWS {v["cache_rows"]}\n')
             f.write(f'`define FOLDSIM_VMEM_BYTES 64\'h{info["vmem_bytes"]:x}\n')
     print(f'foldsim: {", ".join(f"{k} x{v}" for k, v in info["threads"].items())}', file=sys.stderr)
 
