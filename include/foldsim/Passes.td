@@ -396,6 +396,16 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "shallow distributed RAM spends a LUT's whole depth on a few words, "
            "and a two-word read folds into the bypass LUT; 0 keeps every "
            "store in distributed RAM">,
+    ListOption<"storage", "storage", "std::string",
+               "The storage of folded state stores, as <model>:<store>=<kind>, "
+               "<kind> a Vivado ram_style (registers, distributed, block, "
+               "ultra). <store> is a memory of the model, by name, or `regs` "
+               "or `regs>=<width>`: the per-instance stores of its registers, "
+               "those at least <width> bits wide (the largest such bound "
+               "applies). A copy of <model> takes its rules. A register store "
+               "in block or ultra RAM is read a host cycle early, registered, "
+               "which needs a state gap of 4. Without rules the stores keep "
+               "the default rules">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

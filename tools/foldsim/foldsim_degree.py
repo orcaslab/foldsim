@@ -11,7 +11,15 @@ deeper), and the frame it allows: the deepest copy's. For every choice of k per 
   sites   the LUT sites the placer needs, distributed RAM weighted, against
           the V80 dynamic region (fits);
   period  a fit of the routed period against the largest copy's LUTs and,
-          with a logic screen of every build, the netlist's depth.
+          with a logic screen of every build, the netlist's depth;
+  storage with --storage auto, a kind per state store (flip-flops,
+          distributed, block or ultra RAM) against the region's sites,
+          RAMB36 and URAM288 (foldsim_storage.py); fixed: the compiler's
+          default rules against the device's RAMB36;
+  routes  the routability term (foldsim_storage.py): the router's congestion
+          fitted on the V80 builds against LUTs and block RAMs and the SLRs
+          they spread over (the region's, fewer with fewer SLR groups); a pick
+          must route as well as place (--no-routability: place only).
 
 A simulated cycle takes II x period ns: since the memory endpoint is in the
 frame, H = II. Reports the Pareto front of ns per simulated cycle against LUTs,
@@ -19,14 +27,19 @@ the fastest point that places within a LUT budget, and the unfolded target's
 area (what an unfolded simulator needs at the least). The model ranks and
 prunes; it does not promise a clock: retiming and routing dominate the period.
 
+Every choice is scheduled while there are few; lanes folded as classes (256
+instances each) make tens of thousands, and those are searched (evaluate).
+
 usage:
   foldsim_degree.py calibrate --models <models.mlir> --schedule <schedule.txt>
       --util <routed_util_hier.rpt> --timing <routed_timing_summary.rpt>
       --period <ns> --name <build> --out <calibration.json> [--screen <dir>]
   foldsim_degree.py fit --calibration <calibration.json>
   foldsim_degree.py explore --models <models.mlir> --module <top> --workdir <dir>
-      [--calibration F] [--screen <dir>]
-  foldsim.py ... --static --copies auto [--lut-budget N] [--degree-calibration F]
+      [--calibration F] [--screen <dir>] [--storage fixed|auto] [--no-routability]
+      [--no-uram] [--slr-groups] [--schedules <dir> [--cached-only]]
+  foldsim.py ... --static --copies auto [--storage auto] [--lut-budget N]
+      [--degree-calibration F]
 """
 import argparse
 import itertools
@@ -40,6 +53,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import foldsim_cost as cost  # noqa: E402
+import foldsim_storage as storage  # noqa: E402
 
 
 # The V80 dynamic region's LUT sites as the placer counts them, and what a LUT
@@ -77,13 +91,15 @@ def class_estimates(models, names):
     mods, _ = cost.parse(models)
     out = {}
     for name in names:
-        acc = dict(lut=0.0, ff=0, mems=[])
+        acc = dict(lut=0.0, ff=0, mems=[], regw={})
 
         def visit(n):
             m = mods[n]
             acc['lut'] += sum(m.lut.values())
             acc['ff'] += m.ff
             acc['mems'] += [list(r) for r in m.mems]
+            for w, k in m.regw.items():
+                acc['regw'][w] = acc['regw'].get(w, 0) + k
             for child, _ in m.insts:
                 base = child.split('__')[0]
                 if child in cost.BLACKBOX or base in cost.BLACKBOX:
@@ -104,7 +120,7 @@ def state_lutram(est, threads, form='lutram'):
     threads = 1 << (threads - 1).bit_length() if threads > 1 else 1
     luts = 0.0 if form != 'lutram' else cost.mem_cost(threads, est['ff'], 1, 0)[0]
     bram = 0.0
-    for (_, d, w, r, _, rl, st) in est['mems']:
+    for (_, d, w, r, _, rl, st, *_) in est['mems']:
         lr, br = cost.mem_cost(d * threads, w, r, rl, st)
         luts += lr
         bram += br
@@ -218,11 +234,33 @@ def rest_of(cal, est_total):
     return min(builds, key=lambda b: abs(math.log(max(size(b), 1) / max(est_total, 1))))['rest']
 
 
-def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2):
+def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fixed',
+         route=False, uram=True, slr_groups=False):
     """LUTs of one fold degree ({class: copies}, 1 when absent): logic and
     distributed RAM apart, the sites they take, and the largest copy. With the
     degree's schedule report (parse_classes) each copy's state takes the form
-    the compiler gives it (state_form)."""
+    the compiler gives it (state_form). `store`: 'fixed', the compiler's
+    default storage (block RAM by Vivado's inference, the rest distributed),
+    against the whole device's RAMB36; 'auto', a kind per store
+    (storage_area) against the V80 dynamic region. `route`: whether a point
+    must also route (the routability term, foldsim_storage.congestion).
+    `uram`: whether the storage may use UltraRAM. `slr_groups`: whether each
+    copy is kept whole in one SLR (foldsim --slr-groups), which confines the
+    fold to as many SLRs as it has copies."""
+    slrs = storage.route_slrs(sum(degree.get(c, 1) for c in classes) if slr_groups else 0)
+    if store == 'auto':
+        res = storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram,
+                           slrs)
+    else:
+        res = fixed_area(cal, est, classes, degree, rest, sched, ii, entries)
+    if route:
+        c = storage.fold_congestion(res['luts'], res['bram'], res.get('uram', 0), slrs)
+        res['congestion'] = round(c, 2)
+        res['routes'] = c <= storage.ROUTE_LIMIT
+    return res
+
+
+def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2):
     logic = lutram = bram = largest = 0.0
     for c, n in classes.items():
         k = degree.get(c, 1)
@@ -242,6 +280,129 @@ def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2):
     sites, fits = placement(logic, lutram, bram)
     return dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
                 sites=round(sites), fits=fits, bram=round(bram, 1), largest_copy=round(largest))
+
+
+def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram=True,
+                 slrs=None):
+    """area() with a kind chosen per store (foldsim_storage.assign) against
+    the V80 dynamic region: its sites, RAMB36 and URAM288 and, with `route`,
+    the LUTs that route over `slrs` SLRs (the region's by default). Every
+    copy of a class takes its stores' kinds (the compiler's `storage` rules
+    are per class); a class's register stores choose by width, and only
+    where every copy of several instances keeps them in distributed RAM (no
+    flops or ring) with a state gap of 4."""
+    logic = rest
+    units, copy_logic, base_lutram = [], {}, 0.0
+    for c, n in classes.items():
+        k = degree.get(c, 1)
+        kappa, lam = factors(cal, c, est[c]['lut'])
+        forms = []
+        for j in range(k):
+            t = copy_threads(n, k, j)
+            info = (sched or {}).get(c if j == 0 else f'{c}_copy{j}')
+            form, bypass = state_form(t, info, ii, entries) if sched is not None else \
+                ('one' if t == 1 else 'lutram', False)
+            cl = kappa * est[c]['lut'] + state_logic(cal, form, bypass, est[c]['ff'])
+            logic += cl
+            copy_logic[(c, j)] = cl
+            forms.append((j, t, form, info['gap'] if info else None))
+        deep = [f for f in forms if f[2] == 'lutram']
+        regs_free = all(f[2] in ('lutram', 'one') for f in forms)
+        for w, cnt in sorted(est[c]['regw'].items()):
+            per = []
+            for j, t, _, gap in deep:
+                per.append((j, dict(depth=1 << (t - 1).bit_length(), width=w, rports=1, wports=1,
+                                    rlat=0, mask=1, reg=True, gap=gap, threads=t), cnt))
+            if per:
+                units.append(unit(c, f'regs>={w}', per, lam, None if regs_free else 'distributed'))
+        mems = {}
+        for (name, d, w, r, wr, rl, st, mask, named) in est[c]['mems']:
+            mems.setdefault((name, named, d, w, r, wr, rl, st, mask), 0)
+            mems[(name, named, d, w, r, wr, rl, st, mask)] += 1
+        for (name, named, d, w, r, wr, rl, st, mask), cnt in mems.items():
+            per = []
+            for j, t, _, gap in forms:
+                th = 1 << (t - 1).bit_length() if t > 1 else 1
+                per.append((j, dict(depth=d * th, width=w, rports=r, wports=wr, rlat=rl,
+                                    mask=mask, reg=False, gap=gap, threads=t), cnt))
+            # Vivado's inference at the deepest copy's depth, or the hint.
+            th = max(1 << (t - 1).bit_length() if t > 1 else 1 for _, t, _, _ in forms)
+            default = 'block' if cost.mem_cost(d * th, w, r, rl, st)[1] else 'distributed'
+            # A memory the compiler's rules can name: named, and its name
+            # free of the pass options' separators.
+            nameable = named and not re.search(r'[,=:{}\s]', name)
+            u = unit(c, name, per, lam, None if nameable else default)
+            u['default'] = default
+            units.append(u)
+    if not uram:
+        for u in units:
+            u['costs'].pop('ultra', None)
+    caps = {p: storage.MARGIN * storage.REGION[p] for p in ('sites', 'bram', 'uram')}
+    base = dict(sites=logic, luts=logic)
+    choice, used = storage.assign(units, base, caps,
+                                  dict(luts=storage.route_luts(slrs)) if route else None)
+    fits = all(used[p] <= caps[p] + 1e-9 for p in ('sites', 'bram', 'uram'))
+    lutram = bram = uram = 0.0
+    per_copy = dict(copy_logic)
+    rules, floor = [], 0
+    for u, ch in zip(units, choice):
+        (kind, _), = ch.items()     # one store a unit: never split
+        for j, c in u['per'][kind]:
+            lutram += c['lutram']
+            bram += c['bram']
+            uram += c['uram']
+            logic += c['lut']
+            floor = max(floor, c['ii_floor'])
+            per_copy[(u['class'], j)] += c['lut'] + c['lutram']
+        u['kind'] = kind
+    for c in classes:
+        rules += storage_rules(c, [u for u in units if u['class'] == c])
+    sites = logic + storage.LUTRAM_SITES * lutram
+    return dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
+                sites=round(sites), fits=fits, bram=round(bram, 1), uram=uram,
+                largest_copy=round(max(per_copy.values())), storage=','.join(rules),
+                **({'ii_floor': floor} if floor > ii else {}))
+
+
+def unit(cls, store, per, lam, fixed):
+    """A store of a class, every copy's: its cost per kind (None where some
+    copy cannot take it), each copy's apart for the largest copy."""
+    costs, by_copy = {}, {}
+    for kind in storage.KINDS:
+        total = dict(lut=0.0, lutram=0.0, ff=0, bram=0.0, uram=0, ii_floor=0)
+        parts = []
+        for j, st, cnt in per:
+            c = storage.kind_cost(st, kind)
+            if c is None:
+                total = None
+                break
+            c = dict(c, lutram=lam * c['lutram'])
+            c = {k: (v if k == 'ii_floor' else v * cnt) for k, v in c.items()}
+            parts.append((j, c))
+            for key in total:
+                total[key] = max(total[key], c[key]) if key == 'ii_floor' else total[key] + c[key]
+        if total is not None:
+            costs[kind] = total
+            by_copy[kind] = parts
+    return dict(costs=costs, per=by_copy, count=1, fixed=fixed, store=store, **{'class': cls})
+
+
+def storage_rules(cls, units):
+    """The compiler's `storage` rules of a class's choice: its memories whose
+    kind is not the default, and its register stores by width (each width
+    whose kind differs from the narrower's: the largest bound applies)."""
+    rules = []
+    regs = sorted((int(u['store'].split('>=')[1]), u['kind']) for u in units
+                  if u['store'].startswith('regs>=') and not u['fixed'])
+    current = 'distributed'
+    for w, kind in regs:
+        if kind != current:
+            rules.append(f'{cls}:regs>={w}={kind}')
+            current = kind
+    for u in units:
+        if not u['store'].startswith('regs>=') and not u['fixed'] and u['kind'] != u['default']:
+            rules.append(f"{cls}:{u['store']}={u['kind']}")
+    return rules
 
 
 # The screen's measure of a netlist's depth for the period fit: log2 of the end
@@ -497,12 +658,54 @@ def degrees(n):
     return ks
 
 
+def deepest(n, k):
+    return -(-n // k)
+
+
+def by_depth(sizes, choices):
+    """One choice per frame depth: every class on the fewest copies whose
+    deepest copy is no deeper. The frame is bounded by the deepest copy of
+    any class, so a class folded finer than the others only adds copies."""
+    depths = sorted({deepest(n, k) for n, ks in zip(sizes, choices) for k in ks})
+    return list(dict.fromkeys(
+        tuple(next(k for k in ks if deepest(n, k) <= d) for n, ks in zip(sizes, choices))
+        for d in depths))
+
+
+def neighbours(point, choices):
+    """The choices one degree finer or coarser in a single class."""
+    for i, k in enumerate(point):
+        j = choices[i].index(k)
+        for m in (j - 1, j + 1):
+            if 0 <= m < len(choices[i]):
+                yield point[:i] + (choices[i][m],) + point[i + 1:]
+
+
+def pareto(points, key):
+    front = []
+    for p in sorted(points, key=lambda p: (p['luts'], p[key])):
+        if not front or p[key] < front[-1][key]:
+            front.append(p)
+    return front
+
+
 def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
-             jobs=4, budget=0, depth=None):
+             jobs=4, budget=0, depth=None, max_points=256, store='fixed', route=False,
+             cache=None, cached_only=False, uram=True, slr_groups=False):
     """Every choice of copies per class: II, LUTs, whether it places, period
     and ns per cycle; the Pareto front, and the fastest point that places and
     stays within `budget` LUTs (0: none). `depth` is the design's screen depth
-    (screen_depth), for a fit that has the depth term."""
+    (screen_depth), for a fit that has the depth term. `store` and `route`:
+    the storage choice and the routability term (area); with `route` the
+    pick must also route; `slr_groups`: each copy whole in one SLR (area).
+    `cache`: a directory of schedule reports of the same models and options
+    (an earlier explore's workdir), read instead of scheduling; with
+    `cached_only`, its choices are the only ones priced.
+
+    Past `max_points` choices (lanes folded as classes: 256 instances each),
+    every choice is too many to schedule; the search then schedules one choice
+    per frame depth (by_depth), then the neighbours of the front until the
+    front stops changing or `max_points` are scheduled."""
     _, classes, _ = parse_schedule(base_schedule)
     m = re.search(r'register-state-entries=(\d+)', fold_options)
     entries = int(m.group(1)) if m else 2
@@ -517,19 +720,23 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
         copies = ','.join(f'{c}:{k}' for c, k in zip(names, ks) if k > 1)
         tag = '_'.join(str(k) for k in ks) or 'base'
         report = os.path.join(workdir, f'schedule_{tag}.txt')
-        opts = fold_options + f' report={report} schedule-only'
-        if copies:
-            opts += f' copies={copies}'
-        r = subprocess.run([foldsim_opt, models,
-                            f'--pass-pipeline=builtin.module(foldsim-fold-static{{{opts}}})',
-                            '-o', os.devnull], capture_output=True, text=True)
-        if r.returncode:
-            return dict(copies=copies or '-', error=r.stderr.strip().splitlines()[-1:])
+        cached = cache and os.path.join(cache, f'schedule_{tag}.txt')
+        if cached and os.path.exists(cached):
+            report = cached
+        else:
+            opts = fold_options + f' report={report} schedule-only'
+            if copies:
+                opts += f' copies={copies}'
+            r = subprocess.run([foldsim_opt, models,
+                                f'--pass-pipeline=builtin.module(foldsim-fold-static{{{opts}}})',
+                                '-o', os.devnull], capture_output=True, text=True)
+            if r.returncode:
+                return dict(copies=copies or '-', error=r.stderr.strip().splitlines()[-1:])
         text = open(report).read()
         ii, _, _ = parse_schedule(text)
         res = dict(copies=copies or '-', ii=ii,
                    **area(cal, est, classes, dict(zip(names, ks)), rest,
-                          parse_classes(text), ii, entries))
+                          parse_classes(text), ii, entries, store, route, uram, slr_groups))
         if fit:
             period = fit_period(fit, features(res['largest_copy'], depth, sum(ks),
                                               res['luts']))
@@ -537,28 +744,52 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
                        ns=round(ii * period, 1))
         return res
 
-    with ThreadPoolExecutor(max_workers=jobs) as pool:
-        points = list(pool.map(one, itertools.product(*choices)))
-    good = [p for p in points if 'ii' in p]
     key = 'ns' if fit else 'ii'
-    front = []
-    for p in sorted(good, key=lambda p: (p['luts'], p[key])):
-        if not front or p[key] < front[-1][key]:
-            front.append(p)
-    within = [p for p in good if p['fits'] and (not budget or p['luts'] <= budget)]
+    space = math.prod(len(ks) for ks in choices)
+    done = {}
+    with ThreadPoolExecutor(max_workers=jobs) as pool:
+        def run(batch):
+            done.update(zip(batch, pool.map(one, batch)))
+        if cached_only:
+            tags = [f[len('schedule_'):-len('.txt')] for f in sorted(os.listdir(cache))
+                    if f.startswith('schedule_') and f != 'schedule_base.txt']
+            run([tuple(int(k) for k in t.split('_')) for t in tags
+                 if len(t.split('_')) == len(names)])
+        elif space <= max_points:
+            run(list(itertools.product(*choices)))
+        else:
+            sizes = [classes[c] for c in names]
+            run(by_depth(sizes, choices)[:max_points])
+            while len(done) < max_points:
+                point = {id(p): ks for ks, p in done.items()}
+                front = pareto([p for p in done.values() if 'ii' in p], key)
+                batch = list(dict.fromkeys(
+                    q for p in front for q in neighbours(point[id(p)], choices)
+                    if q not in done))
+                if not batch:
+                    break
+                run(batch[:max_points - len(done)])
+    points = list(done.values())
+    good = [p for p in points if 'ii' in p]
+    front = pareto(good, key)
+    within = [p for p in good if p['fits'] and (not budget or p['luts'] <= budget)
+              and p.get('routes', True)]
     pick = min(within, key=lambda p: (p[key], p['luts'])) if within else None
     # Every instance its own copy and its state in flip-flops: the target's
     # own area, which an unfolded simulator (FireSim) needs at the least.
     unfolded = area(cal, est, classes, dict(classes), rest)
     return dict(classes=classes, points=points, front=front, pick=pick, budget=budget,
-                unfolded=unfolded, firesim=firesim_area(cal, unfolded), depth=depth, fit=fit)
+                unfolded=unfolded, firesim=firesim_area(cal, unfolded), depth=depth, fit=fit,
+                space=space, store=store, route=route, uram=uram, slr_groups=slr_groups)
 
 
 def table(result):
     lines = []
     fit = result['fit']
-    cols = ['copies', 'ii', 'luts', 'lutram', 'sites', 'fits', 'bram', 'largest_copy'] + \
-        (['mhz', 'ns'] if fit else [])
+    store, route = result.get('store', 'fixed'), result.get('route', False)
+    cols = ['copies', 'ii', 'luts', 'lutram', 'sites', 'fits', 'bram'] + \
+        (['uram'] if store == 'auto' else []) + ['largest_copy'] + \
+        (['congestion', 'routes'] if route else []) + (['mhz', 'ns'] if fit else [])
     lines.append(' '.join(f'{c:>12}' if c != 'copies' else f'{c:<60}' for c in cols))
     front = {id(p) for p in result['front']}
     for p in sorted(result['points'], key=lambda p: p.get('luts', 0)):
@@ -566,6 +797,8 @@ def table(result):
             lines.append(f"{p['copies']:<60} error: {' '.join(p['error'])}")
             continue
         mark = (' *' if id(p) in front else '') + (' <- pick' if p is result['pick'] else '')
+        if p.get('ii_floor'):
+            mark += f" (II >= {p['ii_floor']} with paging)"
         lines.append(' '.join(f'{str(p[c]):>12}' if c != 'copies' else f'{p[c]:<60}'
                               for c in cols) + mark)
     u = result['unfolded']
@@ -575,10 +808,35 @@ def table(result):
     if fs:
         lines.append(f"{'FireSim, projected (at least: unfolded x FireSim builds)':<60} {'-':>12} "
                      f"{fs['luts']:>12} {fs['lutram']:>12} {fs['sites']:>12} {str(fs['fits']):>12}")
-    lines.append('* Pareto front (ns per simulated cycle against LUTs); '
-                 f"budget {result['budget'] or 'none'}; fits: {PLACE_MARGIN:.0%} of "
-                 f'{PLACE_SITES} V80 LUT sites (a LUTRAM LUT {LUTRAM_SITES} sites) and of '
-                 f'{BRAM_SITES} RAMB36')
+    space = result.get('space', len(result['points']))
+    if space > len(result['points']):
+        lines.append(f"searched {len(result['points'])} of {space} choices: one per frame depth, "
+                     'then the neighbours of the front')
+    if store == 'auto':
+        r = storage.REGION
+        lines.append('* Pareto front (ns per simulated cycle against LUTs); '
+                     f"budget {result['budget'] or 'none'}; storage chosen per store; fits: "
+                     f"{storage.MARGIN:.0%} of the V80 region's {r['sites']} LUT sites (a LUTRAM "
+                     f"LUT {storage.LUTRAM_SITES} sites), {r['bram']} RAMB36 and "
+                     + (f"{r['uram']} URAM288" if result.get('uram', True) else 'no URAM288'))
+        pick = result['pick']
+        if pick and pick.get('storage'):
+            lines.append(f"storage of the pick: {pick['storage']}")
+    else:
+        lines.append('* Pareto front (ns per simulated cycle against LUTs); '
+                     f"budget {result['budget'] or 'none'}; fits: {PLACE_MARGIN:.0%} of "
+                     f'{PLACE_SITES} V80 LUT sites (a LUTRAM LUT {LUTRAM_SITES} sites) and of '
+                     f'{BRAM_SITES} RAMB36')
+    if route:
+        per = storage.ROUTE_PER
+        slrs = storage.route_slrs()
+        groups = ', fewer if a choice has fewer copies (SLR groups)' \
+            if result.get('slr_groups') else ''
+        lines.append(f'routes: congestion = {storage.ROUTE_A} L + {storage.ROUTE_B} L (L / S) % '
+                     f"(L = {storage.SYNTH_PER_ROUTED} LUTs + {per['bram']} RAMB36 + "
+                     f"{per['uram']} URAM288, in millions; S = the region's {slrs:g} SLRs"
+                     f'{groups}; foldsim_storage.py fit-route) <= {storage.ROUTE_LIMIT} %: a load '
+                     f'of at most {storage.route_luts():.0f} LUTs')
     if fit:
         c = fit['coef']
         label = dict(size='log2(largest copy LUTs)',
@@ -629,8 +887,25 @@ def main():
     e.add_argument('--calibration', default='')
     e.add_argument('--lut-budget', type=int, default=0)
     e.add_argument('--jobs', type=int, default=4)
+    e.add_argument('--max-points', type=int, default=256,
+                   help='schedule every choice up to this many, else search (evaluate)')
     e.add_argument('--screen', default='',
                    help='the logic screen of the design\'s netlist, for the depth term')
+    e.add_argument('--storage', choices=('fixed', 'auto'), default='fixed',
+                   help="fixed: the compiler's default storage; auto: a kind per store "
+                        '(foldsim_storage.py), as foldsim --storage auto emits it')
+    e.add_argument('--routability', action=argparse.BooleanOptionalAction, default=True,
+                   help='a pick must also route (foldsim_storage.congestion)')
+    e.add_argument('--uram', action=argparse.BooleanOptionalAction, default=True,
+                   help='with --storage auto: whether stores may take UltraRAM')
+    e.add_argument('--slr-groups', action='store_true',
+                   help='each copy kept whole in one SLR, as foldsim --slr-groups '
+                        '(the routability term)')
+    e.add_argument('--schedules', default='',
+                   help='a directory of schedule reports of the same models and options '
+                        '(an earlier explore\'s workdir), read instead of scheduling')
+    e.add_argument('--cached-only', action='store_true',
+                   help='with --schedules: price its choices only, schedule none')
     e.add_argument('--fold-options', default='',
                    help='more foldsim-fold-static options, as the driver gives them '
                         '(nest, modulo, ...)')
@@ -656,14 +931,19 @@ def main():
         fold += ' ' + a.fold_options
     base = os.path.join(a.workdir, 'schedule_base.txt')
     os.makedirs(a.workdir, exist_ok=True)
-    r = subprocess.run([a.foldsim_opt, a.models,
-                        f'--pass-pipeline=builtin.module(foldsim-fold-static{{{fold} '
-                        f'report={base} schedule-only}})', '-o', os.devnull],
-                       capture_output=True, text=True)
-    if r.returncode:
-        sys.exit(r.stderr)
+    if a.schedules and os.path.exists(os.path.join(a.schedules, 'schedule_base.txt')):
+        base = os.path.join(a.schedules, 'schedule_base.txt')
+    else:
+        r = subprocess.run([a.foldsim_opt, a.models,
+                            f'--pass-pipeline=builtin.module(foldsim-fold-static{{{fold} '
+                            f'report={base} schedule-only}})', '-o', os.devnull],
+                           capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(r.stderr)
     result = evaluate(a.models, open(base).read(), fold, a.foldsim_opt, a.workdir, cal,
-                      a.jobs, a.lut_budget, screen_depth(a.screen) if a.screen else None)
+                      a.jobs, a.lut_budget, screen_depth(a.screen) if a.screen else None,
+                      a.max_points, a.storage, a.routability, a.schedules or None,
+                      a.cached_only, a.uram, a.slr_groups)
     print(table(result))
     json.dump(result, open(os.path.join(a.workdir, 'degree.json'), 'w'), indent=1,
               default=str)

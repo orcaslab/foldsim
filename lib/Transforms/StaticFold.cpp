@@ -186,7 +186,8 @@ public:
                StringRef virtualMemories, bool stagedEnv, ArrayRef<std::string> specGroups, unsigned specDepth,
                ArrayRef<std::string> envSinks, unsigned registerStateEntries,
                unsigned slrGroups, ArrayRef<std::string> slrSites,
-               uint64_t slrCapacity, ArrayRef<std::string> slrAssign)
+               uint64_t slrCapacity, ArrayRef<std::string> slrAssign,
+               ArrayRef<std::string> storage)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -197,7 +198,7 @@ public:
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
         zeroLatencyChains(zeroLatencyChains), shortLead(shortLead),
         bubbles(bubbles), virtualMemoryPattern(virtualMemories.str()),
-        registerStateEntries(registerStateEntries),
+        registerStateEntries(registerStateEntries), storageSpecs(storage),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -302,6 +303,21 @@ private:
   /// `--virtual-memories`: the names of the memories kept outside.
   std::string virtualMemoryPattern;
   unsigned registerStateEntries;
+  /// The storage rules (`storage`): a model's stores in a given ram_style.
+  struct StorageRule {
+    std::string model, store, kind;
+    /// A rule for the model's register stores, of at least `minWidth` bits.
+    bool regs = false;
+    unsigned minWidth = 0;
+    bool used = false;
+  };
+  ArrayRef<std::string> storageSpecs;
+  SmallVector<StorageRule> storageRules;
+  LogicalResult parseStorage();
+  /// The rule for a store of class `cls`: a memory by name, or a register
+  /// store of `width` bits; null if none.
+  StorageRule *storageFor(const Class &cls, StringRef store, bool reg,
+                          unsigned width);
   // Host cycles from a late netlist output's slot to the next frame's first.
   int envRoundTrip;
   /// Whether producer `p`'s link to class `c`'s input may be taken in the
@@ -2304,6 +2320,71 @@ static Value nextValue(ImplicitLocOpBuilder &b, Value root,
   return nexts.lookup(root);
 }
 
+/// Sets an operation's Vivado ram_style, replacing any it has.
+static void setRamStyle(Operation *op, StringRef kind) {
+  auto *context = op->getContext();
+  sv::modifySVAttributes(op, [&](SmallVectorImpl<sv::SVAttributeAttr> &attrs) {
+    llvm::erase_if(attrs, [](sv::SVAttributeAttr attr) {
+      return attr.getName().getValue() == "ram_style";
+    });
+    attrs.push_back(sv::SVAttributeAttr::get(
+        context, "ram_style", ("\"" + kind + "\"").str(),
+        /*emitAsComment=*/false));
+  });
+}
+
+LogicalResult StaticFolder::parseStorage() {
+  for (auto &spec : storageSpecs) {
+    auto [model, rest] = StringRef(spec).split(':');
+    auto [store, kind] = rest.rsplit('=');
+    if (model.empty() || store.empty() || kind.empty() || kind == rest)
+      return netlist.emitError("storage: '")
+             << spec << "' is not <model>:<store>=<kind>";
+    if (!llvm::is_contained({"registers", "distributed", "block", "ultra"},
+                            kind))
+      return netlist.emitError("storage: '")
+             << kind
+             << "' is not a ram_style: registers, distributed, block, ultra";
+    if (llvm::none_of(classes, [&](auto &cls) {
+          return cls.splitFrom < 0 && cls.name == model;
+        }))
+      return netlist.emitError("storage: no model '") << model << "'";
+    StorageRule rule;
+    rule.model = model.str();
+    rule.store = store.str();
+    rule.kind = kind.str();
+    if (store == "regs") {
+      rule.regs = true;
+    } else if (store.consume_front("regs>=")) {
+      rule.regs = true;
+      if (store.getAsInteger(10, rule.minWidth))
+        return netlist.emitError("storage: '")
+               << spec << "': regs>= takes a width";
+    }
+    storageRules.push_back(std::move(rule));
+  }
+  return success();
+}
+
+StaticFolder::StorageRule *StaticFolder::storageFor(const Class &cls,
+                                                    StringRef store, bool reg,
+                                                    unsigned width) {
+  StringRef model =
+      cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : cls.name;
+  StorageRule *best = nullptr;
+  for (auto &rule : storageRules) {
+    if (rule.model != model || rule.regs != reg)
+      continue;
+    if (reg ? width >= rule.minWidth &&
+                  (!best || rule.minWidth > best->minWidth)
+            : rule.store == store)
+      best = &rule;
+  }
+  if (best)
+    best->used = true;
+  return best;
+}
+
 LogicalResult StaticFolder::buildCopy(Class &cls) {
   auto model = cls.model;
   auto *context = model.getContext();
@@ -2548,7 +2629,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
 
   struct Region {
     std::string prefix;
-    Value inst1, inst, state, instStaged;
+    Value inst2, inst1, inst, state, instStaged;
   };
   SmallVector<Region> regions;
   uint64_t regionUsed = regionBits;
@@ -2563,6 +2644,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       region.state = keep(seq::FirRegOp::create(
           b, state1, hostClock, b.getStringAttr(prefix + "_state")));
       if (threads > 1) {
+        region.inst2 = ahead.inst2;
         region.inst1 = keep(seq::FirRegOp::create(
             b, ahead.inst2, hostClock, b.getStringAttr(prefix + "_inst1")));
         region.inst = keep(seq::FirRegOp::create(
@@ -2752,15 +2834,31 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                             b, enable, write.data, kept)));
         value = kept;
       } else {
+        // A store in block or ultra RAM reads a host cycle early, at the
+        // instance two host cycles ahead, into the RAM's own register: the
+        // same data a host cycle later when no write lands in between, which
+        // a state gap of 4 ensures (the staged write lands a host cycle after
+        // the state pass).
+        auto *rule = storageFor(cls, reg.getName(), /*reg=*/true, width);
+        bool block = rule && (rule->kind == "block" || rule->kind == "ultra");
+        if (block && cls.stateGap < 4)
+          return reg.emitError("storage: '")
+                 << rule->kind << "' RAM for the registers of '" << cls.name
+                 << "' needs a state gap of 4, not " << cls.stateGap;
+        // Read-first: the RAM's output register, as Vivado infers block and
+        // ultra RAM (the read never meets a write to its entry).
         auto memType = seq::FirMemType::get(context, entries, width, 1);
         auto memory = seq::FirMemOp::create(
-            b, memType, /*readLatency=*/0, /*writeLatency=*/1,
-            seq::RUW::Undefined, seq::WUW::Undefined, reg.getNameAttr(),
+            b, memType, /*readLatency=*/block ? 1 : 0, /*writeLatency=*/1,
+            block ? seq::RUW::Old : seq::RUW::Undefined, seq::WUW::Undefined,
+            reg.getNameAttr(),
             hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{},
             Attribute{});
         keepShallowInFlops(memory);
-        Value data = seq::FirMemReadOp::create(b, memory, region.inst1,
-                                               hostClock, one());
+        if (rule)
+          setRamStyle(memory, rule->kind);
+        Value data = seq::FirMemReadOp::create(
+            b, memory, block ? region.inst2 : region.inst1, hostClock, one());
         // The read register: the memory's output register.
         auto readEdges = BackedgeBuilder(b, reg.getLoc());
         auto readNext = readEdges.get(data.getType());
@@ -2833,6 +2931,15 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         hw::InnerSymAttr{}, seq::FirMemInitAttr{}, memory.getPrefixAttr(),
         memory.getOutputFileAttr());
     threadedMemory->setDialectAttrs(memory->getDialectAttrs());
+    if (auto *rule = storageFor(cls, memory.getName().value_or(""),
+                                /*reg=*/false, memType.getWidth())) {
+      if ((rule->kind == "block" || rule->kind == "ultra") &&
+          memory.getReadLatency() == 0)
+        return memory.emitError("storage: '")
+               << rule->kind << "' RAM for '" << rule->store
+               << "', which reads combinationally";
+      setRamStyle(threadedMemory, rule->kind);
+    }
     if (folding)
       if (auto it = folding->foldOfStore.find(memory);
           it != folding->foldOfStore.end())
@@ -4288,7 +4395,7 @@ LogicalResult StaticFolder::run() {
   for (auto &cls : classes)
     if (failed(analyze(cls)))
       return failure();
-  if (failed(schedule()))
+  if (failed(schedule()) || failed(parseStorage()))
     return failure();
   if (scheduleOnly) {
     // Nothing is built: the folded pipelines' edges stay unresolved.
@@ -4300,6 +4407,10 @@ LogicalResult StaticFolder::run() {
   for (auto &cls : classes)
     if (failed(buildCopy(cls)))
       return failure();
+  for (auto &rule : storageRules)
+    if (!rule.regs && !rule.used)
+      return netlist.emitError("storage: no memory '")
+             << rule.store << "' in model '" << rule.model << "'";
   if (failed(buildSim()))
     return failure();
   if (!slrOf.empty() && failed(extractGroups()))
@@ -4323,7 +4434,7 @@ void FoldStaticPass::runOnOperation() {
                       shortLead, bubbles, virtualMemories, stagedEnv,
                       specGroups, specDepth,
                       envSinks, registerStateEntries, slrGroups, slrSites,
-                      slrCapacity, slrAssign);
+                      slrCapacity, slrAssign, storage);
   if (failed(folder.run()))
     return signalPassFailure();
 }

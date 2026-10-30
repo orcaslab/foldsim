@@ -5,8 +5,13 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/cal --static --copies auto Leaf 2>&1 | FileCheck %s --check-prefix=CAL
 # RUN: FileCheck %s --check-prefix=TABLE < %t/cal/degree.txt
 # RUN: foldsim --srcs top.f --top Top --out %t/none --static --copies auto --degree-calibration none Leaf 2>&1 | FileCheck %s --check-prefix=NONE
+# Past --degree-max-points the choices are searched, not all scheduled.
+# RUN: foldsim --srcs top.f --top Top --out %t/search --static --copies auto --degree-max-points 1 Leaf
+# RUN: FileCheck %s --check-prefix=SEARCH < %t/search/degree.txt
 # CAL: foldsim: copies {{.*}}: II {{[0-9]+}}, about {{[0-9]+}} LUTs, {{[0-9.]+}} MHz, {{[0-9.]+}} ns per cycle (foldsim_v80.json)
 # TABLE: copies ii luts {{.*}} mhz ns
 # TABLE: <- pick
 # TABLE: period = {{[0-9.]+}} + {{.*}} copies (held to
+# SEARCH: <- pick
+# SEARCH: searched 1 of 2 choices: one per frame depth, then the neighbours of the front
 # NONE: foldsim: copies {{.*}}: II {{[0-9]+}}, about {{[0-9]+}} LUTs (uncalibrated)

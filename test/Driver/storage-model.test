@@ -1,0 +1,34 @@
+# The storage choice and the routability term (foldsim_storage.py), priced
+# without a schedule: which kinds a store can take, a choice that places
+# where distributed RAM alone does not, the rejections, a choice that
+# moves state out of LUTs until the fold routes, and the SLRs a fold's
+# layout lets it spread over.
+# RUN: python3 %S/Inputs/storage/model.py foldsim | FileCheck %s
+# CHECK: reg gap 3: block None ultra None
+# CHECK: reg gap 4: block 1 ultra 1 distributed 400
+# CHECK: mem rlat 0: block None ultra None
+# CHECK: mem rlat 1 4096x72: block 8 ultra 1
+# CHECK: mem 256x120 mask 8: block 4.0, 512x64 mask 8: block 1
+# CHECK: mem two writes: block floor 0 distributed floor 32
+# Routability by load and SLRs: out of context (3 SLRs) f_hs, f_k2 and
+# o8_t8n route; o8_t8sf, held in 2 SLRs by its 2 SLR groups, does not at
+# the same load; in the image's region (1.8 SLRs) img_int routes and img_ii8
+# does not.
+# CHECK: slrs: region 1.8 groups 1 1 groups 2 1.8 ooc groups 2 2 ooc groups 7 3
+# CHECK: f_hs luts 905171 slrs 3: congestion 14.5 routes True
+# CHECK: img_int luts 908019 slrs 1.8: congestion 18.2 routes True
+# CHECK: f_k2 luts 1179619 slrs 3: congestion 21.1 routes True
+# CHECK: o8_t8n luts 1460935 slrs 3: congestion 28.8 routes True
+# CHECK: o8_t8sf luts 1432069 slrs 2: congestion 34.5 routes False
+# CHECK: img_ii8 luts 1461670 slrs 1.8: congestion 38.2 routes False
+# CHECK: route limit 1270515 LUTs in the region, 1521646 over 3 SLRs, 1012512 in one
+# CHECK: fixed gap 300: luts 1320960 sites 5019917 fits False
+# CHECK: auto gap 300: luts 564800 sites 1934784 fits True bram 2000.0 uram 0.0 routes - storage Lane:regs>=64=block,Lane:regs>=80=distributed
+# CHECK: auto gap 2: luts 1515360 sites 5214317 fits False bram 0.0 uram 0.0
+# CHECK: auto gap 300: {{.*}} fits True {{.*}} routes True
+# CHECK: logic 1150000 route False: luts 1392400 fits True bram 2000.0 uram 0.0 congestion - routes -
+# CHECK: logic 1150000 route True: luts 1170000 fits True bram 2000.0 uram 1000.0 congestion 30.5 routes True storage Lane:regs>=64=block,Lane:regs>=80=ultra
+# CHECK: logic 1350000 route True: luts 1370000 fits True {{.*}} congestion 38.73 routes False
+# A single copy kept whole in one SLR (--slr-groups) is confined to it.
+# CHECK: slr groups False: luts 1100000 congestion 25.25 routes True
+# CHECK: slr groups True: luts 1100000 congestion 36.38 routes False
