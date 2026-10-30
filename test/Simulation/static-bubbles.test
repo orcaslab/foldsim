@@ -1,0 +1,32 @@
+# REQUIRES: verilator
+# Slot bubbles: with --bubbles, a host cycle `advance` is low puts an idle slot
+# in the frame. The static simulator of a chain of late links matches the
+# target at any bubble rate, with and without stalled channels, one copy
+# (state in distributed RAM, its bypasses), three copies chained in a host
+# cycle, a short lead, nested sequencers and SLR groups; H grows by the
+# bubbles (at 50 %, twice the frame).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/late
+# RUN: foldsim --srcs top.f --top Top --out %t/one --static --bubbles Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/one/obj %S/Inputs/tb_late.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +bubble=0 | FileCheck %s --check-prefix=NONE
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +bubble=50 | FileCheck %s --check-prefix=HALF
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +bubble=30 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/chain --static --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/chain/obj %S/Inputs/tb_late.sv top.sv %t/chain/foldsim_sim.sv > %t/chain/build.log 2>&1
+# RUN: %t/chain/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +bubble=90 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/short --static --bubbles --short-lead Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/short/obj %S/Inputs/tb_late.sv top.sv %t/short/foldsim_sim.sv > %t/short/build.log 2>&1
+# RUN: %t/short/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +bubble=10 +stall=10 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --bubbles --nest Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_late.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +bubble=30 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/slr --static --bubbles --copies Leaf:3 --two-cycle-links --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:0,Top_model:1 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/slr/obj %S/Inputs/tb_late.sv top.sv %t/slr/foldsim_sim.sv > %t/slr/build.log 2>&1
+# RUN: %t/slr/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +bubble=50 +stall=20 | FileCheck %s
+# Without --bubbles there is no `advance`.
+# RUN: foldsim --srcs top.f --top Top --out %t/plain --static Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=PLAIN < %t/plain/foldsim_sim.json
+# NONE: {{^}}MATCH 196 cycles in 1800 host cycles, H 9.00
+# HALF: {{^}}MATCH 196 cycles in {{[0-9]+}} host cycles, H {{1[6-9]\.[0-9]+|20\.[0-9]+}}
+# CHECK: {{^}}MATCH
+# PLAIN-NOT: advance

@@ -164,8 +164,8 @@ public:
                ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
                bool oneCycleLinks, bool overlapFrames, bool modulo,
                bool interleaveCopies, bool zeroLatencyLinks,
-               bool zeroLatencyChains, bool shortLead, bool stagedEnv,
-               ArrayRef<std::string> specGroups, unsigned specDepth,
+               bool zeroLatencyChains, bool shortLead, bool bubbles,
+               bool stagedEnv, ArrayRef<std::string> specGroups, unsigned specDepth,
                ArrayRef<std::string> envSinks, unsigned registerStateEntries,
                unsigned slrGroups, ArrayRef<std::string> slrSites,
                uint64_t slrCapacity, ArrayRef<std::string> slrAssign)
@@ -178,7 +178,7 @@ public:
         overlapFrames(overlapFrames), modulo(modulo),
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
         zeroLatencyChains(zeroLatencyChains), shortLead(shortLead),
-        registerStateEntries(registerStateEntries),
+        bubbles(bubbles), registerStateEntries(registerStateEntries),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -279,6 +279,7 @@ private:
   bool oneCycleLinks, overlapFrames, modulo, interleaveCopies;
   bool zeroLatencyLinks, zeroLatencyChains;
   bool shortLead;
+  bool bubbles;
   unsigned registerStateEntries;
   // Host cycles from a late netlist output's slot to the next frame's first.
   int envRoundTrip;
@@ -2853,6 +2854,9 @@ LogicalResult StaticFolder::buildSim() {
       addPort(consumer.name + "_bits", IntegerType::get(context, consumer.width),
               false);
   }
+  unsigned advancePort = numIn;
+  if (bubbles)
+    addPort("advance", i1, true);
   OpBuilder tb(netlist);
   auto sim = hw::HWModuleOp::create(tb, netlist.getLoc(),
                                     StringAttr::get(context, simName),
@@ -2893,14 +2897,30 @@ LogicalResult StaticFolder::buildSim() {
   // its token and every output room for one.
   unsigned posWidth = llvm::Log2_32_Ceil(ii + 1);
   auto go = backedges.get(i1);
+  // With bubbles, a host cycle `advance` is low the position stays and the
+  // slot tables read `ii` the host cycle after (a bubble): every control
+  // after the decision is a register chain of it, so the whole frame from
+  // there on moves a host cycle later, and no distance shrinks.
+  Value advance = bubbles ? body->getArgument(advancePort) : Value();
   // A position's next: the next slot, or at the frame's end the next frame's
-  // first if it starts, else `ii`.
+  // first if it starts, else `ii`; with bubbles, itself when not advancing.
   auto nextPosition = [&](Value pos) -> Value {
     Value end = comb::OrOp::create(b, eq(pos, ii - 1), eq(pos, ii));
-    return comb::MuxOp::create(
+    Value next = comb::MuxOp::create(
         b, end,
         comb::MuxOp::create(b, go, constant(posWidth, 0), constant(posWidth, ii)),
         comb::AddOp::create(b, pos, constant(posWidth, 1)));
+    return advance ? comb::MuxOp::create(b, advance, next, pos) : next;
+  };
+  // The position the slot tables read: `ii` in a bubble. With a short lead
+  // the tables read a position as it is decided, so a bubble is this host
+  // cycle's; else the decision's register's, so it is the host cycle after.
+  auto bubbleOf = [&](const Twine &regName) -> Value {
+    return shortLead ? notOf(advance) : resetReg(notOf(advance), regName, 0);
+  };
+  auto shown = [&](Value pos, Value bubble) -> Value {
+    return advance ? comb::MuxOp::create(b, bubble, constant(posWidth, ii), pos)
+                   : pos;
   };
   // With a short lead the frame is decided a host cycle later, on the
   // position two host cycles ahead: the one three ahead is its next, which
@@ -2909,6 +2929,8 @@ LogicalResult StaticFolder::buildSim() {
   Value posD = resetReg(posDNext, shortLead ? "pos2" : "pos3", ii);
   Value boundary = comb::OrOp::create(b, eq(posD, ii - 1), eq(posD, ii));
   Value starting = comb::AndOp::create(b, boundary, go);
+  if (advance)
+    starting = comb::AndOp::create(b, starting, advance);
   Value posDN = nextPosition(posD);
   posDNext.setValue(posDN);
   auto parDNext = backedges.get(i1);
@@ -2916,8 +2938,12 @@ LogicalResult StaticFolder::buildSim() {
   Value parDN = comb::MuxOp::create(b, starting, notOf(parD), parD);
   parDNext.setValue(parDN);
   Value pos3 = shortLead ? posDN : posD;
+  if (advance)
+    pos3 = shown(pos3, bubbleOf("bubble3"));
   Value rootNext = posDN;
-  Value pos2 = shortLead ? posD : resetReg(pos3, "pos2", ii);
+  // With bubbles and a short lead, the decision's register is not the
+  // position shown a host cycle before: in a bubble it holds.
+  Value pos2 = shortLead && !advance ? posD : resetReg(pos3, "pos2", ii);
   Value par2 = shortLead ? parD : reg(parD, "parity2");
   Value pos1 = resetReg(pos2, "pos1", ii), par1 = reg(par2, "parity1");
   Value pos0 = resetReg(pos1, "pos0", ii);
@@ -2996,6 +3022,8 @@ LogicalResult StaticFolder::buildSim() {
     // A sequencer is the position the decision is made on; with a short
     // lead the tables read its next.
     Value at = !nest ? pos3 : shortLead ? nextPosition(sequencer[c]) : sequencer[c];
+    if (nest && advance)
+      at = shown(at, bubbleOf(cls.name + "_bubble"));
     auto &ctl = controls[c];
     auto prefix = cls.name;
     ctl.state3 = table(b, at, stateRow, 1);
@@ -3971,7 +3999,7 @@ void FoldStaticPass::runOnOperation() {
   StaticFolder folder(top, netlist, simName, regionBits, report, copies,
                       nest, scheduleOnly, oneCycleLinks, overlapFrames,
                       modulo, interleaveCopies, zeroLatencyLinks, zeroLatencyChains,
-                      shortLead, stagedEnv,
+                      shortLead, bubbles, stagedEnv,
                       specGroups, specDepth,
                       envSinks, registerStateEntries, slrGroups, slrSites,
                       slrCapacity, slrAssign);

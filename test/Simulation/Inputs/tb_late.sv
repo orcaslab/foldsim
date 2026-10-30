@@ -2,7 +2,8 @@
 // per clock) and its static simulator (`foldsim_sim`) on the same input
 // tokens, the simulator's channels stalled on +stall=<percent> of the host
 // cycles, and compares the output tokens from cycle W on (the leaves'
-// registers have no reset). Prints MATCH or the first difference.
+// registers have no reset). Prints MATCH or the first difference. With
+// BUBBLES defined, `advance` is low on +bubble=<percent> of the host cycles.
 module tb;
   localparam T = 200, W = 4;
   function automatic logic [7:0] stim_x(int t);
@@ -32,12 +33,19 @@ module tb;
   wire [7:0] yb;
   foldsim_sim dut(.hostClock(clk), .hostReset(rst),
     .x_valid(vx), .x_bits(stim_x(ix)), .x_ready(xr),
-    .y_ready(yr), .y_valid(yv), .y_bits(yb), .profile_finish());
-  int stall = 0;
+    .y_ready(yr), .y_valid(yv), .y_bits(yb),
+`ifdef BUBBLES
+    .advance(adv),
+`endif
+    .profile_finish());
+  int stall = 0, bubble = 0;
+  logic adv;
   initial if (!$value$plusargs("stall=%d", stall)) stall = 0;
+  initial if (!$value$plusargs("bubble=%d", bubble)) bubble = 0;
   always @(negedge clk) begin
     vx = ix < T && ($urandom % 100 >= stall);
     yr = $urandom % 100 >= stall;
+    adv = $urandom % 100 >= bubble;
   end
   always @(posedge clk) begin
     cyc <= cyc + 1; rst <= 0;

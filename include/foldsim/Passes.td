@@ -339,6 +339,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "Decide a frame three host cycles before its first slot instead "
            "of four: the slot tables read the frame's position as the "
            "decision makes it, not a register of it">,
+    Option<"bubbles", "bubbles", "bool", "false",
+           "An input `advance`: a host cycle it is low puts an idle slot (a "
+           "bubble) into the frame where its position is decided; the frame "
+           "goes on from where it stopped. No state, link or token moves in "
+           "a bubble and the schedule is the same: its distances only grow. "
+           "For a slot that waits on data, such as a target memory kept "
+           "off-chip">,
     Option<"stagedEnv", "staged-env", "bool", "true",
            "The environment's endpoints take a token a host cycle after it "
            "is offered (registered token ends), not in that host cycle">,

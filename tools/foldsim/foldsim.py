@@ -142,6 +142,8 @@ def frame_options(a):
         fold += ' zero-latency-chains'
     if a.short_lead:
         fold += ' short-lead'
+    if a.bubbles:
+        fold += ' bubbles'
     if a.unstaged_env:
         fold += ' staged-env=false'
     if getattr(a, 'register_state_entries', None) is not None:
@@ -370,6 +372,9 @@ def main():
     ap.add_argument('--short-lead', action='store_true',
                     help='with --static: decide a frame three host cycles before its first slot, '
                          'not four (the slot tables read the decided position combinationally)')
+    ap.add_argument('--bubbles', action='store_true',
+                    help='with --static: an input `advance`; a host cycle it is low puts an idle '
+                         'slot in the frame (for slots that wait on data, e.g. memories off-chip)')
     ap.add_argument('--register-state-entries', type=int, metavar='N',
                     help='with --static: per-instance state of copies with at most N instances in flops, '
                          'deeper in distributed RAM (default 2; 0: always distributed RAM)')
