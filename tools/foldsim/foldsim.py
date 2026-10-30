@@ -629,6 +629,16 @@ def main():
         info['vmem'].append({'port': f'vm{k}', 'memory': name, 'class': cls, 'inst_width': int(iw),
                              'row_width': int(aw), 'data_width': int(dw), 'mask_width': int(mw),
                              'read_first': rf == '1', 'instances': int(insts)})
+    # Each memory's region in the kernel's vmem space (VMEM_INTERFACE.md):
+    # row r of instance i at ((r * INSTANCES + i) << log2(ROW_BYTES)), rows a
+    # power of two of at least 64 bytes; regions 4 KiB aligned.
+    offset = 0
+    for v in info['vmem']:
+        row_bytes = max(64, 1 << ((v['data_width'] + 7) // 8 - 1).bit_length())
+        size = (v['instances'] << v['row_width']) * row_bytes
+        v.update(row_bytes=row_bytes, base=offset, bytes=size)
+        offset += -(-size // 4096) * 4096
+    info['vmem_bytes'] = offset
     with open(out('foldsim_sim.json'), 'w') as f:
         json.dump(info, f, indent=1)
     # The kernel's view of it: how many classes report their finishes, bit c
@@ -646,6 +656,8 @@ def main():
                                ('MW', 'mask_width'), ('INSTANCES', 'instances')):
                     f.write(f'`define FOLDSIM_VMEM_{k}_{key} {v[d]}\n')
                 f.write(f'`define FOLDSIM_VMEM_{k}_RDWRF {int(v["read_first"])}\n')
+                f.write(f'`define FOLDSIM_VMEM_{k}_BASE 64\'h{v["base"]:x}\n')
+            f.write(f'`define FOLDSIM_VMEM_BYTES 64\'h{info["vmem_bytes"]:x}\n')
     print(f'foldsim: {", ".join(f"{k} x{v}" for k, v in info["threads"].items())}', file=sys.stderr)
 
 

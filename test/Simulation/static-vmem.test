@@ -15,6 +15,7 @@
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | FileCheck %s
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/copies --static --virtual-memories ram --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=VH2 < %t/copies/foldsim_sim.vh
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DCOPIES2 -DIW=1 -Mdir %t/copies/obj %S/Inputs/tb_vmem.sv top.sv %t/copies/foldsim_sim.sv > %t/copies/build.log 2>&1
 # RUN: %t/copies/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/nest --static --virtual-memories ram --nest Leaf > /dev/null 2>&1
@@ -33,7 +34,17 @@
 # VH: `define FOLDSIM_VMEM_0_IW 2
 # VH: `define FOLDSIM_VMEM_0_AW 4
 # VH: `define FOLDSIM_VMEM_0_DW 8
+# VH: `define FOLDSIM_VMEM_0_INSTANCES 4
 # VH: `define FOLDSIM_VMEM_0_RDWRF 1
+# VH: `define FOLDSIM_VMEM_0_BASE 64'h0
+# VH: `define FOLDSIM_VMEM_BYTES 64'h1000
+# Two copies, two regions of 2 instances x 16 rows x 64 bytes, 4 KiB aligned.
+# VH2: `define FOLDSIM_VMEM_COUNT 2
+# VH2: `define FOLDSIM_VMEM_0_INSTANCES 2
+# VH2: `define FOLDSIM_VMEM_0_BASE 64'h0
+# VH2: `define FOLDSIM_VMEM_1_INSTANCES 2
+# VH2: `define FOLDSIM_VMEM_1_BASE 64'h1000
+# VH2: `define FOLDSIM_VMEM_BYTES 64'h2000
 # FAST: {{^}}MATCH 196 cycles in 2000 host cycles, H 10.00
 # CHECK: {{^}}MATCH
 # PLAIN-NOT: "vm0_
