@@ -90,7 +90,9 @@ class Mod:
         self.lut = defaultdict(float)   # by op class
         self.ff = 0
         self.dsp = 0
-        self.mems = []                  # (name, depth, width, read ports, write ports, read latency)
+        self.mems = []                  # (name, depth, width, read ports, write ports, read latency,
+                                        #  ram_style, mask bits, named)
+        self.regw = defaultdict(int)    # register width -> registers
         self.insts = []                 # (child module, instance name)
         self.consts = set()
         self.Z, self.O, self.W = {}, {}, {}   # known-zero / known-one bits, widths of int values
@@ -446,6 +448,7 @@ def parse(path):
             continue
         if op in REGS:
             cur.ff += width(result_type(rhs))
+            cur.regw[width(result_type(rhs))] += 1
             if operands:
                 cur.regs[res[0]] = operands[0]
             continue
@@ -453,8 +456,9 @@ def parse(path):
             mm = re.search(r'(\d+),\s*(\d+),\s*\w+,\s*\w+.*<\s*(\d+)\s*x\s*(\d+)', rhs)
             nm = re.search(r'name "([^"]*)"', rhs)
             st = re.search(r'ram_style" = "\\22(\w+)', rhs)
+            mk = re.search(r'mask\s+(\d+)\s*>', rhs)
             rec = [nm.group(1) if nm else res[0][1:], int(mm.group(3)), int(mm.group(4)), 0, 0, int(mm.group(1)),
-                   st.group(1) if st else None]
+                   st.group(1) if st else None, int(mk.group(1)) if mk else 1, bool(nm)]
             mems[res[0]] = rec
             cur.mems.append(rec)
             continue
@@ -521,7 +525,7 @@ def mod_totals(mods, name, stop=(), mult=1, acc=None):
     acc['lut'] += mult * sum(m.lut.values())
     acc['ff'] += mult * m.ff
     acc['dsp'] += mult * m.dsp
-    for (_, d, w, r, wr, rl, st) in m.mems:
+    for (_, d, w, r, wr, rl, st, *_) in m.mems:
         lr, br = mem_cost(d, w, r, rl, st)
         acc['membits'] += mult * d * w
         acc['lutram'] += mult * lr

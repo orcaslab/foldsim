@@ -1,0 +1,37 @@
+# REQUIRES: verilator
+# The storage of folded state (--storage, foldsim-fold-static `storage`) does
+# not change what the simulator computes: four leaves on one copy, their
+# registers in distributed RAM by default, then in ultra RAM (the 80-bit one)
+# and block RAM (the rest), read a host cycle early; each simulator's y
+# tokens against the native design's y (tb.sv).
+# RUN: rm -rf %t && cd %S/Inputs/storage
+# RUN: foldsim --srcs top.f --top Top --out %t/off --static --copies Leaf:1 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal --x-initial 0 --top-module tb -Mdir %t/off/obj tb.sv top.sv %t/off/foldsim_sim.sv > %t/off/build.log 2>&1
+# RUN: %t/off/obj/Vtb | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/ram --static --copies Leaf:1 --storage 'Leaf:regs>=64=ultra,Leaf:regs=block' Leaf 2>&1 | FileCheck %s --check-prefix=OPT
+# RUN: FileCheck %s --check-prefix=SV < %t/ram/foldsim_sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal --x-initial 0 --top-module tb -Mdir %t/ram/obj tb.sv top.sv %t/ram/foldsim_sim.sv > %t/ram/build.log 2>&1
+# RUN: %t/ram/obj/Vtb | FileCheck %s
+# CHECK: tokens 64 mismatches 0
+# OPT: foldsim-fold-static{{.*}} storage=Leaf:regs>=64=ultra,Leaf:regs=block
+# SV: ram_style = "block"
+# SV: ram_style = "ultra"
+# SV-NEXT: reg [79:0] Memory[0:3];
+# SV-NEXT: reg [79:0] _R0_data_d0;
+# SV: _R0_data_d0 <= Memory[R0_addr];
+# With --copies auto, --storage auto takes the chooser's storage (none here:
+# every store is cheapest in distributed RAM) and reports it.
+# RUN: foldsim --srcs top.f --top Top --out %t/auto --static --copies auto --storage auto Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=AUTO < %t/auto/degree.txt
+# AUTO: copies {{.*}} bram uram largest_copy congestion routes
+# AUTO: <- pick
+# AUTO: storage chosen per store; fits: 90% of the V80 region's 3269043 LUT sites (a LUTRAM LUT 4.08 sites), 2415 RAMB36 and 1211 URAM288
+# AUTO: routes: congestion = {{.*}} <= 28.39 %: a load of at most 1278803 LUTs
+# Block RAM needs a state gap of 4 (the leaves' output is the memory's read
+# data: a ready pass, a gap of 1), and the options their flows.
+# RUN: not foldsim --srcs late.f --top Top --out %t/late --static --copies Leaf:1 --storage 'Leaf:regs=block' Leaf 2>&1 | FileCheck %s --check-prefix=GAP
+# RUN: not foldsim --srcs top.f --top Top --out %t/x --static --copies Leaf:1 --storage auto Leaf 2>&1 | FileCheck %s --check-prefix=AUTOCOPIES
+# RUN: not foldsim --srcs top.f --top Top --out %t/y --storage 'Leaf:regs=block' Leaf 2>&1 | FileCheck %s --check-prefix=STATIC
+# GAP: storage: 'block' RAM for the registers of 'Leaf' needs a state gap of 4, not 1
+# AUTOCOPIES: --storage auto needs --copies auto
+# STATIC: --storage needs --static

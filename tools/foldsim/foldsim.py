@@ -208,18 +208,24 @@ def choose_copies(a, foldsim_opt, flat, passes, out):
     path = a.degree_calibration or DEGREE_CALIBRATION
     cal = json.load(open(path)) if path != 'none' and os.path.exists(path) else None
     result = foldsim_degree.evaluate(models, open(base).read(), fold, foldsim_opt, work, cal,
-                                     a.jobs, a.lut_budget, max_points=a.degree_max_points)
+                                     a.jobs, a.lut_budget, max_points=a.degree_max_points,
+                                     store='auto' if a.storage == 'auto' else 'fixed',
+                                     route=a.routability)
     with open(out('degree.txt'), 'w') as f:
         f.write(foldsim_degree.table(result) + '\n')
     with open(out('degree.json'), 'w') as f:
         json.dump(result, f, indent=1, default=str)
     if not result['pick']:
-        sys.exit(f'--copies auto: no choice that places within {a.lut_budget or "any"} LUTs; see {out("degree.txt")}')
+        routes = ' and routes' if a.routability else ''
+        sys.exit(f'--copies auto: no choice that places{routes} within {a.lut_budget or "any"} '
+                 f'LUTs; see {out("degree.txt")}')
     pick = result['pick']
     timing = (f", {pick['mhz']} MHz, {pick['ns']} ns per cycle" if 'ns' in pick else '')
+    rules = pick.get('storage', '')
     print(f"foldsim: copies {pick['copies']}: II {pick['ii']}, about {pick['luts']} LUTs"
-          f"{timing} ({os.path.basename(path) if cal else 'uncalibrated'})", file=sys.stderr)
-    return '' if pick['copies'] == '-' else pick['copies']
+          f"{timing} ({os.path.basename(path) if cal else 'uncalibrated'})"
+          + (f"; storage: {len(rules.split(','))} rules" if rules else ''), file=sys.stderr)
+    return ('' if pick['copies'] == '-' else pick['copies']), rules
 
 
 def write_slr_groups(sv, path):
@@ -364,6 +370,15 @@ def main():
     ap.add_argument('--degree-max-points', type=int, default=256,
                     help='with --copies auto: schedule every choice up to this many, '
                          'else search them (foldsim_degree.py evaluate)')
+    ap.add_argument('--routability', action=argparse.BooleanOptionalAction, default=True,
+                    help='with --copies auto: the pick must also route (the V80 routability '
+                         'term, foldsim_storage.py)')
+    ap.add_argument('--storage', default='',
+                    help='with --static: the storage of folded state stores, as '
+                         '<model>:<store>=<kind>,... (foldsim-fold-static storage; kind a Vivado '
+                         'ram_style: registers, distributed, block, ultra); with --copies auto, '
+                         '`auto`: a kind per store chosen with the fold degree against the V80 '
+                         'region (foldsim_storage.py), else the default rules')
     ap.add_argument('--slr-groups', action='store_true',
                     help='with --static: <out>/foldsim_floorplan.tcl keeps each threaded copy '
                          'whole in one SLR (Vivado picks which), for an implementation flow to '
@@ -516,15 +531,23 @@ def main():
         a.spec_groups = axi_spec_groups(a.top, open(flat).read(), a.axi_spec)
     if a.copies == 'auto' and not a.static:
         sys.exit('--copies auto needs --static')
+    if a.storage and not a.static:
+        sys.exit('--storage needs --static')
     if a.static:
         fold = f'module={a.top} sim=foldsim_sim report={out("schedule.txt")}'
         if a.region_bits:
             fold += f' region-bits={a.region_bits}'
-        copies = a.copies
+        copies, rules = a.copies, a.storage
+        if a.storage == 'auto' and copies != 'auto':
+            sys.exit('--storage auto needs --copies auto')
         if copies == 'auto':
-            copies = choose_copies(a, foldsim_opt, flat, passes, out)
+            copies, chosen = choose_copies(a, foldsim_opt, flat, passes, out)
+            if a.storage == 'auto':
+                rules = chosen
         if copies:
             fold += f' copies={copies}'
+        if rules:
+            fold += f' storage={rules}'
         if a.nest:
             fold += ' nest'
         fold += frame_options(a)

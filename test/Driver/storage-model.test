@@ -1,0 +1,26 @@
+# The storage choice and the routability term (foldsim_storage.py), priced
+# without a schedule: which kinds a store can take, a choice that places
+# where distributed RAM alone does not, the rejections, and a choice that
+# moves state out of LUTs until the fold routes.
+# RUN: python3 %S/Inputs/storage/model.py foldsim | FileCheck %s
+# CHECK: reg gap 3: block None ultra None
+# CHECK: reg gap 4: block 1 ultra 1 distributed 400
+# CHECK: mem rlat 0: block None ultra None
+# CHECK: mem rlat 1 4096x72: block 8 ultra 1
+# CHECK: mem 256x120 mask 8: block 4.0, 512x64 mask 8: block 1
+# CHECK: mem two writes: block floor 0 distributed floor 32
+# The OOC folds and images: f_hs (II 19) and img_int route, f_k2 routes,
+# o8_t8sf and img_ii8 (II 8) fail.
+# CHECK: luts 905171: congestion 15.3 routes True
+# CHECK: luts 908019: congestion 15.4 routes True
+# CHECK: luts 1179619: congestion 23.8 routes True
+# CHECK: luts 1432069: congestion 33.0 routes False
+# CHECK: luts 1461670: congestion 34.4 routes False
+# CHECK: route limit 1278803 LUTs
+# CHECK: fixed gap 300: luts 1320960 sites 5019917 fits False
+# CHECK: auto gap 300: luts 564800 sites 1934784 fits True bram 2000.0 uram 0.0 routes - storage Lane:regs>=64=block,Lane:regs>=80=distributed
+# CHECK: auto gap 2: luts 1515360 sites 5214317 fits False bram 0.0 uram 0.0
+# CHECK: auto gap 300: {{.*}} fits True {{.*}} routes True
+# CHECK: logic 1150000 route False: luts 1392400 fits True bram 2000.0 uram 0.0 congestion - routes -
+# CHECK: logic 1150000 route True: luts 1170000 fits True bram 2000.0 uram 1000.0 congestion 26.97 routes True storage Lane:regs>=64=block,Lane:regs>=80=ultra
+# CHECK: logic 1350000 route True: luts 1370000 fits True {{.*}} congestion 34.94 routes False
