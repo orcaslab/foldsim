@@ -26,7 +26,11 @@
 # Without --bubbles there is no `advance`.
 # RUN: foldsim --srcs top.f --top Top --out %t/plain --static Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=PLAIN < %t/plain/foldsim_sim.json
+# RUN: FileCheck %s --check-prefix=PLAIN < %t/plain/foldsim_sim.vh
+# The kernel's header says the simulator has it.
+# RUN: FileCheck %s --check-prefix=VH < %t/one/foldsim_sim.vh
 # NONE: {{^}}MATCH 196 cycles in 1800 host cycles, H 9.00
 # HALF: {{^}}MATCH 196 cycles in {{[0-9]+}} host cycles, H {{1[6-9]\.[0-9]+|20\.[0-9]+}}
 # CHECK: {{^}}MATCH
-# PLAIN-NOT: advance
+# PLAIN-NOT: {{advance|ADVANCE}}
+# VH: `define FOLDSIM_ADVANCE
