@@ -650,9 +650,13 @@ def parse_classes(text):
             cur = out[m.group(1)] = dict(n=int(m.group(2)), ready=[], state=[],
                                          gap=int(m.group(4)) if m.group(4) else None)
             continue
-        m = re.match(r'^    (ready|state): ([\d ]+)$', line)
+        m = re.match(r'^    (ready|state): ([\d .]+)$', line)
         if m and cur is not None:
-            cur[m.group(1)] = [int(x) for x in m.group(2).split()]
+            slots = []
+            for x in m.group(2).split():
+                a, _, b = x.partition('..')
+                slots += list(range(int(a), int(b) + 1)) if b else [int(a)]
+            cur[m.group(1)] = slots
     return out
 
 
