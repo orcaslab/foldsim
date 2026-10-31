@@ -490,6 +490,12 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--circt-bin', default='')
     ap.add_argument('--foldsim-bin', default='')
+    ap.add_argument('--max-unroll-trip-count', type=int, default=0, metavar='N',
+                    help="circt-verilog's limit on the iterations of a process's loop it unrolls "
+                         '(--max-unroll-trip-count); 0: its default (1024)')
+    ap.add_argument('--max-generate-steps', type=int, default=0, metavar='N',
+                    help="circt-verilog's (slang's) generate-loop step limit, which counts the "
+                         'blocks of a loop times those of the loops around it; 0: its default')
     ap.add_argument('--region-loads', type=int, default=0,
                     help="split each threaded model's state into regions of at most this "
                          'many loads, each with its own thread index and edge (foldsim-fame5)')
@@ -715,7 +721,10 @@ def main():
     design = out('design.mlir')
     run([tool('circt-verilog'), '--ir-hw', f'--top={a.top}', '--allow-use-before-declare',
          '--allow-hierarchical-const', '--ignore-uninstantiated-modules', '--detect-memories',
-         '--preserve-unpacked-ports', *defines, *incdirs, *files, '-o', design])
+         '--preserve-unpacked-ports',
+         *([f'-Xslang=--max-generate-steps={a.max_generate_steps}'] if a.max_generate_steps else []),
+         *([f'--max-unroll-trip-count={a.max_unroll_trip_count}'] if a.max_unroll_trip_count else []),
+         *defines, *incdirs, *files, '-o', design])
 
     # A module declared a black box (a core the synthesis flow provides) stays
     # an instance through flattening; foldsim-fame5 folds it by its contract.

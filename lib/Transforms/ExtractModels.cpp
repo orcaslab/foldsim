@@ -71,6 +71,8 @@ public:
 private:
   BitSources compute(Value value);
   BitSources computeRegister(seq::FirRegOp reg);
+  /// The values `compute` traces `value` through, in the order it reads them.
+  void readsOf(Value value, SmallVectorImpl<Value> &reads);
 
   const DenseSet<Value> &ports;
   bool throughRegisters;
@@ -125,15 +127,63 @@ static std::optional<APInt> getAggregateValue(Attribute attr, Type type) {
   return result;
 }
 
-const BitSources &BitTracer::get(Value value) {
-  auto it = cache.find(value);
-  if (it != cache.end())
+/// Without recursion: wiring and registers chain far more values than a
+/// thread's stack holds frames. Each value is computed once the values it
+/// reads are, depth first in the order `compute` reads them, so that a value
+/// reached again while it is traced, through a register, is logic.
+const BitSources &BitTracer::get(Value root) {
+  if (auto it = cache.find(root); it != cache.end())
     return *it->second;
-  // A value reached again while it is traced, through a register, is logic.
-  auto width = std::max<int64_t>(hw::getBitWidth(value.getType()), 0);
-  cache[value] = std::make_unique<BitSources>(width);
-  auto sources = compute(value);
-  return *(cache[value] = std::make_unique<BitSources>(std::move(sources)));
+  struct Frame {
+    Value value;
+    SmallVector<Value, 4> reads;
+    unsigned next = 0;
+  };
+  SmallVector<Frame> frames;
+  auto enter = [&](Value value) {
+    auto width = std::max<int64_t>(hw::getBitWidth(value.getType()), 0);
+    cache[value] = std::make_unique<BitSources>(width);
+    frames.push_back({value, {}, 0});
+    readsOf(value, frames.back().reads);
+  };
+  enter(root);
+  while (!frames.empty()) {
+    auto &frame = frames.back();
+    if (frame.next < frame.reads.size()) {
+      Value read = frame.reads[frame.next++];
+      if (!cache.count(read))
+        enter(read);
+      continue;
+    }
+    Value value = frame.value;
+    frames.pop_back();
+    auto sources = compute(value);
+    cache[value] = std::make_unique<BitSources>(std::move(sources));
+  }
+  return *cache[root];
+}
+
+void BitTracer::readsOf(Value value, SmallVectorImpl<Value> &reads) {
+  if (hw::getBitWidth(value.getType()) <= 0 || ports.contains(value))
+    return;
+  auto *op = value.getDefiningOp();
+  if (auto reg = dyn_cast_or_null<seq::FirRegOp>(op); reg && throughRegisters) {
+    reads.push_back(reg.getNext());
+    if (reg.hasReset())
+      reads.push_back(reg.getResetValue());
+    return;
+  }
+  if (!op || !isWiring(op) || isa<hw::ConstantOp, hw::AggregateConstantOp>(op))
+    return;
+  // Concatenations and creates read their last operand first.
+  if (isa<comb::ConcatOp, hw::ArrayCreateOp, hw::ArrayConcatOp,
+          hw::StructCreateOp>(op)) {
+    reads.append(op->operand_begin(), op->operand_end());
+    std::reverse(reads.begin(), reads.end());
+    return;
+  }
+  // The others read the value they take bits of (an index is a constant).
+  reads.push_back(op->getOperand(0));
 }
 
 BitSources BitTracer::compute(Value value) {
@@ -314,22 +364,76 @@ static std::string describe(const BitSources &sources,
 
 /// Whether the parent's own logic reads `value`, rather than only the inputs
 /// of the models being cut out.
-static bool isReadByParent(Value value, const DenseSet<Operation *> &models,
+///
+/// Without recursion (logic chains far more values than a thread's stack
+/// holds frames), in the order of a depth-first search over the users: a value
+/// reached again while it is searched counts as not read.
+static bool isReadByParent(Value root, const DenseSet<Operation *> &models,
                            DenseMap<Value, bool> &read) {
-  if (auto it = read.find(value); it != read.end())
+  if (auto it = read.find(root); it != read.end())
     return it->second;
-  read[value] = false;
-  bool result = llvm::any_of(value.getUsers(), [&](Operation *user) {
-    if (models.contains(user))
-      return false;
-    if (!BitTracer::isWiring(user) &&
-        !isa<comb::CombDialect>(user->getDialect()))
-      return true;
-    return llvm::any_of(user->getResults(), [&](Value result) {
-      return isReadByParent(result, models, read);
-    });
-  });
-  return read[value] = result;
+  struct Frame {
+    Value value;
+    SmallVector<Operation *, 4> users;
+    unsigned nextUser = 0, nextResult = 0;
+  };
+  SmallVector<Frame> frames;
+  auto enter = [&](Value value) {
+    read[value] = false;
+    frames.push_back({value, {}, 0, 0});
+    frames.back().users.append(value.getUsers().begin(),
+                               value.getUsers().end());
+  };
+  enter(root);
+  // The result of the frame just left, for its caller.
+  bool returned = false;
+  bool pending = false;
+  while (!frames.empty()) {
+    auto &frame = frames.back();
+    bool result = false;
+    if (pending) {
+      pending = false;
+      result = returned;
+      if (!result)
+        ++frame.nextResult;
+    }
+    while (!result && frame.nextUser < frame.users.size()) {
+      Operation *user = frame.users[frame.nextUser];
+      if (models.contains(user)) {
+        ++frame.nextUser;
+        continue;
+      }
+      if (!BitTracer::isWiring(user) &&
+          !isa<comb::CombDialect>(user->getDialect())) {
+        result = true;
+        break;
+      }
+      if (frame.nextResult == user->getNumResults()) {
+        ++frame.nextUser;
+        frame.nextResult = 0;
+        continue;
+      }
+      Value next = user->getResult(frame.nextResult);
+      if (auto it = read.find(next); it != read.end()) {
+        if (it->second)
+          result = true;
+        else
+          ++frame.nextResult;
+        continue;
+      }
+      break;
+    }
+    if (!result && frame.nextUser < frame.users.size()) {
+      // A result of the user not searched yet.
+      enter(frame.users[frame.nextUser]->getResult(frame.nextResult));
+      continue;
+    }
+    read[frame.value] = result;
+    frames.pop_back();
+    returned = result;
+    pending = true;
+  }
+  return read[root];
 }
 
 /// For each output of a model, the bits that are always the same constant.
@@ -373,22 +477,64 @@ private:
 
 /// Whether `value` is computed, through logic, from an input of the parent or
 /// an output of a model: what is not is the parent's state and constants.
-bool LogicAbsorber::dependsOnPorts(Value value) {
-  if (auto it = portDeps.find(value); it != portDeps.end())
+/// Without recursion (logic chains far more values than a thread's stack holds
+/// frames), in the order of a depth-first search over the operands: a value
+/// reached again while it is searched counts as not depending on them.
+bool LogicAbsorber::dependsOnPorts(Value root) {
+  if (auto it = portDeps.find(root); it != portDeps.end())
     return it->second;
-  auto *op = value.getDefiningOp();
-  bool result;
-  if (!op || isa<hw::InstanceOp>(op))
-    result = true;
-  else if (!isConeOp(op))
-    result = false;
-  else {
+  // The result of a value that needs no search of its operands.
+  auto leaf = [&](Value value) -> std::optional<bool> {
+    auto *op = value.getDefiningOp();
+    if (!op || isa<hw::InstanceOp>(op))
+      return true;
+    if (!isConeOp(op))
+      return false;
+    return std::nullopt;
+  };
+  if (auto result = leaf(root))
+    return portDeps[root] = *result;
+  struct Frame {
+    Value value;
+    Operation *op;
+    unsigned next = 0;
+  };
+  SmallVector<Frame> frames;
+  auto enter = [&](Value value) {
     portDeps[value] = false;
-    result = llvm::any_of(op->getOperands(), [&](Value operand) {
-      return dependsOnPorts(operand);
-    });
+    frames.push_back({value, value.getDefiningOp(), 0});
+  };
+  enter(root);
+  std::optional<bool> returned;
+  while (!frames.empty()) {
+    auto &frame = frames.back();
+    bool result = returned.value_or(false);
+    returned.reset();
+    while (!result && frame.next < frame.op->getNumOperands()) {
+      Value operand = frame.op->getOperand(frame.next);
+      if (auto it = portDeps.find(operand); it != portDeps.end()) {
+        result = it->second;
+        ++frame.next;
+        continue;
+      }
+      if (auto known = leaf(operand)) {
+        result = portDeps[operand] = *known;
+        ++frame.next;
+        continue;
+      }
+      break;
+    }
+    if (!result && frame.next < frame.op->getNumOperands()) {
+      Value operand = frame.op->getOperand(frame.next++);
+      enter(operand);
+      continue;
+    }
+    Value value = frame.value;
+    portDeps[value] = result;
+    frames.pop_back();
+    returned = result;
   }
-  return portDeps[value] = result;
+  return portDeps[root];
 }
 
 /// Whether `op` is logic that can be computed anywhere: no state, no regions,
@@ -407,22 +553,37 @@ bool LogicAbsorber::collect(Value root, SmallVectorImpl<Operation *> &ops,
                             SmallVectorImpl<Value> &leaves) {
   DenseSet<Operation *> seen;
   DenseSet<Value> leafSet;
-  std::function<bool(Value)> visit = [&](Value value) -> bool {
-    auto *op = value.getDefiningOp();
-    bool inside = op && isConeOp(op) &&
-                  (dependsOnPorts(value) || op->getNumOperands() == 0);
-    if (!inside) {
-      if (leafSet.insert(value).second)
-        leaves.push_back(value);
-      return true;
-    }
-    if (!seen.insert(op).second)
-      return true;
-    for (auto operand : op->getOperands())
-      if (!visit(operand))
+  // Operand first, without recursion: a cone may chain far more ops than a
+  // thread's stack holds frames before it is found over the limit.
+  auto visit = [&](Value root) -> bool {
+    SmallVector<std::pair<Operation *, unsigned>> frames;
+    // Whether `value` is an op of the cone not seen yet: a leaf or an op seen
+    // is done with.
+    auto enter = [&](Value value) {
+      auto *op = value.getDefiningOp();
+      bool inside = op && isConeOp(op) &&
+                    (dependsOnPorts(value) || op->getNumOperands() == 0);
+      if (!inside) {
+        if (leafSet.insert(value).second)
+          leaves.push_back(value);
+        return;
+      }
+      if (seen.insert(op).second)
+        frames.push_back({op, 0});
+    };
+    enter(root);
+    while (!frames.empty()) {
+      auto &[op, next] = frames.back();
+      if (next < op->getNumOperands()) {
+        enter(op->getOperand(next++));
+        continue;
+      }
+      ops.push_back(op);
+      frames.pop_back();
+      if (ops.size() > limit)
         return false;
-    ops.push_back(op);
-    return ops.size() <= limit;
+    }
+    return true;
   };
   auto *rootOp = root.getDefiningOp();
   if (!rootOp || !isConeOp(rootOp) || !dependsOnPorts(root))
