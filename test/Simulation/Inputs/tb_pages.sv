@@ -13,6 +13,8 @@
 // +stall=<percent> of the host cycles; with BUBBLES, `advance` is low on
 // +bubble=<percent>. Prints MATCH or the first difference, and PROTOCOL if
 // the simulator issues a read of an instance whose read is still outstanding.
+// With REAL_VMEM, the kernel's own controller (foldsim_vmem.sv, given on the
+// command line) serves each one, in front of an AXI memory model.
 `include "foldsim_sim.vh"
 
 module vmem_bytes_model #(parameter IW = 2, AW = 1, DW = 8, MW = 1) (
@@ -61,6 +63,134 @@ module vmem_bytes_model #(parameter IW = 2, AW = 1, DW = 8, MW = 1) (
   end
 endmodule
 
+
+`ifdef REAL_VMEM
+// The real controller (REAL_VMEM: the kernel's foldsim_vmem.sv on the command
+// line) in front of an AXI memory: in order, each transaction answered +lo to
+// +hi host cycles after it is taken, writes by byte strobe, unwritten lines
+// zero.
+module axi_mem_model #(parameter IDW = 4) (
+    input logic clk, rst, input int cyc, lo, hi,
+    input logic awvalid, output logic awready, input logic [63:0] awaddr,
+    input logic [IDW-1:0] awid, input logic [7:0] awlen,
+    input logic wvalid, output logic wready, input logic [511:0] wdata,
+    input logic [63:0] wstrb, input logic wlast,
+    output logic bvalid, input logic bready, output logic [IDW-1:0] bid,
+    input logic arvalid, output logic arready, input logic [63:0] araddr,
+    input logic [IDW-1:0] arid, input logic [7:0] arlen,
+    output logic rvalid, input logic rready, output logic [511:0] rdata,
+    output logic [IDW-1:0] rid, output logic rlast);
+  logic [511:0] mem [longint];
+  typedef struct { longint addr; int len; int id; int due; logic [511:0] data [16]; } txn_t;
+  txn_t aw_q [$], b_q [$], ar_q [$];
+  int wbeat = 0, rbeat = 0, last_due = 0;
+  function automatic int next_due();
+    int d = cyc + lo + int'($urandom % (hi - lo + 1));
+    if (d < last_due) d = last_due;
+    last_due = d;
+    return d;
+  endfunction
+  assign awready = 1;
+  assign arready = 1;
+  assign wready = aw_q.size() > 0;
+  always_comb begin
+    bvalid = b_q.size() > 0 && b_q[0].due <= cyc;
+    bid = b_q.size() > 0 ? IDW'(b_q[0].id) : '0;
+    rvalid = ar_q.size() > 0 && ar_q[0].due <= cyc;
+    rid = ar_q.size() > 0 ? IDW'(ar_q[0].id) : '0;
+    rlast = ar_q.size() > 0 && rbeat == ar_q[0].len;
+    rdata = ar_q.size() > 0 ? ar_q[0].data[rbeat] : '0;
+  end
+  // Handshakes sampled at the rising edge (the controller's outputs as they
+  // were), applied at the falling edge, so this model's outputs never
+  // change in the controller's edge.
+  logic aw_f, w_f, b_f, ar_f, r_f, rst_f;
+  logic [63:0] aw_a, ar_a; logic [7:0] aw_l, ar_l; logic [IDW-1:0] aw_i, ar_i;
+  logic [511:0] w_d; logic [63:0] w_s; logic w_l;
+  always @(posedge clk) begin
+    rst_f <= rst;
+    aw_f <= awvalid && awready; aw_a <= awaddr; aw_l <= awlen; aw_i <= awid;
+    w_f <= wvalid && wready; w_d <= wdata; w_s <= wstrb; w_l <= wlast;
+    b_f <= bvalid && bready;
+    ar_f <= arvalid && arready; ar_a <= araddr; ar_l <= arlen; ar_i <= arid;
+    r_f <= rvalid && rready;
+  end
+  always @(negedge clk) begin
+    if (rst_f) begin
+      aw_q.delete(); b_q.delete(); ar_q.delete(); wbeat = 0; rbeat = 0;
+    end else begin
+      if (b_f) void'(b_q.pop_front());
+      if (r_f) begin
+        if (rbeat == ar_q[0].len) begin void'(ar_q.pop_front()); rbeat = 0; end
+        else rbeat++;
+      end
+      if (aw_f) begin automatic txn_t t; t.addr = aw_a; t.len = aw_l; t.id = aw_i; t.due = 0; aw_q.push_back(t); end
+      if (w_f) begin
+        automatic longint line = (aw_q[0].addr >> 6) + wbeat;
+        automatic logic [511:0] old = mem.exists(line) ? mem[line] : '0;
+        for (int k = 0; k < 64; k++) if (w_s[k]) old[k*8 +: 8] = w_d[k*8 +: 8];
+        mem[line] = old;
+        if (w_l) begin
+          automatic txn_t t = aw_q.pop_front(); t.due = next_due(); b_q.push_back(t); wbeat = 0;
+        end else wbeat++;
+      end
+      if (ar_f) begin
+        // The read's data as of its acceptance.
+        automatic txn_t t; t.addr = ar_a; t.len = ar_l; t.id = ar_i; t.due = next_due();
+        for (int k = 0; k < 16; k++)
+          t.data[k] = mem.exists((ar_a >> 6) + k) ? mem[(ar_a >> 6) + k] : '0;
+        ar_q.push_back(t);
+      end
+    end
+  end
+endmodule
+
+module vmem_real #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 4) (
+    input logic clk, rst,
+    input int cyc, lo, hi, full,
+    output logic rsp_valid, output logic [IW-1:0] rsp_inst, output logic [DW-1:0] rsp_data,
+    output logic [15:0] free,
+    input logic rd_valid, input logic [IW-1:0] rd_inst, input logic [AW-1:0] rd_row,
+    input logic wr_valid, input logic [IW-1:0] wr_inst, input logic [AW-1:0] wr_row,
+    input logic [DW-1:0] wr_data, input logic [MW-1:0] wr_mask,
+    output bit ok);
+  wire awvalid, awready, wvalid, wready, wlast, bvalid, bready, arvalid, arready, rvalid, rready, rlast;
+  wire [63:0] awaddr, araddr; wire [63:0] wstrb; wire [511:0] wdata, rdata;
+  wire [3:0] awid, bid, arid, rid; wire [7:0] awlen, arlen;
+  wire [5:0] free6; wire moving;
+  foldsim_vmem #(.IW(IW), .AW(AW), .DW(DW), .MW(MW), .INSTANCES(INSTANCES)) ctl(
+    .clk, .reset(rst), .rd_valid, .rd_inst, .rd_row, .wr_valid, .wr_inst, .wr_row, .wr_data, .wr_mask,
+    .rsp_valid, .rsp_inst, .rsp_data, .free(free6), .base(64'h0), .zero(1'b1), .move(1'b0), .moving,
+    .m_awvalid(awvalid), .m_awready(awready), .m_awaddr(awaddr), .m_awid(awid), .m_awlen(awlen),
+    .m_wvalid(wvalid), .m_wready(wready), .m_wdata(wdata), .m_wstrb(wstrb), .m_wlast(wlast),
+    .m_bvalid(bvalid), .m_bready(bready), .m_bid(bid),
+    .m_arvalid(arvalid), .m_arready(arready), .m_araddr(araddr), .m_arid(arid), .m_arlen(arlen),
+    .m_rvalid(rvalid), .m_rready(rready), .m_rdata(rdata), .m_rid(rid), .m_rlast(rlast));
+  axi_mem_model mem(.clk, .rst, .cyc, .lo, .hi, .awvalid, .awready, .awaddr, .awid, .awlen,
+    .wvalid, .wready, .wdata, .wstrb, .wlast, .bvalid, .bready, .bid, .arvalid, .arready, .araddr,
+    .arid, .arlen, .rvalid, .rready, .rdata, .rid, .rlast);
+  assign free = 16'(free6);
+  localparam INSTS = 1 << IW;
+  bit outstanding [INSTS];
+  initial begin ok = 1; for (int i = 0; i < INSTS; i++) outstanding[i] = 0; end
+  always @(posedge clk) if (!rst) begin
+    if (rsp_valid) outstanding[rsp_inst] = 0;
+    if (rd_valid) begin
+      if (outstanding[rd_inst]) begin
+        if (ok) $display("PROTOCOL: read of instance %0d at host cycle %0d", rd_inst, cyc);
+        ok = 0;
+      end
+      outstanding[rd_inst] = 1;
+    end
+  end
+endmodule
+`define VMEM_MODULE vmem_real
+`define VMEM_INSTANCES(k) , .INSTANCES(`FOLDSIM_VMEM_``k``_INSTANCES)
+`else
+`define VMEM_MODULE vmem_bytes_model
+`define VMEM_INSTANCES(k)
+`endif
+
 `define VM_MODEL(k) \
   logic vm``k``_rsp_valid, vm``k``_rd_valid, vm``k``_wr_valid; \
   logic [`FOLDSIM_VMEM_``k``_IW-1:0] vm``k``_rsp_inst, vm``k``_rd_inst, vm``k``_wr_inst; \
@@ -69,8 +199,8 @@ endmodule
   logic [`FOLDSIM_VMEM_``k``_MW-1:0] vm``k``_wr_mask; \
   logic [15:0] vm``k``_free; \
   bit vm``k``_ok; \
-  vmem_bytes_model #(.IW(`FOLDSIM_VMEM_``k``_IW), .AW(`FOLDSIM_VMEM_``k``_AW), \
-                     .DW(`FOLDSIM_VMEM_``k``_DW), .MW(`FOLDSIM_VMEM_``k``_MW)) model``k``( \
+  `VMEM_MODULE #(.IW(`FOLDSIM_VMEM_``k``_IW), .AW(`FOLDSIM_VMEM_``k``_AW), \
+                 .DW(`FOLDSIM_VMEM_``k``_DW), .MW(`FOLDSIM_VMEM_``k``_MW) `VMEM_INSTANCES(k)) model``k``( \
     .clk, .rst, .cyc, .lo, .hi, .full, .rsp_valid(vm``k``_rsp_valid), .rsp_inst(vm``k``_rsp_inst), \
     .rsp_data(vm``k``_rsp_data), .free(vm``k``_free), .rd_valid(vm``k``_rd_valid), \
     .rd_inst(vm``k``_rd_inst), .rd_row(vm``k``_rd_row), .wr_valid(vm``k``_wr_valid), \
