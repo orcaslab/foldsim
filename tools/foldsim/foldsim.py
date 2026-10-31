@@ -887,6 +887,9 @@ def main():
                  '-o', models])
             if a.copies and a.copies != 'auto':
                 fold += f' copies={a.copies}'
+            # Storage rules that change the schedule (pages kept off chip) apply here too.
+            if a.storage and a.storage != 'auto':
+                fold += f' storage={a.storage}'
             if a.nest:
                 fold += ' nest'
             fold += frame_options(a) + ' schedule-only'
