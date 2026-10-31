@@ -29,7 +29,11 @@
 // SIM: %Two_ready_l1_2 = seq.firreg
 // SIM: %Two_links0_ready_l1_1 = seq.firreg %Two_ready_l1_2
 // SIM-NEXT: %Two_links0_ready_l1_0 = seq.firreg %Two_links0_ready_l1_1
-// SIM: seq.firmem.write_port %Two_y2_to_{{.*}} = %Two_copy.y2, clock %hostClock enable %Two_links0_ready_l1_0
+// y2, read by two classes, is written a host cycle late from one register,
+// at its own level's pass a host cycle on.
+// SIM: %Two_y2_written_0 = seq.firreg %Two_copy.y2
+// SIM-NEXT: %Two_links0_ready_l1_late = seq.firreg %Two_links0_ready_l1_0
+// SIM: seq.firmem.write_port %Two_y2_to_{{.*}} = %Two_y2_written_0, clock %hostClock enable %Two_links0_ready_l1_late
 // SIM: seq.firmem.write_port %Two_y1_to_{{.*}} = %Two_copy.y1, clock %hostClock enable %Two_links0_ready0
 hw.module @Two(in %clk : !seq.clock, in %x1 : i8, in %x2 : i8, out y1 : i8, out y2 : i8) {
   %r = seq.firreg %x1 clock %clk : i8

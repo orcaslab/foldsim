@@ -19,7 +19,19 @@ module tb;
     .x_valid(ix < N && x_offer), .x_bits(8'(ix + 1)), .x_ready(x_ready),
     .z0_ready(lfsr[0]), .z0_valid(z_valid[0]), .z0_bits(z_bits[0]),
     .z1_ready(lfsr[5]), .z1_valid(z_valid[1]), .z1_bits(z_bits[1]),
+`ifdef BUBBLES
+    .advance(adv),
+`endif
     .profile_finish());
+`ifdef BUBBLES
+  localparam END = 4000;
+  int bubble = 0;
+  logic adv;
+  initial if (!$value$plusargs("bubble=%d", bubble)) bubble = 0;
+  always @(negedge clk) adv = $urandom % 100 >= bubble;
+`else
+  localparam END = 400;
+`endif
   always @(posedge clk) begin
     cyc <= cyc + 1;
     rst <= 0;
@@ -38,7 +50,7 @@ module tb;
         last <= cyc;
       end
     end
-    if (cyc == 400) begin
+    if (cyc == END) begin
       for (int k = 0; k < 2; k++) begin
         $write("z%0d:", k);
         for (int i = 1; i < N; i++) $write(" %h", z[k][i]);

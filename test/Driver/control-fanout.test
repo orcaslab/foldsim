@@ -8,9 +8,9 @@
 # RUN: FileCheck %s --check-prefix=FOUR < %t/four/foldsim_sim.sv
 # RUN: foldsim --srcs top.f --top Top --out %t/off --static --copies Leaf:1 --register-state-entries 0 --control-fanout 0 Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=OFF < %t/off/foldsim_sim.sv
-# FOUR: reg Leaf_links0_state0;
+# FOUR: reg Leaf_links0_state_late;
 # FOUR-NEXT: (* keep = "true", DONT_TOUCH = "true" *)
-# FOUR-NEXT: reg Leaf_links0_state0_rep1;
+# FOUR-NEXT: reg Leaf_links0_state_late_rep1;
 # FOUR: reg [1:0] region0_inst1;
 # FOUR-NEXT: (* keep = "true", DONT_TOUCH = "true" *)
 # FOUR-NEXT: reg [1:0] region0_inst1_rep1;
