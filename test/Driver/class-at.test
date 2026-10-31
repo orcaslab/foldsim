@@ -53,3 +53,16 @@
 # NESTED-IR-LABEL: hw.module @Top(
 # NESTED-IR: hw.instance "p" @Pair(
 # NESTED-IR: hw.instance "q" @Pair(
+
+# `>GLOB` takes an innermost match only: `tall` and its inner tree have slices
+# below them, so the walk goes on to the innermost tree, which the root class
+# takes as it takes the one-leaf tree `flat`; the slices of both levels are
+# one class.
+# RUN: rm -rf %t && cd %S/Inputs/class-at-tree && foldsim --srcs tree.f --top Top --out %t --static --class-at 'sl@*.s[01]' --class-at 'root@>tall' --class-at 'root@>flat' --class-at 'root@>*.t' 2>&1 | FileCheck %s --check-prefix=INNER
+# RUN: FileCheck %s --check-prefix=INNER-IR < %t/design.mlir
+# INNER: class-at sl: sl (Leaf) x4
+# INNER: class-at root: root ({{.*}}) x2
+# INNER: foldsim-fold-static: II =
+# INNER-IR-LABEL: hw.module @Top(
+# INNER-IR-DAG: hw.instance "tall" @{{Arb[^ ]*}}(
+# INNER-IR-DAG: hw.instance "flat" @root(

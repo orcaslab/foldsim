@@ -91,8 +91,12 @@ def class_at(text, top, specs):
     matched instances alone change module; each parameter set of them (each
     module they were instances of) becomes a module named TAG, or TAG_<k> for
     several, in the order first met. The first GLOB that matches takes an
-    instance; a GLOB may match none. Returns the design and the new modules'
-    names."""
+    instance; a GLOB may match none. A GLOB written `>GLOB` takes only an
+    innermost match: an instance with a match of any GLOB below it is not
+    taken, the walk goes on below it (a tree of arbiters whose size depends on
+    the configuration: its slices one class and its root another, or the
+    whole tree where it is one arbiter). Several GLOBs may share a TAG.
+    Returns the design and the new modules' names."""
     lines = text.split('\n')
     span, order = {}, []
     for i, line in enumerate(lines):
@@ -127,11 +131,28 @@ def class_at(text, top, specs):
     leaves = []             # (tag, leaf module), every matched instance
     sys.setrecursionlimit(max(10000, sys.getrecursionlimit()))
 
+    innermost = [g.startswith('>') for _, g in specs]
+    globs = [(t, g[1:] if inner else g) for (t, g), inner in zip(specs, innermost)]
+
+    def match(p):
+        return next((k for k, (_, g) in enumerate(globs) if fnmatch.fnmatchcase(p, g)), None)
+
+    def below(mod, path):
+        """Whether an instance below `mod` (at `path`) matches a GLOB."""
+        for _, name, callee in body.get(mod, ()):
+            p = f'{path}.{name}'
+            if match(p) is not None or below(callee, p):
+                return True
+        return False
+
     def walk(mod, path):
         changes = []
         for rel, name, callee in body[mod]:
             p = f'{path}.{name}' if path else name
-            tag = next((t for t, g in specs if fnmatch.fnmatchcase(p, g)), None)
+            k = match(p)
+            if k is not None and innermost[k] and below(callee, p):
+                k = None
+            tag = globs[k][0] if k is not None else None
             if tag:
                 leaves.append((tag, callee))
                 changes.append((rel, ('class', tag, callee)))
@@ -151,9 +172,10 @@ def class_at(text, top, specs):
     walk(top, '')
     # A glob a configuration has no instance for is not an error: one class
     # list serves configurations whose crossbars take different forms.
-    for t, g in specs:
+    for t in dict.fromkeys(t for t, _ in specs):
         if all(tag != t for tag, _ in leaves):
-            print(f'class-at {t}: no instance matches {g}', file=sys.stderr)
+            print(f'class-at {t}: no instance matches {" or ".join(g for u, g in specs if u == t)}',
+                  file=sys.stderr)
     # Each parameter set a module of its own, named after the tag.
     groups = {}
     for tag, leaf in leaves:
@@ -548,7 +570,8 @@ def main():
     ap.add_argument('--class-at', action='append', default=[], metavar='TAG@GLOB',
                     help='the instances whose path (instance names joined by ".") matches GLOB '
                          'are a class: one module per parameter set, TAG or TAG_<k>; repeatable, '
-                         'the first match takes an instance. A class `A+B` may name them')
+                         'the first match takes an instance; `>GLOB` only an instance with no '
+                         'match below it. A class `A+B` may name them')
     ap.add_argument('--nest', action='store_true',
                     help="fold nested classes recursively: each class's threads numbered so "
                          "that a thread and its parent's are current together (foldsim-compose); with "
