@@ -8,6 +8,7 @@ add_mlir_library(FoldsimTransforms
   MemoriesToRegisters.cpp
   FuseModels.cpp
   Pipelines.cpp
+  RemoveDeadState.cpp
   ReplicateControls.cpp
   Sort.cpp
   StaticFold.cpp

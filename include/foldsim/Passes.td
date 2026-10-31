@@ -782,6 +782,25 @@ def FoldZeroWidth : Pass<"foldsim-fold-zero-width", "::circt::hw::HWModuleOp"> {
   let dependentDialects = ["circt::hw::HWDialect"];
 }
 
+def RemoveDeadState : Pass<"foldsim-remove-dead-state", "::circt::hw::HWModuleOp"> {
+  let summary = "Remove registers and memories that no output observes";
+  let description = [{
+    A register, memory or combinational value is live when it reaches an
+    output of the module, an instance's input or an op with side effects,
+    through any number of registers and memories (a memory is live when one
+    of its read ports is; its writes then are). Everything else is removed:
+    it can change no output in any cycle. Canonicalization already removes
+    an unused value, but not state in a cycle of its own, such as a counter
+    whose only reader is its own increment: an unconnected performance
+    counter (`VX_stream_xbar`'s collision count, quadratic in its inputs)
+    keeps its whole cone. Registers and memories with a symbol stay.
+  }];
+  let statistics = [
+    Statistic<"numRemoved", "removed", "Ops removed">,
+  ];
+  let dependentDialects = ["circt::hw::HWDialect", "circt::seq::SeqDialect"];
+}
+
 def LowerConstantDivision
     : Pass<"foldsim-lower-constant-division", "::circt::hw::HWModuleOp"> {
   let summary = "Lower unsigned division by a constant as synthesis does";

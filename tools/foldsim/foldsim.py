@@ -31,7 +31,8 @@ import re
 import subprocess
 import sys
 
-# Passes each model gets before it is threaded: register constants, shared
+# Passes each model gets before it is threaded: state no output observes
+# (foldsim-remove-dead-state: an unconnected counter and its cone), register constants, shared
 # adders and narrowed low bits matter for area once every register of a model
 # is replicated per thread. A conditional write of one array element becomes a
 # select per element, and sorting lets CSE merge duplicates whose users come
@@ -40,6 +41,7 @@ import sys
 # a parameter sizes a field to nothing (a one-entry table indexed by a one-bit
 # number), and firtool emits neither their compares nor their constants.
 OPTIMIZE = ['hw.module(hw-expand-array-writes)', 'hw.module(foldsim-fold-zero-width)',
+            'hw.module(foldsim-remove-dead-state)',
             'hw.module(seq-reg-const-prop)',
             'hw.module(comb-share-adders)', 'canonicalize', 'hw.module(comb-low-bits-narrowing)',
             'canonicalize', 'foldsim-sort', 'cse']
@@ -787,7 +789,9 @@ def main():
     # Without classes, the target is a netlist of its own logic alone.
     if not order:
         order = [a.top]
-    passes = []
+    # State no output observes goes before the models are cut (their ports then
+    # carry only what is read) and again in each model (OPTIMIZE).
+    passes = ['hw.module(foldsim-remove-dead-state)']
     registers = memory_registers(a, flat, out)
     if registers:
         passes.append(registers)
