@@ -1,0 +1,80 @@
+# REQUIRES: verilator
+# Paged register state: with --page p a copy of several instances keeps its
+# registers in a page RAM and moves an instance's state in and out p host
+# cycles at a time (a fetch buffer filled a page a host cycle before the
+# state pass, a write-back buffer written a page a host cycle after it). The
+# leaves (Driver/Inputs/paged) page a 160-bit register cut across pages and
+# 72-bit RAM columns (--region-bits 72), a 13-bit sum and a byte, and keep the register their ready pass reads; their
+# RAM is read through a register. Against the target (tb_late.sv, and
+# tb_vmem.sv with the RAM virtual), from zero state: one copy at p = 1, two
+# copies chained in a host cycle at p = 2, overlapped frames at p = 3 (a dense
+# page word, --no-page-masks; elsewhere byte write masks by enable), nested
+# sequencers with a short lead at p = 4, ready passes by rank with
+# interleaved copies, and virtual memories at p = 2, 3, 4 (with bubbles,
+# copies, a short lead); bubbles and stalled channels throughout.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/paged
+# RUN: foldsim --srcs top.f --top Top --out %t/one --static --bubbles --page 1 Leaf > %t/one.log 2>&1
+# RUN: FileCheck %s --check-prefix=ONE < %t/one.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/one/obj %S/Inputs/tb_late.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/chain --static --bubbles --page 2 --region-bits 72 --copies Leaf:2 --zero-latency-links --zero-latency-chains Leaf > %t/chain.log 2>&1
+# RUN: FileCheck %s --check-prefix=CHAIN < %t/chain.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/chain/obj %S/Inputs/tb_late.sv top.sv %t/chain/foldsim_sim.sv > %t/chain/build.log 2>&1
+# RUN: %t/chain/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +bubble=40 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/mod --static --bubbles --modulo --page 3 --no-page-masks Leaf > %t/mod.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/mod/obj %S/Inputs/tb_late.sv top.sv %t/mod/foldsim_sim.sv > %t/mod/build.log 2>&1
+# RUN: %t/mod/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --bubbles --nest --short-lead --region-bits 100 --page 4 Leaf > %t/nest.log 2>&1
+# RUN: FileCheck %s --check-prefix=NEST < %t/nest.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_late.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/rank --static --modulo --ready-levels rank --interleave-copies --copies Leaf:2 --page 2 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/rank/obj %S/Inputs/tb_late.sv top.sv %t/rank/foldsim_sim.sv > %t/rank/build.log 2>&1
+# RUN: %t/rank/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/vm --static --virtual-memories ram --page 2 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/vm/obj %S/Inputs/tb_vmem.sv top.sv %t/vm/foldsim_sim.sv > %t/vm/build.log 2>&1
+# RUN: %t/vm/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/vmb --static --virtual-memories ram --bubbles --modulo --region-bits 72 --page 4 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -Mdir %t/vmb/obj %S/Inputs/tb_vmem.sv top.sv %t/vmb/foldsim_sim.sv > %t/vmb/build.log 2>&1
+# RUN: %t/vmb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=5 +hi=60 +bubble=30 +full=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/vmc --static --virtual-memories ram --copies Leaf:2 --short-lead --page 3 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DCOPIES2 -DIW=1 -Mdir %t/vmc/obj %S/Inputs/tb_vmem.sv top.sv %t/vmc/foldsim_sim.sv > %t/vmc/build.log 2>&1
+# RUN: %t/vmc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=1 +hi=40 +stall=30 +full=10 | FileCheck %s
+# The dense page word (--no-page-masks): the shift-xor, written under an
+# enable, writes its old value back where the enable is low.
+# RUN: FileCheck %s --check-prefix=MOD < %t/mod.log
+# MOD: pages Leaf: p 3, 3 registers, 181 bits; page RAMs
+# Memories read combinationally or through a register, paged as rows with
+# the registers (Driver/Inputs/pagedq: a queue and a register file of two
+# read ports), against the target at p = 2 with copies and overlapped frames,
+# and at p = 4 nested with a short lead and bubbles.
+# RUN: cd %S/../Driver/Inputs/pagedq && foldsim --srcs top.f --top Top --out %t/q2 --static --page 2 --copies Leaf:2 --modulo Leaf > %t/q2.log 2>&1
+# RUN: FileCheck %s --check-prefix=Q2 < %t/q2.log
+# RUN: FileCheck %s --check-prefix=Q2IR < %t/q2/foldsim_sim.mlir
+# RUN: cd %S/../Driver/Inputs/pagedq && %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/q2/obj %S/Inputs/tb_late.sv top.sv %t/q2/foldsim_sim.sv > %t/q2/build.log 2>&1
+# RUN: %t/q2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +stall=20 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/pagedq && foldsim --srcs top.f --top Top --out %t/q4 --static --page 4 --nest --short-lead --bubbles Leaf > /dev/null 2>&1
+# RUN: cd %S/../Driver/Inputs/pagedq && %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/q4/obj %S/Inputs/tb_late.sv top.sv %t/q4/foldsim_sim.sv > %t/q4/build.log 2>&1
+# RUN: %t/q4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +bubble=30 +stall=20 | FileCheck %s
+# Q2: pages Leaf: p 2, 17 registers, 113 bits (with 2 memories' rows, 96 bits)
+# The queue's head reads through its read pointer, a latency-1 read of new
+# data: paged as the address register (2 bits), the head the rows at it.
+# Q2IR: %fifo_raddr_writeback = seq.firreg
+# Q2IR-NOT: %fifo_rdata
+# At p = 15 a page is one 9-bit byte: its column's memory has mask width 1,
+# which is no mask, so the byte's enable goes into the write's enable.
+# RUN: cd %S/../Driver/Inputs/pagedq && foldsim --srcs top.f --top Top --out %t/q15 --static --page 15 --bubbles Leaf > %t/q15.log 2>&1
+# RUN: FileCheck %s --check-prefix=Q15 < %t/q15.log
+# RUN: cd %S/../Driver/Inputs/pagedq && %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/q15/obj %S/Inputs/tb_late.sv top.sv %t/q15/foldsim_sim.sv > %t/q15/build.log 2>&1
+# RUN: %t/q15/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +bubble=30 +stall=20 | FileCheck %s
+# Q15: pages Leaf: p 15, {{.*}} page RAMs 64 rows x 9 bits in 1 columns, 1 ports
+# Without --page nothing pages.
+# RUN: cd %S/../Driver/Inputs/paged
+# RUN: foldsim --srcs top.f --top Top --out %t/plain --static Leaf > %t/plain.log 2>&1
+# RUN: FileCheck %s --check-prefix=PLAIN < %t/plain/foldsim_sim.sv
+# ONE: pages Leaf: p 1, 21 registers, 325 bits (with 1 memories' rows, 128 bits) (350 in 9-bit bytes, 17 enables); page RAMs 4 rows x 351 bits in 1 columns, 5 ports, block; kept 0 registers, 0 bits
+# CHAIN: pages Leaf: p 2, 3 registers, 181 bits (187 in 9-bit bytes, 1 enables); page RAMs 4 rows x 99 bits in 2 columns, 2 ports, block; kept 1 registers, 8 bits
+# CHAIN: pages Leaf_copy1: p 2,
+# NEST: pages Leaf: p 4, 3 registers, 181 bits (187 in 9-bit bytes, 1 enables); page RAMs 16 rows x 54 bits in 1 columns, 1 ports, block; kept 1 registers, 8 bits; state passes 4 x 4 = 16
+# CHECK: {{^}}MATCH 196 cycles
+# PLAIN-NOT: fetch3

@@ -1,0 +1,54 @@
+# REQUIRES: verilator
+# Paged register state off chip (--storage <model>:pages=hbm): a paged copy's
+# page word, in columns, is kept in virtual memories (behind foldsim_vmem
+# controllers) whose instances are {instance, page}, a row each. Each page of
+# a fetch is a read request at its position, from the copy's state pass
+# before (so the round trip hides in the slots between); the responses fill
+# the fetch buffer by page; the state pass waits in a bubble until its
+# instance's pages are in; the write-back's pages are write requests, byte
+# masked. Against the target (Inputs/tb_pages.sv: a controller model per
+# virtual memory, its widths from foldsim_sim.vh), from zero state: one
+# column at response latency 1, six columns at 1-60 with stalls and the
+# controllers out of room, overlapped frames with bubbles, nested sequencers
+# with a short lead, two copies chained in a host cycle, the leaves' RAM
+# virtual too, the dense page word, and an on-chip window of 2 slots
+# (--page-hbm-window: each instance prefetched two state passes ahead, then
+# fetched from the window as on chip).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/paged
+# RUN: foldsim --srcs top.f --top Top --out %t/one --static --page 2 --storage Leaf:pages=hbm Leaf > %t/one.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/one  -Mdir %t/one/obj %S/Inputs/tb_pages.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/cols --static --page 1 --storage Leaf:pages=hbm --page-hbm-column-bits 64 Leaf > %t/cols.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/cols  -DVM1 -DVM2 -Mdir %t/cols/obj %S/Inputs/tb_pages.sv top.sv %t/cols/foldsim_sim.sv > %t/cols/build.log 2>&1
+# RUN: %t/cols/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bub --static --page 3 --storage Leaf:pages=hbm --bubbles --modulo --page-hbm-column-bits 32 Leaf > %t/bub.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/bub -DBUBBLES -DVM1 -Mdir %t/bub/obj %S/Inputs/tb_pages.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --page 4 --storage Leaf:pages=hbm --nest --short-lead --bubbles Leaf > %t/nest.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/nest -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_pages.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=20 +bubble=20 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/copies --static --page 4 --storage Leaf:pages=hbm --copies Leaf:2 --zero-latency-links --zero-latency-chains Leaf > %t/copies.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/copies  -DVM1 -Mdir %t/copies/obj %S/Inputs/tb_pages.sv top.sv %t/copies/foldsim_sim.sv > %t/copies/build.log 2>&1
+# RUN: %t/copies/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=30 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/ram --static --page 2 --storage Leaf:pages=hbm --virtual-memories ram --bubbles Leaf > %t/ram.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/ram -DBUBBLES -DVM1 -Mdir %t/ram/obj %S/Inputs/tb_pages.sv top.sv %t/ram/foldsim_sim.sv > %t/ram/build.log 2>&1
+# RUN: %t/ram/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=40 +bubble=20 +full=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/dense --static --page 3 --storage Leaf:pages=hbm --no-page-masks --modulo Leaf > %t/dense.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/dense  -Mdir %t/dense/obj %S/Inputs/tb_pages.sv top.sv %t/dense/foldsim_sim.sv > %t/dense/build.log 2>&1
+# RUN: %t/dense/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=3 +hi=10 +stall=10 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/win --static --page 2 --storage Leaf:pages=hbm --page-hbm-window 2 Leaf > %t/win.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/win  -Mdir %t/win/obj %S/Inputs/tb_pages.sv top.sv %t/win/foldsim_sim.sv > %t/win/build.log 2>&1
+# RUN: %t/win/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 +full=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/winb --static --page 3 --storage Leaf:pages=hbm --page-hbm-window 4 --nest --short-lead --bubbles --page-hbm-column-bits 64 Leaf > %t/winb.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/winb -DBUBBLES -Mdir %t/winb/obj %S/Inputs/tb_pages.sv top.sv %t/winb/foldsim_sim.sv > %t/winb/build.log 2>&1
+# RUN: %t/winb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=40 +bubble=20 | FileCheck %s
+# RUN: FileCheck %s --check-prefix=WIN < %t/win.log
+# WIN: Leaf off-chip page window 2
+# RUN: FileCheck %s --check-prefix=ONE < %t/one.log
+# RUN: FileCheck %s --check-prefix=COLS < %t/cols/foldsim_sim.vh
+# ONE: pages Leaf: p 2, 3 registers, 181 bits (184 in 8-bit bytes, 1 enables); off chip: 1 virtual memories of 8 rows x 96 bits (vm0), lead 2
+# COLS: `define FOLDSIM_VMEM_COUNT 3
+# COLS: `define FOLDSIM_VMEM_0_IW 2
+# COLS: `define FOLDSIM_VMEM_0_DW 64
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL
