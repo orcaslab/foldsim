@@ -1,0 +1,32 @@
+# REQUIRES: verilator
+# Virtual memories, guarantee 2 (VMEM_INTERFACE.md): a position runs only when
+# the controller's `free` covers every request that may follow the `free` the
+# sequencer saw: those of the decisions still in flight (the decision's lead,
+# four host cycles, three with --short-lead) and its own, a read and a write
+# each. Eight leaves side by side (Driver/Inputs/vmem_room) issue a read and a
+# write at every state pass, in consecutive host cycles, against a controller
+# whose queue is exactly the `free` it shows (Inputs/tb_vmem_queue.sv), served
+# one request a host cycle or less: the queue fills to its last entry and
+# never past it (a room of 8 for a lead of 4 overflowed it by one).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_room
+# RUN: foldsim --srcs top.f --top Top --out %t/one --static --virtual-memories ram Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=ROOM10 < %t/one/foldsim_sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/one/obj %S/Inputs/tb_vmem_queue.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +full=50 | FileCheck %s --check-prefix=FULL
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=80 | FileCheck %s --check-prefix=FULL
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=30 +full=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/short --static --virtual-memories ram --short-lead Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=ROOM8 < %t/short/foldsim_sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/short/obj %S/Inputs/tb_vmem_queue.sv top.sv %t/short/foldsim_sim.sv > %t/short/build.log 2>&1
+# RUN: %t/short/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +full=50 | FileCheck %s --check-prefix=FULL
+# RUN: %t/short/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +full=80 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --virtual-memories ram --nest Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/nest/obj %S/Inputs/tb_vmem_queue.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=5 +hi=60 +full=80 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bub --static --virtual-memories ram --bubbles Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_vmem_queue.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=20 +full=60 +bubble=30 | FileCheck %s
+# ROOM10: vm0_free > 16'h9
+# ROOM8: |(vm0_free[15:3])
+# FULL: {{^}}MATCH {{.*}} queue peak 16
+# CHECK: {{^}}MATCH

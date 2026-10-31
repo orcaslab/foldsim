@@ -1,0 +1,54 @@
+# REQUIRES: verilator
+# Several virtual memories per copy (Driver/Inputs/vmem_multi: per leaf, a
+# RAM built as four byte lanes, two more RAMs written at the lanes' address,
+# one also read there, and RAMs of 32 x 16 and 8 x 26; write-first), served
+# by models of the kernel's controllers (Inputs/tb_vmem_multi.sv): each memory
+# alone, or (--vmem-group) a class copy's memories behind one controller that
+# takes one request a host cycle from the members' FIFOs. The static simulator
+# matches the target at response latencies of 1 to 60 host cycles, with
+# stalled channels and a controller out of room: memories apart, lanes merged
+# into one row (--vmem-merge-lanes), grouped per copy and at most two per
+# controller, nested sequencers, with --bubbles, and eight leaves a copy. The
+# grouped runs take 64-byte rows (the v6 layout), so a copy's memories share a
+# controller; with packed rows (v7) memories of different row sizes do not
+# (`two`: the 1-byte ones pair up).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_multi
+# RUN: foldsim --srcs top.f --top Top --out %t/plain --static --virtual-memories 'Leaf:.*' --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/plain/foldsim_sim.json %t/plain
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/plain --top-module tb -Mdir %t/plain/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/plain/foldsim_sim.sv > %t/plain/build.log 2>&1
+# RUN: %t/plain/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=FAST
+# RUN: %t/plain/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/merged --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/merged/foldsim_sim.json %t/merged
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/merged --top-module tb -Mdir %t/merged/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/merged/foldsim_sim.sv > %t/merged/build.log 2>&1
+# RUN: %t/merged/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s --check-prefix=FAST
+# RUN: %t/merged/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/group --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --vmem-group copy --vmem-row-bytes-min 64 --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/group/foldsim_sim.json %t/group
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/group --top-module tb -Mdir %t/group/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/group/foldsim_sim.sv > %t/group/build.log 2>&1
+# RUN: %t/group/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=1 | FileCheck %s
+# RUN: %t/group/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: %t/group/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=5 +hi=60 +full=30 | FileCheck %s
+# RUN: %t/group/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=60 +full=50 | FileCheck %s
+# Memories apart but grouped, two at most per controller, one copy.
+# RUN: foldsim --srcs top.f --top Top --out %t/two --static --virtual-memories 'Leaf:.*' --vmem-group 2 Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/two/foldsim_sim.json %t/two
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/two --top-module tb -Mdir %t/two/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/two/foldsim_sim.sv > %t/two/build.log 2>&1
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=40 +stall=30 +full=10 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --vmem-group copy --vmem-row-bytes-min 64 --nest Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/nest/foldsim_sim.json %t/nest
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/nest --top-module tb -Mdir %t/nest/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bub --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --vmem-group copy --vmem-row-bytes-min 64 --bubbles --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/bub/foldsim_sim.json %t/bub
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/bub --top-module tb -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +lo=1 +hi=30 +bubble=30 +stall=10 | FileCheck %s
+# Eight leaves (Top8): one copy evaluates eight instances a frame, grouped, a
+# controller nearly always out of room.
+# RUN: foldsim --srcs top.f --top Top8 --out %t/eight --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --vmem-group copy --vmem-row-bytes-min 64 Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/eight/foldsim_sim.json %t/eight
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/eight --top-module tb -DTOP8 -Mdir %t/eight/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/eight/foldsim_sim.sv > %t/eight/build.log 2>&1
+# RUN: %t/eight/obj/Vtb +verilator+rand+reset+0 +verilator+seed+12 +lo=1 +full=95 | FileCheck %s
+# RUN: %t/eight/obj/Vtb +verilator+rand+reset+0 +verilator+seed+13 +lo=20 +hi=60 +full=80 +stall=20 | FileCheck %s
+# FAST: {{^}}MATCH 196 cycles in 2000 host cycles, H 10.00
+# CHECK: {{^}}MATCH
