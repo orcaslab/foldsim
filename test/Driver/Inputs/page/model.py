@@ -61,3 +61,16 @@ print(f'beyond the chip: page {spec!r} off chip {res["offchip"]} frame {frame} '
       f'bram {res["bram"]} fits {res["fits"]}')
 info = d.parse_classes('foldsim-fold-static: II = 8\n  Leaf x4 state gap 8 page 2 off chip\n    state: 0 2 4 6\n')
 print('parsed off chip', info['Leaf']['offchip'])
+# Small memories page as rows: a 31 x 64 register file read combinationally
+# (two ports) and a 4 x 8 queue read through a register join the paged bits
+# and leave distributed RAM; a 64 x 128 memory (8,192 bits) keeps its store.
+mems = [('rf', 31, 64, 2, 1, 0, None, 1, True), ('q', 4, 8, 1, 1, 1, None, 1, True),
+        ('big', 64, 128, 1, 1, 0, None, 1, True)]
+e = dict(lut=1000.0, ff=500, mems=mems, regw={500: 1})
+bits, mux, rest = d.paged_state(e)
+print(f'rows: bits {bits} mux {mux:.0f} kept {[m[0] for m in rest["mems"]]}')
+classes = dict(Lane=256, Top=1)
+est = dict(Lane=e, Top=dict(lut=10000.0, ff=1000, mems=[], regw={}))
+un = d.area(None, est, classes, {}, 0, sched(256), 256, 2, 'fixed')
+pg = d.area(None, est, classes, {}, 0, sched(256, 2), 512, 2, 'fixed')
+print(f'rows unpaged lutram {un["lutram"]} paged lutram {pg["lutram"]} paged bits {pg["paged_bits"]}')

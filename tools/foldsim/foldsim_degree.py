@@ -297,6 +297,29 @@ def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fi
     return res
 
 
+# A paged class's memories of at most this many bits page as rows with its
+# registers (foldsim-fold-static page-memory-bits).
+PAGE_MEMORY_BITS = 4096
+
+
+def paged_state(est):
+    """A paged copy's state as foldsim-fold-static pages it: its registers'
+    bits and its small memories' rows (and a registered read's output
+    register); the read ports' choice of rows in LUTs (a flop store's read,
+    foldsim_storage.kind_cost 'registers'); and its other memories, which
+    keep their stores. Registers a ready pass reads are not known here: all
+    page."""
+    bits, luts, rest = est['ff'], 0.0, []
+    for m in est['mems']:
+        (_, d, w, r, _, rl, *_) = m
+        if rl <= 1 and d * w <= PAGE_MEMORY_BITS:
+            bits += d * w + (w * r if rl == 1 else 0)
+            luts += max(r, 1) * w * math.ceil((d - 1) / 3) if d > 1 else 0
+        else:
+            rest.append(m)
+    return bits, luts, dict(est, mems=rest)
+
+
 def paged_fields(paged):
     """The paged register state of a point, for its row: bits (every
     instance's), the flops of the fetch and write-back buffers, and the
@@ -325,13 +348,15 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
             lr, br = state_lutram(est[c], t, form)
             copy_logic = kappa * est[c]['lut'] + state_logic(cal, form, bypass, est[c]['ff'])
             if form == 'paged':
-                pc = storage.page_cost(est[c]['ff'], t, info['page'],
+                bits, mux, others = paged_state(est[c])
+                lr, br = state_lutram(others, t, form)
+                pc = storage.page_cost(bits, t, info['page'],
                                        'hbm' if info.get('offchip') else 'block')
-                copy_logic += pc['lut']
+                copy_logic += pc['lut'] + mux
                 br += pc['bram']
                 paged['ff'] += pc['ff']
                 paged['ports'] += pc['ports']
-                paged['bits'] += est[c]['ff'] * t
+                paged['bits'] += bits * t
                 paged['hbm'] += pc.get('hbm_bytes', 0)
             logic += copy_logic
             lutram += lam * lr
@@ -370,15 +395,18 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             copy_logic[(c, j)] = cl
             forms.append((j, t, form, info['gap'] if info else None))
             if form == 'paged' and info.get('offchip'):
-                pc = storage.page_cost(est[c]['ff'], t, info['page'], 'hbm')
-                logic += pc['lut']
-                copy_logic[(c, j)] += pc['lut']
+                bits, mux, _ = paged_state(est[c])
+                pc = storage.page_cost(bits, t, info['page'], 'hbm')
+                logic += pc['lut'] + mux
+                copy_logic[(c, j)] += pc['lut'] + mux
                 paged['ff'] += pc['ff']
-                paged['bits'] += est[c]['ff'] * t
+                paged['bits'] += bits * t
                 paged['hbm'] += pc['hbm_bytes']
             elif form == 'paged':
                 # A page RAM per paged copy: block or ultra, as the rest choose.
-                bits = est[c]['ff']
+                bits, mux, _ = paged_state(est[c])
+                logic += mux
+                copy_logic[(c, j)] += mux
                 pcost = {kind: storage.page_cost(bits, t, info['page'], kind)
                          for kind in ('block', 'ultra')}
                 # The frame its state passes need is the schedule's (`ii`).
@@ -405,10 +433,15 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             mems[(name, named, d, w, r, wr, rl, st, mask)] += 1
         for (name, named, d, w, r, wr, rl, st, mask), cnt in mems.items():
             per = []
-            for j, t, _, gap in forms:
+            for j, t, f, gap in forms:
+                # A paged copy's small memories are rows of its pages.
+                if f == 'paged' and rl <= 1 and d * w <= PAGE_MEMORY_BITS:
+                    continue
                 th = 1 << (t - 1).bit_length() if t > 1 else 1
                 per.append((j, dict(depth=d * th, width=w, rports=r, wports=wr, rlat=rl,
                                     mask=mask, reg=False, gap=gap, threads=t), cnt))
+            if not per:
+                continue
             # Vivado's inference at the deepest copy's depth, or the hint.
             th = max(1 << (t - 1).bit_length() if t > 1 else 1 for _, t, _, _ in forms)
             default = 'block' if cost.mem_cost(d * th, w, r, rl, st)[1] else 'distributed'

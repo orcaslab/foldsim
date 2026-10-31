@@ -26,3 +26,8 @@
 # CHECK: hbm: bram 0.0 uram 0 ports 0 bytes 128000000 frame 200000 controllers 245
 # CHECK: beyond the chip: page 'Lane:1' off chip ['Lane'] frame 200000 bram 0.0 fits True
 # CHECK: parsed off chip True
+# Small memories page as rows (paged_state): the register file and the
+# queue (and its read register) join the paged bits, the large one keeps its
+# distributed RAM.
+# CHECK: rows: bits 2524 mux 1288 kept ['big']
+# CHECK: rows unpaged lutram 71734 paged lutram 48236 paged bits 646144
