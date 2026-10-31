@@ -3200,8 +3200,9 @@ void StaticFolder::reportLinks(raw_ostream &os) {
     } else {
       depth = linkDepth(entries, banked);
       StringRef style;
-      if (haveSchedule && use.sources == 1 && entries != 1 && slrOf.empty() &&
-          !syncLinkStyle(depth, use.width).empty()) {
+      if (haveSchedule && entries != 1 && slrOf.empty() &&
+          !syncLinkStyle(depth, use.width).empty() &&
+          (use.sources == 1 || !shortLead)) {
         // As buildSim decides: never forwarded, taken now or forwarded
         // from a shared register.
         unsigned rthreads = classes[use.reader].threads();
@@ -3218,7 +3219,16 @@ void StaticFolder::reportLinks(raw_ostream &os) {
         bool late = shareLinkWrites && classReaders[use.producer] > 1;
         bool forwardLate =
             late && needsForward(use.producer, use.reader, takes, rows, 2);
-        if (!forward && !now && !forwardLate)
+        // The only source: read into the RAM's output register, which is
+        // the read register. One of several: read a host cycle ahead, where
+        // no write of an entry it reads lands in the host cycles between.
+        if (use.sources == 1 ? !forward && !now && !forwardLate
+                             : !forward && !now &&
+                                   !needsForward(use.producer, use.reader,
+                                                 takes, rows, 2) &&
+                                   !(late && needsForward(use.producer,
+                                                          use.reader, takes,
+                                                          rows, 3)))
           style = syncLinkStyle(depth, use.width);
       }
       if (style == "ultra") {
@@ -5152,6 +5162,8 @@ LogicalResult StaticFolder::buildSim() {
     /// The frame's position three host cycles ahead, as the tables read it.
     Value at3;
     Value inst2, state2, ready2, tail2;
+    /// Whether the slot is the frame before's, three host cycles ahead.
+    Value tail3;
     Value inst1, inst, state, ready;
     /// The ready passes past the first, two host cycles ahead.
     SmallVector<Value> laterReady2;
@@ -5243,6 +5255,7 @@ LogicalResult StaticFolder::buildSim() {
       ctl.state3 = comb::AndOp::create(b, ctl.state3, runs);
       ready3 = comb::AndOp::create(b, ready3, runs);
       ctl.tail2 = reg(tail3, prefix + "_tail2");
+      ctl.tail3 = tail3;
     }
     ctl.state2 = reg(ctl.state3, prefix + "_state2");
     ctl.ready2 = reg(ready3, prefix + "_ready2");
@@ -5790,7 +5803,7 @@ LogicalResult StaticFolder::buildSim() {
   // register (forwarded the host cycle the write lands), for the report.
   unsigned linkReads = 0, forwardedReads = 0, forwardedAfter = 0, nowReads = 0,
            lateReads = 0, forwardedLate = 0, compactReads = 0, stagedReads = 0,
-           syncReads = 0;
+           syncReads = 0, earlyReads = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
   SmallVector<unsigned> classReaders(producers.size(), 0);
@@ -6009,6 +6022,29 @@ LogicalResult StaticFolder::buildSim() {
                                          copyReg(ctl.tail2, name + "_tail"));
           return parity;
         };
+        // The read's address and bank a host cycle earlier, for a block or
+        // ultra RAM link read a host cycle ahead (several sources: its
+        // output register, then the choice of source, then the read
+        // register).
+        auto address2 = [&]() -> Value {
+          if (pThreads <= 1)
+            return Value();
+          if (threads == 1)
+            return constant(w, entryRows[0]);
+          return copyReg(table(b, ctl.inst3, entryRows, w),
+                         consumer.name + "_addr2_" + Twine(at) + "_" +
+                             Twine(addressCopies++));
+        };
+        auto bank2 = [&]() -> Value {
+          std::string name = (consumer.name + "_parity2_" + Twine(at) + "_" +
+                              Twine(bankCopies++))
+                                 .str();
+          Value parity = copyReg(parD, name);
+          if (ctl.tail3)
+            parity = comb::XorOp::create(b, parity,
+                                         copyReg(ctl.tail3, name + "_tail"));
+          return parity;
+        };
         // A staged link (`staged-links`): an early link of one producer
         // instance in two registers, the first written at the producer's
         // pass, the second, which the reader reads, loaded from it at a
@@ -6094,12 +6130,33 @@ LogicalResult StaticFolder::buildSim() {
           syncPart = true;
           ++syncReads;
         }
+        // One of several sources: read a host cycle ahead, where no write
+        // of an entry it reads lands in the two host cycles before its read
+        // register loads (three for a write from a shared register).
+        bool early = false;
+        if (style.empty() && sources.size() > 1 && !now && !forward &&
+            !shortLead && to < 0 && pThreads != 1 &&
+            !needsForward(key.first, c, takes, rows, 2) &&
+            !(late && needsForward(key.first, c, takes, rows, 3))) {
+          style = syncLinkStyle(linkDepth(pThreads, !producer.late), width);
+          early = !style.empty();
+          if (early) {
+            ++syncReads;
+            ++earlyReads;
+          }
+        }
         sourceData[index] =
-            linkRead(key.first, key.second, width, address, bank,
-                     producer.name + "_to_" + consumer.name + "_" + Twine(at),
-                     to, now ? &sourceNow[index] : nullptr, forward,
-                     after ? &sourceAfter[index] : nullptr, late, forwardLate,
-                     kept, style);
+            early ? linkRead(key.first, key.second, width, address2, bank2,
+                             producer.name + "_to_" + consumer.name + "_" +
+                                 Twine(at),
+                             to, nullptr, false, nullptr, late, false, kept,
+                             style)
+                  : linkRead(key.first, key.second, width, address, bank,
+                             producer.name + "_to_" + consumer.name + "_" +
+                                 Twine(at),
+                             to, now ? &sourceNow[index] : nullptr, forward,
+                             after ? &sourceAfter[index] : nullptr, late,
+                             forwardLate, kept, style);
       }
       if (syncPart) {
         // Registered already: wired around the read register.
@@ -6266,7 +6323,8 @@ LogicalResult StaticFolder::buildSim() {
     if (stagedLinks)
       os << "; staged " << stagedReads;
     if (linkBlockDepth || linkUltraDepth)
-      os << "; block/ultra " << syncReads;
+      os << "; block/ultra " << syncReads << " (read ahead " << earlyReads
+         << ")";
     os << "\n";
     llvm::errs() << os.str();
     if (!reportPath.empty()) {
