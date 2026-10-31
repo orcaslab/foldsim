@@ -125,6 +125,12 @@ struct Class {
     unsigned rowWidth, dataWidth, maskWidth;
     bool readFirst;
     unsigned firstInput, firstOutput;
+    /// A column of a page word kept off chip (`pages=hbm`): its instances
+    /// are {instance, page} (`instWidth` bits, `instances` of them), a row
+    /// each, read at the fetch's positions and waited for by the state pass
+    /// alone; 0 for a memory of the model (the class's instances).
+    bool pages = false;
+    unsigned instWidth = 0, instances = 0;
   };
   SmallVector<VirtualMemory> virtualMemories;
   /// With virtual memories, the copy's host reset input (their pending reads
@@ -144,8 +150,16 @@ struct Class {
                  : ArrayRef<int>(slot[kReady]);
   }
   /// Paged register state (`page`): host cycles an instance's state takes
-  /// to move in or out of its page RAM, or 0 if it is not paged.
+  /// to move in or out of its page RAM, or 0 if it is not paged; whether
+  /// its pages are kept off chip (`<model>:pages=hbm`), behind virtual
+  /// memories; and the slots from an instance's first page read to its
+  /// state pass: the page, and with pages off chip at least 2, so that the
+  /// read is pending before the state pass is decided.
   unsigned page = 0;
+  bool pagesOffChip = false;
+  unsigned pageLead() const {
+    return pagesOffChip && page ? std::max(page, 2u) : page;
+  }
   /// Its folded pipelines, if any.
   std::unique_ptr<Folding> folding;
   /// Built: the copy and its instance in the simulator.
@@ -246,7 +260,8 @@ public:
                uint64_t slrCapacity, ArrayRef<std::string> slrAssign,
                ArrayRef<std::string> storage, StringRef readyLevels,
                unsigned forwardAfterLevels, bool shareLinkWrites,
-               ArrayRef<std::string> page, bool pageMasks)
+               ArrayRef<std::string> page, bool pageMasks,
+               unsigned pageHbmColumnBits)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -261,6 +276,7 @@ public:
         registerStateEntries(registerStateEntries), storageSpecs(storage),
         forwardAfterLevels(forwardAfterLevels),
         shareLinkWrites(shareLinkWrites), pageSpecs(page), pageMasks(pageMasks),
+        pageHbmColumnBits(pageHbmColumnBits),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -413,7 +429,12 @@ private:
   /// `page`: the paged models, as <model>:<p>; each class's `page` from them.
   ArrayRef<std::string> pageSpecs;
   bool pageMasks;
+  /// The most bits of an off-chip page word in one virtual memory's row (a
+  /// controller per column, so wide: 8 beats of the 512-bit AXI port).
+  unsigned pageHbmColumnBits;
   LogicalResult parsePages();
+  /// Marks the paged classes whose pages a storage rule keeps off chip.
+  LogicalResult pagesOffChip();
   /// What each paged copy pages, for the report.
   std::string pageReport;
   /// The registers of class `cls` a ready pass reads: the cone of each
@@ -1548,7 +1569,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
   // port reads an instance's pages in the slots before its state pass.
   std::vector<std::set<int>> pageSlots(classes.size());
   auto pageClash = [&](unsigned c, int t) {
-    int p = classes[c].page;
+    int p = classes[c].pageLead();
     auto &slots = pageSlots[c];
     auto it = slots.lower_bound(t - p + 1);
     return it != slots.end() && *it < t + p;
@@ -1598,8 +1619,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     if (paged(c) && !pageSlots[c].empty())
       length = std::max<int>(
           {length,
-           *pageSlots[c].rbegin() - *pageSlots[c].begin() + int(cls.page),
-           int(cls.page) + 4});
+           *pageSlots[c].rbegin() - *pageSlots[c].begin() + int(cls.pageLead()),
+           int(cls.pageLead()) + 4});
   for (auto &consumer : consumers) {
     if (consumer.cls < 0)
       continue;
@@ -1695,7 +1716,7 @@ unsigned StaticFolder::placeModulo(
   // page recurrence.
   for (auto [c, cls] : llvm::enumerate(classes))
     if (paged(c) && cls.threads())
-      lower = std::max({lower, cls.page * cls.threads(), cls.page + 4});
+      lower = std::max({lower, cls.pageLead() * cls.threads(), cls.pageLead() + 4});
   auto cmp = [&](unsigned a, unsigned b) {
     if (height[a] != height[b])
       return height[a] < height[b];
@@ -1726,7 +1747,7 @@ unsigned StaticFolder::placeModulo(
     // slots of its page-in, the page before it and its own.
     std::vector<std::set<int>> pagePort(classes.size());
     auto window = [&](unsigned c, int t, auto &&each) {
-      for (int k = 0; k < int(classes[c].page); ++k)
+      for (int k = 0; k < int(classes[c].pageLead()); ++k)
         each(((t - k) % int(period) + int(period)) % int(period));
     };
     auto pageFree = [&](unsigned c, int t) {
@@ -2640,6 +2661,18 @@ int StaticFolder::minStateGap(const Class &cls) const {
   return gap;
 }
 
+LogicalResult StaticFolder::pagesOffChip() {
+  for (auto &cls : classes) {
+    StringRef model =
+        cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : cls.name;
+    for (auto &rule : storageRules)
+      if (rule.model == model && !rule.regs && rule.store == "pages" &&
+          rule.kind == "hbm")
+        cls.pagesOffChip = cls.page > 0;
+  }
+  return success();
+}
+
 LogicalResult StaticFolder::parsePages() {
   for (auto &spec : pageSpecs) {
     auto [model, count] = StringRef(spec).rsplit(':');
@@ -2735,6 +2768,7 @@ LogicalResult StaticFolder::schedule() {
                    << " has no register to page (its ready passes read them "
                       "all); not paged\n";
       cls.page = 0;
+      cls.pagesOffChip = false;
       unpaged = true;
     }
   if (unpaged)
@@ -2809,7 +2843,7 @@ LogicalResult StaticFolder::schedule() {
        << " state gap "
        << cls.stateGap;
     if (cls.page)
-      os << " page " << cls.page;
+      os << " page " << cls.page << (cls.pagesOffChip ? " off chip" : "");
     if (nest)
       os << " depth " << cls.depth
          << (cls.parent >= 0 ? " under " + classes[cls.parent].name : "");
@@ -3422,7 +3456,11 @@ LogicalResult StaticFolder::parseStorage() {
     if (model.empty() || store.empty() || kind.empty() || kind == rest)
       return netlist.emitError("storage: '")
              << spec << "' is not <model>:<store>=<kind>";
-    if (!llvm::is_contained({"registers", "distributed", "block", "ultra"},
+    // `hbm`: a paged model's page word kept off chip (`pages` only).
+    if (kind == "hbm" && store != "pages")
+      return netlist.emitError("storage: 'hbm' is for a model's pages, not '")
+             << store << "'";
+    if (!llvm::is_contained({"registers", "distributed", "block", "ultra", "hbm"},
                             kind))
       return netlist.emitError("storage: '")
              << kind
@@ -3633,9 +3671,20 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   if (threads > 1)
     addPort("inst3", IntegerType::get(context, idxWidth), true);
   // Paged: the instance whose pages to read, from three host cycles ahead.
-  if (cls.page) {
+  // Off chip, each position's page read (instance, page) and page write
+  // (page) instead.
+  unsigned pageBits = 0;
+  if (cls.page)
+    pageBits = std::max(1u, llvm::Log2_32_Ceil(unsigned(llvm::PowerOf2Ceil(cls.page))));
+  if (cls.page && !cls.pagesOffChip) {
     addPort("fetch3", IntegerType::get(context, 1), true);
     addPort("finst3", IntegerType::get(context, idxWidth), true);
+  } else if (cls.page) {
+    addPort("pread3", IntegerType::get(context, 1), true);
+    addPort("pinst3", IntegerType::get(context, idxWidth), true);
+    addPort("ppage3", IntegerType::get(context, pageBits), true);
+    addPort("pwrite3", IntegerType::get(context, 1), true);
+    addPort("pwpage3", IntegerType::get(context, pageBits), true);
   }
   SmallVector<unsigned> inputArg(cls.inputNames.size(), 0);
   for (auto [i, name] : llvm::enumerate(cls.inputNames)) {
@@ -3685,8 +3734,14 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   Value hostClock = body->getArgument(0);
   Value state3 = body->getArgument(1);
   Value inst3 = threads > 1 ? body->getArgument(2) : Value();
-  Value fetch3 = cls.page ? body->getArgument(3) : Value();
-  Value finst3 = cls.page ? body->getArgument(4) : Value();
+  bool offChip = cls.page && cls.pagesOffChip;
+  Value fetch3 = cls.page && !offChip ? body->getArgument(3) : Value();
+  Value finst3 = cls.page && !offChip ? body->getArgument(4) : Value();
+  // Off chip: [read, instance, page, write, write page], three ahead.
+  SmallVector<Value> offChip3;
+  if (offChip)
+    for (unsigned k = 0; k < 5; ++k)
+      offChip3.push_back(body->getArgument(3 + k));
   unsigned pages = cls.page ? unsigned(llvm::PowerOf2Ceil(cls.page)) : 0;
   unsigned pageWidth = pages > 1 ? llvm::Log2_32_Ceil(pages) : 0;
   DenseMap<Value, Value> replaced;
@@ -3724,7 +3779,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       if (threads > 1)
         ahead.inst2 = keep(seq::FirRegOp::create(
             b, inst3, hostClock, b.getStringAttr(prefix + "_inst2")));
-      if (cls.page) {
+      if (cls.page && !offChip) {
         ahead.fetch2 = keep(seq::FirRegOp::create(
             b, fetch3, hostClock, b.getStringAttr(prefix + "_fetch2")));
         BackedgeBuilder edges(b, model.getLoc());
@@ -3929,6 +3984,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     Value enable;
   };
   SmallVector<PagedReg> pagedRegs;
+  // Off chip, each page column's virtual memory and its outputs (requests
+  // and pending reads), appended to the copy's ports once its body is built.
+  SmallVector<std::pair<unsigned, SmallVector<Value>>> pageRequests;
   // With page masks, each enable's register, one per enable.
   DenseMap<std::pair<Value, unsigned>, Value> pagedEnableRegs;
   BackedgeBuilder pageEdges(b, model.getLoc());
@@ -4250,7 +4308,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     auto *rule = storageFor(cls, "pages", /*reg=*/false, 0);
     std::string kind = rule ? rule->kind : "block";
     if (kind != "block" && kind != "ultra" && kind != "distributed" &&
-        kind != "registers")
+        kind != "registers" && kind != "hbm")
       return model.emitError("storage: '") << kind << "' for pages";
     uint64_t pagedBits = 0;
     for (auto &reg : pagedRegs)
@@ -4261,7 +4319,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     // whole bytes (the RAM's write-enable grain), so a byte is one
     // enable's; the page word is whole bytes too.
     bool masked = llvm::any_of(pagedRegs, [](auto &r) { return bool(r.enable); });
-    unsigned grain = masked ? (kind == "ultra" ? 8 : 9) : 1;
+    // Off chip, a virtual memory's write mask is bytes: always built.
+    bool bytesMasked = masked || offChip;
+    unsigned grain = offChip ? 8 : masked ? (kind == "ultra" ? 8 : 9) : 1;
     SmallVector<uint64_t> bitAt(pagedRegs.size(), 0);
     llvm::MapVector<Value, SmallVector<unsigned>> groups;
     for (auto [i, reg] : llvm::enumerate(pagedRegs))
@@ -4288,9 +4348,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     }
     unsigned pw = unsigned((layoutBits + p - 1) / p);
     pw = (pw + grain - 1) / grain * grain;
-    while (masked && byteEnable.size() * grain < uint64_t(pw) * p)
+    while (bytesMasked && byteEnable.size() * grain < uint64_t(pw) * p)
       byteEnable.push_back(Value());
-    unsigned colBits = 72 * std::max(1u, regionBits / 72);
+    // Off chip a column is a virtual memory's row: wide, few controllers.
+    unsigned colBits =
+        offChip ? std::max(8u, pageHbmColumnBits / 8 * 8)
+                : 72 * std::max(1u, regionBits / 72);
     unsigned columns = (pw + colBits - 1) / colBits;
     struct Column {
       unsigned width;
@@ -4301,8 +4364,13 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       /// at their offsets in the column.
       SmallVector<Value> land, writing;
       SmallVector<SmallVector<std::pair<unsigned, Value>>> parts;
+      /// Off chip: its virtual memory, its write's valid, and its requests
+      /// and pending reads, in the order of the copy's vm ports.
+      unsigned vm = 0;
+      Value writeValid;
+      SmallVector<Value> requests;
     };
-    SmallVector<Column> cols(columns);
+    std::vector<Column> cols(columns);
     // Each column's controls: a region of its own.
     for (unsigned c = 0; c < columns; ++c) {
       unsigned width = std::min(colBits, pw - c * colBits);
@@ -4315,6 +4383,148 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     for (auto &col : cols) {
       auto &region = *col.region;
       std::string prefix = region.prefix;
+      if (offChip) {
+        // A virtual memory of {instance, page} rows: each position's page
+        // read and page write requests, three host cycles from the tables;
+        // the responses into the fetch buffer as they come, by page; the
+        // instance's read pending from its fetch's decision until its last
+        // page is in.
+        auto chain = [&](Value v3, const Twine &what) -> Value {
+          Value v2 = keep(seq::FirRegOp::create(b, v3, hostClock,
+                                                b.getStringAttr(prefix + "_" + what + "2")));
+          Value v1 = keep(seq::FirRegOp::create(b, v2, hostClock,
+                                                b.getStringAttr(prefix + "_" + what + "1")));
+          return keep(seq::FirRegOp::create(b, v1, hostClock,
+                                            b.getStringAttr(prefix + "_" + what + "0")));
+        };
+        Value inst0 = chain(offChip3[1], "pinst");
+        Value page0 = chain(offChip3[2], "ppage");
+        Value write0 = chain(offChip3[3], "pwrite");
+        Value wpage0 = chain(offChip3[4], "pwpage");
+        auto low = [&](Value v) -> Value {
+          return b.createOrFold<comb::ExtractOp>(bits(pageWidth), v, 0);
+        };
+        auto isPage = [&](Value v, unsigned j) -> Value {
+          if (!pageWidth)
+            return one();
+          return comb::ICmpOp::create(b, comb::ICmpPredicate::eq, low(v),
+                                      hw::ConstantOp::create(b, bits(pageWidth), j));
+        };
+        auto virtualInst = [&](Value inst, Value page) -> Value {
+          return pageWidth ? b.createOrFold<comb::ConcatOp>(inst, low(page)) : inst;
+        };
+        Class::VirtualMemory vm;
+        vm.name = prefix + "_pages";
+        vm.rowWidth = 1;
+        vm.dataWidth = col.width;
+        vm.maskWidth = col.width / 8;
+        vm.readFirst = true;
+        vm.pages = true;
+        vm.instWidth = idxWidth + pageWidth;
+        vm.instances = entries * pages;
+        if (cls.virtualMemories.empty()) {
+          auto [name, arg] = copy.appendInput("hostReset", b.getI1Type());
+          cls.resetInput = arg.getArgNumber();
+        }
+        Value hostReset = body->getArgument(cls.resetInput);
+        // A page read only within a fetch that started (its page 0 read):
+        // a fetch that wraps into the frame before is partial in the first
+        // frame, and its other pages' reads would go out unaccounted.
+        auto activeNext = edges.get(b.getI1Type());
+        Value active = seq::FirRegOp::create(
+            b, activeNext, hostClock, b.getStringAttr(prefix + "_fetching"),
+            hostReset,
+            hw::ConstantOp::create(b, b.getI1Type(), 0), hw::InnerSymAttr{},
+            /*isAsync=*/false, b.getIntegerAttr(b.getI1Type(), 0));
+        Value first3 = comb::AndOp::create(b, offChip3[0], isPage(offChip3[2], 0));
+        Value last3 = comb::AndOp::create(b, offChip3[0], isPage(offChip3[2], p - 1));
+        activeNext.setValue(comb::MuxOp::create(
+            b, last3, hw::ConstantOp::create(b, b.getI1Type(), 0),
+            comb::OrOp::create(b, first3, active)));
+        Value read3 = comb::AndOp::create(
+            b, offChip3[0], comb::OrOp::create(b, first3, active));
+        Value read0 = chain(read3, "pread");
+        std::string vmName = ("vm" + Twine(cls.virtualMemories.size()) + "_").str();
+        auto rspValid = copy.appendInput(vmName + "rsp_valid", b.getI1Type()).second;
+        vm.firstInput = rspValid.getArgNumber();
+        auto rspInst = copy.appendInput(vmName + "rsp_inst", bits(vm.instWidth)).second;
+        auto rspData = copy.appendInput(vmName + "rsp_data", bits(col.width)).second;
+        auto resetReg = [&](Value next, const Twine &name) -> Value {
+          auto type = next.getType();
+          return seq::FirRegOp::create(b, next, hostClock, b.getStringAttr(name),
+                                       hostReset, hw::ConstantOp::create(b, type, 0),
+                                       hw::InnerSymAttr{}, /*isAsync=*/false,
+                                       b.getIntegerAttr(type, 0));
+        };
+        // The responses, registered: page j's parts load as it comes.
+        Value valid = resetReg(rspValid, prefix + "_rsp_valid");
+        Value rspAt = seq::FirRegOp::create(b, rspInst, hostClock,
+                                            b.getStringAttr(prefix + "_rsp_inst"));
+        col.out = seq::FirRegOp::create(b, rspData, hostClock,
+                                        b.getStringAttr(prefix + "_page_out"));
+        for (unsigned j = 0; j < p; ++j)
+          col.land.push_back(comb::AndOp::create(b, valid, isPage(rspAt, j)));
+        // Pages in: counted from the fetch's decision (its page 0's read,
+        // three ahead); the last clears the pending read.
+        unsigned cw = llvm::Log2_32_Ceil(p + 1);
+        Value start = comb::AndOp::create(b, offChip3[0], isPage(offChip3[2], 0));
+        auto countNext = edges.get(bits(cw));
+        Value count = resetReg(countNext, prefix + "_pages_in");
+        Value done = comb::AndOp::create(
+            b, valid,
+            comb::ICmpOp::create(b, comb::ICmpPredicate::eq, count,
+                                 hw::ConstantOp::create(b, bits(cw), p - 1)));
+        countNext.setValue(comb::MuxOp::create(
+            b, start, hw::ConstantOp::create(b, bits(cw), 0),
+            comb::MuxOp::create(
+                b, valid,
+                comb::AddOp::create(b, count, hw::ConstantOp::create(b, bits(cw), 1)),
+                count)));
+        auto widen = [&](Value v) -> Value {
+          unsigned have = hw::getBitWidth(v.getType());
+          return have >= entries
+                     ? b.createOrFold<comb::ExtractOp>(bits(entries), v, 0)
+                     : b.createOrFold<comb::ConcatOp>(
+                           hw::ConstantOp::create(b, bits(entries - have), 0), v);
+        };
+        Value bit = comb::ShlOp::create(b, hw::ConstantOp::create(b, bits(entries), 1),
+                                        widen(offChip3[1]));
+        auto pendingNext = edges.get(bits(entries));
+        Value pending = resetReg(pendingNext, prefix + "_pages_pending");
+        Value all = hw::ConstantOp::create(b, APInt::getAllOnes(entries));
+        pendingNext.setValue(comb::OrOp::create(
+            b,
+            comb::AndOp::create(
+                b, pending,
+                comb::MuxOp::create(b, done, hw::ConstantOp::create(b, bits(entries), 0),
+                                    all)),
+            comb::MuxOp::create(b, start, bit,
+                                hw::ConstantOp::create(b, bits(entries), 0))));
+        // Write-back: a position's page write, of the last state pass's
+        // instance, while that pass's pages are not all written (a state pass
+        // that did not run writes none).
+        auto wbNext = edges.get(b.getI1Type());
+        Value wb = resetReg(wbNext, prefix + "_writeback_valid");
+        Value last = comb::AndOp::create(b, write0, isPage(wpage0, p - 1));
+        wbNext.setValue(comb::MuxOp::create(
+            b, region.state, one(),
+            comb::MuxOp::create(b, last, hw::ConstantOp::create(b, b.getI1Type(), 0), wb)));
+        auto instNext = edges.get(region.inst.getType());
+        Value writeInst = keep(seq::FirRegOp::create(
+            b, instNext, hostClock, b.getStringAttr(prefix + "_write_inst")));
+        instNext.setValue(
+            comb::MuxOp::create(b, region.state, region.inst, writeInst));
+        for (unsigned j = 0; j < p; ++j)
+          col.writing.push_back(comb::AndOp::create(b, write0, isPage(wpage0, j)));
+        col.writeValid = comb::AndOp::create(b, write0, wb);
+        Value zero1 = hw::ConstantOp::create(b, b.getI1Type(), 0);
+        col.requests = {read0, virtualInst(inst0, page0), zero1, col.writeValid,
+                        virtualInst(writeInst, wpage0), zero1, Value(), Value(), pending};
+        col.parts.resize(p);
+        col.vm = cls.virtualMemories.size();
+        cls.virtualMemories.push_back(vm);
+        continue;
+      }
       ports += (col.width + 71) / 72;
       auto memType = seq::FirMemType::get(
           context, entries * pages, col.width,
@@ -4408,7 +4618,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     for (auto [c, col] : llvm::enumerate(cols)) {
       auto &writing = col.writing;
       Value writeData, writeEnable, writeMask;
-      unsigned bytes = masked ? col.width / grain : 0;
+      unsigned bytes = bytesMasked ? col.width / grain : 0;
       for (unsigned j = 0; j < p; ++j) {
         // The page's bits in order, zeros between.
         auto &parts = col.parts[j];
@@ -4428,7 +4638,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                          : b.createOrFold<comb::ConcatOp>(
                                SmallVector<Value>(low.rbegin(), low.rend()));
         Value mask;
-        if (masked) {
+        if (bytesMasked) {
           // Byte k of this page and column: the vector's byte at its offset.
           uint64_t first = (uint64_t(j) * pw + uint64_t(c) * colBits) / grain;
           SmallVector<Value> high;
@@ -4454,19 +4664,34 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                           ? Value(comb::OrOp::create(b, writeEnable, writing[j]))
                           : writing[j];
       }
+      if (offChip) {
+        col.requests[6] = writeData;
+        col.requests[7] = writeMask;
+        pageRequests.push_back({col.vm, col.requests});
+        continue;
+      }
       seq::FirMemWriteOp::create(b, col.memory, col.writeAt, hostClock,
                                  writeEnable, writeData, writeMask);
     }
     std::string text;
     llvm::raw_string_ostream os(text);
-    unsigned bound =
-        threads * unsigned((pagedBits + 72ull * ports - 1) / (72ull * ports));
+    unsigned bound = ports ? threads * unsigned((pagedBits + 72ull * ports - 1) /
+                                                (72ull * ports))
+                           : 0;
     os << "  pages " << cls.name << ": p " << p << ", " << pagedRegs.size()
        << " registers, " << pagedBits << " bits";
     if (masked)
       os << " (" << layoutBits << " in " << grain << "-bit bytes, "
          << groups.size() - (groups.count(Value()) ? 1 : 0) << " enables)";
-    os << "; page RAMs " << entries * pages
+    if (offChip)
+      os << "; off chip: " << columns << " virtual memories of "
+         << entries * pages << " rows x " << pw << " bits (vm"
+         << cols.front().vm << (columns > 1 ? "-vm" + std::to_string(cols.back().vm) : "")
+         << "), lead " << cls.pageLead() << "; kept " << keptRegs << " registers, "
+         << keptBits << " bits; state passes " << threads << " x " << cls.pageLead()
+         << " = " << threads * cls.pageLead() << "\n";
+    else
+      os << "; page RAMs " << entries * pages
        << " rows x " << pw << " bits in " << columns << " columns, " << ports
        << " ports, " << kind << "; kept " << keptRegs << " registers, "
        << keptBits << " bits; state passes " << threads << " x " << p << " = "
@@ -4538,6 +4763,19 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     outputs.append(ports.begin(), ports.end());
   b.setInsertionPointToEnd(body);
   hw::OutputOp::create(b, outputs);
+  for (auto &[k, values] : pageRequests) {
+    auto &vm = cls.virtualMemories[k];
+    vm.firstOutput = copy.getNumOutputPorts();
+    std::string name = ("vm" + Twine(k) + "_").str();
+    SmallVector<std::pair<StringAttr, Value>> ports;
+    for (auto [what, value] :
+         llvm::zip(ArrayRef<StringRef>{"rd_valid", "rd_inst", "rd_row", "wr_valid",
+                                       "wr_inst", "wr_row", "wr_data", "wr_mask",
+                                       "pending"},
+                   values))
+      ports.push_back({b.getStringAttr(name + what), value});
+    copy.appendOutputs(ports);
+  }
   cls.copy = copy;
   model.erase();
   return success();
@@ -4625,7 +4863,9 @@ LogicalResult StaticFolder::buildSim() {
     for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
       std::string name = ("vm" + Twine(simVirtuals.size()) + "_").str();
       unsigned instWidth =
-          std::max(cls.threads() > 1 ? llvm::Log2_32_Ceil(cls.threads()) : 0u, 1u);
+          vm.instWidth ? vm.instWidth
+                       : std::max(cls.threads() > 1 ? llvm::Log2_32_Ceil(cls.threads()) : 0u,
+                                  1u);
       simVirtuals.push_back({unsigned(c), unsigned(k), unsigned(numIn)});
       addPort(name + "rsp_valid", i1, true);
       addPort(name + "rsp_inst", IntegerType::get(context, instWidth), true);
@@ -4743,8 +4983,10 @@ LogicalResult StaticFolder::buildSim() {
   struct Controls {
     Value inst3, state3;
     /// Paged: the instance whose pages are read, from three host cycles
-    /// ahead (a page before its state pass).
+    /// ahead (a page before its state pass). Off chip: each position's page
+    /// read [valid, instance, page] and page write [valid, page].
     Value fetch3, finst3;
+    SmallVector<Value> offChip3;
     Value inst2, state2, ready2, tail2;
     Value inst1, inst, state, ready;
     /// The ready passes past the first, two host cycles ahead.
@@ -4849,18 +5091,51 @@ LogicalResult StaticFolder::buildSim() {
       ctl.inst1 = reg(ctl.inst2, prefix + "_inst1");
       ctl.inst = reg(ctl.inst1, prefix + "_inst0");
     }
-    if (cls.page) {
+    auto wrap = [&](int pos) { return unsigned(((pos % int(ii)) + int(ii)) % int(ii)); };
+    if (cls.page && !cls.pagesOffChip) {
       // Each state pass's page-in, a page before it in the position stream
       // (in the frame before for a slot within the page of the frame's start).
       SmallVector<uint64_t> fetchRow(ii + 1, 0), finstRow(ii + 1, 0);
       for (unsigned i = 0; i < threads; ++i) {
-        int f = cls.slot[kState][i] - int(cls.page);
-        unsigned pos = unsigned(((f % int(ii)) + int(ii)) % int(ii));
+        unsigned pos = wrap(cls.slot[kState][i] - int(cls.pageLead()));
         fetchRow[pos] = 1;
         finstRow[pos] = i;
       }
       ctl.fetch3 = table(b, at, fetchRow, 1);
       ctl.finst3 = table(b, at, finstRow, idxWidth);
+    } else if (cls.page) {
+      // Off chip: page j of each state pass's instance read at the fetch's
+      // j-th position, and written at the j-th after the state pass.
+      unsigned pageBits = std::max(
+          1u, llvm::Log2_32_Ceil(unsigned(llvm::PowerOf2Ceil(cls.page))));
+      SmallVector<uint64_t> readRow(ii + 1, 0), instRow(ii + 1, 0),
+          pageRow(ii + 1, 0), writeRow(ii + 1, 0), wpageRow(ii + 1, 0);
+      // Each fetch as early as the fetch buffer allows: at the copy's state
+      // pass before it (the one before the first in the frame before), so
+      // its pages' round trip hides in the slots between; the schedule keeps
+      // them at least the lead apart.
+      SmallVector<int> states(cls.slot[kState].begin(), cls.slot[kState].end());
+      llvm::sort(states);
+      auto fetchOf = [&](int s) {
+        auto it = llvm::lower_bound(states, s);
+        return it == states.begin() ? states.back() - int(ii) : *std::prev(it);
+      };
+      for (unsigned i = 0; i < threads; ++i) {
+        int s = cls.slot[kState][i];
+        int f = std::min(fetchOf(s), s - int(cls.pageLead()));
+        for (unsigned j = 0; j < cls.page; ++j) {
+          unsigned pos = wrap(f + int(j));
+          readRow[pos] = 1;
+          instRow[pos] = i;
+          pageRow[pos] = j;
+          unsigned wpos = wrap(s + 1 + int(j));
+          writeRow[wpos] = 1;
+          wpageRow[wpos] = j;
+        }
+      }
+      ctl.offChip3 = {table(b, at, readRow, 1), table(b, at, instRow, idxWidth),
+                      table(b, at, pageRow, pageBits), table(b, at, writeRow, 1),
+                      table(b, at, wpageRow, pageBits)};
     }
     for (auto [l, row] : llvm::enumerate(laterRows)) {
       Value later3 = table(b, at, row, 1);
@@ -5036,9 +5311,11 @@ LogicalResult StaticFolder::buildSim() {
     SmallVector<Value> operands{hostClock, controls[c].state3};
     if (cls.threads() > 1)
       operands.push_back(controls[c].inst3);
-    if (cls.page) {
+    if (cls.page && !cls.pagesOffChip) {
       operands.push_back(controls[c].fetch3);
       operands.push_back(controls[c].finst3);
+    } else if (cls.page) {
+      operands.append(controls[c].offChip3.begin(), controls[c].offChip3.end());
     }
     for (auto [i, type] : llvm::enumerate(cls.inputTypes)) {
       if (int(i) == cls.clockInput)
@@ -6003,7 +6280,18 @@ LogicalResult StaticFolder::buildSim() {
         }
       Value use = table(b, next, useRow, 1);
       Value inst = threads > 1 ? table(b, next, instRow, idxWidth) : Value();
+      // A page word off chip is waited for by the state pass alone.
+      Value stateUse;
+      if (cls.pagesOffChip) {
+        // (The instance a state pass loads is the slot's: instRow names it
+        // at every pass.)
+        SmallVector<uint64_t> stateRow(ii + 1, 0);
+        for (unsigned i = 0; i < threads; ++i)
+          stateRow[cls.slot[kState][i] % ii] = 1;
+        stateUse = table(b, next, stateRow, 1);
+      }
       for (auto &vm : cls.virtualMemories) {
+        Value used = vm.pages ? stateUse : use;
         Value pending = copies[c].getResult(vm.firstOutput + 8);
         Value bit = pending;
         if (inst) {
@@ -6013,7 +6301,7 @@ LogicalResult StaticFolder::buildSim() {
           bit = b.createOrFold<comb::ExtractOp>(
               i1, comb::ShrUOp::create(b, pending, shift), 0);
         }
-        terms.push_back(comb::OrOp::create(b, notOf(use), notOf(bit)));
+        terms.push_back(comb::OrOp::create(b, notOf(used), notOf(bit)));
       }
     }
     for (auto &v : simVirtuals)
@@ -6052,12 +6340,14 @@ LogicalResult StaticFolder::buildSim() {
       auto &cls = classes[v.cls];
       auto &vm = cls.virtualMemories[v.k];
       unsigned instWidth =
-          std::max(cls.threads() > 1 ? llvm::Log2_32_Ceil(cls.threads()) : 0u, 1u);
+          vm.instWidth ? vm.instWidth
+                       : std::max(cls.threads() > 1 ? llvm::Log2_32_Ceil(cls.threads()) : 0u,
+                                  1u);
       virtuals.push_back(b.getStringAttr(
           vm.name + ":" + cls.name + ":" + Twine(instWidth) + ":" +
           Twine(vm.rowWidth) + ":" + Twine(vm.dataWidth) + ":" +
           Twine(vm.maskWidth) + ":" + Twine(vm.readFirst ? 1 : 0) + ":" +
-          Twine(cls.threads())));
+          Twine(vm.instances ? vm.instances : cls.threads())));
     }
     sim->setAttr("foldsim.vmems", b.getArrayAttr(virtuals));
   }
@@ -6256,7 +6546,8 @@ LogicalResult StaticFolder::run() {
       if (cls.folding && cls.folding->edges)
         cls.folding->edges->abandon();
   };
-  if (failed(parsePages()) || failed(schedule()) || failed(parseStorage())) {
+  if (failed(parsePages()) || failed(parseStorage()) || failed(pagesOffChip()) ||
+      failed(schedule())) {
     abandonFolds();
     return failure();
   }
@@ -6295,7 +6586,8 @@ void FoldStaticPass::runOnOperation() {
                       specGroups, specDepth,
                       envSinks, registerStateEntries, slrGroups, slrSites,
                       slrCapacity, slrAssign, storage, readyLevels,
-                      forwardAfterLevels, shareLinkWrites, page, pageMasks);
+                      forwardAfterLevels, shareLinkWrites, page, pageMasks,
+                      pageHbmColumnBits);
   if (failed(folder.run()))
     return signalPassFailure();
 }

@@ -444,6 +444,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "the p host cycles after. The evaluation stays one host cycle; "
                "the copy's state passes are p slots apart and the frame at "
                "least p + 4. Registers a ready pass reads keep their stores">,
+    Option<"pageHbmColumnBits", "page-hbm-column-bits", "unsigned", "4096",
+           "With a model's pages off chip (storage <model>:pages=hbm): the "
+           "most bits of a page word in one virtual memory's row (a multiple "
+           "of 8); each such column is a virtual memory of its own, served by "
+           "a controller of its own">,
     Option<"pageMasks", "page-masks", "bool", "true",
            "With page: a paged register written under an enable keeps it, "
            "registered at the state pass, as its bytes' write mask in the "

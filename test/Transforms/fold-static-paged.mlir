@@ -13,6 +13,12 @@
 // Registers a ready pass reads keep their stores (the leaves' output is the
 // memory's read data, through two registers: a ready pass).
 // RUN: foldsim-opt %S/Inputs/fold-static-storage-late.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2})' 2>&1 | FileCheck %s --check-prefix=READY
+// Off chip (storage <model>:pages=hbm): the page word's columns (here at
+// most 32 bits) are virtual memories of {instance, page} rows; each
+// position's page read and write come from the tables, and the copy's
+// virtual memory ports follow its own.
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2 storage=Leaf:pages=hbm page-hbm-column-bits=32})' 2>&1 | FileCheck %s --check-prefix=HBM
+// RUN: not foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top storage=Leaf:regs=hbm})' 2>&1 | FileCheck %s --check-prefix=HBMREGS
 // RUN: not foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Nope:2})' 2>&1 | FileCheck %s --check-prefix=MODEL
 // RUN: not foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:0})' 2>&1 | FileCheck %s --check-prefix=SPEC
 // OFF: II = 6
@@ -73,6 +79,14 @@
 // COLS: %wide_1_fetched = seq.firreg {{%.+}} clock %hostClock : i28
 // COLS: seq.firmem.write_port %region4_pages[%region4_write_inst] = {{%.+}}, clock %hostClock enable %region4_write0 : <4 x 72, mask 1>
 // COLS: seq.firmem.write_port %region5_pages[%region5_write_inst] = {{%.+}}, clock %hostClock enable %region5_write0 : <4 x 28, mask 1>
+// HBM: Leaf x4 state gap 8 page 2 off chip
+// HBM: pages Leaf: p 2, 4 registers, 100 bits; off chip: 2 virtual memories of 8 rows x 56 bits (vm0-vm1), lead 2
+// HBM: hw.module @Leaf_static(in %hostClock : !seq.clock, in %state3 : i1, in %inst3 : i2, in %pread3 : i1, in %pinst3 : i2, in %ppage3 : i1, in %pwrite3 : i1, in %pwpage3 : i1, in %d : i8, in %hostReset : i1, in %vm0_rsp_valid : i1, in %vm0_rsp_inst : i3, in %vm0_rsp_data : i32, in %vm1_rsp_valid : i1, in %vm1_rsp_inst : i3, in %vm1_rsp_data : i24, out q : i8, out vm0_rd_valid : i1, out vm0_rd_inst : i3, out vm0_rd_row : i1, out vm0_wr_valid : i1, out vm0_wr_inst : i3, out vm0_wr_row : i1, out vm0_wr_data : i32, out vm0_wr_mask : i4, out vm0_pending : i4, out vm1_rd_valid : i1, out vm1_rd_inst : i3, out vm1_rd_row : i1, out vm1_wr_valid : i1, out vm1_wr_inst : i3, out vm1_wr_row : i1, out vm1_wr_data : i24, out vm1_wr_mask : i3, out vm1_pending : i4)
+// HBM: %region1_fetching = seq.firreg
+// HBM: %region1_pages_pending = seq.firreg
+// HBM: %region1_writeback_valid = seq.firreg
+// HBM: foldsim.vmems = ["region1_pages:Leaf:3:1:32:4:1:8", "region2_pages:Leaf:3:1:24:3:1:8"]
+// HBMREGS: storage: 'hbm' is for a model's pages, not 'regs'
 // MODEL: page: no model 'Nope'
 // SPEC: page: 'Leaf:0' is not <model>:<p>, p at least 1
 module {
