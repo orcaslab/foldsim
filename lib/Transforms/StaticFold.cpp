@@ -186,9 +186,11 @@ struct Consumer {
 /// Forwarded, a write reaches a read register loaded in its own slot.
 static constexpr int kLinkLatency = 2, kForwardedLinkLatency = 1;
 /// A virtual memory's controller reports its free request entries in this
-/// many bits; a position runs only with `kVirtualRoom` of them, two requests
-/// for each host cycle from a decision to the requests it causes.
-static constexpr unsigned kVirtualFreeWidth = 16, kVirtualRoom = 8;
+/// many bits (VMEM_INTERFACE.md, guarantee 2: StaticFolder::virtualRoom).
+static constexpr unsigned kVirtualFreeWidth = 16;
+/// The control stages from a slot table's read to its pass: the state and
+/// ready passes' two staged registers and the one that makes them now.
+static constexpr int kControlStages = 3;
 
 /// One evaluation of a frame: an instance of a class in a pass.
 struct Node {
@@ -265,11 +267,23 @@ public:
         registerStateEntries(registerStateEntries), storageSpecs(storage),
         forwardAfterLevels(forwardAfterLevels),
         shareLinkWrites(shareLinkWrites),
-        envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
+        envRoundTrip((stagedEnv ? 1 : 0) + 1 + decisionLead()),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
 
 private:
+  /// Host cycles from the decision on a position (the sequencer's `advance`,
+  /// taken on what the controllers' `free` shows) to the passes it runs: the
+  /// decision's register (none with short-lead, whose slot tables read the
+  /// position as it is decided), then the control stages. A pass's virtual
+  /// requests leave in that host cycle.
+  int decisionLead() const { return (shortLead ? 0 : 1) + kControlStages; }
+  /// The free request entries a position needs to run: a `free` the
+  /// sequencer sees does not yet count the requests of the decisions still in
+  /// flight (one a host cycle, decisionLead() of them) nor those of its own
+  /// decision, each at most a read and a write.
+  unsigned virtualRoom() const { return 2 * (decisionLead() + 1); }
+
   void inlineNetlists();
   LogicalResult collect();
   LogicalResult resolveEnvironment();
@@ -3472,7 +3486,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       if (reads != 1 || writes > 1)
         return memory.emitError("a virtual memory has one read port and at "
                                 "most one write port");
-      int gap = shortLead ? 4 : 5;
+      // The pending bit its state pass sets must be there for the decision
+      // on the instance's next evaluation.
+      int gap = decisionLead() + 1;
       if (cls.stateGap < gap)
         return memory.emitError("a virtual memory needs a state gap of ")
                << gap << " host cycles; class " << cls.name << " has "
@@ -5683,7 +5699,7 @@ LogicalResult StaticFolder::buildSim() {
     for (auto &v : simVirtuals)
       terms.push_back(comb::ICmpOp::create(
           b, comb::ICmpPredicate::uge, body->getArgument(v.firstInput + 3),
-          constant(kVirtualFreeWidth, kVirtualRoom)));
+          constant(kVirtualFreeWidth, virtualRoom())));
     virtualReady.setValue(comb::AndOp::create(b, terms, false));
   }
 
