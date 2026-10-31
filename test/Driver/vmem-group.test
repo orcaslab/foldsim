@@ -143,9 +143,9 @@
 # --vmem-group auto:M: M controllers in all, a copy's memories (v6 rows: one
 # set a copy) spread by load. By default every memory's load is its
 # instances, so each copy's four memories go to three controllers as 2+1+1.
-# With measured loads (--vmem-weights, by port or memory name, the port's
-# first): copy 0's 100 accesses against copy 1's 11 take every spare
-# controller, a memory each.
+# With measured loads (--vmem-weights: accesses per instance, by port or
+# memory name, the port's first): copy 0's 100 against copy 1's 11 take every
+# spare controller, a memory each.
 # RUN: foldsim --srcs top.f --top Top --out %t/auto --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --vmem-group auto:6 --vmem-row-bytes-min 64 --copies Leaf:2 Leaf 2> %t/auto.log > /dev/null
 # RUN: FileCheck %s --check-prefix=AUTOL < %t/auto.log
 # AUTOL: foldsim: vmem controllers: g0 vm0+vm3, g1 vm1, g2 vm2, g3 vm4+vm7, g4 vm5, g5 vm6

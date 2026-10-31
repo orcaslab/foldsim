@@ -310,15 +310,16 @@ def vmem_partition(vmems, sets, choice, weights):
     (default 32, at least one a set) given out one at a time to the set whose
     controllers carry the most expected accesses each, and each set's
     memories spread over its controllers largest load first, each to the
-    least loaded (LPT). A memory's load: `weights` (accesses measured per
-    port or memory name) or, by default, its instances (one entry a frame
-    each: the most a state pass issues)."""
+    least loaded (LPT). A memory's load: its instances (a state pass issues at
+    most one entry a frame each) times its weight: its accesses per instance
+    as measured (`weights`, by port or memory name, so a profile of one fold
+    carries to another of the same classes), else 1."""
     if not choice.startswith('auto'):
         cap = None if choice == 'copy' else int(choice)
         return [ms[i:i + (cap or len(ms))] for ms in sets for i in range(0, len(ms), cap or len(ms))]
     budget = int(choice.split(':')[1]) if ':' in choice else 32
-    load = lambda k: float(weights.get(vmems[k]['port'], weights.get(vmems[k]['memory'], vmems[k]['instances']))
-                           if weights else vmems[k]['instances'])
+    weights = weights or {}
+    load = lambda k: vmems[k]['instances'] * float(weights.get(vmems[k]['port'], weights.get(vmems[k]['memory'], 1.0)))
     count = [1] * len(sets)
     total = [sum(load(k) for k in ms) for ms in sets]
     for _ in range(budget - len(sets)):
@@ -520,8 +521,8 @@ def main():
                          "each memory keeps its own region within the controller's, and the "
                          "simulator's ports are unchanged. Absent: a controller per memory")
     ap.add_argument('--vmem-weights', metavar='JSON',
-                    help='with --vmem-group auto: each memory\'s expected accesses (a JSON object by '
-                         'port vm<k> or memory name, e.g. counted by a profiling run)')
+                    help='with --vmem-group auto: each memory\'s expected accesses per instance (a JSON '
+                         'object by port vm<k> or memory name, e.g. from a profiling run; default 1)')
     ap.add_argument('--vmem-row-bytes-min', type=int, default=1, metavar='BYTES',
                     help='with --virtual-memories: a row takes its bytes rounded up to a power of two '
                          'in device memory, at least this many (default %(default)s: rows below 64 '
