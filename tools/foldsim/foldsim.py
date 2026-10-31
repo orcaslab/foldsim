@@ -574,12 +574,15 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
     entries = a.register_state_entries if a.register_state_entries is not None else 2
     weights = json.load(open(a.vmem_weights)) if a.vmem_weights else None
     vmem = (a.vmem_cache_rows, a.vmem_cache_budget) if a.vmem_cache_rows is not None else None
+    links = foldsim_degree.parse_links(text)
     res = foldsim_degree.choose_state(cal, est, classes, foldsim_degree.parse_classes(text), ii,
                                       route=a.routability, entries=entries, vmem=vmem,
                                       pattern=pattern, weights=weights,
-                                      row_bytes_min=a.vmem_row_bytes_min)
+                                      row_bytes_min=a.vmem_row_bytes_min, links=links)
     if res is None:
-        sys.exit(f'--state auto: nothing fits the V80 region (II {ii}); see {base}')
+        sys.exit(f'--state auto: nothing fits the V80 region (II {ii})'
+                 + (f" with the links' {links['lutram']} LUTRAM LUTs" if links else '')
+                 + f'; see {base}')
     with open(out('state.txt'), 'w') as f:
         f.write(f'II {ii} (schedule)\n' + foldsim_degree.state_table(res, classes, est) + '\n')
     h = res['h']

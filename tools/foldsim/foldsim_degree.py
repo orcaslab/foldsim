@@ -539,7 +539,11 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         for u in units:
             u['costs'].pop('ultra', None)
     caps = {p: storage.MARGIN * storage.REGION[p] for p in ('sites', 'bram', 'uram')}
-    base = dict(sites=logic, luts=storage.fold_load(logic, cache), bram=cache)
+    # The links' memories (the schedule report's link storage), distributed
+    # RAM by the cost model's rule, where known (tiers['links']).
+    link_lutram = float((tiers or {}).get('links', {}).get('lutram', 0))
+    base = dict(sites=logic + storage.LUTRAM_SITES * link_lutram,
+                luts=storage.fold_load(logic + link_lutram, cache), bram=cache)
     if tiers is not None:
         caps['hbm'] = max(0.0, storage.HBM_STATE_SHARE * tiers['frame'] *
                           storage.HBM_BYTES_PER_CYCLE - tiers.get('base_hbm', 0.0))
@@ -582,15 +586,26 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             off['vmem_new'].append((u['class'], u['store']))
         elif kind == 'rows':
             off['rows_new'].append((u['class'], u['store']))
+    # The compiler's rules name a model: a copy (<class>_copy<j>, its own class
+    # here when the schedule lists it apart) takes its model's, the first
+    # copy's choice for a store where they differ.
+    taken = set()
     for c in classes:
-        rules += storage_rules(c, [u for u in units if u['class'] == c])
+        model = re.sub(r'_copy\d+$', '', c)
+        for rule in storage_rules(model, [u for u in units if u['class'] == c]):
+            key = rule.rsplit('=', 1)[0]
+            if key not in taken:
+                taken.add(key)
+                rules.append(rule)
+    lutram += link_lutram
     sites = logic + storage.LUTRAM_SITES * lutram
     res = dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
                sites=round(sites), fits=fits, bram=round(bram, 1), uram=uram,
                largest_copy=round(max(per_copy.values())), storage=','.join(rules),
                **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged))
     if tiers is not None:
-        res.update(off, hbm_bytes=round(off['hbm_bytes']), hbm_cap=round(caps['hbm']))
+        res.update(off, hbm_bytes=round(off['hbm_bytes']), hbm_cap=round(caps['hbm']),
+                   link_lutram=round(link_lutram))
     return res
 
 
@@ -1120,6 +1135,19 @@ def choose_pages(cal, est, classes, sched, ii, store='fixed', route=False, entri
     return None, None, None
 
 
+def parse_links(text):
+    """The link storage of a schedule report (foldsim-fold-static: every link
+    memory as buildSim cuts them): memories, bits, distributed-RAM LUTs by
+    foldsim_cost.mem_cost's rule and the register bits; None if the report
+    has none (a compiler before it)."""
+    m = re.search(r'^  link storage: (\d+) memories, (\d+) bits, (\d+) LUTRAM LUTs; '
+                  r'(\d+) register bits', text, re.M)
+    if not m:
+        return None
+    return dict(memories=int(m.group(1)), bits=int(m.group(2)), lutram=int(m.group(3)),
+                regbits=int(m.group(4)))
+
+
 def ere_escape(text):
     """`text` as a literal in a POSIX extended regex (llvm::Regex)."""
     return re.sub(r'([.\[\]()*+?^$|\\])', r'\\\1', text)
@@ -1232,9 +1260,13 @@ def project_h(ii, classes, sched, est, pattern, pages=None, offchip=(), weights=
                 h=max(ii, hbm_ii) + round(bubbles), per=per)
 
 
+# choose_state looks at frames up to this many times the schedule's.
+FRAME_GROWTH = 4
+
+
 def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True, vmem=None,
                  pattern='', weights=None, pages_hbm=True, row_bytes_min=1, max_ii=1 << 16,
-                 page=True):
+                 page=True, links=None):
     """--state auto: where each class's state lives, three tiers, priced.
 
       on chip    register stores and memories in flops, distributed, block or
@@ -1256,7 +1288,13 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
     schedule's classes (parse_classes). Returns None if nothing fits by
     max_ii, else a dict: page (the `page` option, '' for none), pattern (the
     virtual memories now: `pattern` and those moved), storage (rules, with
-    pages=hbm), frame, the area (res), the projection (h) and what moved."""
+    pages=hbm), frame, the area (res), the projection (h) and what moved.
+
+    `links` (parse_links): the links' memories, counted in the region's
+    sites and routing load; none of the tiers moves them (a link is read
+    within its frame, a few host cycles after its write: no HBM round trip,
+    and no instance's page). When they alone (with the logic outside the
+    copies) leave no room, nothing fits at any frame: None at once."""
     est = copy_estimates(est, classes)
     rest = rest_of(cal, sum(e['lut'] for e in {id(e): e for e in est.values()}.values()))
     # Traffic of the memories already virtual (est has them under 'vmems').
@@ -1290,22 +1328,30 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
                     res=res, h=h, moved=moved, pages_offchip=off,
                     rows=tiers_pattern(res.get('rows_new', [])), rows_new=res.get('rows_new', []))
 
+    if links and (rest + storage.LUTRAM_SITES * links['lutram'] >
+                  storage.MARGIN * storage.REGION['sites'] or
+                  (route and rest + links['lutram'] > storage.route_luts())):
+        return None
     deep = sorted({n for n in classes.values() if n > 1})
-    frames = sorted({f for n in deep for f in range(n * ((ii + n - 1) // n), max_ii + 1, n)} |
+    top = min(max_ii, FRAME_GROWTH * ii)
+    frames = sorted({f for n in deep for f in range(n * ((ii + n - 1) // n), top + 1, n)} |
                     {ii})
+    last = None
     for f in frames:
         if f < ii:
             continue
         tiers = dict(frame=f, base_hbm=base_hbm, base_bubbles=base_bubbles, weights=weights,
-                     pages_hbm=pages_hbm, row_bytes_min=row_bytes_min)
+                     pages_hbm=pages_hbm, row_bytes_min=row_bytes_min, links=links or {})
         if f == ii:
             res = area(cal, est, classes, {}, rest, sched, f, entries, 'auto', route, uram,
                        vmem=vmem, tiers=tiers)
             if ok(res):
                 return outcome(res, {}, f)
         pages = page_pick(est, classes, f, sched=sched) if page else None
-        if not pages:
+        # A longer frame helps only through deeper pages.
+        if not pages or pages == last:
             continue
+        last = pages
         # The least paging that fits: the models of most register state
         # first (they free the most distributed RAM a page port), as few as
         # fit and route; every page constrains the schedule (its copy's state
@@ -1349,7 +1395,8 @@ def state_table(out, classes, est):
              f"page rows (beyond {PAGE_MEMORY_BITS} bits): {out['rows'] or 'none'}",
              f"virtual memories: {out['pattern'] or 'none'}",
              f"pages off chip: {', '.join(out['pages_offchip']) or 'none'}",
-             f"storage: {out['storage'] or 'default'}"]
+             f"storage: {out['storage'] or 'default'}",
+             f"links: {res.get('link_lutram', 0)} LUTRAM LUTs counted"]
     est = copy_estimates(est, classes)
     vest = split_virtual({c: dict(e, mems=e['mems'] + e.get('vmems', []), vmems=[])
                           for c, e in est.items()}, out['pattern'])
@@ -1534,6 +1581,11 @@ def main():
     st.add_argument('--no-routability', action='store_true')
     st.add_argument('--register-state-entries', type=int, default=2)
     st.add_argument('--out', default='', help='the outcome as JSON')
+    st.add_argument('--links', choices=('report', 'none'), default='report',
+                    help="count the links' memories from the schedule report (or --links-from's)")
+    st.add_argument('--links-from', default='', metavar='SCHEDULE',
+                    help='another schedule report of the same fold to read the link storage from '
+                         '(one made by a compiler that reports it)')
     f = sub.add_parser('fit', help='the period fit of a calibration and its leave-one-out error')
     f.add_argument('--calibration', required=True)
     a = ap.parse_args()
@@ -1588,12 +1640,21 @@ def state_main(a):
     est = split_virtual(class_estimates(a.models, names), pattern)
     weights = json.load(open(a.vmem_weights)) if a.vmem_weights else None
     vmem = (a.vmem_cache_rows, a.vmem_cache_budget) if a.vmem_cache_rows else None
+    links = None
+    if a.links == 'report':
+        links = parse_links(open(a.links_from).read() if a.links_from else text)
     out = choose_state(cal, est, classes, sched, ii, route=not a.no_routability,
                        entries=a.register_state_entries, vmem=vmem, pattern=pattern,
                        weights=weights, pages_hbm=not a.no_pages_hbm,
-                       row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page)
+                       row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page, links=links)
+    if links:
+        print(f"links: {links['memories']} memories, {links['bits'] / 1e6:.1f} Mbit, "
+              f"{links['lutram']} LUTRAM LUTs ({storage.LUTRAM_SITES * links['lutram'] / 1e6:.2f}M "
+              f"sites of {storage.MARGIN * storage.REGION['sites'] / 1e6:.2f}M), "
+              f"{links['regbits']} register bits")
     if out is None:
-        print(f'--state auto: nothing fits the V80 region (II {ii})')
+        print(f'--state auto: nothing fits the V80 region (II {ii})'
+              + (' with the links\' memories' if links else ''))
         return 1
     print(f'II {ii} (schedule)')
     print(state_table(out, classes, est))
