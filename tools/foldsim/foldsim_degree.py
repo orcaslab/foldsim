@@ -1139,13 +1139,37 @@ def join_patterns(*patterns):
     return ps[0] if len(ps) == 1 else '|'.join(f'({p})' for p in ps)
 
 
-def page_pick(est, classes, frame, kinds=('block', 'ultra')):
+# The share of the frame a copy's page port may be busy (page_pick).
+PAGE_PORT_SHARE = 0.5
+
+
+def state_span(slots, frame):
+    """The shortest arc of the frame (slots modulo `frame`) that holds every
+    one of a copy's state passes, in slots."""
+    if not slots or frame <= 0:
+        return frame
+    rs = sorted({s % frame for s in slots})
+    gaps = [rs[k + 1] - rs[k] for k in range(len(rs) - 1)] + [rs[0] + frame - rs[-1]]
+    return frame - max(gaps) + 1
+
+
+def page_pick(est, classes, frame, kinds=('block', 'ultra'), sched=None):
     """Each multi-instance copy's page at a frame: the p from 1 to as many as
-    the frame lets its state passes (p x instances <= frame, p + 4 <= frame)
+    PAGE_PORT_SHARE of the frame lets its state passes (p x instances <=
+    share x frame, p + 4 <= frame: a page port busy every slot leaves the
+    scheduler no room, and a full port fails placement after placement)
     whose page RAM (block or ultra, foldsim_storage.page_cost) and
     write-back select take the least share of the V80 region, fewer pages
     first on a tie; per model the shallowest of its copies'. None when some
-    copy cannot page at that frame."""
+    copy cannot page at that frame.
+
+    With the unpaged schedule (`sched`, parse_classes), a copy's page also
+    keeps its state passes within the arc the schedule gave them: p x
+    instances <= that arc. Passes packed in a short arc sit on a chain of
+    links taken in one frame (the L2's per-requester request stage behind
+    the SMs' requests); spaced p apart they would stretch it and the frame
+    with it (4 SMs: II 576 -> 768 with the request stage at p 4, 640 at
+    p 2, 576 at p 1)."""
     def share(c):
         return (c['bram'] / (storage.MARGIN * storage.REGION['bram']) +
                 c['uram'] / (storage.MARGIN * storage.REGION['uram']) +
@@ -1154,7 +1178,10 @@ def page_pick(est, classes, frame, kinds=('block', 'ultra')):
     for c, n in classes.items():
         if n < 2:
             continue
-        top = min(frame // n, frame - 4)
+        top = min(max(1, int(PAGE_PORT_SHARE * frame) // n), frame - 4)
+        info = (sched or {}).get(c)
+        if info and info.get('state'):
+            top = min(top, max(1, state_span(info['state'], frame) // n))
         if top < 1:
             return None
         bits = paged_state(est[c])[0]
@@ -1219,12 +1246,12 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
                  twice a frame).
 
     The frame is the schedule's (`ii`) unless nothing fits there. At a frame,
-    the fold as it is (no paging, nothing new off chip) and the fold with
-    every multi-instance copy paged (page_pick) are priced by storage_area,
-    with the off-chip tier as relief kinds against the HBM bytes the frame
-    carries; of those that place (and route), the one of least projected H
-    (project_h), then least routing load. Frames grow by the instances of
-    the copies (deeper pages) until one fits. `est`: class_estimates, with
+    the fold as it is (no paging, nothing new off chip) is priced by
+    storage_area, with the off-chip tier as relief kinds against the HBM
+    bytes the frame carries; if it does not place (and route), the models
+    page (page_pick), those of most register state first, as few as fit
+    (a binary search over how many). Frames grow by the instances of the
+    copies (deeper pages) until one fits. `est`: class_estimates, with
     the memories already virtual split off (`pattern`); `sched`: the
     schedule's classes (parse_classes). Returns None if nothing fits by
     max_ii, else a dict: page (the `page` option, '' for none), pattern (the
@@ -1271,22 +1298,40 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
             continue
         tiers = dict(frame=f, base_hbm=base_hbm, base_bubbles=base_bubbles, weights=weights,
                      pages_hbm=pages_hbm, row_bytes_min=row_bytes_min)
-        found = []
         if f == ii:
             res = area(cal, est, classes, {}, rest, sched, f, entries, 'auto', route, uram,
                        vmem=vmem, tiers=tiers)
             if ok(res):
-                found.append(outcome(res, {}, f))
-        pages = page_pick(est, classes, f) if page else None
-        if pages:
-            res = area(cal, est, classes, {}, rest, with_pages(sched, pages), f, entries, 'auto',
-                       route, uram, vmem=vmem, tiers=tiers)
-            if ok(res):
-                found.append(outcome(res, pages, f))
-        if found:
-            load = lambda o: storage.fold_load(o['res']['luts'], o['res']['bram'],
-                                               o['res'].get('uram', 0))
-            return min(found, key=lambda o: (o['h']['h'], load(o)))
+                return outcome(res, {}, f)
+        pages = page_pick(est, classes, f, sched=sched) if page else None
+        if not pages:
+            continue
+        # The least paging that fits: the models of most register state
+        # first (they free the most distributed RAM a page port), as few as
+        # fit and route; every page constrains the schedule (its copy's state
+        # passes p apart).
+        order = sorted(pages, key=lambda m: -sum(paged_state(est[c])[0] * n
+                                                 for c, n in classes.items()
+                                                 if re.sub(r'_copy\d+$', '', c) == m))
+        tried = {}
+
+        def at(k):
+            if k not in tried:
+                some = {m: pages[m] for m in order[:k]}
+                tried[k] = (some, area(cal, est, classes, {}, rest, with_pages(sched, some), f,
+                                       entries, 'auto', route, uram, vmem=vmem, tiers=tiers))
+            return tried[k]
+        if not ok(at(len(order))[1]):
+            continue
+        lo, hi = 1, len(order)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if ok(at(mid)[1]):
+                hi = mid
+            else:
+                lo = mid + 1
+        some, res = at(lo)
+        return outcome(res, some, f)
     return None
 
 

@@ -19,8 +19,10 @@ print(f'vmem 512 x 64 x 2048: hbm {c["hbm"]:.0f} lutram {c["lutram"]} bram {c["b
 print('pattern', d.tiers_pattern([('Opc_copy1', 'gpr/ram'), ('Opc', 'a.b[0]')]))
 
 
-def sched(classes, gap=None):
-    return {c: dict(n=n, ready=[], state=list(range(n)), gap=gap or 1000, page=0)
+def sched(classes, gap=None, frame=4096):
+    # Each copy's state passes spread over the frame.
+    return {c: dict(n=n, ready=[], state=[i * (frame // n) for i in range(n)],
+                    gap=gap or 1000, page=0)
             for c, n in classes.items()}
 
 
@@ -41,14 +43,18 @@ print('opc pattern', out['pattern'])
 # A small fold fits as it is: nothing moves.
 est['Opc'] = dict(lut=20000.0, ff=2000, mems=[('g/ram', 64, 32, 1, 1, 1, 'block', 4, True)],
                   regw={2000: 1})
-out = d.choose_state(None, est, dict(Opc=64, Top=1), sched(dict(Opc=64, Top=1)), 256)
+out = d.choose_state(None, est, dict(Opc=64, Top=1), sched(dict(Opc=64, Top=1), frame=256), 256)
 print(f"small: moved {out['moved']} H {out['h']['h']} fits {out['res']['fits']}")
-# A memory read combinationally (a 24 x 512 table) in a paged class pages as
-# rows where its distributed RAM costs more: the choice names it.
-est['Opc'] = dict(lut=20000.0, ff=20000, mems=gprs + [('ptw', 24, 512, 1, 1, 0, None, 1, True)],
-                  regw={20000: 1})
+# 200,000 register bits an instance (102 Mbit), a store of 2,778 72-bit columns
+# read whole each host cycle, take more block RAM than the region has: Opc
+# pages (as deep as half the frame lets its state passes), and
+# a memory read combinationally (a 24 x 512 table) pages as rows where its
+# distributed RAM costs more: the choice names it (two register-file banks,
+# so that ultra RAM is not the pool the choice balances against).
+est["Opc"] = dict(lut=20000.0, ff=200000,
+                  mems=gprs[:2] + [("ptw", 24, 512, 1, 1, 0, None, 1, True)], regw={200000: 1})
 out = d.choose_state(None, est, classes, sched(classes), 4096, vmem=('auto', 120))
-print('rows', out['rows'])
+print(f"paged: page {out['page']!r} rows {out['rows']} fits {out['res']['fits']}")
 # Reads younger than the HBM round trip wait: a state gap of 40 for every
 # instance of a class with virtual memories.
 h = d.project_h(4096, classes, sched(classes, gap=40), est, '^Opc:g0/ram$')

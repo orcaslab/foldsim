@@ -174,6 +174,9 @@ struct Class {
   /// each instance's slot.
   unsigned pageWindow = 0;
   SmallVector<unsigned> windowSlot;
+  /// The fewest host cycles from a state pass to the instance's next
+  /// evaluation its stores allow (StaticFolder::minStateGap), once known.
+  mutable int minGap = -1;
   unsigned pageLead() const {
     return pagesOffChip && page ? std::max(page, 2u) : page;
   }
@@ -2030,23 +2033,36 @@ unsigned StaticFolder::placeModulo(
     std::vector<llvm::BitVector> busy(classes.size(),
                                       llvm::BitVector(period, false));
     // A paged copy's page port, modulo the frame: each state pass holds the
-    // slots of its page-in, the page before it and its own.
-    std::vector<std::set<int>> pagePort(classes.size());
+    // slots of its page-in, the page before it and its own: the residues
+    // (t - lead, t], as at most two runs of bits.
+    std::vector<llvm::BitVector> pagePort(classes.size());
     auto window = [&](unsigned c, int t, auto &&each) {
-      for (int k = 0; k < int(classes[c].pageLead()); ++k)
-        each(((t - k) % int(period) + int(period)) % int(period));
+      int lead = std::min<int>(classes[c].pageLead(), period);
+      int start = ((t - lead + 1) % int(period) + int(period)) % int(period);
+      if (start + lead <= int(period)) {
+        each(start, start + lead);
+      } else {
+        each(start, int(period));
+        each(0, start + lead - int(period));
+      }
     };
     auto pageFree = [&](unsigned c, int t) {
+      auto &port = pagePort[c];
+      if (port.empty())
+        return true;
       bool free = true;
-      window(c, t, [&](int r) { free &= !pagePort[c].count(r); });
+      window(c, t, [&](int lo, int hi) { free &= port.find_first_in(lo, hi) < 0; });
       return free;
     };
     auto pageTake = [&](unsigned c, int t, bool take) {
-      window(c, t, [&](int r) {
+      auto &port = pagePort[c];
+      if (port.empty())
+        port.resize(period);
+      window(c, t, [&](int lo, int hi) {
         if (take)
-          pagePort[c].insert(r);
+          port.set(lo, hi);
         else
-          pagePort[c].erase(r);
+          port.reset(lo, hi);
       });
     };
     auto pages = [&](unsigned n) {
@@ -3211,16 +3227,28 @@ bool StaticFolder::pagesAny(const Class &cls) const {
 }
 
 int StaticFolder::minStateGap(const Class &cls) const {
+  // Computed once a class: the scheduler asks for every instance of every
+  // choice it places.
+  if (cls.minGap >= 0)
+    return cls.minGap;
   int gap = writeBackLatency(cls);
-  if (virtualMemoryPattern.empty())
-    return gap;
-  llvm::Regex pattern(virtualMemoryPattern);
-  auto *folding = cls.folding.get();
-  for (auto memory :
-       const_cast<hw::HWModuleOp &>(cls.model).getBodyBlock()->getOps<seq::FirMemOp>())
-    if (!(folding && folding->physical.contains(memory)) &&
-        pattern.match(memory.getName().value_or("")))
-      return std::max(gap, decisionLead() + 1);
+  if (!virtualMemoryPattern.empty()) {
+    llvm::Regex pattern(virtualMemoryPattern);
+    StringRef model = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
+                                         : StringRef(cls.name);
+    auto *folding = cls.folding.get();
+    // As buildCopy finds its virtual memories: by name or <class model>:<name>.
+    for (auto memory :
+         const_cast<hw::HWModuleOp &>(cls.model).getBodyBlock()->getOps<seq::FirMemOp>()) {
+      StringRef name = memory.getName().value_or("");
+      if (!(folding && folding->physical.contains(memory)) &&
+          (pattern.match(name) || pattern.match((model + ":" + name).str()))) {
+        gap = std::max(gap, decisionLead() + 1);
+        break;
+      }
+    }
+  }
+  cls.minGap = gap;
   return gap;
 }
 
