@@ -444,6 +444,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "the p host cycles after. The evaluation stays one host cycle; "
                "the copy's state passes are p slots apart and the frame at "
                "least p + 4. Registers a ready pass reads keep their stores">,
+    Option<"pageMasks", "page-masks", "bool", "true",
+           "With page: a paged register written under an enable keeps it, "
+           "registered at the state pass, as its bytes' write mask in the "
+           "page RAM (block RAM's 9-bit bytes, ultra RAM's 8-bit), its next "
+           "value written straight into its write-back register; registers "
+           "of one enable share bytes, each enable's padded to whole bytes. "
+           "Off, the page is dense and such a register writes its old value "
+           "where its enable is low, through a mux after the target logic">,
     Option<"shareLinkWrites", "share-link-writes", "bool", "true",
            "A producer's bits read by several classes' inputs are registered "
            "once and written to each reader's link a host cycle after the "

@@ -246,7 +246,7 @@ public:
                uint64_t slrCapacity, ArrayRef<std::string> slrAssign,
                ArrayRef<std::string> storage, StringRef readyLevels,
                unsigned forwardAfterLevels, bool shareLinkWrites,
-               ArrayRef<std::string> page)
+               ArrayRef<std::string> page, bool pageMasks)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -260,7 +260,7 @@ public:
         readyLevelsMode(readyLevels.str()),
         registerStateEntries(registerStateEntries), storageSpecs(storage),
         forwardAfterLevels(forwardAfterLevels),
-        shareLinkWrites(shareLinkWrites), pageSpecs(page),
+        shareLinkWrites(shareLinkWrites), pageSpecs(page), pageMasks(pageMasks),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -412,6 +412,7 @@ private:
   bool shareLinkWrites;
   /// `page`: the paged models, as <model>:<p>; each class's `page` from them.
   ArrayRef<std::string> pageSpecs;
+  bool pageMasks;
   LogicalResult parsePages();
   /// What each paged copy pages, for the report.
   std::string pageReport;
@@ -3923,8 +3924,13 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     unsigned width;
     Value writeBack;
     std::string name;
+    /// With page masks, the enable it is written under, registered at the
+    /// state pass (null: written every state pass).
+    Value enable;
   };
   SmallVector<PagedReg> pagedRegs;
+  // With page masks, each enable's register, one per enable.
+  DenseMap<std::pair<Value, unsigned>, Value> pagedEnableRegs;
   BackedgeBuilder pageEdges(b, model.getLoc());
   unsigned keptRegs = 0;
   uint64_t keptBits = 0;
@@ -3983,10 +3989,26 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         // write-back register at the state pass (the pages built below).
         auto placeholder = pageEdges.get(reg.getType());
         Value data = asBits(b, write.data);
-        Value next = write.enable ? Value(comb::MuxOp::create(
-                                        b, write.enable, data,
-                                        asBits(b, placeholder)))
-                                  : data;
+        // Under masks the enable is the write mask's: the next value goes
+        // straight into the write-back register.
+        Value enable;
+        if (write.enable && pageMasks) {
+          Value &kept = pagedEnableRegs[{write.enable, 0u}];
+          if (!kept) {
+            BackedgeBuilder enableEdges(b, reg.getLoc());
+            auto enableNext = enableEdges.get(b.getI1Type());
+            kept = seq::FirRegOp::create(
+                b, enableNext, hostClock,
+                b.getStringAttr(reg.getName() + "_wen"));
+            enableNext.setValue(
+                comb::MuxOp::create(b, region.state, write.enable, kept));
+          }
+          enable = kept;
+        }
+        Value next = write.enable && !pageMasks
+                         ? Value(comb::MuxOp::create(b, write.enable, data,
+                                                     asBits(b, placeholder)))
+                         : data;
         BackedgeBuilder backEdges(b, reg.getLoc());
         auto backNext = backEdges.get(data.getType());
         Value back = seq::FirRegOp::create(
@@ -3994,7 +4016,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             b.getStringAttr(reg.getName() + "_writeback"));
         backNext.setValue(comb::MuxOp::create(b, region.state, next, back));
         pagedRegs.push_back({reg.getResult(), placeholder, unsigned(width),
-                             back, reg.getName().str()});
+                             back, reg.getName().str(), enable});
         value = placeholder;
       } else {
         if (cls.page && !write.holds) {
@@ -4233,7 +4255,41 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     uint64_t pagedBits = 0;
     for (auto &reg : pagedRegs)
       pagedBits += reg.width;
-    unsigned pw = unsigned((pagedBits + p - 1) / p);
+    // The page word's layout: each register's offset in the vector. With
+    // masks, the registers written every state pass first, then those of
+    // each enable together, each run from a byte boundary and padded to
+    // whole bytes (the RAM's write-enable grain), so a byte is one
+    // enable's; the page word is whole bytes too.
+    bool masked = llvm::any_of(pagedRegs, [](auto &r) { return bool(r.enable); });
+    unsigned grain = masked ? (kind == "ultra" ? 8 : 9) : 1;
+    SmallVector<uint64_t> bitAt(pagedRegs.size(), 0);
+    llvm::MapVector<Value, SmallVector<unsigned>> groups;
+    for (auto [i, reg] : llvm::enumerate(pagedRegs))
+      groups[reg.enable].push_back(i);
+    uint64_t layoutBits = 0;
+    // The always-written run first (the null enable, if any).
+    SmallVector<std::pair<Value, SmallVector<unsigned>>> runs;
+    if (auto it = groups.find(Value()); it != groups.end())
+      runs.push_back(*it);
+    for (auto &[enable, members] : groups)
+      if (enable)
+        runs.push_back({enable, members});
+    // Each byte's enable (null: always written), for the masks.
+    SmallVector<Value> byteEnable;
+    for (auto &[enable, members] : runs) {
+      layoutBits = (layoutBits + grain - 1) / grain * grain;
+      for (unsigned i : members) {
+        bitAt[i] = layoutBits;
+        layoutBits += pagedRegs[i].width;
+      }
+      uint64_t end = (layoutBits + grain - 1) / grain * grain;
+      while (byteEnable.size() * grain < end)
+        byteEnable.push_back(enable);
+    }
+    unsigned pw = unsigned((layoutBits + p - 1) / p);
+    pw = (pw + grain - 1) / grain * grain;
+    while (masked && byteEnable.size() * grain < uint64_t(pw) * p)
+      byteEnable.push_back(Value());
     unsigned colBits = 72 * std::max(1u, regionBits / 72);
     unsigned columns = (pw + colBits - 1) / colBits;
     struct Column {
@@ -4241,9 +4297,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       Region *region;
       seq::FirMemOp memory;
       Value out, writeAt;
-      /// Per page: the host cycle it lands, it is written, and its bits.
+      /// Per page: the host cycle it lands, it is written, and its bits,
+      /// at their offsets in the column.
       SmallVector<Value> land, writing;
-      SmallVector<SmallVector<Value>> words;
+      SmallVector<SmallVector<std::pair<unsigned, Value>>> parts;
     };
     SmallVector<Column> cols(columns);
     // Each column's controls: a region of its own.
@@ -4259,7 +4316,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       auto &region = *col.region;
       std::string prefix = region.prefix;
       ports += (col.width + 71) / 72;
-      auto memType = seq::FirMemType::get(context, entries * pages, col.width, 1);
+      auto memType = seq::FirMemType::get(
+          context, entries * pages, col.width,
+          masked ? std::optional<size_t>(col.width / grain) : std::optional<size_t>(1));
       auto memory = seq::FirMemOp::create(
           b, memType, /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old,
           seq::WUW::Undefined, b.getStringAttr(prefix + "_pages"),
@@ -4281,7 +4340,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         col.land.push_back(keep(seq::FirRegOp::create(
             b, col.land.back(), hostClock,
             b.getStringAttr(prefix + "_land" + Twine(j)))));
-      col.words.resize(p);
+      col.parts.resize(p);
       // Write-back: page j a host cycle + j after the state pass, at the
       // instance of that pass.
       auto &writing = col.writing;
@@ -4312,8 +4371,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     // Each register's bits, cut where pages and columns meet: a fetch
     // buffer part loaded as its page lands in its column, and the
     // write-back bits of that page and column, low bits first.
-    uint64_t at = 0;
-    for (auto &reg : pagedRegs) {
+    for (auto [r, reg] : llvm::enumerate(pagedRegs)) {
+      uint64_t at = bitAt[r];
       SmallVector<Value> parts;
       unsigned part = 0;
       for (unsigned lo = 0; lo < reg.width;) {
@@ -4332,8 +4391,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             b, col.land[j],
             b.createOrFold<comb::ExtractOp>(bits(n), col.out, offset), fetched));
         parts.push_back(fetched);
-        col.words[j].push_back(
-            b.createOrFold<comb::ExtractOp>(bits(n), reg.writeBack, lo));
+        col.parts[j].push_back(
+            {offset, b.createOrFold<comb::ExtractOp>(bits(n), reg.writeBack, lo)});
         lo += n;
       }
       Value value = parts.size() == 1
@@ -4343,41 +4402,71 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       value = b.createOrFold<hw::BitcastOp>(Value(reg.value).getType(), value);
       reg.value.setValue(value);
       replaced[reg.original] = value;
-      at += reg.width;
     }
-    // Each column's write: page j's bits at its host cycle.
-    for (auto &col : cols) {
+    // Each column's write: page j's bits at its host cycle, and with masks
+    // its bytes' enables.
+    for (auto [c, col] : llvm::enumerate(cols)) {
       auto &writing = col.writing;
-      Value writeData, writeEnable;
+      Value writeData, writeEnable, writeMask;
+      unsigned bytes = masked ? col.width / grain : 0;
       for (unsigned j = 0; j < p; ++j) {
+        // The page's bits in order, zeros between.
+        auto &parts = col.parts[j];
+        llvm::sort(parts, [](auto &x, auto &y) { return x.first < y.first; });
+        SmallVector<Value> low;
         unsigned have = 0;
-        for (auto word : col.words[j])
-          have += hw::getBitWidth(word.getType());
-        SmallVector<Value> high;
+        for (auto &[off, value] : parts) {
+          if (off > have)
+            low.push_back(hw::ConstantOp::create(b, bits(off - have), 0));
+          low.push_back(value);
+          have = off + hw::getBitWidth(value.getType());
+        }
         if (have < col.width)
-          high.push_back(hw::ConstantOp::create(b, bits(col.width - have), 0));
-        high.append(col.words[j].rbegin(), col.words[j].rend());
-        Value word = high.size() == 1 ? high[0]
-                                      : b.createOrFold<comb::ConcatOp>(high);
-        if (p > 1)
+          low.push_back(hw::ConstantOp::create(b, bits(col.width - have), 0));
+        Value word = low.size() == 1
+                         ? low[0]
+                         : b.createOrFold<comb::ConcatOp>(
+                               SmallVector<Value>(low.rbegin(), low.rend()));
+        Value mask;
+        if (masked) {
+          // Byte k of this page and column: the vector's byte at its offset.
+          uint64_t first = (uint64_t(j) * pw + uint64_t(c) * colBits) / grain;
+          SmallVector<Value> high;
+          for (unsigned k = bytes; k-- > 0;) {
+            Value enable = byteEnable[first + k];
+            high.push_back(enable ? enable : one());
+          }
+          mask = high.size() == 1 ? high[0] : b.createOrFold<comb::ConcatOp>(high);
+        }
+        if (p > 1) {
           word = comb::AndOp::create(
               b, word,
               b.createOrFold<comb::ReplicateOp>(bits(col.width), writing[j]));
+          if (mask)
+            mask = comb::AndOp::create(
+                b, mask, b.createOrFold<comb::ReplicateOp>(bits(bytes), writing[j]));
+        }
         writeData = writeData ? Value(comb::OrOp::create(b, writeData, word))
                               : word;
+        if (mask)
+          writeMask = writeMask ? Value(comb::OrOp::create(b, writeMask, mask)) : mask;
         writeEnable = writeEnable
                           ? Value(comb::OrOp::create(b, writeEnable, writing[j]))
                           : writing[j];
       }
       seq::FirMemWriteOp::create(b, col.memory, col.writeAt, hostClock,
-                                 writeEnable, writeData, Value{});
+                                 writeEnable, writeData, writeMask);
     }
     std::string text;
     llvm::raw_string_ostream os(text);
     unsigned bound =
         threads * unsigned((pagedBits + 72ull * ports - 1) / (72ull * ports));
     os << "  pages " << cls.name << ": p " << p << ", " << pagedRegs.size()
-       << " registers, " << pagedBits << " bits; page RAMs " << entries * pages
+       << " registers, " << pagedBits << " bits";
+    if (masked)
+      os << " (" << layoutBits << " in " << grain << "-bit bytes, "
+         << groups.size() - (groups.count(Value()) ? 1 : 0) << " enables)";
+    os << "; page RAMs " << entries * pages
        << " rows x " << pw << " bits in " << columns << " columns, " << ports
        << " ports, " << kind << "; kept " << keptRegs << " registers, "
        << keptBits << " bits; state passes " << threads << " x " << p << " = "
@@ -6206,7 +6295,7 @@ void FoldStaticPass::runOnOperation() {
                       specGroups, specDepth,
                       envSinks, registerStateEntries, slrGroups, slrSites,
                       slrCapacity, slrAssign, storage, readyLevels,
-                      forwardAfterLevels, shareLinkWrites, page);
+                      forwardAfterLevels, shareLinkWrites, page, pageMasks);
   if (failed(folder.run()))
     return signalPassFailure();
 }

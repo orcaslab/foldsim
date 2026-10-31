@@ -173,6 +173,8 @@ def frame_options(a):
         fold += ' share-link-writes=false'
     if getattr(a, 'page', '') and a.page != 'auto':
         fold += f' page={page_option(a.page)}'
+    if getattr(a, 'no_page_masks', False):
+        fold += ' page-masks=false'
     return fold
 
 
@@ -486,6 +488,10 @@ def main():
                          "copy of several instances keeps its registers in a page RAM per "
                          'region and moves an instance\'s state in and out P host cycles at a '
                          'time, double-buffered; a count pages every model, else per model')
+    ap.add_argument('--no-page-masks', action='store_true',
+                    help='with --page: a dense page word, a register under an enable writing its old '
+                         'value where the enable is low, instead of byte write masks by enable '
+                         '(foldsim-fold-static page-masks=false)')
     ap.add_argument('--register-state-entries', type=int, metavar='N',
                     help='with --static: per-instance state of copies with at most N instances in flops, '
                          'deeper in distributed RAM (default 2; 0: always distributed RAM)')
