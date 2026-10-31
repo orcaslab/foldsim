@@ -464,6 +464,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "ready pass reads, pages with its instance's registers: each row "
            "a register, its reads a choice of the rows from the fetch buffer, "
            "its writes the rows' next values (0: registers only)">,
+    Option<"pageMemories", "page-memories", "std::string", "\"\"",
+           "With page-memory-bits: a regex of the memories that page as rows "
+           "(empty: every one that qualifies)">,
     Option<"pageMasks", "page-masks", "bool", "true",
            "With page: a paged register written under an enable keeps it, "
            "registered at the state pass, as its bytes' write mask in the "

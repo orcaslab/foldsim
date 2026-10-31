@@ -177,6 +177,10 @@ def frame_options(a):
         fold += ' page-masks=false'
     if getattr(a, 'page_memory_bits', None) is not None:
         fold += f' page-memory-bits={a.page_memory_bits}'
+    if getattr(a, 'page_memories', None):
+        if re.search(r'[\s{}]', a.page_memories):
+            sys.exit('--page-memories: a regex without spaces or braces')
+        fold += f' page-memories={a.page_memories}'
     if getattr(a, 'page_hbm_window', None):
         fold += f' page-hbm-window={a.page_hbm_window}'
     if getattr(a, 'page_hbm_column_bits', None):
@@ -501,6 +505,9 @@ def main():
                     help='with --page: memories read combinationally of at most N bits page as '
                          'rows with the registers (foldsim-fold-static page-memory-bits; default '
                          '4096, 0: registers only)')
+    ap.add_argument('--page-memories', metavar='REGEX',
+                    help='with --page: only the memories this regex finds page as rows '
+                         '(foldsim-fold-static page-memories)')
     ap.add_argument('--page-hbm-window', type=int, metavar='K',
                     help='with pages off chip: an on-chip window of at most K instances\' pages per '
                          'copy, prefetched K state passes ahead (foldsim-fold-static page-hbm-window)')

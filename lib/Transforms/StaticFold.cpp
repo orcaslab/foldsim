@@ -266,7 +266,7 @@ public:
                unsigned forwardAfterLevels, bool shareLinkWrites,
                ArrayRef<std::string> page, bool pageMasks,
                unsigned pageHbmColumnBits, unsigned pageHbmWindow,
-               unsigned pageMemoryBits)
+               unsigned pageMemoryBits, StringRef pageMemories)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -282,7 +282,7 @@ public:
         forwardAfterLevels(forwardAfterLevels),
         shareLinkWrites(shareLinkWrites), pageSpecs(page), pageMasks(pageMasks),
         pageHbmColumnBits(pageHbmColumnBits), pageHbmWindow(pageHbmWindow),
-        pageMemoryBits(pageMemoryBits),
+        pageMemoryBits(pageMemoryBits), pageMemories(pageMemories.str()),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -440,8 +440,10 @@ private:
   unsigned pageHbmColumnBits;
   /// The most instance slots of an off-chip page window (0: none).
   unsigned pageHbmWindow;
-  /// The most bits of a combinationally read memory paged as rows.
+  /// The most bits of a combinationally read memory paged as rows, and a
+  /// regex of the memories that may (empty: any).
   unsigned pageMemoryBits;
+  std::string pageMemories;
   /// A paged class's combinationally read memories of at most
   /// `pageMemoryBits` bits that no ready pass reads, as a register per row:
   /// the reads a choice of the rows, the writes their next values. Returns
@@ -2665,8 +2667,11 @@ StaticFolder::memoriesAsRows(Class &cls, const DenseSet<Operation *> &ready,
   auto *folding = cls.folding.get();
   Value clock = body->getArgument(cls.clockInput);
   SmallVector<seq::FirMemOp> memories;
+  llvm::Regex only(pageMemories.empty() ? ".*" : pageMemories);
   for (auto memory : body->getOps<seq::FirMemOp>()) {
     auto type = memory.getType();
+    if (!only.match(memory.getName().value_or("")))
+      continue;
     // A folded pipeline's result store is the pipeline's, not the model's.
     if ((folding && (folding->physical.contains(memory) ||
                      folding->foldOfStore.count(memory))) ||
@@ -2699,10 +2704,12 @@ StaticFolder::memoriesAsRows(Class &cls, const DenseSet<Operation *> &ready,
                                            b.getStringAttr(name + "_row" + Twine(e))));
     }
     SmallVector<Value> next(rows.begin(), rows.end());
-    // A registered read: its output register, loaded with the row read (or,
-    // reading new data, the row as written in the same cycle) where enabled.
+    // A registered read: its output register, loaded with the row read where
+    // enabled, as the threaded memory's read is: a memory reading old data
+    // registers it; any other registers the address, so it reads the row as
+    // written in the same cycle (firtool's lowering of a latency-1 read).
     bool registered = memory.getReadLatency() == 1;
-    bool readNew = memory.getRuw() == seq::RUW::New;
+    bool readNew = memory.getRuw() != seq::RUW::Old;
     SmallVector<std::tuple<seq::FirMemReadOp, Backedge, Value>> outputs;
     for (auto *user : llvm::make_early_inc_range(memory->getUsers())) {
       if (auto read = dyn_cast<seq::FirMemReadOp>(user)) {
@@ -2713,12 +2720,19 @@ StaticFolder::memoriesAsRows(Class &cls, const DenseSet<Operation *> &ready,
           data = seq::FirRegOp::create(b, outNext, clock,
                                        b.getStringAttr(name + "_rdata"));
           outputs.push_back({read, outNext, data});
-        } else if (depth == 1) {
-          data = rows[0];
         } else {
-          SmallVector<Value> elements(rows.rbegin(), rows.rend());
-          data = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elements),
-                                        read.getAddress());
+          if (depth == 1) {
+            data = rows[0];
+          } else {
+            SmallVector<Value> elements(rows.rbegin(), rows.rend());
+            data = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elements),
+                                          read.getAddress());
+          }
+          // A combinational read not enabled reads nothing (firtool's x, as
+          // the threaded memory's read gives it): zero.
+          if (read.getEnable())
+            data = comb::MuxOp::create(b, read.getEnable(), data,
+                                       hw::ConstantOp::create(b, rowType, 0));
         }
         read.getData().replaceAllUsesWith(data);
         if (!registered)
@@ -6914,7 +6928,8 @@ void FoldStaticPass::runOnOperation() {
                       envSinks, registerStateEntries, slrGroups, slrSites,
                       slrCapacity, slrAssign, storage, readyLevels,
                       forwardAfterLevels, shareLinkWrites, page, pageMasks,
-                      pageHbmColumnBits, pageHbmWindow, pageMemoryBits);
+                      pageHbmColumnBits, pageHbmWindow, pageMemoryBits,
+                      pageMemories);
   if (failed(folder.run()))
     return signalPassFailure();
 }

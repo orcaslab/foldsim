@@ -20,6 +20,12 @@
 // ROWS-DAG: %mem_row15_fetched = seq.firreg
 // ROWS-DAG: %mem_rdata_fetched = seq.firreg
 // ROWS-DAG: hw.array_get {{%.+}}[{{%.+}}] : !hw.array<16xi8>, i4
+// page-memories limits the rows to the memories it finds by name: the leaves'
+// memory, `mem`, is found by `^me` and not by `^x`, which pages registers only.
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2 page-memories=^me})' 2>&1 | FileCheck %s --check-prefix=ROWS
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2 page-memories=^x})' 2>&1 | FileCheck %s --check-prefix=NOROWS
+// NOROWS: pages Leaf: p 2, 4 registers, 100 bits; page RAMs 8 rows x 50 bits
+// NOROWS: %mem = seq.firmem 1, 1, old, undefined : <64 x 8, mask 1>
 // Registers a ready pass reads keep their stores (the leaves' output is the
 // memory's read data, through two registers: a ready pass).
 // RUN: foldsim-opt %S/Inputs/fold-static-storage-late.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2})' 2>&1 | FileCheck %s --check-prefix=READY
