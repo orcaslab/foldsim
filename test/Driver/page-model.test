@@ -20,6 +20,7 @@
 # CHECK: p 1: bram 4167.0 ports 4167 lutram 0 fits False
 # CHECK: big state: page 'Lane:2' frame 512 fits True bram 2083.5 ports 2084 paged bits 76800000
 # CHECK: big state, storage auto: page 'Lane:2' frame 512 bram 2083.5 uram 0.0
+# CHECK: big state with links: page 'Lane:2' frame 512 fits True link lutram 4
 # CHECK: parsed 2 ('paged', False)
 # Beyond the chip: no frame fits on chip, the pages go off chip, and the
 # frame is the HBM traffic's.

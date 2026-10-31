@@ -46,6 +46,11 @@ print(f'big state: page {spec!r} frame {frame} fits {res["fits"]} bram {res["bra
 spec, frame, res = d.choose_pages(None, est, classes, sched(256), 256, store='auto')
 print(f'big state, storage auto: page {spec!r} frame {frame} bram {res["bram"]} uram {res["uram"]} '
       f'storage {res["storage"]!r}')
+# A report with links (parse_classes keeps them under '__links__', not a
+# class): the same choice, the links' LUTRAM counted.
+links = d.parse_links('  link kinds: distributed 2 64 4; block 0 0 0; ultra 0 0 0; registers 1 8\n')
+spec, frame, res = d.choose_pages(None, est, classes, dict(sched(256), __links__=links), 256)
+print(f'big state with links: page {spec!r} frame {frame} fits {res["fits"]} link lutram {res["link_lutram"]}')
 # Schedule reports name the page per class.
 info = d.parse_classes('foldsim-fold-static: II = 8\n  Leaf x4 state gap 8 page 2\n    state: 0 2 4 6\n')
 print('parsed', info['Leaf']['page'], d.state_form(4, info['Leaf'], 8, 2))
