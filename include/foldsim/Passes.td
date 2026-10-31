@@ -449,6 +449,48 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "the choice: the producer's path then ends at that register, not "
            "through the choice into the read register; 0 forwards every one "
            "into the read register">,
+    ListOption<"page", "page", "std::string",
+               "Paged register state, as <model>:<p> (or *:<p> for every "
+               "model): a copy of the model of several instances keeps its "
+               "registers in one page RAM per region (block RAM, or the "
+               "<model>:pages=<kind> storage rule) and moves an instance's "
+               "state in and out p host cycles at a time: its pages are read "
+               "into a fetch buffer over the p slots before its state pass, "
+               "and its next state written back from a write-back buffer over "
+               "the p host cycles after. The evaluation stays one host cycle; "
+               "the copy's state passes are p slots apart and the frame at "
+               "least p + 4. Registers a ready pass reads keep their stores">,
+    Option<"pageHbmColumnBits", "page-hbm-column-bits", "unsigned", "4096",
+           "With a model's pages off chip (storage <model>:pages=hbm): the "
+           "most bits of a page word in one virtual memory's row (a multiple "
+           "of 8); each such column is a virtual memory of its own, served by "
+           "a controller of its own">,
+    Option<"pageHbmWindow", "page-hbm-window", "unsigned", "0",
+           "With a model's pages off chip: an on-chip window of at most this "
+           "many instances' pages per copy, filled from the virtual memories "
+           "that many instances ahead of their state passes (each instance's "
+           "pages prefetched at the copy's state pass that many before), so "
+           "the round trip hides behind them; the fetch buffer loads from it "
+           "as from an on-chip page RAM. The compiler takes the most slots "
+           "the schedule allows (a divisor of the copy's instances). 0: no "
+           "window, each fetch from the copy's state pass before">,
+    Option<"pageMemoryBits", "page-memory-bits", "unsigned", "4096",
+           "With page: a memory read combinationally (a queue, a register "
+           "file, a predictor table) of at most this many bits, which no "
+           "ready pass reads, pages with its instance's registers: each row "
+           "a register, its reads a choice of the rows from the fetch buffer, "
+           "its writes the rows' next values (0: registers only)">,
+    Option<"pageMemories", "page-memories", "std::string", "\"\"",
+           "With page-memory-bits: a regex of the memories that page as rows "
+           "(empty: every one that qualifies)">,
+    Option<"pageMasks", "page-masks", "bool", "true",
+           "With page: a paged register written under an enable keeps it, "
+           "registered at the state pass, as its bytes' write mask in the "
+           "page RAM (block RAM's 9-bit bytes, ultra RAM's 8-bit), its next "
+           "value written straight into its write-back register; registers "
+           "of one enable share bytes, each enable's padded to whole bytes. "
+           "Off, the page is dense and such a register writes its old value "
+           "where its enable is low, through a mux after the target logic">,
     Option<"shareLinkWrites", "share-link-writes", "bool", "true",
            "A producer's bits read by several classes' inputs are registered "
            "once and written to each reader's link a host cycle after the "
