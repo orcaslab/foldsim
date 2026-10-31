@@ -1,0 +1,43 @@
+# REQUIRES: verilator
+# Stateless classes: a model with no registers, memories or black boxes (here
+# a per-lane address unit, no clock) folded as a class of its own between
+# its parent's registers and its parent's next state, as an LSU's AGUs sit
+# between its dispatch registers and its request queue: it needs no clock,
+# and its parent's state pass follows its evaluation in the frame. The fold
+# matches the target, its
+# channels stalled or not: with and without zero-latency links (the units'
+# addresses taken in their host cycle), and with compact links (each SM's
+# lane port keeps the two of the eight units it reads; the top's reads of
+# each SM's register keep the one SM it reads, in a register or a
+# two-bank memory).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/stateless
+# RUN: foldsim --srcs top.f --top Top --out %t/base --static --nest --modulo Sm Agu 2>&1 | FileCheck %s --check-prefix=BASE
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/base/obj %S/Inputs/tb_reset.sv top.sv %t/base/foldsim_sim.sv > %t/base/build.log 2>&1
+# RUN: %t/base/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/base/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/compact --static --nest --modulo --compact-links Sm Agu 2>&1 | FileCheck %s --check-prefix=COMPACT
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/compact/obj %S/Inputs/tb_reset.sv top.sv %t/compact/foldsim_sim.sv > %t/compact/build.log 2>&1
+# RUN: %t/compact/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s
+# RUN: %t/compact/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/zero --static --nest --modulo --compact-links --zero-latency-links --zero-latency-chains Sm Agu 2>&1 | FileCheck %s --check-prefix=ZERO
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/zero/obj %S/Inputs/tb_reset.sv top.sv %t/zero/foldsim_sim.sv > %t/zero/build.log 2>&1
+# RUN: %t/zero/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +stall=0 | FileCheck %s
+# RUN: %t/zero/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +stall=30 | FileCheck %s
+# BASE: Agu x8 state gap {{[0-9]+}} depth 2 under Sm_model stateless
+# BASE: link storage: {{[0-9]+}} memories, 1216 bits
+# COMPACT: link storage: {{[0-9]+}} memories, 744 bits, {{[0-9]+}} LUTRAM LUTs; 8 register bits; compact: 10 links, 472 bits saved
+# COMPACT: compact 10
+# Links out of the address units taken from their read register alone
+# (`--registered-links`): their path ends at the link, not in the SM.
+# RUN: foldsim --srcs top.f --top Top --out %t/reg --static --nest --modulo --compact-links --zero-latency-links --zero-latency-chains --registered-links 'Ag*' Sm Agu 2>&1 | FileCheck %s --check-prefix=REG
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/reg/obj %S/Inputs/tb_reset.sv top.sv %t/reg/foldsim_sim.sv > %t/reg/build.log 2>&1
+# RUN: %t/reg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +stall=0 | FileCheck %s
+# RUN: %t/reg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +stall=30 | FileCheck %s
+# RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --zero-latency-links --registered-links Nope Sm Agu 2>&1 | FileCheck %s --check-prefix=BAD
+# REG: zero-latency links: 1 of 9
+# REG: taken now 0
+# BAD: registered-links: no class matches 'Nope'
+# ZERO: zero-latency links: 9 of 9
+# ZERO: Agu x8 {{.*}} stateless
+# ZERO: taken now 2
+# CHECK: {{^}}MATCH 196 cycles

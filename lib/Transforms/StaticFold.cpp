@@ -35,6 +35,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/GlobPattern.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/raw_ostream.h"
 #include <deque>
@@ -94,6 +95,11 @@ struct Class {
   SmallVector<std::string> inputNames, outputNames;
   SmallVector<Type> inputTypes, outputTypes;
   int clockInput = -1;
+  /// Pure logic: no registers, memories or black boxes, and so it needs no
+  /// clock. Its outputs are late or constant; its state pass writes no state
+  /// and a ready pass computes the same outputs a slot of its own earlier,
+  /// which the search for ready passes weighs as for any class.
+  bool stateless = false;
   /// The class it was split from by copies, or -1.
   int splitFrom = -1;
   /// Nested folding: the class of its instances' parents (-1 for a root),
@@ -286,7 +292,8 @@ public:
                unsigned zeroChainHops, ArrayRef<std::string> page,
                bool pageMasks, unsigned pageHbmColumnBits,
                unsigned pageHbmWindow, unsigned pageMemoryBits,
-               StringRef pageMemories, StringRef pageRows)
+               StringRef pageMemories, StringRef pageRows, bool compactLinks,
+               ArrayRef<std::string> registeredLinks)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -305,7 +312,9 @@ public:
         pageSpecs(page), pageMasks(pageMasks),
         pageHbmColumnBits(pageHbmColumnBits), pageHbmWindow(pageHbmWindow),
         pageMemoryBits(pageMemoryBits), pageMemories(pageMemories.str()),
-        pageRows(pageRows.str()), envRoundTrip((stagedEnv ? 1 : 0) + 1 + decisionLead()),
+        pageRows(pageRows.str()), compactLinks(compactLinks),
+        registeredLinkSpecs(registeredLinks),
+        envRoundTrip((stagedEnv ? 1 : 0) + 1 + decisionLead()),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
 
@@ -501,6 +510,28 @@ private:
   /// a host cycle (0: unbounded), and the links cut to keep it (chainCuts),
   /// each as (producer, consumer class, input).
   unsigned zeroChainHops;
+  /// `compact-links`: a link memory holds only the producer instances its
+  /// reader takes.
+  bool compactLinks;
+  /// `registered-links`: the classes whose links are never zero-latency,
+  /// as globs, and whether each class (a copy by its class) matches.
+  ArrayRef<std::string> registeredLinkSpecs;
+  SmallVector<bool> registeredLinks;
+  LogicalResult parseRegisteredLinks();
+  /// One link memory (a read of a producer's bits by a class input, a run of
+  /// bits with the same sources): the producer, its bits, and the producer
+  /// instances the reader takes, sorted and distinct.
+  struct LinkUse {
+    unsigned producer, low, width, reader;
+    SmallVector<uint64_t> rows;
+  };
+  /// Every link memory the simulator builds, as buildSim cuts them.
+  void linkUses(std::vector<LinkUse> &uses) const;
+  /// Whether a link of producer `p` whose reader takes `rows` is compacted.
+  bool compacted(unsigned p, size_t rows) const {
+    unsigned threads = classes[producers[p].cls].threads();
+    return compactLinks && threads > 1 && rows < threads;
+  }
   std::set<std::tuple<unsigned, unsigned, unsigned>> cutLinks;
   /// Counts, instance by instance, the zero-latency links on the paths into
   /// each late output and cuts the links that would pass `zeroChainHops`.
@@ -721,6 +752,14 @@ LogicalResult StaticFolder::decompose(Value value, unsigned low,
   return op->emitError("not wiring of a netlist");
 }
 
+/// Whether a model is pure logic: no registers, memories or black boxes.
+static bool isStateless(hw::HWModuleOp model) {
+  for (auto &op : *model.getBodyBlock())
+    if (isa<seq::FirRegOp, seq::FirMemOp, seq::CompRegOp, hw::InstanceOp>(op))
+      return false;
+  return true;
+}
+
 LogicalResult StaticFolder::collect() {
   auto *body = netlist.getBodyBlock();
   for (auto aggregate :
@@ -765,7 +804,10 @@ LogicalResult StaticFolder::collect() {
         cls.outputNames.push_back(cast<StringAttr>(name).getValue().str());
         cls.outputTypes.push_back(instance.getResult(o).getType());
       }
-      if (cls.clockInput < 0)
+      // A stateless model (no registers, memories or black boxes) is pure
+      // logic and needs no clock: its outputs are all late.
+      cls.stateless = isStateless(model);
+      if (cls.clockInput < 0 && !cls.stateless)
         return instance.emitError("a model has a clock input");
     }
     auto &cls = classes[it->second];
@@ -889,6 +931,7 @@ LogicalResult StaticFolder::splitCopies() {
       copy.inputTypes = classes[c].inputTypes;
       copy.outputTypes = classes[c].outputTypes;
       copy.clockInput = classes[c].clockInput;
+      copy.stateless = classes[c].stateless;
       copy.splitFrom = c;
       copy.parent = classes[c].parent;
       copy.depth = classes[c].depth;
@@ -1165,9 +1208,32 @@ LogicalResult StaticFolder::analyze(Class &cls) {
   return success();
 }
 
+LogicalResult StaticFolder::parseRegisteredLinks() {
+  registeredLinks.assign(classes.size(), false);
+  for (auto &spec : registeredLinkSpecs) {
+    auto glob = llvm::GlobPattern::create(spec);
+    if (!glob)
+      return netlist.emitError("registered-links: '") << spec
+                                                      << "' is not a glob";
+    bool any = false;
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      int base = cls.splitFrom >= 0 ? cls.splitFrom : int(c);
+      if (glob->match(classes[base].name)) {
+        registeredLinks[c] = any = true;
+      }
+    }
+    if (!any)
+      return netlist.emitError("registered-links: no class matches '")
+             << spec << "'";
+  }
+  return success();
+}
+
 bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   auto &producer = producers[p];
   if (!zeroLatencyLinks || producer.cls < 0 || !producer.late)
+    return false;
+  if (!registeredLinks.empty() && registeredLinks[producer.cls])
     return false;
   // Between SLR groups a link is registered on both sides of the crossing.
   if (crosses(producer.cls, c))
@@ -1275,6 +1341,46 @@ void StaticFolder::chainCuts() {
                      << classes[producers[p].cls].outputNames[producers[p].port]
                      << " -> " << classes[c].name << "."
                      << classes[c].inputNames[input] << "\n";
+  }
+}
+
+void StaticFolder::linkUses(std::vector<LinkUse> &uses) const {
+  // As buildSim cuts a class input: at every bit where any instance's piece
+  // starts or ends, each run of bits read from each class producer (and the
+  // low bit there) its own link, at the producer instances the reader's
+  // instances take.
+  for (auto &consumer : consumers) {
+    if (consumer.cls < 0)
+      continue;
+    unsigned threads = classes[consumer.cls].threads();
+    std::set<unsigned> cuts{consumer.width};
+    for (auto &pieces : consumer.pieces) {
+      unsigned at = 0;
+      for (auto &piece : pieces)
+        cuts.insert(at += piece.width);
+    }
+    unsigned at = 0;
+    for (unsigned end : cuts) {
+      if (end == at)
+        continue;
+      std::map<std::pair<unsigned, unsigned>, std::set<uint64_t>> sources;
+      for (unsigned i = 0; i < threads; ++i) {
+        unsigned base = 0;
+        for (auto &piece : consumer.pieces[i]) {
+          if (at < base + piece.width) {
+            if (piece.producer >= 0 && producers[piece.producer].cls >= 0)
+              sources[{unsigned(piece.producer), piece.low + at - base}]
+                  .insert(piece.inst);
+            break;
+          }
+          base += piece.width;
+        }
+      }
+      for (auto &[key, rows] : sources)
+        uses.push_back({key.first, key.second, end - at, unsigned(consumer.cls),
+                        SmallVector<uint64_t>(rows.begin(), rows.end())});
+      at = end;
+    }
   }
 }
 
@@ -3486,6 +3592,8 @@ LogicalResult StaticFolder::schedule() {
     if (nest)
       os << " depth " << cls.depth
          << (cls.parent >= 0 ? " under " + classes[cls.parent].name : "");
+    if (cls.stateless)
+      os << " stateless";
     os << "\n";
     for (unsigned l = 0; l < cls.readyLevels; ++l) {
       os << "    ready" << (l ? std::to_string(l + 1) : "") << ":";
@@ -3512,6 +3620,72 @@ LogicalResult StaticFolder::schedule() {
         os << " " << cls.inputNames[input];
       os << "\n";
     }
+  }
+  {
+    // The links' storage, as buildSim makes it: a register for a late link
+    // of one entry, else a memory of an entry per producer instance (per
+    // instance read, compacted), doubled by frame parity for an early one;
+    // distributed RAM's LUTs as the cost model counts them (foldsim_cost
+    // mem_cost: one read port, asynchronous).
+    std::vector<LinkUse> uses;
+    linkUses(uses);
+    uint64_t memBits = 0, regBits = 0, compactSaved = 0;
+    double luts = 0;
+    unsigned memories = 0, compactMemories = 0;
+    auto depthOf = [&](unsigned entries, bool banked) -> uint64_t {
+      unsigned indices = entries > 1 ? llvm::PowerOf2Ceil(entries) : 1;
+      return banked ? 2 * indices : entries;
+    };
+    auto lutram = [](uint64_t depth, unsigned width) {
+      if (depth <= 32)
+        return width * 0.57;
+      uint64_t blocks = (depth + 63) / 64;
+      return width * blocks * 1.14 +
+             (depth > 64 ? width * (blocks - 1) / 3.0 : 0.0);
+    };
+    // By producer and reading class: (LUTRAM, bits).
+    std::map<std::pair<unsigned, unsigned>, std::pair<double, uint64_t>> byPair;
+    for (auto &use : uses) {
+      auto &producer = producers[use.producer];
+      bool banked = !producer.late;
+      unsigned threads = classes[producer.cls].threads();
+      unsigned entries = compacted(use.producer, use.rows.size())
+                             ? use.rows.size()
+                             : threads;
+      bool register_ = entries == 1 && !banked;
+      uint64_t depth = register_ ? 1 : depthOf(entries, banked);
+      if (entries < threads) {
+        ++compactMemories;
+        compactSaved += (depthOf(threads, banked) - depth) * use.width;
+      }
+      if (register_) {
+        regBits += use.width;
+        continue;
+      }
+      ++memories;
+      memBits += depth * use.width;
+      luts += lutram(depth, use.width);
+      auto &pair = byPair[{unsigned(producer.cls), use.reader}];
+      pair.first += lutram(depth, use.width);
+      pair.second += depth * use.width;
+    }
+    os << "  link storage: " << memories << " memories, " << memBits
+       << " bits, " << uint64_t(luts) << " LUTRAM LUTs; " << regBits
+       << " register bits";
+    if (compactLinks)
+      os << "; compact: " << compactMemories << " links, "
+         << compactSaved << " bits saved";
+    os << "\n";
+    // The largest, by the classes they join.
+    SmallVector<std::pair<std::pair<unsigned, unsigned>, std::pair<double, uint64_t>>>
+        largest(byPair.begin(), byPair.end());
+    llvm::sort(largest, [](auto &x, auto &y) {
+      return x.second.first > y.second.first;
+    });
+    for (auto &[pair, cost] : ArrayRef(largest).take_front(8))
+      os << "    links " << classes[pair.first].name << " -> "
+         << classes[pair.second].name << ": " << uint64_t(cost.first)
+         << " LUTRAM LUTs, " << cost.second << " bits\n";
   }
   for (auto [k, consumer] : llvm::enumerate(consumers))
     if (consumer.cls < 0)
@@ -4355,7 +4529,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
       if (reg.getIsAsync())
         return reg.emitError("asynchronous reset in a folded model");
-      if (reg.getClk() != modelBody->getArgument(cls.clockInput))
+      if (cls.clockInput < 0 ||
+          reg.getClk() != modelBody->getArgument(cls.clockInput))
         return reg.emitError("register not on the model's clock");
     }
     if (auto memory = dyn_cast<seq::FirMemOp>(op)) {
@@ -6527,17 +6702,33 @@ LogicalResult StaticFolder::buildSim() {
       written = reg(data, producers[p].name + "_written_" + Twine(low));
     return written;
   };
+  // A compact link's write side (`compact-links`), per link group and set of
+  // producer instances kept: each instance's entry and whether it is kept, by
+  // tables of the slot's instance registered as the group's instance is (and
+  // a host cycle later for a late write).
+  struct CompactWrite {
+    Value inst, member, instLate, memberLate;
+  };
+  std::map<std::pair<std::string, std::vector<uint64_t>>, CompactWrite>
+      compactWrites;
+  // With `compact` (the producer instances the reader takes, sorted), the
+  // link keeps an entry for each of those alone, at its index among them;
+  // the other instances' writes are masked, and so are their forwards and
+  // takes (a masked write's entry may be a kept one's). The reader's address
+  // is then that index.
   auto linkRead = [&](unsigned p, unsigned low, unsigned width,
                       function_ref<Value()> address, function_ref<Value()> bank,
                       const Twine &linkName, int to,
                       std::pair<Value, Value> *now = nullptr,
                       bool forward = true,
                       SmallVectorImpl<AfterForward> *after = nullptr,
-                      bool late = false, bool forwardLate = false) -> Value {
+                      bool late = false, bool forwardLate = false,
+                      ArrayRef<uint64_t> compact = {}) -> Value {
     auto &producer = producers[p];
     unsigned c = producer.cls;
     auto &ctl = controls[c];
-    unsigned threads = classes[c].threads();
+    unsigned threads =
+        compact.empty() ? classes[c].threads() : unsigned(compact.size());
     bool banked = !producer.late;
     bool crossing = to >= 0 && !slrOf.empty() && slrOf[c] != to;
     assert(!(crossing && now) && "a link between SLR groups is never zero");
@@ -6581,9 +6772,52 @@ LogicalResult StaticFolder::buildSim() {
         if (crossing)
           enable = copyReg(enable, group.prefix + pass + "_late");
       }
+      // A compact link's entry and mask, registered as the group's.
+      Value member, memberLate, compactInst, compactInstLate;
+      if (!compact.empty()) {
+        auto &cw = compactWrites[{group.prefix,
+                                  std::vector<uint64_t>(compact.begin(),
+                                                        compact.end())}];
+        if (!cw.member) {
+          unsigned producerThreads = classes[c].threads();
+          SmallVector<uint64_t> index(producerThreads, 0),
+              kept(producerThreads, 0);
+          for (auto [k, r] : llvm::enumerate(compact)) {
+            index[r] = k;
+            kept[r] = 1;
+          }
+          std::string prefix =
+              group.prefix + "_compact" + std::to_string(compactWrites.size());
+          cw.member = copyReg(copyReg(table(b, ctl.inst2, kept, 1),
+                                      prefix + "_member1"),
+                              prefix + "_member0");
+          if (crossing)
+            cw.member = copyReg(cw.member, prefix + "_member_late");
+          if (threads > 1) {
+            cw.inst = copyReg(
+                copyReg(table(b, ctl.inst2, index, llvm::Log2_32_Ceil(threads)),
+                        prefix + "_inst1"),
+                prefix + "_inst0");
+            if (crossing)
+              cw.inst = copyReg(cw.inst, prefix + "_inst_late");
+          }
+        }
+        member = cw.member;
+        compactInst = cw.inst;
+        if (late) {
+          if (!cw.memberLate)
+            cw.memberLate = copyReg(cw.member, group.prefix + "_member_late");
+          memberLate = cw.memberLate;
+          if (cw.inst && !cw.instLate)
+            cw.instLate = copyReg(cw.inst, group.prefix + "_cinst_late");
+          compactInstLate = cw.instLate;
+        }
+      }
+      // The pass's enable, masked to the kept instances.
+      Value kept = member ? Value(comb::AndOp::create(b, enable, member)) : enable;
       if (now && !banked) {
         if (!now->first)
-          now->first = enable;
+          now->first = kept;
         nowPieces.push_back(data);
       }
       // What the link is written with, and when.
@@ -6603,6 +6837,9 @@ LogicalResult StaticFolder::buildSim() {
                           "_late");
         writeEnable = lateEnable;
       }
+      if (member)
+        writeEnable = comb::AndOp::create(b, writeEnable,
+                                          late ? memberLate : member);
       if (threads == 1 && !banked) {
         auto next = backedges.get(data.getType());
         Value r = reg(next, name);
@@ -6613,9 +6850,9 @@ LogicalResult StaticFolder::buildSim() {
           value = written;
         if (oneCycleLinks && forward) {
           if (after)
-            after->push_back({at, w, enable, data});
+            after->push_back({at, w, kept, data});
           else
-            value = late ? comb::MuxOp::create(b, enable, data, value).getResult()
+            value = late ? comb::MuxOp::create(b, kept, data, value).getResult()
                          : written;
         }
         pieces.push_back(value);
@@ -6650,13 +6887,13 @@ LogicalResult StaticFolder::buildSim() {
         readAddress.push_back(bank());
       }
       if (threads > 1) {
-        if (!group.inst) {
+        if (compact.empty() && !group.inst) {
           group.inst = copyReg(copyReg(ctl.inst2, group.prefix + "_inst1"),
                                group.prefix + "_inst0");
           if (crossing)
             group.inst = copyReg(group.inst, group.prefix + "_inst_late");
         }
-        writeAddress.push_back(group.inst);
+        writeAddress.push_back(compact.empty() ? group.inst : compactInst);
         readAddress.push_back(address());
       }
       Value writeAt = b.createOrFold<comb::ConcatOp>(writeAddress);
@@ -6670,9 +6907,10 @@ LogicalResult StaticFolder::buildSim() {
           lateAddress.push_back(group.bankLate);
         }
         if (threads > 1) {
-          if (!group.instLate)
+          if (compact.empty() && !group.instLate)
             group.instLate = copyReg(group.inst, group.prefix + "_inst_late");
-          lateAddress.push_back(group.instLate);
+          lateAddress.push_back(compact.empty() ? group.instLate
+                                                : compactInstLate);
         }
         lateAt = b.createOrFold<comb::ConcatOp>(lateAddress);
       }
@@ -6694,13 +6932,13 @@ LogicalResult StaticFolder::buildSim() {
                             ? readAt
                             : copyReg(readAt, name + "_now");
         now->first = comb::AndOp::create(
-            b, enable,
+            b, kept,
             comb::ICmpOp::create(b, comb::ICmpPredicate::eq, writeAt, readNow));
       }
       if (oneCycleLinks && forward) {
         // A write reaches a read of its entry in the same host cycle.
         Value hit = comb::AndOp::create(
-            b, enable,
+            b, kept,
             comb::ICmpOp::create(b, comb::ICmpPredicate::eq, writeAt, readAt));
         if (after)
           after->push_back({at, w, hit, data});
@@ -6858,7 +7096,7 @@ LogicalResult StaticFolder::buildSim() {
   // taken in the producer's host cycle, and those written from a shared
   // register (forwarded the host cycle the write lands), for the report.
   unsigned linkReads = 0, forwardedReads = 0, forwardedAfter = 0, nowReads = 0,
-           lateReads = 0, forwardedLate = 0;
+           lateReads = 0, forwardedLate = 0, compactReads = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
   SmallVector<unsigned> classReaders(producers.size(), 0);
@@ -7035,6 +7273,24 @@ LogicalResult StaticFolder::buildSim() {
         SmallVector<uint64_t> rows;
         SmallVector<bool> takes;
         rowsOf(key, rows, takes);
+        // A compact link: the producer instances taken, and each instance's
+        // index among them for its address.
+        SmallVector<uint64_t> kept;
+        for (unsigned i = 0; i < threads; ++i)
+          if (takes[i])
+            kept.push_back(rows[i]);
+        llvm::sort(kept);
+        kept.erase(std::unique(kept.begin(), kept.end()), kept.end());
+        SmallVector<uint64_t> entryRows = rows;
+        if (compacted(key.first, kept.size())) {
+          ++compactReads;
+          pThreads = kept.size();
+          for (unsigned i = 0; i < threads; ++i)
+            if (takes[i])
+              entryRows[i] = llvm::lower_bound(kept, rows[i]) - kept.begin();
+        } else {
+          kept.clear();
+        }
         unsigned w = llvm::Log2_32_Ceil(pThreads);
         // Each piece of the link reads at its own copy of the address and
         // the bank.
@@ -7043,8 +7299,8 @@ LogicalResult StaticFolder::buildSim() {
           if (pThreads <= 1)
             return Value();
           if (threads == 1)
-            return constant(w, rows[0]);
-          return copyReg(table(b, ctl.inst2, rows, w),
+            return constant(w, entryRows[0]);
+          return copyReg(table(b, ctl.inst2, entryRows, w),
                          consumer.name + "_addr" + Twine(at) + "_" +
                              Twine(addressCopies++));
         };
@@ -7082,7 +7338,8 @@ LogicalResult StaticFolder::buildSim() {
             linkRead(key.first, key.second, width, address, bank,
                      producer.name + "_to_" + consumer.name + "_" + Twine(at),
                      to, now ? &sourceNow[index] : nullptr, forward,
-                     after ? &sourceAfter[index] : nullptr, late, forwardLate);
+                     after ? &sourceAfter[index] : nullptr, late, forwardLate,
+                     kept);
       }
       // Taken around the read register when written in the reader's slot:
       // the source of this slot's instance, a host cycle after the read's.
@@ -7238,7 +7495,10 @@ LogicalResult StaticFolder::buildSim() {
     os << "  link reads: " << linkReads << ", forwarded " << forwardedReads
        << " (past the read register " << forwardedAfter << "), taken now "
        << nowReads << "; written from a shared register " << lateReads
-       << " (forwarded " << forwardedLate << ")\n";
+       << " (forwarded " << forwardedLate << ")";
+    if (compactLinks)
+      os << "; compact " << compactReads;
+    os << "\n";
     llvm::errs() << os.str();
     if (!reportPath.empty()) {
       std::error_code ec;
@@ -7672,7 +7932,8 @@ LogicalResult StaticFolder::resolveEnvironment() {
 
 LogicalResult StaticFolder::run() {
   inlineNetlists();
-  if (failed(collect()) || failed(resolveEnvironment()))
+  if (failed(collect()) || failed(resolveEnvironment()) ||
+      failed(parseRegisteredLinks()))
     return failure();
   for (auto &cls : classes)
     if (cls.threads() > 1 &&
@@ -7732,7 +7993,8 @@ void FoldStaticPass::runOnOperation() {
                       slrCapacity, slrAssign, storage, readyLevels,
                       forwardAfterLevels, shareLinkWrites, zeroChainHops,
                       page, pageMasks, pageHbmColumnBits, pageHbmWindow,
-                      pageMemoryBits, pageMemories, pageRows);
+                      pageMemoryBits, pageMemories, pageRows, compactLinks,
+                      registeredLinks);
   if (failed(folder.run()))
     return signalPassFailure();
 }
