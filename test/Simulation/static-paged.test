@@ -50,12 +50,17 @@
 # and at p = 4 nested with a short lead and bubbles.
 # RUN: cd %S/../Driver/Inputs/pagedq && foldsim --srcs top.f --top Top --out %t/q2 --static --page 2 --copies Leaf:2 --modulo Leaf > %t/q2.log 2>&1
 # RUN: FileCheck %s --check-prefix=Q2 < %t/q2.log
+# RUN: FileCheck %s --check-prefix=Q2IR < %t/q2/foldsim_sim.mlir
 # RUN: cd %S/../Driver/Inputs/pagedq && %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/q2/obj %S/Inputs/tb_late.sv top.sv %t/q2/foldsim_sim.sv > %t/q2/build.log 2>&1
 # RUN: %t/q2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +stall=20 | FileCheck %s
 # RUN: cd %S/../Driver/Inputs/pagedq && foldsim --srcs top.f --top Top --out %t/q4 --static --page 4 --nest --short-lead --bubbles Leaf > /dev/null 2>&1
 # RUN: cd %S/../Driver/Inputs/pagedq && %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/q4/obj %S/Inputs/tb_late.sv top.sv %t/q4/foldsim_sim.sv > %t/q4/build.log 2>&1
 # RUN: %t/q4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +bubble=30 +stall=20 | FileCheck %s
-# Q2: pages Leaf: p 2, 17 registers, 119 bits (with 2 memories' rows, 96 bits)
+# Q2: pages Leaf: p 2, 17 registers, 113 bits (with 2 memories' rows, 96 bits)
+# The queue's head reads through its read pointer, a latency-1 read of new
+# data: paged as the address register (2 bits), the head the rows at it.
+# Q2IR: %fifo_raddr_writeback = seq.firreg
+# Q2IR-NOT: %fifo_rdata
 # At p = 15 a page is one 9-bit byte: its column's memory has mask width 1,
 # which is no mask, so the byte's enable goes into the write's enable.
 # RUN: cd %S/../Driver/Inputs/pagedq && foldsim --srcs top.f --top Top --out %t/q15 --static --page 15 --bubbles Leaf > %t/q15.log 2>&1

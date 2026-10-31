@@ -2704,18 +2704,31 @@ StaticFolder::memoriesAsRows(Class &cls, const DenseSet<Operation *> &ready,
                                            b.getStringAttr(name + "_row" + Twine(e))));
     }
     SmallVector<Value> next(rows.begin(), rows.end());
-    // A registered read: its output register, loaded with the row read where
-    // enabled, as the threaded memory's read is: a memory reading old data
-    // registers it; any other registers the address, so it reads the row as
-    // written in the same cycle (firtool's lowering of a latency-1 read).
+    // A registered read, as the target's: a memory reading old data
+    // registers the row read where enabled; any other registers the address
+    // where enabled and reads the rows at it (firtool's lowering of a
+    // latency-1 read), so a write after the read shows, as in the target's
+    // write-first RAM. Either register pages with the rows.
     bool registered = memory.getReadLatency() == 1;
     bool readNew = memory.getRuw() != seq::RUW::Old;
+    auto rowAt = [&](ArrayRef<Value> source, Value addr) -> Value {
+      if (depth == 1)
+        return source[0];
+      SmallVector<Value> elements(source.rbegin(), source.rend());
+      return hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elements), addr);
+    };
     SmallVector<std::tuple<seq::FirMemReadOp, Backedge, Value>> outputs;
     for (auto *user : llvm::make_early_inc_range(memory->getUsers())) {
       if (auto read = dyn_cast<seq::FirMemReadOp>(user)) {
         b.setInsertionPoint(read);
         Value data;
-        if (registered) {
+        if (registered && readNew) {
+          auto addrNext = edges.get(read.getAddress().getType());
+          Value addr = seq::FirRegOp::create(b, addrNext, clock,
+                                             b.getStringAttr(name + "_raddr"));
+          outputs.push_back({read, addrNext, addr});
+          data = rowAt(rows, addr);
+        } else if (registered) {
           auto outNext = edges.get(rowType);
           data = seq::FirRegOp::create(b, outNext, clock,
                                        b.getStringAttr(name + "_rdata"));
@@ -2772,14 +2785,9 @@ StaticFolder::memoriesAsRows(Class &cls, const DenseSet<Operation *> &ready,
     }
     for (auto &[read, outNext, self] : outputs) {
       b.setInsertionPoint(read);
-      ArrayRef<Value> source = readNew ? ArrayRef<Value>(next) : ArrayRef<Value>(rows);
-      Value value = source[0];
-      if (depth > 1) {
-        SmallVector<Value> elements(source.rbegin(), source.rend());
-        value = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elements),
-                                       read.getAddress());
-      }
-      // The output register: the old one where the read is not enabled.
+      // The address (new) or the row read as of the cycle's start (old).
+      Value value = readNew ? read.getAddress() : rowAt(rows, read.getAddress());
+      // The register holds where the read is not enabled.
       Value loaded = read.getEnable() ? Value(comb::MuxOp::create(b, read.getEnable(), value,
                                                                   self))
                                       : value;
