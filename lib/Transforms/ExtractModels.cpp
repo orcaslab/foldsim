@@ -452,23 +452,39 @@ namespace {
 class LogicAbsorber {
 public:
   LogicAbsorber(ModuleOp top, hw::HWModuleOp parent,
-                const llvm::StringSet<> &modelNames, unsigned limit)
-      : top(top), parent(parent), modelNames(modelNames), limit(limit) {}
+                const llvm::StringSet<> &modelNames, unsigned limit,
+                bool exclusive)
+      : top(top), parent(parent), modelNames(modelNames), limit(limit),
+        exclusive(exclusive) {}
   void run();
 
 private:
+  /// A value's sink: the one model input (instance and operand) its logic
+  /// reaches, or none yet, or several or anything else.
+  static constexpr int64_t kNoSink = -1, kManySinks = -2;
+  static int64_t sinkCode(unsigned instance, unsigned operand) {
+    return (int64_t(instance) << 32) | operand;
+  }
   bool dependsOnPorts(Value value);
   bool isConeOp(Operation *op);
+  int64_t sinkOf(Value value);
   bool collect(Value root, SmallVectorImpl<Operation *> &ops,
-               SmallVectorImpl<Value> &leaves);
+               SmallVectorImpl<Value> &leaves, int64_t only = kNoSink,
+               const DenseSet<Value> *forced = nullptr);
   bool match(Value a, Value b, DenseMap<Value, Value> &leafMap,
-             DenseMap<Value, Value> &matched);
+             DenseMap<Value, Value> &matched,
+             DenseSet<Value> *differing = nullptr);
 
   ModuleOp top;
   hw::HWModuleOp parent;
   const llvm::StringSet<> &modelNames;
   unsigned limit;
+  bool exclusive;
   DenseMap<Value, bool> portDeps;
+  /// The instances of the model being absorbed into, by their index, and the
+  /// sinks of the parent's values for it.
+  DenseMap<Operation *, unsigned> instanceIndex;
+  DenseMap<Value, int64_t> sinks;
   /// Inputs added to a model, by the value each instance gives them.
   DenseMap<Operation *, SmallVector<std::pair<SmallVector<Value>, Value>>>
       absorbedInputs;
@@ -546,11 +562,88 @@ bool LogicAbsorber::isConeOp(Operation *op) {
          op->getNumResults() >= 1;
 }
 
+/// The one input of an instance of the model that `root` reaches through
+/// logic, as `sinkCode`; `kManySinks` if it reaches several, or anything else
+/// (state, an output, another model). Without recursion, over the users
+/// depth first; logic has no cycles but through state, which ends a search.
+int64_t LogicAbsorber::sinkOf(Value root) {
+  if (auto it = sinks.find(root); it != sinks.end())
+    return it->second;
+  auto meet = [](int64_t a, int64_t b) {
+    return a == kNoSink ? b : b == kNoSink ? a : a == b ? a : kManySinks;
+  };
+  struct Frame {
+    Value value;
+    SmallVector<OpOperand *> uses;
+    unsigned next = 0, nextResult = 0;
+    int64_t sink = kNoSink;
+  };
+  SmallVector<Frame> frames;
+  auto enter = [&](Value value) {
+    sinks[value] = kNoSink;
+    auto &frame = frames.emplace_back();
+    frame.value = value;
+    for (auto &use : value.getUses())
+      frame.uses.push_back(&use);
+  };
+  enter(root);
+  std::optional<int64_t> returned;
+  while (!frames.empty()) {
+    auto &frame = frames.back();
+    if (returned) {
+      frame.sink = meet(frame.sink, *returned);
+      returned.reset();
+      ++frame.nextResult;
+    }
+    bool descend = false;
+    while (frame.sink != kManySinks && frame.next < frame.uses.size()) {
+      OpOperand *use = frame.uses[frame.next];
+      Operation *user = use->getOwner();
+      if (auto it = instanceIndex.find(user); it != instanceIndex.end()) {
+        frame.sink = meet(frame.sink, sinkCode(it->second,
+                                               use->getOperandNumber()));
+        ++frame.next;
+        continue;
+      }
+      if (!isConeOp(user)) {
+        frame.sink = kManySinks;
+        break;
+      }
+      if (frame.nextResult == user->getNumResults()) {
+        ++frame.next;
+        frame.nextResult = 0;
+        continue;
+      }
+      Value result = user->getResult(frame.nextResult);
+      if (auto it = sinks.find(result); it != sinks.end()) {
+        frame.sink = meet(frame.sink, it->second);
+        ++frame.nextResult;
+        continue;
+      }
+      descend = true;
+      break;
+    }
+    if (descend) {
+      auto &top = frames.back();
+      enter(top.uses[top.next]->getOwner()->getResult(top.nextResult));
+      continue;
+    }
+    int64_t sink = frame.sink;
+    sinks[frame.value] = sink;
+    frames.pop_back();
+    returned = sink;
+  }
+  return sinks[root];
+}
+
 /// The logic computing `root` from the ports, in operand-first order, and the
 /// values it reads: ports, the parent's state, or other logic's results that do
-/// not depend on ports. Fails if there is none or it is over the limit.
+/// not depend on ports. Fails if there is none or it is over the limit. With
+/// `only`, the logic is what reaches that input alone (`sinkOf`): a value
+/// other logic also reads is a leaf.
 bool LogicAbsorber::collect(Value root, SmallVectorImpl<Operation *> &ops,
-                            SmallVectorImpl<Value> &leaves) {
+                            SmallVectorImpl<Value> &leaves, int64_t only,
+                            const DenseSet<Value> *forced) {
   DenseSet<Operation *> seen;
   DenseSet<Value> leafSet;
   // Operand first, without recursion: a cone may chain far more ops than a
@@ -561,8 +654,10 @@ bool LogicAbsorber::collect(Value root, SmallVectorImpl<Operation *> &ops,
     // is done with.
     auto enter = [&](Value value) {
       auto *op = value.getDefiningOp();
-      bool inside = op && isConeOp(op) &&
-                    (dependsOnPorts(value) || op->getNumOperands() == 0);
+      bool inside = op && isConeOp(op) && !(forced && forced->contains(value)) &&
+                    (op->getNumOperands() == 0 ||
+                     (dependsOnPorts(value) &&
+                      (only == kNoSink || sinkOf(value) == only)));
       if (!inside) {
         if (leafSet.insert(value).second)
           leaves.push_back(value);
@@ -586,7 +681,8 @@ bool LogicAbsorber::collect(Value root, SmallVectorImpl<Operation *> &ops,
     return true;
   };
   auto *rootOp = root.getDefiningOp();
-  if (!rootOp || !isConeOp(rootOp) || !dependsOnPorts(root))
+  if (!rootOp || !isConeOp(rootOp) || !dependsOnPorts(root) ||
+      (only != kNoSink && sinkOf(root) != only))
     return false;
   if (!visit(root))
     return false;
@@ -606,9 +702,13 @@ static bool sameAttributes(Operation *a, Operation *b) {
   return filtered(a) == filtered(b);
 }
 
-/// Whether `b` is the same logic as `a`, its leaves in `leafMap`.
+/// Whether `b` is the same logic as `a`, its leaves in `leafMap`. With
+/// `differing`, a value of `a` that is other logic of the same type in `b` (a
+/// constant of another value, a padded input, ...) matches, and is noted
+/// there.
 bool LogicAbsorber::match(Value a, Value b, DenseMap<Value, Value> &leafMap,
-                          DenseMap<Value, Value> &matched) {
+                          DenseMap<Value, Value> &matched,
+                          DenseSet<Value> *differing) {
   if (auto it = leafMap.find(a); it != leafMap.end()) {
     if (!it->second)
       return (it->second = b), true;
@@ -623,11 +723,21 @@ bool LogicAbsorber::match(Value a, Value b, DenseMap<Value, Value> &leafMap,
       opA->getResultTypes() != opB->getResultTypes() ||
       opA->getNumOperands() != opB->getNumOperands() ||
       cast<OpResult>(a).getResultNumber() !=
-          cast<OpResult>(b).getResultNumber())
-    return false;
-  for (auto [x, y] : llvm::zip(opA->getOperands(), opB->getOperands()))
-    if (!match(x, y, leafMap, matched))
+          cast<OpResult>(b).getResultNumber()) {
+    if (!differing || a.getType() != b.getType())
       return false;
+    differing->insert(a);
+    return true;
+  }
+  for (auto [x, y] : llvm::zip(opA->getOperands(), opB->getOperands()))
+    if (!match(x, y, leafMap, matched, differing)) {
+      // Logic of other operand types below (a bus of fewer elements): the
+      // whole value differs.
+      if (!differing || a.getType() != b.getType())
+        return false;
+      differing->insert(a);
+      return true;
+    }
   return true;
 }
 
@@ -651,6 +761,10 @@ void LogicAbsorber::run() {
     });
     if (numInstances != instances.size())
       continue;
+    instanceIndex.clear();
+    sinks.clear();
+    for (auto [i, instance] : llvm::enumerate(instances))
+      instanceIndex[instance.getOperation()] = i;
     for (unsigned index = 0; index < model.getNumInputPorts(); ++index) {
       auto arg = model.getBodyBlock()->getArgument(index);
       if (arg.use_empty() || isa<seq::ClockType>(arg.getType()))
@@ -660,23 +774,46 @@ void LogicAbsorber::run() {
       SmallVector<Operation *> ops;
       SmallVector<Value> leaves;
       portDeps.clear();
-      if (!collect(instances[0].getOperand(index), ops, leaves))
-        continue;
+      // Over the limit, with `exclusive`, the logic that reaches this input
+      // alone: what other inputs or state also read stays in the parent.
+      int64_t only = kNoSink;
+      if (!collect(instances[0].getOperand(index), ops, leaves)) {
+        ops.clear();
+        leaves.clear();
+        only = sinkCode(0, index);
+        if (!exclusive ||
+            !collect(instances[0].getOperand(index), ops, leaves, only))
+          continue;
+      }
+      // Every instance's leaves for the logic, if it is the same logic. With
+      // `exclusive`, a value that differs among the instances (a constant
+      // index into a bus, an input padded with zeros) is a leaf too: each
+      // instance's value becomes the model's input.
       SmallVector<SmallVector<Value>> leavesOf;
-      bool same = true;
-      for (auto instance : instances) {
-        DenseMap<Value, Value> leafMap;
-        for (auto leaf : leaves)
-          leafMap[leaf] = Value();
-        DenseMap<Value, Value> matched;
-        if (!match(instances[0].getOperand(index), instance.getOperand(index),
-                   leafMap, matched)) {
-          same = false;
-          break;
+      auto matchAll = [&](DenseSet<Value> *differing) {
+        leavesOf.clear();
+        for (auto instance : instances) {
+          DenseMap<Value, Value> leafMap;
+          for (auto leaf : leaves)
+            leafMap[leaf] = Value();
+          DenseMap<Value, Value> matched;
+          if (!match(instances[0].getOperand(index),
+                     instance.getOperand(index), leafMap, matched, differing))
+            return false;
+          auto &mapped = leavesOf.emplace_back();
+          for (auto leaf : leaves)
+            mapped.push_back(leafMap[leaf]);
         }
-        auto &mapped = leavesOf.emplace_back();
-        for (auto leaf : leaves)
-          mapped.push_back(leafMap[leaf]);
+        return true;
+      };
+      DenseSet<Value> differing;
+      bool same = matchAll(exclusive ? &differing : nullptr);
+      if (same && !differing.empty()) {
+        ops.clear();
+        leaves.clear();
+        same = collect(instances[0].getOperand(index), ops, leaves, only,
+                       &differing) &&
+               matchAll(nullptr);
       }
       if (!same)
         continue;
@@ -747,6 +884,12 @@ void LogicAbsorber::run() {
       for (auto instance : instances)
         instance.erase();
       instances = replacements;
+      // The sinks found so far name instances by index: they hold for the
+      // replacements, but for the leaves, which the new inputs also read.
+      instanceIndex.clear();
+      for (auto [i, instance] : llvm::enumerate(instances))
+        instanceIndex[instance.getOperation()] = i;
+      sinks.clear();
     }
   }
 }
@@ -776,7 +919,8 @@ void ExtractModelsPass::runOnOperation() {
   }
 
   if (absorbLogic)
-    LogicAbsorber(top, parent, modelNames, absorbLogic).run();
+    LogicAbsorber(top, parent, modelNames, absorbLogic, absorbExclusive)
+        .run();
 
   auto *body = parent.getBodyBlock();
   auto originalPorts = parent.getPortList();

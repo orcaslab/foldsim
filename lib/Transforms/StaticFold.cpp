@@ -328,11 +328,23 @@ private:
   /// Places every evaluation of the given choice of ready passes; II, or 0
   /// if the evaluations depend on each other in a cycle.
   unsigned place(ArrayRef<bool> ready, SmallVectorImpl<SmallVector<int>> &slots,
-                 ReadyWrites &writes);
+                 ReadyWrites &writes, unsigned below = 0);
   /// The evaluations of the last cycle `place` found, for the search for
   /// ready passes and the error.
   std::string lastCycle;
   SmallVector<Node> lastCycleNodes;
+  /// The search for ready passes: the choices placed, and those not placed
+  /// as no shorter than the best frame by their bound.
+  unsigned searchPlaced = 0, searchPruned = 0;
+  /// What each instance of each class reads from late outputs, input by
+  /// input in order, with the link's latency: the same for every choice of
+  /// ready passes, so built once for a search (`frameGraph`); cleared where
+  /// the links' latencies change (chain cuts, SLR groups).
+  struct LateRead {
+    unsigned input, producer, inst;
+    int latency;
+  };
+  std::vector<std::vector<SmallVector<LateRead, 4>>> lateReads;
   /// Late outputs written at their class's state pass even with a ready
   /// pass: what the search for ready passes moved out of a cycle.
   DenseSet<unsigned> stateOnly;
@@ -346,13 +358,13 @@ private:
   void explainCycle(ArrayRef<bool> ready, InFlightDiagnostic &diag);
   /// Places the evaluations with consecutive frames overlapped: the shortest
   /// frame at which every copy's evaluations fit, modulo the frame, and every
-  /// dependence across frames holds; 0 if none does.
+  /// dependence across frames holds, shorter than `below`; 0 if none does.
   unsigned placeModulo(
       ArrayRef<Node> nodes,
       ArrayRef<SmallVector<std::pair<unsigned, int>>> preds,
       ArrayRef<SmallVector<std::pair<unsigned, int>>> succs,
       ArrayRef<int> height, const ReadyWrites &writes,
-      SmallVectorImpl<SmallVector<int>> &slots);
+      SmallVectorImpl<SmallVector<int>> &slots, unsigned below);
   LogicalResult buildCopy(Class &cls);
   LogicalResult buildSim();
 
@@ -1065,6 +1077,7 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
 }
 
 void StaticFolder::chainCuts() {
+  lateReads.clear();
   cutLinks.clear();
   if (!zeroLatencyLinks || !zeroLatencyChains || !zeroChainHops)
     return;
@@ -1490,27 +1503,56 @@ void StaticFolder::frameGraph(ArrayRef<bool> ready, ReadyWrites &writes,
       writes.rows += writes.passes[c] - 1;
   }
 
-  // The evaluations, and what each waits for within the frame.
+  // What each instance reads from late outputs, once for the search.
+  if (lateReads.empty()) {
+    lateReads.resize(classes.size());
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      lateReads[c].resize(cls.threads());
+      for (unsigned i = 0; i < cls.threads(); ++i)
+        for (unsigned input = 0; input < cls.inputNames.size(); ++input) {
+          int k = cls.consumerOf[input];
+          if (k < 0)
+            continue;
+          for (auto &piece : consumers[k].pieces[i]) {
+            if (piece.producer < 0)
+              continue;
+            auto &producer = producers[piece.producer];
+            if (producer.cls < 0 || !producer.late)
+              continue;
+            lateReads[c][i].push_back(
+                {input, unsigned(piece.producer), piece.inst,
+                 zeroLink(piece.producer, c, input)
+                     ? 0
+                     : int(linkLatency + crossDelay(producer.cls, c))});
+          }
+        }
+    }
+  }
+
+  // The evaluations, and what each waits for within the frame: each
+  // instance's ready passes by level, then its state pass.
   auto &nodes = graph.nodes;
   auto &preds = graph.preds;
   nodes.clear();
-  std::map<std::tuple<unsigned, unsigned, unsigned, unsigned>, unsigned>
-      nodeIndex;
-  for (auto [c, cls] : llvm::enumerate(classes))
+  SmallVector<unsigned> base(classes.size());
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    base[c] = nodes.size();
     for (unsigned i = 0; i < cls.threads(); ++i)
       for (auto pass : {kReady, kState})
-        for (unsigned l = 0; l < (pass == kReady ? writes.passes[c] : 1);
-             ++l) {
-          nodeIndex[{c, i, pass, l}] = nodes.size();
+        for (unsigned l = 0; l < (pass == kReady ? writes.passes[c] : 1); ++l)
           nodes.push_back({unsigned(c), i, pass, l});
-        }
+  }
+  auto nodeIndex = [&](unsigned c, unsigned i, Pass pass, unsigned l) {
+    return base[c] + i * (writes.passes[c] + 1) +
+           (pass == kReady ? l : writes.passes[c]);
+  };
   preds.assign(nodes.size(), {});
   graph.why.assign(keepWhy ? nodes.size() : 0, {});
   for (auto [n, node] : llvm::enumerate(nodes)) {
     auto &cls = classes[node.cls];
     if (node.pass == kState)
       for (unsigned l = 0; l < writes.passes[node.cls]; ++l) {
-        preds[n].push_back({nodeIndex[{node.cls, node.inst, kReady, l}], 1});
+        preds[n].push_back({nodeIndex(node.cls, node.inst, kReady, l), 1});
         if (keepWhy)
           graph.why[n].push_back({});
       }
@@ -1523,26 +1565,16 @@ void StaticFolder::frameGraph(ArrayRef<bool> ready, ReadyWrites &writes,
         if (atReady[p] && writes.level[p] == node.level)
           reads |= cls.deps[o];
       }
-    for (auto input : reads.set_bits()) {
-      int k = cls.consumerOf[input];
-      if (k < 0)
+    for (auto &read : lateReads[node.cls][node.inst]) {
+      if (!reads.test(read.input))
         continue;
-      for (auto &piece : consumers[k].pieces[node.inst]) {
-        if (piece.producer < 0)
-          continue;
-        auto &producer = producers[piece.producer];
-        if (producer.cls < 0 || !producer.late)
-          continue;
-        auto pass = writes.passOf(piece.producer);
-        unsigned l = pass == kReady ? writes.level[piece.producer] : 0;
-        preds[n].push_back(
-            {nodeIndex[{unsigned(producer.cls), piece.inst, pass, l}],
-             zeroLink(piece.producer, node.cls, input)
-                 ? 0
-                 : linkLatency + crossDelay(producer.cls, node.cls)});
-        if (keepWhy)
-          graph.why[n].push_back({piece.producer, unsigned(input)});
-      }
+      auto &producer = producers[read.producer];
+      auto pass = writes.passOf(read.producer);
+      unsigned l = pass == kReady ? writes.level[read.producer] : 0;
+      preds[n].push_back(
+          {nodeIndex(unsigned(producer.cls), read.inst, pass, l), read.latency});
+      if (keepWhy)
+        graph.why[n].push_back({int(read.producer), read.input});
     }
   }
 }
@@ -1580,9 +1612,33 @@ static unsigned writeRow(const ReadyWrites &writes, const Producer &producer,
              : writes.row(producer.cls, kState);
 }
 
+/// The first slot from `at` on a copy's slots `taken` leave free, the slots
+/// taken modulo `period` (0: not), and every residue not taken.
+static int firstFree(const llvm::BitVector &taken, int at, unsigned period) {
+  if (!period) {
+    if (at >= int(taken.size()))
+      return at;
+    int free = taken.find_first_unset_in(at, taken.size());
+    return free < 0 ? int(taken.size()) : free;
+  }
+  unsigned r = at % period;
+  int free = taken.find_first_unset_in(r, period);
+  if (free < 0)
+    return at + (period - r) + taken.find_first_unset();
+  return at + (free - r);
+}
+
+/// Takes slot `at` of a copy's slots (modulo `period`, 0: not).
+static void takeSlot(llvm::BitVector &taken, int at, unsigned period) {
+  unsigned bit = period ? at % period : at;
+  if (bit >= taken.size())
+    taken.resize(std::max<unsigned>(bit + 1, taken.size() * 2));
+  taken.set(bit);
+}
+
 unsigned StaticFolder::place(ArrayRef<bool> ready,
                              SmallVectorImpl<SmallVector<int>> &slots,
-                             ReadyWrites &writes) {
+                             ReadyWrites &writes, unsigned below) {
   FrameGraph graph;
   frameGraph(ready, writes, graph, /*keepWhy=*/false);
   auto &nodes = graph.nodes;
@@ -1639,7 +1695,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
 
   // List scheduling: in topological order, highest first among the ready.
   SmallVector<int> slotOf(nodes.size(), -1);
-  std::vector<std::set<int>> busy(classes.size());
+  std::vector<llvm::BitVector> busy(classes.size());
   SmallVector<unsigned> waiting(nodes.size(), 0);
   for (unsigned n = 0; n < nodes.size(); ++n)
     waiting[n] = preds[n].size();
@@ -1661,9 +1717,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     for (auto [p, latency] : preds[n])
       earliest = std::max(earliest, slotOf[p] + latency);
     auto &taken = busy[nodes[n].cls];
-    while (taken.count(earliest))
-      ++earliest;
-    taken.insert(earliest);
+    earliest = firstFree(taken, earliest, 0);
+    takeSlot(taken, earliest, 0);
     slotOf[n] = earliest;
     for (auto [s, latency] : succs[n])
       if (!--waiting[s]) {
@@ -1756,7 +1811,9 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     SmallVector<SmallVector<int>> overlapped;
     SmallVector<int> aloneSlot = outputSlot;
     SmallVector<bool> aloneEarly = outputEarly;
-    unsigned period = placeModulo(nodes, preds, succs, height, writes, overlapped);
+    unsigned period =
+        placeModulo(nodes, preds, succs, height, writes, overlapped,
+                    below ? std::min<unsigned>(below, length) : length);
     if (period && period < unsigned(length)) {
       slots = std::move(overlapped);
       return period;
@@ -1801,7 +1858,8 @@ SmallVector<unsigned> StaticFolder::readersOf(ArrayRef<Node> cycle, unsigned k,
 unsigned StaticFolder::placeModulo(
     ArrayRef<Node> nodes, ArrayRef<SmallVector<std::pair<unsigned, int>>> preds,
     ArrayRef<SmallVector<std::pair<unsigned, int>>> succs, ArrayRef<int> height,
-    const ReadyWrites &writes, SmallVectorImpl<SmallVector<int>> &slots) {
+    const ReadyWrites &writes, SmallVectorImpl<SmallVector<int>> &slots,
+    unsigned below) {
   auto &atReady = writes.atReady;
   // No frame is shorter than a copy's evaluations of it.
   SmallVector<unsigned> evaluations(classes.size(), 0);
@@ -1831,11 +1889,14 @@ unsigned StaticFolder::placeModulo(
       slack = std::max(slack, envSlackOf(k, late, period));
     return slack;
   };
-  for (unsigned period = lower; period <= 4 * lower + 64; ++period) {
+  // A frame no shorter than `below` is of no use: the frames apart are.
+  for (unsigned period = lower; period <= 4 * lower + 64 && period < below;
+       ++period) {
     // List scheduling, a copy's slots taken modulo the frame; an evaluation
     // runs at most one frame late.
     SmallVector<int> slotOf(nodes.size(), -1);
-    std::vector<std::set<int>> busy(classes.size());
+    std::vector<llvm::BitVector> busy(classes.size(),
+                                      llvm::BitVector(period, false));
     SmallVector<unsigned> waiting(nodes.size(), 0);
     for (unsigned n = 0; n < nodes.size(); ++n)
       waiting[n] = preds[n].size();
@@ -1853,13 +1914,12 @@ unsigned StaticFolder::placeModulo(
       for (auto [p, latency] : preds[n])
         earliest = std::max(earliest, slotOf[p] + latency);
       auto &taken = busy[nodes[n].cls];
-      while (taken.count(earliest % period))
-        ++earliest;
+      earliest = firstFree(taken, earliest, period);
       if (earliest >= int(2 * period)) {
         fits = false;
         break;
       }
-      taken.insert(earliest % period);
+      takeSlot(taken, earliest, period);
       slotOf[n] = earliest;
       for (auto [s, latency] : succs[n])
         if (!--waiting[s]) {
@@ -1904,15 +1964,22 @@ unsigned StaticFolder::placeModulo(
       }
       if (latest == INT_MAX)
         continue;
+      // The latest slot in (slotOf[n], latest] the copy leaves free, by
+      // blocks of residues from `latest` down.
       auto &taken = busy[node.cls];
-      taken.erase(slotOf[n] % period);
+      taken.reset(slotOf[n] % period);
       int at = slotOf[n];
-      for (int t = latest; t > slotOf[n]; --t)
-        if (!taken.count(t % period)) {
-          at = t;
+      for (int hi = latest; hi > slotOf[n];) {
+        int r = hi % int(period);
+        int lo = std::max(slotOf[n] + 1, hi - r);
+        int free = taken.find_last_unset_in(lo % int(period), r + 1);
+        if (free >= 0) {
+          at = hi - (r - free);
           break;
         }
-      taken.insert(at % period);
+        hi = lo - 1;
+      }
+      taken.set(at % period);
       slotOf[n] = at;
     }
 
@@ -2482,10 +2549,28 @@ StaticFolder::Choice StaticFolder::searchReady() {
                    [&](unsigned c) { return classes[c].splitFrom >= 0; });
   Choice best;
   stateOnly.clear();
+  lateReads.clear();
+  // A frame is at least as long as the evaluations of its busiest copy: a
+  // slot for each instance's state pass, and one for its ready pass. A
+  // choice whose bound is no shorter than the best frame found cannot better
+  // it, and is not placed (the result is the same; the search is not).
+  auto bound = [&](const SmallVector<bool> &ready) {
+    unsigned b = 0;
+    for (auto [c, cls] : llvm::enumerate(classes))
+      b = std::max(b, cls.threads() * (ready[c] ? 2u : 1u));
+    return b;
+  };
   auto tryReady = [&](const SmallVector<bool> &ready, bool orEqual = false) {
+    if (best.length &&
+        (orEqual ? bound(ready) > best.length : bound(ready) >= best.length)) {
+      ++searchPruned;
+      return false;
+    }
+    ++searchPlaced;
     SmallVector<SmallVector<int>> slots;
     ReadyWrites writes;
-    unsigned length = place(ready, slots, writes);
+    unsigned length = place(ready, slots, writes,
+                            best.length ? best.length + (orEqual ? 1 : 0) : 0);
     if (!length ||
         (best.length && (orEqual ? length > best.length : length >= best.length)))
       return false;
@@ -2837,6 +2922,9 @@ LogicalResult StaticFolder::schedule() {
       }
     }
     os << "  zero-latency links: " << zero << " of " << links << "\n";
+    if (searchPruned)
+      os << "  ready-pass search: " << searchPlaced << " choices placed, "
+         << searchPruned << " bounded out\n";
     if (zeroChainHops && zeroLatencyChains)
       os << "  chains cut past " << zeroChainHops << " hops: "
          << cutLinks.size() << " links\n";

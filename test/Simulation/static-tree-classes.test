@@ -17,6 +17,14 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/flat --static --zero-latency-links --zero-latency-chains --class-at 'root@inner:arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=WHOLE
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/flat/obj %S/Inputs/tb_reset.sv top.sv %t/flat/foldsim_sim.sv > %t/flat/build.log 2>&1
 # RUN: %t/flat/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=30 | FileCheck %s
+# The buffers alone as classes, each with the select in front of it (its
+# slice's arbiter, over the limit with the readies behind it) absorbed.
+# RUN: foldsim --srcs top.f --top Top --out %t/excl --static --zero-latency-links --zero-latency-chains --absorb-exclusive --class-at 'b@*.out_buf' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=EXCL
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/excl/obj %S/Inputs/tb_reset.sv top.sv %t/excl/foldsim_sim.sv > %t/excl/build.log 2>&1
+# RUN: %t/excl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +stall=0 | FileCheck %s
+# RUN: %t/excl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +stall=30 | FileCheck %s
+# EXCL: class-at b: b (Buf) x6
+# EXCL: foldsim: Top_model x1, b x6, root_Bank x1
 # INNER: class-at sl: sl (Slice) x6
 # INNER: class-at root: root ({{.*}}) x1
 # INNER: foldsim: Top_model x1, sl x6, root_Bank x1

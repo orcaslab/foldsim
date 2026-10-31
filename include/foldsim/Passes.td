@@ -53,6 +53,16 @@ def ExtractModels : Pass<"foldsim-extract-models", "::mlir::ModuleOp"> {
     computed in the model instead: the model takes the logic's operands as
     inputs of its own. A model's input then comes from the models that
     produce its operands rather than from a hop through the parent's model.
+
+    With `absorb-exclusive`, an input whose logic is over N ops takes the
+    part of it that reaches that input alone: a value the parent's other
+    logic, state or another input also reads stays in the parent, and the
+    model takes it as an input. Logic copied per instance in the parent (each
+    port's select in front of a per-port buffer that is a model) is then one
+    copy in the model, however wide the shared logic behind it. A value that
+    differs among the instances' logic (a constant index into a bus, an input
+    one instance has padded with zeros) is then an input too, each instance's
+    own.
   }];
   let options = [
     Option<"moduleName", "module", "std::string", "",
@@ -60,6 +70,9 @@ def ExtractModels : Pass<"foldsim-extract-models", "::mlir::ModuleOp"> {
     Option<"absorbLogic", "absorb-logic", "unsigned", "0",
            "Move logic of up to this many ops driving a model's input into "
            "the model">,
+    Option<"absorbExclusive", "absorb-exclusive", "bool", "false",
+           "Over the limit, move the part of the logic that reaches the "
+           "input alone">,
     ListOption<"models", "models", "std::string",
                "The modules simulated as separate models">,
     Option<"netlist", "netlist", "bool", "false",
