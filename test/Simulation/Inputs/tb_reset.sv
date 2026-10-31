@@ -3,7 +3,8 @@
 // per clock) and its static simulator (`foldsim_sim`) on the same input
 // tokens, the simulator's channels stalled on +stall=<percent> of the host
 // cycles, and compares the output tokens from cycle W on. Prints MATCH or the
-// first difference.
+// first difference. With BUBBLES defined, `advance` is low on
+// +bubble=<percent> of the host cycles.
 module tb;
   localparam T = 200, W = 4;
   function automatic logic [7:0] stim_x(int t);
@@ -37,6 +38,9 @@ module tb;
     .x_valid(vx), .x_bits(stim_x(ix)), .x_ready(xr),
     .rst_valid(vr), .rst_bits(ir < 2), .rst_ready(rr),
     .y_ready(yr), .y_valid(yv), .y_bits(yb),
+`ifdef BUBBLES
+    .advance(adv),
+`endif
     .profile_finish());
   int stall = 0, bubble = 0;
   logic adv;

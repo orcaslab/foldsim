@@ -177,6 +177,11 @@ struct Class {
   /// read is pending before the state pass is decided.
   unsigned page = 0;
   bool pagesOffChip = false;
+  /// Paged links (`link-kinds` with a page): the most host cycles a link
+  /// it reads or writes moves an entry in, page by page; every pass of the
+  /// copy then holds its link port that many slots, so its passes are at
+  /// least that far apart (0: none).
+  unsigned linkPage = 0;
   /// Off chip with a window (`page-hbm-window`): its slots (0: none), and
   /// each instance's slot.
   unsigned pageWindow = 0;
@@ -306,7 +311,7 @@ public:
                StringRef pageMemories, StringRef pageRows, bool compactLinks,
                ArrayRef<std::string> registeredLinks, bool shareLinks,
                bool stagedLinks, unsigned linkBlockDepth,
-               unsigned linkUltraDepth)
+               unsigned linkUltraDepth, StringRef linkKindSpec)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -328,7 +333,7 @@ public:
         pageRows(pageRows.str()), compactLinks(compactLinks),
         registeredLinkSpecs(registeredLinks), shareLinks(shareLinks),
         stagedLinks(stagedLinks), linkBlockDepth(linkBlockDepth),
-        linkUltraDepth(linkUltraDepth),
+        linkUltraDepth(linkUltraDepth), linkKindSpec(linkKindSpec.str()),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + decisionLead()),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -566,6 +571,52 @@ private:
   /// taken in its producer's host cycle, in block (ultra) RAM, read a host
   /// cycle on into the RAM's output register (0: none).
   unsigned linkBlockDepth, linkUltraDepth;
+  /// The passes a frame of class `c` (a copy): its instances' state and
+  /// ready passes.
+  unsigned passesOf(unsigned c) const {
+    return classes[c].threads() * (1 + classes[c].readyLevels);
+  }
+  /// A class's model: a copy's class's name.
+  StringRef modelOf(unsigned c) const {
+    return classes[c].splitFrom >= 0 ? StringRef(classes[classes[c].splitFrom].name)
+                                     : StringRef(classes[c].name);
+  }
+  /// `link-kinds`: <producer model>:<reader model>:<kind> rules (kind
+  /// distributed, block or ultra), parsed; a rule overrides the depths for
+  /// the links between those models that block or ultra RAM may hold.
+  std::string linkKindSpec;
+  struct LinkKind {
+    std::string kind;
+    unsigned page = 0;
+  };
+  std::map<std::pair<std::string, std::string>, LinkKind> linkKinds;
+  /// The page of the links from producer `p` to class `reader` (0: none).
+  unsigned linkPageRule(unsigned p, unsigned reader) const {
+    if (linkKinds.empty())
+      return 0;
+    auto it = linkKinds.find({modelOf(producers[p].cls).str(), modelOf(reader).str()});
+    return it == linkKinds.end() || it->second.kind == "distributed" ? 0
+                                                                     : it->second.page;
+  }
+  /// Whether a link that block or ultra RAM may hold, the input's only
+  /// source, is paged: its rule's page p, where the schedule writes its
+  /// entries and reads them p host cycles apart and each entry is written
+  /// 2p + 3 host cycles before a read of it (the write's p host cycles, the
+  /// read's p + 1 and the RAM's); early links only. Returns p, or 0.
+  unsigned linkPaged(const LinkUse &use, bool banked, unsigned entries) const;
+  LogicalResult parseLinkKinds();
+  /// A link memory's RAM style: by `link-kinds`, else by depth.
+  StringRef linkStyle(unsigned p, unsigned reader, uint64_t depth,
+                      unsigned width) const {
+    if (!linkKinds.empty()) {
+      auto it = linkKinds.find({modelOf(producers[p].cls).str(),
+                                modelOf(reader).str()});
+      if (it != linkKinds.end())
+        return it->second.kind == "distributed" ? StringRef()
+                                                : StringRef(it->second.kind);
+    }
+    return syncLinkStyle(depth, width);
+  }
   StringRef syncLinkStyle(uint64_t depth, unsigned width) const {
     if (linkUltraDepth && depth >= linkUltraDepth)
       return "ultra";
@@ -581,6 +632,19 @@ private:
   }
   /// Every link memory the simulator builds, as buildSim cuts them.
   void linkUses(std::vector<LinkUse> &uses) const;
+  /// A link's accesses in the schedule: the fewest host cycles between the
+  /// writes of two of its entries (`writeGap`), between two reads of
+  /// different entries (`readGap`: a read of the entry the read before took
+  /// needs none), and from an entry's write to a read of it (`lead`: an
+  /// early link's reads take the frame before's write); and the reads of a
+  /// new entry a frame (`reads`). The frame (II) where there is no second.
+  struct LinkTiming {
+    int writeGap, readGap, lead;
+    unsigned reads;
+    /// The fewest host cycles between two reads, of any entries.
+    int eventGap;
+  };
+  LinkTiming linkTiming(const LinkUse &use) const;
   /// The schedule report's lines on the links' storage.
   void reportLinks(raw_ostream &os);
   /// What each class evaluates at each position (`frameAt`), and whether
@@ -1323,6 +1387,40 @@ LogicalResult StaticFolder::parseRegisteredLinks() {
   return success();
 }
 
+LogicalResult StaticFolder::parseLinkKinds() {
+  if (linkKindSpec.empty())
+    return success();
+  std::set<std::string> models;
+  for (unsigned c = 0; c < classes.size(); ++c)
+    models.insert(modelOf(c).str());
+  SmallVector<StringRef> rules;
+  StringRef(linkKindSpec).split(rules, ',', -1, false);
+  for (StringRef rule : rules) {
+    SmallVector<StringRef> parts;
+    rule.trim().split(parts, ':');
+    unsigned page = 0;
+    if ((parts.size() != 3 && parts.size() != 4) ||
+        !llvm::is_contained({"distributed", "block", "ultra"}, parts[2]) ||
+        (parts.size() == 4 &&
+         (parts[3].getAsInteger(10, page) || page < 2 || page > 64 ||
+          parts[2] == "distributed")))
+      return netlist.emitError("link-kinds: '")
+             << rule
+             << "' is not <producer model>:<reader model>:"
+                "distributed|block|ultra[:<page 2..64>]";
+    for (StringRef m : {parts[0], parts[1]})
+      if (!models.count(m.str()))
+        return netlist.emitError("link-kinds: no class model '") << m << "'";
+    linkKinds[{parts[0].str(), parts[1].str()}] = {parts[2].str(), page};
+    // Both models' copies space their passes by the page.
+    if (page)
+      for (unsigned c = 0; c < classes.size(); ++c)
+        if (modelOf(c) == parts[0] || modelOf(c) == parts[1])
+          classes[c].linkPage = std::max(classes[c].linkPage, page);
+  }
+  return success();
+}
+
 bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   auto &producer = producers[p];
   if (!zeroLatencyLinks || producer.cls < 0 || !producer.late)
@@ -1501,6 +1599,73 @@ void StaticFolder::linkUses(std::vector<LinkUse> &uses) const {
       at = end;
     }
   }
+}
+
+StaticFolder::LinkTiming
+StaticFolder::linkTiming(const LinkUse &use) const {
+  int frame = int(ii);
+  LinkTiming t{frame, frame, frame, 0, frame};
+  if (frame <= 0)
+    return t;
+  auto &producer = producers[use.producer];
+  auto &pcls = classes[producer.cls];
+  auto writeAt = [&](uint64_t inst) {
+    return producer.atReady ? pcls.readySlots(producer.readyLevel)[inst]
+                            : pcls.slot[kState][inst];
+  };
+  auto mod = [&](int s) { return ((s % frame) + frame) % frame; };
+  // Writes: the entries' slots in the frame.
+  SmallVector<int> writes;
+  for (uint64_t r : use.rows)
+    writes.push_back(mod(writeAt(r)));
+  llvm::sort(writes);
+  for (size_t k = 0; k < writes.size() && writes.size() > 1; ++k) {
+    int next = k + 1 < writes.size() ? writes[k + 1] : writes[0] + frame;
+    t.writeGap = std::min(t.writeGap, next - writes[k]);
+  }
+  // Reads: each reader instance's passes, with the entry each takes.
+  auto &rcls = classes[use.reader];
+  SmallVector<std::pair<int, uint64_t>> reads;
+  for (auto [i, row] : llvm::zip(use.readers, use.readerRows)) {
+    auto take = [&](int s) {
+      reads.push_back({mod(s), row});
+      // Host cycles from the entry's write to this read (an early link
+      // reads the write of the frame before).
+      int lead = s - writeAt(row) + (producer.late ? 0 : frame);
+      t.lead = std::min(t.lead, lead);
+    };
+    take(rcls.slot[kState][i]);
+    for (unsigned l = 0; l < rcls.readyLevels; ++l)
+      take(rcls.readySlots(l)[i]);
+  }
+  llvm::sort(reads);
+  for (size_t k = 0; k < reads.size() && reads.size() > 1; ++k) {
+    int gap = reads[(k + 1) % reads.size()].first - reads[k].first;
+    t.eventGap = std::min(t.eventGap, gap > 0 ? gap : gap + frame);
+  }
+  for (size_t k = 0; k < reads.size(); ++k) {
+    auto &before = reads[(k + reads.size() - 1) % reads.size()];
+    if (reads.size() > 1 && before.second == reads[k].second)
+      continue;
+    ++t.reads;
+    if (reads.size() > 1) {
+      int gap = reads[k].first - before.first;
+      t.readGap = std::min(t.readGap, gap > 0 ? gap : gap + frame);
+    }
+  }
+  return t;
+}
+
+unsigned StaticFolder::linkPaged(const LinkUse &use, bool banked,
+                                 unsigned entries) const {
+  unsigned p = linkPageRule(use.producer, use.reader);
+  if (!p || ii == 0 || !banked || entries < 2 || use.sources != 1 ||
+      !slrOf.empty() || shortLead)
+    return 0;
+  auto t = linkTiming(use);
+  if (t.writeGap < int(p) || t.eventGap < int(p) || t.lead < int(2 * p + 3))
+    return 0;
+  return p;
 }
 
 int StaticFolder::stagedCopy(unsigned p, unsigned inst, unsigned reader,
@@ -2090,6 +2255,14 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     auto it = slots.lower_bound(t - p + 1);
     return it != slots.end() && *it < t + p;
   };
+  // A copy with paged links: every pass at least its link page apart.
+  std::vector<std::set<int>> linkSlots(classes.size());
+  auto linkClash = [&](unsigned c, int t) {
+    int p = classes[c].linkPage;
+    auto &slots = linkSlots[c];
+    auto it = slots.lower_bound(t - p + 1);
+    return it != slots.end() && *it < t + p;
+  };
   while (!heap.empty()) {
     std::pop_heap(heap.begin(), heap.end(), cmp);
     unsigned n = heap.back();
@@ -2100,12 +2273,16 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     unsigned c = nodes[n].cls;
     bool pages = nodes[n].pass == kState && paged(c);
     auto &taken = busy[c];
+    bool spaced = classes[c].linkPage > 1;
     earliest = firstFree(taken, earliest, 0);
-    while (pages && pageClash(c, earliest))
+    while ((pages && pageClash(c, earliest)) ||
+           (spaced && linkClash(c, earliest)))
       earliest = firstFree(taken, earliest + 1, 0);
     takeSlot(taken, earliest, 0);
     if (pages)
       pageSlots[c].insert(earliest);
+    if (spaced)
+      linkSlots[c].insert(earliest);
     slotOf[n] = earliest;
     for (auto [s, latency] : succs[n])
       if (!--waiting[s]) {
@@ -2138,6 +2315,12 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
           {length,
            *pageSlots[c].rbegin() - *pageSlots[c].begin() + int(cls.pageLead()),
            int(cls.pageLead()) + 4});
+  // Paged links: the next frame's first pass a link page after the last.
+  for (auto [c, cls] : llvm::enumerate(classes))
+    if (cls.linkPage > 1 && !linkSlots[c].empty())
+      length = std::max<int>(length, *linkSlots[c].rbegin() -
+                                         *linkSlots[c].begin() +
+                                         int(cls.linkPage));
   for (auto &consumer : consumers) {
     if (consumer.cls < 0)
       continue;
@@ -2268,6 +2451,10 @@ unsigned StaticFolder::placeModulo(
   for (auto [c, cls] : llvm::enumerate(classes))
     if (paged(c) && cls.threads())
       lower = std::max({lower, cls.pageLead() * cls.threads(), cls.pageLead() + 4});
+  // Nor than a copy with paged links' passes, each its link page apart.
+  for (auto [c, cls] : llvm::enumerate(classes))
+    if (cls.linkPage > 1)
+      lower = std::max(lower, cls.linkPage * evaluations[c]);
   auto cmp = [&](unsigned a, unsigned b) {
     if (height[a] != height[b])
       return height[a] < height[b];
@@ -2301,8 +2488,11 @@ unsigned StaticFolder::placeModulo(
     // slots of its page-in, the page before it and its own: the residues
     // (t - lead, t], as at most two runs of bits.
     std::vector<llvm::BitVector> pagePort(classes.size());
-    auto window = [&](unsigned c, int t, auto &&each) {
-      int lead = std::min<int>(classes[c].pageLead(), period);
+    // A copy with paged links' link port alike: each pass holds the link
+    // page's slots up to it, (t - page, t].
+    std::vector<llvm::BitVector> linkPort(classes.size());
+    auto windowOf = [&](int lead, int t, auto &&each) {
+      lead = std::min<int>(lead, period);
       int start = ((t - lead + 1) % int(period) + int(period)) % int(period);
       if (start + lead <= int(period)) {
         each(start, start + lead);
@@ -2311,6 +2501,30 @@ unsigned StaticFolder::placeModulo(
         each(0, start + lead - int(period));
       }
     };
+    auto window = [&](unsigned c, int t, auto &&each) {
+      windowOf(classes[c].pageLead(), t, each);
+    };
+    auto linkFree = [&](unsigned c, int t) {
+      auto &port = linkPort[c];
+      if (port.empty())
+        return true;
+      bool free = true;
+      windowOf(classes[c].linkPage, t,
+               [&](int lo, int hi) { free &= port.find_first_in(lo, hi) < 0; });
+      return free;
+    };
+    auto linkTake = [&](unsigned c, int t, bool take) {
+      auto &port = linkPort[c];
+      if (port.empty())
+        port.resize(period);
+      windowOf(classes[c].linkPage, t, [&](int lo, int hi) {
+        if (take)
+          port.set(lo, hi);
+        else
+          port.reset(lo, hi);
+      });
+    };
+    auto spaced = [&](unsigned n) { return classes[nodes[n].cls].linkPage > 1; };
     auto pageFree = [&](unsigned c, int t) {
       auto &port = pagePort[c];
       if (port.empty())
@@ -2352,7 +2566,9 @@ unsigned StaticFolder::placeModulo(
       unsigned c = nodes[n].cls;
       auto &taken = busy[c];
       earliest = firstFree(taken, earliest, period);
-      while (pages(n) && earliest < int(2 * period) && !pageFree(c, earliest))
+      while (earliest < int(2 * period) &&
+             ((pages(n) && !pageFree(c, earliest)) ||
+              (spaced(n) && !linkFree(c, earliest))))
         earliest = firstFree(taken, earliest + 1, period);
       if (earliest >= int(2 * period)) {
         fits = false;
@@ -2361,6 +2577,8 @@ unsigned StaticFolder::placeModulo(
       takeSlot(taken, earliest, period);
       if (pages(n))
         pageTake(c, earliest, true);
+      if (spaced(n))
+        linkTake(c, earliest, true);
       slotOf[n] = earliest;
       for (auto [s, latency] : succs[n])
         if (!--waiting[s]) {
@@ -2411,8 +2629,10 @@ unsigned StaticFolder::placeModulo(
       taken.reset(slotOf[n] % period);
       if (pages(n))
         pageTake(node.cls, slotOf[n], false);
+      if (spaced(n))
+        linkTake(node.cls, slotOf[n], false);
       int at = slotOf[n];
-      if (!pages(n)) {
+      if (!pages(n) && !spaced(n)) {
         for (int hi = latest; hi > slotOf[n];) {
           int r = hi % int(period);
           int lo = std::max(slotOf[n] + 1, hi - r);
@@ -2425,7 +2645,8 @@ unsigned StaticFolder::placeModulo(
         }
       } else {
         for (int t = latest; t > slotOf[n]; --t)
-          if (!taken.test(t % period) && pageFree(node.cls, t)) {
+          if (!taken.test(t % period) && (!pages(n) || pageFree(node.cls, t)) &&
+              (!spaced(n) || linkFree(node.cls, t))) {
             at = t;
             break;
           }
@@ -2433,6 +2654,8 @@ unsigned StaticFolder::placeModulo(
       taken.set(at % period);
       if (pages(n))
         pageTake(node.cls, at, true);
+      if (spaced(n))
+        linkTake(node.cls, at, true);
       slotOf[n] = at;
     }
 
@@ -3658,7 +3881,8 @@ void StaticFolder::reportLinks(raw_ostream &os) {
     uint64_t bits = 0;
     double cost = 0;
   };
-  Kind distributed, block, ultra, registers, staged;
+  Kind distributed, block, ultra, registers, staged, paged;
+  std::vector<std::string> useLines;
   uint64_t compactSaved = 0;
   unsigned compactMemories = 0;
   // By producer and reading class: (LUTRAM, bits).
@@ -3679,6 +3903,8 @@ void StaticFolder::reportLinks(raw_ostream &os) {
     uint64_t full = linkDepth(threads, banked);
     StringRef kind;
     uint64_t depth = 0;
+    bool syncOk = false;
+    unsigned page = 0;
     if (entries == 1 && !banked) {
       kind = "register";
       depth = 1;
@@ -3695,7 +3921,6 @@ void StaticFolder::reportLinks(raw_ostream &os) {
       depth = linkDepth(entries, banked);
       StringRef style;
       if (haveSchedule && entries != 1 && slrOf.empty() &&
-          !syncLinkStyle(depth, use.width).empty() &&
           (use.sources == 1 || !shortLead)) {
         // As buildSim decides: never forwarded, taken now or forwarded
         // from a shared register.
@@ -3723,18 +3948,29 @@ void StaticFolder::reportLinks(raw_ostream &os) {
                                    !(late && needsForward(use.producer,
                                                           use.reader, takes,
                                                           rows, 3)))
-          style = syncLinkStyle(depth, use.width);
+          syncOk = true;
+      }
+      if (syncOk)
+        style = linkStyle(use.producer, use.reader, depth, use.width);
+      // A paged link: p rows an entry of a p-th of its bits.
+      if (!style.empty())
+        page = linkPaged(use, banked, entries);
+      uint64_t rows = page ? depth * llvm::PowerOf2Ceil(page) : depth;
+      unsigned cols = page ? (use.width + page - 1) / page : use.width;
+      if (page) {
+        paged.memories++;
+        paged.bits += 2 * use.width;
       }
       if (style == "ultra") {
         kind = "ultra";
         ultra.memories++;
-        ultra.bits += depth * use.width;
-        ultra.cost += uram(depth, use.width);
+        ultra.bits += rows * cols;
+        ultra.cost += uram(rows, cols);
       } else if (style == "block") {
         kind = "block";
         block.memories++;
-        block.bits += depth * use.width;
-        block.cost += bram36(depth, use.width);
+        block.bits += rows * cols;
+        block.cost += bram36(rows, cols);
       } else {
         kind = "distributed";
         distributed.memories++;
@@ -3749,6 +3985,21 @@ void StaticFolder::reportLinks(raw_ostream &os) {
       ++compactMemories;
       compactSaved += (full - depth) * use.width;
     }
+    if (haveSchedule && kind != "register" && kind != "staged") {
+      // For the fold-degree model's link tiers: the link's models, shape,
+      // kind, whether block or ultra RAM may hold it, and its accesses.
+      auto timing = linkTiming(use);
+      std::string line;
+      llvm::raw_string_ostream ls(line);
+      ls << "    link use " << modelOf(producer.cls) << " "
+         << modelOf(use.reader) << " " << use.width << " " << depth << " "
+         << entries << " " << kind << " " << (syncOk ? 1 : 0) << " "
+         << timing.writeGap << " " << timing.readGap << " " << timing.lead
+         << " " << timing.reads << " " << (banked ? 1 : 0) << " "
+         << use.sources << " " << passesOf(producer.cls) << " "
+         << passesOf(use.reader) << " " << page << "\n";
+      useLines.push_back(std::move(line));
+    }
     if (dump) {
       auto &pc = classes[producer.cls];
       *dump << pc.name << " " << pc.outputNames[producer.port] << " "
@@ -3757,8 +4008,13 @@ void StaticFolder::reportLinks(raw_ostream &os) {
             << classes[use.reader].name << " "
             << classes[use.reader].threads() << " " << use.input << " "
             << kind << " " << depth << " " << producer.name << "_to_"
-            << classes[use.reader].name << "_" << use.input << "_" << use.at
-            << "\n";
+            << classes[use.reader].name << "_" << use.input << "_" << use.at;
+      if (haveSchedule) {
+        auto timing = linkTiming(use);
+        *dump << " " << timing.writeGap << " " << timing.readGap << " "
+              << timing.lead << " " << timing.reads;
+      }
+      *dump << "\n";
     }
   }
   os << "  link storage: " << distributed.memories + block.memories +
@@ -3775,6 +4031,9 @@ void StaticFolder::reportLinks(raw_ostream &os) {
   if (compactLinks)
     os << "; compact: " << compactMemories << " links, " << compactSaved
        << " bits saved";
+  if (paged.memories)
+    os << "; paged: " << paged.memories << " links, " << paged.bits
+       << " flops";
   os << "\n";
   // For the fold-degree model: memories, bits and cost per kind (LUTRAM
   // LUTs, RAMB36, URAM288; flip-flops for registers).
@@ -3786,6 +4045,8 @@ void StaticFolder::reportLinks(raw_ostream &os) {
      << "; registers "
      << registers.memories + staged.memories << " "
      << registers.bits + staged.bits << "\n";
+  for (auto &line : useLines)
+    os << line;
   // The largest in distributed RAM, by the classes they join.
   SmallVector<std::pair<std::pair<unsigned, unsigned>, std::pair<double, uint64_t>>>
       largest(byPair.begin(), byPair.end());
@@ -7168,6 +7429,62 @@ LogicalResult StaticFolder::buildSim() {
   };
   std::map<std::pair<std::string, std::vector<uint64_t>>, CompactWrite>
       compactWrites;
+  // Paged links' gathers, per reader class and page: tables of the frame's
+  // position (the class's `at3`) give, for each host cycle of the p before
+  // a pass, the page read and the instance whose entry it reads (and
+  // whether that position is in another frame than the pass, for the bank);
+  // registered as the class's controls are, the page is the read address's
+  // low bits a host cycle ahead and selects the register it loads.
+  struct LinkGather {
+    Value inst2, flip2, page1;
+    SmallVector<Value> load0;
+  };
+  std::map<std::pair<unsigned, unsigned>, LinkGather> linkGathers;
+  auto gatherFor = [&](unsigned c, unsigned page) -> const LinkGather & {
+    auto &g = linkGathers[{c, page}];
+    if (g.page1)
+      return g;
+    auto &cls = classes[c];
+    auto &ctl = controls[c];
+    unsigned threads = cls.threads();
+    unsigned idxWidth = threads > 1 ? llvm::Log2_32_Ceil(threads) : 1;
+    unsigned pageBits = std::max(1u, llvm::Log2_32(unsigned(llvm::PowerOf2Ceil(page))));
+    SmallVector<uint64_t> valid(ii + 1, 0), pageRow(ii + 1, 0), inst(ii + 1, 0),
+        flip(ii + 1, 0);
+    auto floorDiv = [&](int x) {
+      return x >= 0 ? x / int(ii) : -((-x + int(ii) - 1) / int(ii));
+    };
+    for (unsigned i = 0; i < threads; ++i) {
+      SmallVector<int> slots{cls.slot[kState][i]};
+      for (unsigned l = 0; l < cls.readyLevels; ++l)
+        slots.push_back(cls.readySlots(l)[i]);
+      for (int s : slots)
+        for (unsigned k = 0; k < page; ++k) {
+          int q = s - int(page) + int(k);
+          unsigned row = unsigned(((q % int(ii)) + int(ii)) % int(ii));
+          valid[row] = 1;
+          pageRow[row] = k;
+          inst[row] = i;
+          flip[row] = floorDiv(q) & 1;
+        }
+    }
+    std::string prefix = (cls.name + "_gather" + Twine(page)).str();
+    Value valid2 = reg(table(b, ctl.at3, valid, 1), prefix + "_valid2");
+    Value page2 = reg(table(b, ctl.at3, pageRow, pageBits), prefix + "_page2");
+    g.inst2 = threads > 1 ? reg(table(b, ctl.at3, inst, idxWidth), prefix + "_inst2")
+                          : Value();
+    g.flip2 = reg(table(b, ctl.at3, flip, 1), prefix + "_flip2");
+    g.page1 = reg(page2, prefix + "_page1");
+    for (unsigned k = 0; k < page; ++k) {
+      Value load2 = comb::AndOp::create(
+          b, valid2,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::eq, page2,
+                               constant(pageBits, k)));
+      g.load0.push_back(reg(reg(load2, prefix + "_load1_" + Twine(k)),
+                            prefix + "_load0_" + Twine(k)));
+    }
+    return g;
+  };
   // With `compact` (the producer instances the reader takes, sorted), the
   // link keeps an entry for each of those alone, at its index among them;
   // the other instances' writes are masked, and so are their forwards and
@@ -7181,7 +7498,10 @@ LogicalResult StaticFolder::buildSim() {
                       SmallVectorImpl<AfterForward> *after = nullptr,
                       bool late = false, bool forwardLate = false,
                       ArrayRef<uint64_t> compact = {},
-                      StringRef syncStyle = {}) -> Value {
+                      StringRef syncStyle = {}, unsigned page = 0,
+                      const LinkGather *gather = nullptr) -> Value {
+    assert((!page || (gather && !late && !now && !forward && !after)) &&
+           "a paged link is never forwarded, taken now or written late");
     auto &producer = producers[p];
     unsigned c = producer.cls;
     auto &ctl = controls[c];
@@ -7321,19 +7641,22 @@ LogicalResult StaticFolder::buildSim() {
       // two, beyond the last instance.
       unsigned indices = threads > 1 ? llvm::PowerOf2Ceil(threads) : 1;
       unsigned depth = banked ? 2 * indices : threads;
-      auto memType = seq::FirMemType::get(context, depth, w, 1);
       // A block or ultra RAM link (`syncStyle`) reads at the same registered
       // address a host cycle on, into its output register, which is the read
       // register: read-first, as a distributed RAM's read register takes the
       // entry before a write landing at the same edge.
       bool sync = !syncStyle.empty();
-      auto memory = seq::FirMemOp::create(
-          b, memType, /*readLatency=*/sync ? 1 : 0, /*writeLatency=*/1,
-          sync ? seq::RUW::Old : seq::RUW::Undefined, seq::WUW::Undefined,
-          b.getStringAttr(name), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
-          StringAttr{}, Attribute{});
-      if (sync)
-        setRamStyle(memory, syncStyle);
+      auto makeMemory = [&](uint64_t rows, unsigned cols) {
+        auto memory = seq::FirMemOp::create(
+            b, seq::FirMemType::get(context, rows, cols, 1),
+            /*readLatency=*/sync ? 1 : 0, /*writeLatency=*/1,
+            sync ? seq::RUW::Old : seq::RUW::Undefined, seq::WUW::Undefined,
+            b.getStringAttr(name), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+            StringAttr{}, Attribute{});
+        if (sync)
+          setRamStyle(memory, syncStyle);
+        return memory;
+      };
       // The bank in the high bit, the instance in the low ones.
       SmallVector<Value> writeAddress, readAddress;
       if (banked) {
@@ -7362,6 +7685,79 @@ LogicalResult StaticFolder::buildSim() {
         writeAddress.push_back(compact.empty() ? group.inst : compactInst);
         readAddress.push_back(address());
       }
+      if (page) {
+        // A paged link (`link-kinds` with a page p): an entry in p rows of
+        // a p-th of its bits, the page in the low address bits. The write
+        // holds the producer's bits and the entry at its pass and writes a
+        // page a host cycle over the p after it; the reader's gather (the
+        // class's gather controls) reads its entry's pages over the p + 1
+        // host cycles before its slot into a register each, which together
+        // are the read register.
+        unsigned pages = llvm::PowerOf2Ceil(page);
+        unsigned pageBits = std::max(1u, llvm::Log2_32(pages));
+        unsigned cols = (w + page - 1) / page;
+        auto memory = makeMemory(uint64_t(depth) * pages, cols);
+        Value writeAt = b.createOrFold<comb::ConcatOp>(writeAddress);
+        Value heldAt = seq::CompRegClockEnabledOp::create(
+            b, writeAt, hostClock, writeEnable,
+            b.getStringAttr(name + "_page_at"), Value(), Value(), Value(),
+            hw::InnerSymAttr());
+        Value held = seq::CompRegClockEnabledOp::create(
+            b, writeData, hostClock, writeEnable,
+            b.getStringAttr(name + "_page_data"), Value(), Value(), Value(),
+            hw::InnerSymAttr());
+        // The write's page: a host cycle each after the pass.
+        SmallVector<Value> step;
+        Value previous = writeEnable;
+        for (unsigned k = 0; k < page; ++k)
+          step.push_back(previous = reg(previous, name + "_page_we" + Twine(k)));
+        Value we = step[0];
+        for (unsigned k = 1; k < page; ++k)
+          we = comb::OrOp::create(b, we, step[k]);
+        SmallVector<Value> indexBits;
+        for (unsigned bit = 0; bit < pageBits; ++bit) {
+          Value v = constant(1, 0);
+          for (unsigned k = 0; k < page; ++k)
+            if (k >> bit & 1)
+              v = comb::OrOp::create(b, v, step[k]);
+          indexBits.push_back(v);
+        }
+        Value index = b.createOrFold<comb::ConcatOp>(
+            SmallVector<Value>(indexBits.rbegin(), indexBits.rend()));
+        SmallVector<Value> chunks;
+        for (unsigned k = pages; k-- > 0;) {
+          unsigned lo = std::min(k * cols, w);
+          unsigned n = std::min(cols, w - lo);
+          Value chunk = n ? b.createOrFold<comb::ExtractOp>(b.getIntegerType(n),
+                                                          held, lo)
+                          : constant(cols, 0);
+          if (n && n < cols)
+            chunk = b.createOrFold<comb::ConcatOp>(constant(cols - n, 0), chunk);
+          chunks.push_back(chunk);
+        }
+        Value pageData = hw::ArrayGetOp::create(
+            b, hw::ArrayCreateOp::create(b, chunks), index);
+        seq::FirMemWriteOp::create(
+            b, memory, b.createOrFold<comb::ConcatOp>(heldAt, index), hostClock,
+            we, pageData, Value{});
+        // The gather: the read address the caller gave (bank and entry,
+        // registered) with the page of the class's gather controls.
+        readAddress.push_back(gather->page1);
+        Value readAt = b.createOrFold<comb::ConcatOp>(readAddress);
+        Value out = seq::FirMemReadOp::create(b, memory, readAt, hostClock,
+                                             constant(1, 1));
+        SmallVector<Value> gathered;
+        for (unsigned k = page; k-- > 0;)
+          gathered.push_back(seq::CompRegClockEnabledOp::create(
+              b, out, hostClock, gather->load0[k],
+              b.getStringAttr(name + "_page" + Twine(k)), Value(), Value(),
+              Value(), hw::InnerSymAttr()));
+        Value all = b.createOrFold<comb::ConcatOp>(gathered);
+        pieces.push_back(
+            b.createOrFold<comb::ExtractOp>(b.getIntegerType(w), all, 0));
+        continue;
+      }
+      auto memory = makeMemory(depth, w);
       Value writeAt = b.createOrFold<comb::ConcatOp>(writeAddress);
       Value readAt = b.createOrFold<comb::ConcatOp>(readAddress);
       Value lateAt;
@@ -7433,7 +7829,7 @@ LogicalResult StaticFolder::buildSim() {
   // register (forwarded the host cycle the write lands), for the report.
   unsigned linkReads = 0, forwardedReads = 0, forwardedAfter = 0, nowReads = 0,
            lateReads = 0, forwardedLate = 0, compactReads = 0, stagedReads = 0,
-           syncReads = 0, earlyReads = 0;
+           syncReads = 0, earlyReads = 0, pagedReads = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
   SmallVector<unsigned> classReaders(producers.size(), 0);
@@ -7758,10 +8154,28 @@ LogicalResult StaticFolder::buildSim() {
         if (sources.size() == 1 && !now && !forward && !(late && forwardLate) &&
             to < 0 && !(pThreads == 1 && !producer.late) &&
             !(pThreads == 1 && producer.late))
-          style = syncLinkStyle(linkDepth(pThreads, !producer.late), width);
+          style = linkStyle(key.first, c, linkDepth(pThreads, !producer.late),
+                            width);
         if (!style.empty()) {
           syncPart = true;
           ++syncReads;
+        }
+        // A paged link (`link-kinds` with a page), where the schedule lets it.
+        unsigned page = 0;
+        if (!style.empty()) {
+          LinkUse use{unsigned(key.first), key.second, width, unsigned(c), std::string(), {}, {}, {}};
+          std::set<uint64_t> distinct;
+          for (unsigned i = 0; i < threads; ++i)
+            if (takes[i]) {
+              distinct.insert(rows[i]);
+              use.readers.push_back(i);
+              use.readerRows.push_back(rows[i]);
+            }
+          use.rows.assign(distinct.begin(), distinct.end());
+          use.sources = sources.size();
+          use.port = consumer.port;
+          page = linkPaged(use, !producer.late, pThreads);
+          pagedReads += page > 0;
         }
         // One of several sources: read a host cycle ahead, where no write
         // of an entry it reads lands in the two host cycles before its read
@@ -7771,12 +8185,37 @@ LogicalResult StaticFolder::buildSim() {
             !shortLead && to < 0 && pThreads != 1 &&
             !needsForward(key.first, c, takes, rows, 2) &&
             !(late && needsForward(key.first, c, takes, rows, 3))) {
-          style = syncLinkStyle(linkDepth(pThreads, !producer.late), width);
+          style = linkStyle(key.first, c, linkDepth(pThreads, !producer.late),
+                            width);
           early = !style.empty();
           if (early) {
             ++syncReads;
             ++earlyReads;
           }
+        }
+        if (page) {
+          auto &g = gatherFor(c, page);
+          auto addressP = [&]() -> Value {
+            if (pThreads <= 1)
+              return Value();
+            if (threads == 1)
+              return constant(w, entryRows[0]);
+            return copyReg(table(b, g.inst2, entryRows, w),
+                           consumer.name + "_paddr" + Twine(at) + "_" +
+                               Twine(addressCopies++));
+          };
+          auto bankP = [&]() -> Value {
+            std::string name = (consumer.name + "_pparity1_" + Twine(at) + "_" +
+                                Twine(bankCopies++))
+                                   .str();
+            return comb::XorOp::create(b, copyReg(par2, name),
+                                       copyReg(g.flip2, name + "_flip"));
+          };
+          sourceData[index] = linkRead(
+              key.first, key.second, width, addressP, bankP,
+              producer.name + "_to_" + consumer.name + "_" + Twine(at), to,
+              nullptr, false, nullptr, false, false, kept, style, page, &g);
+          continue;
         }
         sourceData[index] =
             early ? linkRead(key.first, key.second, width, address2, bank2,
@@ -7959,6 +8398,8 @@ LogicalResult StaticFolder::buildSim() {
     if (linkBlockDepth || linkUltraDepth)
       os << "; block/ultra " << syncReads << " (read ahead " << earlyReads
          << ")";
+    if (pagedReads)
+      os << "; paged " << pagedReads;
     os << "\n";
     llvm::errs() << os.str();
     if (!reportPath.empty()) {
@@ -8394,7 +8835,7 @@ LogicalResult StaticFolder::resolveEnvironment() {
 LogicalResult StaticFolder::run() {
   inlineNetlists();
   if (failed(collect()) || failed(resolveEnvironment()) ||
-      failed(parseRegisteredLinks()))
+      failed(parseRegisteredLinks()) || failed(parseLinkKinds()))
     return failure();
   for (auto &cls : classes)
     if (cls.threads() > 1 &&
@@ -8465,7 +8906,7 @@ void FoldStaticPass::runOnOperation() {
                       page, pageMasks, pageHbmColumnBits, pageHbmWindow,
                       pageMemoryBits, pageMemories, pageRows, compactLinks,
                       registeredLinks, shareLinks, stagedLinks, linkBlockDepth,
-                      linkUltraDepth);
+                      linkUltraDepth, linkKinds);
   if (failed(folder.run()))
     return signalPassFailure();
 }

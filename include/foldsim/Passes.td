@@ -538,6 +538,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "which is the read register (0: none)">,
     Option<"linkUltraDepth", "link-ultra-depth", "unsigned", "0",
            "As link-block-depth, in ultra RAM (0: none)">,
+    Option<"linkKinds", "link-kinds", "std::string", "\"\"",
+           "Per pair of models, the RAM of the links between them that "
+           "link-block-depth's rules let block or ultra RAM hold, whatever "
+           "their depth: <producer model>:<reader model>:distributed|block|"
+           "ultra, comma separated (the fold-degree model's link tier, "
+           "foldsim --state auto)">,
     Option<"stagedLinks", "staged-links", "bool", "false",
            "An early link of one producer instance (its reader takes one) "
            "kept in two registers where the schedule allows: written at the "

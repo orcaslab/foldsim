@@ -599,7 +599,10 @@ def assign(units, base, caps, extra=None, paging=False, price_extra=False):
     least used is kept."""
     pools = list(caps) + list(extra or {})
     limit = dict(caps, **(extra or {}))
-    order = KINDS + ('rows',) + RELIEF_KINDS
+    # Kinds of their own (paged links, `block:4`) after the stores' kinds.
+    own = sorted({k for u in units for k in u['costs']} - set(KINDS) - {'rows'} -
+                 set(RELIEF_KINDS))
+    order = KINDS + ('rows',) + tuple(own) + RELIEF_KINDS
 
     def usage_of(i, k, p):
         return usage(units[i]['costs'][k], p)

@@ -368,6 +368,8 @@ def frame_options(a):
         fold += f' link-block-depth={a.link_block_depth}'
     if getattr(a, 'link_ultra_depth', 0):
         fold += f' link-ultra-depth={a.link_ultra_depth}'
+    if getattr(a, 'link_kinds', ''):
+        fold += f' link-kinds={a.link_kinds}'
     if getattr(a, 'registered_links', ''):
         fold += f' registered-links={a.registered_links}'
     return fold
@@ -604,6 +606,8 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
         fold = re.sub(r' page=\S+', '', fold) + f" page={res['page']}"
     if res['rows']:
         fold += f" page-rows={res['rows']}"
+    if res.get('link_kinds'):
+        fold = re.sub(r' link-kinds=\S+', '', fold) + f" link-kinds={res['link_kinds']}"
     if res['pattern'] and res['pattern'] != pattern:
         if m:
             fold = fold.replace(m.group(0), f" virtual-memories={res['pattern']}")
@@ -935,6 +939,10 @@ def main():
                          'register (foldsim-fold-static; 0: none)')
     ap.add_argument('--link-ultra-depth', type=int, default=0, metavar='N',
                     help='as --link-block-depth, in ultra RAM (foldsim-fold-static; 0: none)')
+    ap.add_argument('--link-kinds', default='', metavar='P:R:KIND,...',
+                    help='with --static: the RAM (distributed, block or ultra) of the links from model P '
+                         'to model R that --link-block-depth\'s rules let block or ultra RAM hold, '
+                         'whatever their depth (--state auto chooses them; foldsim-fold-static)')
     ap.add_argument('--staged-links', action='store_true',
                     help="with --static: an early link of one producer instance in two registers, "
                          'copied at a fixed position of the frame, where the schedule allows '

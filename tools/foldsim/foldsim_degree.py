@@ -547,6 +547,14 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     # The links' storage, as the compiler emits it (the schedule report's
     # link kinds), in the base usage the stores' kinds are chosen against.
     lk = link_cost(cal, (sched or {}).get('__links__'))
+    # With the report's link uses, a pair of models' links that block or
+    # ultra RAM may hold is a unit of its own (the link tier); the rest stays
+    # in the base.
+    lu = link_units(cal, (sched or {}).get('__links__'), ii, tiers.get('link_pages', True),
+                    tiers.get('link_hbm', False), tiers['frame']) if tiers is not None else None
+    if lu:
+        units.extend(lu[0])
+        lk = dict(lu[1])
     base = dict(sites=logic + storage.LUTRAM_SITES * lk['lutram'],
                 luts=storage.fold_load(logic + lk['lutram'], cache + lk['bram'], lk['uram']),
                 bram=cache + lk['bram'], uram=lk['uram'])
@@ -568,8 +576,27 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     rules, floor = [], 0
     off = dict(vmem_new=[], pages_offchip=[], rows_new=[], hbm_bytes=0.0, controllers=0,
                bubbles=0.0)
+    link_rules = []
     for u, ch in zip(units, choice):
         (kind, _), = ch.items()     # one store a unit: never split
+        if u.get('link'):
+            c = u['costs'][kind]
+            if kind == 'hbm':
+                off['hbm_bytes'] += c['hbm']
+                off['controllers'] += c['ctl']
+                off.setdefault('links_hbm', []).append(u['store'])
+                off['link_hbm_bytes'] = off.get('link_hbm_bytes', 0.0) + c['hbm']
+            lk['ff'] += c['ff']
+            lk['lutram'] += c['lutram']
+            lk['bram'] += c['bram']
+            lk['uram'] += c['uram']
+            lutram += c['lutram']
+            bram += c['bram']
+            uram += c['uram']
+            logic += c['lut']
+            u['kind'] = kind
+            link_rules.append(f"{u['store']}:{kind}")
+            continue
         for j, c in u['per'][kind]:
             lutram += c['lutram']
             bram += c['bram']
@@ -609,6 +636,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                link_lutram=round(lk['lutram']), link_bram=round(lk['bram'], 1),
                link_uram=lk['uram'], link_ff=lk['ff'],
                largest_copy=round(max(per_copy.values())), storage=','.join(rules),
+               **({'link_kinds': ','.join(link_rules)} if lu else {}),
                **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged))
     if tiers is not None:
         res.update(off, hbm_bytes=round(off['hbm_bytes']), hbm_cap=round(caps['hbm']))
@@ -825,8 +853,141 @@ def parse_links(text):
     if not m:
         return None
     g = m.groups()
+    uses = [dict(p=u[0], r=u[1], width=int(u[2]), depth=int(u[3]), entries=int(u[4]), kind=u[5],
+                 sync=u[6] == '1', write_gap=int(u[7]), read_gap=int(u[8]), lead=int(u[9]),
+                 reads=int(u[10]), banked=u[11] == '1', sources=int(u[12]),
+                 producer_passes=int(u[13]), reader_passes=int(u[14]), page=int(u[15]))
+            for u in re.findall(r'^    link use (\S+) (\S+) (\d+) (\d+) (\d+) (\S+) ([01]) (-?\d+) '
+                                r'(-?\d+) (-?\d+) (\d+) ([01]) (\d+) (\d+) (\d+) (\d+)$', text, re.M)]
     return dict(lutram=float(g[2]), lutram_bits=int(g[1]), bram=float(g[5]), bram_bits=int(g[4]),
-                uram=float(g[8]), uram_bits=int(g[7]), ff=int(g[10]))
+                uram=float(g[8]), uram_bits=int(g[7]), ff=int(g[10]), uses=uses)
+
+
+def link_lutram(depth, width):
+    """A link memory's LUTRAM LUTs as the schedule report counts them
+    (foldsim-fold-static reportLinks: foldsim_cost.mem_cost's distributed
+    RAM)."""
+    if depth <= 32:
+        return width * 0.57
+    blocks = (depth + 63) // 64
+    return width * blocks * 1.14 + (width * (blocks - 1) / 3.0 if depth > 64 else 0.0)
+
+
+# The link tier's kinds: the RAM a group of links (every link from one model to
+# another) is held in, where block or ultra RAM may hold it (`sync`: the
+# reader's only source or read a host cycle ahead, never forwarded or taken in
+# the producer's host cycle), and paged (`<kind>:<p>`, foldsim-fold-static
+# `link-kinds` with a page): an early link, its input's only source, as p rows
+# an entry of a p-th of its bits, its write held (W flops) and paged out over
+# the p host cycles after the pass, its read gathered page by page into W
+# flops; the select of the write's page as a paged copy's (ceil(p / 3) LUTs a
+# page bit). Paging spaces both models' passes p apart (their link ports): a
+# page is offered only where that takes at most LINK_PORT_SHARE of the frame,
+# so the frame stays the schedule's; and where each entry is written 2p + 3
+# host cycles before its read in the schedule.
+LINK_KINDS = ('distributed', 'block', 'ultra')
+LINK_PAGES = (2, 4, 8)
+LINK_PORT_SHARE = 0.5
+# Links in HBM (the `hbm` relief kind, priced only with link_hbm): each entry
+# written and each new entry read through a virtual memory a frame (a row of
+# at least an AXI beat per 4096-bit column), the read prefetched a round trip
+# ahead at its fixed slot into a landing buffer of the reads in flight, a
+# controller per column. The compiler builds no HBM links yet.
+LINK_HBM_LEAD = 8
+
+
+def link_page_ok(u, p, ii):
+    """Whether a link may page at p (see LINK_KINDS) at a frame of `ii`."""
+    return (u['sync'] and u['sources'] == 1 and u['banked'] and u['entries'] > 1 and
+            u['lead'] >= 2 * p + 3 and
+            max(u['producer_passes'], u['reader_passes']) * p <= LINK_PORT_SHARE * ii)
+
+
+def link_kind_cost(u, kind, f=1.0, b=1.0):
+    """A link's cost in a link kind (`kind` or `kind:p`), or None where it
+    cannot take it unpaged; a paged kind it cannot take costs its kind's."""
+    zero = dict(lut=0.0, lutram=0.0, ff=0, bram=0.0, uram=0.0, ii_floor=0, hbm=0.0, ctl=0)
+    base, _, page = kind.partition(':')
+    if base == 'distributed' or not u['sync']:
+        return dict(zero, lutram=f * link_lutram(u['depth'], u['width']))
+    p = int(page) if page else 0
+    if not p:
+        rows, cols = u['depth'], u['width']
+        c = dict(zero)
+    else:
+        rows, cols = u['depth'] * (1 << (p - 1).bit_length()), math.ceil(u['width'] / p)
+        c = dict(zero, ff=2 * u['width'], lut=float(cols * math.ceil(p / 3)))
+    if base == 'block':
+        c['bram'] = b * storage.bram36(rows, cols)
+    else:
+        c['uram'] = float(storage.uram(rows, cols))
+    return c
+
+
+def link_hbm_cost(u, frame, f=1.0):
+    """A link kept in HBM (LINK_HBM_LEAD), or None where its reads come too
+    soon after the writes for a prefetch at its slot."""
+    if not u['banked'] or u['lead'] < storage.HBM_ROUND_TRIP + LINK_HBM_LEAD:
+        return None
+    cols = math.ceil(u['width'] / storage.VMEM_ROW_BITS)
+    row = cols * max(storage.vmem_row_bytes(min(u['width'], storage.VMEM_ROW_BITS)),
+                     storage.HBM_BEAT_BYTES)
+    flight = min(u['reads'], math.ceil(storage.HBM_ROUND_TRIP / max(1, u['read_gap'])) + 1)
+    return dict(lut=0.0, lutram=f * link_lutram(max(2, flight), u['width']), ff=u['width'],
+                bram=0.0, uram=0.0, ii_floor=0, hbm=float((u['entries'] + u['reads']) * row),
+                ctl=cols)
+
+
+def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0):
+    """The links as storage_area units, a unit per pair of models with a
+    link that block or ultra RAM may hold (foldsim-fold-static `link-kinds`):
+    its cost in each of LINK_KINDS, paged (`<kind>:<p>`, at the schedule's
+    frame `ii`) and with `hbm` in HBM (relief, at `frame`), its other links
+    distributed; and the cost of the rest (registers and links only
+    distributed RAM may hold), for the base usage. None without the report's
+    link uses."""
+    if not links or not links.get('uses'):
+        return None
+    k = (cal or {}).get('links', {})
+    f, b = k.get('lutram', 1.0), k.get('bits', 1.0)
+    zero = dict(lut=0.0, lutram=0.0, ff=0, bram=0.0, uram=0.0, ii_floor=0)
+    rest = dict(zero, ff=round(b * links['ff']))
+    groups = {}
+    for u in links['uses']:
+        if not u['sync']:
+            rest['lutram'] += f * link_lutram(u['depth'], u['width'])
+            continue
+        groups.setdefault((u['p'], u['r']), []).append(u)
+    units = []
+    for (p, r), uses in sorted(groups.items()):
+        kinds = list(LINK_KINDS)
+        if pages and ii:
+            kinds += [f'{kind}:{q}' for kind in ('block', 'ultra') for q in LINK_PAGES
+                      if any(link_page_ok(u, q, ii) for u in uses)]
+        costs = {}
+        for kind in kinds:
+            q = int(kind.partition(':')[2] or 0)
+            c = dict(zero, hbm=0.0, ctl=0)
+            for u in uses:
+                one = link_kind_cost(u, kind if not q or link_page_ok(u, q, ii)
+                                     else kind.partition(':')[0], f, b)
+                for key in c:
+                    c[key] += one.get(key, 0)
+            costs[kind] = c
+        if hbm and frame:
+            parts = [link_hbm_cost(u, frame, f) for u in uses]
+            if all(x is not None for x in parts):
+                c = dict(zero, hbm=0.0, ctl=0)
+                for x in parts:
+                    for key in c:
+                        c[key] += x.get(key, 0)
+                c['lut'] += storage.VMEM_CTL_LUTS * max(x['ctl'] for x in parts)
+                c['ctl'] = max(x['ctl'] for x in parts)
+                costs['hbm'] = c
+        units.append(dict(costs=costs, per={kind: [(0, c)] for kind, c in costs.items()},
+                          count=1, fixed=None, store=f'{p}:{r}', default='distributed',
+                          link=True, **{'class': '__links__'}))
+    return units, rest
 
 
 # The links as the fold-degree model prices them: what the schedule report
@@ -1294,7 +1455,7 @@ FRAME_GROWTH = 4
 
 def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True, vmem=None,
                  pattern='', weights=None, pages_hbm=True, row_bytes_min=1, max_ii=1 << 16,
-                 page=True):
+                 page=True, link_pages=True, link_hbm=False):
     """--state auto: where each class's state lives, three tiers, priced.
 
       on chip    register stores and memories in flops, distributed, block or
@@ -1351,12 +1512,27 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
         raw = {c: dict(e, mems=e['mems'] + e.get('vmems', []), vmems=[]) for c, e in full.items()}
         h = project_h(frame, classes, with_pages(sched, pages or {}, off), raw, pat,
                       pages, off, weights, row_bytes_min)
+        if res.get('link_hbm_bytes'):
+            # Links in HBM: their traffic too (prefetched at their slots: no
+            # bubbles).
+            h['hbm_bytes'] += round(res['link_hbm_bytes'])
+            h['hbm_ii'] = math.ceil(h['hbm_bytes'] / storage.HBM_BYTES_PER_CYCLE)
+            h['h'] = max(h['ii'], h['hbm_ii']) + h['bubbles']
         spec = ','.join(f'{m}:{p}' for m, p in sorted((pages or {}).items()))
         return dict(page=spec, pattern=pat, storage=res.get('storage', ''), frame=frame,
                     res=res, h=h, moved=moved, pages_offchip=off,
-                    rows=tiers_pattern(res.get('rows_new', [])), rows_new=res.get('rows_new', []))
+                    rows=tiers_pattern(res.get('rows_new', [])), rows_new=res.get('rows_new', []),
+                    link_kinds=res.get('link_kinds', ''), links_hbm=res.get('links_hbm', []))
 
     lk = link_cost(cal, (sched or {}).get('__links__'))
+    lu = link_units(cal, (sched or {}).get('__links__'))
+    if lu:
+        # The links that may move are the tier's: the rest alone, each group
+        # at its least in every pool.
+        lk = dict(lu[1])
+        for u in lu[0]:
+            for p in ('lutram', 'bram', 'uram'):
+                lk[p] += min(c[p] for c in u['costs'].values())
     caps = {p: storage.MARGIN * storage.REGION[p] for p in ('sites', 'bram', 'uram')}
     if (rest + storage.LUTRAM_SITES * lk['lutram'] > caps['sites'] or lk['bram'] > caps['bram']
             or lk['uram'] > caps['uram'] or
@@ -1372,7 +1548,8 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
         if f < ii:
             continue
         tiers = dict(frame=f, base_hbm=base_hbm, base_bubbles=base_bubbles, weights=weights,
-                     pages_hbm=pages_hbm, row_bytes_min=row_bytes_min)
+                     pages_hbm=pages_hbm, row_bytes_min=row_bytes_min, link_pages=link_pages,
+                     link_hbm=link_hbm)
         if f == ii:
             res = area(cal, est, classes, {}, rest, sched, f, entries, 'auto', route, uram,
                        vmem=vmem, tiers=tiers)
@@ -1428,7 +1605,9 @@ def state_table(out, classes, est):
              f"pages off chip: {', '.join(out['pages_offchip']) or 'none'}",
              f"storage: {out['storage'] or 'default'}",
              f"links: {res.get('link_lutram', 0)} LUTRAM LUTs, {res.get('link_bram', 0)} RAMB36, "
-             f"{res.get('link_uram', 0)} URAM288 counted"]
+             f"{round(res.get('link_uram', 0))} URAM288 counted",
+             f"link kinds: {out.get('link_kinds') or 'by depth'}"
+             + (f"; in HBM: {', '.join(out['links_hbm'])}" if out.get('links_hbm') else '')]
     est = copy_estimates(est, classes)
     vest = split_virtual({c: dict(e, mems=e['mems'] + e.get('vmems', []), vmems=[])
                           for c, e in est.items()}, out['pattern'])
@@ -1615,6 +1794,9 @@ def main():
     st.add_argument('--out', default='', help='the outcome as JSON')
     st.add_argument('--links', choices=('report', 'none'), default='report',
                     help="count the links' memories from the schedule report (or --links-from's)")
+    st.add_argument('--no-link-pages', action='store_true', help='no paged links')
+    st.add_argument('--link-hbm', action='store_true',
+                    help='price links in HBM too (a what-if: the compiler builds none)')
     st.add_argument('--links-from', default='', metavar='SCHEDULE',
                     help='another schedule report of the same fold to read the link storage from '
                          '(one made by a compiler that reports it)')
@@ -1681,7 +1863,8 @@ def state_main(a):
     out = choose_state(cal, est, classes, sched, ii, route=not a.no_routability,
                        entries=a.register_state_entries, vmem=vmem, pattern=pattern,
                        weights=weights, pages_hbm=not a.no_pages_hbm,
-                       row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page)
+                       row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page,
+                       link_pages=not a.no_link_pages, link_hbm=a.link_hbm)
     if links:
         lk = link_cost(cal, links)
         print(f"links: {(links['lutram_bits'] + links['bram_bits'] + links['uram_bits']) / 1e6:.1f} "

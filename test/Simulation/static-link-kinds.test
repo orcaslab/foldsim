@@ -39,6 +39,18 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/ult --static --nest --modulo --compact-links --link-ultra-depth 2 Sm Agu 2>&1 | FileCheck %s --check-prefix=ULT
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/ult/obj %S/Inputs/tb_reset.sv top.sv %t/ult/foldsim_sim.sv > %t/ult/build.log 2>&1
 # RUN: %t/ult/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +stall=30 | FileCheck %s
+# Per pair of models (`--link-kinds`): the Sm -> Agu links in ultra RAM, the
+# Agu -> Sm ones distributed whatever their depth; the report lists each link.
+# RUN: foldsim --srcs top.f --top Top --out %t/lk --static --nest --modulo --compact-links --link-block-depth 2 --link-kinds Sm_model:Agu:ultra,Agu:Sm_model:distributed Sm Agu 2>&1 | FileCheck %s --check-prefix=LK
+# RUN: FileCheck %s --check-prefix=LKUSE < %t/lk/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/lk/obj %S/Inputs/tb_reset.sv top.sv %t/lk/foldsim_sim.sv > %t/lk/build.log 2>&1
+# RUN: %t/lk/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +stall=30 | FileCheck %s
+# RUN: not foldsim --srcs top.f --top Top --out %t/lkx --static --nest --modulo --link-kinds Sm_model:Nope:block Sm Agu 2>&1 | FileCheck %s --check-prefix=LKX
+# LK: link kinds: distributed {{[0-9]+}} {{[0-9]+}} {{[0-9]+}}; block 0 0 0.0; ultra [[U:[1-9][0-9]*]]
+# LK: block/ultra [[U]]
+# LKUSE-NOT: link use Agu Sm_model {{[0-9]+ [0-9]+ [0-9]+}} block
+# LKUSE: link use Sm_model Agu {{[0-9]+ [0-9]+ [0-9]+}} ultra 1
+# LKX: link-kinds: no class model 'Nope'
 # BLK: link kinds: distributed {{[0-9]+}} {{[0-9]+}} {{[0-9]+}}; block [[N:[1-9][0-9]*]] {{[0-9]+}} {{[0-9.]+}}; ultra 0
 # BLK: block/ultra [[N]] (read ahead {{[1-9][0-9]*}})
 # BLKSIM: seq.firmem 1, 1, old, undefined {sv.attributes = [#sv.attribute<"ram_style" = "\22block\22">]}
