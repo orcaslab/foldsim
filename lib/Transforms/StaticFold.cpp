@@ -35,6 +35,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Format.h"
 #include "llvm/Support/GlobPattern.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/raw_ostream.h"
@@ -274,6 +275,16 @@ struct FrameGraph {
   std::vector<SmallVector<Wait>> why;
 };
 
+/// What a class evaluates at a position of the frame: its instance, its
+/// passes, and whether the slot is the frame before's.
+struct Evaluation {
+  unsigned inst = 0;
+  /// The ready passes evaluated, by level.
+  uint64_t ready = 0;
+  bool state = false, tail = false;
+  bool runs() const { return ready || state; }
+};
+
 class StaticFolder {
 public:
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
@@ -293,7 +304,9 @@ public:
                bool pageMasks, unsigned pageHbmColumnBits,
                unsigned pageHbmWindow, unsigned pageMemoryBits,
                StringRef pageMemories, StringRef pageRows, bool compactLinks,
-               ArrayRef<std::string> registeredLinks)
+               ArrayRef<std::string> registeredLinks, bool shareLinks,
+               bool stagedLinks, unsigned linkBlockDepth,
+               unsigned linkUltraDepth)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -313,7 +326,9 @@ public:
         pageHbmColumnBits(pageHbmColumnBits), pageHbmWindow(pageHbmWindow),
         pageMemoryBits(pageMemoryBits), pageMemories(pageMemories.str()),
         pageRows(pageRows.str()), compactLinks(compactLinks),
-        registeredLinkSpecs(registeredLinks),
+        registeredLinkSpecs(registeredLinks), shareLinks(shareLinks),
+        stagedLinks(stagedLinks), linkBlockDepth(linkBlockDepth),
+        linkUltraDepth(linkUltraDepth),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + decisionLead()),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -518,15 +533,71 @@ private:
   ArrayRef<std::string> registeredLinkSpecs;
   SmallVector<bool> registeredLinks;
   LogicalResult parseRegisteredLinks();
+  /// `share-links`: outputs of a model driven by one value are one producer.
+  bool shareLinks;
+  unsigned sharedOutputs = 0;
   /// One link memory (a read of a producer's bits by a class input, a run of
   /// bits with the same sources): the producer, its bits, and the producer
   /// instances the reader takes, sorted and distinct.
   struct LinkUse {
     unsigned producer, low, width, reader;
+    std::string input;
     SmallVector<uint64_t> rows;
+    /// The reader's instances that take it, and the producer instance each
+    /// takes.
+    SmallVector<unsigned> readers;
+    SmallVector<uint64_t> readerRows;
+    /// The reader's input, and the sources of its bits there (this one,
+    /// other producers, frame inputs, constants).
+    unsigned port = 0, sources = 0;
+    /// The first bit of the reader's input it is.
+    unsigned at = 0;
   };
+  /// `staged-links`: an early link of one producer instance kept in two
+  /// registers, written at the producer's pass and copied to the one its
+  /// readers read at a position of the frame between the last read of the
+  /// frame before and the first of this one (no bank select, no memory):
+  /// that position (0 to II-1), or -1 where the schedule leaves none.
+  int stagedCopy(unsigned p, unsigned inst, unsigned reader,
+                 ArrayRef<unsigned> readers) const;
+  bool stagedLinks;
+  /// `link-block-depth`, `link-ultra-depth`: a link memory at least this
+  /// deep, the only source of its reader's bits and never forwarded or
+  /// taken in its producer's host cycle, in block (ultra) RAM, read a host
+  /// cycle on into the RAM's output register (0: none).
+  unsigned linkBlockDepth, linkUltraDepth;
+  StringRef syncLinkStyle(uint64_t depth, unsigned width) const {
+    if (linkUltraDepth && depth >= linkUltraDepth)
+      return "ultra";
+    if (linkBlockDepth && depth >= linkBlockDepth)
+      return "block";
+    return {};
+  }
+  /// A link memory's depth: an entry per producer instance (kept), doubled
+  /// by frame parity for an early one.
+  static uint64_t linkDepth(unsigned entries, bool banked) {
+    unsigned indices = entries > 1 ? llvm::PowerOf2Ceil(entries) : 1;
+    return banked ? 2 * indices : entries;
+  }
   /// Every link memory the simulator builds, as buildSim cuts them.
   void linkUses(std::vector<LinkUse> &uses) const;
+  /// The schedule report's lines on the links' storage.
+  void reportLinks(raw_ostream &os);
+  /// What each class evaluates at each position (`frameAt`), and whether
+  /// any host cycle may idle (bubbles); then whether a link's reads ever
+  /// need its producer's write forwarded, or taken around the read register
+  /// in its host cycle (buildSim's links, and the report's choice of their
+  /// storage).
+  void buildFrameTable(bool stalls);
+  SmallVector<SmallVector<Evaluation>> frameAt;
+  bool stalls = false;
+  bool writesAt(const Producer &producer, unsigned at) const;
+  bool needsForward(unsigned p, unsigned c, ArrayRef<bool> takes,
+                    ArrayRef<uint64_t> from, unsigned lands = 1) const;
+  bool takesNow(unsigned p, unsigned c, ArrayRef<bool> takes,
+                ArrayRef<uint64_t> from) const;
+  bool hitsOnlyTakes(unsigned p, unsigned c, ArrayRef<bool> takes,
+                     ArrayRef<uint64_t> from) const;
   /// Whether a link of producer `p` whose reader takes `rows` is compacted.
   bool compacted(unsigned p, size_t rows) const {
     unsigned threads = classes[producers[p].cls].threads();
@@ -870,6 +941,29 @@ LogicalResult StaticFolder::collect() {
     if (failed(decompose(operand, 0, consumer.width,
                          consumer.pieces.emplace_back())))
       return failure();
+  }
+  // Outputs of a model driven by the same value (a bus broadcast to several
+  // children: a crossbar's data to each of its port arbiters) are one
+  // producer: every reader of them takes the first, so they share links.
+  if (shareLinks) {
+    SmallVector<int> canonical(producers.size());
+    std::iota(canonical.begin(), canonical.end(), 0);
+    for (auto &cls : classes) {
+      DenseMap<Value, unsigned> first;
+      auto *output = cls.model.getBodyBlock()->getTerminator();
+      for (auto [o, value] : llvm::enumerate(output->getOperands())) {
+        auto [it, inserted] = first.try_emplace(value, o);
+        if (!inserted) {
+          canonical[cls.producerOf[o]] = cls.producerOf[it->second];
+          ++sharedOutputs;
+        }
+      }
+    }
+    for (auto &consumer : consumers)
+      for (auto &pieces : consumer.pieces)
+        for (auto &piece : pieces)
+          if (piece.producer >= 0)
+            piece.producer = canonical[piece.producer];
   }
   for (auto &consumer : consumers)
     for (auto &pieces : consumer.pieces)
@@ -1363,25 +1457,90 @@ void StaticFolder::linkUses(std::vector<LinkUse> &uses) const {
     for (unsigned end : cuts) {
       if (end == at)
         continue;
-      std::map<std::pair<unsigned, unsigned>, std::set<uint64_t>> sources;
+      struct Source {
+        std::set<uint64_t> rows;
+        SmallVector<unsigned> readers;
+        SmallVector<uint64_t> readerRows;
+      };
+      std::map<std::pair<unsigned, unsigned>, Source> sources;
+      // Every source as buildSim keys them: a producer's bits, or one key
+      // for all constants.
+      std::set<std::pair<int, unsigned>> keys;
       for (unsigned i = 0; i < threads; ++i) {
         unsigned base = 0;
         for (auto &piece : consumer.pieces[i]) {
           if (at < base + piece.width) {
-            if (piece.producer >= 0 && producers[piece.producer].cls >= 0)
-              sources[{unsigned(piece.producer), piece.low + at - base}]
-                  .insert(piece.inst);
+            if (piece.producer >= 0) {
+              keys.insert({piece.producer, piece.low + at - base});
+              if (producers[piece.producer].cls >= 0) {
+                auto &source =
+                    sources[{unsigned(piece.producer), piece.low + at - base}];
+                source.rows.insert(piece.inst);
+                source.readers.push_back(i);
+                source.readerRows.push_back(piece.inst);
+              }
+            } else {
+              keys.insert({-1, 0});
+            }
             break;
           }
           base += piece.width;
         }
       }
-      for (auto &[key, rows] : sources)
-        uses.push_back({key.first, key.second, end - at, unsigned(consumer.cls),
-                        SmallVector<uint64_t>(rows.begin(), rows.end())});
+      for (auto &[key, source] : sources) {
+        LinkUse use{key.first, key.second, end - at, unsigned(consumer.cls),
+                    classes[consumer.cls].inputNames[consumer.port],
+                    SmallVector<uint64_t>(source.rows.begin(),
+                                          source.rows.end()),
+                    source.readers, source.readerRows};
+        use.port = consumer.port;
+        use.sources = keys.size();
+        use.at = at;
+        uses.push_back(std::move(use));
+      }
       at = end;
     }
   }
+}
+
+int StaticFolder::stagedCopy(unsigned p, unsigned inst, unsigned reader,
+                             ArrayRef<unsigned> readers) const {
+  if (!stagedLinks || ii == 0)
+    return -1;
+  auto &producer = producers[p];
+  if (producer.late)
+    return -1;
+  auto &pcls = classes[producer.cls];
+  // The producer's write: at the end of its pass's slot, visible after it.
+  int written = producer.atReady
+                    ? pcls.readySlots(producer.readyLevel)[inst]
+                    : pcls.slot[kState][inst];
+  // Each reader instance reads at each of its passes, its read register
+  // loaded the host cycle before the slot.
+  auto &rcls = classes[reader];
+  int first = std::numeric_limits<int>::max(), last = 0;
+  for (unsigned i : readers) {
+    auto take = [&](int s) {
+      first = std::min(first, s);
+      last = std::max(last, s);
+    };
+    take(rcls.slot[kState][i]);
+    for (unsigned l = 0; l < rcls.readyLevels; ++l)
+      take(rcls.readySlots(l)[i]);
+  }
+  if (readers.empty())
+    return -1;
+  // The copy at the end of a host cycle t of frame f (t past the frame's
+  // first, II earlier for the frame before) takes the producer's write of
+  // frame f-1: after it lands (t >= written + 1 - II), before the write of
+  // frame f lands (t <= written), after the last read of frame f-1
+  // (t >= last - 1 - II), and in time for the first read of frame f
+  // (t <= first - 2).
+  int low = std::max(written + 1, last - 1) - int(ii);
+  int high = std::min(written, first - 2);
+  if (low > high)
+    return -1;
+  return ((high % int(ii)) + int(ii)) % int(ii);
 }
 
 //===----------------------------------------------------------------------===//
@@ -3441,6 +3600,204 @@ LogicalResult StaticFolder::parsePages() {
   return success();
 }
 
+void StaticFolder::reportLinks(raw_ostream &os) {
+  // The links' storage, as buildSim makes it: a register for a late link of
+  // one entry, two (staged) for an early one where the schedule allows, else
+  // a memory of an entry per producer instance (per instance read, with
+  // compact links), doubled by frame parity for an early one, in block or
+  // ultra RAM where deep enough and never forwarded, else distributed RAM.
+  // Costs by the cost model's rules (foldsim_cost.mem_cost's distributed
+  // RAM, foldsim_storage's RAMB36 and URAM288 shapes); a line per kind
+  // (`link kinds`) for the fold-degree model to price.
+  std::vector<LinkUse> uses;
+  linkUses(uses);
+  bool haveSchedule = !frameAt.empty();
+  auto lutram = [](uint64_t depth, unsigned width) {
+    if (depth <= 32)
+      return width * 0.57;
+    uint64_t blocks = (depth + 63) / 64;
+    return width * blocks * 1.14 +
+           (depth > 64 ? width * (blocks - 1) / 3.0 : 0.0);
+  };
+  // RAMB36 holding depth x width (one port pair): 72x512, 36x1k, 18x2k,
+  // 9x4k, 4x8k, 2x16k, 1x32k; an 18K half where it fits one.
+  auto bram36 = [](uint64_t depth, unsigned width) {
+    static const std::pair<unsigned, unsigned> shapes36[] = {
+        {512, 72}, {1024, 36}, {2048, 18}, {4096, 9},
+        {8192, 4}, {16384, 2}, {32768, 1}};
+    static const std::pair<unsigned, unsigned> shapes18[] = {
+        {512, 36}, {1024, 18}, {2048, 9}, {4096, 4},
+        {8192, 2}, {16384, 1}};
+    double best = 1e18;
+    for (auto [d, w] : shapes36)
+      best = std::min(best, double((width + w - 1) / w) *
+                                double((depth + d - 1) / d));
+    for (auto [d, w] : shapes18)
+      best = std::min(best, 0.5 * double((width + w - 1) / w) *
+                                double((depth + d - 1) / d));
+    return best;
+  };
+  auto uram = [](uint64_t depth, unsigned width) {
+    return double((width + 71) / 72) * double((depth + 4095) / 4096);
+  };
+  // Each producer's reading classes: several share a register of its bits.
+  SmallVector<unsigned> classReaders(producers.size(), 0);
+  for (auto &consumer : consumers) {
+    if (consumer.cls < 0)
+      continue;
+    std::set<int> read;
+    for (auto &pieces : consumer.pieces)
+      for (auto &piece : pieces)
+        if (piece.producer >= 0 && producers[piece.producer].cls >= 0)
+          read.insert(piece.producer);
+    for (int p : read)
+      ++classReaders[p];
+  }
+  struct Kind {
+    unsigned memories = 0;
+    uint64_t bits = 0;
+    double cost = 0;
+  };
+  Kind distributed, block, ultra, registers, staged;
+  uint64_t compactSaved = 0;
+  unsigned compactMemories = 0;
+  // By producer and reading class: (LUTRAM, bits).
+  std::map<std::pair<unsigned, unsigned>, std::pair<double, uint64_t>> byPair;
+  std::unique_ptr<llvm::raw_fd_ostream> dump;
+  if (const char *path = getenv("FOLDSIM_LINK_DUMP")) {
+    std::error_code ec;
+    dump = std::make_unique<llvm::raw_fd_ostream>(path, ec);
+    if (ec)
+      dump.reset();
+  }
+  for (auto &use : uses) {
+    auto &producer = producers[use.producer];
+    bool banked = !producer.late;
+    unsigned threads = classes[producer.cls].threads();
+    bool compact = compacted(use.producer, use.rows.size());
+    unsigned entries = compact ? use.rows.size() : threads;
+    uint64_t full = linkDepth(threads, banked);
+    StringRef kind;
+    uint64_t depth = 0;
+    if (entries == 1 && !banked) {
+      kind = "register";
+      depth = 1;
+      registers.memories++;
+      registers.bits += use.width;
+    } else if (entries == 1 && banked && haveSchedule &&
+               stagedCopy(use.producer, compact ? unsigned(use.rows[0]) : 0,
+                          use.reader, use.readers) >= 0) {
+      kind = "staged";
+      depth = 2;
+      staged.memories++;
+      staged.bits += 2 * use.width;
+    } else {
+      depth = linkDepth(entries, banked);
+      StringRef style;
+      if (haveSchedule && entries != 1 && slrOf.empty() &&
+          !syncLinkStyle(depth, use.width).empty() &&
+          (use.sources == 1 || !shortLead)) {
+        // As buildSim decides: never forwarded, taken now or forwarded
+        // from a shared register.
+        unsigned rthreads = classes[use.reader].threads();
+        SmallVector<bool> takes(rthreads, false);
+        SmallVector<uint64_t> rows(rthreads, 0);
+        for (auto [i, r] : llvm::zip(use.readers, use.readerRows)) {
+          takes[i] = true;
+          rows[i] = r;
+        }
+        bool forward =
+            oneCycleLinks && needsForward(use.producer, use.reader, takes, rows);
+        bool now = zeroLink(use.producer, use.reader, use.port) &&
+                   takesNow(use.producer, use.reader, takes, rows);
+        bool late = shareLinkWrites && classReaders[use.producer] > 1;
+        bool forwardLate =
+            late && needsForward(use.producer, use.reader, takes, rows, 2);
+        // The only source: read into the RAM's output register, which is
+        // the read register. One of several: read a host cycle ahead, where
+        // no write of an entry it reads lands in the host cycles between.
+        if (use.sources == 1 ? !forward && !now && !forwardLate
+                             : !forward && !now &&
+                                   !needsForward(use.producer, use.reader,
+                                                 takes, rows, 2) &&
+                                   !(late && needsForward(use.producer,
+                                                          use.reader, takes,
+                                                          rows, 3)))
+          style = syncLinkStyle(depth, use.width);
+      }
+      if (style == "ultra") {
+        kind = "ultra";
+        ultra.memories++;
+        ultra.bits += depth * use.width;
+        ultra.cost += uram(depth, use.width);
+      } else if (style == "block") {
+        kind = "block";
+        block.memories++;
+        block.bits += depth * use.width;
+        block.cost += bram36(depth, use.width);
+      } else {
+        kind = "distributed";
+        distributed.memories++;
+        distributed.bits += depth * use.width;
+        distributed.cost += lutram(depth, use.width);
+        auto &pair = byPair[{unsigned(producer.cls), use.reader}];
+        pair.first += lutram(depth, use.width);
+        pair.second += depth * use.width;
+      }
+    }
+    if (entries < threads) {
+      ++compactMemories;
+      compactSaved += (full - depth) * use.width;
+    }
+    if (dump) {
+      auto &pc = classes[producer.cls];
+      *dump << pc.name << " " << pc.outputNames[producer.port] << " "
+            << use.low << " " << use.width << " " << threads << " "
+            << use.rows.size() << " " << (banked ? 1 : 0) << " "
+            << classes[use.reader].name << " "
+            << classes[use.reader].threads() << " " << use.input << " "
+            << kind << " " << depth << " " << producer.name << "_to_"
+            << classes[use.reader].name << "_" << use.input << "_" << use.at
+            << "\n";
+    }
+  }
+  os << "  link storage: " << distributed.memories + block.memories +
+                                  ultra.memories
+     << " memories, "
+     << distributed.bits + block.bits + ultra.bits << " bits, "
+     << uint64_t(distributed.cost) << " LUTRAM LUTs; " << registers.bits
+     << " register bits";
+  if (shareLinks)
+    os << "; shared outputs " << sharedOutputs;
+  if (stagedLinks)
+    os << "; staged: " << staged.memories << " links, " << staged.bits
+       << " register bits";
+  if (compactLinks)
+    os << "; compact: " << compactMemories << " links, " << compactSaved
+       << " bits saved";
+  os << "\n";
+  // For the fold-degree model: memories, bits and cost per kind (LUTRAM
+  // LUTs, RAMB36, URAM288; flip-flops for registers).
+  os << "  link kinds: distributed " << distributed.memories << " "
+     << distributed.bits << " " << uint64_t(std::ceil(distributed.cost))
+     << "; block " << block.memories << " " << block.bits << " "
+     << llvm::format("%.1f", block.cost) << "; ultra " << ultra.memories
+     << " " << ultra.bits << " " << llvm::format("%.0f", ultra.cost)
+     << "; registers "
+     << registers.memories + staged.memories << " "
+     << registers.bits + staged.bits << "\n";
+  // The largest in distributed RAM, by the classes they join.
+  SmallVector<std::pair<std::pair<unsigned, unsigned>, std::pair<double, uint64_t>>>
+      largest(byPair.begin(), byPair.end());
+  llvm::sort(largest, [](auto &x, auto &y) {
+    return x.second.first > y.second.first;
+  });
+  for (auto &[pair, cost] : ArrayRef(largest).take_front(8))
+    os << "    links " << classes[pair.first].name << " -> "
+       << classes[pair.second].name << ": " << uint64_t(cost.first)
+       << " LUTRAM LUTs, " << cost.second << " bits\n";
+}
+
 LogicalResult StaticFolder::schedule() {
   chainCuts();
   auto late = [](const Class &cls) {
@@ -3621,72 +3978,8 @@ LogicalResult StaticFolder::schedule() {
       os << "\n";
     }
   }
-  {
-    // The links' storage, as buildSim makes it: a register for a late link
-    // of one entry, else a memory of an entry per producer instance (per
-    // instance read, compacted), doubled by frame parity for an early one;
-    // distributed RAM's LUTs as the cost model counts them (foldsim_cost
-    // mem_cost: one read port, asynchronous).
-    std::vector<LinkUse> uses;
-    linkUses(uses);
-    uint64_t memBits = 0, regBits = 0, compactSaved = 0;
-    double luts = 0;
-    unsigned memories = 0, compactMemories = 0;
-    auto depthOf = [&](unsigned entries, bool banked) -> uint64_t {
-      unsigned indices = entries > 1 ? llvm::PowerOf2Ceil(entries) : 1;
-      return banked ? 2 * indices : entries;
-    };
-    auto lutram = [](uint64_t depth, unsigned width) {
-      if (depth <= 32)
-        return width * 0.57;
-      uint64_t blocks = (depth + 63) / 64;
-      return width * blocks * 1.14 +
-             (depth > 64 ? width * (blocks - 1) / 3.0 : 0.0);
-    };
-    // By producer and reading class: (LUTRAM, bits).
-    std::map<std::pair<unsigned, unsigned>, std::pair<double, uint64_t>> byPair;
-    for (auto &use : uses) {
-      auto &producer = producers[use.producer];
-      bool banked = !producer.late;
-      unsigned threads = classes[producer.cls].threads();
-      unsigned entries = compacted(use.producer, use.rows.size())
-                             ? use.rows.size()
-                             : threads;
-      bool register_ = entries == 1 && !banked;
-      uint64_t depth = register_ ? 1 : depthOf(entries, banked);
-      if (entries < threads) {
-        ++compactMemories;
-        compactSaved += (depthOf(threads, banked) - depth) * use.width;
-      }
-      if (register_) {
-        regBits += use.width;
-        continue;
-      }
-      ++memories;
-      memBits += depth * use.width;
-      luts += lutram(depth, use.width);
-      auto &pair = byPair[{unsigned(producer.cls), use.reader}];
-      pair.first += lutram(depth, use.width);
-      pair.second += depth * use.width;
-    }
-    os << "  link storage: " << memories << " memories, " << memBits
-       << " bits, " << uint64_t(luts) << " LUTRAM LUTs; " << regBits
-       << " register bits";
-    if (compactLinks)
-      os << "; compact: " << compactMemories << " links, "
-         << compactSaved << " bits saved";
-    os << "\n";
-    // The largest, by the classes they join.
-    SmallVector<std::pair<std::pair<unsigned, unsigned>, std::pair<double, uint64_t>>>
-        largest(byPair.begin(), byPair.end());
-    llvm::sort(largest, [](auto &x, auto &y) {
-      return x.second.first > y.second.first;
-    });
-    for (auto &[pair, cost] : ArrayRef(largest).take_front(8))
-      os << "    links " << classes[pair.first].name << " -> "
-         << classes[pair.second].name << ": " << uint64_t(cost.first)
-         << " LUTRAM LUTs, " << cost.second << " bits\n";
-  }
+  buildFrameTable(bubbles || !virtualMemoryPattern.empty());
+  reportLinks(os);
   for (auto [k, consumer] : llvm::enumerate(consumers))
     if (consumer.cls < 0)
       os << "  output " << consumer.name << " @" << outputSlot[k]
@@ -6082,6 +6375,137 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
   return hw::ArrayGetOp::create(b, array, index);
 }
 
+void StaticFolder::buildFrameTable(bool stalls) {
+  // What each class evaluates at each position of the frame: its instance,
+  // its passes, and whether the slot is the frame before's. Every control is
+  // a fixed delay of the position, so a link's forwarding and its reader's
+  // taking around the read register are needed only where the schedule
+  // brings a write and a read of its entry together; elsewhere they are
+  // logic on the producer's path into the read register that never decides
+  // a value (and, across a zero-latency link into the producer, a path from
+  // one class through another back into the first).
+  // A ready pass is one of the class's levels (`readyLevels`), each at its
+  // own slots, as the slot tables have them.
+  frameAt.assign(classes.size(), {});
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    frameAt[c].resize(ii);
+    for (unsigned i = 0; i < cls.threads(); ++i)
+      for (auto pass : {kReady, kState})
+        for (unsigned l = 0; l < (pass == kReady ? cls.readyLevels : 1); ++l) {
+          unsigned s =
+              pass == kState ? cls.slot[kState][i] : cls.readySlots(l)[i];
+          auto &at = frameAt[c][s % ii];
+          at.inst = i;
+          if (pass == kState)
+            at.state = true;
+          else
+            at.ready |= uint64_t(1) << l;
+          at.tail = s >= ii;
+        }
+  }
+  this->stalls = stalls;
+}
+
+/// Whether a producer writes its links at position `at`.
+bool StaticFolder::writesAt(const Producer &producer, unsigned at) const {
+  auto &e = frameAt[producer.cls][at];
+  return producer.atReady ? bool((e.ready >> producer.readyLevel) & 1)
+                          : e.state;
+}
+
+/// Whether a read of producer `p`'s link by class `c`, for the instances
+/// `takes` holds, at producer instance `from[i]`, ever needs a write
+/// forwarded: the write lands `lands` host cycles after its position's (one,
+/// or two registered), and the read register loaded in the host cycle it
+/// lands is used in the next one, by such an instance at its entry (for an
+/// early link, in the bank that read takes: the write's frame's next).
+/// Between frames the position may idle, so each host cycle after a frame's
+/// last position is the next frame's first, or idle. With bubbles (an
+/// `advance` input, or virtual memories) any host cycle may idle: the read
+/// `lands` host cycles on is then of a position 1 to `lands` steps on.
+bool StaticFolder::needsForward(unsigned p, unsigned c, ArrayRef<bool> takes,
+                                ArrayRef<uint64_t> from, unsigned lands) const {
+  auto &producer = producers[p];
+  bool banked = !producer.late;
+  bool threaded = classes[producer.cls].threads() > 1;
+  for (unsigned at = 0; at < ii; ++at) {
+    if (!writesAt(producer, at))
+      continue;
+    auto &write = frameAt[producer.cls][at];
+    for (unsigned steps = stalls ? 1 : lands; steps <= lands; ++steps) {
+    // The positions `steps` host cycles on (`ii` idle), and the frames
+    // they are past the write's.
+    SmallVector<std::pair<unsigned, int>> reach{{at, 0}};
+    for (unsigned step = 0; step < steps; ++step) {
+      SmallVector<std::pair<unsigned, int>> next;
+      for (auto [pos, frames] : reach) {
+        if (pos + 1 < ii) {
+          next.push_back({pos + 1, frames});
+          continue;
+        }
+        next.push_back({0, frames + 1});
+        next.push_back({ii, frames});
+      }
+      reach = std::move(next);
+    }
+    for (auto [pos, frames] : reach) {
+      if (pos >= ii)
+        continue;
+      auto &read = frameAt[c][pos];
+      if (!read.runs() || !takes[read.inst])
+        continue;
+      if (threaded && from[read.inst] != write.inst)
+        continue;
+      // The write's token is of the frame after its own, the read's of
+      // its own.
+      int written = 1 - int(write.tail);
+      int wanted = frames - int(read.tail);
+      if (banked && (wanted - written) % 2 != 0)
+        continue;
+      return true;
+    }
+    }
+  }
+  return false;
+}
+
+/// Whether a reader of class `c` ever takes producer `p`'s write around its
+/// read register: a write at a position that evaluates an instance `takes`
+/// holds, at its entry.
+bool StaticFolder::takesNow(unsigned p, unsigned c, ArrayRef<bool> takes,
+                            ArrayRef<uint64_t> from) const {
+  auto &producer = producers[p];
+  bool threaded = classes[producer.cls].threads() > 1;
+  for (unsigned at = 0; at < ii; ++at) {
+    if (!writesAt(producer, at))
+      continue;
+    auto &read = frameAt[c][at];
+    if (!read.runs() || !takes[read.inst])
+      continue;
+    if (threaded && from[read.inst] != frameAt[producer.cls][at].inst)
+      continue;
+    return true;
+  }
+  return false;
+}
+
+/// Whether the hit of such a take (a write at the entry the evaluated
+/// instance's row names) comes only at positions evaluating an instance
+/// `takes` holds: then no other source's instance needs it masked.
+bool StaticFolder::hitsOnlyTakes(unsigned p, unsigned c, ArrayRef<bool> takes,
+                                 ArrayRef<uint64_t> from) const {
+  auto &producer = producers[p];
+  bool threaded = classes[producer.cls].threads() > 1;
+  for (unsigned at = 0; at < ii; ++at) {
+    auto &read = frameAt[c][at];
+    if (!writesAt(producer, at) || !read.runs() || takes[read.inst])
+      continue;
+    if (!threaded || from[read.inst] == frameAt[producer.cls][at].inst)
+      return false;
+  }
+  return true;
+}
+
 LogicalResult StaticFolder::buildSim() {
   auto *context = top.getContext();
   auto i1 = IntegerType::get(context, 1);
@@ -6268,7 +6692,11 @@ LogicalResult StaticFolder::buildSim() {
     /// read [valid, instance, page] and page write [valid, page].
     Value fetch3, finst3;
     SmallVector<Value> offChip3;
+    /// The frame's position three host cycles ahead, as the tables read it.
+    Value at3;
     Value inst2, state2, ready2, tail2;
+    /// Whether the slot is the frame before's, three host cycles ahead.
+    Value tail3;
     Value inst1, inst, state, ready;
     /// The ready passes past the first, two host cycles ahead.
     SmallVector<Value> laterReady2;
@@ -6349,6 +6777,7 @@ LogicalResult StaticFolder::buildSim() {
       at = shown(at, bubbleOf(cls.name + "_bubble"));
     auto &ctl = controls[c];
     auto prefix = cls.name;
+    ctl.at3 = at;
     ctl.state3 = table(b, at, stateRow, 1);
     Value ready3 = table(b, at, readyRow, 1);
     Value runs;
@@ -6359,6 +6788,7 @@ LogicalResult StaticFolder::buildSim() {
       ctl.state3 = comb::AndOp::create(b, ctl.state3, runs);
       ready3 = comb::AndOp::create(b, ready3, runs);
       ctl.tail2 = reg(tail3, prefix + "_tail2");
+      ctl.tail3 = tail3;
     }
     ctl.state2 = reg(ctl.state3, prefix + "_state2");
     ctl.ready2 = reg(ready3, prefix + "_ready2");
@@ -6723,7 +7153,8 @@ LogicalResult StaticFolder::buildSim() {
                       bool forward = true,
                       SmallVectorImpl<AfterForward> *after = nullptr,
                       bool late = false, bool forwardLate = false,
-                      ArrayRef<uint64_t> compact = {}) -> Value {
+                      ArrayRef<uint64_t> compact = {},
+                      StringRef syncStyle = {}) -> Value {
     auto &producer = producers[p];
     unsigned c = producer.cls;
     auto &ctl = controls[c];
@@ -6864,10 +7295,18 @@ LogicalResult StaticFolder::buildSim() {
       unsigned indices = threads > 1 ? llvm::PowerOf2Ceil(threads) : 1;
       unsigned depth = banked ? 2 * indices : threads;
       auto memType = seq::FirMemType::get(context, depth, w, 1);
+      // A block or ultra RAM link (`syncStyle`) reads at the same registered
+      // address a host cycle on, into its output register, which is the read
+      // register: read-first, as a distributed RAM's read register takes the
+      // entry before a write landing at the same edge.
+      bool sync = !syncStyle.empty();
       auto memory = seq::FirMemOp::create(
-          b, memType, /*readLatency=*/0, /*writeLatency=*/1,
-          seq::RUW::Undefined, seq::WUW::Undefined, b.getStringAttr(name),
-          hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+          b, memType, /*readLatency=*/sync ? 1 : 0, /*writeLatency=*/1,
+          sync ? seq::RUW::Old : seq::RUW::Undefined, seq::WUW::Undefined,
+          b.getStringAttr(name), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+          StringAttr{}, Attribute{});
+      if (sync)
+        setRamStyle(memory, syncStyle);
       // The bank in the high bit, the instance in the low ones.
       SmallVector<Value> writeAddress, readAddress;
       if (banked) {
@@ -6960,143 +7399,14 @@ LogicalResult StaticFolder::buildSim() {
         SmallVector<Value>(pieces.rbegin(), pieces.rend()));
   };
 
-  // What each class evaluates at each position of the frame: its instance,
-  // its passes, and whether the slot is the frame before's. Every control is
-  // a fixed delay of the position, so a link's forwarding and its reader's
-  // taking around the read register are needed only where the schedule
-  // brings a write and a read of its entry together; elsewhere they are
-  // logic on the producer's path into the read register that never decides
-  // a value (and, across a zero-latency link into the producer, a path from
-  // one class through another back into the first).
-  // A ready pass is one of the class's levels (`readyLevels`), each at its
-  // own slots, as the slot tables have them.
-  struct Evaluation {
-    unsigned inst = 0;
-    /// The ready passes evaluated, by level.
-    uint64_t ready = 0;
-    bool state = false, tail = false;
-    bool runs() const { return ready || state; }
-  };
-  SmallVector<SmallVector<Evaluation>> frameAt(classes.size());
-  for (auto [c, cls] : llvm::enumerate(classes)) {
-    frameAt[c].resize(ii);
-    for (unsigned i = 0; i < cls.threads(); ++i)
-      for (auto pass : {kReady, kState})
-        for (unsigned l = 0; l < (pass == kReady ? cls.readyLevels : 1); ++l) {
-          unsigned s =
-              pass == kState ? cls.slot[kState][i] : cls.readySlots(l)[i];
-          auto &at = frameAt[c][s % ii];
-          at.inst = i;
-          if (pass == kState)
-            at.state = true;
-          else
-            at.ready |= uint64_t(1) << l;
-          at.tail = s >= ii;
-        }
-  }
-  // Whether a producer writes its links at position `at`.
-  auto writesAt = [&](const Producer &producer, unsigned at) {
-    auto &e = frameAt[producer.cls][at];
-    return producer.atReady ? bool((e.ready >> producer.readyLevel) & 1)
-                            : e.state;
-  };
-  // Whether a read of producer `p`'s link by class `c`, for the instances
-  // `takes` holds, at producer instance `from[i]`, ever needs a write
-  // forwarded: the write lands `lands` host cycles after its position's
-  // (one, or two registered), and the read register loaded in the host cycle
-  // it lands is used in the next one, by such an instance at its entry (for
-  // an early link, in the bank that read takes: the write's frame's next).
-  // Between frames the position may idle, so each host cycle after a
-  // frame's last position is the next frame's first, or idle. With bubbles
-  // (an `advance` input, or virtual memories) any host cycle may idle: the
-  // read `lands` host cycles on is then of a position 1 to `lands` steps on.
-  bool stalls = bool(advance);
-  auto needsForward = [&](unsigned p, unsigned c, ArrayRef<bool> takes,
-                          ArrayRef<uint64_t> from, unsigned lands = 1) {
-    auto &producer = producers[p];
-    bool banked = !producer.late;
-    bool threaded = classes[producer.cls].threads() > 1;
-    for (unsigned at = 0; at < ii; ++at) {
-      if (!writesAt(producer, at))
-        continue;
-      auto &write = frameAt[producer.cls][at];
-      for (unsigned steps = stalls ? 1 : lands; steps <= lands; ++steps) {
-      // The positions `steps` host cycles on (`ii` idle), and the frames
-      // they are past the write's.
-      SmallVector<std::pair<unsigned, int>> reach{{at, 0}};
-      for (unsigned step = 0; step < steps; ++step) {
-        SmallVector<std::pair<unsigned, int>> next;
-        for (auto [pos, frames] : reach) {
-          if (pos + 1 < ii) {
-            next.push_back({pos + 1, frames});
-            continue;
-          }
-          next.push_back({0, frames + 1});
-          next.push_back({ii, frames});
-        }
-        reach = std::move(next);
-      }
-      for (auto [pos, frames] : reach) {
-        if (pos >= ii)
-          continue;
-        auto &read = frameAt[c][pos];
-        if (!read.runs() || !takes[read.inst])
-          continue;
-        if (threaded && from[read.inst] != write.inst)
-          continue;
-        // The write's token is of the frame after its own, the read's of
-        // its own.
-        int written = 1 - int(write.tail);
-        int wanted = frames - int(read.tail);
-        if (banked && (wanted - written) % 2 != 0)
-          continue;
-        return true;
-      }
-      }
-    }
-    return false;
-  };
-  // Whether a reader of class `c` ever takes producer `p`'s write around its
-  // read register: a write at a position that evaluates an instance
-  // `takes` holds, at its entry.
-  auto takesNow = [&](unsigned p, unsigned c, ArrayRef<bool> takes,
-                      ArrayRef<uint64_t> from) {
-    auto &producer = producers[p];
-    bool threaded = classes[producer.cls].threads() > 1;
-    for (unsigned at = 0; at < ii; ++at) {
-      if (!writesAt(producer, at))
-        continue;
-      auto &read = frameAt[c][at];
-      if (!read.runs() || !takes[read.inst])
-        continue;
-      if (threaded && from[read.inst] != frameAt[producer.cls][at].inst)
-        continue;
-      return true;
-    }
-    return false;
-  };
-  // Whether the hit of such a take (a write at the entry the evaluated
-  // instance's row names) comes only at positions evaluating an instance
-  // `takes` holds: then no other source's instance needs it masked.
-  auto hitsOnlyTakes = [&](unsigned p, unsigned c, ArrayRef<bool> takes,
-                           ArrayRef<uint64_t> from) {
-    auto &producer = producers[p];
-    bool threaded = classes[producer.cls].threads() > 1;
-    for (unsigned at = 0; at < ii; ++at) {
-      auto &read = frameAt[c][at];
-      if (!writesAt(producer, at) || !read.runs() || takes[read.inst])
-        continue;
-      if (!threaded || from[read.inst] == frameAt[producer.cls][at].inst)
-        return false;
-    }
-    return true;
-  };
+  buildFrameTable(bool(advance));
 
   // The link reads built: those forwarded (past the read register), those
   // taken in the producer's host cycle, and those written from a shared
   // register (forwarded the host cycle the write lands), for the report.
   unsigned linkReads = 0, forwardedReads = 0, forwardedAfter = 0, nowReads = 0,
-           lateReads = 0, forwardedLate = 0, compactReads = 0;
+           lateReads = 0, forwardedLate = 0, compactReads = 0, stagedReads = 0,
+           syncReads = 0, earlyReads = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
   SmallVector<unsigned> classReaders(producers.size(), 0);
@@ -7211,6 +7521,7 @@ LogicalResult StaticFolder::buildSim() {
         }
       }
       SmallVector<Value> sourceData(sources.size());
+      bool syncPart = false;
       SmallVector<std::pair<Value, Value>> sourceNow(sources.size());
       SmallVector<bool> nowAlone(sources.size(), false);
       SmallVector<SmallVector<AfterForward>> sourceAfter(sources.size());
@@ -7314,6 +7625,82 @@ LogicalResult StaticFolder::buildSim() {
                                          copyReg(ctl.tail2, name + "_tail"));
           return parity;
         };
+        // The read's address and bank a host cycle earlier, for a block or
+        // ultra RAM link read a host cycle ahead (several sources: its
+        // output register, then the choice of source, then the read
+        // register).
+        auto address2 = [&]() -> Value {
+          if (pThreads <= 1)
+            return Value();
+          if (threads == 1)
+            return constant(w, entryRows[0]);
+          return copyReg(table(b, ctl.inst3, entryRows, w),
+                         consumer.name + "_addr2_" + Twine(at) + "_" +
+                             Twine(addressCopies++));
+        };
+        auto bank2 = [&]() -> Value {
+          std::string name = (consumer.name + "_parity2_" + Twine(at) + "_" +
+                              Twine(bankCopies++))
+                                 .str();
+          Value parity = copyReg(parD, name);
+          if (ctl.tail3)
+            parity = comb::XorOp::create(b, parity,
+                                         copyReg(ctl.tail3, name + "_tail"));
+          return parity;
+        };
+        // A staged link (`staged-links`): an early link of one producer
+        // instance in two registers, the first written at the producer's
+        // pass, the second, which the reader reads, loaded from it at a
+        // position of the frame between the reads of consecutive frames.
+        if (!producer.late && pThreads == 1 && slrOf.empty()) {
+          SmallVector<unsigned> readers;
+          for (unsigned i = 0; i < threads; ++i)
+            if (takes[i])
+              readers.push_back(i);
+          unsigned inst = kept.empty() ? 0 : unsigned(kept[0]);
+          int copyAt = stagedCopy(key.first, inst, c, readers);
+          if (copyAt >= 0) {
+            ++stagedReads;
+            auto &pctl = controls[producer.cls];
+            std::string name = (producer.name + "_to_" + consumer.name +
+                                "_" + Twine(at))
+                                   .str();
+            Value data = b.createOrFold<comb::ExtractOp>(
+                b.getIntegerType(width),
+                asBits(b, copies[producer.cls].getResult(producer.port)),
+                key.second);
+            // The pass's enable, of this instance alone where the producer
+            // has several.
+            Value pass3 = !producer.atReady ? pctl.state2
+                          : producer.readyLevel
+                              ? pctl.laterReady2[producer.readyLevel - 1]
+                              : pctl.ready2;
+            Value write = copyReg(copyReg(pass3, name + "_we1"), name + "_we0");
+            if (classes[producer.cls].threads() > 1) {
+              SmallVector<uint64_t> mine(classes[producer.cls].threads(), 0);
+              mine[inst] = 1;
+              write = comb::AndOp::create(
+                  b, write,
+                  copyReg(copyReg(table(b, pctl.inst2, mine, 1),
+                                  name + "_mine1"),
+                          name + "_mine0"));
+            }
+            SmallVector<uint64_t> row(ii + 1, 0);
+            row[copyAt] = 1;
+            Value copy = copyReg(
+                copyReg(copyReg(table(b, pctl.at3, row, 1), name + "_copy2"),
+                        name + "_copy1"),
+                name + "_copy0");
+            // Clock enables, as the flops take them: no select on the
+            // producer's path into the first register.
+            Value stageA = seq::CompRegClockEnabledOp::create(
+                b, data, hostClock, write, b.getStringAttr(name + "_staged"));
+            Value stageB = seq::CompRegClockEnabledOp::create(
+                b, stageA, hostClock, copy, b.getStringAttr(name + "_held"));
+            sourceData[index] = stageB;
+            continue;
+          }
+        }
         bool now = zeroLink(key.first, c, consumer.port) &&
                    takesNow(key.first, c, takes, rows);
         nowAlone[index] = now && hitsOnlyTakes(key.first, c, takes, rows);
@@ -7334,12 +7721,51 @@ LogicalResult StaticFolder::buildSim() {
         nowReads += now;
         lateReads += late;
         forwardedLate += forwardLate;
+        // The input's only source, never forwarded or taken around its
+        // read register: a deep link in block or ultra RAM, whose output
+        // register is the read register.
+        StringRef style;
+        if (sources.size() == 1 && !now && !forward && !(late && forwardLate) &&
+            to < 0 && !(pThreads == 1 && !producer.late) &&
+            !(pThreads == 1 && producer.late))
+          style = syncLinkStyle(linkDepth(pThreads, !producer.late), width);
+        if (!style.empty()) {
+          syncPart = true;
+          ++syncReads;
+        }
+        // One of several sources: read a host cycle ahead, where no write
+        // of an entry it reads lands in the two host cycles before its read
+        // register loads (three for a write from a shared register).
+        bool early = false;
+        if (style.empty() && sources.size() > 1 && !now && !forward &&
+            !shortLead && to < 0 && pThreads != 1 &&
+            !needsForward(key.first, c, takes, rows, 2) &&
+            !(late && needsForward(key.first, c, takes, rows, 3))) {
+          style = syncLinkStyle(linkDepth(pThreads, !producer.late), width);
+          early = !style.empty();
+          if (early) {
+            ++syncReads;
+            ++earlyReads;
+          }
+        }
         sourceData[index] =
-            linkRead(key.first, key.second, width, address, bank,
-                     producer.name + "_to_" + consumer.name + "_" + Twine(at),
-                     to, now ? &sourceNow[index] : nullptr, forward,
-                     after ? &sourceAfter[index] : nullptr, late, forwardLate,
-                     kept);
+            early ? linkRead(key.first, key.second, width, address2, bank2,
+                             producer.name + "_to_" + consumer.name + "_" +
+                                 Twine(at),
+                             to, nullptr, false, nullptr, late, false, kept,
+                             style)
+                  : linkRead(key.first, key.second, width, address, bank,
+                             producer.name + "_to_" + consumer.name + "_" +
+                                 Twine(at),
+                             to, now ? &sourceNow[index] : nullptr, forward,
+                             after ? &sourceAfter[index] : nullptr, late,
+                             forwardLate, kept, style);
+      }
+      if (syncPart) {
+        // Registered already: wired around the read register.
+        parts.push_back(sourceData[0]);
+        at = end;
+        continue;
       }
       // Taken around the read register when written in the reader's slot:
       // the source of this slot's instance, a host cycle after the read's.
@@ -7498,6 +7924,11 @@ LogicalResult StaticFolder::buildSim() {
        << " (forwarded " << forwardedLate << ")";
     if (compactLinks)
       os << "; compact " << compactReads;
+    if (stagedLinks)
+      os << "; staged " << stagedReads;
+    if (linkBlockDepth || linkUltraDepth)
+      os << "; block/ultra " << syncReads << " (read ahead " << earlyReads
+         << ")";
     os << "\n";
     llvm::errs() << os.str();
     if (!reportPath.empty()) {
@@ -7942,6 +8373,15 @@ LogicalResult StaticFolder::run() {
   for (auto &cls : classes)
     if (failed(analyze(cls)))
       return failure();
+  // The links' storage alone, before any schedule (it does not depend on
+  // one): for a quick look at a large design.
+  if (getenv("FOLDSIM_LINKS_ONLY")) {
+    reportLinks(llvm::errs());
+    for (auto &cls : classes)
+      if (cls.folding && cls.folding->edges)
+        cls.folding->edges->abandon();
+    return failure();
+  }
   // Without a schedule, or with one only, nothing is built: the folded
   // pipelines' edges stay unresolved.
   auto abandonFolds = [&] {
@@ -7994,7 +8434,8 @@ void FoldStaticPass::runOnOperation() {
                       forwardAfterLevels, shareLinkWrites, zeroChainHops,
                       page, pageMasks, pageHbmColumnBits, pageHbmWindow,
                       pageMemoryBits, pageMemories, pageRows, compactLinks,
-                      registeredLinks);
+                      registeredLinks, shareLinks, stagedLinks, linkBlockDepth,
+                      linkUltraDepth);
   if (failed(folder.run()))
     return signalPassFailure();
 }

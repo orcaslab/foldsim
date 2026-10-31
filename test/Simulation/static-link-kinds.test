@@ -1,0 +1,47 @@
+# REQUIRES: verilator
+# The links' storage kinds, each exact against the target, channels stalled
+# or not, and the report's `link kinds` as built:
+# - shared links (`--share-links`): the top drives one registered bus to its
+#   four lanes, one link for the four model outputs it drives;
+# - staged links (`--staged-links`): an early link of one producer instance
+#   in two registers, copied at a position of the frame between the reads
+#   of consecutive frames (the bus, the lanes' accumulators, the arbiter
+#   tree's slices with and without zero-latency links);
+# - block and ultra RAM links (`--link-block-depth`, `--link-ultra-depth`):
+#   the address units' memories read into the RAM's output register, which
+#   is the read register for an input's only source; one of several sources
+#   (an address unit's operand from its lane's port) is read a host cycle
+#   ahead, then chosen into the read register.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/broadcast
+# RUN: foldsim --srcs top.f --top Top --out %t/bc --static --nest --modulo --share-links --compact-links --staged-links Lane 2>&1 | FileCheck %s --check-prefix=BC
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/bc/obj %S/Inputs/tb_reset.sv top.sv %t/bc/foldsim_sim.sv > %t/bc/build.log 2>&1
+# RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bc0 --static --nest --modulo Lane 2>&1 | FileCheck %s --check-prefix=BC0
+# BC: shared outputs 3; staged: 9 links, 200 register bits
+# BC: link kinds: distributed 0 0 0; block 0 0 0.0; ultra 0 0 0; registers 9 200
+# BC0: link storage: 12 memories, 776 bits
+# RUN: cd %S/../Driver/Inputs/tree-arb
+# RUN: foldsim --srcs top.f --top Top --out %t/tz --static --nest --modulo --compact-links --staged-links --share-links --zero-latency-links --zero-latency-chains --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=TREE
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/tz/obj %S/Inputs/tb_reset.sv top.sv %t/tz/foldsim_sim.sv > %t/tz/build.log 2>&1
+# RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s
+# RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=60 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/t --static --nest --modulo --compact-links --staged-links --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/t/obj %S/Inputs/tb_reset.sv top.sv %t/t/foldsim_sim.sv > %t/t/build.log 2>&1
+# RUN: %t/t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +stall=30 | FileCheck %s
+# TREE: staged 11
+# RUN: cd %S/../Driver/Inputs/stateless
+# RUN: foldsim --srcs top.f --top Top --out %t/blk --static --nest --modulo --compact-links --link-block-depth 2 Sm Agu 2>&1 | FileCheck %s --check-prefix=BLK
+# RUN: FileCheck %s --check-prefix=BLKSIM < %t/blk/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/blk/obj %S/Inputs/tb_reset.sv top.sv %t/blk/foldsim_sim.sv > %t/blk/build.log 2>&1
+# RUN: %t/blk/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +stall=0 | FileCheck %s
+# RUN: %t/blk/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/ult --static --nest --modulo --compact-links --link-ultra-depth 2 Sm Agu 2>&1 | FileCheck %s --check-prefix=ULT
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/ult/obj %S/Inputs/tb_reset.sv top.sv %t/ult/foldsim_sim.sv > %t/ult/build.log 2>&1
+# RUN: %t/ult/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +stall=30 | FileCheck %s
+# BLK: link kinds: distributed {{[0-9]+}} {{[0-9]+}} {{[0-9]+}}; block [[N:[1-9][0-9]*]] {{[0-9]+}} {{[0-9.]+}}; ultra 0
+# BLK: block/ultra [[N]] (read ahead {{[1-9][0-9]*}})
+# BLKSIM: seq.firmem 1, 1, old, undefined {sv.attributes = [#sv.attribute<"ram_style" = "\22block\22">]}
+# ULT: link kinds: {{.*}}; block 0 0 0.0; ultra [[M:[1-9][0-9]*]]
+# ULT: block/ultra [[M]]
+# CHECK: {{^}}MATCH 196 cycles

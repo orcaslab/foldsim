@@ -379,10 +379,15 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
             bram += br
             largest = max(largest, copy_logic + lam * lr)
     logic += rest
+    lk = link_cost(cal, (sched or {}).get('__links__'))
+    lutram += lk['lutram']
+    bram += lk['bram']
     sites, fits = placement(logic, lutram, bram)
     return dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
                 sites=round(sites), fits=fits, bram=round(bram, 1), largest_copy=round(largest),
-                **paged_fields(paged))
+                **paged_fields(paged),
+                uram=lk['uram'], link_lutram=round(lk['lutram']), link_bram=round(lk['bram'], 1),
+                link_uram=lk['uram'], link_ff=lk['ff'])
 
 
 def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram=True,
@@ -539,11 +544,12 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         for u in units:
             u['costs'].pop('ultra', None)
     caps = {p: storage.MARGIN * storage.REGION[p] for p in ('sites', 'bram', 'uram')}
-    # The links' memories (the schedule report's link storage), distributed
-    # RAM by the cost model's rule, where known (tiers['links']).
-    link_lutram = float((tiers or {}).get('links', {}).get('lutram', 0))
-    base = dict(sites=logic + storage.LUTRAM_SITES * link_lutram,
-                luts=storage.fold_load(logic + link_lutram, cache), bram=cache)
+    # The links' storage, as the compiler emits it (the schedule report's
+    # link kinds), in the base usage the stores' kinds are chosen against.
+    lk = link_cost(cal, (sched or {}).get('__links__'))
+    base = dict(sites=logic + storage.LUTRAM_SITES * lk['lutram'],
+                luts=storage.fold_load(logic + lk['lutram'], cache + lk['bram'], lk['uram']),
+                bram=cache + lk['bram'], uram=lk['uram'])
     if tiers is not None:
         caps['hbm'] = max(0.0, storage.HBM_STATE_SHARE * tiers['frame'] *
                           storage.HBM_BYTES_PER_CYCLE - tiers.get('base_hbm', 0.0))
@@ -556,8 +562,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                                   dict(luts=storage.route_luts(slrs)) if route else None,
                                   price_extra=tiers is not None)
     fits = all(used[p] <= caps[p] + 1e-9 for p in caps)
-    lutram = uram = 0.0
-    bram = cache
+    lutram, uram = lk['lutram'], lk['uram']
+    bram = cache + lk['bram']
     per_copy = dict(copy_logic)
     rules, floor = [], 0
     off = dict(vmem_new=[], pages_offchip=[], rows_new=[], hbm_bytes=0.0, controllers=0,
@@ -597,15 +603,15 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             if key not in taken:
                 taken.add(key)
                 rules.append(rule)
-    lutram += link_lutram
     sites = logic + storage.LUTRAM_SITES * lutram
     res = dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
                sites=round(sites), fits=fits, bram=round(bram, 1), uram=uram,
+               link_lutram=round(lk['lutram']), link_bram=round(lk['bram'], 1),
+               link_uram=lk['uram'], link_ff=lk['ff'],
                largest_copy=round(max(per_copy.values())), storage=','.join(rules),
                **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged))
     if tiers is not None:
-        res.update(off, hbm_bytes=round(off['hbm_bytes']), hbm_cap=round(caps['hbm']),
-                   link_lutram=round(link_lutram))
+        res.update(off, hbm_bytes=round(off['hbm_bytes']), hbm_cap=round(caps['hbm']))
     return res
 
 
@@ -810,10 +816,40 @@ def fit_period(fit, feats):
     return sum(x * y for x, y in zip(fit['coef'], fit_row(fit['terms'], {**feats, **held})))
 
 
+def parse_links(text):
+    """The links' storage of a schedule report (`link kinds`: memories, bits
+    and cost per kind, the cost in LUTRAM LUTs, RAMB36 and URAM288; register
+    bits), or None for a report from before links were priced."""
+    m = re.search(r'^  link kinds: distributed (\d+) (\d+) (\d+); block (\d+) (\d+) ([\d.e+]+); '
+                  r'ultra (\d+) (\d+) ([\d.e+]+); registers (\d+) (\d+)', text, re.M)
+    if not m:
+        return None
+    g = m.groups()
+    return dict(lutram=float(g[2]), lutram_bits=int(g[1]), bram=float(g[5]), bram_bits=int(g[4]),
+                uram=float(g[8]), uram_bits=int(g[7]), ff=int(g[10]))
+
+
+# The links as the fold-degree model prices them: what the schedule report
+# gives, scaled by a calibration's `links` factors (`lutram`, `bits`: the
+# built simulator's link LUTRAM and bits over the report's, measured on the
+# 1-SM a1 fold's netlist).
+def link_cost(cal, links):
+    if not links:
+        return dict(lutram=0.0, bram=0.0, uram=0.0, ff=0)
+    k = (cal or {}).get('links', {})
+    f, b = k.get('lutram', 1.0), k.get('bits', 1.0)
+    return dict(lutram=f * links['lutram'], bram=b * links['bram'], uram=links['uram'],
+                ff=round(b * links['ff']))
+
+
 def parse_classes(text):
     """Each class of a schedule report (a copy of a class its own): its
-    instances, the state gap, and each instance's ready and state slots."""
+    instances, the state gap, and each instance's ready and state slots;
+    under '__links__' the links' storage (parse_links)."""
     out, cur = {}, None
+    links = parse_links(text)
+    if links:
+        out['__links__'] = links
     for line in text.splitlines():
         m = re.match(r'^  (\S+) x(\d+)( \(ready pass\))?(?: state gap (\d+))?', line)
         if m:
@@ -1076,8 +1112,9 @@ def with_pages(sched, pages, offchip=()):
     the models in `offchip` with their pages off chip."""
     def model(c):
         return re.sub(r'_copy\d+$', '', c)
-    return {c: dict(info, page=pages.get(model(c), 0) if info['n'] > 1 else 0,
-                    offchip=model(c) in offchip and info['n'] > 1)
+    return {c: (info if c == '__links__' else
+                dict(info, page=pages.get(model(c), 0) if info['n'] > 1 else 0,
+                     offchip=model(c) in offchip and info['n'] > 1))
             for c, info in sched.items()}
 
 
@@ -1133,19 +1170,6 @@ def choose_pages(cal, est, classes, sched, ii, store='fixed', route=False, entri
                 return (','.join(f'{m}:{p}' for m, p in sorted(pages.items())), res['hbm_ii'],
                         dict(res, offchip=sorted(offchip)))
     return None, None, None
-
-
-def parse_links(text):
-    """The link storage of a schedule report (foldsim-fold-static: every link
-    memory as buildSim cuts them): memories, bits, distributed-RAM LUTs by
-    foldsim_cost.mem_cost's rule and the register bits; None if the report
-    has none (a compiler before it)."""
-    m = re.search(r'^  link storage: (\d+) memories, (\d+) bits, (\d+) LUTRAM LUTs; '
-                  r'(\d+) register bits', text, re.M)
-    if not m:
-        return None
-    return dict(memories=int(m.group(1)), bits=int(m.group(2)), lutram=int(m.group(3)),
-                regbits=int(m.group(4)))
 
 
 def ere_escape(text):
@@ -1266,7 +1290,7 @@ FRAME_GROWTH = 4
 
 def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True, vmem=None,
                  pattern='', weights=None, pages_hbm=True, row_bytes_min=1, max_ii=1 << 16,
-                 page=True, links=None):
+                 page=True):
     """--state auto: where each class's state lives, three tiers, priced.
 
       on chip    register stores and memories in flops, distributed, block or
@@ -1290,10 +1314,10 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
     virtual memories now: `pattern` and those moved), storage (rules, with
     pages=hbm), frame, the area (res), the projection (h) and what moved.
 
-    `links` (parse_links): the links' memories, counted in the region's
-    sites and routing load; none of the tiers moves them (a link is read
-    within its frame, a few host cycles after its write: no HBM round trip,
-    and no instance's page). When they alone (with the logic outside the
+    The links' storage (the schedule report's link kinds, `sched['__links__']`,
+    priced by link_cost as storage_area does) is in the base usage; none of
+    the tiers moves links yet (paging them, written and read at fixed slots,
+    is the next tier). When the links alone (with the logic outside the
     copies) leave no room, nothing fits at any frame: None at once."""
     est = copy_estimates(est, classes)
     rest = rest_of(cal, sum(e['lut'] for e in {id(e): e for e in est.values()}.values()))
@@ -1328,9 +1352,12 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
                     res=res, h=h, moved=moved, pages_offchip=off,
                     rows=tiers_pattern(res.get('rows_new', [])), rows_new=res.get('rows_new', []))
 
-    if links and (rest + storage.LUTRAM_SITES * links['lutram'] >
-                  storage.MARGIN * storage.REGION['sites'] or
-                  (route and rest + links['lutram'] > storage.route_luts())):
+    lk = link_cost(cal, (sched or {}).get('__links__'))
+    caps = {p: storage.MARGIN * storage.REGION[p] for p in ('sites', 'bram', 'uram')}
+    if (rest + storage.LUTRAM_SITES * lk['lutram'] > caps['sites'] or lk['bram'] > caps['bram']
+            or lk['uram'] > caps['uram'] or
+            (route and storage.fold_load(rest + lk['lutram'], lk['bram'], lk['uram']) >
+             storage.route_luts())):
         return None
     deep = sorted({n for n in classes.values() if n > 1})
     top = min(max_ii, FRAME_GROWTH * ii)
@@ -1341,7 +1368,7 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
         if f < ii:
             continue
         tiers = dict(frame=f, base_hbm=base_hbm, base_bubbles=base_bubbles, weights=weights,
-                     pages_hbm=pages_hbm, row_bytes_min=row_bytes_min, links=links or {})
+                     pages_hbm=pages_hbm, row_bytes_min=row_bytes_min)
         if f == ii:
             res = area(cal, est, classes, {}, rest, sched, f, entries, 'auto', route, uram,
                        vmem=vmem, tiers=tiers)
@@ -1396,7 +1423,8 @@ def state_table(out, classes, est):
              f"virtual memories: {out['pattern'] or 'none'}",
              f"pages off chip: {', '.join(out['pages_offchip']) or 'none'}",
              f"storage: {out['storage'] or 'default'}",
-             f"links: {res.get('link_lutram', 0)} LUTRAM LUTs counted"]
+             f"links: {res.get('link_lutram', 0)} LUTRAM LUTs, {res.get('link_bram', 0)} RAMB36, "
+             f"{res.get('link_uram', 0)} URAM288 counted"]
     est = copy_estimates(est, classes)
     vest = split_virtual({c: dict(e, mems=e['mems'] + e.get('vmems', []), vmems=[])
                           for c, e in est.items()}, out['pattern'])
@@ -1640,18 +1668,24 @@ def state_main(a):
     est = split_virtual(class_estimates(a.models, names), pattern)
     weights = json.load(open(a.vmem_weights)) if a.vmem_weights else None
     vmem = (a.vmem_cache_rows, a.vmem_cache_budget) if a.vmem_cache_rows else None
+    sched.pop('__links__', None)
     links = None
     if a.links == 'report':
         links = parse_links(open(a.links_from).read() if a.links_from else text)
+    if links:
+        sched['__links__'] = links
     out = choose_state(cal, est, classes, sched, ii, route=not a.no_routability,
                        entries=a.register_state_entries, vmem=vmem, pattern=pattern,
                        weights=weights, pages_hbm=not a.no_pages_hbm,
-                       row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page, links=links)
+                       row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page)
     if links:
-        print(f"links: {links['memories']} memories, {links['bits'] / 1e6:.1f} Mbit, "
-              f"{links['lutram']} LUTRAM LUTs ({storage.LUTRAM_SITES * links['lutram'] / 1e6:.2f}M "
-              f"sites of {storage.MARGIN * storage.REGION['sites'] / 1e6:.2f}M), "
-              f"{links['regbits']} register bits")
+        lk = link_cost(cal, links)
+        print(f"links: {(links['lutram_bits'] + links['bram_bits'] + links['uram_bits']) / 1e6:.1f} "
+              f"Mbit in memories ({lk['lutram']:.0f} LUTRAM LUTs, {lk['bram']:.1f} RAMB36, "
+              f"{lk['uram']:.0f} URAM288), {links['ff']} register bits; region caps "
+              f"{storage.MARGIN * storage.REGION['sites'] / 1e6:.2f}M sites, "
+              f"{storage.MARGIN * storage.REGION['bram']:.0f} RAMB36, "
+              f"{storage.MARGIN * storage.REGION['uram']:.0f} URAM288")
     if out is None:
         print(f'--state auto: nothing fits the V80 region (II {ii})'
               + (' with the links\' memories' if links else ''))

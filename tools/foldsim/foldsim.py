@@ -360,6 +360,14 @@ def frame_options(a):
         fold += f' page-hbm-column-bits={a.page_hbm_column_bits}'
     if getattr(a, 'compact_links', False):
         fold += ' compact-links'
+    if getattr(a, 'share_links', False):
+        fold += ' share-links'
+    if getattr(a, 'staged_links', False):
+        fold += ' staged-links'
+    if getattr(a, 'link_block_depth', 0):
+        fold += f' link-block-depth={a.link_block_depth}'
+    if getattr(a, 'link_ultra_depth', 0):
+        fold += f' link-ultra-depth={a.link_ultra_depth}'
     if getattr(a, 'registered_links', ''):
         fold += f' registered-links={a.registered_links}'
     return fold
@@ -578,11 +586,11 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
     res = foldsim_degree.choose_state(cal, est, classes, foldsim_degree.parse_classes(text), ii,
                                       route=a.routability, entries=entries, vmem=vmem,
                                       pattern=pattern, weights=weights,
-                                      row_bytes_min=a.vmem_row_bytes_min, links=links)
+                                      row_bytes_min=a.vmem_row_bytes_min)
     if res is None:
         sys.exit(f'--state auto: nothing fits the V80 region (II {ii})'
-                 + (f" with the links' {links['lutram']} LUTRAM LUTs" if links else '')
-                 + f'; see {base}')
+                 + (f" with the links' {links['lutram']:.0f} LUTRAM LUTs, {links['bram']} RAMB36, "
+                    f"{links['uram']} URAM288" if links else '') + f'; see {base}')
     with open(out('state.txt'), 'w') as f:
         f.write(f'II {ii} (schedule)\n' + foldsim_degree.state_table(res, classes, est) + '\n')
     h = res['h']
@@ -921,6 +929,19 @@ def main():
                     help="with --static: a link keeps only the producer instances its reader takes (a "
                          "per-lane port read by its own lane's instances, say), not an entry for every "
                          'instance (foldsim-fold-static)')
+    ap.add_argument('--link-block-depth', type=int, default=0, metavar='N',
+                    help='with --static: a link memory at least N deep that is its reader input\'s only '
+                         'source and never forwarded is a block RAM, its output register the read '
+                         'register (foldsim-fold-static; 0: none)')
+    ap.add_argument('--link-ultra-depth', type=int, default=0, metavar='N',
+                    help='as --link-block-depth, in ultra RAM (foldsim-fold-static; 0: none)')
+    ap.add_argument('--staged-links', action='store_true',
+                    help="with --static: an early link of one producer instance in two registers, "
+                         'copied at a fixed position of the frame, where the schedule allows '
+                         '(foldsim-fold-static)')
+    ap.add_argument('--share-links', action='store_true',
+                    help='with --static: outputs of a model driven by the same value (a bus broadcast '
+                         'to several children) share one link (foldsim-fold-static)')
     ap.add_argument('--registered-links', default='', metavar='CLASS,...',
                     help='with --zero-latency-links: classes (globs) whose links a reader always takes '
                          "from its read register, never in their producer's host cycle: a class whose "
