@@ -171,7 +171,19 @@ def frame_options(a):
         fold += f' forward-after-levels={a.forward_after_levels}'
     if getattr(a, 'no_share_link_writes', False):
         fold += ' share-link-writes=false'
+    if getattr(a, 'page', ''):
+        fold += f' page={page_option(a.page)}'
     return fold
+
+
+def page_option(spec):
+    """fold-static's `page` of --page: a count pages every model's copies,
+    else <model>:<p>,... as given."""
+    if re.fullmatch(r'\d+', spec):
+        return f'*:{spec}'
+    if not re.fullmatch(r'[\w$*]+:\d+(,[\w$*]+:\d+)*', spec):
+        sys.exit(f"--page: '{spec}' is not <p> or <model>:<p>,...")
+    return spec
 
 
 # An AXI4 port's inputs the endpoint offers for either fire of R in the
@@ -427,6 +439,11 @@ def main():
     ap.add_argument('--no-share-link-writes', action='store_true',
                     help="with --static: write each reader's link from the producer's bits in the "
                          'pass, not a host cycle late from one register of them (foldsim-fold-static)')
+    ap.add_argument('--page', default='', metavar='P|MODEL:P,...',
+                    help='with --static: paged register state (foldsim-fold-static page): a '
+                         "copy of several instances keeps its registers in a page RAM per "
+                         'region and moves an instance\'s state in and out P host cycles at a '
+                         'time, double-buffered; a count pages every model, else per model')
     ap.add_argument('--register-state-entries', type=int, metavar='N',
                     help='with --static: per-instance state of copies with at most N instances in flops, '
                          'deeper in distributed RAM (default 2; 0: always distributed RAM)')
@@ -646,6 +663,8 @@ def main():
         if a.vmem_cache_rows != 'auto' and not a.vmem_cache_rows.isdigit():
             sys.exit('--vmem-cache-rows: auto, 0 or a power of two of at least 2')
         vmem_cache_rows([], a.vmem_cache_rows, a.vmem_cache_budget)
+    if a.page and not a.static:
+        sys.exit('--page needs --static')
     if a.storage and not a.static:
         sys.exit('--storage needs --static')
     if a.schedule_only and not a.static:

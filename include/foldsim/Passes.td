@@ -433,6 +433,17 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "the choice: the producer's path then ends at that register, not "
            "through the choice into the read register; 0 forwards every one "
            "into the read register">,
+    ListOption<"page", "page", "std::string",
+               "Paged register state, as <model>:<p> (or *:<p> for every "
+               "model): a copy of the model of several instances keeps its "
+               "registers in one page RAM per region (block RAM, or the "
+               "<model>:pages=<kind> storage rule) and moves an instance's "
+               "state in and out p host cycles at a time: its pages are read "
+               "into a fetch buffer over the p slots before its state pass, "
+               "and its next state written back from a write-back buffer over "
+               "the p host cycles after. The evaluation stays one host cycle; "
+               "the copy's state passes are p slots apart and the frame at "
+               "least p + 4. Registers a ready pass reads keep their stores">,
     Option<"shareLinkWrites", "share-link-writes", "bool", "true",
            "A producer's bits read by several classes' inputs are registered "
            "once and written to each reader's link a host cycle after the "
