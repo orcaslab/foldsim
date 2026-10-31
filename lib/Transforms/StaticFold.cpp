@@ -485,6 +485,8 @@ private:
     /// The reader's input, and the sources of its bits there (this one,
     /// other producers, frame inputs, constants).
     unsigned port = 0, sources = 0;
+    /// The first bit of the reader's input it is.
+    unsigned at = 0;
   };
   /// `staged-links`: an early link of one producer instance kept in two
   /// registers, written at the producer's pass and copied to the one its
@@ -1385,6 +1387,7 @@ void StaticFolder::linkUses(std::vector<LinkUse> &uses) const {
                     source.readers, source.readerRows};
         use.port = consumer.port;
         use.sources = keys.size();
+        use.at = at;
         uses.push_back(std::move(use));
       }
       at = end;
@@ -3249,7 +3252,9 @@ void StaticFolder::reportLinks(raw_ostream &os) {
             << use.rows.size() << " " << (banked ? 1 : 0) << " "
             << classes[use.reader].name << " "
             << classes[use.reader].threads() << " " << use.input << " "
-            << kind << " " << depth << "\n";
+            << kind << " " << depth << " " << producer.name << "_to_"
+            << classes[use.reader].name << "_" << use.input << "_" << use.at
+            << "\n";
     }
   }
   os << "  link storage: " << distributed.memories + block.memories +

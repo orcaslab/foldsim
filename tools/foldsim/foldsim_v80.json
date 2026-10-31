@@ -476,8 +476,8 @@
   }
  ],
  "links": {
-  "bits": 0.977,
-  "lutram": 0.984,
-  "source": "built 1-SM a1 fold (a1_1031/gen/a1_fold): 82,493,908 link bits / 2,524,686 LUTRAM (mem_cost rule) in foldsim_sim.mlir against the report 84,428,872 / 2,565,595 (foldsim fold-static-links); no Vivado point"
+  "bits": 1.0,
+  "lutram": 1.0,
+  "source": "built 1-SM a1 fold (a1_1031/gen/a1_fold/gen/foldsim_sim.mlir): 84,430,600 link bits / 2,566,088 LUTRAM (mem_cost rule) against the report 84,428,872 / 2,565,595; small / mid gates with block and ultra links: 58,676 / 126,244 distributed bits built against 58,584 / 126,086 reported, block and ultra bits equal; no Vivado point"
  }
 }
