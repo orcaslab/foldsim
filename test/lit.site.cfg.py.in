@@ -1,6 +1,7 @@
 @LIT_SITE_CFG_IN_HEADER@
 
 config.llvm_tools_dir = lit_config.substitute("@LLVM_TOOLS_DIR@")
+config.circt_tools_dir = "@CIRCT_TOOLS_DIR@"
 config.foldsim_obj_root = "@CMAKE_BINARY_DIR@"
 config.foldsim_tools_dir = "@CMAKE_BINARY_DIR@/bin"
 config.verilator = "@FOLDSIM_VERILATOR@"

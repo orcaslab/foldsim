@@ -431,6 +431,9 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--circt-bin', default='')
     ap.add_argument('--foldsim-bin', default='')
+    ap.add_argument('--max-unroll-trip-count', type=int, default=0, metavar='N',
+                    help="circt-verilog's limit on the iterations of a process's loop it unrolls "
+                         '(--max-unroll-trip-count); 0: its default (1024)')
     ap.add_argument('--max-generate-steps', type=int, default=0, metavar='N',
                     help="circt-verilog's (slang's) generate-loop step limit, which counts the "
                          'blocks of a loop times those of the loops around it; 0: its default')
@@ -654,6 +657,7 @@ def main():
          '--allow-hierarchical-const', '--ignore-uninstantiated-modules', '--detect-memories',
          '--preserve-unpacked-ports',
          *([f'-Xslang=--max-generate-steps={a.max_generate_steps}'] if a.max_generate_steps else []),
+         *([f'--max-unroll-trip-count={a.max_unroll_trip_count}'] if a.max_unroll_trip_count else []),
          *defines, *incdirs, *files, '-o', design])
 
     # A module declared a black box (a core the synthesis flow provides) stays
