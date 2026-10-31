@@ -243,7 +243,8 @@ public:
                unsigned slrGroups, ArrayRef<std::string> slrSites,
                uint64_t slrCapacity, ArrayRef<std::string> slrAssign,
                ArrayRef<std::string> storage, StringRef readyLevels,
-               unsigned forwardAfterLevels, bool shareLinkWrites)
+               unsigned forwardAfterLevels, bool shareLinkWrites,
+               unsigned zeroChainHops)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -257,7 +258,7 @@ public:
         readyLevelsMode(readyLevels.str()),
         registerStateEntries(registerStateEntries), storageSpecs(storage),
         forwardAfterLevels(forwardAfterLevels),
-        shareLinkWrites(shareLinkWrites),
+        shareLinkWrites(shareLinkWrites), zeroChainHops(zeroChainHops),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -420,6 +421,14 @@ private:
                           unsigned width);
   unsigned forwardAfterLevels;
   bool shareLinkWrites;
+  /// `zero-chain-hops`: the most zero-latency links a path may take within
+  /// a host cycle (0: unbounded), and the links cut to keep it (chainCuts),
+  /// each as (producer, consumer class, input).
+  unsigned zeroChainHops;
+  std::set<std::tuple<unsigned, unsigned, unsigned>> cutLinks;
+  /// Counts, instance by instance, the zero-latency links on the paths into
+  /// each late output and cuts the links that would pass `zeroChainHops`.
+  void chainCuts();
   // Host cycles from a late netlist output's slot to the next frame's first.
   int envRoundTrip;
   /// Whether producer `p`'s link to class `c`'s input may be taken in the
@@ -1045,7 +1054,7 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   if (crosses(producer.cls, c))
     return false;
   if (zeroLatencyChains)
-    return true;
+    return !cutLinks.count({p, c, input});
   auto &cls = classes[c];
   if (cls.inputToOutput.test(input))
     return false;
@@ -1053,6 +1062,100 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   return classes[producer.cls].outputDepth[producer.port] +
              cls.inputDepth[input] + 3 <=
          kZeroLinkLevels;
+}
+
+void StaticFolder::chainCuts() {
+  cutLinks.clear();
+  if (!zeroLatencyLinks || !zeroLatencyChains || !zeroChainHops)
+    return;
+  // Instance by instance: a late output's hops, the most zero-latency links
+  // on a path into it within its host cycle (each adds its reader's choice
+  // of source to the path); a link from it takes one more. A link that
+  // would take a chain past `zeroChainHops` is cut: read a host cycle later
+  // from its register, where the chain starts anew.
+  struct Edge {
+    unsigned p, pinst, c, cinst, input;
+  };
+  std::vector<Edge> edges;
+  for (auto &consumer : consumers) {
+    if (consumer.cls < 0)
+      continue;
+    for (auto [ci, pieces] : llvm::enumerate(consumer.pieces))
+      for (auto &piece : pieces)
+        if (piece.producer >= 0 && producers[piece.producer].cls >= 0 &&
+            producers[piece.producer].late)
+          edges.push_back({unsigned(piece.producer), piece.inst,
+                           unsigned(consumer.cls), unsigned(ci),
+                           consumer.port});
+  }
+  llvm::sort(edges, [](const Edge &a, const Edge &b) {
+    return std::tie(a.p, a.pinst, a.c, a.cinst, a.input) <
+           std::tie(b.p, b.pinst, b.c, b.cinst, b.input);
+  });
+  edges.erase(std::unique(edges.begin(), edges.end(),
+                          [](const Edge &a, const Edge &b) {
+                            return std::tie(a.p, a.pinst, a.c, a.cinst,
+                                            a.input) ==
+                                   std::tie(b.p, b.pinst, b.c, b.cinst,
+                                            b.input);
+                          }),
+              edges.end());
+  // Hops per (producer, instance), to a fixed point, held at the bound plus
+  // one where port-level dependences make a loop.
+  int cap = int(zeroChainHops) + 1;
+  std::map<std::pair<unsigned, unsigned>, int> hops;
+  auto settle = [&] {
+    hops.clear();
+    std::map<std::tuple<unsigned, unsigned, unsigned>, int> in;
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (auto &e : edges) {
+        if (cutLinks.count({e.p, e.c, e.input}))
+          continue;
+        int at = hops[{e.p, e.pinst}] + 1;
+        int &slot = in[{e.c, e.cinst, e.input}];
+        slot = std::max(slot, at);
+      }
+      for (auto [p, producer] : llvm::enumerate(producers)) {
+        if (producer.cls < 0 || !producer.late)
+          continue;
+        auto &cls = classes[producer.cls];
+        for (unsigned i = 0; i < cls.threads(); ++i) {
+          int at = 0;
+          for (auto input : cls.deps[producer.port].set_bits())
+            if (auto it = in.find({unsigned(producer.cls), i, unsigned(input)});
+                it != in.end())
+              at = std::max(at, it->second);
+          at = std::min(at, cap);
+          int &h = hops[{unsigned(p), i}];
+          if (at > h) {
+            h = at;
+            changed = true;
+          }
+        }
+      }
+    }
+  };
+  // Cut the links where a chain first passes the bound, then again, until
+  // none does.
+  for (;;) {
+    settle();
+    std::set<std::tuple<unsigned, unsigned, unsigned>> cut;
+    for (auto &e : edges)
+      if (!cutLinks.count({e.p, e.c, e.input}) &&
+          hops[{e.p, e.pinst}] + 1 > int(zeroChainHops) &&
+          hops[{e.p, e.pinst}] == int(zeroChainHops))
+        cut.insert({e.p, e.c, e.input});
+    if (cut.empty())
+      break;
+    cutLinks.insert(cut.begin(), cut.end());
+    if (getenv("FOLDSIM_CHAIN_DEBUG"))
+      for (auto &[p, c, input] : cut)
+        llvm::errs() << "chain cut " << classes[producers[p].cls].name << "."
+                     << classes[producers[p].cls].outputNames[producers[p].port]
+                     << " -> " << classes[c].name << "."
+                     << classes[c].inputNames[input] << "\n";
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -2655,6 +2758,7 @@ LogicalResult StaticFolder::chooseGroups() {
 }
 
 LogicalResult StaticFolder::schedule() {
+  chainCuts();
   auto late = [](const Class &cls) {
     return llvm::any_of(cls.late, [](bool late) { return late; });
   };
@@ -2733,6 +2837,9 @@ LogicalResult StaticFolder::schedule() {
       }
     }
     os << "  zero-latency links: " << zero << " of " << links << "\n";
+    if (zeroChainHops && zeroLatencyChains)
+      os << "  chains cut past " << zeroChainHops << " hops: "
+         << cutLinks.size() << " links\n";
   }
   if (!slrOf.empty()) {
     SmallVector<SmallVector<uint64_t>> bits;
@@ -5898,7 +6005,7 @@ void FoldStaticPass::runOnOperation() {
                       specGroups, specDepth,
                       envSinks, registerStateEntries, slrGroups, slrSites,
                       slrCapacity, slrAssign, storage, readyLevels,
-                      forwardAfterLevels, shareLinkWrites);
+                      forwardAfterLevels, shareLinkWrites, zeroChainHops);
   if (failed(folder.run()))
     return signalPassFailure();
 }

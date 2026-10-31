@@ -291,6 +291,8 @@ def frame_options(a):
         fold += f' forward-after-levels={a.forward_after_levels}'
     if getattr(a, 'no_share_link_writes', False):
         fold += ' share-link-writes=false'
+    if getattr(a, 'zero_chain_hops', None):
+        fold += f' zero-chain-hops={a.zero_chain_hops}'
     return fold
 
 
@@ -548,6 +550,10 @@ def main():
                     help='with --static: a link read forwarded past the read register where the '
                          "reader's logic behind it stays below N levels (default 8; 0: into the "
                          'read register) (foldsim-fold-static)')
+    ap.add_argument('--zero-chain-hops', type=int, metavar='N',
+                    help="with --zero-latency-chains: at most N links taken in their producers' host "
+                         'cycle on a combinational path; a link past them is taken a host cycle later '
+                         '(default: no bound) (foldsim-fold-static)')
     ap.add_argument('--no-share-link-writes', action='store_true',
                     help="with --static: write each reader's link from the producer's bits in the "
                          'pass, not a host cycle late from one register of them (foldsim-fold-static)')

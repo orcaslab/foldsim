@@ -441,6 +441,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "pass, forwarded from the register to a read in between: the "
            "producer's path ends at that one register, not at every reader's "
            "link">,
+    Option<"zeroChainHops", "zero-chain-hops", "unsigned", "0",
+           "With zero-latency-chains: the most links taken in their "
+           "producers' host cycle a combinational path may cross, instance "
+           "by instance (each adds its reader's choice of source to the "
+           "path); a link that would pass them is taken a host cycle later "
+           "from its register, where the chain starts anew. 0: no bound">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

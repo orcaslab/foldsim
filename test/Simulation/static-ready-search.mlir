@@ -25,6 +25,24 @@
 // RUN: firtool --format=mlir %t/c/sim.mlir -o %t/c/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/c/obj %S/Inputs/tb_staged.sv %t/c/sim.sv > %t/c/build.log 2>&1
 // RUN: %t/c/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// Chains of zero-latency links held to one and two hops (zero-chain-hops):
+// the links past them are read a host cycle later from their registers, the
+// same tokens.
+// RUN: mkdir -p %t/h1 && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=S,A,B netlist},foldsim-fold-static{module=Top modulo zero-latency-links zero-latency-chains zero-chain-hops=1 report=%t/h1/schedule.txt})" -o %t/h1/sim.mlir
+// RUN: FileCheck %s --check-prefix=HOPS1 < %t/h1/schedule.txt
+// RUN: firtool --format=mlir %t/h1/sim.mlir -o %t/h1/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/h1/obj %S/Inputs/tb_staged.sv %t/h1/sim.sv > %t/h1/build.log 2>&1
+// RUN: %t/h1/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/h1/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+// RUN: mkdir -p %t/h2 && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=S,A,B netlist},foldsim-fold-static{module=Top modulo zero-latency-links zero-latency-chains zero-chain-hops=2 copies=A:2,B:2 report=%t/h2/schedule.txt})" -o %t/h2/sim.mlir
+// RUN: FileCheck %s --check-prefix=HOPS2 < %t/h2/schedule.txt
+// RUN: firtool --format=mlir %t/h2/sim.mlir -o %t/h2/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/h2/obj %S/Inputs/tb_staged.sv %t/h2/sim.sv > %t/h2/build.log 2>&1
+// RUN: %t/h2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/h2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 | FileCheck %s
+// HOPS1: zero-latency links: 5 of 10
+// HOPS1-NEXT: chains cut past 1 hops: 5 links
+// HOPS2: chains cut past 2 hops: {{[1-9][0-9]*}} links
 // CHECK: z0: 00 00 01 07 0f 17 1e 28 23 2e 3a
 // CHECK: z1: 00 02 04 06 08 0a 0c 0e 10 11 13
 hw.module @S(in %clk : !seq.clock, in %reset : i1, in %r_in : i1, in %k_in : i1, in %x : i8, out q : i8) {
