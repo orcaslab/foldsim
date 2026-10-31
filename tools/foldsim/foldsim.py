@@ -24,6 +24,7 @@ port (`<port>_valid`, `_ready`, `_bits`) and a `profile_finish` bit per class;
 order of those bits; and <out>/foldsim_sim.vh, their number for the kernel.
 """
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -75,6 +76,125 @@ def publish(src, public):
         if not n:
             sys.exit(f'no module {m} in the design')
     return s
+
+
+INSTANCE = re.compile(r'hw\.instance "([^"]+)"( sym @\S+)? @([\w$.]+)\(')
+
+
+def class_at(text, top, specs):
+    """`--class-at TAG@GLOB`: the instances whose path from `top` (instance
+    names joined by '.') matches GLOB become a class of their own. The modules
+    along their paths that other instances share are copied, so that the
+    matched instances alone change module; each parameter set of them (each
+    module they were instances of) becomes a module named TAG, or TAG_<k> for
+    several, in the order first met. The first GLOB that matches takes an
+    instance; a GLOB may match none. Returns the design and the new modules'
+    names."""
+    lines = text.split('\n')
+    span, order = {}, []
+    for i, line in enumerate(lines):
+        m = re.match(r'  hw\.module (?:private )?@([\w$.]+)\(', line)
+        if m:
+            span[m.group(1)] = [i, None]
+            order.append(m.group(1))
+        elif line == '  }' and order and span[order[-1]][1] is None:
+            span[order[-1]][1] = i
+    for tag, _ in specs:
+        if tag in span:
+            sys.exit(f'--class-at {tag}: a module of the design has that name')
+    if top not in span:
+        sys.exit(f'--class-at: no module {top}')
+
+    def instances(mod):
+        s, e = span[mod]
+        return [(i - s, m.group(1), m.group(3)) for i in range(s, e)
+                for m in [INSTANCE.search(lines[i])] if m]
+    body = {m: instances(m) for m in span}
+    refs = {m: 0 for m in span}
+    for m in span:
+        for _, _, c in body[m]:
+            if c in refs:
+                refs[c] += 1
+    # Every matched instance, as the path of (relative line) of each instance
+    # op from the top; the search descends only below unmatched instances.
+    matched = []
+    sys.setrecursionlimit(max(10000, sys.getrecursionlimit()))
+
+    def walk(mod, path, edges):
+        for rel, name, callee in body[mod]:
+            p = f'{path}.{name}' if path else name
+            tag = next((t for t, g in specs if fnmatch.fnmatchcase(p, g)), None)
+            if tag:
+                matched.append((tag, edges + (rel,), callee))
+            elif callee in body:
+                walk(callee, p, edges + (rel,))
+    walk(top, '', ())
+    # A glob a configuration has no instance for is not an error: one class
+    # list serves configurations whose crossbars take different forms.
+    for t, g in specs:
+        if all(m[0] != t for m in matched):
+            print(f'class-at {t}: no instance matches {g}', file=sys.stderr)
+
+    def retarget(mod, rel, new):
+        i = span[mod][0] + rel
+        m = INSTANCE.search(lines[i])
+        lines[i] = lines[i][:m.start(3)] + new + lines[i][m.end(3):]
+
+    end = max(i for i, line in enumerate(lines) if line == '}')
+
+    def copy(mod, new):
+        nonlocal end
+        s, e = span[mod]
+        text = lines[s:e + 1]
+        text[0] = text[0].replace(f'@{mod}(', f'@{new}(', 1)
+        span[new] = [end, end + e - s]
+        lines[end:end] = text
+        end += len(text)
+        body[new] = body[mod]
+        refs[new] = 0
+        for _, _, c in body[mod]:
+            if c in refs:
+                refs[c] += 1
+
+    # Each module on a matched path made the path's own, top down.
+    owned, copies = {}, 0
+    leaves = []
+    for tag, edges, leaf in matched:
+        cur = top
+        for rel in edges[:-1]:
+            if (cur, rel) not in owned:
+                callee = INSTANCE.search(lines[span[cur][0] + rel]).group(3)
+                if refs[callee] > 1:
+                    new = f'{callee}__at{copies}'
+                    copies += 1
+                    copy(callee, new)
+                    refs[callee] -= 1
+                    refs[new] += 1
+                    retarget(cur, rel, new)
+                    callee = new
+                owned[(cur, rel)] = callee
+            cur = owned[(cur, rel)]
+        leaves.append((tag, cur, edges[-1], leaf))
+    # Each parameter set a module of its own, named after the tag.
+    groups = {}
+    for tag, _, _, leaf in leaves:
+        groups.setdefault(tag, [])
+        if leaf not in groups[tag]:
+            groups[tag].append(leaf)
+    name = {(t, l): t if len(ls) == 1 else f'{t}_{k}'
+            for t, ls in groups.items() for k, l in enumerate(ls)}
+    for (tag, leaf), new in name.items():
+        if new in span:
+            sys.exit(f'--class-at {tag}: a module of the design is named {new}')
+        copy(leaf, new)
+    for tag, mod, rel, leaf in leaves:
+        refs[leaf] -= 1
+        refs[name[(tag, leaf)]] += 1
+        retarget(mod, rel, name[(tag, leaf)])
+    for (tag, leaf), new in name.items():
+        n = sum(1 for t, _, _, l in leaves if (t, l) == (tag, leaf))
+        print(f'class-at {tag}: {new} ({leaf}) x{n}', file=sys.stderr)
+    return '\n'.join(lines), list(name.values())
 
 
 def instantiated(text, module, names):
@@ -356,6 +476,10 @@ def main():
     ap.add_argument('--domains', action='store_true',
                     help='emit the simulator as a tree of domains, one module per class '
                          'nested as the class tree (foldsim-compose)')
+    ap.add_argument('--class-at', action='append', default=[], metavar='TAG@GLOB',
+                    help='the instances whose path (instance names joined by ".") matches GLOB '
+                         'are a class: one module per parameter set, TAG or TAG_<k>; repeatable, '
+                         'the first match takes an instance. A class `A+B` may name them')
     ap.add_argument('--nest', action='store_true',
                     help="fold nested classes recursively: each class's threads numbered so "
                          "that a thread and its parent's are current together (foldsim-compose); with "
@@ -527,6 +651,18 @@ def main():
         run([foldsim_opt, design, '--foldsim-black-boxes', '-o', design + '.tmp'])
         os.replace(design + '.tmp', design)
 
+    if a.class_at:
+        specs = []
+        for spec in a.class_at:
+            tag, sep, glob = spec.partition('@')
+            if not sep or not re.fullmatch(r'[A-Za-z_]\w*', tag) or not glob:
+                sys.exit(f'--class-at {spec}: not TAG@GLOB')
+            specs.append((tag, glob))
+        text, new = class_at(open(design).read(), a.top, specs)
+        with open(design, 'w') as f:
+            f.write(text)
+        named = {m for c in a.classes for m in c.split('+')}
+        a.classes = a.classes + [n for n in new if n not in named]
     groups = [c.split('+') for c in a.classes if '+' in c]
     if any(len(g) != 2 for g in groups):
         sys.exit('a fused class is two modules, A+B')
