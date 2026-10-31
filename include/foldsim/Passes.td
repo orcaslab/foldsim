@@ -287,6 +287,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     - Every input of a copy is a read register: a link's read at the
       consumer's slot, a constant of the instance, or the netlist input of
       the frame.
+    - A write reaches a read register loaded in its own host cycle
+      (forwarded) or a read in it (taken around the read register) only
+      where the schedule puts such a read of its entry there: each control
+      is a fixed delay of the frame's position, so the compiler knows which
+      reads meet which writes. A forward goes past the read register where
+      the reader's logic behind it stays shallow, and bits several classes
+      read are written to their links from one register of them, a host
+      cycle after the pass: the producer's logic then ends at one register,
+      not at every link and read register through the choices.
     - The netlist's inputs and outputs are token channels
       (`<port>_valid`, `_ready`, `_bits`): a frame starts when every input
       has its token and every output has room.
@@ -416,6 +425,20 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "in block or ultra RAM is read a host cycle early, registered, "
                "which needs a state gap of 4. Without rules the stores keep "
                "the default rules">,
+    Option<"forwardAfterLevels", "forward-after-levels", "unsigned", "8",
+           "A link read the schedule forwards a write to in its host cycle "
+           "is forwarded past the reader's read register, from a register of "
+           "the written bits, where the reader's input reaches no output and "
+           "its logic behind the register stays below this many levels with "
+           "the choice: the producer's path then ends at that register, not "
+           "through the choice into the read register; 0 forwards every one "
+           "into the read register">,
+    Option<"shareLinkWrites", "share-link-writes", "bool", "true",
+           "A producer's bits read by several classes' inputs are registered "
+           "once and written to each reader's link a host cycle after the "
+           "pass, forwarded from the register to a read in between: the "
+           "producer's path ends at that one register, not at every reader's "
+           "link">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

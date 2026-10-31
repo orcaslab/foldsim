@@ -167,6 +167,10 @@ def frame_options(a):
         fold += f' register-state-entries={a.register_state_entries}'
     if getattr(a, 'ready_levels', 'auto') != 'auto':
         fold += f' ready-levels={a.ready_levels}'
+    if getattr(a, 'forward_after_levels', None) is not None:
+        fold += f' forward-after-levels={a.forward_after_levels}'
+    if getattr(a, 'no_share_link_writes', False):
+        fold += ' share-link-writes=false'
     return fold
 
 
@@ -416,6 +420,13 @@ def main():
     ap.add_argument('--vmem-cache-budget', type=float, default=VMEM_CACHE_BUDGET, metavar='RAMB36',
                     help='with --vmem-cache-rows auto: the block RAM all the host caches\' lines may '
                          'take, in RAMB36 (default %(default)g, 5%% of the V80 dynamic region\'s)')
+    ap.add_argument('--forward-after-levels', type=int, metavar='N',
+                    help='with --static: a link read forwarded past the read register where the '
+                         "reader's logic behind it stays below N levels (default 8; 0: into the "
+                         'read register) (foldsim-fold-static)')
+    ap.add_argument('--no-share-link-writes', action='store_true',
+                    help="with --static: write each reader's link from the producer's bits in the "
+                         'pass, not a host cycle late from one register of them (foldsim-fold-static)')
     ap.add_argument('--register-state-entries', type=int, metavar='N',
                     help='with --static: per-instance state of copies with at most N instances in flops, '
                          'deeper in distributed RAM (default 2; 0: always distributed RAM)')
