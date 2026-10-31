@@ -19,7 +19,7 @@
 # RUN: %t/flat/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=30 | FileCheck %s
 # The buffers alone as classes, each with the select in front of it (its
 # slice's arbiter, over the limit with the readies behind it) absorbed.
-# RUN: foldsim --srcs top.f --top Top --out %t/excl --static --zero-latency-links --zero-latency-chains --absorb-exclusive --class-at 'b@*.out_buf' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=EXCL
+# RUN: foldsim --srcs top.f --top Top --out %t/excl --static --zero-latency-links --zero-latency-chains --absorb-exclusive b --class-at 'b@*.out_buf' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=EXCL
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/excl/obj %S/Inputs/tb_reset.sv top.sv %t/excl/foldsim_sim.sv > %t/excl/build.log 2>&1
 # RUN: %t/excl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +stall=0 | FileCheck %s
 # RUN: %t/excl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +stall=30 | FileCheck %s

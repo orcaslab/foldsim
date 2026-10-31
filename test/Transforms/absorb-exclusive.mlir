@@ -1,5 +1,5 @@
 // RUN: foldsim-opt %s --foldsim-extract-models="module=Shared models=Buf absorb-logic=3" | FileCheck %s --check-prefix=LIMIT
-// RUN: foldsim-opt %s --foldsim-extract-models="module=Shared models=Buf absorb-logic=3 absorb-exclusive" | FileCheck %s
+// RUN: foldsim-opt %s --foldsim-extract-models="module=Shared models=Buf absorb-logic=3 absorb-exclusive=B*" | FileCheck %s
 
 // Each buffer's input is a select by `s`, which both buffers' selects read
 // and which takes more ops than the limit: no logic is absorbed without

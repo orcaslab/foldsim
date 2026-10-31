@@ -577,11 +577,12 @@ def main():
                          'are a class: one module per parameter set, TAG or TAG_<k>; repeatable, '
                          'the first match takes an instance; `inner:GLOB` only an instance with no '
                          'match below it. A class `A+B` may name them')
-    ap.add_argument('--absorb-exclusive', action='store_true',
-                    help="a model input whose logic in the parent is over the absorb limit takes "
-                         "the part of it that reaches that input alone, the rest as inputs: a "
-                         "per-port select in front of a per-port class is then one copy in the "
-                         "class (foldsim-extract-models absorb-exclusive)")
+    ap.add_argument('--absorb-exclusive', default='', metavar='CLASS,...',
+                    help="for these classes (globs), a model input whose logic in the parent is "
+                         "over the absorb limit takes the part of it that reaches that input "
+                         "alone, the rest as inputs: a per-port select in front of a per-port "
+                         "class is then one copy in the class (foldsim-extract-models "
+                         "absorb-exclusive)")
     ap.add_argument('--nest', action='store_true',
                     help="fold nested classes recursively: each class's threads numbered so "
                          "that a thread and its parent's are current together (foldsim-compose); with "
@@ -830,7 +831,7 @@ def main():
         passes.append(registers)
     for m in order:
         models = f' models={",".join(sorted(children[m]))}' if children[m] else ''
-        exclusive = ' absorb-exclusive' if a.absorb_exclusive else ''
+        exclusive = f' absorb-exclusive={a.absorb_exclusive}' if a.absorb_exclusive else ''
         passes.append(f'foldsim-extract-models{{module={m}{models} netlist absorb-logic={ABSORB_LOGIC}{exclusive}}}')
         fused = [g for g in groups if set(g) <= children[m]]
         if fused:

@@ -18,6 +18,7 @@
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 #include "foldsim/Passes.h"
+#include "llvm/Support/GlobPattern.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Matchers.h"
@@ -453,9 +454,17 @@ class LogicAbsorber {
 public:
   LogicAbsorber(ModuleOp top, hw::HWModuleOp parent,
                 const llvm::StringSet<> &modelNames, unsigned limit,
-                bool exclusive)
-      : top(top), parent(parent), modelNames(modelNames), limit(limit),
-        exclusive(exclusive) {}
+                ArrayRef<std::string> exclusiveModels)
+      : top(top), parent(parent), modelNames(modelNames), limit(limit) {
+    for (auto &glob : exclusiveModels) {
+      auto pattern = llvm::GlobPattern::create(glob);
+      if (!pattern) {
+        llvm::consumeError(pattern.takeError());
+        continue;
+      }
+      exclusiveGlobs.push_back(std::move(*pattern));
+    }
+  }
   void run();
 
 private:
@@ -479,7 +488,9 @@ private:
   hw::HWModuleOp parent;
   const llvm::StringSet<> &modelNames;
   unsigned limit;
-  bool exclusive;
+  /// The models whose inputs take the logic that reaches them alone.
+  SmallVector<llvm::GlobPattern> exclusiveGlobs;
+  bool exclusive = false;
   DenseMap<Value, bool> portDeps;
   /// The instances of the model being absorbed into, by their index, and the
   /// sinks of the parent's values for it.
@@ -765,6 +776,9 @@ void LogicAbsorber::run() {
     sinks.clear();
     for (auto [i, instance] : llvm::enumerate(instances))
       instanceIndex[instance.getOperation()] = i;
+    exclusive = llvm::any_of(exclusiveGlobs, [&](const llvm::GlobPattern &g) {
+      return g.match(name.getValue());
+    });
     for (unsigned index = 0; index < model.getNumInputPorts(); ++index) {
       auto arg = model.getBodyBlock()->getArgument(index);
       if (arg.use_empty() || isa<seq::ClockType>(arg.getType()))
