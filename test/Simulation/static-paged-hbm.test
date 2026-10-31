@@ -11,7 +11,9 @@
 # column at response latency 1, six columns at 1-60 with stalls and the
 # controllers out of room, overlapped frames with bubbles, nested sequencers
 # with a short lead, two copies chained in a host cycle, the leaves' RAM
-# virtual too, and the dense page word.
+# virtual too, the dense page word, and an on-chip window of 2 slots
+# (--page-hbm-window: each instance prefetched two state passes ahead, then
+# fetched from the window as on chip).
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/paged
 # RUN: foldsim --srcs top.f --top Top --out %t/one --static --page 2 --storage Leaf:pages=hbm Leaf > %t/one.log 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/one  -Mdir %t/one/obj %S/Inputs/tb_pages.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
@@ -34,6 +36,14 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/dense --static --page 3 --storage Leaf:pages=hbm --no-page-masks --modulo Leaf > %t/dense.log 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/dense  -Mdir %t/dense/obj %S/Inputs/tb_pages.sv top.sv %t/dense/foldsim_sim.sv > %t/dense/build.log 2>&1
 # RUN: %t/dense/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=3 +hi=10 +stall=10 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/win --static --page 2 --storage Leaf:pages=hbm --page-hbm-window 2 Leaf > %t/win.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/win  -Mdir %t/win/obj %S/Inputs/tb_pages.sv top.sv %t/win/foldsim_sim.sv > %t/win/build.log 2>&1
+# RUN: %t/win/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 +full=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/winb --static --page 3 --storage Leaf:pages=hbm --page-hbm-window 4 --nest --short-lead --bubbles --page-hbm-column-bits 64 Leaf > %t/winb.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/winb -DBUBBLES -Mdir %t/winb/obj %S/Inputs/tb_pages.sv top.sv %t/winb/foldsim_sim.sv > %t/winb/build.log 2>&1
+# RUN: %t/winb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=40 +bubble=20 | FileCheck %s
+# RUN: FileCheck %s --check-prefix=WIN < %t/win.log
+# WIN: Leaf off-chip page window 2
 # RUN: FileCheck %s --check-prefix=ONE < %t/one.log
 # RUN: FileCheck %s --check-prefix=COLS < %t/cols/foldsim_sim.vh
 # ONE: pages Leaf: p 2, 3 registers, 181 bits (184 in 8-bit bytes, 1 enables); off chip: 1 virtual memories of 8 rows x 96 bits (vm0), lead 2

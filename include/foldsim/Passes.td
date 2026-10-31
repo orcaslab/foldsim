@@ -449,6 +449,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "most bits of a page word in one virtual memory's row (a multiple "
            "of 8); each such column is a virtual memory of its own, served by "
            "a controller of its own">,
+    Option<"pageHbmWindow", "page-hbm-window", "unsigned", "0",
+           "With a model's pages off chip: an on-chip window of at most this "
+           "many instances' pages per copy, filled from the virtual memories "
+           "that many instances ahead of their state passes (each instance's "
+           "pages prefetched at the copy's state pass that many before), so "
+           "the round trip hides behind them; the fetch buffer loads from it "
+           "as from an on-chip page RAM. The compiler takes the most slots "
+           "the schedule allows (a divisor of the copy's instances). 0: no "
+           "window, each fetch from the copy's state pass before">,
     Option<"pageMasks", "page-masks", "bool", "true",
            "With page: a paged register written under an enable keeps it, "
            "registered at the state pass, as its bytes' write mask in the "
