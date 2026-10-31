@@ -3913,10 +3913,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     state.push_back({memory.getName().value_or("mem").str(), memory});
   llvm::stable_sort(state, [](auto &a, auto &c) { return a.first < c.first; });
 
-  // Paged registers, by region: each read from its region's fetch buffer
-  // (a placeholder until the region's pages are built), and its write-back
-  // register, loaded at the state pass with its next value whole (a held
-  // register's old value where its enable is low).
+  // Paged registers, in state order: each read from the fetch buffer (a
+  // placeholder until the pages are built), and its write-back register,
+  // loaded at the state pass with its next value whole (a held register's
+  // old value where its enable is low).
   struct PagedReg {
     Value original;
     Backedge value;
@@ -3924,13 +3924,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     Value writeBack;
     std::string name;
   };
-  struct PageGroup {
-    unsigned region;
-    SmallVector<PagedReg> regs;
-    unsigned width = 0;
-  };
-  SmallVector<PageGroup> pageGroups;
-  DenseMap<unsigned, unsigned> pageGroupOf;
+  SmallVector<PagedReg> pagedRegs;
   BackedgeBuilder pageEdges(b, model.getLoc());
   unsigned keptRegs = 0;
   uint64_t keptBits = 0;
@@ -3985,13 +3979,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                             b, enable, write.data, kept)));
         value = kept;
       } else if (cls.page && !write.holds && width && !readyRegs.contains(reg)) {
-        // Paged: read out of the region's fetch buffer, written whole into
-        // its write-back buffer at the state pass (built below).
-        unsigned r = &region - regions.data();
-        auto [it, inserted] = pageGroupOf.try_emplace(r, pageGroups.size());
-        if (inserted)
-          pageGroups.push_back({r, {}, 0});
-        auto &group = pageGroups[it->second];
+        // Paged: read out of the fetch buffer, written whole into its
+        // write-back register at the state pass (the pages built below).
         auto placeholder = pageEdges.get(reg.getType());
         Value data = asBits(b, write.data);
         Value next = write.enable ? Value(comb::MuxOp::create(
@@ -4004,9 +3993,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             b, backNext, hostClock,
             b.getStringAttr(reg.getName() + "_writeback"));
         backNext.setValue(comb::MuxOp::create(b, region.state, next, back));
-        group.regs.push_back({reg.getResult(), placeholder, unsigned(width),
-                              back, reg.getName().str()});
-        group.width += width;
+        pagedRegs.push_back({reg.getResult(), placeholder, unsigned(width),
+                             back, reg.getName().str()});
         value = placeholder;
       } else {
         if (cls.page && !write.holds) {
@@ -4220,17 +4208,20 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     memory.erase();
   }
 
-  // Each region's paged registers, in one page RAM of `entries` x `pages`
-  // rows of `pw` bits, a row per {instance, page}:
+  // The paged registers, one vector of W bits a row of `pages` pages of
+  // pw = ceil(W / p) bits, the page word cut into columns of whole 72-bit
+  // ports (one RAM and one copy of the controls each, at most about
+  // `regionBits` bits): pw / 72 ports read a page a host cycle, the
+  // bits/ports bound. A column's RAM has a row per {instance, page}:
   // - page-in: the fetch's pages, read one a host cycle from two host cycles
-  //   after its `fetch3`, each through the RAM's output register into its
-  //   slice of the fetch buffer, which the target logic reads: page j lands
-  //   at the end of the fetch position's host cycle + j;
-  // - write-back: the state pass loads the next state into the write-back
-  //   buffer; its page j is written a host cycle + j after.
+  //   after its `fetch3`, each through the RAM's output register into the
+  //   fetch buffer's parts it holds, which the target logic reads: page j
+  //   lands at the end of the fetch position's host cycle + j;
+  // - write-back: the state pass loads each register's write-back register;
+  //   page j is written a host cycle + j after.
   // The schedule spaces a copy's state passes a page apart and fetches each
   // a page before it, so neither buffer is overwritten before it is used.
-  if (!pageGroups.empty()) {
+  if (!pagedRegs.empty()) {
     unsigned p = cls.page;
     BackedgeBuilder edges(b, model.getLoc());
     auto bits = [&](unsigned width) { return b.getIntegerType(width); };
@@ -4240,75 +4231,60 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         kind != "registers")
       return model.emitError("storage: '") << kind << "' for pages";
     uint64_t pagedBits = 0;
-    unsigned pagedRegs = 0, ports = 0;
-    unsigned widest = 0;
-    for (auto &group : pageGroups) {
-      auto &region = regions[group.region];
-      unsigned width = group.width;
-      unsigned pw = (width + p - 1) / p;
-      widest = std::max(widest, pw);
-      pagedBits += width;
-      pagedRegs += group.regs.size();
-      ports += (pw + 71) / 72;
+    for (auto &reg : pagedRegs)
+      pagedBits += reg.width;
+    unsigned pw = unsigned((pagedBits + p - 1) / p);
+    unsigned colBits = 72 * std::max(1u, regionBits / 72);
+    unsigned columns = (pw + colBits - 1) / colBits;
+    struct Column {
+      unsigned width;
+      Region *region;
+      seq::FirMemOp memory;
+      Value out, writeAt;
+      /// Per page: the host cycle it lands, it is written, and its bits.
+      SmallVector<Value> land, writing;
+      SmallVector<SmallVector<Value>> words;
+    };
+    SmallVector<Column> cols(columns);
+    // Each column's controls: a region of its own.
+    for (unsigned c = 0; c < columns; ++c) {
+      unsigned width = std::min(colBits, pw - c * colBits);
+      regionFor(regionBits);
+      cols[c].width = width;
+    }
+    for (unsigned c = 0; c < columns; ++c)
+      cols[c].region = &regions[regions.size() - columns + c];
+    unsigned ports = 0;
+    for (auto &col : cols) {
+      auto &region = *col.region;
       std::string prefix = region.prefix;
-      auto memType = seq::FirMemType::get(context, entries * pages, pw, 1);
+      ports += (col.width + 71) / 72;
+      auto memType = seq::FirMemType::get(context, entries * pages, col.width, 1);
       auto memory = seq::FirMemOp::create(
           b, memType, /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old,
           seq::WUW::Undefined, b.getStringAttr(prefix + "_pages"),
           hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{},
           Attribute{});
       setRamStyle(memory, kind);
+      col.memory = memory;
       Value data = seq::FirMemReadOp::create(b, memory, region.readAt,
                                              hostClock, one());
       // The RAM's output register.
-      Value out = seq::FirRegOp::create(b, data, hostClock,
-                                        b.getStringAttr(prefix + "_page_out"));
+      col.out = seq::FirRegOp::create(b, data, hostClock,
+                                      b.getStringAttr(prefix + "_page_out"));
       // Page j lands at the end of the host cycle `land[j]` is set.
-      SmallVector<Value> land;
       Value fetch1 = keep(seq::FirRegOp::create(
           b, region.fetch2, hostClock, b.getStringAttr(prefix + "_fetch1")));
-      land.push_back(keep(seq::FirRegOp::create(
+      col.land.push_back(keep(seq::FirRegOp::create(
           b, fetch1, hostClock, b.getStringAttr(prefix + "_land0"))));
       for (unsigned j = 1; j < p; ++j)
-        land.push_back(keep(seq::FirRegOp::create(
-            b, land.back(), hostClock,
+        col.land.push_back(keep(seq::FirRegOp::create(
+            b, col.land.back(), hostClock,
             b.getStringAttr(prefix + "_land" + Twine(j)))));
-      // Each register's bits, cut at page boundaries: a fetch buffer part
-      // loaded as its page lands, and a write-back part loaded at the state
-      // pass; the write-back parts of each page, low bits first.
-      SmallVector<SmallVector<Value>> pageWords(p);
-      unsigned at = 0;
-      for (auto &reg : group.regs) {
-        SmallVector<Value> parts;
-        for (unsigned lo = 0; lo < reg.width;) {
-          unsigned j = (at + lo) / pw, offset = (at + lo) % pw;
-          unsigned n = std::min(reg.width - lo, pw - offset);
-          std::string name = reg.name + (n == reg.width
-                                             ? std::string()
-                                             : "_" + std::to_string(j));
-          auto fetchNext = edges.get(bits(n));
-          Value fetched = seq::FirRegOp::create(
-              b, fetchNext, hostClock, b.getStringAttr(name + "_fetched"));
-          fetchNext.setValue(comb::MuxOp::create(
-              b, land[j], b.createOrFold<comb::ExtractOp>(bits(n), out, offset),
-              fetched));
-          parts.push_back(fetched);
-          pageWords[j].push_back(
-              b.createOrFold<comb::ExtractOp>(bits(n), reg.writeBack, lo));
-          lo += n;
-        }
-        Value value = parts.size() == 1
-                          ? parts[0]
-                          : b.createOrFold<comb::ConcatOp>(
-                                SmallVector<Value>(parts.rbegin(), parts.rend()));
-        value = b.createOrFold<hw::BitcastOp>(Value(reg.value).getType(), value);
-        reg.value.setValue(value);
-        replaced[reg.original] = value;
-        at += reg.width;
-      }
+      col.words.resize(p);
       // Write-back: page j a host cycle + j after the state pass, at the
       // instance of that pass.
-      SmallVector<Value> writing;
+      auto &writing = col.writing;
       writing.push_back(keep(seq::FirRegOp::create(
           b, region.state, hostClock, b.getStringAttr(prefix + "_write0"))));
       for (unsigned j = 1; j < p; ++j)
@@ -4331,40 +4307,81 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                 hw::ConstantOp::create(b, bits(pageWidth), 1))));
         writeAt = comb::ConcatOp::create(b, writeInst, page);
       }
+      col.writeAt = writeAt;
+    }
+    // Each register's bits, cut where pages and columns meet: a fetch
+    // buffer part loaded as its page lands in its column, and the
+    // write-back bits of that page and column, low bits first.
+    uint64_t at = 0;
+    for (auto &reg : pagedRegs) {
+      SmallVector<Value> parts;
+      unsigned part = 0;
+      for (unsigned lo = 0; lo < reg.width;) {
+        uint64_t g = at + lo;
+        unsigned j = unsigned(g / pw), k = unsigned(g % pw);
+        unsigned c = k / colBits, offset = k % colBits;
+        unsigned n = std::min({reg.width - lo, pw - k, colBits - offset});
+        auto &col = cols[c];
+        std::string name =
+            reg.name + (n == reg.width ? std::string()
+                                       : "_" + std::to_string(part++));
+        auto fetchNext = edges.get(bits(n));
+        Value fetched = seq::FirRegOp::create(
+            b, fetchNext, hostClock, b.getStringAttr(name + "_fetched"));
+        fetchNext.setValue(comb::MuxOp::create(
+            b, col.land[j],
+            b.createOrFold<comb::ExtractOp>(bits(n), col.out, offset), fetched));
+        parts.push_back(fetched);
+        col.words[j].push_back(
+            b.createOrFold<comb::ExtractOp>(bits(n), reg.writeBack, lo));
+        lo += n;
+      }
+      Value value = parts.size() == 1
+                        ? parts[0]
+                        : b.createOrFold<comb::ConcatOp>(
+                              SmallVector<Value>(parts.rbegin(), parts.rend()));
+      value = b.createOrFold<hw::BitcastOp>(Value(reg.value).getType(), value);
+      reg.value.setValue(value);
+      replaced[reg.original] = value;
+      at += reg.width;
+    }
+    // Each column's write: page j's bits at its host cycle.
+    for (auto &col : cols) {
+      auto &writing = col.writing;
       Value writeData, writeEnable;
       for (unsigned j = 0; j < p; ++j) {
         unsigned have = 0;
-        for (auto word : pageWords[j])
+        for (auto word : col.words[j])
           have += hw::getBitWidth(word.getType());
         SmallVector<Value> high;
-        if (have < pw)
-          high.push_back(hw::ConstantOp::create(b, bits(pw - have), 0));
-        high.append(pageWords[j].rbegin(), pageWords[j].rend());
+        if (have < col.width)
+          high.push_back(hw::ConstantOp::create(b, bits(col.width - have), 0));
+        high.append(col.words[j].rbegin(), col.words[j].rend());
         Value word = high.size() == 1 ? high[0]
                                       : b.createOrFold<comb::ConcatOp>(high);
         if (p > 1)
           word = comb::AndOp::create(
-              b, word, b.createOrFold<comb::ReplicateOp>(bits(pw), writing[j]));
+              b, word,
+              b.createOrFold<comb::ReplicateOp>(bits(col.width), writing[j]));
         writeData = writeData ? Value(comb::OrOp::create(b, writeData, word))
                               : word;
         writeEnable = writeEnable
                           ? Value(comb::OrOp::create(b, writeEnable, writing[j]))
                           : writing[j];
       }
-      seq::FirMemWriteOp::create(b, memory, writeAt, hostClock, writeEnable,
-                                 writeData, Value{});
+      seq::FirMemWriteOp::create(b, col.memory, col.writeAt, hostClock,
+                                 writeEnable, writeData, Value{});
     }
     std::string text;
     llvm::raw_string_ostream os(text);
     unsigned bound =
         threads * unsigned((pagedBits + 72ull * ports - 1) / (72ull * ports));
-    os << "  pages " << cls.name << ": p " << p << ", " << pagedRegs
-       << " registers, " << pagedBits << " bits in " << pageGroups.size()
-       << " page RAMs (" << entries * pages << " rows, widest " << widest
-       << " bits, " << ports << " ports, " << kind << "); kept " << keptRegs
-       << " registers, " << keptBits << " bits; state passes " << threads
-       << " x " << p << " = " << threads * p << ", ports bound " << bound
-       << "\n";
+    os << "  pages " << cls.name << ": p " << p << ", " << pagedRegs.size()
+       << " registers, " << pagedBits << " bits; page RAMs " << entries * pages
+       << " rows x " << pw << " bits in " << columns << " columns, " << ports
+       << " ports, " << kind << "; kept " << keptRegs << " registers, "
+       << keptBits << " bits; state passes " << threads << " x " << p << " = "
+       << threads * p << ", ports bound " << bound << "\n";
     pageReport += os.str();
   } else if (cls.page) {
     pageReport += "  pages " + cls.name + ": p " + std::to_string(cls.page) +
