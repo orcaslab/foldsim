@@ -3798,6 +3798,26 @@ void StaticFolder::reportLinks(raw_ostream &os) {
        << " LUTRAM LUTs, " << cost.second << " bits\n";
 }
 
+/// The inputs named on a late output's line of the schedule report.
+static constexpr unsigned kNamedDeps = 8;
+
+/// A class's slots on the report: each run of three or more consecutive
+/// slots as `first..last` (foldsim_degree.parse_classes reads both forms).
+static void printSlots(raw_ostream &os, ArrayRef<int> slots) {
+  for (size_t i = 0; i < slots.size();) {
+    size_t j = i;
+    while (j + 1 < slots.size() && slots[j + 1] == slots[j] + 1)
+      ++j;
+    if (j - i >= 2) {
+      os << " " << slots[i] << ".." << slots[j];
+      i = j + 1;
+    } else {
+      os << " " << slots[i];
+      ++i;
+    }
+  }
+}
+
 LogicalResult StaticFolder::schedule() {
   chainCuts();
   auto late = [](const Class &cls) {
@@ -3954,13 +3974,11 @@ LogicalResult StaticFolder::schedule() {
     os << "\n";
     for (unsigned l = 0; l < cls.readyLevels; ++l) {
       os << "    ready" << (l ? std::to_string(l + 1) : "") << ":";
-      for (auto s : cls.readySlots(l))
-        os << " " << s;
+      printSlots(os, cls.readySlots(l));
       os << "\n";
     }
     os << "    state:";
-    for (auto s : cls.slot[kState])
-      os << " " << s;
+    printSlots(os, cls.slot[kState]);
     os << "\n";
     for (auto [o, late] : llvm::enumerate(cls.late)) {
       auto &producer = producers[cls.producerOf[o]];
@@ -3973,8 +3991,17 @@ LogicalResult StaticFolder::schedule() {
                  : std::string(" @ready"))
          << (stateOnly.contains(cls.producerOf[o]) ? " (moved)" : "")
          << " <-";
-      for (auto input : cls.deps[o].set_bits())
+      // The first inputs by name, then their count: a model's late output
+      // may depend on thousands (the top's AXI outputs at 16 SMs).
+      unsigned named = 0, inputs = cls.deps[o].count();
+      for (auto input : cls.deps[o].set_bits()) {
+        if (named == kNamedDeps && inputs > kNamedDeps + 1) {
+          os << " ... (" << inputs - named << " more)";
+          break;
+        }
         os << " " << cls.inputNames[input];
+        ++named;
+      }
       os << "\n";
     }
   }
@@ -7693,10 +7720,13 @@ LogicalResult StaticFolder::buildSim() {
                 name + "_copy0");
             // Clock enables, as the flops take them: no select on the
             // producer's path into the first register.
+            // Named, with no inner symbol: several links may share a name.
             Value stageA = seq::CompRegClockEnabledOp::create(
-                b, data, hostClock, write, b.getStringAttr(name + "_staged"));
+                b, data, hostClock, write, b.getStringAttr(name + "_staged"),
+                Value(), Value(), Value(), hw::InnerSymAttr());
             Value stageB = seq::CompRegClockEnabledOp::create(
-                b, stageA, hostClock, copy, b.getStringAttr(name + "_held"));
+                b, stageA, hostClock, copy, b.getStringAttr(name + "_held"),
+                Value(), Value(), Value(), hw::InnerSymAttr());
             sourceData[index] = stageB;
             continue;
           }

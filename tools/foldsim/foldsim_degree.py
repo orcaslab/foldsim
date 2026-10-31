@@ -859,9 +859,13 @@ def parse_classes(text):
                                          page=int(page.group(1)) if page else 0,
                                          offchip=bool(page and page.group(2)))
             continue
-        m = re.match(r'^    (ready|state): ([\d ]+)$', line)
+        m = re.match(r'^    (ready|state): ([\d .]+)$', line)
         if m and cur is not None:
-            cur[m.group(1)] = [int(x) for x in m.group(2).split()]
+            slots = []
+            for x in m.group(2).split():
+                a, _, b = x.partition('..')
+                slots += list(range(int(a), int(b) + 1)) if b else [int(a)]
+            cur[m.group(1)] = slots
     return out
 
 

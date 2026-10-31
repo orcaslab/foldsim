@@ -18,9 +18,9 @@
 # RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
 # RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/bc0 --static --nest --modulo Lane 2>&1 | FileCheck %s --check-prefix=BC0
-# BC: shared outputs 3; staged: 9 links, 200 register bits
-# BC: link kinds: distributed 0 0 0; block 0 0 0.0; ultra 0 0 0; registers 9 200
-# BC0: link storage: 12 memories, 776 bits
+# BC: shared outputs 5; staged: 11 links, 232 register bits
+# BC: link kinds: distributed 0 0 0; block 0 0 0.0; ultra 0 0 0; registers 11 232
+# BC0: link storage: 16 memories, 840 bits
 # RUN: cd %S/../Driver/Inputs/tree-arb
 # RUN: foldsim --srcs top.f --top Top --out %t/tz --static --nest --modulo --compact-links --staged-links --share-links --zero-latency-links --zero-latency-chains --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=TREE
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/tz/obj %S/Inputs/tb_reset.sv top.sv %t/tz/foldsim_sim.sv > %t/tz/build.log 2>&1
