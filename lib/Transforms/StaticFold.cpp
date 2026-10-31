@@ -134,8 +134,9 @@ struct Class {
     SmallVector<unsigned> laneOffset;
     /// With --vmem-skip-held-reads, where the read's address is provably the
     /// previous target cycle's whenever it is true (heldReadCondition): an
-    /// op in the model computing that condition, else null.
-    Value held;
+    /// op in the model computing that condition, else null; and the row it
+    /// holds (the read's address then).
+    Value held, heldRow;
   };
   SmallVector<VirtualMemory> virtualMemories;
   /// With virtual memories, the copy's host reset input (their pending reads
@@ -3319,8 +3320,13 @@ static Value nextValue(ImplicitLocOpBuilder &b, Value root,
 /// registered read address with an enable, as front ends emit SRAMs and
 /// `if (en) raddr_q <= raddr; rdata = mem[raddr_q]` imports. The condition
 /// is built as an op of its own next to the mux, so that registers replaced
-/// later reach it. Null where the pattern is not found.
-static Value heldReadCondition(seq::FirMemReadOp read) {
+/// later reach it; so is the held row, the address's function applied to q
+/// (the address whenever the condition holds, without the mux and what
+/// computes c and A in its path). Null where the pattern is not found.
+struct HeldRead {
+  Value held, row;
+};
+static HeldRead heldReadCondition(seq::FirMemReadOp read) {
   comb::MuxOp found;
   bool qOnTrue = false;
   SmallVector<Value> work{read.getAddress()};
@@ -3367,7 +3373,25 @@ static Value heldReadCondition(seq::FirMemReadOp read) {
   b.setInsertionPointAfter(found);
   Location loc = found.getLoc();
   Value flip = hw::ConstantOp::create(b, loc, b.getI1Type(), qOnTrue ? 0 : 1);
-  return comb::XorOp::create(b, loc, found.getCond(), flip);
+  HeldRead result;
+  result.held = comb::XorOp::create(b, loc, found.getCond(), flip);
+  // The address cone again, q in place of the mux.
+  IRMapping mapping;
+  mapping.map(found.getResult(),
+              qOnTrue ? found.getTrueValue() : found.getFalseValue());
+  std::function<Value(Value)> rebuild = [&](Value value) -> Value {
+    if (Value mapped = mapping.lookupOrNull(value))
+      return mapped;
+    auto *op = value.getDefiningOp();
+    if (isa<hw::ConstantOp>(op))
+      return value;
+    for (auto operand : op->getOperands())
+      rebuild(operand);
+    b.clone(*op, mapping);
+    return mapping.lookup(value);
+  };
+  result.row = rebuild(read.getAddress());
+  return result;
 }
 
 /// Sets an operation's Vivado ram_style, replacing any it has.
@@ -3639,8 +3663,11 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     }
     // The lanes share the first's read address (sameRam), whose row the
     // requests carry.
-    if (skipHeldReads)
-      vm.held = heldReadCondition(portsOf(memory).first);
+    if (skipHeldReads) {
+      auto held = heldReadCondition(portsOf(memory).first);
+      vm.held = held.held;
+      vm.heldRow = held.row;
+    }
     for (auto lane : vm.lanes)
       virtualOf[lane] = cls.virtualMemories.size();
     cls.virtualMemories.push_back(std::move(vm));
@@ -3974,18 +4001,27 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           /*isAsync=*/false, b.getIntegerAttr(intType(entries), 0));
       Value isFresh = b.createOrFold<comb::ExtractOp>(
           intType(1), comb::ShrUOp::create(b, fresh, widen(inst, entries)), 0);
-      Value hit = comb::AndOp::create(
-          b, wrValid,
-          comb::ICmpOp::create(b, comb::ICmpPredicate::eq, wrRow, rdRow));
-      Value notHit = comb::XorOp::create(b, hit, one());
+      // Whether the pass writes the row it reads: against the held row for
+      // the skip (the read's row whenever it may skip; off the address's own
+      // path), against the read's row for a read-first instance's bit.
+      auto writes = [&](Value row) -> Value {
+        return comb::AndOp::create(
+            b, wrValid,
+            comb::ICmpOp::create(b, comb::ICmpPredicate::eq, wrRow, row));
+      };
       Value skip = comb::AndOp::create(b, vm.held, isFresh);
       if (!vm.readFirst)
-        skip = comb::AndOp::create(b, skip, notHit);
+        skip = comb::AndOp::create(
+            b, skip,
+            comb::XorOp::create(b, writes(widen(vm.heldRow, vm.rowWidth)), one()));
       Value enabled = rdValid;
       rdValid = comb::AndOp::create(b, rdValid,
                                     comb::XorOp::create(b, skip, one()));
-      Value current = vm.readFirst ? Value(comb::AndOp::create(b, enabled, notHit))
-                                   : enabled;
+      Value current =
+          vm.readFirst
+              ? Value(comb::AndOp::create(
+                    b, enabled, comb::XorOp::create(b, writes(rdRow), one())))
+              : enabled;
       Value others = comb::AndOp::create(
           b, fresh, comb::XorOp::create(b, bitOf(inst), ones));
       Value updated = comb::OrOp::create(
