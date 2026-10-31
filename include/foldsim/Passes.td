@@ -458,6 +458,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "as from an on-chip page RAM. The compiler takes the most slots "
            "the schedule allows (a divisor of the copy's instances). 0: no "
            "window, each fetch from the copy's state pass before">,
+    Option<"pageMemoryBits", "page-memory-bits", "unsigned", "4096",
+           "With page: a memory read combinationally (a queue, a register "
+           "file, a predictor table) of at most this many bits, which no "
+           "ready pass reads, pages with its instance's registers: each row "
+           "a register, its reads a choice of the rows from the fetch buffer, "
+           "its writes the rows' next values (0: registers only)">,
     Option<"pageMasks", "page-masks", "bool", "true",
            "With page: a paged register written under an enable keeps it, "
            "registered at the state pass, as its bytes' write mask in the "

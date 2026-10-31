@@ -6,18 +6,29 @@
 // The page word is cut into columns of whole 72-bit ports, each a RAM with
 // its own controls (a region): at 72 region bits and p = 1, 72 + 28 bits.
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top})' 2>&1 | FileCheck %s --check-prefix=OFF
-// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2})' 2>&1 | FileCheck %s
-// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=*:3 storage=Leaf:pages=ultra})' 2>&1 | FileCheck %s --check-prefix=ULTRA
-// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:4 modulo})' 2>&1 | FileCheck %s --check-prefix=MOD
-// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:1 region-bits=72})' 2>&1 | FileCheck %s --check-prefix=COLS
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page-memory-bits=0 page=Leaf:2})' 2>&1 | FileCheck %s
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page-memory-bits=0 page=*:3 storage=Leaf:pages=ultra})' 2>&1 | FileCheck %s --check-prefix=ULTRA
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page-memory-bits=0 page=Leaf:4 modulo})' 2>&1 | FileCheck %s --check-prefix=MOD
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page-memory-bits=0 page=Leaf:1 region-bits=72})' 2>&1 | FileCheck %s --check-prefix=COLS
+// The leaves' memory (16 rows of 8 bits, read through a register) pages as
+// rows with the registers by default (page-memory-bits): a register a row,
+// the read a choice of the rows into the read register; the runs above page
+// registers only (page-memory-bits=0).
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2})' 2>&1 | FileCheck %s --check-prefix=ROWS
+// ROWS: pages Leaf: p 2, 21 registers, 236 bits (with 1 memories' rows, 128 bits) (251 in 9-bit bytes, 16 enables); page RAMs 8 rows x 126 bits
+// ROWS-NOT: seq.firmem {{.*}} <64 x 8
+// ROWS-DAG: %mem_row15_fetched = seq.firreg
+// ROWS-DAG: %mem_rdata_fetched = seq.firreg
+// ROWS-DAG: hw.array_get {{%.+}}[{{%.+}}] : !hw.array<16xi8>, i4
 // Registers a ready pass reads keep their stores (the leaves' output is the
 // memory's read data, through two registers: a ready pass).
 // RUN: foldsim-opt %S/Inputs/fold-static-storage-late.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2})' 2>&1 | FileCheck %s --check-prefix=READY
 // Off chip (storage <model>:pages=hbm): the page word's columns (here at
 // most 32 bits) are virtual memories of {instance, page} rows; each
 // position's page read and write come from the tables, and the copy's
-// virtual memory ports follow its own.
-// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2 storage=Leaf:pages=hbm page-hbm-column-bits=32})' 2>&1 | FileCheck %s --check-prefix=HBM
+// virtual memory ports follow its own. A row is a power of two of bits
+// (the last column's 24 padded to 32, its padding's mask bytes off).
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page-memory-bits=0 page=Leaf:2 storage=Leaf:pages=hbm page-hbm-column-bits=32})' 2>&1 | FileCheck %s --check-prefix=HBM
 // RUN: not foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top storage=Leaf:regs=hbm})' 2>&1 | FileCheck %s --check-prefix=HBMREGS
 // RUN: not foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Nope:2})' 2>&1 | FileCheck %s --check-prefix=MODEL
 // RUN: not foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:0})' 2>&1 | FileCheck %s --check-prefix=SPEC
@@ -81,11 +92,11 @@
 // COLS: seq.firmem.write_port %region5_pages[%region5_write_inst] = {{%.+}}, clock %hostClock enable %region5_write0 : <4 x 28, mask 1>
 // HBM: Leaf x4 state gap 8 page 2 off chip
 // HBM: pages Leaf: p 2, 4 registers, 100 bits; off chip: 2 virtual memories of 8 rows x 56 bits (vm0-vm1), lead 2
-// HBM: hw.module @Leaf_static(in %hostClock : !seq.clock, in %state3 : i1, in %inst3 : i2, in %pread3 : i1, in %pinst3 : i2, in %ppage3 : i1, in %pwrite3 : i1, in %pwpage3 : i1, in %d : i8, in %hostReset : i1, in %vm0_rsp_valid : i1, in %vm0_rsp_inst : i3, in %vm0_rsp_data : i32, in %vm1_rsp_valid : i1, in %vm1_rsp_inst : i3, in %vm1_rsp_data : i24, out q : i8, out vm0_rd_valid : i1, out vm0_rd_inst : i3, out vm0_rd_row : i1, out vm0_wr_valid : i1, out vm0_wr_inst : i3, out vm0_wr_row : i1, out vm0_wr_data : i32, out vm0_wr_mask : i4, out vm0_pending : i4, out vm1_rd_valid : i1, out vm1_rd_inst : i3, out vm1_rd_row : i1, out vm1_wr_valid : i1, out vm1_wr_inst : i3, out vm1_wr_row : i1, out vm1_wr_data : i24, out vm1_wr_mask : i3, out vm1_pending : i4)
+// HBM: hw.module @Leaf_static(in %hostClock : !seq.clock, in %state3 : i1, in %inst3 : i2, in %pread3 : i1, in %pinst3 : i2, in %ppage3 : i1, in %pwrite3 : i1, in %pwpage3 : i1, in %d : i8, in %hostReset : i1, in %vm0_rsp_valid : i1, in %vm0_rsp_inst : i3, in %vm0_rsp_data : i32, in %vm1_rsp_valid : i1, in %vm1_rsp_inst : i3, in %vm1_rsp_data : i32, out q : i8, out vm0_rd_valid : i1, out vm0_rd_inst : i3, out vm0_rd_row : i1, out vm0_wr_valid : i1, out vm0_wr_inst : i3, out vm0_wr_row : i1, out vm0_wr_data : i32, out vm0_wr_mask : i4, out vm0_pending : i4, out vm1_rd_valid : i1, out vm1_rd_inst : i3, out vm1_rd_row : i1, out vm1_wr_valid : i1, out vm1_wr_inst : i3, out vm1_wr_row : i1, out vm1_wr_data : i32, out vm1_wr_mask : i4, out vm1_pending : i4)
 // HBM: %region1_fetching = seq.firreg
 // HBM: %region1_pages_pending = seq.firreg
 // HBM: %region1_writeback_valid = seq.firreg
-// HBM: foldsim.vmems = ["region1_pages:Leaf:3:1:32:4:1:8", "region2_pages:Leaf:3:1:24:3:1:8"]
+// HBM: foldsim.vmems = ["region1_pages:Leaf:3:1:32:4:1:8", "region2_pages:Leaf:3:1:32:4:1:8"]
 // HBMREGS: storage: 'hbm' is for a model's pages, not 'regs'
 // MODEL: page: no model 'Nope'
 // SPEC: page: 'Leaf:0' is not <model>:<p>, p at least 1

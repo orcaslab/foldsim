@@ -44,10 +44,23 @@
 # enable, writes its old value back where the enable is low.
 # RUN: FileCheck %s --check-prefix=MOD < %t/mod.log
 # MOD: pages Leaf: p 3, 3 registers, 181 bits; page RAMs
+# Memories read combinationally or through a register, paged as rows with
+# the registers (Driver/Inputs/pagedq: a queue and a register file of two
+# read ports), against the target at p = 2 with copies and overlapped frames,
+# and at p = 4 nested with a short lead and bubbles.
+# RUN: cd %S/../Driver/Inputs/pagedq && foldsim --srcs top.f --top Top --out %t/q2 --static --page 2 --copies Leaf:2 --modulo Leaf > %t/q2.log 2>&1
+# RUN: FileCheck %s --check-prefix=Q2 < %t/q2.log
+# RUN: cd %S/../Driver/Inputs/pagedq && %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/q2/obj %S/Inputs/tb_late.sv top.sv %t/q2/foldsim_sim.sv > %t/q2/build.log 2>&1
+# RUN: %t/q2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +stall=20 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/pagedq && foldsim --srcs top.f --top Top --out %t/q4 --static --page 4 --nest --short-lead --bubbles Leaf > /dev/null 2>&1
+# RUN: cd %S/../Driver/Inputs/pagedq && %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/q4/obj %S/Inputs/tb_late.sv top.sv %t/q4/foldsim_sim.sv > %t/q4/build.log 2>&1
+# RUN: %t/q4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +bubble=30 +stall=20 | FileCheck %s
+# Q2: pages Leaf: p 2, 17 registers, 119 bits (with 2 memories' rows, 96 bits)
 # Without --page nothing pages.
+# RUN: cd %S/../Driver/Inputs/paged
 # RUN: foldsim --srcs top.f --top Top --out %t/plain --static Leaf > %t/plain.log 2>&1
 # RUN: FileCheck %s --check-prefix=PLAIN < %t/plain/foldsim_sim.sv
-# ONE: pages Leaf: p 1, 4 registers, 189 bits (196 in 9-bit bytes, 1 enables); page RAMs 4 rows x 198 bits in 1 columns, 3 ports, block; kept 0 registers, 0 bits
+# ONE: pages Leaf: p 1, 21 registers, 325 bits (with 1 memories' rows, 128 bits) (350 in 9-bit bytes, 17 enables); page RAMs 4 rows x 351 bits in 1 columns, 5 ports, block; kept 0 registers, 0 bits
 # CHAIN: pages Leaf: p 2, 3 registers, 181 bits (187 in 9-bit bytes, 1 enables); page RAMs 4 rows x 99 bits in 2 columns, 2 ports, block; kept 1 registers, 8 bits
 # CHAIN: pages Leaf_copy1: p 2,
 # NEST: pages Leaf: p 4, 3 registers, 181 bits (187 in 9-bit bytes, 1 enables); page RAMs 16 rows x 54 bits in 1 columns, 1 ports, block; kept 1 registers, 8 bits; state passes 4 x 4 = 16

@@ -265,7 +265,8 @@ public:
                ArrayRef<std::string> storage, StringRef readyLevels,
                unsigned forwardAfterLevels, bool shareLinkWrites,
                ArrayRef<std::string> page, bool pageMasks,
-               unsigned pageHbmColumnBits, unsigned pageHbmWindow)
+               unsigned pageHbmColumnBits, unsigned pageHbmWindow,
+               unsigned pageMemoryBits)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -281,6 +282,7 @@ public:
         forwardAfterLevels(forwardAfterLevels),
         shareLinkWrites(shareLinkWrites), pageSpecs(page), pageMasks(pageMasks),
         pageHbmColumnBits(pageHbmColumnBits), pageHbmWindow(pageHbmWindow),
+        pageMemoryBits(pageMemoryBits),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -438,6 +440,15 @@ private:
   unsigned pageHbmColumnBits;
   /// The most instance slots of an off-chip page window (0: none).
   unsigned pageHbmWindow;
+  /// The most bits of a combinationally read memory paged as rows.
+  unsigned pageMemoryBits;
+  /// A paged class's combinationally read memories of at most
+  /// `pageMemoryBits` bits that no ready pass reads, as a register per row:
+  /// the reads a choice of the rows, the writes their next values. Returns
+  /// the memories and bits so turned.
+  std::pair<unsigned, uint64_t>
+  memoriesAsRows(Class &cls, const DenseSet<Operation *> &ready,
+                 const DenseMap<Operation *, unsigned> &virtualOf);
   /// Chooses each off-chip paged copy's window from its schedule.
   void chooseWindows();
   LogicalResult parsePages();
@@ -2631,6 +2642,10 @@ void StaticFolder::readyRegisters(const Class &cls,
     }
     if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
       auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+      // A memory read here (its read register, or combinationally): read at
+      // a ready pass too, so it keeps its store.
+      if (memory)
+        regs.insert(memory);
       if (memory && memory.getReadLatency() > 0)
         continue;
       stack.push_back(read.getAddress());
@@ -2641,6 +2656,127 @@ void StaticFolder::readyRegisters(const Class &cls,
     for (auto operand : op->getOperands())
       stack.push_back(operand);
   }
+}
+
+std::pair<unsigned, uint64_t>
+StaticFolder::memoriesAsRows(Class &cls, const DenseSet<Operation *> &ready,
+                             const DenseMap<Operation *, unsigned> &virtualOf) {
+  auto *body = cls.model.getBodyBlock();
+  auto *folding = cls.folding.get();
+  Value clock = body->getArgument(cls.clockInput);
+  SmallVector<seq::FirMemOp> memories;
+  for (auto memory : body->getOps<seq::FirMemOp>()) {
+    auto type = memory.getType();
+    // A folded pipeline's result store is the pipeline's, not the model's.
+    if ((folding && (folding->physical.contains(memory) ||
+                     folding->foldOfStore.count(memory))) ||
+        ready.contains(memory) || virtualOf.count(memory) ||
+        memory.getReadLatency() > 1 || memory.getInit() ||
+        uint64_t(type.getDepth()) * type.getWidth() > pageMemoryBits)
+      continue;
+    if (llvm::all_of(memory->getUsers(), [&](Operation *user) {
+          if (isa<seq::FirMemReadOp>(user))
+            return true;
+          auto write = dyn_cast<seq::FirMemWriteOp>(user);
+          return write && write.getClk() == clock;
+        }))
+      memories.push_back(memory);
+  }
+  uint64_t bits = 0;
+  for (auto memory : memories) {
+    auto type = memory.getType();
+    unsigned depth = type.getDepth(), width = type.getWidth();
+    bits += uint64_t(depth) * width;
+    ImplicitLocOpBuilder b(memory.getLoc(), memory);
+    auto rowType = b.getIntegerType(width);
+    BackedgeBuilder edges(b, memory.getLoc());
+    SmallVector<Backedge> nexts;
+    SmallVector<Value> rows;
+    std::string name = memory.getName().value_or("mem").str();
+    for (unsigned e = 0; e < depth; ++e) {
+      nexts.push_back(edges.get(rowType));
+      rows.push_back(seq::FirRegOp::create(b, nexts.back(), clock,
+                                           b.getStringAttr(name + "_row" + Twine(e))));
+    }
+    SmallVector<Value> next(rows.begin(), rows.end());
+    // A registered read: its output register, loaded with the row read (or,
+    // reading new data, the row as written in the same cycle) where enabled.
+    bool registered = memory.getReadLatency() == 1;
+    bool readNew = memory.getRuw() == seq::RUW::New;
+    SmallVector<std::tuple<seq::FirMemReadOp, Backedge, Value>> outputs;
+    for (auto *user : llvm::make_early_inc_range(memory->getUsers())) {
+      if (auto read = dyn_cast<seq::FirMemReadOp>(user)) {
+        b.setInsertionPoint(read);
+        Value data;
+        if (registered) {
+          auto outNext = edges.get(rowType);
+          data = seq::FirRegOp::create(b, outNext, clock,
+                                       b.getStringAttr(name + "_rdata"));
+          outputs.push_back({read, outNext, data});
+        } else if (depth == 1) {
+          data = rows[0];
+        } else {
+          SmallVector<Value> elements(rows.rbegin(), rows.rend());
+          data = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elements),
+                                        read.getAddress());
+        }
+        read.getData().replaceAllUsesWith(data);
+        if (!registered)
+          read.erase();
+        continue;
+      }
+      auto write = cast<seq::FirMemWriteOp>(user);
+      b.setInsertionPoint(write);
+      Value enable = write.getEnable();
+      unsigned addrWidth = hw::getBitWidth(write.getAddress().getType());
+      Value data = write.getData();
+      unsigned lanes = write.getMask() ? hw::getBitWidth(write.getMask().getType()) : 1;
+      for (unsigned e = 0; e < depth; ++e) {
+        Value hit = addrWidth
+                        ? Value(comb::ICmpOp::create(
+                              b, comb::ICmpPredicate::eq, write.getAddress(),
+                              hw::ConstantOp::create(b, b.getIntegerType(addrWidth), e)))
+                        : Value(hw::ConstantOp::create(b, b.getI1Type(), 1));
+        if (enable)
+          hit = comb::AndOp::create(b, hit, enable);
+        Value value = data;
+        if (lanes > 1) {
+          // Each mask bit its lane of the row.
+          unsigned lane = width / lanes;
+          SmallVector<Value> parts;
+          for (unsigned l = lanes; l-- > 0;) {
+            Value on = b.createOrFold<comb::ExtractOp>(b.getI1Type(), write.getMask(), l);
+            parts.push_back(comb::MuxOp::create(
+                b, on, b.createOrFold<comb::ExtractOp>(b.getIntegerType(lane), data, l * lane),
+                b.createOrFold<comb::ExtractOp>(b.getIntegerType(lane), next[e], l * lane)));
+          }
+          value = b.createOrFold<comb::ConcatOp>(parts);
+        }
+        next[e] = comb::MuxOp::create(b, hit, value, next[e]);
+      }
+      write.erase();
+    }
+    for (auto &[read, outNext, self] : outputs) {
+      b.setInsertionPoint(read);
+      ArrayRef<Value> source = readNew ? ArrayRef<Value>(next) : ArrayRef<Value>(rows);
+      Value value = source[0];
+      if (depth > 1) {
+        SmallVector<Value> elements(source.rbegin(), source.rend());
+        value = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elements),
+                                       read.getAddress());
+      }
+      // The output register: the old one where the read is not enabled.
+      Value loaded = read.getEnable() ? Value(comb::MuxOp::create(b, read.getEnable(), value,
+                                                                  self))
+                                      : value;
+      read.erase();
+      outNext.setValue(loaded);
+    }
+    for (unsigned e = 0; e < depth; ++e)
+      nexts[e].setValue(next[e]);
+    memory.erase();
+  }
+  return {unsigned(memories.size()), bits};
 }
 
 bool StaticFolder::pagesAny(const Class &cls) const {
@@ -3701,8 +3837,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // stores, read at any slot; the rest page, read only at the state pass.
   auto *modelOutput = modelBody->getTerminator();
   DenseSet<Operation *> readyRegs;
-  if (cls.page)
+  std::pair<unsigned, uint64_t> rowMemories{0, 0};
+  if (cls.page) {
     readyRegisters(cls, readyRegs);
+    if (pageMemoryBits && threads > 1)
+      rowMemories = memoriesAsRows(cls, readyRegs, virtualOf);
+  }
 
   // The early outputs' next values, before any register is replaced.
   ImplicitLocOpBuilder mb(model.getLoc(), modelOutput);
@@ -4433,7 +4573,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       SmallVector<SmallVector<std::pair<unsigned, Value>>> parts;
       /// Off chip: its virtual memory, its write's valid, and its requests
       /// and pending reads, in the order of the copy's vm ports.
-      unsigned vm = 0;
+      unsigned vm = 0, vmWidth = 0;
       Value writeValid;
       SmallVector<Value> requests;
     };
@@ -4483,8 +4623,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         Class::VirtualMemory vm;
         vm.name = prefix + "_pages";
         vm.rowWidth = 1;
-        vm.dataWidth = col.width;
-        vm.maskWidth = col.width / 8;
+        // A row of a power of two of bits (of at least 32), as the
+        // controller lays rows out: the last column's padding is never
+        // written (its mask bytes are off).
+        col.vmWidth = std::max(32u, unsigned(llvm::PowerOf2Ceil(col.width)));
+        vm.dataWidth = col.vmWidth;
+        vm.maskWidth = col.vmWidth / 8;
         vm.readFirst = true;
         vm.pages = true;
         vm.instWidth = idxWidth + pageWidth;
@@ -4515,7 +4659,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         auto rspValid = copy.appendInput(vmName + "rsp_valid", b.getI1Type()).second;
         vm.firstInput = rspValid.getArgNumber();
         auto rspInst = copy.appendInput(vmName + "rsp_inst", bits(vm.instWidth)).second;
-        auto rspData = copy.appendInput(vmName + "rsp_data", bits(col.width)).second;
+        auto rspData = copy.appendInput(vmName + "rsp_data", bits(col.vmWidth)).second;
         auto resetReg = [&](Value next, const Twine &name) -> Value {
           auto type = next.getType();
           return seq::FirRegOp::create(b, next, hostClock, b.getStringAttr(name),
@@ -4529,8 +4673,11 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         Value valid = resetReg(rspValid, prefix + "_rsp_valid");
         Value rspAt = seq::FirRegOp::create(b, rspInst, hostClock,
                                             b.getStringAttr(prefix + "_rsp_inst"));
-        Value rspBits = seq::FirRegOp::create(b, rspData, hostClock,
-                                              b.getStringAttr(prefix + "_rsp_data"));
+        Value rspBits = b.createOrFold<comb::ExtractOp>(
+            bits(col.width),
+            seq::FirRegOp::create(b, rspData, hostClock,
+                                  b.getStringAttr(prefix + "_rsp_data")),
+            0);
         // The instance a response is of, and its slot.
         Value rspInstance = pageWidth ? b.createOrFold<comb::ExtractOp>(
                                             bits(idxWidth), rspAt, pageWidth)
@@ -4803,6 +4950,13 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                           : writing[j];
       }
       if (offChip) {
+        unsigned pad = col.vmWidth - col.width;
+        if (pad) {
+          writeData = b.createOrFold<comb::ConcatOp>(
+              hw::ConstantOp::create(b, bits(pad), 0), writeData);
+          writeMask = b.createOrFold<comb::ConcatOp>(
+              hw::ConstantOp::create(b, bits(pad / 8), 0), writeMask);
+        }
         col.requests[6] = writeData;
         col.requests[7] = writeMask;
         pageRequests.push_back({col.vm, col.requests});
@@ -4818,6 +4972,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                            : 0;
     os << "  pages " << cls.name << ": p " << p << ", " << pagedRegs.size()
        << " registers, " << pagedBits << " bits";
+    if (rowMemories.first)
+      os << " (with " << rowMemories.first << " memories' rows, "
+         << rowMemories.second << " bits)";
     if (masked)
       os << " (" << layoutBits << " in " << grain << "-bit bytes, "
          << groups.size() - (groups.count(Value()) ? 1 : 0) << " enables)";
@@ -6757,7 +6914,7 @@ void FoldStaticPass::runOnOperation() {
                       envSinks, registerStateEntries, slrGroups, slrSites,
                       slrCapacity, slrAssign, storage, readyLevels,
                       forwardAfterLevels, shareLinkWrites, page, pageMasks,
-                      pageHbmColumnBits, pageHbmWindow);
+                      pageHbmColumnBits, pageHbmWindow, pageMemoryBits);
   if (failed(folder.run()))
     return signalPassFailure();
 }

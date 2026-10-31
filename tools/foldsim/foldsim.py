@@ -175,6 +175,8 @@ def frame_options(a):
         fold += f' page={page_option(a.page)}'
     if getattr(a, 'no_page_masks', False):
         fold += ' page-masks=false'
+    if getattr(a, 'page_memory_bits', None) is not None:
+        fold += f' page-memory-bits={a.page_memory_bits}'
     if getattr(a, 'page_hbm_window', None):
         fold += f' page-hbm-window={a.page_hbm_window}'
     if getattr(a, 'page_hbm_column_bits', None):
@@ -495,6 +497,10 @@ def main():
                          "copy of several instances keeps its registers in a page RAM per "
                          'region and moves an instance\'s state in and out P host cycles at a '
                          'time, double-buffered; a count pages every model, else per model')
+    ap.add_argument('--page-memory-bits', type=int, metavar='N',
+                    help='with --page: memories read combinationally of at most N bits page as '
+                         'rows with the registers (foldsim-fold-static page-memory-bits; default '
+                         '4096, 0: registers only)')
     ap.add_argument('--page-hbm-window', type=int, metavar='K',
                     help='with pages off chip: an on-chip window of at most K instances\' pages per '
                          'copy, prefetched K state passes ahead (foldsim-fold-static page-hbm-window)')
