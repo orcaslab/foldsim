@@ -61,6 +61,7 @@ NO_OP_DUMP = '--mlir-print-op-on-diagnostic=false'
 # foldsim_storage.py, beside the block-RAM table they are priced by.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from foldsim_storage import VMEM_CACHE_BUDGET, bram36, vmem_cache_rows  # noqa: E402
+import foldsim_storage  # noqa: E402
 
 
 def run(cmd, check=True, **kw):
@@ -331,6 +332,51 @@ DEGREE_CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'foldsim_v80.json')
 
 
+def memory_registers(a, flat, out):
+    """The foldsim-memories-to-registers pass of --memory-registers, or None
+    when no memory is kept as registers: `auto` (the default with --storage
+    auto), the memories cheaper as registers for every copy of their module's
+    instances (foldsim_storage.memory_as_registers); `off` (the default
+    otherwise), none; else a regex, the memories that can be registers whose
+    name or <module>:<name> it finds. The choice goes to
+    <out>/memory_registers.txt."""
+    mode = a.memory_registers or ('auto' if a.storage == 'auto' else 'off')
+    if mode == 'off':
+        return None
+    rx = None if mode == 'auto' else re.compile(mode)
+    mems, instances = foldsim_storage.memory_ports(flat, a.top)
+    chosen, lines = [], []
+    for m in mems:
+        key = f"{m['module']}:{m['name']}"
+        shape = (f"{m['depth']}x{m['width']} reads {m['reads']} ({m['const_reads']} constant) "
+                 f"writes {m['wports']}, {instances[m['module']]} instances")
+        why = foldsim_storage.register_ineligible(m)
+        if why:
+            if rx is not None and (rx.search(m['name']) or rx.search(key)):
+                lines.append(f'  memory {key}: {shape}; cannot be registers: {why}')
+                print(f'foldsim: --memory-registers {mode}: {key} cannot be registers: {why}',
+                      file=sys.stderr)
+            continue
+        if rx is None:
+            take, rows = foldsim_storage.memory_as_registers(m, instances[m['module']])
+            price = '; LUT sites as memory / registers: ' + ', '.join(
+                f'{t} instances {mem:.0f} / {reg:.0f}' for t, mem, reg in rows)
+        else:
+            take, price = bool(rx.search(m['name']) or rx.search(key)), ''
+        if take:
+            chosen.append(key)
+            lines.append(f'  registers {key}: {shape}{price}')
+    if not chosen:
+        print(f'foldsim: --memory-registers {mode}: no memory kept as registers', file=sys.stderr)
+        return None
+    with open(out('memory_registers.txt'), 'w') as f:
+        f.write(f'--memory-registers {mode}: {len(chosen)} of {len(mems)} memories kept as '
+                'registers (foldsim-memories-to-registers)\n' + '\n'.join(lines) + '\n')
+    print(f'foldsim: --memory-registers {mode}: {len(chosen)} of {len(mems)} memories kept as '
+          f'registers; see {out("memory_registers.txt")}', file=sys.stderr)
+    return f'foldsim-memories-to-registers{{memories={",".join(chosen)}}}'
+
+
 def choose_copies(a, foldsim_opt, flat, passes, out):
     """The fold degree of each class: every choice (or, past
     --degree-max-points, a search) scheduled, priced and the fastest within
@@ -598,6 +644,13 @@ def main():
                          'ram_style: registers, distributed, block, ultra); with --copies auto, '
                          '`auto`: a kind per store chosen with the fold degree against the V80 '
                          'region (foldsim_storage.py), else the default rules')
+    ap.add_argument('--memory-registers', default='', metavar='auto|off|REGEX',
+                    help='memories kept as registers, a register an entry (foldsim-memories-to-'
+                         'registers): `auto`, those cheaper so for every copy of their instances '
+                         '(foldsim_storage.py: an associative table read at every entry); `off`, '
+                         'none; else those whose name or <module>:<name> the regex finds. '
+                         'Default: auto with --storage auto, else off. The choice in '
+                         '<out>/memory_registers.txt')
     ap.add_argument('--slr-groups', action='store_true',
                     help='with --static: the copies in --slr-count groups, each in an SLR '
                          '(Vivado picks which): within --slr-capacity, the shortest frame, '
@@ -713,6 +766,9 @@ def main():
     if not order:
         order = [a.top]
     passes = []
+    registers = memory_registers(a, flat, out)
+    if registers:
+        passes.append(registers)
     for m in order:
         models = f' models={",".join(sorted(children[m]))}' if children[m] else ''
         passes.append(f'foldsim-extract-models{{module={m}{models} netlist absorb-logic={ABSORB_LOGIC}}}')

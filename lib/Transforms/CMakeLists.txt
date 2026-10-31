@@ -5,6 +5,7 @@ add_mlir_library(FoldsimTransforms
   ExtractModels.cpp
   FAME5.cpp
   FindPipelines.cpp
+  MemoriesToRegisters.cpp
   FuseModels.cpp
   Pipelines.cpp
   ReplicateControls.cpp
