@@ -336,6 +336,8 @@ def frame_options(a):
         fold += ' share-link-writes=false'
     if getattr(a, 'zero_chain_hops', None):
         fold += f' zero-chain-hops={a.zero_chain_hops}'
+    if getattr(a, 'compact_links', False):
+        fold += ' compact-links'
     return fold
 
 
@@ -655,6 +657,10 @@ def main():
                     help="with --zero-latency-chains: at most N links taken in their producers' host "
                          'cycle on a combinational path; a link past them is taken a host cycle later '
                          '(default: no bound) (foldsim-fold-static)')
+    ap.add_argument('--compact-links', action='store_true',
+                    help="with --static: a link keeps only the producer instances its reader takes (a "
+                         "per-lane port read by its own lane's instances, say), not an entry for every "
+                         'instance (foldsim-fold-static)')
     ap.add_argument('--no-share-link-writes', action='store_true',
                     help="with --static: write each reader's link from the producer's bits in the "
                          'pass, not a host cycle late from one register of them (foldsim-fold-static)')

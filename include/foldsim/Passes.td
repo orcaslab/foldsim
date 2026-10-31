@@ -461,6 +461,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "by instance (each adds its reader's choice of source to the "
            "path); a link that would pass them is taken a host cycle later "
            "from its register, where the chain starts anew. 0: no bound">,
+    Option<"compactLinks", "compact-links", "bool", "false",
+           "A link whose reader takes fewer of its producer's instances than "
+           "the producer has (a per-lane port read by its own lane's "
+           "instances, say) keeps only those: an entry per instance read, "
+           "written at the producer's instance's entry by a table of the "
+           "slot's instance, the other instances' writes masked. The schedule "
+           "report gives every link's storage, compact or not">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
