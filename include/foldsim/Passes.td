@@ -381,7 +381,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "when the row was not written since the instance's last read; the "
            "instance keeps its read data, which is that row's. Exact by "
            "construction; a bit per instance records whether its read data "
-           "is current">,
+           "is current. Such a memory's requests leave a host cycle after the "
+           "state pass, from registers (the skip decided there): its room is "
+           "12 (10 with short-lead) and it needs a state gap of the lead + 2">,
     Option<"stagedEnv", "staged-env", "bool", "true",
            "The environment's endpoints take a token a host cycle after it "
            "is offered (registered token ends), not in that host cycle">,

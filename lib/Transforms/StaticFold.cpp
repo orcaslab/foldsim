@@ -132,11 +132,14 @@ struct Class {
     unsigned firstInput, firstOutput;
     SmallVector<seq::FirMemOp> lanes;
     SmallVector<unsigned> laneOffset;
-    /// With --vmem-skip-held-reads, where the read's address is provably the
-    /// previous target cycle's whenever it is true (heldReadCondition): an
-    /// op in the model computing that condition, else null; and the row it
-    /// holds (the read's address then).
-    Value held, heldRow;
+    /// With --vmem-skip-held-reads, where the read's address is a registered
+    /// one (heldReadRow): an op in the model computing the row the previous
+    /// target cycle read, else null.
+    Value heldRow;
+    /// Its requests leave a host cycle after the state pass, from registers
+    /// (the skip computed there): the room and the state gap take a host
+    /// cycle more.
+    bool delayed = false;
   };
   SmallVector<VirtualMemory> virtualMemories;
   /// With virtual memories, the copy's host reset input (their pending reads
@@ -287,8 +290,11 @@ private:
   /// The free request entries a position needs to run: a `free` the
   /// sequencer sees does not yet count the requests of the decisions still in
   /// flight (one a host cycle, decisionLead() of them) nor those of its own
-  /// decision, each at most a read and a write.
-  unsigned virtualRoom() const { return 2 * (decisionLead() + 1); }
+  /// decision, each at most a read and a write; a memory whose requests leave
+  /// a host cycle after the pass (`delayed`) has one decision more in flight.
+  unsigned virtualRoom(bool delayed = false) const {
+    return 2 * (decisionLead() + 1 + (delayed ? 1 : 0));
+  }
 
   void inlineNetlists();
   LogicalResult collect();
@@ -3311,22 +3317,18 @@ static Value nextValue(ImplicitLocOpBuilder &b, Value root,
   return nexts.lookup(root);
 }
 
-/// A registered read's hold condition (--vmem-skip-held-reads): an i1 that,
-/// true in a target cycle, makes the read's address that of the previous
-/// target cycle. Found where the address is a function of one value M alone
-/// (side-effect-free combinational ops and constants), M = mux(c, A, q) or
-/// mux(c, q, A), q a register without reset on the read's clock whose next
-/// value is M: with c low (high) M is q, the previous cycle's M. This is a
-/// registered read address with an enable, as front ends emit SRAMs and
-/// `if (en) raddr_q <= raddr; rdata = mem[raddr_q]` imports. The condition
-/// is built as an op of its own next to the mux, so that registers replaced
-/// later reach it; so is the held row, the address's function applied to q
-/// (the address whenever the condition holds, without the mux and what
-/// computes c and A in its path). Null where the pattern is not found.
-struct HeldRead {
-  Value held, row;
-};
-static HeldRead heldReadCondition(seq::FirMemReadOp read) {
+/// A registered read's previous row (--vmem-skip-held-reads): the row the
+/// read took in the previous target cycle. Found where the address is a
+/// function f of one value M alone (side-effect-free combinational ops and
+/// constants), M = mux(c, A, q) or mux(c, q, A), q a register without reset
+/// on the read's clock whose next value is M: q is the previous cycle's M, so
+/// f(q) is the previous cycle's address. This is a registered read address
+/// with an enable, as front ends emit SRAMs and `if (en) raddr_q <= raddr;
+/// rdata = mem[raddr_q]` imports (c low: the address holds). The address
+/// cone is cloned with q in place of the mux, next to it, so that registers
+/// replaced later reach it; it is a register and a few levels, off the path
+/// that computes c and A. Null where the pattern is not found.
+static Value heldReadRow(seq::FirMemReadOp read) {
   comb::MuxOp found;
   bool qOnTrue = false;
   SmallVector<Value> work{read.getAddress()};
@@ -3371,10 +3373,6 @@ static HeldRead heldReadCondition(seq::FirMemReadOp read) {
     return {};
   OpBuilder b(found->getContext());
   b.setInsertionPointAfter(found);
-  Location loc = found.getLoc();
-  Value flip = hw::ConstantOp::create(b, loc, b.getI1Type(), qOnTrue ? 0 : 1);
-  HeldRead result;
-  result.held = comb::XorOp::create(b, loc, found.getCond(), flip);
   // The address cone again, q in place of the mux.
   IRMapping mapping;
   mapping.map(found.getResult(),
@@ -3390,8 +3388,7 @@ static HeldRead heldReadCondition(seq::FirMemReadOp read) {
     b.clone(*op, mapping);
     return mapping.lookup(value);
   };
-  result.row = rebuild(read.getAddress());
-  return result;
+  return rebuild(read.getAddress());
 }
 
 /// Sets an operation's Vivado ram_style, replacing any it has.
@@ -3663,10 +3660,11 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     }
     // The lanes share the first's read address (sameRam), whose row the
     // requests carry.
-    if (skipHeldReads) {
-      auto held = heldReadCondition(portsOf(memory).first);
-      vm.held = held.held;
-      vm.heldRow = held.row;
+    // The skip's request leaves a host cycle later: the pending bit it sets
+    // must still be there for the decision on the instance's next evaluation.
+    if (skipHeldReads && cls.stateGap >= decisionLead() + 2) {
+      vm.heldRow = heldReadRow(portsOf(memory).first);
+      vm.delayed = bool(vm.heldRow);
     }
     for (auto lane : vm.lanes)
       virtualOf[lane] = cls.virtualMemories.size();
@@ -3983,50 +3981,73 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       return comb::ShlOp::create(b, hw::ConstantOp::create(b, intType(entries), 1),
                                  widen(index, entries));
     };
-    if (vm.held) {
-      // A held read (--vmem-skip-held-reads): its row is the instance's last
-      // read's, so its read data is still the row's unless the row was
-      // written since. `fresh` has a bit per instance: its read data is the
-      // row as its next read would see it, but for that read's own
-      // same-cycle write. Set at a state pass that issued (or skipped) its
-      // read, unless (read first) the same pass writes the row; cleared at
-      // a pass with the read's enable low; all clear after a reset. A held
-      // read of a fresh instance is skipped, unless (write first) the same
-      // pass writes its row.
+    if (vm.delayed) {
+      // A held read (--vmem-skip-held-reads). The requests leave a host cycle
+      // after the state pass, from registers, and the skip is decided there
+      // from registers alone: no request valid waits for the target's paths
+      // to the read's enable or the write's address.
+      // `fresh` has a bit per instance: its read data is the row its last read
+      // took, as a read of that row would see it now. Set at a state pass that
+      // issued (or skipped) its read, unless (read first) the same pass writes
+      // the row; cleared at a pass with the read's enable low; all clear after
+      // a reset. A read of a fresh instance's last row (the held row: the
+      // read's address register, so whenever its enable is low) is skipped,
+      // unless (write first) the same pass writes that row.
+      Value hostReset = body->getArgument(cls.resetInput);
+      auto stage = [&](Value value, StringRef suffix, bool reset) -> Value {
+        if (isa_and_nonnull<hw::ConstantOp>(value.getDefiningOp()))
+          return value;
+        auto name = b.getStringAttr(vm.name + "_q" + suffix);
+        if (!reset)
+          return seq::FirRegOp::create(b, value, hostClock, name);
+        return seq::FirRegOp::create(
+            b, value, hostClock, name, hostReset,
+            hw::ConstantOp::create(b, value.getType(), 0), hw::InnerSymAttr{},
+            /*isAsync=*/false, b.getIntegerAttr(value.getType(), 0));
+      };
+      Value stateQ = stage(region.state, "_state", true);
+      Value instQ = stage(inst, "_inst", false);
+      Value rdValidQ = stage(rdValid, "_rd_valid", true);
+      Value rdRowQ = stage(rdRow, "_rd_row", false);
+      Value heldRowQ = stage(widen(vm.heldRow, vm.rowWidth), "_held_row", false);
+      Value wrValidQ = stage(wrValid, "_wr_valid", true);
+      Value wrRowQ = stage(wrRow, "_wr_row", false);
+      Value wrDataQ = stage(wrData, "_wr_data", false);
+      Value wrMaskQ = stage(wrMask, "_wr_mask", false);
       Value ones = hw::ConstantOp::create(b, APInt::getAllOnes(entries));
       auto freshNext = edges.get(intType(entries));
       Value fresh = seq::FirRegOp::create(
           b, freshNext, hostClock, b.getStringAttr(vm.name + "_fresh"),
-          body->getArgument(cls.resetInput), zero(entries), hw::InnerSymAttr{},
+          hostReset, zero(entries), hw::InnerSymAttr{},
           /*isAsync=*/false, b.getIntegerAttr(intType(entries), 0));
       Value isFresh = b.createOrFold<comb::ExtractOp>(
-          intType(1), comb::ShrUOp::create(b, fresh, widen(inst, entries)), 0);
-      // Whether the pass writes the row it reads: against the held row for
-      // the skip (the read's row whenever it may skip; off the address's own
-      // path), against the read's row for a read-first instance's bit.
-      auto writes = [&](Value row) -> Value {
-        return comb::AndOp::create(
-            b, wrValid,
-            comb::ICmpOp::create(b, comb::ICmpPredicate::eq, wrRow, row));
-      };
-      Value skip = comb::AndOp::create(b, vm.held, isFresh);
+          intType(1), comb::ShrUOp::create(b, fresh, widen(instQ, entries)), 0);
+      // The pass writes the row it reads.
+      Value writesRow = comb::AndOp::create(
+          b, wrValidQ,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::eq, wrRowQ, rdRowQ));
+      Value notWrites = comb::XorOp::create(b, writesRow, one());
+      Value skip = comb::AndOp::create(
+          b, isFresh,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::eq, rdRowQ, heldRowQ));
       if (!vm.readFirst)
-        skip = comb::AndOp::create(
-            b, skip,
-            comb::XorOp::create(b, writes(widen(vm.heldRow, vm.rowWidth)), one()));
-      Value enabled = rdValid;
-      rdValid = comb::AndOp::create(b, rdValid,
-                                    comb::XorOp::create(b, skip, one()));
-      Value current =
-          vm.readFirst
-              ? Value(comb::AndOp::create(
-                    b, enabled, comb::XorOp::create(b, writes(rdRow), one())))
-              : enabled;
+        skip = comb::AndOp::create(b, skip, notWrites);
+      Value current = vm.readFirst
+                          ? Value(comb::AndOp::create(b, rdValidQ, notWrites))
+                          : rdValidQ;
       Value others = comb::AndOp::create(
-          b, fresh, comb::XorOp::create(b, bitOf(inst), ones));
+          b, fresh, comb::XorOp::create(b, bitOf(instQ), ones));
       Value updated = comb::OrOp::create(
-          b, others, comb::MuxOp::create(b, current, bitOf(inst), zero(entries)));
-      freshNext.setValue(comb::MuxOp::create(b, region.state, updated, fresh));
+          b, others, comb::MuxOp::create(b, current, bitOf(instQ), zero(entries)));
+      freshNext.setValue(comb::MuxOp::create(b, stateQ, updated, fresh));
+      rdValid = comb::AndOp::create(b, rdValidQ,
+                                    comb::XorOp::create(b, skip, one()));
+      inst = instQ;
+      rdRow = rdRowQ;
+      wrValid = wrValidQ;
+      wrRow = wrRowQ;
+      wrData = wrDataQ;
+      wrMask = wrMaskQ;
     }
     Value set = comb::MuxOp::create(b, rdValid, bitOf(inst), zero(entries));
     Value clear = comb::MuxOp::create(b, rspValid, bitOf(rspInst), zero(entries));
@@ -5844,7 +5865,8 @@ LogicalResult StaticFolder::buildSim() {
     for (auto &v : simVirtuals)
       terms.push_back(comb::ICmpOp::create(
           b, comb::ICmpPredicate::uge, body->getArgument(v.firstInput + 3),
-          constant(kVirtualFreeWidth, virtualRoom())));
+          constant(kVirtualFreeWidth,
+                   virtualRoom(classes[v.cls].virtualMemories[v.k].delayed))));
     virtualReady.setValue(comb::AndOp::create(b, terms, false));
   }
 

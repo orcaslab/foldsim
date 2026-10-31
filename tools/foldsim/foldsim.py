@@ -518,7 +518,8 @@ def main():
     ap.add_argument('--vmem-skip-held-reads', action='store_true',
                     help='with --virtual-memories: a read whose address register holds (a registered '
                          'read address with its enable low) is not issued unless its row was written '
-                         'since the instance last read it; the instance keeps its read data (exact)')
+                         'since the instance last read it; the instance keeps its read data (exact). '
+                         "Its requests leave a host cycle after the pass, from registers (room 12)")
     ap.add_argument('--vmem-group', metavar='copy|N|auto[:M]',
                     help="with --virtual-memories: one kernel controller (foldsim_vmem_group) for a "
                          "class copy's virtual memories of the same row size and read-during-write "
