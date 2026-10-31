@@ -317,9 +317,14 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
             bram += br
             largest = max(largest, copy_logic + lam * lr)
     logic += rest
+    lk = link_cost(cal, (sched or {}).get('__links__'))
+    lutram += lk['lutram']
+    bram += lk['bram']
     sites, fits = placement(logic, lutram, bram)
     return dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
-                sites=round(sites), fits=fits, bram=round(bram, 1), largest_copy=round(largest))
+                sites=round(sites), fits=fits, bram=round(bram, 1), largest_copy=round(largest),
+                uram=lk['uram'], link_lutram=round(lk['lutram']), link_bram=round(lk['bram'], 1),
+                link_uram=lk['uram'], link_ff=lk['ff'])
 
 
 def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram=True,
@@ -378,12 +383,16 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         for u in units:
             u['costs'].pop('ultra', None)
     caps = {p: storage.MARGIN * storage.REGION[p] for p in ('sites', 'bram', 'uram')}
-    base = dict(sites=logic, luts=storage.fold_load(logic, cache), bram=cache)
+    # The links' storage, as the compiler emits it, before the stores choose.
+    lk = link_cost(cal, (sched or {}).get('__links__'))
+    base = dict(sites=logic + storage.LUTRAM_SITES * lk['lutram'],
+                luts=storage.fold_load(logic + lk['lutram'], cache + lk['bram'], lk['uram']),
+                bram=cache + lk['bram'], uram=lk['uram'])
     choice, used = storage.assign(units, base, caps,
                                   dict(luts=storage.route_luts(slrs)) if route else None)
     fits = all(used[p] <= caps[p] + 1e-9 for p in ('sites', 'bram', 'uram'))
-    lutram = uram = 0.0
-    bram = cache
+    lutram, uram = lk['lutram'], lk['uram']
+    bram = cache + lk['bram']
     per_copy = dict(copy_logic)
     rules, floor = [], 0
     for u, ch in zip(units, choice):
@@ -401,6 +410,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     sites = logic + storage.LUTRAM_SITES * lutram
     return dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
                 sites=round(sites), fits=fits, bram=round(bram, 1), uram=uram,
+                link_lutram=round(lk['lutram']), link_bram=round(lk['bram'], 1),
+                link_uram=lk['uram'], link_ff=lk['ff'],
                 largest_copy=round(max(per_copy.values())), storage=','.join(rules),
                 **({'ii_floor': floor} if floor > ii else {}))
 
@@ -599,10 +610,40 @@ def fit_period(fit, feats):
     return sum(x * y for x, y in zip(fit['coef'], fit_row(fit['terms'], {**feats, **held})))
 
 
+def parse_links(text):
+    """The links' storage of a schedule report (`link kinds`: memories, bits
+    and cost per kind, the cost in LUTRAM LUTs, RAMB36 and URAM288; register
+    bits), or None for a report from before links were priced."""
+    m = re.search(r'^  link kinds: distributed (\d+) (\d+) (\d+); block (\d+) (\d+) ([\d.e+]+); '
+                  r'ultra (\d+) (\d+) ([\d.e+]+); registers (\d+) (\d+)', text, re.M)
+    if not m:
+        return None
+    g = m.groups()
+    return dict(lutram=float(g[2]), lutram_bits=int(g[1]), bram=float(g[5]), bram_bits=int(g[4]),
+                uram=float(g[8]), uram_bits=int(g[7]), ff=int(g[10]))
+
+
+# The links as the fold-degree model prices them: what the schedule report
+# gives, scaled by a calibration's `links` factors (`lutram`, `bits`: the
+# built simulator's link LUTRAM and bits over the report's, measured on the
+# 1-SM a1 fold's netlist).
+def link_cost(cal, links):
+    if not links:
+        return dict(lutram=0.0, bram=0.0, uram=0.0, ff=0)
+    k = (cal or {}).get('links', {})
+    f, b = k.get('lutram', 1.0), k.get('bits', 1.0)
+    return dict(lutram=f * links['lutram'], bram=b * links['bram'], uram=links['uram'],
+                ff=round(b * links['ff']))
+
+
 def parse_classes(text):
     """Each class of a schedule report (a copy of a class its own): its
-    instances, the state gap, and each instance's ready and state slots."""
+    instances, the state gap, and each instance's ready and state slots;
+    under '__links__' the links' storage (parse_links)."""
     out, cur = {}, None
+    links = parse_links(text)
+    if links:
+        out['__links__'] = links
     for line in text.splitlines():
         m = re.match(r'^  (\S+) x(\d+)( \(ready pass\))?(?: state gap (\d+))?', line)
         if m:

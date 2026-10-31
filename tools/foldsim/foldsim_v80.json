@@ -474,5 +474,10 @@
    "est_logic": 427547,
    "est_lutram": 28219
   }
- ]
+ ],
+ "links": {
+  "bits": 0.977,
+  "lutram": 0.984,
+  "source": "built 1-SM a1 fold (a1_1031/gen/a1_fold): 82,493,908 link bits / 2,524,686 LUTRAM (mem_cost rule) in foldsim_sim.mlir against the report 84,428,872 / 2,565,595 (foldsim fold-static-links); no Vivado point"
+ }
 }

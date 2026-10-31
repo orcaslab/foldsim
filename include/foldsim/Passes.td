@@ -468,6 +468,24 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "written at the producer's instance's entry by a table of the "
            "slot's instance, the other instances' writes masked. The schedule "
            "report gives every link's storage, compact or not">,
+    Option<"linkBlockDepth", "link-block-depth", "unsigned", "0",
+           "A link memory at least this deep (entries x banks) that is the "
+           "only source of its reader's bits and never forwarded or taken in "
+           "its producer's host cycle is a block RAM, read at the same "
+           "registered address a host cycle on into its output register, "
+           "which is the read register (0: none)">,
+    Option<"linkUltraDepth", "link-ultra-depth", "unsigned", "0",
+           "As link-block-depth, in ultra RAM (0: none)">,
+    Option<"stagedLinks", "staged-links", "bool", "false",
+           "An early link of one producer instance (its reader takes one) "
+           "kept in two registers where the schedule allows: written at the "
+           "producer's pass, copied at a fixed position of the frame to the "
+           "one the reader reads, between the last read of the frame before "
+           "and the first of this one; no memory and no bank select">,
+    Option<"shareLinks", "share-links", "bool", "false",
+           "Outputs of a model driven by the same value (a bus broadcast to "
+           "several children) are one producer: their readers share its "
+           "links instead of one link per output">,
     ListOption<"registeredLinks", "registered-links", "std::string",
                "Classes (globs; a copy goes by its class's name) whose links "
                "are never taken in their producer's host cycle: with "
