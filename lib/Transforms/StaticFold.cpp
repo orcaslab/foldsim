@@ -6117,10 +6117,13 @@ LogicalResult StaticFolder::buildSim() {
                 name + "_copy0");
             // Clock enables, as the flops take them: no select on the
             // producer's path into the first register.
+            // Named, with no inner symbol: several links may share a name.
             Value stageA = seq::CompRegClockEnabledOp::create(
-                b, data, hostClock, write, b.getStringAttr(name + "_staged"));
+                b, data, hostClock, write, b.getStringAttr(name + "_staged"),
+                Value(), Value(), Value(), hw::InnerSymAttr());
             Value stageB = seq::CompRegClockEnabledOp::create(
-                b, stageA, hostClock, copy, b.getStringAttr(name + "_held"));
+                b, stageA, hostClock, copy, b.getStringAttr(name + "_held"),
+                Value(), Value(), Value(), hw::InnerSymAttr());
             sourceData[index] = stageB;
             continue;
           }
