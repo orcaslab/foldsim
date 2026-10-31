@@ -303,11 +303,60 @@ def write_slr_groups(sv, path):
                     f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT fs_{g[len("foldsim_"):]} $c }}\n')
 
 
-def vmem_groups(vmems, choice):
-    """The kernel's controllers for --vmem-group (VMEM_INTERFACE.md, v6): a
+def vmem_partition(vmems, sets, choice, weights):
+    """The memories of each set (a class copy's memories that may share a
+    controller) split into controllers. `copy`: a set each; N: at most N
+    memories each, in port order; `auto[:M]` (v7): M controllers in all
+    (default 32, at least one a set) given out one at a time to the set whose
+    controllers carry the most expected accesses each, and each set's
+    memories spread over its controllers largest load first, each to the
+    least loaded (LPT). A memory's load: `weights` (accesses measured per
+    port or memory name) or, by default, its instances (one entry a frame
+    each: the most a state pass issues)."""
+    if not choice.startswith('auto'):
+        cap = None if choice == 'copy' else int(choice)
+        return [ms[i:i + (cap or len(ms))] for ms in sets for i in range(0, len(ms), cap or len(ms))]
+    budget = int(choice.split(':')[1]) if ':' in choice else 32
+    load = lambda k: float(weights.get(vmems[k]['port'], weights.get(vmems[k]['memory'], vmems[k]['instances']))
+                           if weights else vmems[k]['instances'])
+    count = [1] * len(sets)
+    total = [sum(load(k) for k in ms) for ms in sets]
+    for _ in range(budget - len(sets)):
+        open_ = [i for i, ms in enumerate(sets) if count[i] < len(ms) and total[i] > 0]
+        if not open_:
+            break
+        i = max(open_, key=lambda i: total[i] / count[i])
+        count[i] += 1
+    out = []
+    for ms, n in zip(sets, count):
+        bins = [[0.0, []] for _ in range(n)]
+        for k in sorted(ms, key=lambda k: (-load(k), k)):
+            b = min(bins, key=lambda b: b[0])
+            b[0] += load(k)
+            b[1].append(k)
+        out += [sorted(b[1]) for b in bins if b[1]]
+    return out
+
+
+def vmem_known_zero(rows, budget):
+    """A controller's known-zero bits (v7): on, with a bit per block of
+    2^shift image rows, the smallest block that keeps the bits within
+    `budget`; off with a budget of 0. `rows`: the image's rows (2^AW x
+    instances)."""
+    if budget <= 0:
+        return 0, 0
+    shift = 0
+    while -(-rows // (1 << shift)) > budget:
+        shift += 1
+    return 1, shift
+
+
+def vmem_groups(vmems, choice, weights=None, kz_bits=0):
+    """The kernel's controllers for --vmem-group (VMEM_INTERFACE.md, v6, v7): a
     class copy's virtual memories with the same instances, row size (bytes in
-    device memory) and read-during-write order share one, in port order, at
-    most N of them (or all, `copy`). Within a controller's image, member m's
+    device memory) and read-during-write order may share one: all of them
+    (`copy`), at most N in port order, or as `auto[:M]` spreads them
+    (vmem_partition). Within a controller's image, member m's
     rows follow the larger members': row r of instance i is the controller's
     row GROW_m + r, so each member keeps its own image (the layout of a
     controller of its own) at a byte offset of the controller's region. The
@@ -318,30 +367,28 @@ def vmem_groups(vmems, choice):
     for k, v in enumerate(vmems):
         keys.setdefault((v['class'], v['instances'], v['inst_width'], v['row_bytes'],
                          v['read_first']), []).append(k)
-    cap = None if choice == 'copy' else int(choice)
     groups, offset = [], 0
-    for members in keys.values():
-        for i in range(0, len(members), cap or len(members)):
-            ks = members[i:i + (cap or len(members))]
-            first = vmems[ks[0]]
-            grow = 0
-            for k in sorted(ks, key=lambda k: -vmems[k]['row_width']):
-                vmems[k]['group_row'] = grow
-                grow += 1 << vmems[k]['row_width']
-            # The controller's rows are whole bytes (a member's data is
-            # zero-extended to them).
-            dw = -(-max(vmems[k]['data_width'] for k in ks) // 8) * 8
-            g = {'members': ks, 'size': len(ks), 'class': first['class'],
-                 'inst_width': first['inst_width'], 'instances': first['instances'],
-                 'rows': grow, 'row_width': max(1, (grow - 1).bit_length()), 'data_width': dw,
-                 'mask_width': dw // 8 if any(vmems[k]['mask_width'] > 1 for k in ks) else 1,
-                 'read_first': first['read_first'], 'row_bytes': first['row_bytes'],
-                 'base': offset, 'bytes': grow * first['instances'] * first['row_bytes']}
-            for j, k in enumerate(ks):
-                vmems[k].update(group=len(groups), group_member=j,
-                                base=offset + vmems[k]['group_row'] * first['instances'] * first['row_bytes'])
-            groups.append(g)
-            offset += -(-g['bytes'] // 4096) * 4096
+    for ks in vmem_partition(vmems, list(keys.values()), choice, weights):
+        first = vmems[ks[0]]
+        grow = 0
+        for k in sorted(ks, key=lambda k: -vmems[k]['row_width']):
+            vmems[k]['group_row'] = grow
+            grow += 1 << vmems[k]['row_width']
+        # The controller's rows are whole bytes (a member's data is
+        # zero-extended to them).
+        dw = -(-max(vmems[k]['data_width'] for k in ks) // 8) * 8
+        g = {'members': ks, 'size': len(ks), 'class': first['class'],
+             'inst_width': first['inst_width'], 'instances': first['instances'],
+             'rows': grow, 'row_width': max(1, (grow - 1).bit_length()), 'data_width': dw,
+             'mask_width': dw // 8 if any(vmems[k]['mask_width'] > 1 for k in ks) else 1,
+             'read_first': first['read_first'], 'row_bytes': first['row_bytes'],
+             'base': offset, 'bytes': grow * first['instances'] * first['row_bytes']}
+        g['known_zero'], g['kz_shift'] = vmem_known_zero((1 << g['row_width']) * g['instances'], kz_bits)
+        for j, k in enumerate(ks):
+            vmems[k].update(group=len(groups), group_member=j,
+                            base=offset + vmems[k]['group_row'] * first['instances'] * first['row_bytes'])
+        groups.append(g)
+        offset += -(-g['bytes'] // 4096) * 4096
     return groups
 
 
@@ -465,12 +512,23 @@ def main():
                     help='with --virtual-memories: the arrays a front end split from one target RAM '
                          '(byte lanes, ways: the same read address and enable, the same write '
                          'address) are one virtual memory, each lane its own bytes of the row')
-    ap.add_argument('--vmem-group', metavar='copy|N',
+    ap.add_argument('--vmem-group', metavar='copy|N|auto[:M]',
                     help="with --virtual-memories: one kernel controller (foldsim_vmem_group) for a "
                          "class copy's virtual memories of the same row size and read-during-write "
-                         "order (copy), or for at most N of them; each memory keeps its own region "
-                         "within the controller's, and the simulator's ports are unchanged. "
-                         "Absent: a controller per memory")
+                         "order (copy), or for at most N of them, or (auto) M controllers in all "
+                         "(default 32) spread by expected accesses (--vmem-weights, else instances); "
+                         "each memory keeps its own region within the controller's, and the "
+                         "simulator's ports are unchanged. Absent: a controller per memory")
+    ap.add_argument('--vmem-weights', metavar='JSON',
+                    help='with --vmem-group auto: each memory\'s expected accesses (a JSON object by '
+                         'port vm<k> or memory name, e.g. counted by a profiling run)')
+    ap.add_argument('--vmem-row-bytes-min', type=int, default=1, metavar='BYTES',
+                    help='with --virtual-memories: a row takes its bytes rounded up to a power of two '
+                         'in device memory, at least this many (default %(default)s: rows below 64 '
+                         'bytes share lines; 64: the v6 layout)')
+    ap.add_argument('--vmem-known-zero-bits', type=int, default=1 << 16, metavar='N',
+                    help="with --virtual-memories: each controller's known-zero bits at most (a bit per "
+                         "block of rows, the smallest block within N; default %(default)s); 0: none")
     ap.add_argument('--vmem-cache-budget', type=float, default=VMEM_CACHE_BUDGET, metavar='RAMB36',
                     help='with --vmem-cache-rows auto: the block RAM all the host caches\' lines may '
                          'take, in RAMB36 (default %(default)g, 5%% of the V80 dynamic region\'s)')
@@ -703,8 +761,16 @@ def main():
     if a.vmem_group is not None:
         if not a.virtual_memories:
             sys.exit('--vmem-group needs --virtual-memories')
-        if a.vmem_group != 'copy' and not (a.vmem_group.isdigit() and int(a.vmem_group) >= 1):
-            sys.exit('--vmem-group: copy, or the memories per controller (at least 1)')
+        if not (a.vmem_group == 'copy' or (a.vmem_group.isdigit() and int(a.vmem_group) >= 1)
+                or re.fullmatch(r'auto(:[1-9][0-9]*)?', a.vmem_group)):
+            sys.exit('--vmem-group: copy, the memories per controller (at least 1), or auto[:M]')
+    if a.vmem_weights and not (a.vmem_group or '').startswith('auto'):
+        sys.exit('--vmem-weights needs --vmem-group auto')
+    m = a.vmem_row_bytes_min
+    if m < 1 or m & (m - 1):
+        sys.exit('--vmem-row-bytes-min: a power of two')
+    if a.vmem_known_zero_bits != 0 and a.vmem_known_zero_bits < 16:
+        sys.exit('--vmem-known-zero-bits: 0 (none) or at least 16')
     if a.storage and not a.static:
         sys.exit('--storage needs --static')
     if a.schedule_only and not a.static:
@@ -785,17 +851,22 @@ def main():
                              'row_width': int(aw), 'data_width': int(dw), 'mask_width': int(mw),
                              'read_first': rf == '1', 'instances': int(insts)})
     # Each memory's region in the kernel's vmem space (VMEM_INTERFACE.md):
-    # row r of instance i at ((r * INSTANCES + i) << log2(ROW_BYTES)), rows a
-    # power of two of at least 64 bytes; regions 4 KiB aligned.
+    # row r of instance i at ((r * INSTANCES + i) << log2(ROW_BYTES)), a row
+    # its bytes rounded up to a power of two, at least --vmem-row-bytes-min
+    # (v7; 64 in v6); regions 4 KiB aligned. A controller of its own has
+    # known-zero bits within --vmem-known-zero-bits.
     offset = 0
     for v in info['vmem']:
-        row_bytes = max(64, 1 << ((v['data_width'] + 7) // 8 - 1).bit_length())
+        row_bytes = max(a.vmem_row_bytes_min, 1 << ((v['data_width'] + 7) // 8 - 1).bit_length())
         size = (v['instances'] << v['row_width']) * row_bytes
         v.update(row_bytes=row_bytes, base=offset, bytes=size)
+        v['known_zero'], v['kz_shift'] = vmem_known_zero((1 << v['row_width']) * v['instances'],
+                                                         a.vmem_known_zero_bits)
         offset += -(-size // 4096) * 4096
     info['vmem_bytes'] = offset
     if a.vmem_group is not None and info['vmem']:
-        info['vmem_groups'] = vmem_groups(info['vmem'], a.vmem_group)
+        weights = json.load(open(a.vmem_weights)) if a.vmem_weights else None
+        info['vmem_groups'] = vmem_groups(info['vmem'], a.vmem_group, weights, a.vmem_known_zero_bits)
         info['vmem_bytes'] = sum(-(-g['bytes'] // 4096) * 4096 for g in info['vmem_groups'])
         if a.vmem_cache_rows is not None:
             pseudo = [{'instances': g['instances'] * g['rows'], 'row_width': 0,
@@ -832,6 +903,10 @@ def main():
                     f.write(f'`define FOLDSIM_VMEM_{k}_{key} {v[d]}\n')
                 f.write(f'`define FOLDSIM_VMEM_{k}_RDWRF {int(v["read_first"])}\n')
                 f.write(f'`define FOLDSIM_VMEM_{k}_BASE 64\'h{v["base"]:x}\n')
+                f.write(f'`define FOLDSIM_VMEM_{k}_ROW_BYTES {v["row_bytes"]}\n')
+                if 'vmem_groups' not in info:
+                    f.write(f'`define FOLDSIM_VMEM_{k}_KNOWN_ZERO {v["known_zero"]}\n')
+                    f.write(f'`define FOLDSIM_VMEM_{k}_KZ_SHIFT {v["kz_shift"]}\n')
                 if 'cache_rows' in v:
                     f.write(f'`define FOLDSIM_VMEM_{k}_CACHE_ROWS {v["cache_rows"]}\n')
                 if 'group' in v:
@@ -846,6 +921,9 @@ def main():
                         f.write(f'`define FOLDSIM_VMEM_G{g}_{key} {v[d]}\n')
                     f.write(f'`define FOLDSIM_VMEM_G{g}_RDWRF {int(v["read_first"])}\n')
                     f.write(f'`define FOLDSIM_VMEM_G{g}_BASE 64\'h{v["base"]:x}\n')
+                    f.write(f'`define FOLDSIM_VMEM_G{g}_ROW_BYTES {v["row_bytes"]}\n')
+                    f.write(f'`define FOLDSIM_VMEM_G{g}_KNOWN_ZERO {v["known_zero"]}\n')
+                    f.write(f'`define FOLDSIM_VMEM_G{g}_KZ_SHIFT {v["kz_shift"]}\n')
                     if 'cache_rows' in v:
                         f.write(f'`define FOLDSIM_VMEM_G{g}_CACHE_ROWS {v["cache_rows"]}\n')
             f.write(f'`define FOLDSIM_VMEM_BYTES 64\'h{info["vmem_bytes"]:x}\n')

@@ -17,6 +17,9 @@
 # RUN: FileCheck %s --check-prefix=AUTOJ < %t/auto/foldsim_sim.json
 # RUN: FileCheck %s --check-prefix=AUTOL < %t/auto.log
 # AUTO: `define FOLDSIM_VMEM_0_BASE 64'h0
+# AUTO-NEXT: `define FOLDSIM_VMEM_0_ROW_BYTES 1
+# AUTO-NEXT: `define FOLDSIM_VMEM_0_KNOWN_ZERO 1
+# AUTO-NEXT: `define FOLDSIM_VMEM_0_KZ_SHIFT 0
 # AUTO-NEXT: `define FOLDSIM_VMEM_0_CACHE_ROWS 64
 # AUTO-NEXT: `define FOLDSIM_VMEM_BYTES 64'h1000
 # AUTOJ: "cache_rows": 64
