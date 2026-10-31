@@ -1,0 +1,96 @@
+# The kernel's view of several virtual memories per copy (Inputs/vmem_multi:
+# per leaf, four byte lanes of one RAM, a RAM written at their address and read
+# there, one read elsewhere, 32 x 16 and 8 x 26 RAMs; two copies of two leaves).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/vmem_multi
+# Apart, a controller each: 8 memories a copy, a region each.
+# RUN: foldsim --srcs top.f --top Top --out %t/plain --static --virtual-memories 'Leaf:.*' --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=PLAIN < %t/plain/foldsim_sim.vh
+# PLAIN: `define FOLDSIM_VMEM_COUNT 16
+# PLAIN: `define FOLDSIM_VMEM_0_DW 8
+# PLAIN-NOT: GROUP
+# PLAIN: `define FOLDSIM_VMEM_BYTES 64'h10000
+# --vmem-merge-lanes: the lanes, and the RAM read and written at their
+# addresses (their read-address registers always agree), are one memory of five
+# byte lanes, a byte enable each; the RAM read elsewhere stays apart.
+# RUN: foldsim --srcs top.f --top Top --out %t/merged --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=MERGED < %t/merged/foldsim_sim.vh
+# RUN: FileCheck %s --check-prefix=MERGEDJ < %t/merged/foldsim_sim.json
+# MERGED: `define FOLDSIM_VMEM_COUNT 8
+# MERGED-NEXT: `define FOLDSIM_VMEM_0_IW 1
+# MERGED-NEXT: `define FOLDSIM_VMEM_0_AW 4
+# MERGED-NEXT: `define FOLDSIM_VMEM_0_DW 40
+# MERGED-NEXT: `define FOLDSIM_VMEM_0_MW 5
+# MERGED: `define FOLDSIM_VMEM_1_DW 8
+# MERGED-NEXT: `define FOLDSIM_VMEM_1_MW 1
+# MERGEDJ: "memory": "g_lane_0.lane/Memory_x5"
+# MERGEDJ: "memory": "pair1/Memory"
+# MERGEDJ: "memory": "m16/Memory"
+# MERGEDJ: "memory": "m26/Memory"
+# --vmem-group copy: a controller per copy, its members placed largest first
+# (m16's 32 rows, the lanes' 16, pair1's 16, m26's 8: rows 0, 32, 48, 64 of a
+# 128-row image of 40-bit rows with byte enables); each member's base is its
+# image's in the vmem space, the group's region 4 KiB aligned.
+# RUN: foldsim --srcs top.f --top Top --out %t/group --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --vmem-group copy --copies Leaf:2 Leaf 2> %t/group.log > /dev/null
+# RUN: FileCheck %s --check-prefix=GROUP < %t/group/foldsim_sim.vh
+# RUN: FileCheck %s --check-prefix=GROUPJ < %t/group/foldsim_sim.json
+# RUN: FileCheck %s --check-prefix=GROUPL < %t/group.log
+# GROUP: `define FOLDSIM_VMEM_COUNT 8
+# GROUP: `define FOLDSIM_VMEM_0_BASE 64'h1000
+# GROUP-NEXT: `define FOLDSIM_VMEM_0_GROUP 0
+# GROUP-NEXT: `define FOLDSIM_VMEM_0_GROW 32
+# GROUP: `define FOLDSIM_VMEM_1_GROUP 0
+# GROUP-NEXT: `define FOLDSIM_VMEM_1_GROW 48
+# GROUP: `define FOLDSIM_VMEM_2_BASE 64'h0
+# GROUP-NEXT: `define FOLDSIM_VMEM_2_GROUP 0
+# GROUP-NEXT: `define FOLDSIM_VMEM_2_GROW 0
+# GROUP: `define FOLDSIM_VMEM_3_GROUP 0
+# GROUP-NEXT: `define FOLDSIM_VMEM_3_GROW 64
+# GROUP: `define FOLDSIM_VMEM_4_GROUP 1
+# GROUP: `define FOLDSIM_VMEM_GROUPS 2
+# GROUP-NEXT: `define FOLDSIM_VMEM_G0_N 4
+# GROUP-NEXT: `define FOLDSIM_VMEM_G0_IW 1
+# GROUP-NEXT: `define FOLDSIM_VMEM_G0_AW 7
+# GROUP-NEXT: `define FOLDSIM_VMEM_G0_DW 40
+# GROUP-NEXT: `define FOLDSIM_VMEM_G0_MW 5
+# GROUP-NEXT: `define FOLDSIM_VMEM_G0_INSTANCES 2
+# GROUP-NEXT: `define FOLDSIM_VMEM_G0_RDWRF 0
+# GROUP-NEXT: `define FOLDSIM_VMEM_G0_BASE 64'h0
+# GROUP: `define FOLDSIM_VMEM_G1_BASE 64'h3000
+# GROUP-NEXT: `define FOLDSIM_VMEM_BYTES 64'h6000
+# GROUPJ: "group_row": 32,
+# GROUPJ-NEXT: "group": 0,
+# GROUPJ-NEXT: "group_member": 0
+# GROUPJ: "vmem_groups": [
+# GROUPJ: "members": [
+# GROUPJ-NEXT: 0,
+# GROUPJ-NEXT: 1,
+# GROUPJ-NEXT: 2,
+# GROUPJ-NEXT: 3
+# GROUPL: foldsim: vmem controllers: g0 vm0+vm1+vm2+vm3, g1 vm4+vm5+vm6+vm7
+# At most N members a controller; with --vmem-cache-rows, each controller's
+# lines (FOLDSIM_VMEM_G<g>_CACHE_ROWS) over all its members' rows.
+# RUN: foldsim --srcs top.f --top Top --out %t/three --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --vmem-group 3 --vmem-cache-rows 64 --copies Leaf:2 Leaf 2> %t/three.log > /dev/null
+# RUN: FileCheck %s --check-prefix=THREE < %t/three/foldsim_sim.vh
+# RUN: FileCheck %s --check-prefix=THREEL < %t/three.log
+# THREE: `define FOLDSIM_VMEM_GROUPS 4
+# THREE-NEXT: `define FOLDSIM_VMEM_G0_N 3
+# THREE: `define FOLDSIM_VMEM_G0_CACHE_ROWS 64
+# THREE: `define FOLDSIM_VMEM_G1_N 1
+# THREE-NEXT: `define FOLDSIM_VMEM_G1_IW 1
+# THREE-NEXT: `define FOLDSIM_VMEM_G1_AW 3
+# THREE-NEXT: `define FOLDSIM_VMEM_G1_DW 32
+# THREE-NEXT: `define FOLDSIM_VMEM_G1_MW 1
+# THREE: `define FOLDSIM_VMEM_G1_CACHE_ROWS 16
+# THREEL: foldsim: vmem controllers: g0 vm0+vm1+vm2 64 lines, g1 vm3 16 lines, g2 vm4+vm5+vm6 64 lines, g3 vm7 16 lines
+# Without the options the output is as before (the simulator's ports never
+# depend on them).
+# RUN: sed -e 's#%t/plain/##g' %t/plain/foldsim_sim.sv > %t/plain.sv
+# RUN: foldsim --srcs top.f --top Top --out %t/plain2 --static --virtual-memories 'Leaf:.*' --vmem-group copy --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: sed -e 's#%t/plain2/##g' %t/plain2/foldsim_sim.sv > %t/plain2.sv
+# RUN: cmp %t/plain.sv %t/plain2.sv
+# Errors, before anything is compiled.
+# RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --vmem-group copy Leaf 2>&1 | FileCheck %s --check-prefix=NOVM
+# NOVM: --vmem-group needs --virtual-memories
+# RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --virtual-memories 'Leaf:.*' --vmem-group 0 Leaf 2>&1 | FileCheck %s --check-prefix=BAD
+# RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --virtual-memories 'Leaf:.*' --vmem-group all Leaf 2>&1 | FileCheck %s --check-prefix=BAD
+# BAD: --vmem-group: copy, or the memories per controller (at least 1)

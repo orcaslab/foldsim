@@ -367,6 +367,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "its state pass and keeps each instance's read data from the "
            "responses; a slot whose instance's read has not been answered "
            "waits in a bubble, so the target's cycles never change">,
+    Option<"vmemMergeLanes", "vmem-merge-lanes", "bool", "false",
+           "With virtual-memories, the arrays a front end split from one "
+           "target RAM (byte lanes, ways: the same depth, read-during-write "
+           "order, read address and enable, and write address, registers "
+           "that always agree counting as the same) are one virtual memory: "
+           "a row of whole-byte lanes, each written under its own enable">,
     Option<"stagedEnv", "staged-env", "bool", "true",
            "The environment's endpoints take a token a host cycle after it "
            "is offered (registered token ends), not in that host cycle">,

@@ -24,6 +24,7 @@
 #include "foldsim/Passes.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
@@ -120,11 +121,17 @@ struct Class {
   /// Its memories kept outside the simulator (`--virtual-memories`): each
   /// one's row address, data and mask widths, read-during-write order, and
   /// where its request and response ports start among the copy's.
+  /// With --vmem-merge-lanes, the arrays split from one target RAM (the same
+  /// read address and enable, the same write address) are one memory: its
+  /// lanes, each at a whole-byte offset of the row, and enabled by its own
+  /// write enable (byte enables).
   struct VirtualMemory {
     std::string name;
     unsigned rowWidth, dataWidth, maskWidth;
     bool readFirst;
     unsigned firstInput, firstOutput;
+    SmallVector<seq::FirMemOp> lanes;
+    SmallVector<unsigned> laneOffset;
   };
   SmallVector<VirtualMemory> virtualMemories;
   /// With virtual memories, the copy's host reset input (their pending reads
@@ -237,7 +244,7 @@ public:
                bool oneCycleLinks, bool overlapFrames, bool modulo,
                bool interleaveCopies, bool zeroLatencyLinks,
                bool zeroLatencyChains, bool shortLead, bool bubbles,
-               StringRef virtualMemories, bool stagedEnv, ArrayRef<std::string> specGroups, unsigned specDepth,
+               StringRef virtualMemories, bool mergeLanes, bool stagedEnv, ArrayRef<std::string> specGroups, unsigned specDepth,
                ArrayRef<std::string> envSinks, unsigned registerStateEntries,
                unsigned slrGroups, ArrayRef<std::string> slrSites,
                uint64_t slrCapacity, ArrayRef<std::string> slrAssign,
@@ -253,6 +260,7 @@ public:
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
         zeroLatencyChains(zeroLatencyChains), shortLead(shortLead),
         bubbles(bubbles), virtualMemoryPattern(virtualMemories.str()),
+        mergeLanes(mergeLanes),
         readyLevelsMode(readyLevels.str()),
         registerStateEntries(registerStateEntries), storageSpecs(storage),
         forwardAfterLevels(forwardAfterLevels),
@@ -383,6 +391,8 @@ private:
   bool bubbles;
   /// `--virtual-memories`: the names of the memories kept outside.
   std::string virtualMemoryPattern;
+  /// `--vmem-merge-lanes`: the arrays split from one target RAM are one.
+  bool mergeLanes;
   /// When a class may write its ready outputs in more than one ready pass,
   /// by level (`ready-levels`: off, auto or always); and whether
   /// `frameGraph` does so now.
@@ -3174,6 +3184,62 @@ static Value asBits(ImplicitLocOpBuilder &b, Value value) {
   return b.createOrFold<hw::BitcastOp>(b.getIntegerType(width), value);
 }
 
+namespace {
+/// Whether two values carry the same bits in every target cycle: the same
+/// value, or the same side-effect-free operation of such operands. Two
+/// registers are taken as such a pair (coinductively) once their clocks,
+/// resets and starting values agree, if their next values are such a pair
+/// under that assumption: they then agree forever, as a memory macro's
+/// per-lane copies of one read-address pipeline do. A query that fails says
+/// nothing; one object answers one query.
+struct SameBits {
+  static constexpr unsigned kMaxSteps = 4096;
+  DenseSet<std::pair<Value, Value>> pairs;
+  unsigned steps = 0;
+
+  static bool sameAttrs(Operation *a, Operation *b) {
+    auto kept = [](Operation *op) {
+      SmallVector<NamedAttribute> attrs;
+      for (auto attr : op->getAttrs())
+        if (!llvm::is_contained({"name", "inner_sym", "sv.namehint"},
+                                attr.getName().getValue()))
+          attrs.push_back(attr);
+      return attrs;
+    };
+    return kept(a) == kept(b);
+  }
+
+  bool operator()(Value a, Value b) {
+    if (a == b)
+      return true;
+    if (a.getType() != b.getType() || ++steps > kMaxSteps)
+      return false;
+    auto key = a.getAsOpaquePointer() < b.getAsOpaquePointer()
+                   ? std::make_pair(a, b)
+                   : std::make_pair(b, a);
+    if (pairs.contains(key))
+      return true;
+    auto ra = dyn_cast<OpResult>(a), rb = dyn_cast<OpResult>(b);
+    if (!ra || !rb || ra.getResultNumber() != rb.getResultNumber())
+      return false;
+    Operation *oa = ra.getOwner(), *ob = rb.getOwner();
+    if (oa->getName() != ob->getName() ||
+        oa->getNumOperands() != ob->getNumOperands() ||
+        oa->getNumRegions() || ob->getNumRegions() || !sameAttrs(oa, ob))
+      return false;
+    if (isa<seq::FirRegOp>(oa))
+      pairs.insert(key);
+    else if (!isMemoryEffectFree(oa))
+      return false;
+    for (auto [x, y] : llvm::zip(oa->getOperands(), ob->getOperands()))
+      if (!(*this)(x, y))
+        return false;
+    pairs.insert(key);
+    return true;
+  }
+};
+} // namespace
+
 /// The value `value` takes in the next target cycle, every register replaced
 /// by its next value; built for a value that depends on no input but static
 /// ones, nor on a memory's read data.
@@ -3378,6 +3444,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // from), so that one class's memories can be named apart from another's
   // with the same path, as the storage rules name them.
   DenseMap<Operation *, unsigned> virtualOf;
+  SmallVector<seq::FirMemOp> candidates;
   if (!virtualMemoryPattern.empty()) {
     llvm::Regex pattern(virtualMemoryPattern);
     StringRef model =
@@ -3416,15 +3483,78 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       // The controller takes byte enables, or none.
       if (maskWidth > 1 && (width % maskWidth || (width / maskWidth) % 8))
         return memory.emitError("a virtual memory's mask covers whole bytes");
-      Class::VirtualMemory vm;
-      vm.name = memory.getName().value_or("mem").str();
-      vm.rowWidth = std::max(1u, llvm::Log2_64_Ceil(type.getDepth()));
-      vm.dataWidth = width;
-      vm.maskWidth = maskWidth > 1 ? width / 8 : 1;
-      vm.readFirst = memory.getRuw() != seq::RUW::New;
-      virtualOf[memory] = cls.virtualMemories.size();
-      cls.virtualMemories.push_back(vm);
+      candidates.push_back(memory);
     }
+  }
+  // Each memory alone, or (--vmem-merge-lanes) with the later ones split
+  // from the same target RAM: the same depth, read-during-write order and
+  // clock, a read address and enable that carry the same bits in every
+  // cycle, and (all or none written) the same write address. A lane takes
+  // whole bytes of the row, as many as its bits need, and its write enable
+  // (with its mask) enables them; the row stays within the controller's 4096
+  // bits.
+  auto portsOf = [](seq::FirMemOp memory) {
+    std::pair<seq::FirMemReadOp, seq::FirMemWriteOp> ports;
+    for (auto *user : memory->getUsers()) {
+      if (auto read = dyn_cast<seq::FirMemReadOp>(user))
+        ports.first = read;
+      else
+        ports.second = cast<seq::FirMemWriteOp>(user);
+    }
+    return ports;
+  };
+  auto sameRam = [&](seq::FirMemOp a, seq::FirMemOp c) {
+    if (a.getType().getDepth() != c.getType().getDepth() ||
+        a.getRuw() != c.getRuw())
+      return false;
+    auto [ra, wa] = portsOf(a);
+    auto [rc, wc] = portsOf(c);
+    if (ra.getClk() != rc.getClk() || !SameBits()(ra.getAddress(), rc.getAddress()) ||
+        bool(ra.getEnable()) != bool(rc.getEnable()) ||
+        (ra.getEnable() && !SameBits()(ra.getEnable(), rc.getEnable())))
+      return false;
+    if (bool(wa) != bool(wc))
+      return false;
+    return !wa || (wa.getClk() == wc.getClk() &&
+                   SameBits()(wa.getAddress(), wc.getAddress()));
+  };
+  auto bytesOf = [](seq::FirMemOp memory) {
+    return (memory.getType().getWidth() + 7) / 8;
+  };
+  DenseSet<Operation *> merged;
+  for (auto [i, memory] : llvm::enumerate(candidates)) {
+    if (merged.contains(memory))
+      continue;
+    auto type = memory.getType();
+    unsigned maskWidth = type.getMaskWidth().value_or(1);
+    Class::VirtualMemory vm;
+    vm.name = memory.getName().value_or("mem").str();
+    vm.rowWidth = std::max(1u, llvm::Log2_64_Ceil(type.getDepth()));
+    vm.dataWidth = type.getWidth();
+    vm.maskWidth = maskWidth > 1 ? type.getWidth() / 8 : 1;
+    vm.readFirst = memory.getRuw() != seq::RUW::New;
+    vm.lanes.push_back(memory);
+    vm.laneOffset.push_back(0);
+    if (mergeLanes) {
+      unsigned bytes = bytesOf(memory);
+      for (auto other : ArrayRef(candidates).drop_front(i + 1)) {
+        if (merged.contains(other) || (bytes + bytesOf(other)) * 8 > 4096 ||
+            !sameRam(memory, other))
+          continue;
+        vm.lanes.push_back(other);
+        vm.laneOffset.push_back(bytes * 8);
+        bytes += bytesOf(other);
+        merged.insert(other);
+      }
+      if (vm.lanes.size() > 1) {
+        vm.name += "_x" + std::to_string(vm.lanes.size());
+        vm.dataWidth = bytes * 8;
+        vm.maskWidth = bytes;
+      }
+    }
+    for (auto lane : vm.lanes)
+      virtualOf[lane] = cls.virtualMemories.size();
+    cls.virtualMemories.push_back(std::move(vm));
   }
 
   // The early outputs' next values, before any register is replaced.
@@ -3596,6 +3726,104 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     Value rdValid = zero(1), rdRow = zero(vm.rowWidth);
     Value wrValid = zero(1), wrRow = zero(vm.rowWidth);
     Value wrData = zero(vm.dataWidth), wrMask = zero(vm.maskWidth);
+    // Each instance's read data, from the responses.
+    auto readBuffer = [&]() -> Value {
+      auto readName = vm.name + "_rdata";
+      Value data;
+      if (threads == 1) {
+        auto nextEdge = edges.get(rspData.getType());
+        auto buffer = seq::FirRegOp::create(b, nextEdge, hostClock,
+                                            b.getStringAttr(readName));
+        nextEdge.setValue(comb::MuxOp::create(b, rspValid, rspData, buffer));
+        data = buffer;
+      } else {
+        auto bufferType =
+            seq::FirMemType::get(context, entries, vm.dataWidth, 1);
+        auto buffer = seq::FirMemOp::create(
+            b, bufferType, /*readLatency=*/0, /*writeLatency=*/1,
+            seq::RUW::Undefined, seq::WUW::Undefined,
+            b.getStringAttr(readName), hw::InnerSymAttr{},
+            seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+        keepShallowInFlops(buffer);
+        seq::FirMemWriteOp::create(b, buffer, rspInst, hostClock, rspValid,
+                                   rspData, Value{});
+        Value bufferData = seq::FirMemReadOp::create(b, buffer, region.inst1,
+                                                     hostClock, one());
+        data = seq::FirRegOp::create(b, bufferData, hostClock,
+                                     b.getStringAttr(readName + "_read"));
+      }
+      return data;
+    };
+    if (vm.lanes.size() > 1) {
+      // The lanes of one target RAM: one read and one write of the whole row,
+      // each lane's bytes enabled by its own write enable.
+      SmallVector<Value> datas, masks;
+      Value anyWrite;
+      for (auto lane : vm.lanes) {
+        seq::FirMemReadOp read;
+        seq::FirMemWriteOp write;
+        for (auto *user : lane->getUsers()) {
+          if (auto r = dyn_cast<seq::FirMemReadOp>(user))
+            read = r;
+          else
+            write = cast<seq::FirMemWriteOp>(user);
+        }
+        unsigned width = lane.getType().getWidth();
+        unsigned bytes = (width + 7) / 8;
+        if (lane == vm.lanes.front()) {
+          rdValid = region.state;
+          if (read.getEnable())
+            rdValid = comb::AndOp::create(b, rdValid, read.getEnable());
+          rdRow = widen(read.getAddress(), vm.rowWidth);
+          if (write)
+            wrRow = widen(write.getAddress(), vm.rowWidth);
+        }
+        if (write) {
+          Value enable = write.getEnable() ? Value(write.getEnable()) : Value(one());
+          anyWrite = anyWrite ? Value(comb::OrOp::create(b, anyWrite, enable))
+                              : enable;
+          datas.push_back(widen(asBits(b, write.getData()), bytes * 8));
+          unsigned maskBits = lane.getType().getMaskWidth().value_or(1);
+          SmallVector<Value> laneMask;
+          for (unsigned i = maskBits; i-- > 0;) {
+            Value bit = enable;
+            if (maskBits > 1 && write.getMask())
+              bit = comb::AndOp::create(
+                  b, bit,
+                  b.createOrFold<comb::ExtractOp>(intType(1), write.getMask(), i));
+            unsigned perBit = bytes / maskBits;
+            laneMask.push_back(perBit > 1 ? b.createOrFold<comb::ReplicateOp>(
+                                                intType(perBit), bit)
+                                          : bit);
+          }
+          masks.push_back(b.createOrFold<comb::ConcatOp>(laneMask));
+          write.erase();
+        } else {
+          datas.push_back(zero(bytes * 8));
+          masks.push_back(zero(bytes));
+        }
+      }
+      if (anyWrite)
+        wrValid = comb::AndOp::create(b, region.state, anyWrite);
+      std::reverse(datas.begin(), datas.end());
+      std::reverse(masks.begin(), masks.end());
+      wrData = b.createOrFold<comb::ConcatOp>(datas);
+      wrMask = b.createOrFold<comb::ConcatOp>(masks);
+      Value data = readBuffer();
+      for (auto [lane, offset] : llvm::zip(vm.lanes, vm.laneOffset)) {
+        seq::FirMemReadOp read;
+        for (auto *user : lane->getUsers())
+          read = cast<seq::FirMemReadOp>(user);
+        unsigned width = lane.getType().getWidth();
+        Value slice = b.createOrFold<comb::ExtractOp>(intType(width), data, offset);
+        slice = b.createOrFold<hw::BitcastOp>(read.getData().getType(), slice);
+        read.getData().replaceAllUsesWith(slice);
+        replaced[read.getData()] = slice;
+        read.erase();
+      }
+      for (auto lane : llvm::drop_begin(vm.lanes))
+        lane.erase();
+    }
     for (auto *user : llvm::make_early_inc_range(memory->getUsers())) {
       if (auto write = dyn_cast<seq::FirMemWriteOp>(user)) {
         wrValid = region.state;
@@ -3628,30 +3856,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       if (read.getEnable())
         rdValid = comb::AndOp::create(b, rdValid, read.getEnable());
       rdRow = widen(read.getAddress(), vm.rowWidth);
-      auto readName = vm.name + "_rdata";
-      Value data;
-      if (threads == 1) {
-        auto nextEdge = edges.get(rspData.getType());
-        auto buffer = seq::FirRegOp::create(b, nextEdge, hostClock,
-                                            b.getStringAttr(readName));
-        nextEdge.setValue(comb::MuxOp::create(b, rspValid, rspData, buffer));
-        data = buffer;
-      } else {
-        auto bufferType =
-            seq::FirMemType::get(context, entries, vm.dataWidth, 1);
-        auto buffer = seq::FirMemOp::create(
-            b, bufferType, /*readLatency=*/0, /*writeLatency=*/1,
-            seq::RUW::Undefined, seq::WUW::Undefined,
-            b.getStringAttr(readName), hw::InnerSymAttr{},
-            seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
-        keepShallowInFlops(buffer);
-        seq::FirMemWriteOp::create(b, buffer, rspInst, hostClock, rspValid,
-                                   rspData, Value{});
-        Value bufferData = seq::FirMemReadOp::create(b, buffer, region.inst1,
-                                                     hostClock, one());
-        data = seq::FirRegOp::create(b, bufferData, hostClock,
-                                     b.getStringAttr(readName + "_read"));
-      }
+      Value data = readBuffer();
       data = b.createOrFold<hw::BitcastOp>(read.getData().getType(), data);
       read.getData().replaceAllUsesWith(data);
       replaced[read.getData()] = data;
@@ -3694,7 +3899,11 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     state.push_back({memory.getName().value_or("mem").str(), memory});
   llvm::stable_sort(state, [](auto &a, auto &c) { return a.first < c.first; });
 
+  // A virtual memory's later lanes go with its first.
+  DenseSet<Operation *> laneDone;
   for (auto &[stateName, op] : state) {
+    if (laneDone.contains(op))
+      continue;
     if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
       b.setLoc(reg.getLoc());
       auto width = hw::getBitWidth(reg.getType());
@@ -3826,7 +4035,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     auto memory = cast<seq::FirMemOp>(op);
     b.setLoc(memory.getLoc());
     if (auto it = virtualOf.find(memory); it != virtualOf.end()) {
-      virtualPorts[it->second] = buildVirtualMemory(memory, it->second);
+      auto &lanes = cls.virtualMemories[it->second].lanes;
+      for (auto lane : lanes)
+        laneDone.insert(lane);
+      virtualPorts[it->second] = buildVirtualMemory(lanes.front(), it->second);
       continue;
     }
     auto memType = memory.getType();
@@ -5743,7 +5955,7 @@ void FoldStaticPass::runOnOperation() {
   StaticFolder folder(top, netlist, simName, regionBits, report, copies,
                       nest, scheduleOnly, oneCycleLinks, overlapFrames,
                       modulo, interleaveCopies, zeroLatencyLinks, zeroLatencyChains,
-                      shortLead, bubbles, virtualMemories, stagedEnv,
+                      shortLead, bubbles, virtualMemories, vmemMergeLanes, stagedEnv,
                       specGroups, specDepth,
                       envSinks, registerStateEntries, slrGroups, slrSites,
                       slrCapacity, slrAssign, storage, readyLevels,

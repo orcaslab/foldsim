@@ -161,6 +161,8 @@ def frame_options(a):
         if re.search(r'[\s{}]', a.virtual_memories):
             sys.exit('--virtual-memories: a regex without spaces or braces')
         fold += f' virtual-memories={a.virtual_memories}'
+        if getattr(a, 'vmem_merge_lanes', False):
+            fold += ' vmem-merge-lanes'
     if a.unstaged_env:
         fold += ' staged-env=false'
     if getattr(a, 'register_state_entries', None) is not None:
@@ -301,6 +303,48 @@ def write_slr_groups(sv, path):
                     f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT fs_{g[len("foldsim_"):]} $c }}\n')
 
 
+def vmem_groups(vmems, choice):
+    """The kernel's controllers for --vmem-group (VMEM_INTERFACE.md, v6): a
+    class copy's virtual memories with the same instances, row size (bytes in
+    device memory) and read-during-write order share one, in port order, at
+    most N of them (or all, `copy`). Within a controller's image, member m's
+    rows follow the larger members': row r of instance i is the controller's
+    row GROW_m + r, so each member keeps its own image (the layout of a
+    controller of its own) at a byte offset of the controller's region. The
+    members are placed largest first, so GROW_m is a multiple of 2^AW_m and
+    GROW_m + r is GROW_m | r. Regions 4 KiB aligned; each memory's `base` is
+    its image's offset in the vmem space. Updates `vmems` in place."""
+    keys = {}
+    for k, v in enumerate(vmems):
+        keys.setdefault((v['class'], v['instances'], v['inst_width'], v['row_bytes'],
+                         v['read_first']), []).append(k)
+    cap = None if choice == 'copy' else int(choice)
+    groups, offset = [], 0
+    for members in keys.values():
+        for i in range(0, len(members), cap or len(members)):
+            ks = members[i:i + (cap or len(members))]
+            first = vmems[ks[0]]
+            grow = 0
+            for k in sorted(ks, key=lambda k: -vmems[k]['row_width']):
+                vmems[k]['group_row'] = grow
+                grow += 1 << vmems[k]['row_width']
+            # The controller's rows are whole bytes (a member's data is
+            # zero-extended to them).
+            dw = -(-max(vmems[k]['data_width'] for k in ks) // 8) * 8
+            g = {'members': ks, 'size': len(ks), 'class': first['class'],
+                 'inst_width': first['inst_width'], 'instances': first['instances'],
+                 'rows': grow, 'row_width': max(1, (grow - 1).bit_length()), 'data_width': dw,
+                 'mask_width': dw // 8 if any(vmems[k]['mask_width'] > 1 for k in ks) else 1,
+                 'read_first': first['read_first'], 'row_bytes': first['row_bytes'],
+                 'base': offset, 'bytes': grow * first['instances'] * first['row_bytes']}
+            for j, k in enumerate(ks):
+                vmems[k].update(group=len(groups), group_member=j,
+                                base=offset + vmems[k]['group_row'] * first['instances'] * first['row_bytes'])
+            groups.append(g)
+            offset += -(-g['bytes'] // 4096) * 4096
+    return groups
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('--srcs', required=True,
@@ -417,6 +461,16 @@ def main():
                          "of two), or `auto`: a sixteenth of the memory's rows, at least 256, "
                          "within --vmem-cache-budget; never more than the memory's rows. "
                          "Absent: the kernel's default (FOLDSIM_VMEM_CACHE_ROWS)")
+    ap.add_argument('--vmem-merge-lanes', action='store_true',
+                    help='with --virtual-memories: the arrays a front end split from one target RAM '
+                         '(byte lanes, ways: the same read address and enable, the same write '
+                         'address) are one virtual memory, each lane its own bytes of the row')
+    ap.add_argument('--vmem-group', metavar='copy|N',
+                    help="with --virtual-memories: one kernel controller (foldsim_vmem_group) for a "
+                         "class copy's virtual memories of the same row size and read-during-write "
+                         "order (copy), or for at most N of them; each memory keeps its own region "
+                         "within the controller's, and the simulator's ports are unchanged. "
+                         "Absent: a controller per memory")
     ap.add_argument('--vmem-cache-budget', type=float, default=VMEM_CACHE_BUDGET, metavar='RAMB36',
                     help='with --vmem-cache-rows auto: the block RAM all the host caches\' lines may '
                          'take, in RAMB36 (default %(default)g, 5%% of the V80 dynamic region\'s)')
@@ -646,6 +700,11 @@ def main():
         if a.vmem_cache_rows != 'auto' and not a.vmem_cache_rows.isdigit():
             sys.exit('--vmem-cache-rows: auto, 0 or a power of two of at least 2')
         vmem_cache_rows([], a.vmem_cache_rows, a.vmem_cache_budget)
+    if a.vmem_group is not None:
+        if not a.virtual_memories:
+            sys.exit('--vmem-group needs --virtual-memories')
+        if a.vmem_group != 'copy' and not (a.vmem_group.isdigit() and int(a.vmem_group) >= 1):
+            sys.exit('--vmem-group: copy, or the memories per controller (at least 1)')
     if a.storage and not a.static:
         sys.exit('--storage needs --static')
     if a.schedule_only and not a.static:
@@ -735,7 +794,20 @@ def main():
         v.update(row_bytes=row_bytes, base=offset, bytes=size)
         offset += -(-size // 4096) * 4096
     info['vmem_bytes'] = offset
-    if a.vmem_cache_rows is not None and info['vmem']:
+    if a.vmem_group is not None and info['vmem']:
+        info['vmem_groups'] = vmem_groups(info['vmem'], a.vmem_group)
+        info['vmem_bytes'] = sum(-(-g['bytes'] // 4096) * 4096 for g in info['vmem_groups'])
+        if a.vmem_cache_rows is not None:
+            pseudo = [{'instances': g['instances'] * g['rows'], 'row_width': 0,
+                       'data_width': g['data_width']} for g in info['vmem_groups']]
+            for g, n in zip(info['vmem_groups'], vmem_cache_rows(pseudo, a.vmem_cache_rows,
+                                                                 a.vmem_cache_budget)):
+                g['cache_rows'] = n
+        print('foldsim: vmem controllers: ' + ', '.join(
+            f'g{i} {"+".join(info["vmem"][k]["port"] for k in g["members"])}'
+            + (f' {g["cache_rows"]} lines' if 'cache_rows' in g else '')
+            for i, g in enumerate(info['vmem_groups'])), file=sys.stderr)
+    elif a.vmem_cache_rows is not None and info['vmem']:
         for v, n in zip(info['vmem'], vmem_cache_rows(info['vmem'], a.vmem_cache_rows,
                                                       a.vmem_cache_budget)):
             v['cache_rows'] = n
@@ -762,6 +834,20 @@ def main():
                 f.write(f'`define FOLDSIM_VMEM_{k}_BASE 64\'h{v["base"]:x}\n')
                 if 'cache_rows' in v:
                     f.write(f'`define FOLDSIM_VMEM_{k}_CACHE_ROWS {v["cache_rows"]}\n')
+                if 'group' in v:
+                    f.write(f'`define FOLDSIM_VMEM_{k}_GROUP {v["group"]}\n')
+                    f.write(f'`define FOLDSIM_VMEM_{k}_GROW {v["group_row"]}\n')
+            if 'vmem_groups' in info:
+                f.write(f'`define FOLDSIM_VMEM_GROUPS {len(info["vmem_groups"])}\n')
+                for g, v in enumerate(info['vmem_groups']):
+                    for key, d in (('N', 'size'), ('IW', 'inst_width'), ('AW', 'row_width'),
+                                   ('DW', 'data_width'), ('MW', 'mask_width'),
+                                   ('INSTANCES', 'instances')):
+                        f.write(f'`define FOLDSIM_VMEM_G{g}_{key} {v[d]}\n')
+                    f.write(f'`define FOLDSIM_VMEM_G{g}_RDWRF {int(v["read_first"])}\n')
+                    f.write(f'`define FOLDSIM_VMEM_G{g}_BASE 64\'h{v["base"]:x}\n')
+                    if 'cache_rows' in v:
+                        f.write(f'`define FOLDSIM_VMEM_G{g}_CACHE_ROWS {v["cache_rows"]}\n')
             f.write(f'`define FOLDSIM_VMEM_BYTES 64\'h{info["vmem_bytes"]:x}\n')
     print(f'foldsim: {", ".join(f"{k} x{v}" for k, v in info["threads"].items())}', file=sys.stderr)
 
