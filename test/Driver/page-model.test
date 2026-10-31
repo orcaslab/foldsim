@@ -1,0 +1,23 @@
+# Paged register state in the cost model (foldsim_storage.page_cost,
+# foldsim_degree.choose_pages): a copy's page RAM (instances x pages rows of
+# ceil(bits / p) bits), its 72-bit ports, the frame its state passes need and
+# the bits/ports bound; and --page auto's choice on a made-up class of 256
+# instances: none where the state fits unpaged, else the shortest frame at
+# which the paged state fits (p = 1 takes more block RAM than the device has,
+# p = 2 fits), also with storage auto. Schedule reports carry the page.
+# RUN: python3 %S/Inputs/page/model.py foldsim | FileCheck %s
+# Through the driver: the paged leaves (Inputs/paged) fit unpaged.
+# RUN: rm -rf %t && cd %S/Inputs/paged && foldsim --srcs top.f --top Top --out %t --static --page auto Leaf 2>&1 | FileCheck %s --check-prefix=AUTO
+# AUTO: foldsim: page none: II at least {{[0-9]+}} (unpaged {{[0-9]+}})
+# AUTO-NOT: pages Leaf
+# CHECK: p 1: rows 4 pw 100 ports 2 bram 1.5 ff 300 lut 0.0 frame 5 bound 4
+# CHECK: p 2: rows 8 pw 50 ports 1 bram 1 ff 250 lut 50.0 frame 8 bound 8
+# CHECK: p 3: rows 16 pw 34 ports 1 bram 0.5 ff 234 lut 34.0 frame 12 bound 8
+# CHECK: distributed None
+# CHECK: ultra 512 x 8: uram 7 ports 7 frame 4096
+# CHECK: small state: page '' frame 256 fits True
+# CHECK: unpaged: lutram 1668000 fits False
+# CHECK: p 1: bram 4167.0 ports 4167 lutram 0 fits False
+# CHECK: big state: page 'Lane:2' frame 512 fits True bram 2083.5 ports 2084 paged bits 76800000
+# CHECK: big state, storage auto: page 'Lane:2' frame 512 bram 2083.5 uram 0.0
+# CHECK: parsed 2 ('paged', False)

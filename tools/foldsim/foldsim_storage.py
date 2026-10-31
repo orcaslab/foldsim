@@ -19,8 +19,18 @@ register store reads combinationally, so it takes block or ultra RAM only
 read a host cycle early (foldsim-fold-static `storage`), which needs a state
 gap of 4; a memory read combinationally takes neither. Read ports beyond
 the kind's are copies of the RAM (each a write and a read), as Vivado builds
-them; write ports beyond the kind's would need slots of several host cycles
-(paging, not built), whose II floor is reported (`ii_floor`).
+them; write ports beyond the kind's would need slots of several host cycles,
+whose II floor is reported (`ii_floor`).
+
+Paged register state (foldsim-fold-static `page`, `page_cost`). A copy of
+`threads` instances whose registers page keeps them in one page RAM of
+pow2(threads) x pow2(p) rows of ceil(bits / p) bits (block or ultra RAM), a
+fetch buffer and a write-back buffer of `bits` flops each and the RAM's
+output register; the write-back's page select is about ceil(p / 3) LUTs a
+page bit. Its state passes are p host cycles apart, so the frame is at least
+p x threads (and p + 4). A RAM of P 72-bit ports moves 72 P bits a host
+cycle, so a copy's II is at least threads x ceil(bits / (72 P)) (`page_bound`):
+the bits/ports bound, which p x threads meets up to rounding.
 
 `assign` chooses a kind per store against the V80 dynamic region: first the
 cheapest kind of each store, pricing every resource by its share of the
@@ -263,6 +273,36 @@ def kind_cost(store, kind):
     else:
         c['uram'] = copies * n * uram(d, grain)
     return c
+
+
+def page_geometry(bits, threads, p):
+    """A paged copy's page RAM: rows, page width and 72-bit read ports."""
+    rows = (1 << (max(threads, 1) - 1).bit_length()) * (1 << (p - 1).bit_length())
+    pw = max(1, math.ceil(bits / p))
+    return rows, pw, math.ceil(pw / 72)
+
+
+def page_cost(bits, threads, p, kind):
+    """What a copy's paged register state costs in a kind (block or ultra):
+    as kind_cost, with `ii_floor` the frame its state passes need, and
+    `ports` the page RAM's 72-bit read ports. None for another kind."""
+    if kind not in ('block', 'ultra'):
+        return None
+    rows, pw, ports = page_geometry(bits, threads, p)
+    c = dict(lut=float(pw * math.ceil(p / 3)) if p > 1 else 0.0, lutram=0.0,
+             ff=2 * bits + pw, bram=0.0, uram=0, ii_floor=max(p * threads, p + 4),
+             ports=ports)
+    if kind == 'block':
+        c['bram'] = bram36(rows, pw)
+    else:
+        c['uram'] = uram(rows, pw)
+    return c
+
+
+def page_bound(bits, threads, ports):
+    """The frame a copy's register state needs through `ports` 72-bit ports,
+    read and written once an instance a frame."""
+    return threads * math.ceil(bits / (72 * max(ports, 1)))
 
 
 def sites(c):

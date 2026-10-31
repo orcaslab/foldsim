@@ -297,9 +297,19 @@ def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fi
     return res
 
 
+def paged_fields(paged):
+    """The paged register state of a point, for its row: bits (every
+    instance's), the flops of the fetch and write-back buffers, and the
+    page RAMs' 72-bit read ports."""
+    if not paged['bits']:
+        return {}
+    return dict(paged_bits=paged['bits'], paged_ff=paged['ff'], page_ports=paged['ports'])
+
+
 def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cache=0.0):
     logic = lutram = largest = 0.0
     bram = cache
+    paged = dict(bits=0, ff=0, ports=0)
     for c, n in classes.items():
         k = degree.get(c, 1)
         kappa, lam = factors(cal, c, est[c]['lut'])
@@ -310,6 +320,13 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
                 ('one' if t == 1 else 'lutram', False)
             lr, br = state_lutram(est[c], t, form)
             copy_logic = kappa * est[c]['lut'] + state_logic(cal, form, bypass, est[c]['ff'])
+            if form == 'paged':
+                pc = storage.page_cost(est[c]['ff'], t, info['page'], 'block')
+                copy_logic += pc['lut']
+                br += pc['bram']
+                paged['ff'] += pc['ff']
+                paged['ports'] += pc['ports']
+                paged['bits'] += est[c]['ff'] * t
             logic += copy_logic
             lutram += lam * lr
             bram += br
@@ -317,7 +334,8 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
     logic += rest
     sites, fits = placement(logic, lutram, bram)
     return dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
-                sites=round(sites), fits=fits, bram=round(bram, 1), largest_copy=round(largest))
+                sites=round(sites), fits=fits, bram=round(bram, 1), largest_copy=round(largest),
+                **paged_fields(paged))
 
 
 def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram=True,
@@ -331,6 +349,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     flops or ring) with a state gap of 4."""
     logic = rest
     units, copy_logic, base_lutram = [], {}, 0.0
+    paged = dict(bits=0, ff=0, ports=0)
     for c, n in classes.items():
         k = degree.get(c, 1)
         kappa, lam = factors(cal, c, est[c]['lut'])
@@ -344,6 +363,20 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             logic += cl
             copy_logic[(c, j)] = cl
             forms.append((j, t, form, info['gap'] if info else None))
+            if form == 'paged':
+                # A page RAM per paged copy: block or ultra, as the rest choose.
+                bits = est[c]['ff']
+                pcost = {kind: storage.page_cost(bits, t, info['page'], kind)
+                         for kind in ('block', 'ultra')}
+                # The frame its state passes need is the schedule's (`ii`).
+                pcost = {k: dict(v, lutram=0.0, ii_floor=0) for k, v in pcost.items()}
+                units.append(dict(costs=pcost,
+                                  per={k: [(j, v)] for k, v in pcost.items()}, count=1,
+                                  fixed=None, store='pages', default='block',
+                                  **{'class': c}))
+                paged['ff'] += pcost['block']['ff']
+                paged['ports'] += pcost['block']['ports']
+                paged['bits'] += bits * t
         deep = [f for f in forms if f[2] == 'lutram']
         regs_free = all(f[2] in ('lutram', 'one') for f in forms)
         for w, cnt in sorted(est[c]['regw'].items()):
@@ -391,7 +424,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             bram += c['bram']
             uram += c['uram']
             logic += c['lut']
-            floor = max(floor, c['ii_floor'])
+            if u['store'] != 'pages':
+                floor = max(floor, c['ii_floor'])
             per_copy[(u['class'], j)] += c['lut'] + c['lutram']
         u['kind'] = kind
     for c in classes:
@@ -400,7 +434,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     return dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
                 sites=round(sites), fits=fits, bram=round(bram, 1), uram=uram,
                 largest_copy=round(max(per_copy.values())), storage=','.join(rules),
-                **({'ii_floor': floor} if floor > ii else {}))
+                **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged))
 
 
 def unit(cls, store, per, lam, fixed):
@@ -440,7 +474,9 @@ def storage_rules(cls, units):
             current = kind
     for u in units:
         if not u['store'].startswith('regs>=') and not u['fixed'] and u['kind'] != u['default']:
-            rules.append(f"{cls}:{u['store']}={u['kind']}")
+            rule = f"{cls}:{u['store']}={u['kind']}"
+            if rule not in rules:
+                rules.append(rule)
     return rules
 
 
@@ -604,8 +640,10 @@ def parse_classes(text):
     for line in text.splitlines():
         m = re.match(r'^  (\S+) x(\d+)( \(ready pass\))?(?: state gap (\d+))?', line)
         if m:
+            page = re.search(r' page (\d+)', line)
             cur = out[m.group(1)] = dict(n=int(m.group(2)), ready=[], state=[],
-                                         gap=int(m.group(4)) if m.group(4) else None)
+                                         gap=int(m.group(4)) if m.group(4) else None,
+                                         page=int(page.group(1)) if page else 0)
             continue
         m = re.match(r'^    (ready|state): ([\d ]+)$', line)
         if m and cur is not None:
@@ -643,6 +681,10 @@ def state_form(threads, info, ii, entries):
     bypass = info is not None and info['gap'] is not None and info['gap'] < 3
     if threads == 1:
         return 'one', bypass
+    # Paged (foldsim-fold-static `page`): a page RAM, priced apart
+    # (foldsim_storage.page_cost).
+    if info is not None and info.get('page'):
+        return 'paged', False
     if threads <= entries:
         if info is not None and ring_order(info, ii):
             return 'ring', bypass
@@ -661,7 +703,8 @@ def state_form(threads, info, ii, entries):
 # instance's (0.42). Without the bypass a flop store's select is a 2:1 mux
 # (0.5, two to a LUT); distributed RAM's read port is the select (0).
 # Overridden by a calibration's 'state_logic'.
-STATE_LOGIC = dict(one=(0.0, 0.0), ring=(0.0, 0.42), flops=(0.5, 0.83), lutram=(0.0, 0.90))
+STATE_LOGIC = dict(one=(0.0, 0.0), ring=(0.0, 0.42), flops=(0.5, 0.83), lutram=(0.0, 0.90),
+                   paged=(0.0, 0.0))
 
 
 def state_logic(cal, form, bypass, bits):
@@ -826,6 +869,69 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
                 unfolded=unfolded, firesim=firesim_area(cal, unfolded), depth=depth, fit=fit,
                 space=space, store=store, route=route, uram=uram, slr_groups=slr_groups,
                 vmems=sum(len(e.get('vmems', [])) for e in est.values()))
+
+
+def copy_estimates(est, classes):
+    """`est` (class_estimates of the models' class names) keyed by every
+    class of a schedule, a copy (`<class>_copy<j>`) taking its class's."""
+    return {c: est[re.sub(r'_copy\d+$', '', c)] for c in classes}
+
+
+def page_choice(classes, sched, ii):
+    """--page auto at a frame of `ii`: each copy of several instances paged
+    as deep as the frame lets its state passes (p x instances <= ii, and
+    p + 4 <= ii), per model the shallowest of its copies'; {model: p}."""
+    pages = {}
+    for c, n in classes.items():
+        if n < 2:
+            continue
+        p = min(ii // n, ii - 4)
+        if p < 1:
+            return None
+        m = re.sub(r'_copy\d+$', '', c)
+        pages[m] = min(pages.get(m, p), p)
+    return pages
+
+
+def with_pages(sched, pages):
+    """A schedule's classes (parse_classes) with each copy's page set."""
+    return {c: dict(info, page=pages.get(re.sub(r'_copy\d+$', '', c), 0) if info['n'] > 1 else 0)
+            for c, info in sched.items()}
+
+
+def choose_pages(cal, est, classes, sched, ii, store='fixed', route=False, entries=2,
+                 max_ii=1 << 16):
+    """--page auto: the paging of a schedule's copies that fits the V80
+    region at the shortest frame. Unpaged first (no page RAM if the state
+    fits as it is); else each frame from `ii` up at which some copy's page
+    may deepen (a multiple of its instances), every copy of several
+    instances paged as deep as that frame lets it (fewest ports: its page
+    word ceil(bits / p) over p host cycles; no distributed RAM for its
+    registers), until one fits (and routes, with `route`). Returns (the
+    `page` option, or '' unpaged, or None if no frame fits; the frame it
+    is priced at, which the paged schedule may still lengthen; the area)."""
+    est = copy_estimates(est, classes)
+    rest = rest_of(cal, sum(e['lut'] for e in {id(e): e for e in est.values()}.values()))
+
+    def ok(res):
+        return res['fits'] and (not route or res.get('routes', True))
+    res = area(cal, est, classes, {}, rest, sched, ii, entries, store, route)
+    if ok(res):
+        return '', ii, res
+    deep = sorted({n for n in classes.values() if n > 1})
+    frames = sorted({f for n in deep for f in range(n * ((ii + n - 1) // n), max_ii + 1, n)} | {ii})
+    last = None
+    for f in frames:
+        if f < ii:
+            continue
+        pages = page_choice(classes, sched, f)
+        if pages is None or pages == last:
+            continue
+        last = pages
+        res = area(cal, est, classes, {}, rest, with_pages(sched, pages), f, entries, store, route)
+        if ok(res):
+            return ','.join(f'{m}:{p}' for m, p in sorted(pages.items())), f, res
+    return None, None, None
 
 
 def table(result):

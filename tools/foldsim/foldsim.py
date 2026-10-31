@@ -171,7 +171,7 @@ def frame_options(a):
         fold += f' forward-after-levels={a.forward_after_levels}'
     if getattr(a, 'no_share_link_writes', False):
         fold += ' share-link-writes=false'
-    if getattr(a, 'page', ''):
+    if getattr(a, 'page', '') and a.page != 'auto':
         fold += f' page={page_option(a.page)}'
     return fold
 
@@ -179,6 +179,8 @@ def frame_options(a):
 def page_option(spec):
     """fold-static's `page` of --page: a count pages every model's copies,
     else <model>:<p>,... as given."""
+    if spec == 'auto':
+        return spec
     if re.fullmatch(r'\d+', spec):
         return f'*:{spec}'
     if not re.fullmatch(r'[\w$*]+:\d+(,[\w$*]+:\d+)*', spec):
@@ -265,6 +267,44 @@ def choose_copies(a, foldsim_opt, flat, passes, out):
           f"{timing} ({os.path.basename(path) if cal else 'uncalibrated'})"
           + (f"; storage: {len(rules.split(','))} rules" if rules else ''), file=sys.stderr)
     return ('' if pick['copies'] == '-' else pick['copies']), rules
+
+
+def choose_pages(a, foldsim_opt, flat, passes, out, fold):
+    """--page auto: the paging that fits the V80 region at the shortest
+    frame (foldsim_degree.choose_pages), priced on a schedule of the fold
+    without paging; the `page` option, '' for none."""
+    import foldsim_degree
+    models = out('models.mlir')
+    if not os.path.exists(models):
+        run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
+             '-o', models])
+    base = out('schedule_page_base.txt')
+    plain = fold.replace(f' report={out("schedule.txt")}', '')
+    r = subprocess.run([foldsim_opt, models, NO_OP_DUMP, f'--pass-pipeline=builtin.module('
+                        f'foldsim-fold-static{{{plain} report={base} schedule-only}})',
+                        '-o', os.devnull], capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(r.stderr)
+    text = open(base).read()
+    ii, classes, _ = foldsim_degree.parse_schedule(text)
+    path = a.degree_calibration or DEGREE_CALIBRATION
+    cal = json.load(open(path)) if path != 'none' and os.path.exists(path) else None
+    names = sorted({re.sub(r'_copy\d+$', '', c) for c in classes})
+    est = foldsim_degree.class_estimates(models, names)
+    m = re.search(r'virtual-memories=(\S+)', fold)
+    est = foldsim_degree.split_virtual(est, m.group(1) if m else '')
+    entries = a.register_state_entries if a.register_state_entries is not None else 2
+    spec, frame, res = foldsim_degree.choose_pages(
+        cal, est, classes, foldsim_degree.parse_classes(text), ii,
+        store='auto' if a.storage == 'auto' else 'fixed', route=a.routability, entries=entries)
+    if spec is None:
+        sys.exit(f'--page auto: no paging fits the V80 region (unpaged II {ii}); '
+                 f'see {base}')
+    print(f"foldsim: page {spec or 'none'}: II at least {frame} (unpaged {ii}), about "
+          f"{res['luts']} LUTs, {res['bram']} RAMB36"
+          + (f", {res['uram']} URAM" if 'uram' in res else '')
+          + (f", {res['page_ports']} page ports" if 'page_ports' in res else ''), file=sys.stderr)
+    return spec
 
 
 def slr_options(a, foldsim_opt, models, fold, out):
@@ -440,7 +480,9 @@ def main():
                     help="with --static: write each reader's link from the producer's bits in the "
                          'pass, not a host cycle late from one register of them (foldsim-fold-static)')
     ap.add_argument('--page', default='', metavar='P|MODEL:P,...',
-                    help='with --static: paged register state (foldsim-fold-static page): a '
+                    help='with --static: paged register state (foldsim-fold-static page), or auto: the '
+                         'paging that fits the V80 region at the shortest frame (foldsim_degree.py '
+                         'choose_pages). A '
                          "copy of several instances keeps its registers in a page RAM per "
                          'region and moves an instance\'s state in and out P host cycles at a '
                          'time, double-buffered; a count pages every model, else per model')
@@ -700,6 +742,10 @@ def main():
         if a.nest:
             fold += ' nest'
         fold += frame_options(a)
+        if a.page == 'auto':
+            spec = choose_pages(a, foldsim_opt, flat, passes, out, fold)
+            if spec:
+                fold += f' page={spec}'
         if a.slr_groups:
             if a.copies != 'auto':
                 run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
