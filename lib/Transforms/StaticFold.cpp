@@ -34,6 +34,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
+#include <numeric>
 #include <set>
 
 namespace foldsim {
@@ -264,6 +265,17 @@ private:
   unsigned ii = 0;
   SmallVector<int> outputSlot;
   SmallVector<bool> outputEarly;
+  /// The evaluations of the last cycle `place` found, for the error and the
+  /// search for ready passes.
+  std::string lastCycle;
+  SmallVector<Node> lastCycleNodes;
+  /// Late outputs written at their class's state pass even with a ready
+  /// pass: what the search for ready passes moved out of a cycle.
+  DenseSet<unsigned> stateOnly;
+  /// The outputs written at the ready pass of the k-th evaluation of a cycle
+  /// that read the evaluation before it: what moving to the state pass cuts.
+  SmallVector<unsigned> readersOf(ArrayRef<Node> cycle, unsigned k,
+                                  ArrayRef<bool> atReady);
 };
 
 } // namespace
@@ -930,7 +942,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
   // outputs written at ready passes.
   atReady.assign(producers.size(), false);
   for (auto [p, producer] : llvm::enumerate(producers))
-    if (producer.cls >= 0 && producer.late && ready[producer.cls])
+    if (producer.cls >= 0 && producer.late && ready[producer.cls] &&
+        !stateOnly.contains(p))
       atReady[p] = true;
   auto inputAtFrameStart = [&](unsigned c, unsigned input) {
     int k = classes[c].consumerOf[input];
@@ -1008,13 +1021,30 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
   for (unsigned n = 0; n < nodes.size(); ++n)
     for (auto [p, latency] : preds[n])
       succs[p].push_back({n, latency});
-  SmallVector<unsigned> order;
+  SmallVector<unsigned> order, stack;
   bool cyclic = false;
   std::function<void(unsigned)> dfs = [&](unsigned n) {
     state[n] = 1;
+    stack.push_back(n);
     int h = 0;
     for (auto [s, latency] : succs[n]) {
       if (state[s] == 1) {
+        if (!cyclic) {
+          // The first cycle, for the error and the search: its evaluations
+          // in order.
+          lastCycleNodes.clear();
+          for (auto it = llvm::find(stack, s); it != stack.end(); ++it)
+            lastCycleNodes.push_back(nodes[*it]);
+          lastCycle.clear();
+          llvm::raw_string_ostream os(lastCycle);
+          auto at = llvm::find(stack, s);
+          for (auto it = at; it != stack.end(); ++it)
+            os << (it == at ? "" : " -> ") << classes[nodes[*it].cls].name
+               << "[" << nodes[*it].inst << "]"
+               << (nodes[*it].pass == kReady ? " ready" : "");
+          os << " -> " << classes[nodes[s].cls].name << "[" << nodes[s].inst
+             << "]";
+        }
         cyclic = true;
         continue;
       }
@@ -1024,6 +1054,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     }
     height[n] = h;
     state[n] = 2;
+    stack.pop_back();
     order.push_back(n);
   };
   for (unsigned n = 0; n < nodes.size(); ++n)
@@ -1169,6 +1200,35 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     outputEarly = aloneEarly;
   }
   return length;
+}
+
+SmallVector<unsigned> StaticFolder::readersOf(ArrayRef<Node> cycle, unsigned k,
+                                              ArrayRef<bool> atReady) {
+  SmallVector<unsigned> moved;
+  auto &q = cycle[k];
+  auto &p = cycle[(k + cycle.size() - 1) % cycle.size()];
+  if (q.pass != kReady)
+    return moved;
+  // q's ready pass waits for p: the outputs it writes that read p's class.
+  auto &cls = classes[q.cls];
+  for (auto [o, late] : llvm::enumerate(cls.late)) {
+    unsigned out = cls.producerOf[o];
+    if (!late || !atReady[out] || stateOnly.contains(out))
+      continue;
+    bool reads = false;
+    for (auto input : cls.deps[o].set_bits()) {
+      int c = cls.consumerOf[input];
+      if (c < 0)
+        continue;
+      for (auto &piece : consumers[c].pieces[q.inst])
+        reads |= piece.producer >= 0 &&
+                 producers[piece.producer].cls == int(p.cls) &&
+                 producers[piece.producer].late;
+    }
+    if (reads)
+      moved.push_back(out);
+  }
+  return moved;
 }
 
 unsigned StaticFolder::placeModulo(
@@ -1372,7 +1432,10 @@ LogicalResult StaticFolder::schedule() {
   // so every choice is placed and the shortest frame kept. Copies multiply
   // the classes: past a dozen, every choice of the models is placed with the
   // copies of a model alike, then single classes are flipped while the frame
-  // gets shorter.
+  // gets shorter. Past a dozen models (a crossbar's port arbiters as classes
+  // of their own, say), the search starts from no ready pass and from a ready
+  // pass for every model instead, with up to two models flipped until one
+  // places, and flips from there while the frame gets shorter.
   auto late = [](const Class &cls) {
     return llvm::any_of(cls.late, [](bool late) { return late; });
   };
@@ -1384,21 +1447,18 @@ LogicalResult StaticFolder::schedule() {
   if (alike)
     llvm::erase_if(candidates,
                    [&](unsigned c) { return classes[c].splitFrom >= 0; });
-  if (candidates.size() > 12)
-    return netlist.emitError("too many models with late outputs to choose "
-                             "their ready passes: ")
-           << candidates.size();
+  bool greedy = candidates.size() > 12;
   unsigned best = 0;
   SmallVector<bool> bestReady;
   SmallVector<SmallVector<int>> bestSlots;
   SmallVector<bool> bestAtReady;
   SmallVector<int> bestOutputSlot;
   SmallVector<bool> bestOutputEarly;
-  auto tryReady = [&](const SmallVector<bool> &ready) {
+  auto tryReady = [&](const SmallVector<bool> &ready, bool orEqual = false) {
     SmallVector<SmallVector<int>> slots;
     SmallVector<bool> atReady;
     unsigned length = place(ready, slots, atReady);
-    if (!length || (best && length >= best))
+    if (!length || (best && (orEqual ? length > best : length >= best)))
       return false;
     best = length;
     bestReady = ready;
@@ -1408,17 +1468,82 @@ LogicalResult StaticFolder::schedule() {
     bestOutputEarly = outputEarly;
     return true;
   };
-  for (uint64_t mask = 0; mask < (uint64_t(1) << candidates.size()); ++mask) {
+  // The choice of a ready pass for candidate k: bit k of `mask`, flipped for
+  // the candidates in `flips`.
+  auto choose = [&](uint64_t mask, ArrayRef<unsigned> flips = {}) {
     SmallVector<bool> ready(classes.size(), false);
     for (auto [k, c] : llvm::enumerate(candidates))
-      ready[c] = (mask >> k) & 1;
+      ready[c] = (k < 64 ? (mask >> k) & 1 : mask == ~uint64_t(0)) ^
+                 llvm::is_contained(flips, unsigned(k));
     if (alike)
       for (auto [c, cls] : llvm::enumerate(classes))
         if (cls.splitFrom >= 0)
           ready[c] = ready[cls.splitFrom];
     tryReady(ready);
+  };
+  if (greedy) {
+    // No ready pass, a ready pass for every model, then those with one or two
+    // models flipped, until a choice places.
+    unsigned n = candidates.size();
+    for (uint64_t seed : {uint64_t(0), ~uint64_t(0)})
+      choose(seed);
+    for (uint64_t seed : {~uint64_t(0), uint64_t(0)})
+      for (unsigned k = 0; k < n && !best; ++k)
+        choose(seed, {k});
+    for (uint64_t seed : {~uint64_t(0), uint64_t(0)})
+      for (unsigned k = 0; k < n && !best; ++k)
+        for (unsigned j = k + 1; j < n && !best; ++j)
+          choose(seed, {k, j});
+  } else {
+    for (uint64_t mask = 0; mask < (uint64_t(1) << candidates.size()); ++mask)
+      choose(mask);
   }
-  for (bool shorter = alike && best; shorter;) {
+  // Every late output a ready pass can compute is written there, which can
+  // make a ready pass both feed a class and read it (a crossbar's port
+  // arbiter between its parent's request and ready logic). Then, from a ready
+  // pass for every model, the outputs that close the cycle found are moved
+  // to their state pass, one cycle at a time, until a choice places.
+  if (!best) {
+    SmallVector<bool> ready(classes.size(), false);
+    for (auto c : candidates)
+      ready[c] = true;
+    if (alike)
+      for (auto [c, cls] : llvm::enumerate(classes))
+        if (cls.splitFrom >= 0)
+          ready[c] = ready[cls.splitFrom];
+    // Depth first over the cycles' edges, a parent's ready pass first, within
+    // a budget of placements.
+    unsigned budget = 256;
+    std::function<bool()> attempt = [&]() {
+      if (!budget--)
+        return false;
+      SmallVector<SmallVector<int>> slots;
+      SmallVector<bool> atReady;
+      if (place(ready, slots, atReady))
+        return tryReady(ready);
+      auto cycle = lastCycleNodes;
+      SmallVector<unsigned> order(cycle.size());
+      std::iota(order.begin(), order.end(), 0);
+      llvm::stable_sort(order, [&](unsigned x, unsigned y) {
+        return classes[cycle[x].cls].depth < classes[cycle[y].cls].depth;
+      });
+      for (auto k : order) {
+        auto moved = readersOf(cycle, k, atReady);
+        if (moved.empty())
+          continue;
+        for (auto out : moved)
+          stateOnly.insert(out);
+        if (attempt())
+          return true;
+        for (auto out : moved)
+          stateOnly.erase(out);
+      }
+      return false;
+    };
+    attempt();
+    greedy = true;
+  }
+  for (bool shorter = (alike || greedy) && best; shorter;) {
     shorter = false;
     for (auto [c, cls] : llvm::enumerate(classes)) {
       if (!late(cls))
@@ -1427,10 +1552,25 @@ LogicalResult StaticFolder::schedule() {
       ready[c] = !ready[c];
       shorter |= tryReady(ready);
     }
+    // Past a dozen models, also a model with all its copies; and a model's
+    // ready pass dropped where the frame is no longer, so that the frame can
+    // shorten once the passes that set it are gone.
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      if (!greedy || !late(cls) || cls.splitFrom >= 0)
+        continue;
+      auto ready = bestReady;
+      for (auto [d, other] : llvm::enumerate(classes))
+        if (d == c || other.splitFrom == int(c))
+          ready[d] = !bestReady[c];
+      unsigned before = best;
+      if (tryReady(ready, /*orEqual=*/!ready[c]))
+        shorter |= best < before || !ready[c];
+    }
   }
   if (!best)
     return netlist.emitError("the evaluations of a frame depend on each other "
-                             "in a cycle for every choice of ready passes");
+                             "in a cycle for every choice of ready passes")
+           << (lastCycle.empty() ? "" : " (last tried: " + lastCycle + ")");
   ii = best;
   outputSlot = bestOutputSlot;
   outputEarly = bestOutputEarly;
@@ -1493,7 +1633,8 @@ LogicalResult StaticFolder::schedule() {
       if (!late || !producer.read)
         continue;
       os << "    late " << cls.outputNames[o]
-         << (producer.atReady ? " @ready" : " @state") << " <-";
+         << (producer.atReady ? " @ready" : " @state")
+         << (stateOnly.contains(cls.producerOf[o]) ? " (moved)" : "") << " <-";
       for (auto input : cls.deps[o].set_bits())
         os << " " << cls.inputNames[input];
       os << "\n";
