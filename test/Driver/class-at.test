@@ -38,3 +38,18 @@
 # NONE: class-at leaf: leaf (Leaf_0) x1
 # RUN: not foldsim --srcs %S/Inputs/class-at/top.f --top Top --out %t/bad --class-at 'Pair@p' 2>&1 | FileCheck %s --check-prefix=BAD
 # BAD: --class-at Pair: a module of the design has that name
+
+# Inside a class of several instances: every `Pair` needs the same change (its
+# `l1` a class), so both share the one module `Pair`, still one class of two
+# instances with a nested class, rather than `p`'s and `q`'s copies of it.
+# RUN: rm -rf %t && cd %S/Inputs/class-at && foldsim --srcs top.f --top Top --out %t --static --class-at 'leaf@*.l1' Pair 2>&1 | FileCheck %s --check-prefix=NESTED
+# RUN: FileCheck %s --check-prefix=NESTED-IR < %t/design.mlir
+# NESTED: class-at leaf: leaf (Leaf) x2
+# NESTED: foldsim: Pair_model x2, leaf x2, Top_model x1
+# NESTED-IR-NOT: __at
+# NESTED-IR-LABEL: hw.module private @Pair(
+# NESTED-IR: hw.instance "l0" @Leaf(
+# NESTED-IR: hw.instance "l1" @leaf(
+# NESTED-IR-LABEL: hw.module @Top(
+# NESTED-IR: hw.instance "p" @Pair(
+# NESTED-IR: hw.instance "q" @Pair(

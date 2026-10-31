@@ -110,35 +110,72 @@ def class_at(text, top, specs):
         return [(i - s, m.group(1), m.group(3)) for i in range(s, e)
                 for m in [INSTANCE.search(lines[i])] if m]
     body = {m: instances(m) for m in span}
-    refs = {m: 0 for m in span}
-    for m in span:
-        for _, _, c in body[m]:
-            if c in refs:
-                refs[c] += 1
-    # Every matched instance, as the path of (relative line) of each instance
-    # op from the top; the search descends only below unmatched instances.
-    matched = []
+    # Every instance walked from the top, the search descending only below
+    # unmatched instances. What a module's instance needs changed below it is
+    # its variant: the (relative line, new callee) pairs of its instance ops,
+    # a matched one becoming its tag's class and an unmatched one a variant of
+    # its own module. Instances of a module that need the same variant share
+    # one module (the instances of a class with several instances, say a
+    # crossbar inside each core), so that a module is copied only for another
+    # variant or where an instance of it keeps it unchanged.
+    variant_id = {}         # (module, changes) -> variant number
+    variants = {}           # module -> [changes], in the order first met
+    kept = set()            # modules some instance keeps unchanged
+    leaves = []             # (tag, leaf module), every matched instance
     sys.setrecursionlimit(max(10000, sys.getrecursionlimit()))
 
-    def walk(mod, path, edges):
+    def walk(mod, path):
+        changes = []
         for rel, name, callee in body[mod]:
             p = f'{path}.{name}' if path else name
             tag = next((t for t, g in specs if fnmatch.fnmatchcase(p, g)), None)
             if tag:
-                matched.append((tag, edges + (rel,), callee))
+                leaves.append((tag, callee))
+                changes.append((rel, ('class', tag, callee)))
             elif callee in body:
-                walk(callee, p, edges + (rel,))
-    walk(top, '', ())
+                v = walk(callee, p)
+                if v is None:
+                    kept.add(callee)
+                else:
+                    changes.append((rel, ('mod', callee, v)))
+        if not changes:
+            return None
+        key = (mod, tuple(changes))
+        if key not in variant_id:
+            variant_id[key] = len(variants.setdefault(mod, []))
+            variants[mod].append(key[1])
+        return variant_id[key]
+    walk(top, '')
     # A glob a configuration has no instance for is not an error: one class
     # list serves configurations whose crossbars take different forms.
     for t, g in specs:
-        if all(m[0] != t for m in matched):
+        if all(tag != t for tag, _ in leaves):
             print(f'class-at {t}: no instance matches {g}', file=sys.stderr)
+    # Each parameter set a module of its own, named after the tag.
+    groups = {}
+    for tag, leaf in leaves:
+        groups.setdefault(tag, [])
+        if leaf not in groups[tag]:
+            groups[tag].append(leaf)
+    name = {(t, l): t if len(ls) == 1 else f'{t}_{k}'
+            for t, ls in groups.items() for k, l in enumerate(ls)}
+    for (tag, leaf), new in name.items():
+        if new in span:
+            sys.exit(f'--class-at {tag}: a module of the design is named {new}')
 
-    def retarget(mod, rel, new):
-        i = span[mod][0] + rel
-        m = INSTANCE.search(lines[i])
-        lines[i] = lines[i][:m.start(3)] + new + lines[i][m.end(3):]
+    # A variant's module: the module itself when no instance keeps it and it
+    # is its first variant, a copy `<module>__at<k>` otherwise, numbered in the
+    # order the walk finished them.
+    vname, copies = {}, 0
+    for (mod, _), v in variant_id.items():
+        if v == 0 and mod not in kept:
+            vname[(mod, v)] = mod
+        else:
+            vname[(mod, v)] = f'{mod}__at{copies}'
+            copies += 1
+    for (mod, _), new in vname.items():
+        if new != mod and new in span:
+            sys.exit(f'--class-at: a module of the design is named {new}')
 
     end = max(i for i, line in enumerate(lines) if line == '}')
 
@@ -150,49 +187,25 @@ def class_at(text, top, specs):
         span[new] = [end, end + e - s]
         lines[end:end] = text
         end += len(text)
-        body[new] = body[mod]
-        refs[new] = 0
-        for _, _, c in body[mod]:
-            if c in refs:
-                refs[c] += 1
 
-    # Each module on a matched path made the path's own, top down.
-    owned, copies = {}, 0
-    leaves = []
-    for tag, edges, leaf in matched:
-        cur = top
-        for rel in edges[:-1]:
-            if (cur, rel) not in owned:
-                callee = INSTANCE.search(lines[span[cur][0] + rel]).group(3)
-                if refs[callee] > 1:
-                    new = f'{callee}__at{copies}'
-                    copies += 1
-                    copy(callee, new)
-                    refs[callee] -= 1
-                    refs[new] += 1
-                    retarget(cur, rel, new)
-                    callee = new
-                owned[(cur, rel)] = callee
-            cur = owned[(cur, rel)]
-        leaves.append((tag, cur, edges[-1], leaf))
-    # Each parameter set a module of its own, named after the tag.
-    groups = {}
-    for tag, _, _, leaf in leaves:
-        groups.setdefault(tag, [])
-        if leaf not in groups[tag]:
-            groups[tag].append(leaf)
-    name = {(t, l): t if len(ls) == 1 else f'{t}_{k}'
-            for t, ls in groups.items() for k, l in enumerate(ls)}
+    # Copies first, from the modules as they were; then each variant's
+    # instance ops pointed at their new callees.
+    for (mod, v), new in vname.items():
+        if new != mod:
+            copy(mod, new)
     for (tag, leaf), new in name.items():
-        if new in span:
-            sys.exit(f'--class-at {tag}: a module of the design is named {new}')
         copy(leaf, new)
-    for tag, mod, rel, leaf in leaves:
-        refs[leaf] -= 1
-        refs[name[(tag, leaf)]] += 1
-        retarget(mod, rel, name[(tag, leaf)])
+
+    def retarget(mod, rel, new):
+        i = span[mod][0] + rel
+        m = INSTANCE.search(lines[i])
+        lines[i] = lines[i][:m.start(3)] + new + lines[i][m.end(3):]
+
+    for (mod, v), new in vname.items():
+        for rel, (kind, a1, a2) in variants[mod][v]:
+            retarget(new, rel, name[(a1, a2)] if kind == 'class' else vname[(a1, a2)])
     for (tag, leaf), new in name.items():
-        n = sum(1 for t, _, _, l in leaves if (t, l) == (tag, leaf))
+        n = sum(1 for t, l in leaves if (t, l) == (tag, leaf))
         print(f'class-at {tag}: {new} ({leaf}) x{n}', file=sys.stderr)
     return '\n'.join(lines), list(name.values())
 
