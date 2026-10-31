@@ -818,6 +818,13 @@ def main():
                          'read address with its enable low) is not issued unless its row was written '
                          'since the instance last read it; the instance keeps its read data (exact). '
                          "Its requests leave a host cycle after the pass, from registers (room 12)")
+    ap.add_argument('--retime-memory-reads', metavar='MIN_BITS', type=int,
+                    help="memories of at least MIN_BITS bits without a ram_style hint, read "
+                         'asynchronously at an address that is a function of registers alone (a '
+                         "queue's head, a buffer's tail), read through a register instead: a target "
+                         'cycle early, at the address\'s next value, reading new data (circt-opt '
+                         'seq-retime-firmem-reads mode=auto). Exact; such a memory may then be '
+                         'virtual (--virtual-memories) or in block RAM')
     ap.add_argument('--vmem-group', metavar='copy|N|auto[:M]',
                     help="with --virtual-memories: one kernel controller (foldsim_vmem_group) for a "
                          "class copy's virtual memories of the same row size and read-during-write "
@@ -1022,7 +1029,8 @@ def main():
     # A RAM that asks for block RAM reads synchronously once its wrapper is
     # flattened into the module that registers its address.
     run([tool('circt-opt'), flat + '.in', '--symbol-dce', '--hw-flatten-modules', '--symbol-dce',
-         '--canonicalize', '--cse', f'--seq-retime-firmem-reads=report={out("memories.rpt")}',
+         '--canonicalize', '--cse', f'--seq-retime-firmem-reads=report={out("memories.rpt")}'
+         + (f' mode=auto min-bits={a.retime_memory_reads}' if a.retime_memory_reads is not None else ''),
          '--canonicalize', '--cse', '-o', flat])
     os.remove(flat + '.in')
     text = open(flat).read()
