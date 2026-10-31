@@ -24,6 +24,11 @@
 // DENSE: %a_writeback = seq.firreg [[AN:%.+]] clock %hostClock : i8
 // DENSE: [[AN]] = comb.mux %region0_state, [[AH:%.+]], %a_writeback : i8
 // DENSE: %region1_pages = seq.firmem 1, 1, old, undefined {{.*}} : <8 x 17, mask 1>
+// At p = 5 a page is one byte: a memory of mask width 1 has no mask, so the
+// byte's enable is anded into the write's enable.
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:5})' 2>&1 | FileCheck %s --check-prefix=ONE
+// ONE: pages Leaf: p 5, 5 registers, 33 bits (44 in 9-bit bytes, 2 enables); page RAMs 32 rows x 9 bits in 1 columns
+// ONE: seq.firmem.write_port %region1_pages[{{%.+}}] = {{%.+}}, clock %hostClock enable {{%[^ ]+}} : <32 x 9, mask 1>
 module {
   hw.module @Leaf(in %clk : !seq.clock, in %d : i8, out q : i8) {
     %c1 = hw.constant 1 : i8

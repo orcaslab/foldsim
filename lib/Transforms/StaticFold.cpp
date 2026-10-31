@@ -4976,6 +4976,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         pageRequests.push_back({col.vm, col.requests});
         continue;
       }
+      // A column of one byte has a memory of mask width 1, which is no
+      // mask (lowering ignores it): its byte's enable is the write's.
+      if (writeMask && bytes == 1) {
+        writeEnable = comb::AndOp::create(b, writeEnable, writeMask);
+        writeMask = Value();
+      }
       seq::FirMemWriteOp::create(b, col.memory, col.writeAt, hostClock,
                                  writeEnable, writeData, writeMask);
     }
