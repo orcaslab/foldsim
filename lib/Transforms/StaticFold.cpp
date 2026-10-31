@@ -7663,11 +7663,19 @@ LogicalResult StaticFolder::buildSim() {
                         name + "_copy1"),
                 name + "_copy0");
             // Clock enables, as the flops take them: no select on the
-            // producer's path into the first register.
-            Value stageA = seq::CompRegClockEnabledOp::create(
-                b, data, hostClock, write, b.getStringAttr(name + "_staged"));
-            Value stageB = seq::CompRegClockEnabledOp::create(
-                b, stageA, hostClock, copy, b.getStringAttr(name + "_held"));
+            // producer's path into the first register. Named like the other
+            // link registers, without an inner symbol: the names repeat
+            // where one producer port feeds several instances of a reader
+            // (a bit each), which symbols may not.
+            auto enabledReg = [&](Value next, Value enable,
+                                  const Twine &regName) -> Value {
+              return seq::CompRegClockEnabledOp::create(
+                  b, next.getType(), next, hostClock, enable,
+                  b.getStringAttr(regName), Value(), Value(), Value(),
+                  hw::InnerSymAttr{});
+            };
+            Value stageA = enabledReg(data, write, name + "_staged");
+            Value stageB = enabledReg(stageA, copy, name + "_held");
             sourceData[index] = stageB;
             continue;
           }
