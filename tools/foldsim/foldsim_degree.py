@@ -303,13 +303,17 @@ def paged_fields(paged):
     page RAMs' 72-bit read ports."""
     if not paged['bits']:
         return {}
-    return dict(paged_bits=paged['bits'], paged_ff=paged['ff'], page_ports=paged['ports'])
+    out = dict(paged_bits=paged['bits'], paged_ff=paged['ff'], page_ports=paged['ports'])
+    if paged.get('hbm'):
+        out.update(hbm_bytes=paged['hbm'],
+                   hbm_ii=math.ceil(paged['hbm'] / storage.HBM_BYTES_PER_CYCLE))
+    return out
 
 
 def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cache=0.0):
     logic = lutram = largest = 0.0
     bram = cache
-    paged = dict(bits=0, ff=0, ports=0)
+    paged = dict(bits=0, ff=0, ports=0, hbm=0)
     for c, n in classes.items():
         k = degree.get(c, 1)
         kappa, lam = factors(cal, c, est[c]['lut'])
@@ -321,12 +325,14 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
             lr, br = state_lutram(est[c], t, form)
             copy_logic = kappa * est[c]['lut'] + state_logic(cal, form, bypass, est[c]['ff'])
             if form == 'paged':
-                pc = storage.page_cost(est[c]['ff'], t, info['page'], 'block')
+                pc = storage.page_cost(est[c]['ff'], t, info['page'],
+                                       'hbm' if info.get('offchip') else 'block')
                 copy_logic += pc['lut']
                 br += pc['bram']
                 paged['ff'] += pc['ff']
                 paged['ports'] += pc['ports']
                 paged['bits'] += est[c]['ff'] * t
+                paged['hbm'] += pc.get('hbm_bytes', 0)
             logic += copy_logic
             lutram += lam * lr
             bram += br
@@ -349,7 +355,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     flops or ring) with a state gap of 4."""
     logic = rest
     units, copy_logic, base_lutram = [], {}, 0.0
-    paged = dict(bits=0, ff=0, ports=0)
+    paged = dict(bits=0, ff=0, ports=0, hbm=0)
     for c, n in classes.items():
         k = degree.get(c, 1)
         kappa, lam = factors(cal, c, est[c]['lut'])
@@ -363,7 +369,14 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             logic += cl
             copy_logic[(c, j)] = cl
             forms.append((j, t, form, info['gap'] if info else None))
-            if form == 'paged':
+            if form == 'paged' and info.get('offchip'):
+                pc = storage.page_cost(est[c]['ff'], t, info['page'], 'hbm')
+                logic += pc['lut']
+                copy_logic[(c, j)] += pc['lut']
+                paged['ff'] += pc['ff']
+                paged['bits'] += est[c]['ff'] * t
+                paged['hbm'] += pc['hbm_bytes']
+            elif form == 'paged':
                 # A page RAM per paged copy: block or ultra, as the rest choose.
                 bits = est[c]['ff']
                 pcost = {kind: storage.page_cost(bits, t, info['page'], kind)
@@ -640,10 +653,11 @@ def parse_classes(text):
     for line in text.splitlines():
         m = re.match(r'^  (\S+) x(\d+)( \(ready pass\))?(?: state gap (\d+))?', line)
         if m:
-            page = re.search(r' page (\d+)', line)
+            page = re.search(r' page (\d+)( off chip)?', line)
             cur = out[m.group(1)] = dict(n=int(m.group(2)), ready=[], state=[],
                                          gap=int(m.group(4)) if m.group(4) else None,
-                                         page=int(page.group(1)) if page else 0)
+                                         page=int(page.group(1)) if page else 0,
+                                         offchip=bool(page and page.group(2)))
             continue
         m = re.match(r'^    (ready|state): ([\d ]+)$', line)
         if m and cur is not None:
@@ -893,9 +907,13 @@ def page_choice(classes, sched, ii):
     return pages
 
 
-def with_pages(sched, pages):
-    """A schedule's classes (parse_classes) with each copy's page set."""
-    return {c: dict(info, page=pages.get(re.sub(r'_copy\d+$', '', c), 0) if info['n'] > 1 else 0)
+def with_pages(sched, pages, offchip=()):
+    """A schedule's classes (parse_classes) with each copy's page set, and
+    the models in `offchip` with their pages off chip."""
+    def model(c):
+        return re.sub(r'_copy\d+$', '', c)
+    return {c: dict(info, page=pages.get(model(c), 0) if info['n'] > 1 else 0,
+                    offchip=model(c) in offchip and info['n'] > 1)
             for c, info in sched.items()}
 
 
@@ -921,16 +939,35 @@ def choose_pages(cal, est, classes, sched, ii, store='fixed', route=False, entri
     deep = sorted({n for n in classes.values() if n > 1})
     frames = sorted({f for n in deep for f in range(n * ((ii + n - 1) // n), max_ii + 1, n)} | {ii})
     last = None
-    for f in frames:
-        if f < ii:
-            continue
-        pages = page_choice(classes, sched, f)
-        if pages is None or pages == last:
-            continue
-        last = pages
-        res = area(cal, est, classes, {}, rest, with_pages(sched, pages), f, entries, store, route)
-        if ok(res):
-            return ','.join(f'{m}:{p}' for m, p in sorted(pages.items())), f, res
+    # Off chip, as little state as lets the rest fit: off-chip pages cross
+    # HBM twice a frame, so the frame grows with the bits moved. Nothing,
+    # then each model alone, fewest bits first, then the largest models
+    # together (two, three, ...).
+    def bits_of(m):
+        return sum(est[c]['ff'] * n for c, n in classes.items()
+                   if re.sub(r'_copy\d+$', '', c) == m)
+    models = sorted({re.sub(r'_copy\d+$', '', c) for c, n in classes.items() if n > 1},
+                    key=bits_of)
+    trials = [set()] + [{m} for m in models] + \
+        [set(models[-k:]) for k in range(2, len(models) + 1)]
+    for offchip in trials:
+        last = None
+        for f in frames:
+            if f < ii:
+                continue
+            pages = page_choice(classes, sched, f)
+            if pages is None or pages == last:
+                continue
+            last = pages
+            res = area(cal, est, classes, {}, rest, with_pages(sched, pages, offchip), f, entries,
+                       store, route)
+            if ok(res) and res.get('hbm_ii', 0) <= f:
+                spec = ','.join(f'{m}:{p}' for m, p in sorted(pages.items()))
+                return spec, f, dict(res, offchip=sorted(offchip))
+            if ok(res) and res.get('hbm_ii', 0) > f:
+                # The bandwidth sets the frame: the least frame it allows.
+                return (','.join(f'{m}:{p}' for m, p in sorted(pages.items())), res['hbm_ii'],
+                        dict(res, offchip=sorted(offchip)))
     return None, None, None
 
 

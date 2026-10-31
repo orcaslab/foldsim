@@ -49,3 +49,15 @@ print(f'big state, storage auto: page {spec!r} frame {frame} bram {res["bram"]} 
 # Schedule reports name the page per class.
 info = d.parse_classes('foldsim-fold-static: II = 8\n  Leaf x4 state gap 8 page 2\n    state: 0 2 4 6\n')
 print('parsed', info['Leaf']['page'], d.state_form(4, info['Leaf'], 8, 2))
+# State beyond the chip: 256 instances of 2,000,000 bits (512 Mbit) fit no
+# frame on chip; --page auto moves the model's pages off chip, and the frame
+# is its HBM traffic's (every instance read and written once a frame).
+est['Lane'] = lane(2000000)
+c = s.page_cost(2000000, 256, 2, 'hbm')
+print(f'hbm: bram {c["bram"]} uram {c["uram"]} ports {c["ports"]} bytes {c["hbm_bytes"]} '
+      f'frame {c["hbm_ii"]} controllers {c["controllers"]}')
+spec, frame, res = d.choose_pages(None, est, classes, sched(256), 256, max_ii=8192)
+print(f'beyond the chip: page {spec!r} off chip {res["offchip"]} frame {frame} '
+      f'bram {res["bram"]} fits {res["fits"]}')
+info = d.parse_classes('foldsim-fold-static: II = 8\n  Leaf x4 state gap 8 page 2 off chip\n    state: 0 2 4 6\n')
+print('parsed off chip', info['Leaf']['offchip'])

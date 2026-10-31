@@ -282,11 +282,21 @@ def page_geometry(bits, threads, p):
     return rows, pw, math.ceil(pw / 72)
 
 
+# Off-chip pages (foldsim-fold-static storage <model>:pages=hbm): the HBM
+# bandwidth a frame may use, in bytes a host cycle (SLASH's 8 HBM vNoC ports,
+# about 128 GB/s a direction, at 200 MHz), and a controller's row.
+HBM_BYTES_PER_CYCLE = 640
+HBM_COLUMN_BITS = 4096
+
+
 def page_cost(bits, threads, p, kind):
-    """What a copy's paged register state costs in a kind (block or ultra):
-    as kind_cost, with `ii_floor` the frame its state passes need, and
-    `ports` the page RAM's 72-bit read ports. None for another kind."""
-    if kind not in ('block', 'ultra'):
+    """What a copy's paged register state costs in a kind (block or ultra,
+    or hbm: off chip): as kind_cost, with `ii_floor` the frame its state
+    passes need, `ports` the page RAM's 72-bit read ports, and off chip
+    `hbm_bytes` its traffic a frame (every instance's state read and written
+    once), `hbm_ii` the frame that traffic needs at HBM_BYTES_PER_CYCLE and
+    `controllers` its virtual memories. None for another kind."""
+    if kind not in ('block', 'ultra', 'hbm'):
         return None
     rows, pw, ports = page_geometry(bits, threads, p)
     c = dict(lut=float(pw * math.ceil(p / 3)) if p > 1 else 0.0, lutram=0.0,
@@ -294,8 +304,14 @@ def page_cost(bits, threads, p, kind):
              ports=ports)
     if kind == 'block':
         c['bram'] = bram36(rows, pw)
-    else:
+    elif kind == 'ultra':
         c['uram'] = uram(rows, pw)
+    else:
+        c['ports'] = 0
+        c['ii_floor'] = max(p, 2) * threads
+        c['hbm_bytes'] = 2 * bits * threads // 8
+        c['hbm_ii'] = math.ceil(c['hbm_bytes'] / HBM_BYTES_PER_CYCLE)
+        c['controllers'] = math.ceil(pw / HBM_COLUMN_BITS)
     return c
 
 

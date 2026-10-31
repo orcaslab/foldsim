@@ -304,11 +304,14 @@ def choose_pages(a, foldsim_opt, flat, passes, out, fold):
     if spec is None:
         sys.exit(f'--page auto: no paging fits the V80 region (unpaged II {ii}); '
                  f'see {base}')
+    off = res.get('offchip', [])
     print(f"foldsim: page {spec or 'none'}: II at least {frame} (unpaged {ii}), about "
           f"{res['luts']} LUTs, {res['bram']} RAMB36"
           + (f", {res['uram']} URAM" if 'uram' in res else '')
-          + (f", {res['page_ports']} page ports" if 'page_ports' in res else ''), file=sys.stderr)
-    return spec
+          + (f", {res['page_ports']} page ports" if 'page_ports' in res else '')
+          + (f"; off chip: {', '.join(off)}, {res['hbm_bytes']} bytes a frame" if off else ''),
+          file=sys.stderr)
+    return spec, [f'{m}:pages=hbm' for m in off]
 
 
 def slr_options(a, foldsim_opt, models, fold, out):
@@ -755,9 +758,13 @@ def main():
             fold += ' nest'
         fold += frame_options(a)
         if a.page == 'auto':
-            spec = choose_pages(a, foldsim_opt, flat, passes, out, fold)
+            spec, hbm = choose_pages(a, foldsim_opt, flat, passes, out, fold)
             if spec:
                 fold += f' page={spec}'
+            if hbm:
+                m = re.search(r' storage=(\S+)', fold)
+                fold = (fold.replace(m.group(0), f' storage={m.group(1)},{",".join(hbm)}') if m
+                        else fold + f' storage={",".join(hbm)}')
         if a.slr_groups:
             if a.copies != 'auto':
                 run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',

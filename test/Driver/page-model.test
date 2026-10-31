@@ -21,3 +21,8 @@
 # CHECK: big state: page 'Lane:2' frame 512 fits True bram 2083.5 ports 2084 paged bits 76800000
 # CHECK: big state, storage auto: page 'Lane:2' frame 512 bram 2083.5 uram 0.0
 # CHECK: parsed 2 ('paged', False)
+# Beyond the chip: no frame fits on chip, the pages go off chip, and the
+# frame is the HBM traffic's.
+# CHECK: hbm: bram 0.0 uram 0 ports 0 bytes 128000000 frame 200000 controllers 245
+# CHECK: beyond the chip: page 'Lane:1' off chip ['Lane'] frame 200000 bram 0.0 fits True
+# CHECK: parsed off chip True
