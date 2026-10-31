@@ -6128,6 +6128,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       Region *region;
       seq::FirMemOp memory;
       Value out, writeAt;
+      /// The page being written, binary (p > 1).
+      Value writeIndex;
       /// Per page: the host cycle it lands, it is written, and its bits,
       /// at their offsets in the column.
       SmallVector<Value> land, writing;
@@ -6362,6 +6364,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             comb::MuxOp::create(b, region.state, region.inst, writeInst));
         for (unsigned j = 0; j < p; ++j)
           col.writing.push_back(comb::AndOp::create(b, write0, isPage(wpage0, j)));
+        if (pageWidth)
+          col.writeIndex = low(wpage0);
         col.writeValid = comb::AndOp::create(b, write0, wb);
         Value zero1 = hw::ConstantOp::create(b, b.getI1Type(), 0);
         col.requests = {read0, virtualInst(inst0, page0), zero1, col.writeValid,
@@ -6421,6 +6425,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             comb::AddOp::create(b, page,
                                 hw::ConstantOp::create(b, bits(pageWidth), 1))));
         writeAt = comb::ConcatOp::create(b, writeInst, page);
+        col.writeIndex = page;
       }
       col.writeAt = writeAt;
     }
@@ -6460,11 +6465,16 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       replaced[reg.original] = value;
     }
     // Each column's write: page j's bits at its host cycle, and with masks
-    // its bytes' enables.
+    // its bytes' enables. The page is chosen by its binary index (the write's
+    // page counter, `writeIndex`), a p:1 multiplexer a bit (a LUT6 and the
+    // slice's wide-mux cells: about ceil(p / 4) LUTs a bit, two bits a LUT at
+    // p 2), not by AND-ing each page with its one-hot strobe and OR-ing them
+    // (two inputs a page). The strobes still enable the write.
     for (auto [c, col] : llvm::enumerate(cols)) {
       auto &writing = col.writing;
       Value writeData, writeEnable, writeMask;
       unsigned bytes = bytesMasked ? col.width / grain : 0;
+      SmallVector<Value> words, masks;
       for (unsigned j = 0; j < p; ++j) {
         // The page's bits in order, zeros between.
         auto &parts = col.parts[j];
@@ -6483,7 +6493,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                          ? low[0]
                          : b.createOrFold<comb::ConcatOp>(
                                SmallVector<Value>(low.rbegin(), low.rend()));
-        Value mask;
+        words.push_back(word);
         if (bytesMasked) {
           // Byte k of this page and column: the vector's byte at its offset.
           uint64_t first = (uint64_t(j) * pw + uint64_t(c) * colBits) / grain;
@@ -6492,24 +6502,27 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             Value enable = byteEnable[first + k];
             high.push_back(enable ? enable : one());
           }
-          mask = high.size() == 1 ? high[0] : b.createOrFold<comb::ConcatOp>(high);
+          masks.push_back(high.size() == 1 ? high[0]
+                                           : b.createOrFold<comb::ConcatOp>(high));
         }
-        if (p > 1) {
-          word = comb::AndOp::create(
-              b, word,
-              b.createOrFold<comb::ReplicateOp>(bits(col.width), writing[j]));
-          if (mask)
-            mask = comb::AndOp::create(
-                b, mask, b.createOrFold<comb::ReplicateOp>(bits(bytes), writing[j]));
-        }
-        writeData = writeData ? Value(comb::OrOp::create(b, writeData, word))
-                              : word;
-        if (mask)
-          writeMask = writeMask ? Value(comb::OrOp::create(b, writeMask, mask)) : mask;
         writeEnable = writeEnable
                           ? Value(comb::OrOp::create(b, writeEnable, writing[j]))
                           : writing[j];
       }
+      // The page of the write: index j while page j writes (pages past p,
+      // when p is not a power of two, never write: zeros).
+      auto select = [&](SmallVector<Value> &of, unsigned width) -> Value {
+        if (p == 1)
+          return of[0];
+        SmallVector<Value> elems;
+        for (unsigned j = 1u << pageWidth; j-- > 0;)
+          elems.push_back(j < p ? of[j] : hw::ConstantOp::create(b, bits(width), 0));
+        return hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elems),
+                                      col.writeIndex);
+      };
+      writeData = select(words, col.width);
+      if (bytesMasked)
+        writeMask = select(masks, bytes);
       if (offChip) {
         unsigned pad = col.vmWidth - col.width;
         if (pad) {

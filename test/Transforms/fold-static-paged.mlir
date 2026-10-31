@@ -83,13 +83,21 @@
 // CHECK: [[W1]] = comb.mux %region1_land1, %region1_page_out, %wide_1_fetched : i50
 // CHECK: [[P0:%.+]] = comb.concat {{%.+}}, %waddr_writeback, %narrow_writeback, %held_writeback : i30, i4, i8, i8
 // CHECK: [[WE:%.+]] = comb.or %region1_write0, %region1_write1 : i1
-// CHECK: seq.firmem.write_port %region1_pages[[[WA]]] = {{%.+}}, clock %hostClock enable [[WE]] : <8 x 50, mask 1>
+// The page written is chosen by the write's page counter (a p:1 multiplexer
+// a bit), not by AND-ing each page with its strobe.
+// CHECK: [[WP:%.+]] = hw.array_create {{%.+}}, [[P0]] : i50
+// CHECK: [[WD:%.+]] = hw.array_get [[WP]][%region1_write_page] : !hw.array<2xi50>, i1
+// CHECK: seq.firmem.write_port %region1_pages[[[WA]]] = [[WD]], clock %hostClock enable [[WE]] : <8 x 50, mask 1>
 // The simulator fetches each instance a page before its state pass: at
 // positions 6 (frame before), 0, 2 and 4.
 // CHECK: hw.module @foldsim_sim
 // CHECK: hw.instance "Leaf_copy" @Leaf_static(hostClock: {{%.+}}: !seq.clock, state3: {{%.+}}: i1, inst3: {{%.+}}: i2, fetch3: {{%.+}}: i1, finst3: {{%.+}}: i2,
 // ULTRA: pages Leaf: p 3, 4 registers, 100 bits; page RAMs 16 rows x 34 bits in 1 columns, 1 ports, ultra
 // ULTRA: %region1_pages = seq.firmem 1, 1, old, undefined {sv.attributes = [#sv.attribute<"ram_style" = "\22ultra\22">]} : <16 x 34, mask 1>
+// p 3 of 4 rows: the fourth page never writes (zeros).
+// ULTRA: [[UP:%.+]] = hw.array_create %c0_i34, {{%.+}}, {{%.+}}, {{%.+}} : i34
+// ULTRA: [[UD:%.+]] = hw.array_get [[UP]][%region1_write_page] : !hw.array<4xi34>, i2
+// ULTRA: seq.firmem.write_port %region1_pages[{{%.+}}] = [[UD]]
 // MOD: II = 16
 // MOD: state passes 4 x 4 = 16
 // READY: Leaf x4 (ready pass) state gap 4 page 2

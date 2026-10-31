@@ -536,7 +536,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                     bits = d * w + (w * r if rl == 1 else 0)
                     rows = (1 << (t - 1).bit_length()) * (1 << (p - 1).bit_length())
                     v = dict(lut=cnt * (max(r, 1) * w * math.ceil((d - 1) / 3) +
-                                        bits / p * math.ceil(p / 3)),
+                                        bits / p * storage.page_select_luts(p)),
                              lutram=0.0, ff=cnt * 2 * bits, bram=0.0,
                              uram=cnt * bits / p / storage.URAM[1] * math.ceil(rows / storage.URAM[0]),
                              ii_floor=0)
@@ -926,7 +926,7 @@ def link_kind_cost(u, kind, f=1.0, b=1.0):
         c = dict(zero)
     else:
         rows, cols = u['depth'] * (1 << (p - 1).bit_length()), math.ceil(u['width'] / p)
-        c = dict(zero, ff=2 * u['width'], lut=float(cols * math.ceil(p / 3)))
+        c = dict(zero, ff=2 * u['width'], lut=float(cols * storage.page_select_luts(p)))
     if base == 'block':
         c['bram'] = b * storage.bram36(rows, cols)
     else:

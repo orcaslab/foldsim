@@ -289,6 +289,21 @@ HBM_BYTES_PER_CYCLE = 640
 HBM_COLUMN_BITS = 4096
 
 
+def page_select_luts(p):
+    """LUTs a page bit of the write-back's p:1 select (a paged copy's, a
+    paged link's, a memory's rows)."""
+    return PAGE_SELECT_LUTS(p) if p > 1 else 0
+
+
+def _select_one_hot(p):
+    # The page's bits AND-ed with its one-hot write strobe, OR-ed over the
+    # pages: three (bit, strobe) pairs a LUT6.
+    return math.ceil(p / 3)
+
+
+PAGE_SELECT_LUTS = _select_one_hot
+
+
 def page_cost(bits, threads, p, kind):
     """What a copy's paged register state costs in a kind (block or ultra,
     or hbm: off chip): as kind_cost, with `ii_floor` the frame its state
@@ -299,7 +314,7 @@ def page_cost(bits, threads, p, kind):
     if kind not in ('block', 'ultra', 'hbm'):
         return None
     rows, pw, ports = page_geometry(bits, threads, p)
-    c = dict(lut=float(pw * math.ceil(p / 3)) if p > 1 else 0.0, lutram=0.0,
+    c = dict(lut=float(pw * page_select_luts(p)), lutram=0.0,
              ff=2 * bits + pw, bram=0.0, uram=0, ii_floor=max(p * threads, p + 4),
              ports=ports)
     if kind == 'block':
