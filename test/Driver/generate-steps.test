@@ -1,0 +1,12 @@
+# --max-generate-steps reaches circt-verilog as slang's generate-loop step
+# limit: 20 steps make the 16 leaves of nested loops, 19 stop the import.
+# RUN: rm -rf %t && cd %S/Inputs/generate-steps
+# RUN: foldsim --srcs top.f --top Top --out %t/ok --max-generate-steps 20 Leaf 2>&1 | FileCheck %s --check-prefix=CMD
+# RUN: FileCheck %s < %t/ok/foldsim_sim.json
+# RUN: not foldsim --srcs top.f --top Top --out %t/low --max-generate-steps 19 Leaf 2>&1 | FileCheck %s --check-prefix=LOW
+# RUN: foldsim --srcs top.f --top Top --out %t/def Leaf 2>&1 | FileCheck %s --check-prefix=DEFAULT
+# CMD: circt-verilog {{.*}}-Xslang=--max-generate-steps=20
+# CHECK: "threads": {
+# CHECK-NEXT: "Leaf": 16,
+# LOW: generate loop hit maximum step limit
+# DEFAULT-NOT: max-generate-steps
