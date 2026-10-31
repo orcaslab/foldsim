@@ -1,0 +1,16 @@
+# --max-unroll-trip-count reaches circt-verilog: a procedural loop of 1100
+# iterations is not unrolled by default (1024 or more are not), and the import
+# leaves a process the flattening cannot take; with 2048 it is logic.
+# RUN: rm -rf %t && cd %S/Inputs/unroll
+# RUN: foldsim --srcs top.f --top Top --out %t/ok --max-unroll-trip-count 2048 Leaf 2>&1 | FileCheck %s --check-prefix=CMD
+# RUN: FileCheck %s < %t/ok/foldsim_sim.json
+# RUN: not grep -q llhd.combinational %t/ok/design.mlir
+# RUN: not foldsim --srcs top.f --top Top --out %t/def Leaf > %t/def.log 2>&1
+# RUN: FileCheck %s --check-prefix=DEFAULT < %t/def.log
+# RUN: grep -q llhd.combinational %t/def/design.mlir
+# CMD: circt-verilog {{.*}}--max-unroll-trip-count=2048
+# CHECK: "threads": {
+# CHECK-NEXT: "Top_model": 1,
+# CHECK-NEXT: "Leaf": 1
+# DEFAULT-NOT: max-unroll-trip-count
+# DEFAULT: llhd

@@ -1,0 +1,32 @@
+# REQUIRES: verilator
+# An arbiter tree folded by level (`--class-at` with `inner:` globs): the
+# slices of every level one class, the innermost arbiter another, fused with
+# the bank it feeds; readies run combinationally from the bank through every
+# level. Each fold matches the target, its channels stalled or not: the slice
+# and root classes with and without zero-latency links, and the whole
+# arbiter as one class: an `inner:` glob with no match below takes it whole,
+# as it takes an arbiter of a configuration too small for slices.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/tree-arb
+# RUN: foldsim --srcs top.f --top Top --out %t/inner --static --zero-latency-links --zero-latency-chains --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=INNER
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/inner/obj %S/Inputs/tb_reset.sv top.sv %t/inner/foldsim_sim.sv > %t/inner/build.log 2>&1
+# RUN: %t/inner/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/inner/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/slow --static --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/slow/obj %S/Inputs/tb_reset.sv top.sv %t/slow/foldsim_sim.sv > %t/slow/build.log 2>&1
+# RUN: %t/slow/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/flat --static --zero-latency-links --zero-latency-chains --class-at 'root@inner:arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=WHOLE
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/flat/obj %S/Inputs/tb_reset.sv top.sv %t/flat/foldsim_sim.sv > %t/flat/build.log 2>&1
+# RUN: %t/flat/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=30 | FileCheck %s
+# The buffers alone as classes, each with the select in front of it (its
+# slice's arbiter, over the limit with the readies behind it) absorbed.
+# RUN: foldsim --srcs top.f --top Top --out %t/excl --static --zero-latency-links --zero-latency-chains --absorb-exclusive b --class-at 'b@*.out_buf' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=EXCL
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/excl/obj %S/Inputs/tb_reset.sv top.sv %t/excl/foldsim_sim.sv > %t/excl/build.log 2>&1
+# RUN: %t/excl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +stall=0 | FileCheck %s
+# RUN: %t/excl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +stall=30 | FileCheck %s
+# EXCL: class-at b: b (Buf) x6
+# EXCL: foldsim: Top_model x1, b x6, root_Bank x1
+# INNER: class-at sl: sl (Slice) x6
+# INNER: class-at root: root ({{.*}}) x1
+# INNER: foldsim: Top_model x1, sl x6, root_Bank x1
+# WHOLE: class-at root: root (Arb) x1
+# CHECK: {{^}}MATCH 196 cycles

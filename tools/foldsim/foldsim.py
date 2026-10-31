@@ -24,13 +24,15 @@ port (`<port>_valid`, `_ready`, `_bits`) and a `profile_finish` bit per class;
 order of those bits; and <out>/foldsim_sim.vh, their number for the kernel.
 """
 import argparse
+import fnmatch
 import json
 import os
 import re
 import subprocess
 import sys
 
-# Passes each model gets before it is threaded: register constants, shared
+# Passes each model gets before it is threaded: state no output observes
+# (foldsim-remove-dead-state: an unconnected counter and its cone), register constants, shared
 # adders and narrowed low bits matter for area once every register of a model
 # is replicated per thread. A conditional write of one array element becomes a
 # select per element, and sorting lets CSE merge duplicates whose users come
@@ -39,6 +41,7 @@ import sys
 # a parameter sizes a field to nothing (a one-entry table indexed by a one-bit
 # number), and firtool emits neither their compares nor their constants.
 OPTIMIZE = ['hw.module(hw-expand-array-writes)', 'hw.module(foldsim-fold-zero-width)',
+            'hw.module(foldsim-remove-dead-state)',
             'hw.module(seq-reg-const-prop)',
             'hw.module(comb-share-adders)', 'canonicalize', 'hw.module(comb-low-bits-narrowing)',
             'canonicalize', 'foldsim-sort', 'cse']
@@ -60,6 +63,7 @@ NO_OP_DUMP = '--mlir-print-op-on-diagnostic=false'
 # foldsim_storage.py, beside the block-RAM table they are priced by.
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from foldsim_storage import VMEM_CACHE_BUDGET, bram36, vmem_cache_rows  # noqa: E402
+import foldsim_storage  # noqa: E402
 
 
 def run(cmd, check=True, **kw):
@@ -75,6 +79,165 @@ def publish(src, public):
         if not n:
             sys.exit(f'no module {m} in the design')
     return s
+
+
+INSTANCE = re.compile(r'hw\.instance "([^"]+)"( sym @\S+)? @([\w$.]+)\(')
+
+
+# `--class-at TAG@inner:GLOB`: innermost matches only (a word every shell
+# passes through, unlike a sign).
+INNER = 'inner:'
+
+
+def class_at(text, top, specs):
+    """`--class-at TAG@GLOB`: the instances whose path from `top` (instance
+    names joined by '.') matches GLOB become a class of their own. The modules
+    along their paths that other instances share are copied, so that the
+    matched instances alone change module; each parameter set of them (each
+    module they were instances of) becomes a module named TAG, or TAG_<k> for
+    several, in the order first met. The first GLOB that matches takes an
+    instance; a GLOB may match none. A GLOB written `inner:GLOB` takes only an
+    innermost match: an instance with a match of any GLOB below it is not
+    taken, the walk goes on below it (a tree of arbiters whose size depends on
+    the configuration: its slices one class and its root another, or the
+    whole tree where it is one arbiter). Several GLOBs may share a TAG.
+    Returns the design and the new modules' names."""
+    lines = text.split('\n')
+    span, order = {}, []
+    for i, line in enumerate(lines):
+        m = re.match(r'  hw\.module (?:private )?@([\w$.]+)\(', line)
+        if m:
+            span[m.group(1)] = [i, None]
+            order.append(m.group(1))
+        elif line == '  }' and order and span[order[-1]][1] is None:
+            span[order[-1]][1] = i
+    for tag, _ in specs:
+        if tag in span:
+            sys.exit(f'--class-at {tag}: a module of the design has that name')
+    if top not in span:
+        sys.exit(f'--class-at: no module {top}')
+
+    def instances(mod):
+        s, e = span[mod]
+        return [(i - s, m.group(1), m.group(3)) for i in range(s, e)
+                for m in [INSTANCE.search(lines[i])] if m]
+    body = {m: instances(m) for m in span}
+    # Every instance walked from the top, the search descending only below
+    # unmatched instances. What a module's instance needs changed below it is
+    # its variant: the (relative line, new callee) pairs of its instance ops,
+    # a matched one becoming its tag's class and an unmatched one a variant of
+    # its own module. Instances of a module that need the same variant share
+    # one module (the instances of a class with several instances, say a
+    # crossbar inside each core), so that a module is copied only for another
+    # variant or where an instance of it keeps it unchanged.
+    variant_id = {}         # (module, changes) -> variant number
+    variants = {}           # module -> [changes], in the order first met
+    kept = set()            # modules some instance keeps unchanged
+    leaves = []             # (tag, leaf module), every matched instance
+    sys.setrecursionlimit(max(10000, sys.getrecursionlimit()))
+
+    innermost = [g.startswith(INNER) for _, g in specs]
+    globs = [(t, g[len(INNER):] if inner else g) for (t, g), inner in zip(specs, innermost)]
+
+    def match(p):
+        return next((k for k, (_, g) in enumerate(globs) if fnmatch.fnmatchcase(p, g)), None)
+
+    def below(mod, path):
+        """Whether an instance below `mod` (at `path`) matches a GLOB."""
+        for _, name, callee in body.get(mod, ()):
+            p = f'{path}.{name}'
+            if match(p) is not None or below(callee, p):
+                return True
+        return False
+
+    def walk(mod, path):
+        changes = []
+        for rel, name, callee in body[mod]:
+            p = f'{path}.{name}' if path else name
+            k = match(p)
+            if k is not None and innermost[k] and below(callee, p):
+                k = None
+            tag = globs[k][0] if k is not None else None
+            if tag:
+                leaves.append((tag, callee))
+                changes.append((rel, ('class', tag, callee)))
+            elif callee in body:
+                v = walk(callee, p)
+                if v is None:
+                    kept.add(callee)
+                else:
+                    changes.append((rel, ('mod', callee, v)))
+        if not changes:
+            return None
+        key = (mod, tuple(changes))
+        if key not in variant_id:
+            variant_id[key] = len(variants.setdefault(mod, []))
+            variants[mod].append(key[1])
+        return variant_id[key]
+    walk(top, '')
+    # A glob a configuration has no instance for is not an error: one class
+    # list serves configurations whose crossbars take different forms.
+    for t in dict.fromkeys(t for t, _ in specs):
+        if all(tag != t for tag, _ in leaves):
+            print(f'class-at {t}: no instance matches {" or ".join(g for u, g in specs if u == t)}',
+                  file=sys.stderr)
+    # Each parameter set a module of its own, named after the tag.
+    groups = {}
+    for tag, leaf in leaves:
+        groups.setdefault(tag, [])
+        if leaf not in groups[tag]:
+            groups[tag].append(leaf)
+    name = {(t, l): t if len(ls) == 1 else f'{t}_{k}'
+            for t, ls in groups.items() for k, l in enumerate(ls)}
+    for (tag, leaf), new in name.items():
+        if new in span:
+            sys.exit(f'--class-at {tag}: a module of the design is named {new}')
+
+    # A variant's module: the module itself when no instance keeps it and it
+    # is its first variant, a copy `<module>__at<k>` otherwise, numbered in the
+    # order the walk finished them.
+    vname, copies = {}, 0
+    for (mod, _), v in variant_id.items():
+        if v == 0 and mod not in kept:
+            vname[(mod, v)] = mod
+        else:
+            vname[(mod, v)] = f'{mod}__at{copies}'
+            copies += 1
+    for (mod, _), new in vname.items():
+        if new != mod and new in span:
+            sys.exit(f'--class-at: a module of the design is named {new}')
+
+    end = max(i for i, line in enumerate(lines) if line == '}')
+
+    def copy(mod, new):
+        nonlocal end
+        s, e = span[mod]
+        text = lines[s:e + 1]
+        text[0] = text[0].replace(f'@{mod}(', f'@{new}(', 1)
+        span[new] = [end, end + e - s]
+        lines[end:end] = text
+        end += len(text)
+
+    # Copies first, from the modules as they were; then each variant's
+    # instance ops pointed at their new callees.
+    for (mod, v), new in vname.items():
+        if new != mod:
+            copy(mod, new)
+    for (tag, leaf), new in name.items():
+        copy(leaf, new)
+
+    def retarget(mod, rel, new):
+        i = span[mod][0] + rel
+        m = INSTANCE.search(lines[i])
+        lines[i] = lines[i][:m.start(3)] + new + lines[i][m.end(3):]
+
+    for (mod, v), new in vname.items():
+        for rel, (kind, a1, a2) in variants[mod][v]:
+            retarget(new, rel, name[(a1, a2)] if kind == 'class' else vname[(a1, a2)])
+    for (tag, leaf), new in name.items():
+        n = sum(1 for t, l in leaves if (t, l) == (tag, leaf))
+        print(f'class-at {tag}: {new} ({leaf}) x{n}', file=sys.stderr)
+    return '\n'.join(lines), list(name.values())
 
 
 def instantiated(text, module, names):
@@ -189,6 +352,12 @@ def frame_options(a):
         fold += f' page-hbm-window={a.page_hbm_window}'
     if getattr(a, 'page_hbm_column_bits', None):
         fold += f' page-hbm-column-bits={a.page_hbm_column_bits}'
+    if getattr(a, 'zero_chain_hops', None):
+        fold += f' zero-chain-hops={a.zero_chain_hops}'
+    if getattr(a, 'compact_links', False):
+        fold += ' compact-links'
+    if getattr(a, 'registered_links', ''):
+        fold += f' registered-links={a.registered_links}'
     return fold
 
 
@@ -237,6 +406,51 @@ def axi_spec_groups(top, design_text, depth):
 # calibrate): area, placement capacity and the period fit.
 DEGREE_CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'foldsim_v80.json')
+
+
+def memory_registers(a, flat, out):
+    """The foldsim-memories-to-registers pass of --memory-registers, or None
+    when no memory is kept as registers: `auto` (the default with --storage
+    auto), the memories cheaper as registers for every copy of their module's
+    instances (foldsim_storage.memory_as_registers); `off` (the default
+    otherwise), none; else a regex, the memories that can be registers whose
+    name or <module>:<name> it finds. The choice goes to
+    <out>/memory_registers.txt."""
+    mode = a.memory_registers or ('auto' if a.storage == 'auto' else 'off')
+    if mode == 'off':
+        return None
+    rx = None if mode == 'auto' else re.compile(mode)
+    mems, instances = foldsim_storage.memory_ports(flat, a.top)
+    chosen, lines = [], []
+    for m in mems:
+        key = f"{m['module']}:{m['name']}"
+        shape = (f"{m['depth']}x{m['width']} reads {m['reads']} ({m['const_reads']} constant) "
+                 f"writes {m['wports']}, {instances[m['module']]} instances")
+        why = foldsim_storage.register_ineligible(m)
+        if why:
+            if rx is not None and (rx.search(m['name']) or rx.search(key)):
+                lines.append(f'  memory {key}: {shape}; cannot be registers: {why}')
+                print(f'foldsim: --memory-registers {mode}: {key} cannot be registers: {why}',
+                      file=sys.stderr)
+            continue
+        if rx is None:
+            take, rows = foldsim_storage.memory_as_registers(m, instances[m['module']])
+            price = '; LUT sites as memory / registers: ' + ', '.join(
+                f'{t} instances {mem:.0f} / {reg:.0f}' for t, mem, reg in rows)
+        else:
+            take, price = bool(rx.search(m['name']) or rx.search(key)), ''
+        if take:
+            chosen.append(key)
+            lines.append(f'  registers {key}: {shape}{price}')
+    if not chosen:
+        print(f'foldsim: --memory-registers {mode}: no memory kept as registers', file=sys.stderr)
+        return None
+    with open(out('memory_registers.txt'), 'w') as f:
+        f.write(f'--memory-registers {mode}: {len(chosen)} of {len(mems)} memories kept as '
+                'registers (foldsim-memories-to-registers)\n' + '\n'.join(lines) + '\n')
+    print(f'foldsim: --memory-registers {mode}: {len(chosen)} of {len(mems)} memories kept as '
+          f'registers; see {out("memory_registers.txt")}', file=sys.stderr)
+    return f'foldsim-memories-to-registers{{memories={",".join(chosen)}}}'
 
 
 def choose_copies(a, foldsim_opt, flat, passes, out):
@@ -470,6 +684,12 @@ def main():
     ap.add_argument('--out', required=True)
     ap.add_argument('--circt-bin', default='')
     ap.add_argument('--foldsim-bin', default='')
+    ap.add_argument('--max-unroll-trip-count', type=int, default=0, metavar='N',
+                    help="circt-verilog's limit on the iterations of a process's loop it unrolls "
+                         '(--max-unroll-trip-count); 0: its default (1024)')
+    ap.add_argument('--max-generate-steps', type=int, default=0, metavar='N',
+                    help="circt-verilog's (slang's) generate-loop step limit, which counts the "
+                         'blocks of a loop times those of the loops around it; 0: its default')
     ap.add_argument('--region-loads', type=int, default=0,
                     help="split each threaded model's state into regions of at most this "
                          'many loads, each with its own thread index and edge (foldsim-fame5)')
@@ -517,6 +737,17 @@ def main():
     ap.add_argument('--domains', action='store_true',
                     help='emit the simulator as a tree of domains, one module per class '
                          'nested as the class tree (foldsim-compose)')
+    ap.add_argument('--class-at', action='append', default=[], metavar='TAG@GLOB',
+                    help='the instances whose path (instance names joined by ".") matches GLOB '
+                         'are a class: one module per parameter set, TAG or TAG_<k>; repeatable, '
+                         'the first match takes an instance; `inner:GLOB` only an instance with no '
+                         'match below it. A class `A+B` may name them')
+    ap.add_argument('--absorb-exclusive', default='', metavar='CLASS,...',
+                    help="for these classes (globs), a model input whose logic in the parent is "
+                         "over the absorb limit takes the part of it that reaches that input "
+                         "alone, the rest as inputs: a per-port select in front of a per-port "
+                         "class is then one copy in the class (foldsim-extract-models "
+                         "absorb-exclusive)")
     ap.add_argument('--nest', action='store_true',
                     help="fold nested classes recursively: each class's threads numbered so "
                          "that a thread and its parent's are current together (foldsim-compose); with "
@@ -611,6 +842,18 @@ def main():
                     help='with --static: a link read forwarded past the read register where the '
                          "reader's logic behind it stays below N levels (default 8; 0: into the "
                          'read register) (foldsim-fold-static)')
+    ap.add_argument('--zero-chain-hops', type=int, metavar='N',
+                    help="with --zero-latency-chains: at most N links taken in their producers' host "
+                         'cycle on a combinational path; a link past them is taken a host cycle later '
+                         '(default: no bound) (foldsim-fold-static)')
+    ap.add_argument('--compact-links', action='store_true',
+                    help="with --static: a link keeps only the producer instances its reader takes (a "
+                         "per-lane port read by its own lane's instances, say), not an entry for every "
+                         'instance (foldsim-fold-static)')
+    ap.add_argument('--registered-links', default='', metavar='CLASS,...',
+                    help='with --zero-latency-links: classes (globs) whose links a reader always takes '
+                         "from its read register, never in their producer's host cycle: a class whose "
+                         "late outputs end a deep path (foldsim-fold-static)")
     ap.add_argument('--no-share-link-writes', action='store_true',
                     help="with --static: write each reader's link from the producer's bits in the "
                          'pass, not a host cycle late from one register of them (foldsim-fold-static)')
@@ -680,6 +923,13 @@ def main():
                          'ram_style: registers, distributed, block, ultra); with --copies auto, '
                          '`auto`: a kind per store chosen with the fold degree against the V80 '
                          'region (foldsim_storage.py), else the default rules')
+    ap.add_argument('--memory-registers', default='', metavar='auto|off|REGEX',
+                    help='memories kept as registers, a register an entry (foldsim-memories-to-'
+                         'registers): `auto`, those cheaper so for every copy of their instances '
+                         '(foldsim_storage.py: an associative table read at every entry); `off`, '
+                         'none; else those whose name or <module>:<name> the regex finds. '
+                         'Default: auto with --storage auto, else off. The choice in '
+                         '<out>/memory_registers.txt')
     ap.add_argument('--slr-groups', action='store_true',
                     help='with --static: the copies in --slr-count groups, each in an SLR '
                          '(Vivado picks which): within --slr-capacity, the shortest frame, '
@@ -731,7 +981,10 @@ def main():
     design = out('design.mlir')
     run([tool('circt-verilog'), '--ir-hw', f'--top={a.top}', '--allow-use-before-declare',
          '--allow-hierarchical-const', '--ignore-uninstantiated-modules', '--detect-memories',
-         '--preserve-unpacked-ports', *defines, *incdirs, *files, '-o', design])
+         '--preserve-unpacked-ports',
+         *([f'-Xslang=--max-generate-steps={a.max_generate_steps}'] if a.max_generate_steps else []),
+         *([f'--max-unroll-trip-count={a.max_unroll_trip_count}'] if a.max_unroll_trip_count else []),
+         *defines, *incdirs, *files, '-o', design])
 
     # A module declared a black box (a core the synthesis flow provides) stays
     # an instance through flattening; foldsim-fame5 folds it by its contract.
@@ -739,6 +992,18 @@ def main():
         run([foldsim_opt, design, '--foldsim-black-boxes', '-o', design + '.tmp'])
         os.replace(design + '.tmp', design)
 
+    if a.class_at:
+        specs = []
+        for spec in a.class_at:
+            tag, sep, glob = spec.partition('@')
+            if not sep or not re.fullmatch(r'[A-Za-z_]\w*', tag) or not glob:
+                sys.exit(f'--class-at {spec}: not TAG@GLOB')
+            specs.append((tag, glob))
+        text, new = class_at(open(design).read(), a.top, specs)
+        with open(design, 'w') as f:
+            f.write(text)
+        named = {m for c in a.classes for m in c.split('+')}
+        a.classes = a.classes + [n for n in new if n not in named]
     groups = [c.split('+') for c in a.classes if '+' in c]
     if any(len(g) != 2 for g in groups):
         sys.exit('a fused class is two modules, A+B')
@@ -782,10 +1047,16 @@ def main():
     # Without classes, the target is a netlist of its own logic alone.
     if not order:
         order = [a.top]
-    passes = []
+    # State no output observes goes before the models are cut (their ports then
+    # carry only what is read) and again in each model (OPTIMIZE).
+    passes = ['hw.module(foldsim-remove-dead-state)']
+    registers = memory_registers(a, flat, out)
+    if registers:
+        passes.append(registers)
     for m in order:
         models = f' models={",".join(sorted(children[m]))}' if children[m] else ''
-        passes.append(f'foldsim-extract-models{{module={m}{models} netlist absorb-logic={ABSORB_LOGIC}}}')
+        exclusive = f' absorb-exclusive={a.absorb_exclusive}' if a.absorb_exclusive else ''
+        passes.append(f'foldsim-extract-models{{module={m}{models} netlist absorb-logic={ABSORB_LOGIC}{exclusive}}}')
         fused = [g for g in groups if set(g) <= children[m]]
         if fused:
             passes.append(f'foldsim-fuse-models{{module={m} groups={",".join("+".join(g) for g in fused)}}}')

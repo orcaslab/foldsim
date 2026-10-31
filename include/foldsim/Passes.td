@@ -53,6 +53,17 @@ def ExtractModels : Pass<"foldsim-extract-models", "::mlir::ModuleOp"> {
     computed in the model instead: the model takes the logic's operands as
     inputs of its own. A model's input then comes from the models that
     produce its operands rather than from a hop through the parent's model.
+
+    For the models `absorb-exclusive` names (globs), an input whose logic is
+    over N ops takes the
+    part of it that reaches that input alone: a value the parent's other
+    logic, state or another input also reads stays in the parent, and the
+    model takes it as an input. Logic copied per instance in the parent (each
+    port's select in front of a per-port buffer that is a model) is then one
+    copy in the model, however wide the shared logic behind it. A value that
+    differs among the instances' logic (a constant index into a bus, an input
+    one instance has padded with zeros) is then an input too, each instance's
+    own.
   }];
   let options = [
     Option<"moduleName", "module", "std::string", "",
@@ -60,6 +71,9 @@ def ExtractModels : Pass<"foldsim-extract-models", "::mlir::ModuleOp"> {
     Option<"absorbLogic", "absorb-logic", "unsigned", "0",
            "Move logic of up to this many ops driving a model's input into "
            "the model">,
+    ListOption<"absorbExclusive", "absorb-exclusive", "std::string",
+               "The models (globs) whose inputs, over the limit, take the "
+               "part of the logic that reaches the input alone">,
     ListOption<"models", "models", "std::string",
                "The modules simulated as separate models">,
     Option<"netlist", "netlist", "bool", "false",
@@ -500,6 +514,26 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "pass, forwarded from the register to a read in between: the "
            "producer's path ends at that one register, not at every reader's "
            "link">,
+    Option<"zeroChainHops", "zero-chain-hops", "unsigned", "0",
+           "With zero-latency-chains: the most links taken in their "
+           "producers' host cycle a combinational path may cross, instance "
+           "by instance (each adds its reader's choice of source to the "
+           "path); a link that would pass them is taken a host cycle later "
+           "from its register, where the chain starts anew. 0: no bound">,
+    Option<"compactLinks", "compact-links", "bool", "false",
+           "A link whose reader takes fewer of its producer's instances than "
+           "the producer has (a per-lane port read by its own lane's "
+           "instances, say) keeps only those: an entry per instance read, "
+           "written at the producer's instance's entry by a table of the "
+           "slot's instance, the other instances' writes masked. The schedule "
+           "report gives every link's storage, compact or not">,
+    ListOption<"registeredLinks", "registered-links", "std::string",
+               "Classes (globs; a copy goes by its class's name) whose links "
+               "are never taken in their producer's host cycle: with "
+               "zero-latency-links, a reader takes them from its read register. "
+               "For a class whose late outputs end a deep path (a stateless "
+               "address unit, say) that a zero-latency link would chain into "
+               "its reader's logic">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
@@ -751,6 +785,42 @@ def SplitMaskedMemories
   let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect"];
 }
 
+def MemoriesToRegisters
+    : Pass<"foldsim-memories-to-registers", "::mlir::ModuleOp"> {
+  let summary = "Keep the named memories as registers, a register an entry";
+  let description = [{
+    `circt-verilog --detect-memories` makes a memory of every register array
+    it can, also of an associative table such as a cache's MSHR address
+    table, whose every entry is read every cycle for a match: a memory with
+    as many read ports as entries, each at a constant address. Folded, such
+    a memory is a store of its depth times the instances, copied once per
+    read port (distributed RAM has one read port a copy), where its entries
+    kept as registers are a row of the copy's state per instance, read
+    whole, and a read at a constant address is a wire.
+
+    Each memory of `memories` (`<module>:<name>`, the memory's `name`)
+    becomes a register per entry, `<name>_<entry>`, of the memory's width:
+    a read at a constant address is that register (zero past the depth), a
+    read at another address a select among them (zero past the depth); each
+    write port, in the order of the module, loads the entry it addresses
+    when enabled, a mask lane at a time, a later port's write over an
+    earlier one's. Only memories read combinationally and written a cycle
+    later (read latency 0, write latency 1), without read-write ports or an
+    initial content, whose write ports share one clock, can be registers;
+    another named is left a memory, with a warning. `foldsim --memory-
+    registers` chooses the memories (foldsim_storage.py prices both forms).
+  }];
+  let options = [
+    ListOption<"memories", "memories", "std::string",
+               "The memories to keep as registers, as <module>:<name>">,
+  ];
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect",
+    "circt::seq::SeqDialect"
+  ];
+}
+
 def ReplicateControls
     : Pass<"foldsim-replicate-controls", "::circt::hw::HWModuleOp"> {
   let summary = "Bound the loads of the static fold's slot controls by replicas";
@@ -797,6 +867,25 @@ def FoldZeroWidth : Pass<"foldsim-fold-zero-width", "::circt::hw::HWModuleOp"> {
     expect a bit to exist do not handle them.
   }];
   let dependentDialects = ["circt::hw::HWDialect"];
+}
+
+def RemoveDeadState : Pass<"foldsim-remove-dead-state", "::circt::hw::HWModuleOp"> {
+  let summary = "Remove registers and memories that no output observes";
+  let description = [{
+    A register, memory or combinational value is live when it reaches an
+    output of the module, an instance's input or an op with side effects,
+    through any number of registers and memories (a memory is live when one
+    of its read ports is; its writes then are). Everything else is removed:
+    it can change no output in any cycle. Canonicalization already removes
+    an unused value, but not state in a cycle of its own, such as a counter
+    whose only reader is its own increment: an unconnected performance
+    counter (`VX_stream_xbar`'s collision count, quadratic in its inputs)
+    keeps its whole cone. Registers and memories with a symbol stay.
+  }];
+  let statistics = [
+    Statistic<"numRemoved", "removed", "Ops removed">,
+  ];
+  let dependentDialects = ["circt::hw::HWDialect", "circt::seq::SeqDialect"];
 }
 
 def LowerConstantDivision

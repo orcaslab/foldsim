@@ -3,7 +3,7 @@
 // ready passes as keep the frame acyclic, each once the inputs its outputs
 // depend on are written.
 // RUN: foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=Shared models=Two netlist},foldsim-fold-static{module=Shared schedule-only})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=SHARED
-// RUN: not foldsim-opt %s --mlir-print-op-on-diagnostic=false --pass-pipeline="builtin.module(foldsim-extract-models{module=Shared models=Two netlist},foldsim-fold-static{module=Shared schedule-only ready-levels=off})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=OFF
+// RUN: foldsim-opt %s --mlir-print-op-on-diagnostic=false --pass-pipeline="builtin.module(foldsim-extract-models{module=Shared models=Two netlist},foldsim-fold-static{module=Shared schedule-only ready-levels=off})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=MOVED
 // RUN: foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=Shared models=Two netlist},foldsim-fold-static{module=Shared})" 2>/dev/null | FileCheck %s --check-prefix=SIM
 // RUN: foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=Chain models=Csr,Slice netlist},foldsim-fold-static{module=Chain schedule-only})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=CHAIN
 // RUN: not foldsim-opt %s --mlir-print-op-on-diagnostic=false --pass-pipeline="builtin.module(foldsim-extract-models{module=Chain models=Csr,Slice netlist},foldsim-fold-static{module=Chain schedule-only ready-levels=off})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=OFF
@@ -22,6 +22,12 @@
 // SHARED-NEXT: state:
 // SHARED-NEXT: late y1 @ready <- x1
 // SHARED-NEXT: late y2 @ready2 <- x2
+// Without the split, the ready-pass search moves `y2` (the output whose
+// ready pass reads the other instance's) to the state pass: the same frame.
+// MOVED: II = 10
+// MOVED: Two x2 (ready pass)
+// MOVED: late y1 @ready <- x1
+// MOVED-NEXT: late y2 @state (moved) <- x2
 // OFF: error: the evaluations of a frame depend on each other in a cycle for every choice of ready passes
 // OFF-NOT: split by level
 // The second pass writes `y2`'s links at its own enable, a host cycle-delayed

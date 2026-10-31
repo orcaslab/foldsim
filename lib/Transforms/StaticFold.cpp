@@ -35,10 +35,12 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/GlobPattern.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/raw_ostream.h"
 #include <deque>
 #include <map>
+#include <numeric>
 #include <set>
 
 namespace foldsim {
@@ -93,6 +95,11 @@ struct Class {
   SmallVector<std::string> inputNames, outputNames;
   SmallVector<Type> inputTypes, outputTypes;
   int clockInput = -1;
+  /// Pure logic: no registers, memories or black boxes, and so it needs no
+  /// clock. Its outputs are late or constant; its state pass writes no state
+  /// and a ready pass computes the same outputs a slot of its own earlier,
+  /// which the search for ready passes weighs as for any class.
+  bool stateless = false;
   /// The class it was split from by copies, or -1.
   int splitFrom = -1;
   /// Nested folding: the class of its instances' parents (-1 for a root),
@@ -284,7 +291,9 @@ public:
                unsigned forwardAfterLevels, bool shareLinkWrites,
                ArrayRef<std::string> page, bool pageMasks,
                unsigned pageHbmColumnBits, unsigned pageHbmWindow,
-               unsigned pageMemoryBits, StringRef pageMemories)
+               unsigned pageMemoryBits, StringRef pageMemories,
+               unsigned zeroChainHops, bool compactLinks,
+               ArrayRef<std::string> registeredLinks)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -302,6 +311,8 @@ public:
         shareLinkWrites(shareLinkWrites), pageSpecs(page), pageMasks(pageMasks),
         pageHbmColumnBits(pageHbmColumnBits), pageHbmWindow(pageHbmWindow),
         pageMemoryBits(pageMemoryBits), pageMemories(pageMemories.str()),
+        zeroChainHops(zeroChainHops),
+        compactLinks(compactLinks), registeredLinkSpecs(registeredLinks),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + decisionLead()),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -345,6 +356,8 @@ private:
     ReadyWrites writes;
     SmallVector<SmallVector<int>> slots;
     SmallVector<int> outputSlot;
+    /// The late outputs moved to their state pass (`stateOnly`).
+    DenseSet<unsigned> moved;
   };
   Choice searchReady();
   /// Assigns the classes to SLR groups (`slrOf`): within the capacity, the
@@ -384,20 +397,43 @@ private:
   /// Places every evaluation of the given choice of ready passes; II, or 0
   /// if the evaluations depend on each other in a cycle.
   unsigned place(ArrayRef<bool> ready, SmallVectorImpl<SmallVector<int>> &slots,
-                 ReadyWrites &writes);
+                 ReadyWrites &writes, unsigned below = 0);
+  /// The evaluations of the last cycle `place` found, for the search for
+  /// ready passes and the error.
+  std::string lastCycle;
+  SmallVector<Node> lastCycleNodes;
+  /// The search for ready passes: the choices placed, and those not placed
+  /// as no shorter than the best frame by their bound.
+  unsigned searchPlaced = 0, searchPruned = 0;
+  /// What each instance of each class reads from late outputs, input by
+  /// input in order, with the link's latency: the same for every choice of
+  /// ready passes, so built once for a search (`frameGraph`); cleared where
+  /// the links' latencies change (chain cuts, SLR groups).
+  struct LateRead {
+    unsigned input, producer, inst;
+    int latency;
+  };
+  std::vector<std::vector<SmallVector<LateRead, 4>>> lateReads;
+  /// Late outputs written at their class's state pass even with a ready
+  /// pass: what the search for ready passes moved out of a cycle.
+  DenseSet<unsigned> stateOnly;
+  /// The outputs written at the ready pass of the k-th evaluation of a cycle
+  /// that read the evaluation before it: what moving to the state pass cuts.
+  SmallVector<unsigned> readersOf(ArrayRef<Node> cycle, unsigned k,
+                                  const ReadyWrites &writes);
   /// Names a shortest cycle of the evaluations of the given choice of ready
   /// passes, edge by edge, on the diagnostic: which link each waits on, and
   /// whether a ready pass could break it.
   void explainCycle(ArrayRef<bool> ready, InFlightDiagnostic &diag);
   /// Places the evaluations with consecutive frames overlapped: the shortest
   /// frame at which every copy's evaluations fit, modulo the frame, and every
-  /// dependence across frames holds; 0 if none does.
+  /// dependence across frames holds, shorter than `below`; 0 if none does.
   unsigned placeModulo(
       ArrayRef<Node> nodes,
       ArrayRef<SmallVector<std::pair<unsigned, int>>> preds,
       ArrayRef<SmallVector<std::pair<unsigned, int>>> succs,
       ArrayRef<int> height, const ReadyWrites &writes,
-      SmallVectorImpl<SmallVector<int>> &slots);
+      SmallVectorImpl<SmallVector<int>> &slots, unsigned below);
   LogicalResult buildCopy(Class &cls);
   LogicalResult buildSim();
 
@@ -512,6 +548,36 @@ private:
   int minStateGap(const Class &cls) const;
   /// Whether class `c`'s state passes use its page port.
   bool paged(unsigned c) const { return classes[c].page > 0; }
+  /// `zero-chain-hops`: the most zero-latency links a path may take within
+  /// a host cycle (0: unbounded), and the links cut to keep it (chainCuts),
+  /// each as (producer, consumer class, input).
+  unsigned zeroChainHops;
+  /// `compact-links`: a link memory holds only the producer instances its
+  /// reader takes.
+  bool compactLinks;
+  /// `registered-links`: the classes whose links are never zero-latency,
+  /// as globs, and whether each class (a copy by its class) matches.
+  ArrayRef<std::string> registeredLinkSpecs;
+  SmallVector<bool> registeredLinks;
+  LogicalResult parseRegisteredLinks();
+  /// One link memory (a read of a producer's bits by a class input, a run of
+  /// bits with the same sources): the producer, its bits, and the producer
+  /// instances the reader takes, sorted and distinct.
+  struct LinkUse {
+    unsigned producer, low, width, reader;
+    SmallVector<uint64_t> rows;
+  };
+  /// Every link memory the simulator builds, as buildSim cuts them.
+  void linkUses(std::vector<LinkUse> &uses) const;
+  /// Whether a link of producer `p` whose reader takes `rows` is compacted.
+  bool compacted(unsigned p, size_t rows) const {
+    unsigned threads = classes[producers[p].cls].threads();
+    return compactLinks && threads > 1 && rows < threads;
+  }
+  std::set<std::tuple<unsigned, unsigned, unsigned>> cutLinks;
+  /// Counts, instance by instance, the zero-latency links on the paths into
+  /// each late output and cuts the links that would pass `zeroChainHops`.
+  void chainCuts();
   // Host cycles from a late netlist output's slot to the next frame's first.
   int envRoundTrip;
   /// Whether producer `p`'s link to class `c`'s input may be taken in the
@@ -685,6 +751,14 @@ LogicalResult StaticFolder::decompose(Value value, unsigned low,
   return op->emitError("not wiring of a netlist");
 }
 
+/// Whether a model is pure logic: no registers, memories or black boxes.
+static bool isStateless(hw::HWModuleOp model) {
+  for (auto &op : *model.getBodyBlock())
+    if (isa<seq::FirRegOp, seq::FirMemOp, seq::CompRegOp, hw::InstanceOp>(op))
+      return false;
+  return true;
+}
+
 LogicalResult StaticFolder::collect() {
   auto *body = netlist.getBodyBlock();
   for (auto aggregate :
@@ -729,7 +803,10 @@ LogicalResult StaticFolder::collect() {
         cls.outputNames.push_back(cast<StringAttr>(name).getValue().str());
         cls.outputTypes.push_back(instance.getResult(o).getType());
       }
-      if (cls.clockInput < 0)
+      // A stateless model (no registers, memories or black boxes) is pure
+      // logic and needs no clock: its outputs are all late.
+      cls.stateless = isStateless(model);
+      if (cls.clockInput < 0 && !cls.stateless)
         return instance.emitError("a model has a clock input");
     }
     auto &cls = classes[it->second];
@@ -853,6 +930,7 @@ LogicalResult StaticFolder::splitCopies() {
       copy.inputTypes = classes[c].inputTypes;
       copy.outputTypes = classes[c].outputTypes;
       copy.clockInput = classes[c].clockInput;
+      copy.stateless = classes[c].stateless;
       copy.splitFrom = c;
       copy.parent = classes[c].parent;
       copy.depth = classes[c].depth;
@@ -1129,15 +1207,38 @@ LogicalResult StaticFolder::analyze(Class &cls) {
   return success();
 }
 
+LogicalResult StaticFolder::parseRegisteredLinks() {
+  registeredLinks.assign(classes.size(), false);
+  for (auto &spec : registeredLinkSpecs) {
+    auto glob = llvm::GlobPattern::create(spec);
+    if (!glob)
+      return netlist.emitError("registered-links: '") << spec
+                                                      << "' is not a glob";
+    bool any = false;
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      int base = cls.splitFrom >= 0 ? cls.splitFrom : int(c);
+      if (glob->match(classes[base].name)) {
+        registeredLinks[c] = any = true;
+      }
+    }
+    if (!any)
+      return netlist.emitError("registered-links: no class matches '")
+             << spec << "'";
+  }
+  return success();
+}
+
 bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   auto &producer = producers[p];
   if (!zeroLatencyLinks || producer.cls < 0 || !producer.late)
+    return false;
+  if (!registeredLinks.empty() && registeredLinks[producer.cls])
     return false;
   // Between SLR groups a link is registered on both sides of the crossing.
   if (crosses(producer.cls, c))
     return false;
   if (zeroLatencyChains)
-    return true;
+    return !cutLinks.count({p, c, input});
   auto &cls = classes[c];
   if (cls.inputToOutput.test(input))
     return false;
@@ -1145,6 +1246,141 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   return classes[producer.cls].outputDepth[producer.port] +
              cls.inputDepth[input] + 3 <=
          kZeroLinkLevels;
+}
+
+void StaticFolder::chainCuts() {
+  lateReads.clear();
+  cutLinks.clear();
+  if (!zeroLatencyLinks || !zeroLatencyChains || !zeroChainHops)
+    return;
+  // Instance by instance: a late output's hops, the most zero-latency links
+  // on a path into it within its host cycle (each adds its reader's choice
+  // of source to the path); a link from it takes one more. A link that
+  // would take a chain past `zeroChainHops` is cut: read a host cycle later
+  // from its register, where the chain starts anew.
+  struct Edge {
+    unsigned p, pinst, c, cinst, input;
+  };
+  std::vector<Edge> edges;
+  for (auto &consumer : consumers) {
+    if (consumer.cls < 0)
+      continue;
+    for (auto [ci, pieces] : llvm::enumerate(consumer.pieces))
+      for (auto &piece : pieces)
+        if (piece.producer >= 0 && producers[piece.producer].cls >= 0 &&
+            producers[piece.producer].late)
+          edges.push_back({unsigned(piece.producer), piece.inst,
+                           unsigned(consumer.cls), unsigned(ci),
+                           consumer.port});
+  }
+  llvm::sort(edges, [](const Edge &a, const Edge &b) {
+    return std::tie(a.p, a.pinst, a.c, a.cinst, a.input) <
+           std::tie(b.p, b.pinst, b.c, b.cinst, b.input);
+  });
+  edges.erase(std::unique(edges.begin(), edges.end(),
+                          [](const Edge &a, const Edge &b) {
+                            return std::tie(a.p, a.pinst, a.c, a.cinst,
+                                            a.input) ==
+                                   std::tie(b.p, b.pinst, b.c, b.cinst,
+                                            b.input);
+                          }),
+              edges.end());
+  // Hops per (producer, instance), to a fixed point, held at the bound plus
+  // one where port-level dependences make a loop.
+  int cap = int(zeroChainHops) + 1;
+  std::map<std::pair<unsigned, unsigned>, int> hops;
+  auto settle = [&] {
+    hops.clear();
+    std::map<std::tuple<unsigned, unsigned, unsigned>, int> in;
+    for (bool changed = true; changed;) {
+      changed = false;
+      for (auto &e : edges) {
+        if (cutLinks.count({e.p, e.c, e.input}))
+          continue;
+        int at = hops[{e.p, e.pinst}] + 1;
+        int &slot = in[{e.c, e.cinst, e.input}];
+        slot = std::max(slot, at);
+      }
+      for (auto [p, producer] : llvm::enumerate(producers)) {
+        if (producer.cls < 0 || !producer.late)
+          continue;
+        auto &cls = classes[producer.cls];
+        for (unsigned i = 0; i < cls.threads(); ++i) {
+          int at = 0;
+          for (auto input : cls.deps[producer.port].set_bits())
+            if (auto it = in.find({unsigned(producer.cls), i, unsigned(input)});
+                it != in.end())
+              at = std::max(at, it->second);
+          at = std::min(at, cap);
+          int &h = hops[{unsigned(p), i}];
+          if (at > h) {
+            h = at;
+            changed = true;
+          }
+        }
+      }
+    }
+  };
+  // Cut the links where a chain first passes the bound, then again, until
+  // none does.
+  for (;;) {
+    settle();
+    std::set<std::tuple<unsigned, unsigned, unsigned>> cut;
+    for (auto &e : edges)
+      if (!cutLinks.count({e.p, e.c, e.input}) &&
+          hops[{e.p, e.pinst}] + 1 > int(zeroChainHops) &&
+          hops[{e.p, e.pinst}] == int(zeroChainHops))
+        cut.insert({e.p, e.c, e.input});
+    if (cut.empty())
+      break;
+    cutLinks.insert(cut.begin(), cut.end());
+    if (getenv("FOLDSIM_CHAIN_DEBUG"))
+      for (auto &[p, c, input] : cut)
+        llvm::errs() << "chain cut " << classes[producers[p].cls].name << "."
+                     << classes[producers[p].cls].outputNames[producers[p].port]
+                     << " -> " << classes[c].name << "."
+                     << classes[c].inputNames[input] << "\n";
+  }
+}
+
+void StaticFolder::linkUses(std::vector<LinkUse> &uses) const {
+  // As buildSim cuts a class input: at every bit where any instance's piece
+  // starts or ends, each run of bits read from each class producer (and the
+  // low bit there) its own link, at the producer instances the reader's
+  // instances take.
+  for (auto &consumer : consumers) {
+    if (consumer.cls < 0)
+      continue;
+    unsigned threads = classes[consumer.cls].threads();
+    std::set<unsigned> cuts{consumer.width};
+    for (auto &pieces : consumer.pieces) {
+      unsigned at = 0;
+      for (auto &piece : pieces)
+        cuts.insert(at += piece.width);
+    }
+    unsigned at = 0;
+    for (unsigned end : cuts) {
+      if (end == at)
+        continue;
+      std::map<std::pair<unsigned, unsigned>, std::set<uint64_t>> sources;
+      for (unsigned i = 0; i < threads; ++i) {
+        unsigned base = 0;
+        for (auto &piece : consumer.pieces[i]) {
+          if (at < base + piece.width) {
+            if (piece.producer >= 0 && producers[piece.producer].cls >= 0)
+              sources[{unsigned(piece.producer), piece.low + at - base}]
+                  .insert(piece.inst);
+            break;
+          }
+          base += piece.width;
+        }
+      }
+      for (auto &[key, rows] : sources)
+        uses.push_back({key.first, key.second, end - at, unsigned(consumer.cls),
+                        SmallVector<uint64_t>(rows.begin(), rows.end())});
+      at = end;
+    }
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -1462,7 +1698,8 @@ void StaticFolder::frameGraph(ArrayRef<bool> ready, ReadyWrites &writes,
   atReady.assign(producers.size(), false);
   writes.level.assign(producers.size(), 0);
   for (auto [p, producer] : llvm::enumerate(producers))
-    if (producer.cls >= 0 && producer.late && ready[producer.cls])
+    if (producer.cls >= 0 && producer.late && ready[producer.cls] &&
+        !stateOnly.contains(p))
       atReady[p] = true;
   settleReady(writes);
   writes.passes.assign(classes.size(), 0);
@@ -1478,27 +1715,56 @@ void StaticFolder::frameGraph(ArrayRef<bool> ready, ReadyWrites &writes,
       writes.rows += writes.passes[c] - 1;
   }
 
-  // The evaluations, and what each waits for within the frame.
+  // What each instance reads from late outputs, once for the search.
+  if (lateReads.empty()) {
+    lateReads.resize(classes.size());
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      lateReads[c].resize(cls.threads());
+      for (unsigned i = 0; i < cls.threads(); ++i)
+        for (unsigned input = 0; input < cls.inputNames.size(); ++input) {
+          int k = cls.consumerOf[input];
+          if (k < 0)
+            continue;
+          for (auto &piece : consumers[k].pieces[i]) {
+            if (piece.producer < 0)
+              continue;
+            auto &producer = producers[piece.producer];
+            if (producer.cls < 0 || !producer.late)
+              continue;
+            lateReads[c][i].push_back(
+                {input, unsigned(piece.producer), piece.inst,
+                 zeroLink(piece.producer, c, input)
+                     ? 0
+                     : int(linkLatency + crossDelay(producer.cls, c))});
+          }
+        }
+    }
+  }
+
+  // The evaluations, and what each waits for within the frame: each
+  // instance's ready passes by level, then its state pass.
   auto &nodes = graph.nodes;
   auto &preds = graph.preds;
   nodes.clear();
-  std::map<std::tuple<unsigned, unsigned, unsigned, unsigned>, unsigned>
-      nodeIndex;
-  for (auto [c, cls] : llvm::enumerate(classes))
+  SmallVector<unsigned> base(classes.size());
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    base[c] = nodes.size();
     for (unsigned i = 0; i < cls.threads(); ++i)
       for (auto pass : {kReady, kState})
-        for (unsigned l = 0; l < (pass == kReady ? writes.passes[c] : 1);
-             ++l) {
-          nodeIndex[{c, i, pass, l}] = nodes.size();
+        for (unsigned l = 0; l < (pass == kReady ? writes.passes[c] : 1); ++l)
           nodes.push_back({unsigned(c), i, pass, l});
-        }
+  }
+  auto nodeIndex = [&](unsigned c, unsigned i, Pass pass, unsigned l) {
+    return base[c] + i * (writes.passes[c] + 1) +
+           (pass == kReady ? l : writes.passes[c]);
+  };
   preds.assign(nodes.size(), {});
   graph.why.assign(keepWhy ? nodes.size() : 0, {});
   for (auto [n, node] : llvm::enumerate(nodes)) {
     auto &cls = classes[node.cls];
     if (node.pass == kState)
       for (unsigned l = 0; l < writes.passes[node.cls]; ++l) {
-        preds[n].push_back({nodeIndex[{node.cls, node.inst, kReady, l}], 1});
+        preds[n].push_back({nodeIndex(node.cls, node.inst, kReady, l), 1});
         if (keepWhy)
           graph.why[n].push_back({});
       }
@@ -1511,26 +1777,16 @@ void StaticFolder::frameGraph(ArrayRef<bool> ready, ReadyWrites &writes,
         if (atReady[p] && writes.level[p] == node.level)
           reads |= cls.deps[o];
       }
-    for (auto input : reads.set_bits()) {
-      int k = cls.consumerOf[input];
-      if (k < 0)
+    for (auto &read : lateReads[node.cls][node.inst]) {
+      if (!reads.test(read.input))
         continue;
-      for (auto &piece : consumers[k].pieces[node.inst]) {
-        if (piece.producer < 0)
-          continue;
-        auto &producer = producers[piece.producer];
-        if (producer.cls < 0 || !producer.late)
-          continue;
-        auto pass = writes.passOf(piece.producer);
-        unsigned l = pass == kReady ? writes.level[piece.producer] : 0;
-        preds[n].push_back(
-            {nodeIndex[{unsigned(producer.cls), piece.inst, pass, l}],
-             zeroLink(piece.producer, node.cls, input)
-                 ? 0
-                 : linkLatency + crossDelay(producer.cls, node.cls)});
-        if (keepWhy)
-          graph.why[n].push_back({piece.producer, unsigned(input)});
-      }
+      auto &producer = producers[read.producer];
+      auto pass = writes.passOf(read.producer);
+      unsigned l = pass == kReady ? writes.level[read.producer] : 0;
+      preds[n].push_back(
+          {nodeIndex(unsigned(producer.cls), read.inst, pass, l), read.latency});
+      if (keepWhy)
+        graph.why[n].push_back({int(read.producer), read.input});
     }
   }
 }
@@ -1568,9 +1824,33 @@ static unsigned writeRow(const ReadyWrites &writes, const Producer &producer,
              : writes.row(producer.cls, kState);
 }
 
+/// The first slot from `at` on a copy's slots `taken` leave free, the slots
+/// taken modulo `period` (0: not), and every residue not taken.
+static int firstFree(const llvm::BitVector &taken, int at, unsigned period) {
+  if (!period) {
+    if (at >= int(taken.size()))
+      return at;
+    int free = taken.find_first_unset_in(at, taken.size());
+    return free < 0 ? int(taken.size()) : free;
+  }
+  unsigned r = at % period;
+  int free = taken.find_first_unset_in(r, period);
+  if (free < 0)
+    return at + (period - r) + taken.find_first_unset();
+  return at + (free - r);
+}
+
+/// Takes slot `at` of a copy's slots (modulo `period`, 0: not).
+static void takeSlot(llvm::BitVector &taken, int at, unsigned period) {
+  unsigned bit = period ? at % period : at;
+  if (bit >= taken.size())
+    taken.resize(std::max<unsigned>(bit + 1, taken.size() * 2));
+  taken.set(bit);
+}
+
 unsigned StaticFolder::place(ArrayRef<bool> ready,
                              SmallVectorImpl<SmallVector<int>> &slots,
-                             ReadyWrites &writes) {
+                             ReadyWrites &writes, unsigned below) {
   FrameGraph graph;
   frameGraph(ready, writes, graph, /*keepWhy=*/false);
   auto &nodes = graph.nodes;
@@ -1593,8 +1873,23 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
       auto &[n, next] = stack.back();
       if (next < succs[n].size()) {
         unsigned s = succs[n][next++].first;
-        if (state[s] == 1)
+        if (state[s] == 1) {
+          // The cycle, for the search and the error: its evaluations in
+          // order, from `s` to the top of the stack.
+          auto at = llvm::find_if(stack, [&](auto &e) { return e.first == s; });
+          lastCycleNodes.clear();
+          lastCycle.clear();
+          llvm::raw_string_ostream os(lastCycle);
+          for (auto it = at; it != stack.end(); ++it) {
+            auto &node = nodes[it->first];
+            lastCycleNodes.push_back(node);
+            os << (it == at ? "" : " -> ") << classes[node.cls].name << "["
+               << node.inst << "]" << (node.pass == kReady ? " ready" : "");
+          }
+          os << " -> " << classes[nodes[s].cls].name << "[" << nodes[s].inst
+             << "]";
           return 0;
+        }
         if (state[s] == 0) {
           state[s] = 1;
           stack.push_back({s, 0});
@@ -1612,7 +1907,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
 
   // List scheduling: in topological order, highest first among the ready.
   SmallVector<int> slotOf(nodes.size(), -1);
-  std::vector<std::set<int>> busy(classes.size());
+  std::vector<llvm::BitVector> busy(classes.size());
   SmallVector<unsigned> waiting(nodes.size(), 0);
   for (unsigned n = 0; n < nodes.size(); ++n)
     waiting[n] = preds[n].size();
@@ -1645,9 +1940,10 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     unsigned c = nodes[n].cls;
     bool pages = nodes[n].pass == kState && paged(c);
     auto &taken = busy[c];
-    while (taken.count(earliest) || (pages && pageClash(c, earliest)))
-      ++earliest;
-    taken.insert(earliest);
+    earliest = firstFree(taken, earliest, 0);
+    while (pages && pageClash(c, earliest))
+      earliest = firstFree(taken, earliest + 1, 0);
+    takeSlot(taken, earliest, 0);
     if (pages)
       pageSlots[c].insert(earliest);
     slotOf[n] = earliest;
@@ -1750,7 +2046,9 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     SmallVector<SmallVector<int>> overlapped;
     SmallVector<int> aloneSlot = outputSlot;
     SmallVector<bool> aloneEarly = outputEarly;
-    unsigned period = placeModulo(nodes, preds, succs, height, writes, overlapped);
+    unsigned period =
+        placeModulo(nodes, preds, succs, height, writes, overlapped,
+                    below ? std::min<unsigned>(below, length) : length);
     if (period && period < unsigned(length)) {
       slots = std::move(overlapped);
       return period;
@@ -1761,10 +2059,42 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
   return length;
 }
 
+SmallVector<unsigned> StaticFolder::readersOf(ArrayRef<Node> cycle, unsigned k,
+                                              const ReadyWrites &writes) {
+  SmallVector<unsigned> moved;
+  auto &q = cycle[k];
+  auto &p = cycle[(k + cycle.size() - 1) % cycle.size()];
+  if (q.pass != kReady)
+    return moved;
+  // q's ready pass (of its level) waits for p: the outputs it writes that
+  // read p's class.
+  auto &cls = classes[q.cls];
+  for (auto [o, late] : llvm::enumerate(cls.late)) {
+    unsigned out = cls.producerOf[o];
+    if (!late || !writes.atReady[out] || writes.level[out] != q.level ||
+        stateOnly.contains(out))
+      continue;
+    bool reads = false;
+    for (auto input : cls.deps[o].set_bits()) {
+      int c = cls.consumerOf[input];
+      if (c < 0)
+        continue;
+      for (auto &piece : consumers[c].pieces[q.inst])
+        reads |= piece.producer >= 0 &&
+                 producers[piece.producer].cls == int(p.cls) &&
+                 producers[piece.producer].late;
+    }
+    if (reads)
+      moved.push_back(out);
+  }
+  return moved;
+}
+
 unsigned StaticFolder::placeModulo(
     ArrayRef<Node> nodes, ArrayRef<SmallVector<std::pair<unsigned, int>>> preds,
     ArrayRef<SmallVector<std::pair<unsigned, int>>> succs, ArrayRef<int> height,
-    const ReadyWrites &writes, SmallVectorImpl<SmallVector<int>> &slots) {
+    const ReadyWrites &writes, SmallVectorImpl<SmallVector<int>> &slots,
+    unsigned below) {
   auto &atReady = writes.atReady;
   // No frame is shorter than a copy's evaluations of it.
   SmallVector<unsigned> evaluations(classes.size(), 0);
@@ -1799,7 +2129,9 @@ unsigned StaticFolder::placeModulo(
       slack = std::max(slack, envSlackOf(k, late, period));
     return slack;
   };
-  for (unsigned period = lower; period <= 4 * lower + 64; ++period) {
+  // A frame no shorter than `below` is of no use: the frames apart are.
+  for (unsigned period = lower; period <= 4 * lower + 64 && period < below;
+       ++period) {
     // List scheduling, a copy's slots taken modulo the frame; an evaluation
     // runs at most one frame late.
     SmallVector<int> slotOf(nodes.size(), -1);
@@ -1900,6 +2232,8 @@ unsigned StaticFolder::placeModulo(
       }
       if (latest == INT_MAX)
         continue;
+      // The latest slot in (slotOf[n], latest] the copy leaves free, by
+      // blocks of residues from `latest` down.
       auto &taken = busy[node.cls];
       taken.erase(slotOf[n] % period);
       if (pages(n))
@@ -2465,7 +2799,10 @@ StaticFolder::Choice StaticFolder::searchReady() {
   // so every choice is placed and the shortest frame kept. Copies multiply
   // the classes: past a dozen, every choice of the models is placed with the
   // copies of a model alike, then single classes are flipped while the frame
-  // gets shorter.
+  // gets shorter. Past a dozen models (a crossbar's port arbiters as classes
+  // of their own, say), the search starts from no ready pass and from a ready
+  // pass for every model instead, with up to two models flipped until one
+  // places, and flips from there while the frame gets shorter.
   auto late = [](const Class &cls) {
     return llvm::any_of(cls.late, [](bool late) { return late; });
   };
@@ -2478,11 +2815,31 @@ StaticFolder::Choice StaticFolder::searchReady() {
     llvm::erase_if(candidates,
                    [&](unsigned c) { return classes[c].splitFrom >= 0; });
   Choice best;
-  auto tryReady = [&](const SmallVector<bool> &ready) {
+  stateOnly.clear();
+  lateReads.clear();
+  // A frame is at least as long as the evaluations of its busiest copy: a
+  // slot for each instance's state pass, and one for its ready pass. A
+  // choice whose bound is no shorter than the best frame found cannot better
+  // it, and is not placed (the result is the same; the search is not).
+  auto bound = [&](const SmallVector<bool> &ready) {
+    unsigned b = 0;
+    for (auto [c, cls] : llvm::enumerate(classes))
+      b = std::max(b, cls.threads() * (ready[c] ? 2u : 1u));
+    return b;
+  };
+  auto tryReady = [&](const SmallVector<bool> &ready, bool orEqual = false) {
+    if (best.length &&
+        (orEqual ? bound(ready) > best.length : bound(ready) >= best.length)) {
+      ++searchPruned;
+      return false;
+    }
+    ++searchPlaced;
     SmallVector<SmallVector<int>> slots;
     ReadyWrites writes;
-    unsigned length = place(ready, slots, writes);
-    if (!length || (best.length && length >= best.length))
+    unsigned length = place(ready, slots, writes,
+                            best.length ? best.length + (orEqual ? 1 : 0) : 0);
+    if (!length ||
+        (best.length && (orEqual ? length > best.length : length >= best.length)))
       return false;
     best.length = length;
     best.ready = ready;
@@ -2490,21 +2847,28 @@ StaticFolder::Choice StaticFolder::searchReady() {
     best.writes = std::move(writes);
     best.outputSlot = outputSlot;
     best.outputEarly = outputEarly;
+    best.moved = stateOnly;
     return true;
   };
-  auto search = [&] {
-    for (uint64_t mask = 0; mask < (uint64_t(1) << candidates.size());
-         ++mask) {
-      SmallVector<bool> ready(classes.size(), false);
-      for (auto [k, c] : llvm::enumerate(candidates))
-        ready[c] = (mask >> k) & 1;
-      if (alike)
-        for (auto [c, cls] : llvm::enumerate(classes))
-          if (cls.splitFrom >= 0)
-            ready[c] = ready[cls.splitFrom];
-      tryReady(ready);
-    }
-    for (bool shorter = alike && best.length; shorter;) {
+  // The choice of a ready pass for candidate k: bit k of `mask`, flipped for
+  // the candidates in `flips`.
+  auto choice = [&](uint64_t mask, ArrayRef<unsigned> flips = {}) {
+    SmallVector<bool> ready(classes.size(), false);
+    for (auto [k, c] : llvm::enumerate(candidates))
+      ready[c] = (k < 64 ? (mask >> k) & 1 : mask == ~uint64_t(0)) ^
+                 llvm::is_contained(flips, unsigned(k));
+    if (alike)
+      for (auto [c, cls] : llvm::enumerate(classes))
+        if (cls.splitFrom >= 0)
+          ready[c] = ready[cls.splitFrom];
+    return ready;
+  };
+  // Shorter frames from the best choice: single classes flipped; past a dozen
+  // models also a model with all its copies, and a model's ready pass dropped
+  // where the frame is no longer, so that the frame can shorten once the
+  // passes that set it are gone.
+  auto shorten = [&](bool greedy) {
+    for (bool shorter = (alike || greedy) && best.length; shorter;) {
       shorter = false;
       for (auto [c, cls] : llvm::enumerate(classes)) {
         if (!late(cls))
@@ -2513,24 +2877,106 @@ StaticFolder::Choice StaticFolder::searchReady() {
         ready[c] = !ready[c];
         shorter |= tryReady(ready);
       }
+      for (auto [c, cls] : llvm::enumerate(classes)) {
+        if (!greedy || !late(cls) || cls.splitFrom >= 0)
+          continue;
+        auto from = best.ready;
+        auto ready = from;
+        for (auto [d, other] : llvm::enumerate(classes))
+          if (d == c || other.splitFrom == int(c))
+            ready[d] = !from[c];
+        unsigned before = best.length;
+        if (tryReady(ready, /*orEqual=*/!ready[c]))
+          shorter |= best.length < before || !ready[c];
+      }
     }
   };
-  // With `auto`, only where one ready pass per class leaves a cycle for every
-  // choice are a class's ready outputs split by level: a schedule found
-  // without is kept as it is (for each assignment of SLR groups alike).
-  // `always` and `rank` split them from the start (schedule).
+  auto search = [&] {
+    bool greedy = candidates.size() > 12;
+    if (greedy) {
+      // No ready pass, a ready pass for every model, then those with one or
+      // two models flipped, until a choice places.
+      unsigned n = candidates.size();
+      for (uint64_t seed : {uint64_t(0), ~uint64_t(0)})
+        tryReady(choice(seed));
+      for (uint64_t seed : {~uint64_t(0), uint64_t(0)})
+        for (unsigned k = 0; k < n && !best.length; ++k)
+          tryReady(choice(seed, {k}));
+      for (uint64_t seed : {~uint64_t(0), uint64_t(0)})
+        for (unsigned k = 0; k < n && !best.length; ++k)
+          for (unsigned j = k + 1; j < n && !best.length; ++j)
+            tryReady(choice(seed, {k, j}));
+    } else {
+      for (uint64_t mask = 0; mask < (uint64_t(1) << candidates.size());
+           ++mask)
+        tryReady(choice(mask));
+    }
+    shorten(greedy);
+  };
+  // Every late output a ready pass can compute is written there, which can
+  // make a ready pass both feed a class and read it (a crossbar's port
+  // arbiter between its parent's request and ready logic). Then, from a ready
+  // pass for every model, the outputs that close the cycle found are moved to
+  // their state pass, one cycle at a time (a parent's ready pass first, depth
+  // first within a budget of placements), until a choice places.
+  auto moveOut = [&] {
+    auto ready = choice(~uint64_t(0));
+    unsigned budget = 256;
+    std::function<bool()> attempt = [&]() {
+      if (!budget--)
+        return false;
+      SmallVector<SmallVector<int>> slots;
+      ReadyWrites writes;
+      if (place(ready, slots, writes))
+        return tryReady(ready);
+      auto cycle = lastCycleNodes;
+      SmallVector<unsigned> order(cycle.size());
+      std::iota(order.begin(), order.end(), 0);
+      llvm::stable_sort(order, [&](unsigned x, unsigned y) {
+        return classes[cycle[x].cls].depth < classes[cycle[y].cls].depth;
+      });
+      for (auto k : order) {
+        auto moved = readersOf(cycle, k, writes);
+        if (moved.empty())
+          continue;
+        for (auto out : moved)
+          stateOnly.insert(out);
+        if (attempt())
+          return true;
+        for (auto out : moved)
+          stateOnly.erase(out);
+      }
+      return false;
+    };
+    if (attempt())
+      shorten(/*greedy=*/true);
+  };
+  // Where no choice of one ready pass per class places: outputs moved out of
+  // the cycles, and (with `auto`) a class's ready outputs split by level; the
+  // shorter frame is kept, the split passes on a tie (no output written
+  // later than its inputs allow). A schedule found
+  // without either is kept as it is (for each assignment of SLR groups
+  // alike). `always` and `rank` split them from the start (schedule).
   search();
-  if (!best.length && readyLevelsMode == "auto" && !splitReady) {
+  if (best.length)
+    return best;
+  moveOut();
+  if (readyLevelsMode == "auto" && !splitReady) {
+    Choice moved = std::move(best);
+    best = Choice();
+    stateOnly.clear();
     splitReady = true;
     search();
     // Split for this choice only; left split when nothing schedules, so the
     // cycle is named for the split passes (explainCycle).
-    if (best.length)
+    if (best.length || moved.length)
       splitReady = false;
+    if (moved.length && (!best.length || moved.length < best.length))
+      best = std::move(moved);
   }
+  stateOnly = best.moved;
   return best;
 }
-
 
 void StaticFolder::linkBits(SmallVectorImpl<SmallVector<uint64_t>> &bits,
                             SmallVectorImpl<SmallVector<unsigned>> &links) const {
@@ -2951,18 +3397,12 @@ LogicalResult StaticFolder::parsePages() {
 }
 
 LogicalResult StaticFolder::schedule() {
+  chainCuts();
   auto late = [](const Class &cls) {
     return llvm::any_of(cls.late, [](bool late) { return late; });
   };
   // Past a dozen classes with late outputs, the copies of a model choose
-  // alike (searchReady).
-  unsigned lateClasses = llvm::count_if(classes, late), lateModels = 0;
-  for (auto &cls : classes)
-    lateModels += late(cls) && (lateClasses <= 12 || cls.splitFrom < 0);
-  if (lateModels > 12)
-    return netlist.emitError("too many models with late outputs to choose "
-                             "their ready passes: ")
-           << lateModels;
+  // alike; past a dozen models, the search is greedy (searchReady).
   // With `auto`, a class's ready outputs are split by level only where one
   // ready pass per class leaves a cycle for every choice (searchReady).
   // `always` splits them from the start (a class whose levels all merge keeps
@@ -2986,6 +3426,8 @@ LogicalResult StaticFolder::schedule() {
     auto diag = netlist.emitError("the evaluations of a frame depend on each "
                                   "other in a cycle for every choice of ready "
                                   "passes");
+    if (!lastCycle.empty())
+      diag << " (last tried: " << lastCycle << ")";
     explainCycle(ready, diag);
     return diag;
   }
@@ -3048,6 +3490,12 @@ LogicalResult StaticFolder::schedule() {
       }
     }
     os << "  zero-latency links: " << zero << " of " << links << "\n";
+    if (searchPruned)
+      os << "  ready-pass search: " << searchPlaced << " choices placed, "
+         << searchPruned << " bounded out\n";
+    if (zeroChainHops && zeroLatencyChains)
+      os << "  chains cut past " << zeroChainHops << " hops: "
+         << cutLinks.size() << " links\n";
   }
   if (!slrOf.empty()) {
     SmallVector<SmallVector<uint64_t>> bits;
@@ -3099,6 +3547,8 @@ LogicalResult StaticFolder::schedule() {
     if (nest)
       os << " depth " << cls.depth
          << (cls.parent >= 0 ? " under " + classes[cls.parent].name : "");
+    if (cls.stateless)
+      os << " stateless";
     os << "\n";
     for (unsigned l = 0; l < cls.readyLevels; ++l) {
       os << "    ready" << (l ? std::to_string(l + 1) : "") << ":";
@@ -3119,11 +3569,78 @@ LogicalResult StaticFolder::schedule() {
              : producer.readyLevel
                  ? " @ready" + std::to_string(producer.readyLevel + 1)
                  : std::string(" @ready"))
+         << (stateOnly.contains(cls.producerOf[o]) ? " (moved)" : "")
          << " <-";
       for (auto input : cls.deps[o].set_bits())
         os << " " << cls.inputNames[input];
       os << "\n";
     }
+  }
+  {
+    // The links' storage, as buildSim makes it: a register for a late link
+    // of one entry, else a memory of an entry per producer instance (per
+    // instance read, compacted), doubled by frame parity for an early one;
+    // distributed RAM's LUTs as the cost model counts them (foldsim_cost
+    // mem_cost: one read port, asynchronous).
+    std::vector<LinkUse> uses;
+    linkUses(uses);
+    uint64_t memBits = 0, regBits = 0, compactSaved = 0;
+    double luts = 0;
+    unsigned memories = 0, compactMemories = 0;
+    auto depthOf = [&](unsigned entries, bool banked) -> uint64_t {
+      unsigned indices = entries > 1 ? llvm::PowerOf2Ceil(entries) : 1;
+      return banked ? 2 * indices : entries;
+    };
+    auto lutram = [](uint64_t depth, unsigned width) {
+      if (depth <= 32)
+        return width * 0.57;
+      uint64_t blocks = (depth + 63) / 64;
+      return width * blocks * 1.14 +
+             (depth > 64 ? width * (blocks - 1) / 3.0 : 0.0);
+    };
+    // By producer and reading class: (LUTRAM, bits).
+    std::map<std::pair<unsigned, unsigned>, std::pair<double, uint64_t>> byPair;
+    for (auto &use : uses) {
+      auto &producer = producers[use.producer];
+      bool banked = !producer.late;
+      unsigned threads = classes[producer.cls].threads();
+      unsigned entries = compacted(use.producer, use.rows.size())
+                             ? use.rows.size()
+                             : threads;
+      bool register_ = entries == 1 && !banked;
+      uint64_t depth = register_ ? 1 : depthOf(entries, banked);
+      if (entries < threads) {
+        ++compactMemories;
+        compactSaved += (depthOf(threads, banked) - depth) * use.width;
+      }
+      if (register_) {
+        regBits += use.width;
+        continue;
+      }
+      ++memories;
+      memBits += depth * use.width;
+      luts += lutram(depth, use.width);
+      auto &pair = byPair[{unsigned(producer.cls), use.reader}];
+      pair.first += lutram(depth, use.width);
+      pair.second += depth * use.width;
+    }
+    os << "  link storage: " << memories << " memories, " << memBits
+       << " bits, " << uint64_t(luts) << " LUTRAM LUTs; " << regBits
+       << " register bits";
+    if (compactLinks)
+      os << "; compact: " << compactMemories << " links, "
+         << compactSaved << " bits saved";
+    os << "\n";
+    // The largest, by the classes they join.
+    SmallVector<std::pair<std::pair<unsigned, unsigned>, std::pair<double, uint64_t>>>
+        largest(byPair.begin(), byPair.end());
+    llvm::sort(largest, [](auto &x, auto &y) {
+      return x.second.first > y.second.first;
+    });
+    for (auto &[pair, cost] : ArrayRef(largest).take_front(8))
+      os << "    links " << classes[pair.first].name << " -> "
+         << classes[pair.second].name << ": " << uint64_t(cost.first)
+         << " LUTRAM LUTs, " << cost.second << " bits\n";
   }
   for (auto [k, consumer] : llvm::enumerate(consumers))
     if (consumer.cls < 0)
@@ -3958,7 +4475,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
       if (reg.getIsAsync())
         return reg.emitError("asynchronous reset in a folded model");
-      if (reg.getClk() != modelBody->getArgument(cls.clockInput))
+      if (cls.clockInput < 0 ||
+          reg.getClk() != modelBody->getArgument(cls.clockInput))
         return reg.emitError("register not on the model's clock");
     }
     if (auto memory = dyn_cast<seq::FirMemOp>(op)) {
@@ -6147,17 +6665,33 @@ LogicalResult StaticFolder::buildSim() {
       written = reg(data, producers[p].name + "_written_" + Twine(low));
     return written;
   };
+  // A compact link's write side (`compact-links`), per link group and set of
+  // producer instances kept: each instance's entry and whether it is kept, by
+  // tables of the slot's instance registered as the group's instance is (and
+  // a host cycle later for a late write).
+  struct CompactWrite {
+    Value inst, member, instLate, memberLate;
+  };
+  std::map<std::pair<std::string, std::vector<uint64_t>>, CompactWrite>
+      compactWrites;
+  // With `compact` (the producer instances the reader takes, sorted), the
+  // link keeps an entry for each of those alone, at its index among them;
+  // the other instances' writes are masked, and so are their forwards and
+  // takes (a masked write's entry may be a kept one's). The reader's address
+  // is then that index.
   auto linkRead = [&](unsigned p, unsigned low, unsigned width,
                       function_ref<Value()> address, function_ref<Value()> bank,
                       const Twine &linkName, int to,
                       std::pair<Value, Value> *now = nullptr,
                       bool forward = true,
                       SmallVectorImpl<AfterForward> *after = nullptr,
-                      bool late = false, bool forwardLate = false) -> Value {
+                      bool late = false, bool forwardLate = false,
+                      ArrayRef<uint64_t> compact = {}) -> Value {
     auto &producer = producers[p];
     unsigned c = producer.cls;
     auto &ctl = controls[c];
-    unsigned threads = classes[c].threads();
+    unsigned threads =
+        compact.empty() ? classes[c].threads() : unsigned(compact.size());
     bool banked = !producer.late;
     bool crossing = to >= 0 && !slrOf.empty() && slrOf[c] != to;
     assert(!(crossing && now) && "a link between SLR groups is never zero");
@@ -6201,9 +6735,52 @@ LogicalResult StaticFolder::buildSim() {
         if (crossing)
           enable = copyReg(enable, group.prefix + pass + "_late");
       }
+      // A compact link's entry and mask, registered as the group's.
+      Value member, memberLate, compactInst, compactInstLate;
+      if (!compact.empty()) {
+        auto &cw = compactWrites[{group.prefix,
+                                  std::vector<uint64_t>(compact.begin(),
+                                                        compact.end())}];
+        if (!cw.member) {
+          unsigned producerThreads = classes[c].threads();
+          SmallVector<uint64_t> index(producerThreads, 0),
+              kept(producerThreads, 0);
+          for (auto [k, r] : llvm::enumerate(compact)) {
+            index[r] = k;
+            kept[r] = 1;
+          }
+          std::string prefix =
+              group.prefix + "_compact" + std::to_string(compactWrites.size());
+          cw.member = copyReg(copyReg(table(b, ctl.inst2, kept, 1),
+                                      prefix + "_member1"),
+                              prefix + "_member0");
+          if (crossing)
+            cw.member = copyReg(cw.member, prefix + "_member_late");
+          if (threads > 1) {
+            cw.inst = copyReg(
+                copyReg(table(b, ctl.inst2, index, llvm::Log2_32_Ceil(threads)),
+                        prefix + "_inst1"),
+                prefix + "_inst0");
+            if (crossing)
+              cw.inst = copyReg(cw.inst, prefix + "_inst_late");
+          }
+        }
+        member = cw.member;
+        compactInst = cw.inst;
+        if (late) {
+          if (!cw.memberLate)
+            cw.memberLate = copyReg(cw.member, group.prefix + "_member_late");
+          memberLate = cw.memberLate;
+          if (cw.inst && !cw.instLate)
+            cw.instLate = copyReg(cw.inst, group.prefix + "_cinst_late");
+          compactInstLate = cw.instLate;
+        }
+      }
+      // The pass's enable, masked to the kept instances.
+      Value kept = member ? Value(comb::AndOp::create(b, enable, member)) : enable;
       if (now && !banked) {
         if (!now->first)
-          now->first = enable;
+          now->first = kept;
         nowPieces.push_back(data);
       }
       // What the link is written with, and when.
@@ -6223,6 +6800,9 @@ LogicalResult StaticFolder::buildSim() {
                           "_late");
         writeEnable = lateEnable;
       }
+      if (member)
+        writeEnable = comb::AndOp::create(b, writeEnable,
+                                          late ? memberLate : member);
       if (threads == 1 && !banked) {
         auto next = backedges.get(data.getType());
         Value r = reg(next, name);
@@ -6233,9 +6813,9 @@ LogicalResult StaticFolder::buildSim() {
           value = written;
         if (oneCycleLinks && forward) {
           if (after)
-            after->push_back({at, w, enable, data});
+            after->push_back({at, w, kept, data});
           else
-            value = late ? comb::MuxOp::create(b, enable, data, value).getResult()
+            value = late ? comb::MuxOp::create(b, kept, data, value).getResult()
                          : written;
         }
         pieces.push_back(value);
@@ -6270,13 +6850,13 @@ LogicalResult StaticFolder::buildSim() {
         readAddress.push_back(bank());
       }
       if (threads > 1) {
-        if (!group.inst) {
+        if (compact.empty() && !group.inst) {
           group.inst = copyReg(copyReg(ctl.inst2, group.prefix + "_inst1"),
                                group.prefix + "_inst0");
           if (crossing)
             group.inst = copyReg(group.inst, group.prefix + "_inst_late");
         }
-        writeAddress.push_back(group.inst);
+        writeAddress.push_back(compact.empty() ? group.inst : compactInst);
         readAddress.push_back(address());
       }
       Value writeAt = b.createOrFold<comb::ConcatOp>(writeAddress);
@@ -6290,9 +6870,10 @@ LogicalResult StaticFolder::buildSim() {
           lateAddress.push_back(group.bankLate);
         }
         if (threads > 1) {
-          if (!group.instLate)
+          if (compact.empty() && !group.instLate)
             group.instLate = copyReg(group.inst, group.prefix + "_inst_late");
-          lateAddress.push_back(group.instLate);
+          lateAddress.push_back(compact.empty() ? group.instLate
+                                                : compactInstLate);
         }
         lateAt = b.createOrFold<comb::ConcatOp>(lateAddress);
       }
@@ -6314,13 +6895,13 @@ LogicalResult StaticFolder::buildSim() {
                             ? readAt
                             : copyReg(readAt, name + "_now");
         now->first = comb::AndOp::create(
-            b, enable,
+            b, kept,
             comb::ICmpOp::create(b, comb::ICmpPredicate::eq, writeAt, readNow));
       }
       if (oneCycleLinks && forward) {
         // A write reaches a read of its entry in the same host cycle.
         Value hit = comb::AndOp::create(
-            b, enable,
+            b, kept,
             comb::ICmpOp::create(b, comb::ICmpPredicate::eq, writeAt, readAt));
         if (after)
           after->push_back({at, w, hit, data});
@@ -6478,7 +7059,7 @@ LogicalResult StaticFolder::buildSim() {
   // taken in the producer's host cycle, and those written from a shared
   // register (forwarded the host cycle the write lands), for the report.
   unsigned linkReads = 0, forwardedReads = 0, forwardedAfter = 0, nowReads = 0,
-           lateReads = 0, forwardedLate = 0;
+           lateReads = 0, forwardedLate = 0, compactReads = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
   SmallVector<unsigned> classReaders(producers.size(), 0);
@@ -6624,18 +7205,23 @@ LogicalResult StaticFolder::buildSim() {
       }
       for (auto &[key, index] : sources) {
         if (key.first < 0) {
-          SmallVector<uint64_t> rows(threads, 0);
-          for (unsigned i = 0; i < threads; ++i)
-            if (sourceOf[i] == key)
-              rows[i] = constants[i].getZExtValue();
-          if (width > 64)
-            return netlist.emitError("a constant of over 64 bits differing by "
-                                     "instance: ")
-                   << consumer.name;
-          sourceData[index] =
-              threads > 1 ? table(b, ctl.inst1, rows, width)
-                          : hw::ConstantOp::create(b, b.getIntegerType(width),
-                                                   rows[0]);
+          // Each instance's constant, by instance: a table of up to 64 bits
+          // a slice, the slices joined (high first).
+          SmallVector<Value> slices;
+          for (unsigned lo = 0; lo < width; lo += 64) {
+            unsigned w = std::min(64u, width - lo);
+            SmallVector<uint64_t> rows(threads, 0);
+            for (unsigned i = 0; i < threads; ++i)
+              if (sourceOf[i] == key)
+                rows[i] = constants[i].extractBits(w, lo).getZExtValue();
+            slices.push_back(threads > 1 ? table(b, ctl.inst1, rows, w)
+                                         : hw::ConstantOp::create(
+                                               b, b.getIntegerType(w), rows[0]));
+          }
+          std::reverse(slices.begin(), slices.end());
+          sourceData[index] = slices.size() == 1
+                                  ? slices[0]
+                                  : b.createOrFold<comb::ConcatOp>(slices);
           continue;
         }
         auto &producer = producers[key.first];
@@ -6650,6 +7236,24 @@ LogicalResult StaticFolder::buildSim() {
         SmallVector<uint64_t> rows;
         SmallVector<bool> takes;
         rowsOf(key, rows, takes);
+        // A compact link: the producer instances taken, and each instance's
+        // index among them for its address.
+        SmallVector<uint64_t> kept;
+        for (unsigned i = 0; i < threads; ++i)
+          if (takes[i])
+            kept.push_back(rows[i]);
+        llvm::sort(kept);
+        kept.erase(std::unique(kept.begin(), kept.end()), kept.end());
+        SmallVector<uint64_t> entryRows = rows;
+        if (compacted(key.first, kept.size())) {
+          ++compactReads;
+          pThreads = kept.size();
+          for (unsigned i = 0; i < threads; ++i)
+            if (takes[i])
+              entryRows[i] = llvm::lower_bound(kept, rows[i]) - kept.begin();
+        } else {
+          kept.clear();
+        }
         unsigned w = llvm::Log2_32_Ceil(pThreads);
         // Each piece of the link reads at its own copy of the address and
         // the bank.
@@ -6658,8 +7262,8 @@ LogicalResult StaticFolder::buildSim() {
           if (pThreads <= 1)
             return Value();
           if (threads == 1)
-            return constant(w, rows[0]);
-          return copyReg(table(b, ctl.inst2, rows, w),
+            return constant(w, entryRows[0]);
+          return copyReg(table(b, ctl.inst2, entryRows, w),
                          consumer.name + "_addr" + Twine(at) + "_" +
                              Twine(addressCopies++));
         };
@@ -6697,7 +7301,8 @@ LogicalResult StaticFolder::buildSim() {
             linkRead(key.first, key.second, width, address, bank,
                      producer.name + "_to_" + consumer.name + "_" + Twine(at),
                      to, now ? &sourceNow[index] : nullptr, forward,
-                     after ? &sourceAfter[index] : nullptr, late, forwardLate);
+                     after ? &sourceAfter[index] : nullptr, late, forwardLate,
+                     kept);
       }
       // Taken around the read register when written in the reader's slot:
       // the source of this slot's instance, a host cycle after the read's.
@@ -6853,7 +7458,10 @@ LogicalResult StaticFolder::buildSim() {
     os << "  link reads: " << linkReads << ", forwarded " << forwardedReads
        << " (past the read register " << forwardedAfter << "), taken now "
        << nowReads << "; written from a shared register " << lateReads
-       << " (forwarded " << forwardedLate << ")\n";
+       << " (forwarded " << forwardedLate << ")";
+    if (compactLinks)
+      os << "; compact " << compactReads;
+    os << "\n";
     llvm::errs() << os.str();
     if (!reportPath.empty()) {
       std::error_code ec;
@@ -7288,7 +7896,8 @@ LogicalResult StaticFolder::resolveEnvironment() {
 
 LogicalResult StaticFolder::run() {
   inlineNetlists();
-  if (failed(collect()) || failed(resolveEnvironment()))
+  if (failed(collect()) || failed(resolveEnvironment()) ||
+      failed(parseRegisteredLinks()))
     return failure();
   for (auto &cls : classes)
     if (cls.threads() > 1 &&
@@ -7348,7 +7957,8 @@ void FoldStaticPass::runOnOperation() {
                       slrCapacity, slrAssign, storage, readyLevels,
                       forwardAfterLevels, shareLinkWrites, page, pageMasks,
                       pageHbmColumnBits, pageHbmWindow, pageMemoryBits,
-                      pageMemories);
+                      pageMemories, zeroChainHops,
+                      compactLinks, registeredLinks);
   if (failed(folder.run()))
     return signalPassFailure();
 }

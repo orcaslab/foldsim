@@ -5,8 +5,10 @@ add_mlir_library(FoldsimTransforms
   ExtractModels.cpp
   FAME5.cpp
   FindPipelines.cpp
+  MemoriesToRegisters.cpp
   FuseModels.cpp
   Pipelines.cpp
+  RemoveDeadState.cpp
   ReplicateControls.cpp
   Sort.cpp
   StaticFold.cpp

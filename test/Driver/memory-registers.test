@@ -1,0 +1,47 @@
+# REQUIRES: verilator
+# Memories kept as registers (--memory-registers, foldsim-memories-to-
+# registers): four associative tables (cam/top.sv: 16 entries, each matched
+# every cycle, a read per entry and one more at an address) folded two to a
+# copy, each simulator's y tokens against the native design's (storage/tb.sv).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/cam
+# As a memory (16 entries x 2 instances deep, 17 read ports):
+# RUN: foldsim --srcs top.f --top Top --out %t/mem --static --copies Cam:2 Cam > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=MEM < %t/mem/foldsim_sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal --x-initial 0 --top-module tb -Mdir %t/mem/obj %S/Inputs/storage/tb.sv top.sv %t/mem/foldsim_sim.sv > %t/mem/build.log 2>&1
+# RUN: %t/mem/obj/Vtb | FileCheck %s
+# MEM: reg [7:0] Memory[0:31];
+# Priced (auto): registers, cheaper for a copy of one instance and of all four.
+# RUN: foldsim --srcs top.f --top Top --out %t/regs --static --copies Cam:2 --memory-registers auto Cam 2>&1 | FileCheck %s --check-prefix=LOG
+# RUN: FileCheck %s --check-prefix=REPORT < %t/regs/memory_registers.txt
+# RUN: FileCheck %s --check-prefix=REGS < %t/regs/foldsim_sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal --x-initial 0 --top-module tb -Mdir %t/regs/obj %S/Inputs/storage/tb.sv top.sv %t/regs/foldsim_sim.sv > %t/regs/build.log 2>&1
+# RUN: %t/regs/obj/Vtb | FileCheck %s
+# LOG: foldsim: --memory-registers auto: 1 of 1 memories kept as registers
+# LOG: foldsim-memories-to-registers{memories=Cam:tags}
+# REPORT: --memory-registers auto: 1 of 1 memories kept as registers
+# REPORT-NEXT: registers Cam:tags: 16x8 reads 17 (16 constant) writes 1, 4 instances; LUT sites as memory / registers: 1 instances 316 / 152, 4 instances 633 / 386
+# REGS-NOT: reg [7:0] Memory[0:31];
+# By name, the four on one copy (four threads):
+# RUN: foldsim --srcs top.f --top Top --out %t/one --static --copies Cam:1 --memory-registers 'Cam:tag' Cam > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal --x-initial 0 --top-module tb -Mdir %t/one/obj %S/Inputs/storage/tb.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
+# RUN: %t/one/obj/Vtb | FileCheck %s
+# With --storage auto (and --copies auto), auto is the default.
+# RUN: foldsim --srcs top.f --top Top --out %t/auto --static --copies auto --storage auto Cam 2>&1 | FileCheck %s --check-prefix=LOG
+# RUN: %verilator --binary --timing -Wno-fatal --x-initial 0 --top-module tb -Mdir %t/auto/obj %S/Inputs/storage/tb.sv top.sv %t/auto/foldsim_sim.sv > %t/auto/build.log 2>&1
+# RUN: %t/auto/obj/Vtb | FileCheck %s
+# CHECK: tokens 64 mismatches 0
+# A memory no copy is cheaper with as registers stays one, and the
+# simulator is the one without the option, byte for byte: storage/top.sv's
+# leaves read their memory a cycle late (it cannot be registers).
+# RUN: cd %S/Inputs/storage
+# RUN: foldsim --srcs top.f --top Top --out %t/same --static --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: cp %t/same/foldsim_sim.sv %t/same.sv && cp %t/same/schedule.txt %t/same.txt && rm -rf %t/same
+# RUN: foldsim --srcs top.f --top Top --out %t/same --static --copies Leaf:2 --memory-registers auto Leaf 2>&1 | FileCheck %s --check-prefix=NONE
+# RUN: diff %t/same.sv %t/same/foldsim_sim.sv
+# RUN: diff %t/same.txt %t/same/schedule.txt
+# RUN: not ls %t/same/memory_registers.txt
+# NONE: foldsim: --memory-registers auto: no memory kept as registers
+# NONE-NOT: foldsim-memories-to-registers
+# Named, it is reported as one that cannot be registers.
+# RUN: foldsim --srcs top.f --top Top --out %t/late --static --copies Leaf:2 --memory-registers 'mem' Leaf 2>&1 | FileCheck %s --check-prefix=NAMED
+# NAMED: foldsim: --memory-registers mem: Leaf:mem cannot be registers: reads registered (latency 1)
