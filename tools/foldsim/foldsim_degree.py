@@ -498,9 +498,18 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                 wt = float(weights.get(f'{c}:{name}', weights.get(name, 1.0)))
                 hc = dict(lut=0.0, lutram=0.0, ff=0, bram=0.0, uram=0, ii_floor=0, hbm=0.0, ctl=0)
                 parts = []
-                for j, t, _, _ in forms:
+                for j, t, _, fgap in forms:
                     v = storage.vmem_cost(d, w, t, wt, tiers.get('row_bytes_min', 1))
                     v = dict(v, lutram=lam * v['lutram'])
+                    if tiers.get('vmem_group') == 'copy':
+                        # foldsim --vmem-group copy: one controller for a
+                        # copy's memories of a row size, its LUTs shared by
+                        # those the class may move.
+                        rb = storage.vmem_row_bytes(w, tiers.get('row_bytes_min', 1))
+                        share = sum(1 for m in est[c]['mems']
+                                    if storage.vmem_row_bytes(m[2], tiers.get('row_bytes_min', 1))
+                                    == rb and not storage.vmem_eligible(m, fgap))
+                        v['lut'] = v['lut'] / max(1, share)
                     v = {k: (x if k == 'ii_floor' else x * cnt) for k, x in v.items()}
                     parts.append((j, v))
                     for key in hc:
@@ -1449,13 +1458,18 @@ def project_h(ii, classes, sched, est, pattern, pages=None, offchip=(), weights=
                 h=max(ii, hbm_ii) + round(bubbles), per=per)
 
 
-# choose_state looks at frames up to this many times the schedule's.
+# choose_state looks at frames up to this many times the schedule's, and
+# where paging every model does not fit, at paging each first few of them up
+# to this many.
 FRAME_GROWTH = 4
+PAGE_FEW = 8
+FRAME_STEPS = (1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8)
 
 
 def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True, vmem=None,
                  pattern='', weights=None, pages_hbm=True, row_bytes_min=1, max_ii=1 << 16,
-                 page=True, link_pages=True, link_hbm=False):
+                 page=True, link_pages=True, link_hbm=False, frame_growth=None,
+                 vmem_group=None):
     """--state auto: where each class's state lives, three tiers, priced.
 
       on chip    register stores and memories in flops, distributed, block or
@@ -1540,24 +1554,27 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
              storage.route_luts())):
         return None
     deep = sorted({n for n in classes.values() if n > 1})
-    top = min(max_ii, FRAME_GROWTH * ii)
+    top = min(max_ii, (frame_growth or FRAME_GROWTH) * ii)
+    steps = {round(ii * x) for x in FRAME_STEPS if ii * x <= top}
     frames = sorted({f for n in deep for f in range(n * ((ii + n - 1) // n), top + 1, n)} |
-                    {ii})
+                    {ii} | steps)
     last = None
     for f in frames:
         if f < ii:
             continue
         tiers = dict(frame=f, base_hbm=base_hbm, base_bubbles=base_bubbles, weights=weights,
                      pages_hbm=pages_hbm, row_bytes_min=row_bytes_min, link_pages=link_pages,
-                     link_hbm=link_hbm)
+                     link_hbm=link_hbm, vmem_group=vmem_group)
         if f == ii:
             res = area(cal, est, classes, {}, rest, sched, f, entries, 'auto', route, uram,
                        vmem=vmem, tiers=tiers)
             if ok(res):
                 return outcome(res, {}, f)
         pages = page_pick(est, classes, f, sched=sched) if page else None
-        # A longer frame helps only through deeper pages.
-        if not pages or pages == last:
+        # A longer frame helps through deeper pages, and through the HBM
+        # bytes and link pages it carries: frames where the pages deepen,
+        # and a few steps of the frame (FRAME_STEPS of the schedule's).
+        if not pages or (pages == last and f not in steps):
             continue
         last = pages
         # The least paging that fits: the models of most register state
@@ -1576,7 +1593,14 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
                                        entries, 'auto', route, uram, vmem=vmem, tiers=tiers))
             return tried[k]
         if not ok(at(len(order))[1]):
-            continue
+            # Paging costs logic (the write-back's selects): where the
+            # routing binds, paging every model may not route while paging
+            # the few of most register state does. The first few alone.
+            some = next((k for k in range(1, min(len(order), PAGE_FEW) + 1)
+                         if ok(at(k)[1])), None)
+            if some is None:
+                continue
+            return outcome(at(some)[1], at(some)[0], f)
         lo, hi = 1, len(order)
         while lo < hi:
             mid = (lo + hi) // 2
@@ -1795,6 +1819,14 @@ def main():
     st.add_argument('--links', choices=('report', 'none'), default='report',
                     help="count the links' memories from the schedule report (or --links-from's)")
     st.add_argument('--no-link-pages', action='store_true', help='no paged links')
+    st.add_argument('--vmem-group', choices=('copy',), default=None,
+                    help='price the controllers as foldsim --vmem-group copy builds them (one a '
+                         'copy and row size)')
+    st.add_argument('--frame-growth', type=int, default=FRAME_GROWTH,
+                    help='frames up to this many times the schedule\'s')
+    st.add_argument('--links-as-built', action='store_true',
+                    help="the links' storage as the report gives it (their kinds fixed: a "
+                         'schedule made with a link-kinds choice), not a tier to choose')
     st.add_argument('--link-hbm', action='store_true',
                     help='price links in HBM too (a what-if: the compiler builds none)')
     st.add_argument('--links-from', default='', metavar='SCHEDULE',
@@ -1858,13 +1890,16 @@ def state_main(a):
     links = None
     if a.links == 'report':
         links = parse_links(open(a.links_from).read() if a.links_from else text)
+    if links and a.links_as_built:
+        links = dict(links, uses=[])
     if links:
         sched['__links__'] = links
     out = choose_state(cal, est, classes, sched, ii, route=not a.no_routability,
                        entries=a.register_state_entries, vmem=vmem, pattern=pattern,
                        weights=weights, pages_hbm=not a.no_pages_hbm,
                        row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page,
-                       link_pages=not a.no_link_pages, link_hbm=a.link_hbm)
+                       link_pages=not a.no_link_pages, link_hbm=a.link_hbm,
+                       frame_growth=a.frame_growth, vmem_group=a.vmem_group)
     if links:
         lk = link_cost(cal, links)
         print(f"links: {(links['lutram_bits'] + links['bram_bits'] + links['uram_bits']) / 1e6:.1f} "

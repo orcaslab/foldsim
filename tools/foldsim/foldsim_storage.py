@@ -702,7 +702,158 @@ def assign(units, base, caps, extra=None, paging=False, price_extra=False):
         choice, used = solve(weight)
         if peak(used) < best[0]:
             best = (peak(used), choice, used)
+    if best[0][0]:
+        # Nothing placed: several pools over pull the repair's single moves
+        # apart. Search the pools' prices instead (multiplicative weights:
+        # each store its cheapest kind at the prices, a pool's price raised
+        # by its overflow and lowered by its slack, MW_ROUNDS times), off
+        # chip only where a pool on chip is over; repair the least
+        # overflowing choice, then bring stores back on chip while they fit.
+        found = mw_search(units, base, limit, pools, order, admissible, offchip)
+        if found is not None:
+            choice, used = found
+            if peak(used) < best[0]:
+                best = (peak(used), choice, used)
     return best[1], best[2]
+
+
+def relief_pair(units, kinds, use, ch, used, lim, score, now):
+    """mw_search's pair of moves: a store into a relief kind (off chip),
+    then the single move that lowers the score most with the room it made:
+    (score, [(unit, kind), (unit, kind)], usage), or None."""
+    best = None
+    for r, u in enumerate(units):
+        a = ch[r]
+        for b in kinds[r]:
+            if b not in RELIEF_KINDS or b == a:
+                continue
+            mid = {p: used[p] + u['count'] * (use[r][b][p] - use[r][a][p]) for p in lim}
+            for i, v in enumerate(units):
+                if i == r or len(kinds[i]) < 2:
+                    continue
+                x = ch[i]
+                for y in kinds[i]:
+                    if y == x:
+                        continue
+                    new = {p: mid[p] + v['count'] * (use[i][y][p] - use[i][x][p]) for p in lim}
+                    sc = score(new)
+                    if sc < now and (best is None or sc < best[0]):
+                        best = (sc, [(r, b), (i, y)], new)
+    return best
+
+
+# Rounds and step of assign's price search (mw_search).
+MW_ROUNDS = 400
+MW_STEP = 0.3
+MW_DESCENT = 2000
+
+
+def mw_search(units, base, limit, pools, order, admissible, offchip):
+    """assign's search of the pools' prices when its repair leaves pools
+    over: (choice, used) of the least overflow found, its stores brought
+    back on chip (off-chip kinds left) while every pool stays within its
+    limit; None if no unit can move."""
+    kinds = []
+    for u in units:
+        if u.get('fixed') in u['costs']:
+            kinds.append([u['fixed']])
+        else:
+            kinds.append([k for k in order if admissible(u, k)] or list(u['costs']))
+    use = [{k: {p: usage(u['costs'][k], p) for p in pools} for k in ks}
+           for u, ks in zip(units, kinds)]
+    price = {p: 1.0 / limit[p] for p in pools if limit[p]}
+
+    def pick(price):
+        out = []
+        for ks, us in zip(kinds, use):
+            out.append(min(ks, key=lambda k: (sum(us[k][p] * w for p, w in price.items()),
+                                               order.index(k) if k in order else 0)))
+        return out
+
+    def totals(ch):
+        used = {p: base.get(p, 0.0) for p in pools}
+        for i, (k, u) in enumerate(zip(ch, units)):
+            for p in pools:
+                used[p] += u['count'] * use[i][k][p]
+        return used
+
+    def overflow(used):
+        return sum(max(0.0, used[p] / limit[p] - 1) for p in pools if limit[p])
+
+    best = None
+    for r in range(MW_ROUNDS):
+        ch = pick(price)
+        used = totals(ch)
+        key = (overflow(used), max(used[p] / limit[p] for p in pools
+                                   if limit[p] and p not in offchip))
+        if best is None or key < best[0]:
+            best = (key, ch, used)
+        for p in price:
+            ratio = used[p] / limit[p]
+            price[p] *= math.exp(MW_STEP * max(-1.0, min(1.0, ratio - 1)))
+            # Off chip costs nothing until an on-chip pool is over; on chip
+            # never drops below a share of its first price.
+            price[p] = max(price[p], (1e-3 if p in offchip else 0.05) / limit[p])
+    if best is None:
+        return None
+    _, ch, used = best
+    ch = list(ch)
+    # Then single moves while one lowers the overflow (steepest first; on a
+    # tie in overflow, the one that frees the most of the pools on chip).
+    lim = {p: limit[p] for p in pools if limit[p]}
+
+    def score(u):
+        # The overflow, then the use of the pools on chip (a move that
+        # frees one into another with room, as state into HBM making room
+        # in a RAM for links, lowers it).
+        return (round(sum(max(0.0, u[p] / lim[p] - 1) for p in lim), 9),
+                sum(u[p] / lim[p] for p in lim if p not in offchip))
+
+    for _ in range(MW_DESCENT):
+        now = score(used)
+        if now[0] <= 0:
+            break
+        move = None
+        for i, u in enumerate(units):
+            if len(kinds[i]) < 2:
+                continue
+            a = ch[i]
+            for b in kinds[i]:
+                if b == a:
+                    continue
+                new = {p: used[p] + u['count'] * (use[i][b][p] - use[i][a][p]) for p in lim}
+                sc = score(new)
+                if sc < now and (move is None or sc < move[0]):
+                    move = (sc, i, b, new)
+        if move is None:
+            # No single move helps: a store off chip (its controller's LUTs
+            # on a pool over) that makes room in a RAM, and the best move
+            # into that room after it.
+            move = relief_pair(units, kinds, use, ch, used, lim, score, now)
+            if move is None:
+                break
+            for i, b in move[1]:
+                ch[i] = b
+            used = dict(used, **move[2])
+            continue
+        _, i, b, new = move
+        ch[i] = b
+        used = dict(used, **new)
+    choice = [{k: u['count']} for k, u in zip(ch, units)]
+    # Back on chip, where every pool stays within its limit.
+    for i, u in enumerate(units):
+        k = ch[i]
+        if k not in RELIEF_KINDS or u.get('fixed') in u['costs']:
+            continue
+        for b in sorted((x for x in kinds[i] if x not in RELIEF_KINDS),
+                        key=lambda x: sum(use[i][x][p] / limit[p] for p in pools
+                                          if limit[p] and p not in offchip)):
+            new = {p: used[p] + u['count'] * (use[i][b][p] - use[i][k][p]) for p in pools}
+            if all(new[p] <= limit[p] + 1e-9 or new[p] <= used[p] + 1e-9 for p in pools):
+                choice[i] = {b: u['count']}
+                used = new
+                break
+    return choice, used
 
 
 # Rounds of assign's utilization-weighted prices (price_extra), and the pools
