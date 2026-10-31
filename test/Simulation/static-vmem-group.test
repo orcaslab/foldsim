@@ -8,7 +8,7 @@
 # matches the target at response latencies of 1 to 60 host cycles, with
 # stalled channels and a controller out of room: memories apart, lanes merged
 # into one row (--vmem-merge-lanes), grouped per copy and at most two per
-# controller, nested sequencers and with --bubbles.
+# controller, nested sequencers, with --bubbles, and eight leaves a copy.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_multi
 # RUN: foldsim --srcs top.f --top Top --out %t/plain --static --virtual-memories 'Leaf:.*' --copies Leaf:2 Leaf > /dev/null 2>&1
 # RUN: python3 %S/Inputs/vmem_bind.py %t/plain/foldsim_sim.json %t/plain
@@ -40,5 +40,12 @@
 # RUN: python3 %S/Inputs/vmem_bind.py %t/bub/foldsim_sim.json %t/bub
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/bub --top-module tb -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
 # RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +lo=1 +hi=30 +bubble=30 +stall=10 | FileCheck %s
+# Eight leaves (Top8): one copy evaluates eight instances a frame, grouped, a
+# controller nearly always out of room.
+# RUN: foldsim --srcs top.f --top Top8 --out %t/eight --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --vmem-group copy Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/eight/foldsim_sim.json %t/eight
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/eight --top-module tb -DTOP8 -Mdir %t/eight/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/eight/foldsim_sim.sv > %t/eight/build.log 2>&1
+# RUN: %t/eight/obj/Vtb +verilator+rand+reset+0 +verilator+seed+12 +lo=1 +full=95 | FileCheck %s
+# RUN: %t/eight/obj/Vtb +verilator+rand+reset+0 +verilator+seed+13 +lo=20 +hi=60 +full=80 +stall=20 | FileCheck %s
 # FAST: {{^}}MATCH 196 cycles in 2000 host cycles, H 10.00
 # CHECK: {{^}}MATCH

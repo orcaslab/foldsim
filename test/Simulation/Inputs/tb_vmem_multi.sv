@@ -6,7 +6,9 @@
 // memory alone, or a group of a class copy's memories (--vmem-group) as the
 // kernel's foldsim_vmem_group serves them. Each member's requests of a host
 // cycle (a read and a write: one entry) wait in a FIFO of 8; its `free` is
-// twice the free entries; one entry a host cycle leaves the group's FIFOs,
+// twice the free entries but one (a decision's requests come four host cycles
+// after it, so five decisions' entries may follow a `free` it saw); one entry
+// a host cycle leaves the group's FIFOs,
 // round robin, and not at all on +full=<percent> of the host cycles (the
 // controller out of room); it applies to the member's rows (a same-cycle
 // read and write of a row by its read-during-write order, a write by its byte
@@ -54,7 +56,7 @@ module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1}
   always @(negedge clk) begin
     automatic bit any = 0;
     for (int m = 0; m < N; m++) begin
-      free[m] = 16'(2 * (DEPTH - cnt[m]));
+      free[m] = 16'(cnt[m] < DEPTH ? 2 * (DEPTH - 1 - cnt[m]) : 0);
       rsp_valid[m] = 0;
     end
     // One due answer a host cycle for the group.
@@ -115,7 +117,11 @@ module tb;
   wire [7:0] ry;
   logic [7:0] ref_y [T];
   bit ref_done = 0;
+`ifdef TOP8
+  Top8 target(.clk(rclk), .x(rx), .y(ry));
+`else
   Top target(.clk(rclk), .x(rx), .y(ry));
+`endif
   initial begin
     for (int t = 0; t < T; t++) begin
       rx = stim_x(t);

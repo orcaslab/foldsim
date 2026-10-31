@@ -54,3 +54,12 @@ module Top(input logic clk, input logic [7:0] x, output logic [7:0] y);
   Leaf l2(.clk, .d(b), .q(c));
   Leaf l3(.clk, .d(c), .q(y));
 endmodule
+// Eight leaves in a chain: one copy evaluates eight instances a frame.
+module Top8(input logic clk, input logic [7:0] x, output logic [7:0] y);
+  logic [7:0] c [9];
+  assign c[0] = x;
+  for (genvar i = 0; i < 8; ++i) begin : g_leaf
+    Leaf l(.clk, .d(c[i]), .q(c[i+1]));
+  end
+  assign y = c[8];
+endmodule
