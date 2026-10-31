@@ -269,6 +269,167 @@ def sites(c):
     return c['lut'] + LUTRAM_SITES * c['lutram']
 
 
+# Memories kept as registers (foldsim --memory-registers, the pass
+# foldsim-memories-to-registers). A memory read combinationally folds into a
+# store of its depth times the instances, copied once per read port (a
+# distributed RAM reads one address a copy); kept as registers it is one row
+# of its entries per instance in the copy's state, read whole, so that a read
+# at a constant address is a wire and a read at another a select of the
+# copy's logic. An associative table matched entry by entry (a cache MSHR's
+# address table: 192 entries, 196 read ports) is the case: the A100-class
+# SM's L2 banks took 688k distributed-RAM LUTs as memories.
+#
+# Both forms are priced in LUT sites, a flip-flop at FF_SITES (a slice: 8
+# LUT6 and 16 flip-flops; the flops the rest of the model leaves unpriced
+# count here, where a form can be mostly flops): the memory at its cheapest
+# kind (kind_cost; one combinationally read takes no block RAM), the
+# registers as a store of one entry per instance (flops for one instance,
+# else the cheaper of flops and distributed RAM; block RAM needs a state gap
+# the schedule sets later, so it is not counted) plus the logic the pass
+# makes as foldsim_cost.py prices it: a select per read at a non-constant
+# address over the entries (padded to a power of two), an address compare
+# and enable per entry and write port and a lane enable per mask lane, and
+# the merge of a later write port's data (the first is the register's
+# enable). A memory becomes registers only when they are cheaper for every
+# number of instances a copy may hold (1 and all the module's instances):
+# both forms grow about linearly in instances beyond, so the two ends bound
+# the choice whatever the fold degree.
+FF_SITES = 0.5
+
+
+def register_ineligible(m):
+    """Why a memory (memory_ports) cannot be registers, or ''. As the pass's
+    check: read combinationally, written a cycle later, no read-write ports,
+    no initial content, written at all; and named in a way the pass's
+    option can carry."""
+    if m['rlat'] != 0:
+        return f"reads registered (latency {m['rlat']})"
+    if m['wlat'] != 1:
+        return f"writes {m['wlat']} cycles late"
+    if m['rwports']:
+        return 'read-write ports'
+    if m['init']:
+        return 'initial content'
+    if not m['wports']:
+        return 'never written'
+    if re.search(r'[,{}"\s]', m['name']):
+        return 'a name the pass option cannot carry'
+    return ''
+
+
+def register_form_cost(m, threads):
+    """kind_cost-style cost of memory `m` kept as registers for a copy of
+    `threads` instances: its state store (cheapest kind) and the pass's
+    logic."""
+    d, w = m['depth'], m['width']
+    th = 1 << (threads - 1).bit_length() if threads > 1 else 1
+    state = dict(depth=th, width=d * w, rports=1, wports=1, rlat=0, mask=1, reg=True,
+                 gap=None, threads=threads)
+    kinds = ('registers',) if th == 1 else ('registers', 'distributed')
+    best = min((kind_cost(state, k) for k in kinds), key=form_sites)
+    a = max(1, m['abits'])
+    lanes = m['mask'] if m['mask'] > 1 else 0
+    select = m['reads'] - m['const_reads']
+    logic = select * w * ((1 << a) - 1) / 3
+    compare = math.ceil(a / 6) + math.ceil(a / 36) + 1 + lanes
+    logic += m['wports'] * d * compare + max(0, m['wports'] - 1) * d * w * 0.5
+    return dict(best, lut=best['lut'] + logic)
+
+
+def memory_form_cost(m, threads):
+    """The cheapest kind_cost of memory `m` folded into a copy of `threads`
+    instances."""
+    th = 1 << (threads - 1).bit_length() if threads > 1 else 1
+    store = dict(depth=m['depth'] * th, width=m['width'], rports=m['reads'],
+                 wports=m['wports'], rlat=m['rlat'], mask=m['mask'], reg=False, gap=None,
+                 threads=threads)
+    costs = [c for c in (kind_cost(store, k) for k in KINDS) if c is not None]
+    return min(costs, key=form_sites)
+
+
+def form_sites(c):
+    return sites(c) + FF_SITES * c['ff']
+
+
+def memory_as_registers(m, instances):
+    """Whether memory `m` (memory_ports) is cheaper as registers for every
+    copy of 1 to `instances` instances (the two ends), and the prices
+    [(instances, as a memory, as registers)] in LUT sites."""
+    rows = [(t, form_sites(memory_form_cost(m, t)), form_sites(register_form_cost(m, t)))
+            for t in sorted({1, max(1, instances)})]
+    return all(r < mm for _, mm, r in rows), rows
+
+
+def memory_ports(path, top):
+    """The memories of an IR (the flat design): per memory its module, name,
+    depth, width, mask lanes, address bits, read and write latency, read
+    ports (and how many at a constant address), write and read-write ports,
+    initial content; and each module's instances in the design under `top`
+    (1 for the top or an uninstantiated module)."""
+    head = re.compile(r'^\s*hw\.module(?:\.extern)?(?:\s+private)?\s+@([\w$.]+)')
+    inst = re.compile(r'hw\.instance\s+"[^"]*"\s+(?:sym\s+@\S+\s+)?@([\w$.]+)')
+    decl = re.compile(r'^(%[\w.$-]+) = seq\.firmem\s+(?:sym\s+@\S+\s+)?(?:name\s+"([^"]*)"\s+)?'
+                      r'(\d+),\s*(\d+),\s*\w+,\s*\w+(.*):\s*<\s*(\d+)\s*x\s*(\d+)(?:,\s*mask\s+(\d+))?\s*>')
+    port = re.compile(r'(%[\w.$-]+)\[(%[\w.$-]+)\]')
+    mems, children, module, consts, by_ssa = [], {}, None, set(), {}
+    for line in open(path):
+        s = line.strip()
+        if s.startswith('hw.module'):
+            mm = head.match(s)
+            module = mm.group(1) if mm else None
+            consts, by_ssa = set(), {}
+            children.setdefault(module, {})
+            continue
+        if module is None:
+            continue
+        if 'hw.instance' in s:
+            mm = inst.search(s)
+            if mm:
+                children[module][mm.group(1)] = children[module].get(mm.group(1), 0) + 1
+            continue
+        if ' = hw.constant ' in s:
+            consts.add(s.split(' = ', 1)[0])
+            continue
+        if 'seq.firmem' not in s:
+            continue
+        mm = decl.match(s)
+        if mm:
+            depth = int(mm.group(6))
+            rec = dict(module=module, name=mm.group(2) if mm.group(2) is not None else mm.group(1)[1:],
+                       depth=depth, width=int(mm.group(7)), mask=int(mm.group(8) or 1),
+                       abits=(depth - 1).bit_length(), rlat=int(mm.group(3)), wlat=int(mm.group(4)),
+                       init=' init ' in f' {mm.group(5)} ', reads=0, const_reads=0, wports=0, rwports=0,
+                       _addrs=[], _consts=consts)
+            by_ssa[mm.group(1)] = rec
+            mems.append(rec)
+            continue
+        mm = port.search(s)
+        rec = mm and by_ssa.get(mm.group(1))
+        if not rec:
+            continue
+        if 'seq.firmem.read_write_port' in s:
+            rec['rwports'] += 1
+        elif 'seq.firmem.write_port' in s:
+            rec['wports'] += 1
+        elif 'seq.firmem.read_port' in s:
+            rec['reads'] += 1
+            rec['_addrs'].append(mm.group(2))
+    for rec in mems:    # a constant may follow its use in a graph region
+        rec['const_reads'] = sum(a in rec['_consts'] for a in rec.pop('_addrs'))
+        del rec['_consts']
+    count = {}
+
+    def instances(m, seen=()):
+        if m == top:
+            return 1
+        if m not in count:
+            n = sum(k * instances(p, seen + (m,)) for p, ch in children.items()
+                    for c, k in ch.items() if c == m and p not in seen)
+            count[m] = n
+        return count[m]
+    return mems, {m: max(1, instances(m)) for m in children}
+
+
 def usage(c, pool):
     if pool == 'sites':
         return sites(c)

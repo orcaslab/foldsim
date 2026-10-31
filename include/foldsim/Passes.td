@@ -698,6 +698,42 @@ def SplitMaskedMemories
   let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect"];
 }
 
+def MemoriesToRegisters
+    : Pass<"foldsim-memories-to-registers", "::mlir::ModuleOp"> {
+  let summary = "Keep the named memories as registers, a register an entry";
+  let description = [{
+    `circt-verilog --detect-memories` makes a memory of every register array
+    it can, also of an associative table such as a cache's MSHR address
+    table, whose every entry is read every cycle for a match: a memory with
+    as many read ports as entries, each at a constant address. Folded, such
+    a memory is a store of its depth times the instances, copied once per
+    read port (distributed RAM has one read port a copy), where its entries
+    kept as registers are a row of the copy's state per instance, read
+    whole, and a read at a constant address is a wire.
+
+    Each memory of `memories` (`<module>:<name>`, the memory's `name`)
+    becomes a register per entry, `<name>_<entry>`, of the memory's width:
+    a read at a constant address is that register (zero past the depth), a
+    read at another address a select among them (zero past the depth); each
+    write port, in the order of the module, loads the entry it addresses
+    when enabled, a mask lane at a time, a later port's write over an
+    earlier one's. Only memories read combinationally and written a cycle
+    later (read latency 0, write latency 1), without read-write ports or an
+    initial content, whose write ports share one clock, can be registers;
+    another named is left a memory, with a warning. `foldsim --memory-
+    registers` chooses the memories (foldsim_storage.py prices both forms).
+  }];
+  let options = [
+    ListOption<"memories", "memories", "std::string",
+               "The memories to keep as registers, as <module>:<name>">,
+  ];
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect",
+    "circt::seq::SeqDialect"
+  ];
+}
+
 def ReplicateControls
     : Pass<"foldsim-replicate-controls", "::circt::hw::HWModuleOp"> {
   let summary = "Bound the loads of the static fold's slot controls by replicas";
