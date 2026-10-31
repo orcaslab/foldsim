@@ -130,14 +130,16 @@ def state_lutram(est, threads, form='lutram'):
 def split_virtual(est, pattern):
     """The classes' estimates with the memories foldsim-fold-static keeps
     outside the simulator (`virtual-memories`: the named memories the regex
-    finds, in HBM behind the kernel's foldsim_vmem controllers) taken off
-    chip: listed under 'vmems', no longer under 'mems'."""
+    finds in a memory's name or in `<class>:<name>`, in HBM behind the
+    kernel's foldsim_vmem controllers) taken off chip: listed under 'vmems',
+    no longer under 'mems'."""
     if not pattern:
         return est
     rx = re.compile(pattern)
-    virtual = lambda m: m[8] and rx.search(m[0])
-    return {c: dict(e, mems=[m for m in e['mems'] if not virtual(m)],
-                    vmems=[m for m in e['mems'] if virtual(m)])
+    base = lambda c: re.sub(r'_copy\d+$', '', c)
+    virtual = lambda c, m: m[8] and (rx.search(m[0]) or rx.search(f'{base(c)}:{m[0]}'))
+    return {c: dict(e, mems=[m for m in e['mems'] if not virtual(c, m)],
+                    vmems=[m for m in e['mems'] if virtual(c, m)])
             for c, e in est.items()}
 
 

@@ -358,7 +358,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "For a slot that waits on data, such as a target memory kept "
            "off-chip">,
     Option<"virtualMemories", "virtual-memories", "std::string", "\"\"",
-           "A regex of target memory names: each such registered-read memory "
+           "A regex of target memory names (searched in the name and in "
+           "<model>:<name>, the class's model, as the storage rules name "
+           "it): each such registered-read memory "
            "of a folded class is kept outside the simulator (in HBM, behind "
            "the kernel's foldsim_vmem controller) instead of in a threaded "
            "RAM. A copy issues the memory's reads and writes as requests at "

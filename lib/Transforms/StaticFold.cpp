@@ -3373,13 +3373,22 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // position whose read register loads it, four host cycles before the
   // instance's next evaluation (three with a short lead); so the state gap
   // is at least five (four).
+  // The regex is searched in a memory's name and in its name qualified by
+  // its class's model, `<model>:<name>` (a copy's by the class it was split
+  // from), so that one class's memories can be named apart from another's
+  // with the same path, as the storage rules name them.
   DenseMap<Operation *, unsigned> virtualOf;
   if (!virtualMemoryPattern.empty()) {
     llvm::Regex pattern(virtualMemoryPattern);
+    StringRef model =
+        cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : cls.name;
     for (auto &op : *modelBody) {
       auto memory = dyn_cast<seq::FirMemOp>(op);
-      if (!memory || physical(&op) ||
-          !pattern.match(memory.getName().value_or("")))
+      if (!memory || physical(&op))
+        continue;
+      StringRef memName = memory.getName().value_or("");
+      if (!pattern.match(memName) &&
+          !pattern.match((model + ":" + memName).str()))
         continue;
       if (memory.getReadLatency() != 1)
         return memory.emitError("a virtual memory needs a registered read");

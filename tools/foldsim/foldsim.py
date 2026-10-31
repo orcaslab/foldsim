@@ -408,9 +408,9 @@ def main():
                     help='with --static: an input `advance`; a host cycle it is low puts an idle '
                          'slot in the frame (for slots that wait on data, e.g. memories off-chip)')
     ap.add_argument('--virtual-memories', metavar='REGEX',
-                    help='with --static: keep the registered-read memories whose names match outside '
-                         'the simulator, behind the kernel\'s foldsim_vmem controllers (HBM); a slot '
-                         'whose read is not back waits in a bubble')
+                    help='with --static: keep the registered-read memories whose names (or '
+                         '<class model>:<name>) match outside the simulator, behind the kernel\'s '
+                         'foldsim_vmem controllers (HBM); a slot whose read is not back waits in a bubble')
     ap.add_argument('--vmem-cache-rows', metavar='N|auto',
                     help="with --virtual-memories: each memory's host-cache lines in the kernel "
                          "(foldsim_sim.vh FOLDSIM_VMEM_<k>_CACHE_ROWS): N (0: none, else a power "

@@ -27,6 +27,12 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/bub --static --virtual-memories ram --bubbles Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_vmem.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
 # RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=30 +bubble=30 +stall=10 | FileCheck %s
+# The regex is also searched in <class model>:<name> (a copy's by its class):
+# Leaf's RAM by its class, in both copies; a class without it keeps it inside.
+# RUN: foldsim --srcs top.f --top Top --out %t/cls --static --virtual-memories 'Leaf:ram' --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=VH2 < %t/cls/foldsim_sim.vh
+# RUN: foldsim --srcs top.f --top Top --out %t/other --static --virtual-memories 'Top_model:ram' Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=PLAIN < %t/other/foldsim_sim.json
 # Without --virtual-memories the RAM stays inside.
 # RUN: foldsim --srcs top.f --top Top --out %t/plain --static Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=PLAIN < %t/plain/foldsim_sim.json
