@@ -84,6 +84,11 @@ def publish(src, public):
 INSTANCE = re.compile(r'hw\.instance "([^"]+)"( sym @\S+)? @([\w$.]+)\(')
 
 
+# `--class-at TAG@inner:GLOB`: innermost matches only (a word every shell
+# passes through, unlike a sign).
+INNER = 'inner:'
+
+
 def class_at(text, top, specs):
     """`--class-at TAG@GLOB`: the instances whose path from `top` (instance
     names joined by '.') matches GLOB become a class of their own. The modules
@@ -91,7 +96,7 @@ def class_at(text, top, specs):
     matched instances alone change module; each parameter set of them (each
     module they were instances of) becomes a module named TAG, or TAG_<k> for
     several, in the order first met. The first GLOB that matches takes an
-    instance; a GLOB may match none. A GLOB written `>GLOB` takes only an
+    instance; a GLOB may match none. A GLOB written `inner:GLOB` takes only an
     innermost match: an instance with a match of any GLOB below it is not
     taken, the walk goes on below it (a tree of arbiters whose size depends on
     the configuration: its slices one class and its root another, or the
@@ -131,8 +136,8 @@ def class_at(text, top, specs):
     leaves = []             # (tag, leaf module), every matched instance
     sys.setrecursionlimit(max(10000, sys.getrecursionlimit()))
 
-    innermost = [g.startswith('>') for _, g in specs]
-    globs = [(t, g[1:] if inner else g) for (t, g), inner in zip(specs, innermost)]
+    innermost = [g.startswith(INNER) for _, g in specs]
+    globs = [(t, g[len(INNER):] if inner else g) for (t, g), inner in zip(specs, innermost)]
 
     def match(p):
         return next((k for k, (_, g) in enumerate(globs) if fnmatch.fnmatchcase(p, g)), None)
@@ -570,7 +575,7 @@ def main():
     ap.add_argument('--class-at', action='append', default=[], metavar='TAG@GLOB',
                     help='the instances whose path (instance names joined by ".") matches GLOB '
                          'are a class: one module per parameter set, TAG or TAG_<k>; repeatable, '
-                         'the first match takes an instance; `>GLOB` only an instance with no '
+                         'the first match takes an instance; `inner:GLOB` only an instance with no '
                          'match below it. A class `A+B` may name them')
     ap.add_argument('--nest', action='store_true',
                     help="fold nested classes recursively: each class's threads numbered so "
