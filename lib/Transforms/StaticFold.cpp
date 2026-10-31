@@ -6052,12 +6052,12 @@ LogicalResult StaticFolder::buildSim() {
                 copyReg(copyReg(table(b, pctl.at3, row, 1), name + "_copy2"),
                         name + "_copy1"),
                 name + "_copy0");
-            auto nextA = backedges.get(data.getType());
-            Value stageA = reg(nextA, name + "_staged");
-            nextA.setValue(comb::MuxOp::create(b, write, data, stageA));
-            auto nextB = backedges.get(data.getType());
-            Value stageB = reg(nextB, name + "_held");
-            nextB.setValue(comb::MuxOp::create(b, copy, stageA, stageB));
+            // Clock enables, as the flops take them: no select on the
+            // producer's path into the first register.
+            Value stageA = seq::CompRegClockEnabledOp::create(
+                b, data, hostClock, write, b.getStringAttr(name + "_staged"));
+            Value stageB = seq::CompRegClockEnabledOp::create(
+                b, stageA, hostClock, copy, b.getStringAttr(name + "_held"));
             sourceData[index] = stageB;
             continue;
           }
