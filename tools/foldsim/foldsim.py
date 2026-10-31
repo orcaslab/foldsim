@@ -338,6 +338,8 @@ def frame_options(a):
         fold += f' zero-chain-hops={a.zero_chain_hops}'
     if getattr(a, 'compact_links', False):
         fold += ' compact-links'
+    if getattr(a, 'registered_links', ''):
+        fold += f' registered-links={a.registered_links}'
     return fold
 
 
@@ -661,6 +663,10 @@ def main():
                     help="with --static: a link keeps only the producer instances its reader takes (a "
                          "per-lane port read by its own lane's instances, say), not an entry for every "
                          'instance (foldsim-fold-static)')
+    ap.add_argument('--registered-links', default='', metavar='CLASS,...',
+                    help='with --zero-latency-links: classes (globs) whose links a reader always takes '
+                         "from its read register, never in their producer's host cycle: a class whose "
+                         "late outputs end a deep path (foldsim-fold-static)")
     ap.add_argument('--no-share-link-writes', action='store_true',
                     help="with --static: write each reader's link from the producer's bits in the "
                          'pass, not a host cycle late from one register of them (foldsim-fold-static)')

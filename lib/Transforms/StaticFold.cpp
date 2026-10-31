@@ -34,6 +34,7 @@
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/GlobPattern.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/raw_ostream.h"
 #include <deque>
@@ -249,7 +250,8 @@ public:
                uint64_t slrCapacity, ArrayRef<std::string> slrAssign,
                ArrayRef<std::string> storage, StringRef readyLevels,
                unsigned forwardAfterLevels, bool shareLinkWrites,
-               unsigned zeroChainHops, bool compactLinks)
+               unsigned zeroChainHops, bool compactLinks,
+               ArrayRef<std::string> registeredLinks)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -264,7 +266,7 @@ public:
         registerStateEntries(registerStateEntries), storageSpecs(storage),
         forwardAfterLevels(forwardAfterLevels),
         shareLinkWrites(shareLinkWrites), zeroChainHops(zeroChainHops),
-        compactLinks(compactLinks),
+        compactLinks(compactLinks), registeredLinkSpecs(registeredLinks),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + (shortLead ? 3 : 4)),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -446,6 +448,11 @@ private:
   /// `compact-links`: a link memory holds only the producer instances its
   /// reader takes.
   bool compactLinks;
+  /// `registered-links`: the classes whose links are never zero-latency,
+  /// as globs, and whether each class (a copy by its class) matches.
+  ArrayRef<std::string> registeredLinkSpecs;
+  SmallVector<bool> registeredLinks;
+  LogicalResult parseRegisteredLinks();
   /// One link memory (a read of a producer's bits by a class input, a run of
   /// bits with the same sources): the producer, its bits, and the producer
   /// instances the reader takes, sorted and distinct.
@@ -1093,9 +1100,32 @@ LogicalResult StaticFolder::analyze(Class &cls) {
   return success();
 }
 
+LogicalResult StaticFolder::parseRegisteredLinks() {
+  registeredLinks.assign(classes.size(), false);
+  for (auto &spec : registeredLinkSpecs) {
+    auto glob = llvm::GlobPattern::create(spec);
+    if (!glob)
+      return netlist.emitError("registered-links: '") << spec
+                                                      << "' is not a glob";
+    bool any = false;
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      int base = cls.splitFrom >= 0 ? cls.splitFrom : int(c);
+      if (glob->match(classes[base].name)) {
+        registeredLinks[c] = any = true;
+      }
+    }
+    if (!any)
+      return netlist.emitError("registered-links: no class matches '")
+             << spec << "'";
+  }
+  return success();
+}
+
 bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   auto &producer = producers[p];
   if (!zeroLatencyLinks || producer.cls < 0 || !producer.late)
+    return false;
+  if (!registeredLinks.empty() && registeredLinks[producer.cls])
     return false;
   // Between SLR groups a link is registered on both sides of the crossing.
   if (crosses(producer.cls, c))
@@ -6272,7 +6302,8 @@ LogicalResult StaticFolder::resolveEnvironment() {
 
 LogicalResult StaticFolder::run() {
   inlineNetlists();
-  if (failed(collect()) || failed(resolveEnvironment()))
+  if (failed(collect()) || failed(resolveEnvironment()) ||
+      failed(parseRegisteredLinks()))
     return failure();
   for (auto &cls : classes)
     if (cls.threads() > 1 &&
@@ -6328,7 +6359,7 @@ void FoldStaticPass::runOnOperation() {
                       envSinks, registerStateEntries, slrGroups, slrSites,
                       slrCapacity, slrAssign, storage, readyLevels,
                       forwardAfterLevels, shareLinkWrites, zeroChainHops,
-                      compactLinks);
+                      compactLinks, registeredLinks);
   if (failed(folder.run()))
     return signalPassFailure();
 }

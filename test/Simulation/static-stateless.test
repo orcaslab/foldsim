@@ -27,6 +27,16 @@
 # BASE: link storage: {{[0-9]+}} memories, 1216 bits
 # COMPACT: link storage: {{[0-9]+}} memories, 744 bits, {{[0-9]+}} LUTRAM LUTs; 8 register bits; compact: 10 links, 472 bits saved
 # COMPACT: compact 10
+# Links out of the address units taken from their read register alone
+# (`--registered-links`): their path ends at the link, not in the SM.
+# RUN: foldsim --srcs top.f --top Top --out %t/reg --static --nest --modulo --compact-links --zero-latency-links --zero-latency-chains --registered-links 'Ag*' Sm Agu 2>&1 | FileCheck %s --check-prefix=REG
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/reg/obj %S/Inputs/tb_reset.sv top.sv %t/reg/foldsim_sim.sv > %t/reg/build.log 2>&1
+# RUN: %t/reg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +stall=0 | FileCheck %s
+# RUN: %t/reg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +stall=30 | FileCheck %s
+# RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --zero-latency-links --registered-links Nope Sm Agu 2>&1 | FileCheck %s --check-prefix=BAD
+# REG: zero-latency links: 1 of 9
+# REG: taken now 0
+# BAD: registered-links: no class matches 'Nope'
 # ZERO: zero-latency links: 9 of 9
 # ZERO: Agu x8 {{.*}} stateless
 # ZERO: taken now 2
