@@ -891,9 +891,10 @@ def link_lutram(depth, width):
 # the p host cycles after the pass, its read gathered page by page into W
 # flops; the select of the write's page as a paged copy's (ceil(p / 3) LUTs a
 # page bit). Paging spaces both models' passes p apart (their link ports): a
-# page is offered only where that takes at most LINK_PORT_SHARE of the frame,
-# so the frame stays the schedule's; and where each entry is written 2p + 3
-# host cycles before its read in the schedule.
+# page is offered only where that takes at most LINK_PORT_SHARE of the frame
+# priced (a longer frame lets more links page, the schedule then stretching
+# to it); and where each entry is written 2p + 3 host cycles before its read
+# in the schedule.
 LINK_KINDS = ('distributed', 'block', 'ultra')
 LINK_PAGES = (2, 4, 8)
 LINK_PORT_SHARE = 0.5
@@ -1520,7 +1521,10 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
     def outcome(res, pages, frame):
         moved = res.get('vmem_new', [])
         pat = join_patterns(pattern, tiers_pattern(moved))
-        off = sorted({re.sub(r'_copy\d+$', '', c) for c in res.get('pages_offchip', [])})
+        # Pages off chip: those moved, and those the schedule has already.
+        off = sorted({re.sub(r'_copy\d+$', '', c) for c in res.get('pages_offchip', [])} |
+                     {re.sub(r'_copy\d+$', '', c) for c, info in (sched or {}).items()
+                      if c != '__links__' and info.get('offchip')})
         full = {c: dict(e, vmems=e.get('vmems', [])) for c, e in est.items()}
         # project_h splits by the whole pattern from the raw memories.
         raw = {c: dict(e, mems=e['mems'] + e.get('vmems', []), vmems=[]) for c, e in full.items()}
