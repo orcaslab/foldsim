@@ -5037,12 +5037,24 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       offChip3.push_back(body->getArgument((fetches ? 5 : 3) + k));
   unsigned pages = cls.page ? unsigned(llvm::PowerOf2Ceil(cls.page)) : 0;
   unsigned pageWidth = pages > 1 ? llvm::Log2_32_Ceil(pages) : 0;
-  DenseMap<Value, Value> replaced;
+  // The copy's outputs are held as the operands of placeholder ops until its
+  // hw.output is built: registers, memory reads and paged registers are
+  // replaced and erased below, and only a use follows a replacement (a
+  // Value kept aside, or a map keyed by it, outlives the op it names).
+  auto hold = [&](ValueRange values) -> Operation * {
+    auto builder = OpBuilder::atBlockEnd(body);
+    return UnrealizedConversionCastOp::create(builder, model.getLoc(),
+                                              TypeRange{}, values);
+  };
+  auto release = [](Operation *held, SmallVectorImpl<Value> &into) {
+    into.append(held->operand_begin(), held->operand_end());
+    held->erase();
+  };
+  Operation *heldResults = hold(results);
   for (auto [i, arg] : llvm::enumerate(modelBody->getArguments())) {
     Value to = int(i) == cls.clockInput ? Value(hostClock)
                                         : Value(body->getArgument(inputArg[i]));
     arg.replaceAllUsesWith(to);
-    replaced[arg] = to;
   }
   ImplicitLocOpBuilder b(model.getLoc(), body, body->end());
   auto i1 = b.getI1Type();
@@ -5139,7 +5151,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // instance's read data from its responses, kept like a registered read's
   // (no bypass: the state gap covers the buffer), and the instances whose
   // read is pending, set as it is issued and cleared as its response comes.
-  SmallVector<SmallVector<Value>> virtualPorts(cls.virtualMemories.size());
+  SmallVector<Operation *> virtualPorts(cls.virtualMemories.size(), nullptr);
   auto buildVirtualMemory = [&](seq::FirMemOp memory,
                                 unsigned k) -> SmallVector<Value> {
     auto &vm = cls.virtualMemories[k];
@@ -5256,7 +5268,6 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         Value slice = b.createOrFold<comb::ExtractOp>(intType(width), data, offset);
         slice = b.createOrFold<hw::BitcastOp>(read.getData().getType(), slice);
         read.getData().replaceAllUsesWith(slice);
-        replaced[read.getData()] = slice;
         read.erase();
       }
       for (auto lane : llvm::drop_begin(vm.lanes))
@@ -5297,7 +5308,6 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       Value data = readBuffer();
       data = b.createOrFold<hw::BitcastOp>(read.getData().getType(), data);
       read.getData().replaceAllUsesWith(data);
-      replaced[read.getData()] = data;
       read.erase();
     }
     memory.erase();
@@ -5424,7 +5434,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   SmallVector<PagedReg> pagedRegs;
   // Off chip, each page column's virtual memory and its outputs (requests
   // and pending reads), appended to the copy's ports once its body is built.
-  SmallVector<std::pair<unsigned, SmallVector<Value>>> pageRequests;
+  SmallVector<std::pair<unsigned, Operation *>> pageRequests;
   // With page masks, each enable's register, one per enable.
   DenseMap<std::pair<Value, unsigned>, Value> pagedEnableRegs;
   BackedgeBuilder pageEdges(b, model.getLoc());
@@ -5596,7 +5606,6 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         readNext.setValue(loaded);
       }
       reg.getResult().replaceAllUsesWith(value);
-      replaced[reg.getResult()] = value;
       reg.erase();
       continue;
     }
@@ -5606,7 +5615,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       auto &lanes = cls.virtualMemories[it->second].lanes;
       for (auto lane : lanes)
         laneDone.insert(lane);
-      virtualPorts[it->second] = buildVirtualMemory(lanes.front(), it->second);
+      virtualPorts[it->second] =
+          hold(buildVirtualMemory(lanes.front(), it->second));
       continue;
     }
     auto memType = memory.getType();
@@ -5725,7 +5735,6 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         }
       }
       read.getData().replaceAllUsesWith(data);
-      replaced[read.getData()] = data;
       read.erase();
     }
     memory.erase();
@@ -6132,7 +6141,6 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                               SmallVector<Value>(parts.rbegin(), parts.rend()));
       value = b.createOrFold<hw::BitcastOp>(Value(reg.value).getType(), value);
       reg.value.setValue(value);
-      replaced[reg.original] = value;
     }
     // Each column's write: page j's bits at its host cycle, and with masks
     // its bytes' enables.
@@ -6195,7 +6203,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         }
         col.requests[6] = writeData;
         col.requests[7] = writeMask;
-        pageRequests.push_back({col.vm, col.requests});
+        pageRequests.push_back({col.vm, hold(col.requests)});
         continue;
       }
       // A column of one byte has a memory of mask width 1, which is no
@@ -6292,15 +6300,15 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   }
 
   SmallVector<Value> outputs;
-  for (auto value : results) {
-    auto it = replaced.find(value);
-    outputs.push_back(it == replaced.end() ? value : it->second);
-  }
-  for (auto &ports : virtualPorts)
-    outputs.append(ports.begin(), ports.end());
+  release(heldResults, outputs);
+  for (auto *held : virtualPorts)
+    if (held)
+      release(held, outputs);
   b.setInsertionPointToEnd(body);
   hw::OutputOp::create(b, outputs);
-  for (auto &[k, values] : pageRequests) {
+  for (auto &[k, held] : pageRequests) {
+    SmallVector<Value> values;
+    release(held, values);
     auto &vm = cls.virtualMemories[k];
     vm.firstOutput = copy.getNumOutputPorts();
     std::string name = ("vm" + Twine(k) + "_").str();
