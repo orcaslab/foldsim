@@ -5314,18 +5314,23 @@ LogicalResult StaticFolder::buildSim() {
       }
       for (auto &[key, index] : sources) {
         if (key.first < 0) {
-          SmallVector<uint64_t> rows(threads, 0);
-          for (unsigned i = 0; i < threads; ++i)
-            if (sourceOf[i] == key)
-              rows[i] = constants[i].getZExtValue();
-          if (width > 64)
-            return netlist.emitError("a constant of over 64 bits differing by "
-                                     "instance: ")
-                   << consumer.name;
-          sourceData[index] =
-              threads > 1 ? table(b, ctl.inst1, rows, width)
-                          : hw::ConstantOp::create(b, b.getIntegerType(width),
-                                                   rows[0]);
+          // Each instance's constant, by instance: a table of up to 64 bits
+          // a slice, the slices joined (high first).
+          SmallVector<Value> slices;
+          for (unsigned lo = 0; lo < width; lo += 64) {
+            unsigned w = std::min(64u, width - lo);
+            SmallVector<uint64_t> rows(threads, 0);
+            for (unsigned i = 0; i < threads; ++i)
+              if (sourceOf[i] == key)
+                rows[i] = constants[i].extractBits(w, lo).getZExtValue();
+            slices.push_back(threads > 1 ? table(b, ctl.inst1, rows, w)
+                                         : hw::ConstantOp::create(
+                                               b, b.getIntegerType(w), rows[0]));
+          }
+          std::reverse(slices.begin(), slices.end());
+          sourceData[index] = slices.size() == 1
+                                  ? slices[0]
+                                  : b.createOrFold<comb::ConcatOp>(slices);
           continue;
         }
         auto &producer = producers[key.first];
