@@ -283,7 +283,7 @@ public:
                unsigned zeroChainHops, ArrayRef<std::string> page,
                bool pageMasks, unsigned pageHbmColumnBits,
                unsigned pageHbmWindow, unsigned pageMemoryBits,
-               StringRef pageMemories)
+               StringRef pageMemories, StringRef pageRows)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -302,7 +302,7 @@ public:
         pageSpecs(page), pageMasks(pageMasks),
         pageHbmColumnBits(pageHbmColumnBits), pageHbmWindow(pageHbmWindow),
         pageMemoryBits(pageMemoryBits), pageMemories(pageMemories.str()),
-        envRoundTrip((stagedEnv ? 1 : 0) + 1 + decisionLead()),
+        pageRows(pageRows.str()), envRoundTrip((stagedEnv ? 1 : 0) + 1 + decisionLead()),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
 
@@ -514,6 +514,9 @@ private:
   /// regex of the memories that may (empty: any).
   unsigned pageMemoryBits;
   std::string pageMemories;
+  /// `page-rows`: <model>:<memory> names that page as rows whatever their
+  /// size (empty: none).
+  std::string pageRows;
   /// A paged class's combinationally read memories of at most
   /// `pageMemoryBits` bits that no ready pass reads, as a register per row:
   /// the reads a choice of the rows, the writes their next values. Returns
@@ -3056,16 +3059,22 @@ StaticFolder::memoriesAsRows(Class &cls, const DenseSet<Operation *> &ready,
   Value clock = body->getArgument(cls.clockInput);
   SmallVector<seq::FirMemOp> memories;
   llvm::Regex only(pageMemories.empty() ? ".*" : pageMemories);
+  llvm::Regex chosenRx(pageRows);
+  StringRef model =
+      cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : StringRef(cls.name);
   for (auto memory : body->getOps<seq::FirMemOp>()) {
     auto type = memory.getType();
-    if (!only.match(memory.getName().value_or("")))
+    StringRef memName = memory.getName().value_or("");
+    // Named by page-rows: whatever its size.
+    bool chosen = !pageRows.empty() && chosenRx.match((model + ":" + memName).str());
+    if (!chosen && (!pageMemoryBits || !only.match(memName) ||
+                    uint64_t(type.getDepth()) * type.getWidth() > pageMemoryBits))
       continue;
     // A folded pipeline's result store is the pipeline's, not the model's.
     if ((folding && (folding->physical.contains(memory) ||
                      folding->foldOfStore.count(memory))) ||
         ready.contains(memory) || virtualOf.count(memory) ||
-        memory.getReadLatency() > 1 || memory.getInit() ||
-        uint64_t(type.getDepth()) * type.getWidth() > pageMemoryBits)
+        memory.getReadLatency() > 1 || memory.getInit())
       continue;
     if (llvm::all_of(memory->getUsers(), [&](Operation *user) {
           if (isa<seq::FirMemReadOp>(user))
@@ -4474,7 +4483,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   std::pair<unsigned, uint64_t> rowMemories{0, 0};
   if (cls.page) {
     readyRegisters(cls, readyRegs);
-    if (pageMemoryBits && threads > 1)
+    if ((pageMemoryBits || !pageRows.empty()) && threads > 1)
       rowMemories = memoriesAsRows(cls, readyRegs, virtualOf);
   }
 
@@ -4723,17 +4732,24 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         nextEdge.setValue(comb::MuxOp::create(b, rspValid, rspData, buffer));
         data = buffer;
       } else {
+        // Read a host cycle early, at the instance two host cycles ahead,
+        // into the RAM's own output register, so that a wide or deep buffer
+        // may be block RAM (Vivado's choice by size) and not only
+        // distributed RAM. Exact: no response for the instance lands between
+        // that read and its pass, since a pass is decided only once the
+        // instance has no read pending (virtualReady), a decision lead
+        // (>= 3 host cycles) before it.
         auto bufferType =
             seq::FirMemType::get(context, entries, vm.dataWidth, 1);
         auto buffer = seq::FirMemOp::create(
-            b, bufferType, /*readLatency=*/0, /*writeLatency=*/1,
-            seq::RUW::Undefined, seq::WUW::Undefined,
+            b, bufferType, /*readLatency=*/1, /*writeLatency=*/1,
+            seq::RUW::Old, seq::WUW::Undefined,
             b.getStringAttr(readName), hw::InnerSymAttr{},
             seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
         keepShallowInFlops(buffer);
         seq::FirMemWriteOp::create(b, buffer, rspInst, hostClock, rspValid,
                                    rspData, Value{});
-        Value bufferData = seq::FirMemReadOp::create(b, buffer, region.inst1,
+        Value bufferData = seq::FirMemReadOp::create(b, buffer, region.inst2,
                                                      hostClock, one());
         data = seq::FirRegOp::create(b, bufferData, hostClock,
                                      b.getStringAttr(readName + "_read"));
@@ -7688,7 +7704,7 @@ void FoldStaticPass::runOnOperation() {
                       slrCapacity, slrAssign, storage, readyLevels,
                       forwardAfterLevels, shareLinkWrites, zeroChainHops,
                       page, pageMasks, pageHbmColumnBits, pageHbmWindow,
-                      pageMemoryBits, pageMemories);
+                      pageMemoryBits, pageMemories, pageRows);
   if (failed(folder.run()))
     return signalPassFailure();
 }

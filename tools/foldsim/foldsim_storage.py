@@ -315,6 +315,88 @@ def page_cost(bits, threads, p, kind):
     return c
 
 
+# The off-chip tier (foldsim --state auto). A store kept in HBM costs no
+# on-chip RAM but HBM traffic each frame, which the frame must carry: a share
+# of HBM_BYTES_PER_CYCLE (the rest is the target's own memory traffic and
+# headroom), so `assign` prices traffic in an 'hbm' pool of
+# HBM_STATE_SHARE x frame x HBM_BYTES_PER_CYCLE bytes. Off-chip kinds are
+# relief kinds: a store takes one only to relieve an on-chip pool that is
+# over, the move freeing it at the least HBM traffic per unit freed, so the
+# least state that lets the rest fit leaves the chip, deep memories (a row
+# of many a frame) before register pages (all of an instance's state, read
+# and written each frame).
+HBM_STATE_SHARE = 0.75
+# The bubbles a frame may take waiting on HBM (the `bubbles` pool): a share of
+# the frame, so H stays within (1 + BUBBLE_SHARE) of it.
+BUBBLE_SHARE = 0.05
+# A virtual memory's read round trip through HBM in host cycles (controller,
+# vNoC, HBM and back; a host-cache hit answers in 5): a state pass whose
+# instance's read is younger than this waits in bubbles (VMEM_INTERFACE.md,
+# controller v1: latency).
+HBM_ROUND_TRIP = 64
+# The controller's row limit and the AXI beat (512 bits).
+VMEM_ROW_BITS = 4096
+HBM_BEAT_BYTES = 64
+RELIEF_KINDS = ('hbm',)
+# A virtual memory's controller in the kernel (foldsim_vmem: request queue,
+# tags, write buffer, AXI master; its host cache is block RAM, priced apart):
+# LUTs, an estimate. It makes moving a small store off chip cost more logic
+# than it frees.
+VMEM_CTL_LUTS = 3000
+
+
+def vmem_row_bytes(width, row_bytes_min=1):
+    """A virtual memory's row in device memory (layout v7): its bytes rounded
+    up to a power of two, at least `row_bytes_min`."""
+    return max(row_bytes_min, 1 << ((width + 7) // 8 - 1).bit_length())
+
+
+def vmem_eligible(m, gap):
+    """Why a memory cannot be a virtual memory (foldsim-fold-static
+    virtual-memories), or '': a registered read, one read port and at most
+    one write port, byte enables or none, a row the controller takes, and a
+    state gap of 5 (the pending read set at a state pass seen by the next
+    decision). `m`: class_estimates' memory (name, depth, width, reads,
+    writes, read latency, style, mask, named); `gap`: the copy's state gap."""
+    name, d, w, r, wr, rl, _, mask, named = m[:9]
+    if rl != 1:
+        return f'read latency {rl}'
+    if r != 1 or wr > 1:
+        return f'{r} read and {wr} write ports'
+    if mask > 1 and (w % mask or (w // mask) % 8):
+        return 'mask not whole bytes'
+    if w > VMEM_ROW_BITS:
+        return f'row of {w} bits'
+    if gap is not None and gap < 5:
+        return f'state gap {gap}'
+    if not named or re.search(r'[\s{},=]', name):
+        return 'a name the option cannot carry'
+    return ''
+
+
+def vmem_cost(depth, width, threads, weight=1.0, row_bytes_min=1):
+    """What a memory costs kept in HBM (a virtual memory): no RAM of its own
+    on chip; its read buffer (a row per instance, read registered: in flops
+    for one instance, else distributed or block RAM as Vivado infers it),
+    the controller (VMEM_CTL_LUTS, shared when grouped: counted whole), and
+    `hbm` bytes a frame: each instance's state pass reads a row and writes
+    one, `weight` times (accesses per instance and target cycle; 1 at most),
+    each at least an AXI beat."""
+    row = max(vmem_row_bytes(width, row_bytes_min), HBM_BEAT_BYTES)
+    th = 1 << (threads - 1).bit_length() if threads > 1 else 1
+    lr, br = cost.mem_cost(th, width, 1, 1) if threads > 1 else (0.0, 0.0)
+    return dict(lut=float(VMEM_CTL_LUTS), lutram=lr, ff=width, bram=br, uram=0,
+                ii_floor=0, hbm=2 * weight * threads * row, ctl=1)
+
+
+def page_hbm_cost(bits, threads, p):
+    """Paged register state off chip (pages=hbm) as a relief kind: page_cost's
+    'hbm' with its traffic in the `hbm` pool."""
+    c = page_cost(bits, threads, p, 'hbm')
+    return dict(c, lut=c['lut'] + VMEM_CTL_LUTS * c['controllers'], hbm=c['hbm_bytes'],
+                ctl=c['controllers'])
+
+
 def page_bound(bits, threads, ports):
     """The frame a copy's register state needs through `ports` 72-bit ports,
     read and written once an instance a frame."""
@@ -491,10 +573,10 @@ def usage(c, pool):
         return sites(c)
     if pool == 'luts':
         return fold_load(c['lut'] + c['lutram'], c['bram'], c['uram'])
-    return c[pool]
+    return c.get(pool, 0.0)
 
 
-def assign(units, base, caps, extra=None, paging=False):
+def assign(units, base, caps, extra=None, paging=False, price_extra=False):
     """A kind per store. `units`: dicts with 'costs' {kind: cost (kind_cost,
     summed over the unit's stores)}, 'count' stores of it, and optionally
     'fixed' (a kind it keeps); `base`: the usage of everything else per pool;
@@ -505,9 +587,19 @@ def assign(units, base, caps, extra=None, paging=False):
     Each store first takes its cheapest kind, every pool priced by its share
     of the capacity; then, while a pool is over, the move that frees it at
     the least price elsewhere, never onto a pool without room, so the
-    overflow only falls and the repair ends."""
+    overflow only falls and the repair ends. A relief kind (RELIEF_KINDS:
+    off chip) is never a first choice, only a move of the repair.
+
+    With `price_extra` (--state auto) the extra pools are priced too, and the
+    prices then follow the pools' use: the choice is made again with each
+    pool's price weighted by the square of its utilization in the last
+    (POLISH_ROUNDS times), so that a pool with room (block RAM nobody needs)
+    stops looking dear and the binding one (the routing load) gets the slack;
+    of the choices that place (and route), the one whose most used pool is
+    least used is kept."""
     pools = list(caps) + list(extra or {})
     limit = dict(caps, **(extra or {}))
+    order = KINDS + ('rows',) + RELIEF_KINDS
 
     def usage_of(i, k, p):
         return usage(units[i]['costs'][k], p)
@@ -516,69 +608,104 @@ def assign(units, base, caps, extra=None, paging=False):
         c = u['costs'].get(k)
         return c is not None and (paging or not c['ii_floor'])
 
-    def price(c):
-        return sum(usage(c, p) / caps[p] for p in caps if caps[p])
+    def solve(weight):
+        def price(c):
+            return sum(usage(c, p) * w for p, w in weight.items())
 
-    choice = []
-    for u in units:
-        kinds = [u['fixed']] if u.get('fixed') in u['costs'] else \
-            [k for k in KINDS if admissible(u, k)]
-        k = min(kinds, key=lambda k: (price(u['costs'][k]), KINDS.index(k)))
-        choice.append({k: u['count']})
-    used = {p: base.get(p, 0.0) + sum(n * usage_of(i, k, p)
-                                      for i, ch in enumerate(choice) for k, n in ch.items())
-            for p in pools}
+        choice = []
+        for u in units:
+            kinds = [u['fixed']] if u.get('fixed') in u['costs'] else \
+                [k for k in order if k not in RELIEF_KINDS and admissible(u, k)]
+            if not kinds:
+                kinds = [k for k in RELIEF_KINDS if admissible(u, k)]
+            k = min(kinds, key=lambda k: (price(u['costs'][k]), order.index(k)))
+            choice.append({k: u['count']})
+        used = {p: base.get(p, 0.0) + sum(n * usage_of(i, k, p)
+                                          for i, ch in enumerate(choice) for k, n in ch.items())
+                for p in pools}
 
-    def relieve(p, active):
-        """The move that frees pool p at the least price elsewhere per unit
-        of p freed: (key, unit, from, to, stores), or None."""
-        best = None
-        for i, u in enumerate(units):
-            if u.get('fixed') in u['costs']:
-                continue
-            for a, n in choice[i].items():
-                for b in KINDS:
-                    if b == a or not admissible(u, b):
-                        continue
-                    relief = usage_of(i, a, p) - usage_of(i, b, p)
-                    if relief <= 0:
-                        continue
-                    m = min(n, math.ceil((used[p] - limit[p]) / relief))
-                    for q in active:
-                        dq = usage_of(i, b, q) - usage_of(i, a, q)
-                        if q != p and dq > 0:
-                            room = limit[q] - used[q]
-                            m = min(m, int(room // dq) if room > 0 else 0)
-                    if m <= 0:
-                        continue
-                    more = sum((usage_of(i, b, q) - usage_of(i, a, q)) / limit[q]
-                               for q in active if q != p and limit[q])
-                    key = (more / (relief / limit[p]), i, KINDS.index(b))
-                    if best is None or key < best[0]:
-                        best = (key, i, a, b, m)
-        return best
-
-    def repair(active):
-        while True:
+        def relieve(p, active):
+            """The move that frees pool p at the least price elsewhere per unit
+            of p freed: (key, unit, from, to, stores), or None."""
             best = None
-            for p in active:
-                if used[p] > limit[p] + 1e-9:
-                    best = relieve(p, active)
-                    if best:
-                        break
-            if best is None:
-                return all(used[p] <= limit[p] + 1e-9 for p in active)
-            _, i, a, b, m = best
-            choice[i][a] -= m
-            if not choice[i][a]:
-                del choice[i][a]
-            choice[i][b] = choice[i].get(b, 0) + m
-            for q in pools:
-                used[q] += m * (usage_of(i, b, q) - usage_of(i, a, q))
+            for i, u in enumerate(units):
+                if u.get('fixed') in u['costs']:
+                    continue
+                for a, n in choice[i].items():
+                    for b in order:
+                        if b == a or not admissible(u, b):
+                            continue
+                        relief = usage_of(i, a, p) - usage_of(i, b, p)
+                        if relief <= 0:
+                            continue
+                        m = min(n, math.ceil((used[p] - limit[p]) / relief))
+                        for q in active:
+                            dq = usage_of(i, b, q) - usage_of(i, a, q)
+                            if q != p and dq > 0:
+                                room = limit[q] - used[q]
+                                m = min(m, int(room // dq) if room > 0 else 0)
+                        if m <= 0:
+                            continue
+                        more = sum((usage_of(i, b, q) - usage_of(i, a, q)) / limit[q]
+                                   for q in active if q != p and limit[q])
+                        key = (more / (relief / limit[p]), i, order.index(b))
+                        if best is None or key < best[0]:
+                            best = (key, i, a, b, m)
+            return best
 
-    if repair(list(caps)) and extra:
-        repair(pools)
-    return choice, used
+        def repair(active):
+            while True:
+                best = None
+                for p in active:
+                    if used[p] > limit[p] + 1e-9:
+                        best = relieve(p, active)
+                        if best:
+                            break
+                if best is None:
+                    return all(used[p] <= limit[p] + 1e-9 for p in active)
+                _, i, a, b, m = best
+                choice[i][a] -= m
+                if not choice[i][a]:
+                    del choice[i][a]
+                choice[i][b] = choice[i].get(b, 0) + m
+                for q in pools:
+                    used[q] += m * (usage_of(i, b, q) - usage_of(i, a, q))
+
+        if repair(list(caps)) and extra:
+            repair(pools)
+        return choice, used
+
+    priced = dict(caps, **(extra or {})) if price_extra else caps
+    weight = {p: 1 / v for p, v in priced.items() if v}
+    choice, used = solve(weight)
+    if not price_extra:
+        return choice, used
+
+    # The off-chip pools are not balanced: the least state leaves the chip
+    # (the first choice's), and a polished choice that moves more is not kept.
+    offchip = [p for p in OFFCHIP_POOLS if p in limit]
+    first = {p: used[p] for p in offchip}
+
+    def peak(used):
+        ok = all(used[p] <= limit[p] + 1e-9 for p in pools)
+        more = any(used[p] > first[p] + 1e-9 for p in offchip)
+        return (not ok, more, max(used[p] / limit[p] for p in pools
+                                  if limit[p] and p not in offchip))
+    best = (peak(used), choice, used)
+    for _ in range(POLISH_ROUNDS):
+        weight = {p: (max(used[p], 0.0) / limit[p]) ** 2 / limit[p] for p in pools
+                  if limit[p] and p not in offchip}
+        weight.update({p: 1 / limit[p] for p in offchip if limit[p]})
+        choice, used = solve(weight)
+        if peak(used) < best[0]:
+            best = (peak(used), choice, used)
+    return best[1], best[2]
+
+
+# Rounds of assign's utilization-weighted prices (price_extra), and the pools
+# they leave alone (off chip: HBM traffic and the bubbles it costs).
+POLISH_ROUNDS = 3
+OFFCHIP_POOLS = ('hbm', 'bubbles')
 
 
 def read_points(path):

@@ -24,6 +24,11 @@
 // memory, `mem`, is found by `^me` and not by `^x`, which pages registers only.
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2 page-memories=^me})' 2>&1 | FileCheck %s --check-prefix=ROWS
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2 page-memories=^x})' 2>&1 | FileCheck %s --check-prefix=NOROWS
+// page-rows names memories (<model>:<name>) that page as rows whatever their
+// size (a cost model's choice): with no size allowed (page-memory-bits=0)
+// the memory still pages by name, and a name of another model takes none.
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2 page-memory-bits=0 page-rows=^(Leaf:mem)$})' 2>&1 | FileCheck %s --check-prefix=ROWS
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page=Leaf:2 page-memory-bits=0 page-rows=^(Top:mem)$})' 2>&1 | FileCheck %s --check-prefix=NOROWS
 // NOROWS: pages Leaf: p 2, 4 registers, 100 bits; page RAMs 8 rows x 50 bits
 // NOROWS: %mem = seq.firmem 1, 1, old, undefined : <64 x 8, mask 1>
 // Registers a ready pass reads keep their stores (the leaves' output is the

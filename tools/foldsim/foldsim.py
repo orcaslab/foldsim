@@ -350,6 +350,10 @@ def frame_options(a):
         if re.search(r'[\s{}]', a.page_memories):
             sys.exit('--page-memories: a regex without spaces or braces')
         fold += f' page-memories={a.page_memories}'
+    if getattr(a, 'page_rows', None):
+        if re.search(r'[\s{}]', a.page_rows):
+            sys.exit('--page-rows: a regex without spaces or braces')
+        fold += f' page-rows={a.page_rows}'
     if getattr(a, 'page_hbm_window', None):
         fold += f' page-hbm-window={a.page_hbm_window}'
     if getattr(a, 'page_hbm_column_bits', None):
@@ -534,6 +538,71 @@ def choose_pages(a, foldsim_opt, flat, passes, out, fold):
           + (f"; off chip: {', '.join(off)}, {res['hbm_bytes']} bytes a frame" if off else ''),
           file=sys.stderr)
     return spec, [f'{m}:pages=hbm' for m in off]
+
+
+def choose_state(a, foldsim_opt, flat, passes, out, fold):
+    """--state auto: where each class's state lives (foldsim_degree.choose_state:
+    on chip, paged on chip, or in HBM, priced against the V80 region, its
+    routing and H), on a schedule of the fold as given. Returns the fold
+    with the choice: its `page`, `page-rows`, the virtual memories it moved
+    and the storage rules (pages=hbm among them); the choice is written to
+    <out>/state.txt."""
+    import foldsim_degree
+    models = out('models.mlir')
+    if not os.path.exists(models):
+        run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
+             '-o', models])
+    base = out('schedule_state_base.txt')
+    plain = re.sub(r' report=\S+', '', fold).replace(' schedule-only', '')
+    r = subprocess.run([foldsim_opt, models, NO_OP_DUMP, f'--pass-pipeline=builtin.module('
+                        f'foldsim-fold-static{{{plain} report={base} schedule-only}})',
+                        '-o', os.devnull], capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(r.stderr)
+    text = open(base).read()
+    ii, classes, _ = foldsim_degree.parse_schedule(text)
+    path = a.degree_calibration or DEGREE_CALIBRATION
+    cal = json.load(open(path)) if path != 'none' and os.path.exists(path) else None
+    names = sorted({re.sub(r'_copy\d+$', '', c) for c in classes})
+    m = re.search(r' virtual-memories=(\S+)', fold)
+    pattern = m.group(1) if m else ''
+    est = foldsim_degree.split_virtual(foldsim_degree.class_estimates(models, names), pattern)
+    entries = a.register_state_entries if a.register_state_entries is not None else 2
+    weights = json.load(open(a.vmem_weights)) if a.vmem_weights else None
+    vmem = (a.vmem_cache_rows, a.vmem_cache_budget) if a.vmem_cache_rows is not None else None
+    res = foldsim_degree.choose_state(cal, est, classes, foldsim_degree.parse_classes(text), ii,
+                                      route=a.routability, entries=entries, vmem=vmem,
+                                      pattern=pattern, weights=weights,
+                                      row_bytes_min=a.vmem_row_bytes_min)
+    if res is None:
+        sys.exit(f'--state auto: nothing fits the V80 region (II {ii}); see {base}')
+    with open(out('state.txt'), 'w') as f:
+        f.write(f'II {ii} (schedule)\n' + foldsim_degree.state_table(res, classes, est) + '\n')
+    h = res['h']
+    print(f"foldsim: state auto: frame {res['frame']} (II {ii}), H at most {h['h']}; page "
+          f"{len(res['page'].split(',')) if res['page'] else 0} models, {len(res['rows_new'])} "
+          f"larger memories as rows, {len(res['moved'])} memories and "
+          f"{len(res['pages_offchip'])} models' pages to HBM ({h['hbm_bytes']} bytes a frame); "
+          f"{res['res']['luts']} LUTs, {res['res']['bram']} RAMB36, "
+          f"{round(res['res'].get('uram', 0))} URAM288; see {out('state.txt')}", file=sys.stderr)
+    if res['page']:
+        fold = re.sub(r' page=\S+', '', fold) + f" page={res['page']}"
+    if res['rows']:
+        fold += f" page-rows={res['rows']}"
+    if res['pattern'] and res['pattern'] != pattern:
+        if m:
+            fold = fold.replace(m.group(0), f" virtual-memories={res['pattern']}")
+        else:
+            fold += f" virtual-memories={res['pattern']}"
+            if a.vmem_merge_lanes:
+                fold += ' vmem-merge-lanes'
+            if a.vmem_skip_held_reads:
+                fold += ' vmem-skip-held-reads'
+    if res['storage']:
+        m = re.search(r' storage=(\S+)', fold)
+        fold = (fold.replace(m.group(0), f" storage={m.group(1)},{res['storage']}") if m
+                else fold + f" storage={res['storage']}")
+    return fold
 
 
 def slr_options(a, foldsim_opt, models, fold, out):
@@ -855,6 +924,16 @@ def main():
                     help='with --page: memories read combinationally of at most N bits page as '
                          'rows with the registers (foldsim-fold-static page-memory-bits; default '
                          '4096, 0: registers only)')
+    ap.add_argument('--state', choices=('auto',),
+                    help="with --static: where each class's state lives, priced "
+                         '(foldsim_degree.py choose_state): on chip (flops, distributed, block or '
+                         'ultra RAM), paged on chip (--page, larger memories as rows: --page-rows), '
+                         'or in HBM (virtual memories, pages off chip), the least state off chip '
+                         'that lets the fold place and route on the V80 region at the shortest '
+                         'frame, H projected; the choice in <out>/state.txt')
+    ap.add_argument('--page-rows', metavar='REGEX',
+                    help='with --page: the memories (<model>:<name>) that page as rows whatever '
+                         'their size, as --state auto chooses them (foldsim-fold-static page-rows)')
     ap.add_argument('--page-memories', metavar='REGEX',
                     help='with --page: only the memories this regex finds page as rows '
                          '(foldsim-fold-static page-memories)')
@@ -1111,16 +1190,20 @@ def main():
     if a.copies == 'auto' and not a.static:
         sys.exit('--copies auto needs --static')
     if a.vmem_cache_rows is not None:
-        if not a.virtual_memories:
-            sys.exit('--vmem-cache-rows needs --virtual-memories')
+        if not a.virtual_memories and a.state != 'auto':
+            sys.exit('--vmem-cache-rows needs --virtual-memories (or --state auto)')
         if a.vmem_cache_rows != 'auto' and not a.vmem_cache_rows.isdigit():
             sys.exit('--vmem-cache-rows: auto, 0 or a power of two of at least 2')
         vmem_cache_rows([], a.vmem_cache_rows, a.vmem_cache_budget)
+    if a.state and not a.static:
+        sys.exit('--state needs --static')
+    if a.state and a.page == 'auto':
+        sys.exit('--state auto chooses the pages: no --page auto with it')
     if a.page and not a.static:
         sys.exit('--page needs --static')
     if a.vmem_group is not None:
-        if not a.virtual_memories:
-            sys.exit('--vmem-group needs --virtual-memories')
+        if not a.virtual_memories and a.state != 'auto':
+            sys.exit('--vmem-group needs --virtual-memories (or --state auto)')
         if not (a.vmem_group == 'copy' or (a.vmem_group.isdigit() and int(a.vmem_group) >= 1)
                 or re.fullmatch(r'auto(:[1-9][0-9]*)?', a.vmem_group)):
             sys.exit('--vmem-group: copy, the memories per controller (at least 1), or auto[:M]')
@@ -1147,7 +1230,10 @@ def main():
                 fold += f' copies={a.copies}'
             if a.nest:
                 fold += ' nest'
-            fold += frame_options(a) + ' schedule-only'
+            fold += frame_options(a)
+            if a.state == 'auto':
+                fold = choose_state(a, foldsim_opt, flat, passes, out, fold)
+            fold += ' schedule-only'
             r = run([foldsim_opt, models, NO_OP_DUMP,
                      f'--pass-pipeline=builtin.module(foldsim-fold-static{{{fold}}})', '-o', os.devnull],
                     check=False)
@@ -1174,6 +1260,8 @@ def main():
                 m = re.search(r' storage=(\S+)', fold)
                 fold = (fold.replace(m.group(0), f' storage={m.group(1)},{",".join(hbm)}') if m
                         else fold + f' storage={",".join(hbm)}')
+        if a.state == 'auto':
+            fold = choose_state(a, foldsim_opt, flat, passes, out, fold)
         if a.slr_groups:
             if a.copies != 'auto':
                 run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',

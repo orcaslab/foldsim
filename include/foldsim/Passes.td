@@ -498,6 +498,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"pageMemories", "page-memories", "std::string", "\"\"",
            "With page-memory-bits: a regex of the memories that page as rows "
            "(empty: every one that qualifies)">,
+    Option<"pageRows", "page-rows", "std::string", "\"\"",
+           "With page: a regex of <model>:<memory> names that page as rows "
+           "whatever their size (a cost model's choice, foldsim --state "
+           "auto), besides those page-memory-bits and page-memories take; "
+           "the other conditions of a row memory hold">,
     Option<"pageMasks", "page-masks", "bool", "true",
            "With page: a paged register written under an enable keeps it, "
            "registered at the state pass, as its bytes' write mask in the "

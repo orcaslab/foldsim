@@ -10,6 +10,14 @@
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem
 # RUN: foldsim --srcs top.f --top Top --out %t/one --static --virtual-memories ram Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=VH < %t/one/foldsim_sim.vh
+# The read buffer (each instance's read data) reads registered, a host cycle
+# early at the instance two ahead, into its output register: block RAM when
+# Vivado finds it large enough.
+# RUN: FileCheck %s --check-prefix=BUF < %t/one/foldsim_sim.mlir
+# BUF: %ram_rdata = seq.firmem 1, 1, old, undefined : <4 x 8, mask 1>
+# BUF-NEXT: seq.firmem.write_port %ram_rdata[%vm0_rsp_inst] = %vm0_rsp_data, clock %hostClock enable %vm0_rsp_valid
+# BUF-NEXT: [[R:%.+]] = seq.firmem.read_port %ram_rdata[%ahead0_inst2], clock %hostClock
+# BUF-NEXT: %ram_rdata_read = seq.firreg [[R]] clock %hostClock
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/one/obj %S/Inputs/tb_vmem.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=FAST
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | FileCheck %s

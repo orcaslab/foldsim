@@ -1,0 +1,55 @@
+"""--state auto in the cost model (foldsim_degree.choose_state), on made-up
+classes: argv[1] is the foldsim driver, beside the modules."""
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.realpath(sys.argv[1])))
+import foldsim_degree as d  # noqa: E402
+import foldsim_storage as s  # noqa: E402
+
+# What a virtual memory may be: a registered read, one read and at most one
+# write port, byte enables, a row the controller takes, a state gap of 5.
+gpr = ('gpr/ram', 64, 2048, 1, 1, 1, 'block', 256, True)
+for m, gap in ((gpr, 100), (gpr, 4), (('q', 16, 64, 1, 1, 0, None, 1, True), 100),
+               (('w', 16, 8192, 1, 1, 1, None, 1, True), 100),
+               (('m', 16, 64, 1, 1, 1, None, 4, True), 100)):
+    print(f'eligible {m[0]} gap {gap}: {s.vmem_eligible(m, gap) or "yes"}')
+c = s.vmem_cost(64, 2048, 512)
+print(f'vmem 512 x 64 x 2048: hbm {c["hbm"]:.0f} lutram {c["lutram"]} bram {c["bram"]} '
+      f'lut {c["lut"]:.0f}')
+print('pattern', d.tiers_pattern([('Opc_copy1', 'gpr/ram'), ('Opc', 'a.b[0]')]))
+
+
+def sched(classes, gap=None):
+    return {c: dict(n=n, ready=[], state=list(range(n)), gap=gap or 1000, page=0)
+            for c, n in classes.items()}
+
+
+# An SM-like fold: 512 operand units, each six 64 x 2048 register-file banks
+# (403 Mbit) and 20,000 register bits; a frame of 4,096. On chip the banks
+# would take 1,392 URAM288 (232 each), more than the region's 1,211; as many
+# go to HBM as the rest needs to fit and route, their traffic (256 KiB a
+# frame each) within the frame's share, so H stays the frame.
+classes = dict(Opc=512, Top=1)
+gprs = [(f'g{k}/ram', 64, 2048, 1, 1, 1, 'block', 256, True) for k in range(6)]
+est = dict(Opc=dict(lut=20000.0, ff=20000, mems=gprs, regw={20000: 1}),
+           Top=dict(lut=50000.0, ff=1000, mems=[], regw={}))
+out = d.choose_state(None, est, classes, sched(classes), 4096, vmem=('auto', 120))
+print(f"opc: page {out['page']!r} frame {out['frame']} H {out['h']['h']} "
+      f"hbm {out['h']['hbm_bytes']} fits {out['res']['fits']} routes {out['res']['routes']}")
+print('opc moved', sorted(m for _, m in out['moved']), 'pages off', out['pages_offchip'])
+print('opc pattern', out['pattern'])
+# A small fold fits as it is: nothing moves.
+est['Opc'] = dict(lut=20000.0, ff=2000, mems=[('g/ram', 64, 32, 1, 1, 1, 'block', 4, True)],
+                  regw={2000: 1})
+out = d.choose_state(None, est, dict(Opc=64, Top=1), sched(dict(Opc=64, Top=1)), 256)
+print(f"small: moved {out['moved']} H {out['h']['h']} fits {out['res']['fits']}")
+# A memory read combinationally (a 24 x 512 table) in a paged class pages as
+# rows where its distributed RAM costs more: the choice names it.
+est['Opc'] = dict(lut=20000.0, ff=20000, mems=gprs + [('ptw', 24, 512, 1, 1, 0, None, 1, True)],
+                  regw={20000: 1})
+out = d.choose_state(None, est, classes, sched(classes), 4096, vmem=('auto', 120))
+print('rows', out['rows'])
+# Reads younger than the HBM round trip wait: a state gap of 40 for every
+# instance of a class with virtual memories.
+h = d.project_h(4096, classes, sched(classes, gap=40), est, '^Opc:g0/ram$')
+print(f"bubbles: H {h['h']} bubbles {h['bubbles']} per {h['per']}")

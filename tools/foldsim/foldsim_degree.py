@@ -139,7 +139,7 @@ def split_virtual(est, pattern):
     base = lambda c: re.sub(r'_copy\d+$', '', c)
     virtual = lambda c, m: m[8] and (rx.search(m[0]) or rx.search(f'{base(c)}:{m[0]}'))
     return {c: dict(e, mems=[m for m in e['mems'] if not virtual(c, m)],
-                    vmems=[m for m in e['mems'] if virtual(c, m)])
+                    vmems=e.get('vmems', []) + [m for m in e['mems'] if virtual(c, m)])
             for c, e in est.items()}
 
 
@@ -269,7 +269,7 @@ def rest_of(cal, est_total):
 
 
 def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fixed',
-         route=False, uram=True, slr_groups=False, vmem=None):
+         route=False, uram=True, slr_groups=False, vmem=None, tiers=None):
     """LUTs of one fold degree ({class: copies}, 1 when absent): logic and
     distributed RAM apart, the sites they take, and the largest copy. With the
     degree's schedule report (parse_classes) each copy's state takes the form
@@ -282,12 +282,24 @@ def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fi
     copy is kept whole in one SLR (foldsim --slr-groups), which confines the
     fold to as many SLRs as it has copies. Virtual memories (split_virtual)
     are off chip; their host caches (`vmem`, vmem_bram) take block RAM.
-    The kernel's controllers' logic is not priced."""
+    The kernel's controllers' logic is not priced. `tiers` (store 'auto'
+    only): the off-chip tier (storage_area), as choose_state gives it."""
     cache = vmem_bram(est, classes, degree, vmem)
     slrs = storage.route_slrs(sum(degree.get(c, 1) for c in classes) if slr_groups else 0)
     if store == 'auto':
         res = storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram,
-                           slrs, cache)
+                           slrs, cache, tiers)
+        if tiers is not None and res.get('vmem_new') and vmem:
+            # The host caches of the memories it moved off chip: priced again
+            # with them in the base (their lines are block RAM).
+            more = vmem_bram(split_virtual(est, tiers_pattern(res['vmem_new'])), classes,
+                             degree, vmem)
+            if more > cache:
+                cache = more
+                res = storage_area(cal, est, classes, degree, rest, sched, ii, entries, route,
+                                   uram, slrs, cache, dict(tiers, force=res['vmem_new'],
+                                                           force_pages=res['pages_offchip'],
+                                                           force_rows=res['rows_new']))
     else:
         res = fixed_area(cal, est, classes, degree, rest, sched, ii, entries, cache)
     if cache:
@@ -300,8 +312,10 @@ def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fi
 
 
 # A paged class's memories of at most this many bits page as rows with its
-# registers (foldsim-fold-static page-memory-bits).
+# registers (foldsim-fold-static page-memory-bits); --state auto may page
+# larger ones, up to ROW_BITS_MAX, where that is cheaper (storage_area).
 PAGE_MEMORY_BITS = 4096
+ROW_BITS_MAX = 1 << 16
 
 
 def paged_state(est):
@@ -372,16 +386,29 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
 
 
 def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram=True,
-                 slrs=None, cache=0.0):
+                 slrs=None, cache=0.0, tiers=None):
     """area() with a kind chosen per store (foldsim_storage.assign) against
     the V80 dynamic region: its sites, RAMB36 and URAM288 and, with `route`,
     the LUTs that route over `slrs` SLRs (the region's by default). Every
     copy of a class takes its stores' kinds (the compiler's `storage` rules
     are per class); a class's register stores choose by width, and only
     where every copy of several instances keeps them in distributed RAM (no
-    flops or ring) with a state gap of 4."""
+    flops or ring) with a state gap of 4.
+
+    `tiers` (choose_state): the off-chip tier as relief kinds (foldsim_storage
+    RELIEF_KINDS): a memory a virtual memory may hold (vmem_eligible in every
+    copy) may go to HBM (vmem_cost), a paged copy's pages too (pages=hbm),
+    against an `hbm` pool of HBM_STATE_SHARE of the frame's HBM bytes
+    (`frame` host cycles at HBM_BYTES_PER_CYCLE) less the traffic of the
+    memories already virtual (`base_hbm`). Keys: frame, base_hbm, weights
+    ({memory name or <class>:<name>: accesses per instance and target cycle,
+    default 1}), row_bytes_min, pages_hbm (whether pages may leave), force /
+    force_pages (moves already chosen, kept). The result names the memories
+    moved (`vmem_new`: (class, memory) pairs) and the classes whose pages
+    left (`pages_offchip`), with their traffic (`hbm_bytes`)."""
     logic = rest
     units, copy_logic, base_lutram = [], {}, 0.0
+    page_of = {}
     paged = dict(bits=0, ff=0, ports=0, hbm=0)
     for c, n in classes.items():
         k = degree.get(c, 1)
@@ -396,6 +423,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             logic += cl
             copy_logic[(c, j)] = cl
             forms.append((j, t, form, info['gap'] if info else None))
+            if form == 'paged':
+                page_of[(c, j)] = info['page']
             if form == 'paged' and info.get('offchip'):
                 bits, mux, _ = paged_state(est[c])
                 pc = storage.page_cost(bits, t, info['page'], 'hbm')
@@ -413,6 +442,11 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                          for kind in ('block', 'ultra')}
                 # The frame its state passes need is the schedule's (`ii`).
                 pcost = {k: dict(v, lutram=0.0, ii_floor=0) for k, v in pcost.items()}
+                if tiers is not None and (tiers.get('pages_hbm') or
+                                          c in tiers.get('force_pages', ())):
+                    pcost['hbm'] = dict(storage.page_hbm_cost(bits, t, info['page']),
+                                        ii_floor=0, bubbles=t * max(
+                                            0, storage.HBM_ROUND_TRIP + 7 - tiers['frame'] // t))
                 units.append(dict(costs=pcost,
                                   per={k: [(j, v)] for k, v in pcost.items()}, count=1,
                                   fixed=None, store='pages', default='block',
@@ -452,19 +486,78 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             nameable = named and not re.search(r'[,=:{}\s]', name)
             u = unit(c, name, per, lam, None if nameable else default)
             u['default'] = default
+            if tiers is not None and nameable and len(per) == len(forms) and all(
+                    not storage.vmem_eligible((name, d, w, r, wr, rl, st, mask, named), gap)
+                    for _, _, _, gap in forms):
+                weights = tiers.get('weights') or {}
+                wt = float(weights.get(f'{c}:{name}', weights.get(name, 1.0)))
+                hc = dict(lut=0.0, lutram=0.0, ff=0, bram=0.0, uram=0, ii_floor=0, hbm=0.0, ctl=0)
+                parts = []
+                for j, t, _, _ in forms:
+                    v = storage.vmem_cost(d, w, t, wt, tiers.get('row_bytes_min', 1))
+                    v = dict(v, lutram=lam * v['lutram'])
+                    v = {k: (x if k == 'ii_floor' else x * cnt) for k, x in v.items()}
+                    parts.append((j, v))
+                    for key in hc:
+                        if key != 'ii_floor':
+                            hc[key] += v[key]
+                rtt = storage.HBM_ROUND_TRIP
+                hc['bubbles'] = cnt * sum(t * max(0, rtt - gap) for _, t, _, gap in forms
+                                          if gap is not None)
+                u['costs']['hbm'] = hc
+                u['per']['hbm'] = parts
+                if (c, name) in tiers.get('force', ()):
+                    u['fixed'] = 'hbm'
+            # A larger memory of a paged class read combinationally or through
+            # a register may page as rows too (foldsim-fold-static
+            # page-memories): a kind priced as paged_state prices the small
+            # ones, its page RAM a share of the class's (URAM).
+            if tiers is not None and nameable and len(per) == len(forms) and rl <= 1 and \
+                    all(f == 'paged' for _, _, f, _ in forms) and \
+                    d * w <= tiers.get('row_bits_max', ROW_BITS_MAX):
+                rc = dict(lut=0.0, lutram=0.0, ff=0, bram=0.0, uram=0.0, ii_floor=0)
+                parts = []
+                for j, t, _, _ in forms:
+                    p = page_of[(c, j)]
+                    bits = d * w + (w * r if rl == 1 else 0)
+                    rows = (1 << (t - 1).bit_length()) * (1 << (p - 1).bit_length())
+                    v = dict(lut=cnt * (max(r, 1) * w * math.ceil((d - 1) / 3) +
+                                        bits / p * math.ceil(p / 3)),
+                             lutram=0.0, ff=cnt * 2 * bits, bram=0.0,
+                             uram=cnt * bits / p / storage.URAM[1] * math.ceil(rows / storage.URAM[0]),
+                             ii_floor=0)
+                    parts.append((j, v))
+                    for key in rc:
+                        if key != 'ii_floor':
+                            rc[key] += v[key]
+                u['costs']['rows'] = rc
+                u['per']['rows'] = parts
+                if (c, name) in tiers.get('force_rows', ()):
+                    u['fixed'] = 'rows'
             units.append(u)
     if not uram:
         for u in units:
             u['costs'].pop('ultra', None)
     caps = {p: storage.MARGIN * storage.REGION[p] for p in ('sites', 'bram', 'uram')}
     base = dict(sites=logic, luts=storage.fold_load(logic, cache), bram=cache)
+    if tiers is not None:
+        caps['hbm'] = max(0.0, storage.HBM_STATE_SHARE * tiers['frame'] *
+                          storage.HBM_BYTES_PER_CYCLE - tiers.get('base_hbm', 0.0))
+        caps['bubbles'] = max(0.0, storage.BUBBLE_SHARE * tiers['frame'] -
+                              tiers.get('base_bubbles', 0.0))
+        for u in units:
+            if u['store'] == 'pages' and u['class'] in tiers.get('force_pages', ()):
+                u['fixed'] = 'hbm'
     choice, used = storage.assign(units, base, caps,
-                                  dict(luts=storage.route_luts(slrs)) if route else None)
-    fits = all(used[p] <= caps[p] + 1e-9 for p in ('sites', 'bram', 'uram'))
+                                  dict(luts=storage.route_luts(slrs)) if route else None,
+                                  price_extra=tiers is not None)
+    fits = all(used[p] <= caps[p] + 1e-9 for p in caps)
     lutram = uram = 0.0
     bram = cache
     per_copy = dict(copy_logic)
     rules, floor = [], 0
+    off = dict(vmem_new=[], pages_offchip=[], rows_new=[], hbm_bytes=0.0, controllers=0,
+               bubbles=0.0)
     for u, ch in zip(units, choice):
         (kind, _), = ch.items()     # one store a unit: never split
         for j, c in u['per'][kind]:
@@ -475,14 +568,30 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             if u['store'] != 'pages':
                 floor = max(floor, c['ii_floor'])
             per_copy[(u['class'], j)] += c['lut'] + c['lutram']
+            if kind == 'hbm':
+                off['hbm_bytes'] += c['hbm']
+                off['controllers'] += c['ctl']
+        if kind == 'hbm':
+            off['bubbles'] += u['costs']['hbm'].get('bubbles', 0.0)
         u['kind'] = kind
+        if kind == 'hbm' and u['store'] == 'pages':
+            off['pages_offchip'].append(u['class'])
+            paged['ports'] -= u['costs']['block']['ports']
+            paged['hbm'] += u['costs']['hbm']['hbm']
+        elif kind == 'hbm':
+            off['vmem_new'].append((u['class'], u['store']))
+        elif kind == 'rows':
+            off['rows_new'].append((u['class'], u['store']))
     for c in classes:
         rules += storage_rules(c, [u for u in units if u['class'] == c])
     sites = logic + storage.LUTRAM_SITES * lutram
-    return dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
-                sites=round(sites), fits=fits, bram=round(bram, 1), uram=uram,
-                largest_copy=round(max(per_copy.values())), storage=','.join(rules),
-                **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged))
+    res = dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
+               sites=round(sites), fits=fits, bram=round(bram, 1), uram=uram,
+               largest_copy=round(max(per_copy.values())), storage=','.join(rules),
+               **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged))
+    if tiers is not None:
+        res.update(off, hbm_bytes=round(off['hbm_bytes']), hbm_cap=round(caps['hbm']))
+    return res
 
 
 def unit(cls, store, per, lam, fixed):
@@ -521,7 +630,12 @@ def storage_rules(cls, units):
             rules.append(f'{cls}:regs>={w}={kind}')
             current = kind
     for u in units:
-        if not u['store'].startswith('regs>=') and not u['fixed'] and u['kind'] != u['default']:
+        # A memory kept off chip is a virtual memory (choose_state's pattern),
+        # not a storage rule; pages off chip are (`<class>:pages=hbm`).
+        if u['kind'] in ('hbm', 'rows') and u['store'] != 'pages':
+            continue
+        if not u['store'].startswith('regs>=') and u['kind'] != u['default'] and \
+                (not u['fixed'] or u['fixed'] == 'hbm'):
             rule = f"{cls}:{u['store']}={u['kind']}"
             if rule not in rules:
                 rules.append(rule)
@@ -1006,6 +1120,224 @@ def choose_pages(cal, est, classes, sched, ii, store='fixed', route=False, entri
     return None, None, None
 
 
+def ere_escape(text):
+    """`text` as a literal in a POSIX extended regex (llvm::Regex)."""
+    return re.sub(r'([.\[\]()*+?^$|\\])', r'\\\1', text)
+
+
+def tiers_pattern(pairs):
+    """The virtual-memories regex that names exactly these (class, memory)
+    pairs as foldsim-fold-static matches them: `<class model>:<name>`, the
+    model of a copy its class's."""
+    names = sorted({f"{re.sub(r'_copy\d+$', '', c)}:{m}" for c, m in pairs})
+    return '^(' + '|'.join(ere_escape(n) for n in names) + ')$' if names else ''
+
+
+def join_patterns(*patterns):
+    """Virtual-memories regexes as one: any of them."""
+    ps = [p for p in patterns if p]
+    return ps[0] if len(ps) == 1 else '|'.join(f'({p})' for p in ps)
+
+
+def page_pick(est, classes, frame, kinds=('block', 'ultra')):
+    """Each multi-instance copy's page at a frame: the p from 1 to as many as
+    the frame lets its state passes (p x instances <= frame, p + 4 <= frame)
+    whose page RAM (block or ultra, foldsim_storage.page_cost) and
+    write-back select take the least share of the V80 region, fewer pages
+    first on a tie; per model the shallowest of its copies'. None when some
+    copy cannot page at that frame."""
+    def share(c):
+        return (c['bram'] / (storage.MARGIN * storage.REGION['bram']) +
+                c['uram'] / (storage.MARGIN * storage.REGION['uram']) +
+                c['lut'] / (storage.MARGIN * storage.REGION['sites']))
+    pages = {}
+    for c, n in classes.items():
+        if n < 2:
+            continue
+        top = min(frame // n, frame - 4)
+        if top < 1:
+            return None
+        bits = paged_state(est[c])[0]
+        best = min(range(1, top + 1), key=lambda p: (min(share(storage.page_cost(bits, n, p, k))
+                                                         for k in kinds), p))
+        m = re.sub(r'_copy\d+$', '', c)
+        pages[m] = min(pages.get(m, best), best)
+    return pages
+
+
+def project_h(ii, classes, sched, est, pattern, pages=None, offchip=(), weights=None,
+              row_bytes_min=1, rtt=None):
+    """The host cycles a target cycle takes (H) with state off chip, an upper
+    bound: the frame, or the HBM traffic's frame if longer (every virtual
+    memory read and written once an instance a frame, `weights` times;
+    pages off chip moved whole twice a frame; at HBM_BYTES_PER_CYCLE), plus
+    the bubbles of reads younger than the round trip: a state pass of a copy
+    with virtual memories whose state gap is below HBM_ROUND_TRIP waits the
+    difference (every read a miss), and a copy with pages off chip waits the
+    round trip and the fetch's 7 host cycles beyond the slots between its
+    state passes (no prefetch window). Returns a dict: ii, hbm_bytes, hbm_ii,
+    bubbles, h, and per class its share."""
+    rtt = storage.HBM_ROUND_TRIP if rtt is None else rtt
+    weights = weights or {}
+    vest = split_virtual(est, pattern)
+    traffic, bubbles, per = 0.0, 0, {}
+    for c, n in classes.items():
+        model = re.sub(r'_copy\d+$', '', c)
+        info = (sched or {}).get(c) or {}
+        gap = info.get('gap')
+        t = b = 0.0
+        vms = vest[c].get('vmems', [])
+        for m in vms:
+            wt = float(weights.get(f'{model}:{m[0]}', weights.get(m[0], 1.0)))
+            t += storage.vmem_cost(m[1], m[2], n, wt, row_bytes_min)['hbm']
+        if vms and gap is not None and gap < rtt:
+            b += n * (rtt - gap)
+        if model in offchip and n > 1:
+            bits = paged_state(est[c])[0]
+            t += 2 * bits * n / 8
+            b += n * max(0, rtt + 7 - ii // n)
+        if t or b:
+            per[c] = dict(hbm_bytes=round(t), bubbles=round(b))
+        traffic += t
+        bubbles += b
+    hbm_ii = math.ceil(traffic / storage.HBM_BYTES_PER_CYCLE)
+    return dict(ii=ii, hbm_bytes=round(traffic), hbm_ii=hbm_ii, bubbles=round(bubbles),
+                h=max(ii, hbm_ii) + round(bubbles), per=per)
+
+
+def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True, vmem=None,
+                 pattern='', weights=None, pages_hbm=True, row_bytes_min=1, max_ii=1 << 16,
+                 page=True):
+    """--state auto: where each class's state lives, three tiers, priced.
+
+      on chip    register stores and memories in flops, distributed, block or
+                 ultra RAM (storage_area's kinds), or a class's registers and
+                 small memories paged on chip (a page RAM, p host cycles a
+                 state; the read-port bound p x instances <= frame);
+      HBM        a memory as a virtual memory (foldsim_vmem: a row a state
+                 pass), or a class's pages off chip (pages=hbm: all its state
+                 twice a frame).
+
+    The frame is the schedule's (`ii`) unless nothing fits there. At a frame,
+    the fold as it is (no paging, nothing new off chip) and the fold with
+    every multi-instance copy paged (page_pick) are priced by storage_area,
+    with the off-chip tier as relief kinds against the HBM bytes the frame
+    carries; of those that place (and route), the one of least projected H
+    (project_h), then least routing load. Frames grow by the instances of
+    the copies (deeper pages) until one fits. `est`: class_estimates, with
+    the memories already virtual split off (`pattern`); `sched`: the
+    schedule's classes (parse_classes). Returns None if nothing fits by
+    max_ii, else a dict: page (the `page` option, '' for none), pattern (the
+    virtual memories now: `pattern` and those moved), storage (rules, with
+    pages=hbm), frame, the area (res), the projection (h) and what moved."""
+    est = copy_estimates(est, classes)
+    rest = rest_of(cal, sum(e['lut'] for e in {id(e): e for e in est.values()}.values()))
+    # Traffic of the memories already virtual (est has them under 'vmems').
+    base_hbm = 0.0
+    for c, n in classes.items():
+        for m in est[c].get('vmems', []):
+            model = re.sub(r'_copy\d+$', '', c)
+            wt = float((weights or {}).get(f'{model}:{m[0]}', (weights or {}).get(m[0], 1.0)))
+            base_hbm += storage.vmem_cost(m[1], m[2], n, wt, row_bytes_min)['hbm']
+
+    base_bubbles = 0
+    for c, n in classes.items():
+        gap = (sched.get(c) or {}).get('gap')
+        if est[c].get('vmems') and gap is not None:
+            base_bubbles += n * max(0, storage.HBM_ROUND_TRIP - gap)
+
+    def ok(res):
+        return res['fits'] and (not route or res.get('routes', True))
+
+    def outcome(res, pages, frame):
+        moved = res.get('vmem_new', [])
+        pat = join_patterns(pattern, tiers_pattern(moved))
+        off = sorted({re.sub(r'_copy\d+$', '', c) for c in res.get('pages_offchip', [])})
+        full = {c: dict(e, vmems=e.get('vmems', [])) for c, e in est.items()}
+        # project_h splits by the whole pattern from the raw memories.
+        raw = {c: dict(e, mems=e['mems'] + e.get('vmems', []), vmems=[]) for c, e in full.items()}
+        h = project_h(frame, classes, with_pages(sched, pages or {}, off), raw, pat,
+                      pages, off, weights, row_bytes_min)
+        spec = ','.join(f'{m}:{p}' for m, p in sorted((pages or {}).items()))
+        return dict(page=spec, pattern=pat, storage=res.get('storage', ''), frame=frame,
+                    res=res, h=h, moved=moved, pages_offchip=off,
+                    rows=tiers_pattern(res.get('rows_new', [])), rows_new=res.get('rows_new', []))
+
+    deep = sorted({n for n in classes.values() if n > 1})
+    frames = sorted({f for n in deep for f in range(n * ((ii + n - 1) // n), max_ii + 1, n)} |
+                    {ii})
+    for f in frames:
+        if f < ii:
+            continue
+        tiers = dict(frame=f, base_hbm=base_hbm, base_bubbles=base_bubbles, weights=weights,
+                     pages_hbm=pages_hbm, row_bytes_min=row_bytes_min)
+        found = []
+        if f == ii:
+            res = area(cal, est, classes, {}, rest, sched, f, entries, 'auto', route, uram,
+                       vmem=vmem, tiers=tiers)
+            if ok(res):
+                found.append(outcome(res, {}, f))
+        pages = page_pick(est, classes, f) if page else None
+        if pages:
+            res = area(cal, est, classes, {}, rest, with_pages(sched, pages), f, entries, 'auto',
+                       route, uram, vmem=vmem, tiers=tiers)
+            if ok(res):
+                found.append(outcome(res, pages, f))
+        if found:
+            load = lambda o: storage.fold_load(o['res']['luts'], o['res']['bram'],
+                                               o['res'].get('uram', 0))
+            return min(found, key=lambda o: (o['h']['h'], load(o)))
+    return None
+
+
+def state_table(out, classes, est):
+    """choose_state's outcome as text: the tiers per class, the area, H."""
+    res, h = out['res'], out['h']
+    lines = [f"frame {out['frame']}: projected H {h['h']} (II {h['ii']}, HBM {h['hbm_bytes']} "
+             f"bytes a frame = {h['hbm_ii']} host cycles at {storage.HBM_BYTES_PER_CYCLE} B, "
+             f"bubbles at most {h['bubbles']})",
+             f"area: {res['luts']} LUTs ({res['logic']} logic + {res['lutram']} LUTRAM), "
+             f"{res['bram']} RAMB36, {res.get('uram', 0)} URAM288, fits {res['fits']}"
+             + (f", congestion {res['congestion']} % routes {res['routes']}"
+                if 'congestion' in res else ''),
+             f"page: {out['page'] or 'none'}",
+             f"page rows (beyond {PAGE_MEMORY_BITS} bits): {out['rows'] or 'none'}",
+             f"virtual memories: {out['pattern'] or 'none'}",
+             f"pages off chip: {', '.join(out['pages_offchip']) or 'none'}",
+             f"storage: {out['storage'] or 'default'}"]
+    est = copy_estimates(est, classes)
+    vest = split_virtual({c: dict(e, mems=e['mems'] + e.get('vmems', []), vmems=[])
+                          for c, e in est.items()}, out['pattern'])
+    pages = dict(p.split(':') for p in out['page'].split(',')) if out['page'] else {}
+    on = paged_on = hbm = 0.0
+    lines.append(f"{'class':36s} {'inst':>5s} {'tier of registers':>22s} {'on-chip Mbit':>12s} "
+                 f"{'HBM Mbit':>9s}")
+    for c, n in sorted(classes.items(), key=lambda kv: -kv[1] * est[kv[0]]['ff']):
+        model = re.sub(r'_copy\d+$', '', c)
+        e = vest[c]
+        mem_on = sum(m[1] * m[2] for m in e['mems']) * n
+        mem_off = sum(m[1] * m[2] for m in e.get('vmems', [])) * n
+        regs = e['ff'] * n
+        if model in out['pages_offchip'] and n > 1:
+            tier, off_regs = f"paged p {pages.get(model)} off chip", regs
+        elif model in pages and n > 1:
+            tier, off_regs = f"paged p {pages[model]}", 0
+        else:
+            tier, off_regs = ('flops' if n == 1 else 'stores'), 0
+        if model in pages and n > 1:
+            paged_on += regs - off_regs
+        else:
+            on += regs
+        on += mem_on
+        hbm += mem_off + off_regs
+        lines.append(f"{c:36s} {n:5d} {tier:>22s} {(regs - off_regs + mem_on) / 1e6:12.2f} "
+                     f"{(mem_off + off_regs) / 1e6:9.2f}")
+    lines.append(f"state: on chip {(on + paged_on) / 1e6:.1f} Mbit (paged {paged_on / 1e6:.1f}), "
+                 f"HBM {hbm / 1e6:.1f} Mbit")
+    out['state_bits'] = dict(on_chip=on + paged_on, paged=paged_on, hbm=hbm)
+    return '\n'.join(lines)
+
+
 def table(result):
     lines = []
     fit = result['fit']
@@ -1140,6 +1472,23 @@ def main():
                         '--vmem-cache-rows (their block RAM; none by default)')
     e.add_argument('--vmem-cache-budget', type=float, default=storage.VMEM_CACHE_BUDGET,
                    metavar='RAMB36', help='as foldsim --vmem-cache-budget')
+    st = sub.add_parser('state', help="--state auto on a schedule: each class's state on chip, "
+                                      'paged or in HBM, and the projected H')
+    st.add_argument('--models', required=True)
+    st.add_argument('--schedule', required=True, help='a schedule report of the models')
+    st.add_argument('--calibration', default='')
+    st.add_argument('--fold-options', default='',
+                    help="the schedule's foldsim-fold-static options (its virtual-memories)")
+    st.add_argument('--vmem-cache-rows', default=None, metavar='N|auto')
+    st.add_argument('--vmem-cache-budget', type=float, default=storage.VMEM_CACHE_BUDGET)
+    st.add_argument('--vmem-weights', default='', metavar='JSON',
+                    help='accesses per instance and target cycle by memory (default 1)')
+    st.add_argument('--vmem-row-bytes-min', type=int, default=1)
+    st.add_argument('--no-pages-hbm', action='store_true', help='keep every page on chip')
+    st.add_argument('--no-page', action='store_true', help='no paging')
+    st.add_argument('--no-routability', action='store_true')
+    st.add_argument('--register-state-entries', type=int, default=2)
+    st.add_argument('--out', default='', help='the outcome as JSON')
     f = sub.add_parser('fit', help='the period fit of a calibration and its leave-one-out error')
     f.add_argument('--calibration', required=True)
     a = ap.parse_args()
@@ -1156,6 +1505,8 @@ def main():
         return calibrate_firesim(a)
     if a.cmd == 'calibrate':
         return calibrate(a)
+    if a.cmd == 'state':
+        return state_main(a)
     cal = json.load(open(a.calibration)) if a.calibration else None
     fold = f'module={a.module} sim=foldsim_sim'
     if a.fold_options:
@@ -1181,5 +1532,30 @@ def main():
               default=str)
 
 
+def state_main(a):
+    cal = json.load(open(a.calibration)) if a.calibration else None
+    text = open(a.schedule).read()
+    ii, classes, _ = parse_schedule(text)
+    sched = parse_classes(text)
+    m = re.search(r'virtual-memories=(\S+)', a.fold_options)
+    pattern = m.group(1) if m else ''
+    names = sorted({re.sub(r'_copy\d+$', '', c) for c in classes})
+    est = split_virtual(class_estimates(a.models, names), pattern)
+    weights = json.load(open(a.vmem_weights)) if a.vmem_weights else None
+    vmem = (a.vmem_cache_rows, a.vmem_cache_budget) if a.vmem_cache_rows else None
+    out = choose_state(cal, est, classes, sched, ii, route=not a.no_routability,
+                       entries=a.register_state_entries, vmem=vmem, pattern=pattern,
+                       weights=weights, pages_hbm=not a.no_pages_hbm,
+                       row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page)
+    if out is None:
+        print(f'--state auto: nothing fits the V80 region (II {ii})')
+        return 1
+    print(f'II {ii} (schedule)')
+    print(state_table(out, classes, est))
+    if a.out:
+        json.dump(out, open(a.out, 'w'), indent=1, default=str)
+    return 0
+
+
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

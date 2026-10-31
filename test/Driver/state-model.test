@@ -1,0 +1,31 @@
+# --state auto (foldsim_degree.choose_state): each class's state on chip,
+# paged on chip or in HBM, priced against the V80 region (places and routes),
+# the HBM bytes a frame carries and the bubbles of reads younger than the
+# HBM round trip, the least state off chip; H projected (project_h).
+# RUN: python3 %S/Inputs/state/model.py foldsim | FileCheck %s
+# Through the driver: the leaves fit as they are; the choice and its table
+# go to state.txt, also with --schedule-only.
+# RUN: rm -rf %t && cd %S/Inputs/paged && foldsim --srcs top.f --top Top --out %t/a --static --state auto Leaf 2>&1 | FileCheck %s --check-prefix=AUTO
+# RUN: FileCheck %s --check-prefix=TABLE < %t/a/state.txt
+# RUN: foldsim --srcs top.f --top Top --out %t/s --static --state auto --schedule-only Leaf 2>&1 | FileCheck %s --check-prefix=AUTO
+# RUN: not foldsim --srcs top.f --top Top --out %t/x --static --state auto --page auto Leaf 2>&1 | FileCheck %s --check-prefix=BOTH
+# AUTO: foldsim: state auto: frame [[F:[0-9]+]] (II [[F]]), H at most [[F]]; page 0 models, 0 larger memories as rows, 0 memories and 0 models' pages to HBM (0 bytes a frame)
+# TABLE: projected H {{[0-9]+}}
+# TABLE: virtual memories: none
+# TABLE: Leaf 4 stores
+# BOTH: --state auto chooses the pages: no --page auto with it
+# CHECK: eligible gpr/ram gap 100: yes
+# CHECK: eligible gpr/ram gap 4: state gap 4
+# CHECK: eligible q gap 100: read latency 0
+# CHECK: eligible w gap 100: row of 8192 bits
+# CHECK: eligible m gap 100: yes
+# CHECK: vmem 512 x 64 x 2048: hbm 262144 lutram 0 bram 29 lut 3000
+# CHECK: pattern ^(Opc:a\.b\[0\]|Opc:gpr/ram)$
+# Two of the six banks go to HBM (the least that fits and routes), H the frame.
+# CHECK: opc: page '' frame 4096 H 4096 hbm 524288 fits True routes True
+# CHECK: opc moved ['g0/ram', 'g1/ram'] pages off []
+# CHECK: opc pattern ^(Opc:g0/ram|Opc:g1/ram)$
+# CHECK: small: moved [] H 256 fits True
+# CHECK: rows ^(Opc:ptw)$
+# A state gap of 40 against a round trip of 64: 24 host cycles each of 512.
+# CHECK: bubbles: H 16384 bubbles 12288 per {'Opc': {'hbm_bytes': 262144, 'bubbles': 12288}}
