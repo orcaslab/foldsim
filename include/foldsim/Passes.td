@@ -373,6 +373,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "order, read address and enable, and write address, registers "
            "that always agree counting as the same) are one virtual memory: "
            "a row of whole-byte lanes, each written under its own enable">,
+    Option<"vmemSkipHeldReads", "vmem-skip-held-reads", "bool", "false",
+           "With virtual-memories, a read whose address is provably the "
+           "previous target cycle's (the address a function of mux(c, A, q) "
+           "alone, q a register without reset whose next value is that mux: "
+           "a registered read address with an enable, c low) is not issued "
+           "when the row was not written since the instance's last read; the "
+           "instance keeps its read data, which is that row's. Exact by "
+           "construction; a bit per instance records whether its read data "
+           "is current">,
     Option<"stagedEnv", "staged-env", "bool", "true",
            "The environment's endpoints take a token a host cycle after it "
            "is offered (registered token ends), not in that host cycle">,

@@ -6,30 +6,35 @@
 // (zero at start, as the target's with +verilator+rand+reset+0), a read
 // answered +lo=<n> to +hi=<n> host cycles after it is issued with the rows as
 // of its issue (writes apply in request order, and a read of the row the same
-// host cycle writes reads the old row: read-first), and `free` low on
+// host cycle writes reads the old row: read-first; with WRITE_FIRST the new
+// row), and `free` low on
 // +full=<percent> of the host cycles. The channels stall on +stall=<percent>
 // of the host cycles; with BUBBLES, `advance` is low on +bubble=<percent>.
 // Prints MATCH or the first difference, and PROTOCOL if the simulator issues
-// a read of an instance whose read is still outstanding.
+// a read of an instance whose read is still outstanding; then READS, the reads
+// issued, and FEWER where they are at most +maxreads=<n>. ROWW: row bits.
 `ifndef IW
 `define IW 2
 `endif
-module vmem_model #(parameter IW = 2, ROWS = 16) (
+`ifndef ROWW
+`define ROWW 4
+`endif
+module vmem_model #(parameter IW = 2, ROWS = 1 << `ROWW) (
     input logic clk, rst,
     input int cyc, lo, hi, full,
     output logic rsp_valid, output logic [IW-1:0] rsp_inst, output logic [7:0] rsp_data,
     output logic [15:0] free,
-    input logic rd_valid, input logic [IW-1:0] rd_inst, input logic [3:0] rd_row,
-    input logic wr_valid, input logic [IW-1:0] wr_inst, input logic [3:0] wr_row,
+    input logic rd_valid, input logic [IW-1:0] rd_inst, input logic [`ROWW-1:0] rd_row,
+    input logic wr_valid, input logic [IW-1:0] wr_inst, input logic [`ROWW-1:0] wr_row,
     input logic [7:0] wr_data, input logic wr_mask,
-    output bit ok);
+    output bit ok, output int reads);
   localparam INSTS = 1 << IW;
   logic [7:0] mem [INSTS][ROWS];
   bit outstanding [INSTS];
   int due [INSTS];
   logic [7:0] data [INSTS];
   initial begin
-    ok = 1;
+    ok = 1; reads = 0;
     for (int i = 0; i < INSTS; i++) begin
       outstanding[i] = 0;
       for (int r = 0; r < ROWS; r++) mem[i][r] = 0;
@@ -46,7 +51,11 @@ module vmem_model #(parameter IW = 2, ROWS = 16) (
   end
   always @(posedge clk) if (!rst) begin
     if (rsp_valid) outstanding[rsp_inst] = 0;
+`ifdef WRITE_FIRST
+    if (wr_valid && wr_mask) mem[wr_inst][wr_row] = wr_data;
+`endif
     if (rd_valid) begin
+      reads++;
       if (outstanding[rd_inst]) begin
         if (ok) $display("PROTOCOL: read of instance %0d at host cycle %0d", rd_inst, cyc);
         ok = 0;
@@ -55,7 +64,9 @@ module vmem_model #(parameter IW = 2, ROWS = 16) (
       due[rd_inst] = cyc + lo + int'($urandom % (hi - lo + 1));
       data[rd_inst] = mem[rd_inst][rd_row];
     end
+`ifndef WRITE_FIRST
     if (wr_valid && wr_mask) mem[wr_inst][wr_row] = wr_data;
+`endif
   end
 endmodule
 
@@ -104,9 +115,10 @@ module tb;
   logic [15:0] free [V];
   logic rd_valid [V], wr_valid [V], wr_mask [V];
   logic [`IW-1:0] rd_inst [V], wr_inst [V];
-  logic [3:0] rd_row [V], wr_row [V];
+  logic [`ROWW-1:0] rd_row [V], wr_row [V];
   logic [7:0] wr_data [V];
   bit model_ok [V];
+  int model_reads [V];
   foldsim_sim dut(.hostClock(clk), .hostReset(rst),
     .x_valid(vx), .x_bits(stim_x(ix)), .x_ready(xr),
     .y_ready(yr), .y_valid(yv), .y_bits(yb),
@@ -118,7 +130,8 @@ module tb;
     `VMEM_PORTS(1)
 `endif
     .profile_finish());
-  int stall = 0, bubble = 0, full = 0, lo = 1, hi = 1;
+  int stall = 0, bubble = 0, full = 0, lo = 1, hi = 1, maxreads = -1;
+  initial if (!$value$plusargs("maxreads=%d", maxreads)) maxreads = -1;
   initial if (!$value$plusargs("stall=%d", stall)) stall = 0;
   initial if (!$value$plusargs("bubble=%d", bubble)) bubble = 0;
   initial if (!$value$plusargs("full=%d", full)) full = 0;
@@ -129,7 +142,7 @@ module tb;
       .rsp_valid(rsp_valid[k]), .rsp_inst(rsp_inst[k]), .rsp_data(rsp_data[k]), .free(free[k]),
       .rd_valid(rd_valid[k]), .rd_inst(rd_inst[k]), .rd_row(rd_row[k]),
       .wr_valid(wr_valid[k]), .wr_inst(wr_inst[k]), .wr_row(wr_row[k]),
-      .wr_data(wr_data[k]), .wr_mask(wr_mask[k]), .ok(model_ok[k]));
+      .wr_data(wr_data[k]), .wr_mask(wr_mask[k]), .ok(model_ok[k]), .reads(model_reads[k]));
   end
   always @(negedge clk) begin
     vx = ix < T && ($urandom % 100 >= stall);
@@ -155,6 +168,12 @@ module tb;
     for (int k = 0; k < V; k++) ok &= model_ok[k];
     if (ok)
       $display("MATCH %0d cycles in %0d host cycles, H %0.2f", T - W, cyc, real'(cyc) / T);
+    begin
+      automatic int n = 0;
+      for (int k = 0; k < V; k++) n += model_reads[k];
+      $display("READS %0d", n);
+      if (maxreads >= 0 && n <= maxreads) $display("FEWER");
+    end
     $finish;
   end
 endmodule

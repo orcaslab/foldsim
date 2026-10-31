@@ -163,6 +163,8 @@ def frame_options(a):
         fold += f' virtual-memories={a.virtual_memories}'
         if getattr(a, 'vmem_merge_lanes', False):
             fold += ' vmem-merge-lanes'
+        if getattr(a, 'vmem_skip_held_reads', False):
+            fold += ' vmem-skip-held-reads'
     if a.unstaged_env:
         fold += ' staged-env=false'
     if getattr(a, 'register_state_entries', None) is not None:
@@ -513,6 +515,10 @@ def main():
                     help='with --virtual-memories: the arrays a front end split from one target RAM '
                          '(byte lanes, ways: the same read address and enable, the same write '
                          'address) are one virtual memory, each lane its own bytes of the row')
+    ap.add_argument('--vmem-skip-held-reads', action='store_true',
+                    help='with --virtual-memories: a read whose address register holds (a registered '
+                         'read address with its enable low) is not issued unless its row was written '
+                         'since the instance last read it; the instance keeps its read data (exact)')
     ap.add_argument('--vmem-group', metavar='copy|N|auto[:M]',
                     help="with --virtual-memories: one kernel controller (foldsim_vmem_group) for a "
                          "class copy's virtual memories of the same row size and read-during-write "

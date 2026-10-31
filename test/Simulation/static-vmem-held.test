@@ -1,0 +1,45 @@
+# REQUIRES: verilator
+# --vmem-skip-held-reads: a virtual memory's read whose address register holds
+# (a registered read address with an enable, here bit 1 of each leaf's input)
+# is not issued unless the row was written since the instance's last read; the
+# instance keeps its read data. Against the controller model of
+# Inputs/tb_vmem.sv (4-row RAMs: writes often hit the held row), with the
+# target's read-during-write order: write first (Driver/Inputs/vmem_held/top.sv,
+# the held row written in the read's own cycle) and read first (top_rf.sv, the
+# held row written in the previous cycle). Every run matches the target at any
+# latency, stalls and controller room, with fewer reads than without the
+# option (800: 4 instances x 200 cycles).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_held
+# RUN: foldsim --srcs top.f --top Top --out %t/base --static --virtual-memories ram Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=2 -DWRITE_FIRST -Mdir %t/base/obj %S/Inputs/tb_vmem.sv top.sv %t/base/foldsim_sim.sv > %t/base/build.log 2>&1
+# RUN: %t/base/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=30 +stall=20 | FileCheck %s --check-prefix=BASE
+# RUN: foldsim --srcs top.f --top Top --out %t/wf --static --virtual-memories ram --vmem-skip-held-reads Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=2 -DWRITE_FIRST -Mdir %t/wf/obj %S/Inputs/tb_vmem.sv top.sv %t/wf/foldsim_sim.sv > %t/wf/build.log 2>&1
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +maxreads=600 | FileCheck %s --check-prefix=FAST
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 +maxreads=600 | FileCheck %s
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 +maxreads=600 | FileCheck %s
+# RUN: foldsim --srcs top_rf.f --top Top --out %t/rf --static --virtual-memories ram --vmem-skip-held-reads Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=RF < %t/rf/foldsim_sim.vh
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=2 -Mdir %t/rf/obj %S/Inputs/tb_vmem.sv top_rf.sv %t/rf/foldsim_sim.sv > %t/rf/build.log 2>&1
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +maxreads=600 | FileCheck %s --check-prefix=FAST
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=1 +hi=30 +stall=20 +maxreads=600 | FileCheck %s
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=5 +hi=60 +full=30 +maxreads=600 | FileCheck %s
+# Two copies, each with its own controller and per-instance bits.
+# RUN: foldsim --srcs top.f --top Top --out %t/copies --static --virtual-memories ram --vmem-skip-held-reads --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=2 -DWRITE_FIRST -DCOPIES2 -DIW=1 -Mdir %t/copies/obj %S/Inputs/tb_vmem.sv top.sv %t/copies/foldsim_sim.sv > %t/copies/build.log 2>&1
+# RUN: %t/copies/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=40 +stall=30 +full=10 +maxreads=600 | FileCheck %s
+# A read whose address is not held (Driver/Inputs/vmem: the read data
+# registered at an input address) is issued every cycle, as without it.
+# RUN: cd %S/../Driver/Inputs/vmem
+# RUN: foldsim --srcs top.f --top Top --out %t/plain --static --virtual-memories ram --vmem-skip-held-reads Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/plain/obj %S/Inputs/tb_vmem.sv top.sv %t/plain/foldsim_sim.sv > %t/plain/build.log 2>&1
+# RUN: %t/plain/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | FileCheck %s --check-prefix=BASE
+# RF: `define FOLDSIM_VMEM_0_RDWRF 1
+# BASE: {{^}}MATCH
+# BASE-NEXT: {{^}}READS 800
+# FAST: {{^}}MATCH 196 cycles in 2000 host cycles, H 10.00
+# FAST-NEXT: {{^}}READS
+# FAST-NEXT: {{^}}FEWER
+# CHECK: {{^}}MATCH
+# CHECK-NEXT: {{^}}READS
+# CHECK-NEXT: {{^}}FEWER

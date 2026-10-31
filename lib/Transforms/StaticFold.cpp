@@ -132,6 +132,10 @@ struct Class {
     unsigned firstInput, firstOutput;
     SmallVector<seq::FirMemOp> lanes;
     SmallVector<unsigned> laneOffset;
+    /// With --vmem-skip-held-reads, where the read's address is provably the
+    /// previous target cycle's whenever it is true (heldReadCondition): an
+    /// op in the model computing that condition, else null.
+    Value held;
   };
   SmallVector<VirtualMemory> virtualMemories;
   /// With virtual memories, the copy's host reset input (their pending reads
@@ -246,7 +250,8 @@ public:
                bool oneCycleLinks, bool overlapFrames, bool modulo,
                bool interleaveCopies, bool zeroLatencyLinks,
                bool zeroLatencyChains, bool shortLead, bool bubbles,
-               StringRef virtualMemories, bool mergeLanes, bool stagedEnv, ArrayRef<std::string> specGroups, unsigned specDepth,
+               StringRef virtualMemories, bool mergeLanes, bool skipHeldReads,
+               bool stagedEnv, ArrayRef<std::string> specGroups, unsigned specDepth,
                ArrayRef<std::string> envSinks, unsigned registerStateEntries,
                unsigned slrGroups, ArrayRef<std::string> slrSites,
                uint64_t slrCapacity, ArrayRef<std::string> slrAssign,
@@ -262,7 +267,7 @@ public:
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
         zeroLatencyChains(zeroLatencyChains), shortLead(shortLead),
         bubbles(bubbles), virtualMemoryPattern(virtualMemories.str()),
-        mergeLanes(mergeLanes),
+        mergeLanes(mergeLanes), skipHeldReads(skipHeldReads),
         readyLevelsMode(readyLevels.str()),
         registerStateEntries(registerStateEntries), storageSpecs(storage),
         forwardAfterLevels(forwardAfterLevels),
@@ -407,6 +412,10 @@ private:
   std::string virtualMemoryPattern;
   /// `--vmem-merge-lanes`: the arrays split from one target RAM are one.
   bool mergeLanes;
+  /// `--vmem-skip-held-reads`: a virtual memory's read is not issued while
+  /// its address register holds and its row was not written since its last
+  /// read; the instance keeps its read data.
+  bool skipHeldReads;
   /// When a class may write its ready outputs in more than one ready pass,
   /// by level (`ready-levels`: off, auto or always); and whether
   /// `frameGraph` does so now.
@@ -3301,6 +3310,66 @@ static Value nextValue(ImplicitLocOpBuilder &b, Value root,
   return nexts.lookup(root);
 }
 
+/// A registered read's hold condition (--vmem-skip-held-reads): an i1 that,
+/// true in a target cycle, makes the read's address that of the previous
+/// target cycle. Found where the address is a function of one value M alone
+/// (side-effect-free combinational ops and constants), M = mux(c, A, q) or
+/// mux(c, q, A), q a register without reset on the read's clock whose next
+/// value is M: with c low (high) M is q, the previous cycle's M. This is a
+/// registered read address with an enable, as front ends emit SRAMs and
+/// `if (en) raddr_q <= raddr; rdata = mem[raddr_q]` imports. The condition
+/// is built as an op of its own next to the mux, so that registers replaced
+/// later reach it. Null where the pattern is not found.
+static Value heldReadCondition(seq::FirMemReadOp read) {
+  comb::MuxOp found;
+  bool qOnTrue = false;
+  SmallVector<Value> work{read.getAddress()};
+  DenseSet<Value> seen;
+  while (!work.empty()) {
+    Value value = work.pop_back_val();
+    if (!seen.insert(value).second)
+      continue;
+    if (seen.size() > 256)
+      return {};
+    auto *op = value.getDefiningOp();
+    if (!op)
+      return {};
+    if (isa<hw::ConstantOp>(op))
+      continue;
+    if (auto mux = dyn_cast<comb::MuxOp>(op)) {
+      bool matched = false;
+      for (bool onTrue : {true, false}) {
+        Value q = onTrue ? mux.getTrueValue() : mux.getFalseValue();
+        auto reg = q.getDefiningOp<seq::FirRegOp>();
+        if (!reg || reg.getReset() || reg.getNext() != value ||
+            reg.getClk() != read.getClk())
+          continue;
+        if (found && found != mux)
+          return {};
+        found = mux;
+        qOnTrue = onTrue;
+        matched = true;
+        break;
+      }
+      if (matched)
+        continue;
+    }
+    if (!isa<comb::CombDialect>(op->getDialect()) && !isa<hw::BitcastOp>(op))
+      return {};
+    if (op->getNumRegions() || !isMemoryEffectFree(op))
+      return {};
+    for (auto operand : op->getOperands())
+      work.push_back(operand);
+  }
+  if (!found)
+    return {};
+  OpBuilder b(found->getContext());
+  b.setInsertionPointAfter(found);
+  Location loc = found.getLoc();
+  Value flip = hw::ConstantOp::create(b, loc, b.getI1Type(), qOnTrue ? 0 : 1);
+  return comb::XorOp::create(b, loc, found.getCond(), flip);
+}
+
 /// Sets an operation's Vivado ram_style, replacing any it has.
 static void setRamStyle(Operation *op, StringRef kind) {
   auto *context = op->getContext();
@@ -3568,6 +3637,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         vm.maskWidth = bytes;
       }
     }
+    // The lanes share the first's read address (sameRam), whose row the
+    // requests carry.
+    if (skipHeldReads)
+      vm.held = heldReadCondition(portsOf(memory).first);
     for (auto lane : vm.lanes)
       virtualOf[lane] = cls.virtualMemories.size();
     cls.virtualMemories.push_back(std::move(vm));
@@ -3883,6 +3956,42 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       return comb::ShlOp::create(b, hw::ConstantOp::create(b, intType(entries), 1),
                                  widen(index, entries));
     };
+    if (vm.held) {
+      // A held read (--vmem-skip-held-reads): its row is the instance's last
+      // read's, so its read data is still the row's unless the row was
+      // written since. `fresh` has a bit per instance: its read data is the
+      // row as its next read would see it, but for that read's own
+      // same-cycle write. Set at a state pass that issued (or skipped) its
+      // read, unless (read first) the same pass writes the row; cleared at
+      // a pass with the read's enable low; all clear after a reset. A held
+      // read of a fresh instance is skipped, unless (write first) the same
+      // pass writes its row.
+      Value ones = hw::ConstantOp::create(b, APInt::getAllOnes(entries));
+      auto freshNext = edges.get(intType(entries));
+      Value fresh = seq::FirRegOp::create(
+          b, freshNext, hostClock, b.getStringAttr(vm.name + "_fresh"),
+          body->getArgument(cls.resetInput), zero(entries), hw::InnerSymAttr{},
+          /*isAsync=*/false, b.getIntegerAttr(intType(entries), 0));
+      Value isFresh = b.createOrFold<comb::ExtractOp>(
+          intType(1), comb::ShrUOp::create(b, fresh, widen(inst, entries)), 0);
+      Value hit = comb::AndOp::create(
+          b, wrValid,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::eq, wrRow, rdRow));
+      Value notHit = comb::XorOp::create(b, hit, one());
+      Value skip = comb::AndOp::create(b, vm.held, isFresh);
+      if (!vm.readFirst)
+        skip = comb::AndOp::create(b, skip, notHit);
+      Value enabled = rdValid;
+      rdValid = comb::AndOp::create(b, rdValid,
+                                    comb::XorOp::create(b, skip, one()));
+      Value current = vm.readFirst ? Value(comb::AndOp::create(b, enabled, notHit))
+                                   : enabled;
+      Value others = comb::AndOp::create(
+          b, fresh, comb::XorOp::create(b, bitOf(inst), ones));
+      Value updated = comb::OrOp::create(
+          b, others, comb::MuxOp::create(b, current, bitOf(inst), zero(entries)));
+      freshNext.setValue(comb::MuxOp::create(b, region.state, updated, fresh));
+    }
     Value set = comb::MuxOp::create(b, rdValid, bitOf(inst), zero(entries));
     Value clear = comb::MuxOp::create(b, rspValid, bitOf(rspInst), zero(entries));
     auto pendingNext = edges.get(intType(entries));
@@ -5971,7 +6080,8 @@ void FoldStaticPass::runOnOperation() {
   StaticFolder folder(top, netlist, simName, regionBits, report, copies,
                       nest, scheduleOnly, oneCycleLinks, overlapFrames,
                       modulo, interleaveCopies, zeroLatencyLinks, zeroLatencyChains,
-                      shortLead, bubbles, virtualMemories, vmemMergeLanes, stagedEnv,
+                      shortLead, bubbles, virtualMemories, vmemMergeLanes,
+                      vmemSkipHeldReads, stagedEnv,
                       specGroups, specDepth,
                       envSinks, registerStateEntries, slrGroups, slrSites,
                       slrCapacity, slrAssign, storage, readyLevels,
