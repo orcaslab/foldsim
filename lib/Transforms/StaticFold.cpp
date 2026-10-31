@@ -450,7 +450,7 @@ private:
   /// bits with the same sources): the producer, its bits, and the producer
   /// instances the reader takes, sorted and distinct.
   struct LinkUse {
-    unsigned producer, low, width;
+    unsigned producer, low, width, reader;
     SmallVector<uint64_t> rows;
   };
   /// Every link memory the simulator builds, as buildSim cuts them.
@@ -1239,7 +1239,7 @@ void StaticFolder::linkUses(std::vector<LinkUse> &uses) const {
         }
       }
       for (auto &[key, rows] : sources)
-        uses.push_back({key.first, key.second, end - at,
+        uses.push_back({key.first, key.second, end - at, unsigned(consumer.cls),
                         SmallVector<uint64_t>(rows.begin(), rows.end())});
       at = end;
     }
@@ -3103,6 +3103,8 @@ LogicalResult StaticFolder::schedule() {
       return width * blocks * 1.14 +
              (depth > 64 ? width * (blocks - 1) / 3.0 : 0.0);
     };
+    // By producer and reading class: (LUTRAM, bits).
+    std::map<std::pair<unsigned, unsigned>, std::pair<double, uint64_t>> byPair;
     for (auto &use : uses) {
       auto &producer = producers[use.producer];
       bool banked = !producer.late;
@@ -3123,6 +3125,9 @@ LogicalResult StaticFolder::schedule() {
       ++memories;
       memBits += depth * use.width;
       luts += lutram(depth, use.width);
+      auto &pair = byPair[{unsigned(producer.cls), use.reader}];
+      pair.first += lutram(depth, use.width);
+      pair.second += depth * use.width;
     }
     os << "  link storage: " << memories << " memories, " << memBits
        << " bits, " << uint64_t(luts) << " LUTRAM LUTs; " << regBits
@@ -3131,6 +3136,16 @@ LogicalResult StaticFolder::schedule() {
       os << "; compact: " << compactMemories << " links, "
          << compactSaved << " bits saved";
     os << "\n";
+    // The largest, by the classes they join.
+    SmallVector<std::pair<std::pair<unsigned, unsigned>, std::pair<double, uint64_t>>>
+        largest(byPair.begin(), byPair.end());
+    llvm::sort(largest, [](auto &x, auto &y) {
+      return x.second.first > y.second.first;
+    });
+    for (auto &[pair, cost] : ArrayRef(largest).take_front(8))
+      os << "    links " << classes[pair.first].name << " -> "
+         << classes[pair.second].name << ": " << uint64_t(cost.first)
+         << " LUTRAM LUTs, " << cost.second << " bits\n";
   }
   for (auto [k, consumer] : llvm::enumerate(consumers))
     if (consumer.cls < 0)
