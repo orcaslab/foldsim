@@ -4,7 +4,7 @@
 # target at any bubble rate, with and without stalled channels, one copy
 # (state in distributed RAM, its bypasses), three copies chained in a host
 # cycle, a short lead, nested sequencers and SLR groups; H grows by the
-# bubbles (at 50 %, twice the frame).
+# bubbles (at 50 %, twice the frame), at up to 99 % and in long runs.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/late
 # RUN: foldsim --srcs top.f --top Top --out %t/one --static --bubbles Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/one/obj %S/Inputs/tb_late.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
@@ -23,6 +23,15 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/slr --static --bubbles --copies Leaf:3 --two-cycle-links --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:0,Top_model:1 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/slr/obj %S/Inputs/tb_late.sv top.sv %t/slr/foldsim_sim.sv > %t/slr/build.log 2>&1
 # RUN: %t/slr/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +bubble=50 +stall=20 | FileCheck %s
+# High rates and long runs of bubbles (a slow host): the chain at 99 % and at
+# 90 % in runs of up to 32, the short lead at 95 % in runs of up to 8, and
+# nested sequencers over chained copies (modulo) at 95 % in runs of up to 16.
+# RUN: %t/chain/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +bubble=99 +stall=20 | FileCheck %s
+# RUN: %t/chain/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +bubble=90 +burst=32 +stall=20 | FileCheck %s
+# RUN: %t/short/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +bubble=95 +burst=8 +stall=10 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nestc --static --bubbles --nest --modulo --copies Leaf:3 --zero-latency-links --zero-latency-chains Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/nestc/obj %S/Inputs/tb_late.sv top.sv %t/nestc/foldsim_sim.sv > %t/nestc/build.log 2>&1
+# RUN: %t/nestc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+10 +bubble=95 +burst=16 +stall=20 | FileCheck %s
 # Without --bubbles there is no `advance`.
 # RUN: foldsim --srcs top.f --top Top --out %t/plain --static Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=PLAIN < %t/plain/foldsim_sim.json
