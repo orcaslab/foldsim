@@ -460,10 +460,15 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                 pcost = {k: dict(v, lutram=0.0, ii_floor=0) for k, v in pcost.items()}
                 if tiers is not None and (tiers.get('pages_hbm') or
                                           c in tiers.get('force_pages', ())):
+                    # On engines, off chip at its own depth (page_hbm_depth:
+                    # few columns, so few engines).
+                    ph = storage.page_hbm_depth(bits, t, info['page'], tiers['frame'],
+                                                PAGE_PORT_SHARE) \
+                        if tiers.get('page_engines') else info['page']
                     pcost['hbm'] = dict(storage.page_hbm_cost(
-                                            bits, t, info['page'],
+                                            bits, t, ph,
                                             tiers['frame'] if tiers.get('page_engines') else None),
-                                        ii_floor=0, bubbles=t * max(
+                                        ii_floor=0, page=ph, bubbles=t * max(
                                             0, storage.HBM_ROUND_TRIP + 7 - tiers['frame'] // t))
                 units.append(dict(costs=pcost,
                                   per={k: [(j, v)] for k, v in pcost.items()}, count=1,
@@ -650,6 +655,13 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         u['kind'] = kind
         if kind == 'hbm' and u['store'] == 'pages':
             off['pages_offchip'].append(u['class'])
+            # The model's page off chip (a model's copies take one page: the
+            # shallowest of theirs).
+            model = re.sub(r'_copy\d+$', '', u['class'])
+            ph = u['costs']['hbm'].get('page')
+            if ph:
+                off.setdefault('page_hbm', {})
+                off['page_hbm'][model] = min(off['page_hbm'].get(model, ph), ph)
             if 'engine_columns' in u['costs']['hbm']:
                 engine_cols.append((u['costs']['hbm']['engine_columns'], u['costs']['hbm']['ctl']))
             paged['ports'] -= u['costs']['block']['ports']
@@ -1675,6 +1687,9 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
         # Pages off chip: those moved, and those the schedule has already.
         # (A model paged anew at this point keeps its pages where the area put
         # them, not where the schedule had them.)
+        # Pages off chip at their own depth (page_hbm_depth), where deeper.
+        pages = dict(pages or {}, **{m: p for m, p in res.get('page_hbm', {}).items()
+                                     if pages and m in pages and p > pages[m]})
         off = sorted({re.sub(r'_copy\d+$', '', c) for c in res.get('pages_offchip', [])} |
                      {re.sub(r'_copy\d+$', '', c) for c, info in (sched or {}).items()
                       if c != '__links__' and info.get('offchip') and
@@ -1697,7 +1712,10 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
                     link_kinds=res.get('link_kinds', ''), links_hbm=res.get('links_hbm', []))
 
     lk = link_cost(cal, (sched or {}).get('__links__'))
-    lu = link_units(cal, (sched or {}).get('__links__'))
+    top = min(max_ii, (frame_growth or FRAME_GROWTH) * ii)
+    # With HBM link streams, at the longest frame tried (their ports fit the
+    # longest best): a pair a stream may carry is at its least there too.
+    lu = link_units(cal, (sched or {}).get('__links__'), 0, True, link_hbm, top, page_engines)
     if lu:
         # The links that may move are the tier's: the rest alone, each group
         # at its least in every pool.
@@ -1712,7 +1730,6 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
              storage.route_luts())):
         return None
     deep = sorted({n for n in classes.values() if n > 1})
-    top = min(max_ii, (frame_growth or FRAME_GROWTH) * ii)
     steps = {round(ii * x) for x in FRAME_STEPS if ii * x <= top}
     frames = sorted({f for n in deep for f in range(n * ((ii + n - 1) // n), top + 1, n)} |
                     {ii} | steps)
@@ -1986,6 +2003,8 @@ def main():
                          'routing headroom for a build')
     st.add_argument('--frame-growth', type=int, default=FRAME_GROWTH,
                     help='frames up to this many times the schedule\'s')
+    st.add_argument('--max-frame', type=int, default=1 << 16,
+                    help='frames up to this many host cycles')
     st.add_argument('--links-as-built', action='store_true',
                     help="the links' storage as the report gives it (their kinds fixed: a "
                          'schedule made with a link-kinds choice), not a tier to choose')
@@ -2071,7 +2090,7 @@ def state_main(a):
                        weights=weights, pages_hbm=not a.no_pages_hbm,
                        row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page,
                        link_pages=not a.no_link_pages, link_hbm=a.link_hbm,
-                       frame_growth=a.frame_growth, vmem_group=a.vmem_group,
+                       frame_growth=a.frame_growth, vmem_group=a.vmem_group, max_ii=a.max_frame,
                        page_engines=a.page_engines)
     if links:
         lk = link_cost(cal, links)

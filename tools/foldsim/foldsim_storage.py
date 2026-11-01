@@ -466,6 +466,25 @@ def page_engine_share(bits, threads, p, frame):
     return columns, columns * min(1.0, max(p, 2) * threads / max(frame, 1))
 
 
+# Off-chip pages on engines take their copy's page word in columns of
+# PAGE_ENGINE_BITS, and the columns of a copy move together (an engine each),
+# so the fold needs at least the widest copy's columns of engines: a copy of
+# 259k state bits at p 15 takes 34. Deeper pages narrow the word (the write-
+# back select stays about a third of a LUT a state bit at any large p), so off
+# chip a copy pages at least deep enough to take PAGE_ENGINE_COLUMNS columns,
+# where its state passes still fit the page port share of the frame.
+PAGE_ENGINE_COLUMNS = 4
+
+
+def page_hbm_depth(bits, threads, p, frame, port_share=0.5):
+    """The page of a copy's state off chip on engines (page_hbm_cost at a
+    `frame`): `p` (its on-chip page), or deeper, up to its word taking
+    PAGE_ENGINE_COLUMNS columns, within p x threads <= port_share x frame."""
+    top = max(1, int(port_share * frame) // max(threads, 1))
+    want = math.ceil(bits / (PAGE_ENGINE_BITS * max(PAGE_ENGINE_COLUMNS, 1)))
+    return max(p, min(top, want))
+
+
 def page_hbm_cost(bits, threads, p, engines_frame=None):
     """Paged register state off chip (pages=hbm) as a relief kind: page_cost's
     'hbm' with its traffic in the `hbm` pool. With `engines_frame` (HBM page
