@@ -916,7 +916,7 @@ def parse_links(text):
                     dw=int(x[5]), pages=int(x[6]), write_rows=int(x[7]), read_rows=int(x[8]),
                     max_need=int(x[9]))
                for x in re.findall(r'^    link stream (\S+) (\S+) (\d+) (\d+) (\d+) (\d+) (\d+) '
-                                   r'(\d+) (\d+) (\d+)$', text, re.M)]
+                                   r'(\d+) (\d+) (\d+)(?: \d+)?$', text, re.M)]
     return dict(lutram=float(g[2]), lutram_bits=int(g[1]), bram=float(g[5]), bram_bits=int(g[4]),
                 uram=float(g[8]), uram_bits=int(g[7]), ff=int(g[10]), uses=uses, pairs=pairs,
                 streams=streams)
