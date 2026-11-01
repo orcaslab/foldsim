@@ -1633,7 +1633,7 @@ FRAME_STEPS = (1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8)
 def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True, vmem=None,
                  pattern='', weights=None, pages_hbm=True, row_bytes_min=1, max_ii=1 << 16,
                  page=True, link_pages=True, link_hbm=False, frame_growth=None,
-                 vmem_group=None, page_engines=False):
+                 vmem_group=None, page_engines=False, only_frames=None):
     """--state auto: where each class's state lives, three tiers, priced.
 
       on chip    register stores and memories in flops, distributed, block or
@@ -1733,6 +1733,14 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
     steps = {round(ii * x) for x in FRAME_STEPS if ii * x <= top}
     frames = sorted({f for n in deep for f in range(n * ((ii + n - 1) // n), top + 1, n)} |
                     {ii} | steps)
+    if only_frames:
+        # Given frames only, each paging every number of models (the
+        # least load that fits and routes): a large fold's frame is set by
+        # its HBM bytes far past the schedule's, where the first-fit search
+        # over every frame takes hours, and the load is not monotonic in
+        # the models paged (selects against freed RAM).
+        frames = sorted(set(only_frames))
+        steps = set(frames)
     last = None
     for f in frames:
         if f < ii:
@@ -1767,6 +1775,12 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
                 tried[k] = (some, area(cal, est, classes, {}, rest, with_pages(sched, some), f,
                                        entries, 'auto', route, uram, vmem=vmem, tiers=tiers))
             return tried[k]
+        if only_frames:
+            fit = [k for k in range(0, len(order) + 1) if ok(at(k)[1])]
+            if not fit:
+                continue
+            k = min(fit, key=lambda k: (at(k)[1].get('congestion', at(k)[1]['luts']), at(k)[1]['luts'], k))
+            return outcome(at(k)[1], at(k)[0], f)
         if not ok(at(len(order))[1]):
             # Paging costs logic (the write-back's selects): where the
             # routing binds, paging every model may not route while paging
@@ -2005,6 +2019,9 @@ def main():
                     help='frames up to this many times the schedule\'s')
     st.add_argument('--max-frame', type=int, default=1 << 16,
                     help='frames up to this many host cycles')
+    st.add_argument('--frames', default='', metavar='F,...',
+                    help='only these frames, each with every number of models paged '
+                         '(the least load that fits)')
     st.add_argument('--links-as-built', action='store_true',
                     help="the links' storage as the report gives it (their kinds fixed: a "
                          'schedule made with a link-kinds choice), not a tier to choose')
@@ -2091,7 +2108,8 @@ def state_main(a):
                        row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page,
                        link_pages=not a.no_link_pages, link_hbm=a.link_hbm,
                        frame_growth=a.frame_growth, vmem_group=a.vmem_group, max_ii=a.max_frame,
-                       page_engines=a.page_engines)
+                       page_engines=a.page_engines,
+                       only_frames=[int(x) for x in a.frames.split(',') if x])
     if links:
         lk = link_cost(cal, links)
         print(f"links: {(links['lutram_bits'] + links['bram_bits'] + links['uram_bits']) / 1e6:.1f} "

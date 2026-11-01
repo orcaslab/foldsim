@@ -47,3 +47,8 @@ est = dict(Opc=dict(lut=20000.0, ff=20000, mems=gprs, regw={20000: 1}),
 out = d.choose_state(None, est, classes, sched(classes), 4096, vmem=('auto', 120))
 print(f"opc: frame {out['frame']} H {out['h']['h']} fits {out['res']['fits']} "
       f"routes {out['res']['routes']} moved {len(out['moved'])}")
+# Given frames only (--frames): the first of them that fits and routes, the
+# frame before it skipped (below the schedule's II).
+out = d.choose_state(None, est, classes, sched(classes), 4096, vmem=('auto', 120),
+                     only_frames=[2048, 8192, 4096])
+print(f"frames: frame {out['frame']} fits {out['res']['fits']} routes {out['res']['routes']}")
