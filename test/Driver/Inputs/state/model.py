@@ -49,6 +49,13 @@ est['Opc'] = dict(lut=20000.0, ff=2000, mems=[('g/ram', 64, 32, 1, 1, 1, 'block'
                   regw={2000: 1})
 out = d.choose_state(None, est, dict(Opc=64, Top=1), sched(dict(Opc=64, Top=1), frame=256), 256)
 print(f"small: moved {out['moved']} H {out['h']['h']} fits {out['res']['fits']}")
+# With routing headroom asked for (foldsim_degree.py state --route-limit): the
+# same fold, its congestion estimate against the lower limit.
+limit = s.ROUTE_LIMIT
+s.ROUTE_LIMIT = out['res']['congestion'] - 0.01
+low = d.choose_state(None, est, dict(Opc=64, Top=1), sched(dict(Opc=64, Top=1), frame=256), 256)
+print(f"headroom: congestion {out['res']['congestion']} routes below it: {low is not None and low['res'].get('routes')}")
+s.ROUTE_LIMIT = limit
 # 200,000 register bits an instance (102 Mbit), a store of 2,778 72-bit columns
 # read whole each host cycle, take more block RAM than the region has: Opc
 # pages (as deep as half the frame lets its state passes), and

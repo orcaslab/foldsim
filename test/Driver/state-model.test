@@ -28,6 +28,7 @@
 # CHECK: opc moved ['g0/ram', 'g1/ram'] pages off []
 # CHECK: opc pattern ^(Opc:g0/ram|Opc:g1/ram)$
 # CHECK: small: moved [] H 256 fits True
+# CHECK: headroom: congestion {{[0-9.]+}} routes below it: False
 # CHECK: paged: page 'Opc:4' rows ^(Opc:ptw)$ fits True
 # A state gap of 40 against a round trip of 64: 24 host cycles each of 512.
 # CHECK: bubbles: H 16384 bubbles 12288 per {'Opc': {'hbm_bytes': 262144, 'bubbles': 12288}}

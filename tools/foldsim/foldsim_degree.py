@@ -1841,6 +1841,10 @@ def main():
     st.add_argument('--vmem-group', choices=('copy',), default=None,
                     help='price the controllers as foldsim --vmem-group copy builds them (one a '
                          'copy and row size)')
+    st.add_argument('--route-limit', type=float, default=None, metavar='PCT',
+                    help='route only below this congestion estimate (default foldsim_storage.'
+                         'ROUTE_LIMIT, the classifier\'s midpoint, 31.65): a lower one keeps '
+                         'routing headroom for a build')
     st.add_argument('--frame-growth', type=int, default=FRAME_GROWTH,
                     help='frames up to this many times the schedule\'s')
     st.add_argument('--links-as-built', action='store_true',
@@ -1895,6 +1899,8 @@ def main():
 
 
 def state_main(a):
+    if a.route_limit is not None:
+        storage.ROUTE_LIMIT = a.route_limit
     cal = json.load(open(a.calibration)) if a.calibration else None
     text = open(a.schedule).read()
     ii, classes, _ = parse_schedule(text)
