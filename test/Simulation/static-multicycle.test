@@ -1,0 +1,84 @@
+# REQUIRES: verilator
+# Multicycle evaluation (--stage-levels N --multicycle <class>): a deep class
+# evaluates one instance at a time over M host cycles, M its cone's estimated
+# levels over N, with no stage registers: its state and inputs taken into
+# capture registers at the read, the logic over M host cycles into end
+# registers a position before the state pass, which writes from them. The
+# leaves (Driver/Inputs/deep_mc: an oldest-first scan whose result picks the
+# address of two registered reads, a RAM write and an element write; a late
+# link into the second leaf) against the target (tb_late.sv), from zero
+# state, with bubbles and stalled channels: one copy at N = 6 and 4, two
+# copies, a copy per instance, paged state (byte masks, and a dense page
+# word), nested sequencers with a short lead, the link kinds, and a span of 2.
+# The simulator checks on every run that each evaluation's capture and end
+# registers are at least M host cycles apart and no other capture falls
+# between (the timing its constraints assume).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/deep_mc
+# RUN: foldsim --srcs top.f --top Top --out %t/plain --static --bubbles Leaf > %t/plain.log 2>&1
+# RUN: foldsim-opt %t/plain/foldsim_sim.mlir --pass-pipeline='builtin.module(foldsim-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=DEEP
+# RUN: foldsim --srcs top.f --top Top --out %t/m6 --static --bubbles --stage-levels 6 --multicycle Leaf Leaf > %t/m6.log 2>&1
+# RUN: FileCheck %s --check-prefix=M6 < %t/m6.log
+# RUN: FileCheck %s --check-prefix=XDC < %t/m6/foldsim_multicycle.xdc
+# RUN: FileCheck %s --check-prefix=JSON < %t/m6/foldsim_sim.json
+# RUN: foldsim-opt %t/m6/foldsim_sim.mlir --pass-pipeline='builtin.module(foldsim-estimate-timing{top=Leaf_static output=%t/m6/ep.csv report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=RAW6
+# RUN: python3 %S/../../tools/foldsim/foldsim_mc_judge.py %t/m6/ep.csv %t/m6/foldsim_sim.json --min-levels 7 | FileCheck %s --check-prefix=JUDGE6
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/m6/obj %S/Inputs/tb_late.sv top.sv %t/m6/foldsim_sim.sv > %t/m6/build.log 2>&1
+# RUN: %t/m6/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/m4 --static --bubbles --stage-levels 4 --multicycle Leaf Leaf > %t/m4.log 2>&1
+# RUN: FileCheck %s --check-prefix=M4 < %t/m4.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/m4/obj %S/Inputs/tb_late.sv top.sv %t/m4/foldsim_sim.sv > %t/m4/build.log 2>&1
+# RUN: %t/m4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/c2 --static --bubbles --modulo --copies Leaf:2 --stage-levels 6 --multicycle Leaf Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/c2/obj %S/Inputs/tb_late.sv top.sv %t/c2/foldsim_sim.sv > %t/c2/build.log 2>&1
+# RUN: %t/c2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/c4 --static --modulo --copies Leaf:4 --stage-levels 5 --multicycle Leaf Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/c4/obj %S/Inputs/tb_late.sv top.sv %t/c4/foldsim_sim.sv > %t/c4/build.log 2>&1
+# RUN: %t/c4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/pg2 --static --bubbles --page 2 --stage-levels 6 --multicycle Leaf Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/pg2/obj %S/Inputs/tb_late.sv top.sv %t/pg2/foldsim_sim.sv > %t/pg2/build.log 2>&1
+# RUN: %t/pg2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/pg3 --static --bubbles --modulo --page 3 --no-page-masks --stage-levels 6 --multicycle Leaf Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/pg3/obj %S/Inputs/tb_late.sv top.sv %t/pg3/foldsim_sim.sv > %t/pg3/build.log 2>&1
+# RUN: %t/pg3/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --bubbles --nest --modulo --short-lead --copies Leaf:2 --page 2 --stage-levels 8 --multicycle Leaf Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_late.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/zl --static --bubbles --modulo --zero-latency-links --zero-latency-chains --share-links --staged-links --compact-links --stage-levels 6 --multicycle Leaf Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/zl/obj %S/Inputs/tb_late.sv top.sv %t/zl/foldsim_sim.sv > %t/zl/build.log 2>&1
+# RUN: %t/zl/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/m24 --static --bubbles --modulo --stage-levels 24 --multicycle Leaf Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/m24/obj %S/Inputs/tb_late.sv top.sv %t/m24/foldsim_sim.sv > %t/m24/build.log 2>&1
+# RUN: %t/m24/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +bubble=30 +stall=20 | FileCheck %s
+# The span given (Leaf:5, as from the logic screen's count): 5 host cycles.
+# RUN: foldsim --srcs top.f --top Top --out %t/g5 --static --bubbles --modulo --stage-levels 6 --multicycle Leaf:5 Leaf > %t/g5.log 2>&1
+# RUN: FileCheck %s --check-prefix=G5 < %t/g5.log
+# RUN: FileCheck %s --check-prefix=XDC5 < %t/g5/foldsim_multicycle.xdc
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/g5/obj %S/Inputs/tb_late.sv top.sv %t/g5/foldsim_sim.sv > %t/g5/build.log 2>&1
+# RUN: %t/g5/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +bubble=30 +stall=20 | FileCheck %s
+# A class that reads a memory combinationally (Driver/Inputs/deep) stays staged.
+# RUN: cd %S/../Driver/Inputs/deep && foldsim --srcs top.f --top Top --out %t/comb --static --stage-levels 6 --multicycle Leaf Leaf > %t/comb.log 2>&1
+# RUN: FileCheck %s --check-prefix=COMB < %t/comb.log
+# Unstaged, the leaf's cone is one host cycle of 46 estimated levels; at 6
+# levels a host cycle it spans 8 (the state passes 8 positions apart), at 4,
+# 11; every path from the capture registers ends at the end registers and is
+# judged per host cycle at no more than 6 levels, the rest at most 6.
+# DEEP: #1 levels 46:
+# M6: Leaf multicycle: {{[0-9]+}} half levels estimated, over 8 host cycles (estimated at 12 half levels a host cycle), state passes 8 positions apart
+# M6: Leaf x4 state gap {{[0-9]+}} stages 9 multicycle 8
+# M6: Leaf multicycle 8: {{[0-9]+}} capture bits ({{[0-9]+}} registers), {{[0-9]+}} end bits ({{[0-9]+}} registers)
+# XDC: set_multicycle_path 8 -setup -from [get_cells -hierarchical -filter {IS_SEQUENTIAL && NAME =~ "*fsmc_Leaf__cap*"}] -to [get_cells -hierarchical -filter {IS_SEQUENTIAL && NAME =~ "*fsmc_Leaf__end*"}]
+# XDC: set_multicycle_path 7 -hold -from [get_cells -hierarchical -filter {IS_SEQUENTIAL && NAME =~ "*fsmc_Leaf__cap*"}] -to [get_cells -hierarchical -filter {IS_SEQUENTIAL && NAME =~ "*fsmc_Leaf__end*"}]
+# JSON: "prefix": "fsmc_Leaf__",
+# JSON-NEXT: "cycles": 8,
+# RAW6: #1 levels 46: /fsmc_Leaf__end{{[0-9]+}}.d[{{[0-9]+}}] (Leaf_static)
+# JUDGE6: end points by levels per allowed host cycle: {{.*}} 6:{{[0-9]+}}{{$}}
+# JUDGE6: at or above 7 levels per host cycle: 0
+# JUDGE6-NOT: OUTSIDE
+# M4: Leaf x4 state gap {{[0-9]+}} stages 12 multicycle 11
+# G5: Leaf multicycle: {{[0-9]+}} half levels estimated, over 5 host cycles (given), state passes 5 positions apart
+# G5: Leaf x4 state gap {{[0-9]+}} stages 6 multicycle 5
+# XDC5: set_multicycle_path 5 -setup
+# XDC5: set_multicycle_path 4 -hold
+# COMB: Leaf reads a memory combinationally: staged, not multicycle
+# COMB: Leaf x4 state gap 4 stages 9{{$}}
+# CHECK: {{^}}MATCH 196 cycles

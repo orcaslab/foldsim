@@ -395,7 +395,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "when the row was not written since the instance's last read; the "
            "instance keeps its read data, which is that row's. Exact by "
            "construction; a bit per instance records whether its read data "
-           "is current">,
+           "is current. Such a memory's requests leave a host cycle after the "
+           "state pass, from registers (the skip decided there): its room is "
+           "12 (10 with short-lead) and it needs a state gap of the lead + 2">,
     Option<"stagedEnv", "staged-env", "bool", "true",
            "The environment's endpoints take a token a host cycle after it "
            "is offered (registered token ends), not in that host cycle">,
@@ -570,6 +572,35 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "Outputs of a model driven by the same value (a bus broadcast to "
            "several children) are one producer: their readers share its "
            "links instead of one link per output">,
+    Option<"stageLevels", "stage-levels", "unsigned", "0",
+           "Staged evaluation: a class whose state cone (from its state and "
+           "inputs to its next state, memory ports and early outputs) is "
+           "deeper than this many estimated logic levels evaluates over "
+           "several host cycles: its logic cut into segments of at most this "
+           "many levels by registers that step with the frame's positions "
+           "(none moves in a bubble or between frames), its state and inputs "
+           "read the stages' positions before its state pass, which writes "
+           "as before. Only for a class with no late output, virtual memory "
+           "or black box. The schedule places such a state pass at least the "
+           "stages into the frame, its inputs' links the stages earlier, and "
+           "its state gap from the read. 0: none">,
+    ListOption<"multicycle", "multicycle", "std::string",
+               "With stage-levels: classes (globs; a copy goes by its class's "
+               "name) staged without stage registers. A copy evaluates one "
+               "instance at a time over M host cycles, M the cone's estimated "
+               "levels over stage-levels, or M given as <glob>:<M> (the logic "
+               "screen's count of the cone over the levels a host cycle may "
+               "take): the state and inputs it reads are "
+               "taken into capture registers at the read position (the state "
+               "pass's M + 1 before), the logic computes from them over M "
+               "host cycles into end registers taken a position before the "
+               "state pass, which writes from them; nothing else reads a "
+               "capture register or writes an end register. The schedule "
+               "spaces the copy's state passes at least M positions apart, so "
+               "a capture holds until its end registers are taken. The "
+               "multicycle paths (capture to end, M host cycles) are listed "
+               "for the flow (`foldsim.multicycle`). Only for a class that "
+               "could be staged and reads no memory combinationally">,
     ListOption<"registeredLinks", "registered-links", "std::string",
                "Classes (globs; a copy goes by its class's name) whose links "
                "are never taken in their producer's host cycle: with "

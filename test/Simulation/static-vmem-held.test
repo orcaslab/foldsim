@@ -28,6 +28,15 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/copies --static --virtual-memories ram --vmem-skip-held-reads --copies Leaf:2 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=2 -DWRITE_FIRST -DCOPIES2 -DIW=1 -Mdir %t/copies/obj %S/Inputs/tb_vmem.sv top.sv %t/copies/foldsim_sim.sv > %t/copies/build.log 2>&1
 # RUN: %t/copies/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=40 +stall=30 +full=10 +maxreads=600 | FileCheck %s
+# A class with a ready pass (top_ready.sv: the leaves' late outputs loop back
+# into the first leaf's state in the cycle) keeps a state gap of the lead + 2
+# (6), so its requests leave from registers, the skip decided there: with a
+# gap of 5 the first copy issued every read, from the target's address logic.
+# RUN: foldsim --srcs top_ready.f --top Top --out %t/ready --static --virtual-memories ram --vmem-skip-held-reads --modulo --copies Leaf:2 Leaf > %t/ready.log 2>&1
+# RUN: FileCheck %s --check-prefix=READY < %t/ready.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=2 -DWRITE_FIRST -DCOPIES2 -DIW=2 -Mdir %t/ready/obj %S/Inputs/tb_vmem.sv top_ready.sv %t/ready/foldsim_sim.sv > %t/ready/build.log 2>&1
+# RUN: %t/ready/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=1 +hi=30 +stall=20 +maxreads=800 | FileCheck %s
+# READY: Leaf x4 (ready pass) state gap 6
 # A read whose address is not held (Driver/Inputs/vmem: the read data
 # registered at an input address) is issued every cycle, as without it.
 # RUN: cd %S/../Driver/Inputs/vmem

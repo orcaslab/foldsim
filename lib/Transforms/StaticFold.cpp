@@ -19,6 +19,7 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/SV/SVAttributes.h"
 #include "circt/Dialect/SV/SVDialect.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 #include "foldsim/Passes.h"
@@ -123,6 +124,20 @@ struct Class {
   /// Host cycles from an instance's state pass to its next evaluation's
   /// first, the fewest over its instances: what the state bypass must cover.
   int stateGap = 0;
+  /// Staged evaluation (`stage-levels`): the stage registers its logic is
+  /// cut by. Its state and inputs are read this many positions before its
+  /// state pass, whose writes are as without stages; its state gap counts
+  /// from the state pass to the next evaluation's read. 0: none.
+  unsigned stages = 0;
+  /// Multicycle (`multicycle`): host cycles from the capture registers to
+  /// the end registers, the stages less one (0: none, or stage registers).
+  unsigned multicycle = 0;
+  /// Multicycle: the bits of its capture and end registers.
+  uint64_t multicycleCaps = 0, multicycleEnds = 0;
+  /// With --vmem-skip-held-reads: a virtual memory of it reads at a held
+  /// address (heldReadRow), so its requests leave from registers a host
+  /// cycle after the state pass, given a state gap of the lead + 2.
+  bool heldReads = false;
   /// Whether its memories include a registered read: its state is then read
   /// a host cycle later after a state pass.
   bool syncReads = false;
@@ -138,19 +153,22 @@ struct Class {
     unsigned rowWidth, dataWidth, maskWidth;
     bool readFirst;
     unsigned firstInput, firstOutput;
+    SmallVector<seq::FirMemOp> lanes;
+    SmallVector<unsigned> laneOffset;
+    /// With --vmem-skip-held-reads, where the read's address is a registered
+    /// one (heldReadRow): an op in the model computing the row the previous
+    /// target cycle read, else null.
+    Value heldRow;
+    /// Its requests leave a host cycle after the state pass, from registers
+    /// (the skip computed there): the room and the state gap take a host
+    /// cycle more.
+    bool delayed = false;
     /// A column of a page word kept off chip (`pages=hbm`): its instances
     /// are {instance, page} (`instWidth` bits, `instances` of them), a row
     /// each, read at the fetch's positions and waited for by the state pass
     /// alone; 0 for a memory of the model (the class's instances).
     bool pages = false;
     unsigned instWidth = 0, instances = 0;
-    SmallVector<seq::FirMemOp> lanes;
-    SmallVector<unsigned> laneOffset;
-    /// With --vmem-skip-held-reads, where the read's address is provably the
-    /// previous target cycle's whenever it is true (heldReadCondition): an
-    /// op in the model computing that condition, else null; and the row it
-    /// holds (the read's address then).
-    Value held, heldRow;
   };
   SmallVector<VirtualMemory> virtualMemories;
   /// With virtual memories, the copy's host reset input (their pending reads
@@ -314,7 +332,8 @@ public:
                unsigned pageMemoryBits, StringRef pageMemories, StringRef pageRows, bool compactLinks,
                ArrayRef<std::string> registeredLinks, bool shareLinks,
                bool stagedLinks, unsigned linkBlockDepth,
-               unsigned linkUltraDepth, StringRef linkKindSpec)
+               unsigned linkUltraDepth, StringRef linkKindSpec,
+               unsigned stageLevels, ArrayRef<std::string> multicycle)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
@@ -338,6 +357,7 @@ public:
         registeredLinkSpecs(registeredLinks), shareLinks(shareLinks),
         stagedLinks(stagedLinks), linkBlockDepth(linkBlockDepth),
         linkUltraDepth(linkUltraDepth), linkKindSpec(linkKindSpec.str()),
+        stageLevels(stageLevels), multicycleSpecs(multicycle),
         envRoundTrip((stagedEnv ? 1 : 0) + 1 + decisionLead()),
         linkLatency(oneCycleLinks ? kForwardedLinkLatency : kLinkLatency) {}
   LogicalResult run();
@@ -352,8 +372,11 @@ private:
   /// The free request entries a position needs to run: a `free` the
   /// sequencer sees does not yet count the requests of the decisions still in
   /// flight (one a host cycle, decisionLead() of them) nor those of its own
-  /// decision, each at most a read and a write.
-  unsigned virtualRoom() const { return 2 * (decisionLead() + 1); }
+  /// decision, each at most a read and a write; a memory whose requests leave
+  /// a host cycle after the pass (`delayed`) has one decision more in flight.
+  unsigned virtualRoom(bool delayed = false) const {
+    return 2 * (decisionLead() + 1 + (delayed ? 1 : 0));
+  }
 
   void inlineNetlists();
   LogicalResult collect();
@@ -459,6 +482,15 @@ private:
   /// The last modulo search: its lower bound and the periods it tried.
   unsigned moduloLower = 0, moduloTried = 0;
   LogicalResult buildCopy(Class &cls);
+  LogicalResult stageLogic(Class &cls, Block *body, Operation *held,
+                           Value hostClock, Value live1, Value pre1,
+                           Value rinst, bool keepOld,
+                           DenseMap<Operation *, Value> &readInst);
+  /// Multicycle: checks that the capture registers of `copy` reach only its
+  /// end registers through logic, and the end registers are reached only
+  /// from its capture registers and constants: the multicycle paths are
+  /// exactly the cone's.
+  LogicalResult checkMulticycle(Class &cls);
   LogicalResult buildSim();
 
   ModuleOp top;
@@ -755,6 +787,18 @@ private:
     }
     return syncLinkStyle(depth, width);
   }
+  /// `stage-levels`: the most estimated logic levels a class's state cone
+  /// spans in one host cycle (0: no staged evaluation), and the classes'
+  /// stages from it (`Class::stages`).
+  unsigned stageLevels;
+  /// `multicycle`: the classes (globs) staged without stage registers.
+  ArrayRef<std::string> multicycleSpecs;
+  LogicalResult chooseStages();
+  /// Multicycle: the positions a copy's state passes are kept apart by the
+  /// schedule (its page lead, or its multicycle span), 0 for none.
+  unsigned passSpacing(unsigned c) const {
+    return std::max(classes[c].pageLead(), classes[c].multicycle);
+  }
   StringRef syncLinkStyle(uint64_t depth, unsigned width) const {
     if (linkUltraDepth && depth >= linkUltraDepth)
       return "ultra";
@@ -792,6 +836,10 @@ private:
   /// storage).
   void buildFrameTable(bool stalls);
   SmallVector<SmallVector<Evaluation>> frameAt;
+  /// What each class reads at each position: its evaluations' reads, the
+  /// stages before their state passes (`frameAt` for a class of no stages).
+  /// A link's reader is looked up here, its producer in `frameAt`.
+  SmallVector<SmallVector<Evaluation>> readFrameAt;
   bool stalls = false;
   bool writesAt(const Producer &producer, unsigned at) const;
   bool needsForward(unsigned p, unsigned c, ArrayRef<bool> takes,
@@ -1312,6 +1360,10 @@ LogicalResult StaticFolder::nestInstances() {
 // What each output depends on
 //===----------------------------------------------------------------------===//
 
+static bool findHeldRead(seq::FirMemReadOp read, comb::MuxOp &found,
+                         bool &qOnTrue);
+static int stageOpFullLevels(Operation *op);
+
 /// The logic levels a link taken in its producer's host cycle may span: the
 /// logic screen's gate.
 static constexpr int kZeroLinkLevels = 12;
@@ -1504,6 +1556,305 @@ LogicalResult StaticFolder::analyze(Class &cls) {
   };
   for (auto arg : body->getArguments())
     cls.inputDepth.push_back(longestPath(arg, toState, outOf));
+  return success();
+}
+
+/// An op's logic levels for staged evaluation, in half levels, by width as the
+/// logic screen counts them on the V80's fabric (foldsim-estimate-timing): an
+/// adder or an ordering compare a LUT and a carry chain of 8-bit blocks, an
+/// equality compare 3-bit matches ANDed in LUT6 trees, a wide AND/OR/XOR a
+/// LUT6 tree; a choice or a gate of two or three inputs half a level (a LUT6
+/// takes two of them chained); otherwise as `logicLevels`.
+static int stageOpLevels(Operation *op) {
+  if (isa<comb::MuxOp, comb::AndOp, comb::OrOp, comb::XorOp>(op) &&
+      op->getNumOperands() <= 3)
+    return 1;
+  return 2 * stageOpFullLevels(op);
+}
+
+static int stageOpFullLevels(Operation *op) {
+  auto lut6 = [](int64_t inputs) {
+    int levels = 1;
+    for (int64_t n = 6; n < inputs; n *= 6)
+      ++levels;
+    return levels;
+  };
+  if (auto cmp = dyn_cast<comb::ICmpOp>(op)) {
+    int64_t w = hw::getBitWidth(cmp.getLhs().getType());
+    switch (cmp.getPredicate()) {
+    case comb::ICmpPredicate::eq:
+    case comb::ICmpPredicate::ne:
+    case comb::ICmpPredicate::ceq:
+    case comb::ICmpPredicate::cne:
+    case comb::ICmpPredicate::weq:
+    case comb::ICmpPredicate::wne:
+      return w <= 3 ? 1 : 1 + lut6((w + 2) / 3);
+    default:
+      return 2 + int(w / 8);
+    }
+  }
+  if (isa<comb::AddOp, comb::SubOp>(op))
+    return 2 + int(hw::getBitWidth(op->getResult(0).getType()) / 8);
+  if (isa<comb::AndOp, comb::OrOp, comb::XorOp>(op))
+    return lut6(op->getNumOperands());
+  return logicLevels(op);
+}
+
+/// The levels a value adds on the paths into it: through the logic and
+/// combinational reads (a level each), stopping at registers (stage
+/// registers too), registered reads, black boxes and the model's inputs.
+static void depthEdges(Value value,
+                       SmallVectorImpl<std::pair<Value, int>> &edges) {
+  auto *op = value.getDefiningOp();
+  if (!op)
+    return;
+  auto read = dyn_cast<seq::FirMemReadOp>(op);
+  auto memory = read ? read.getMemory().getDefiningOp<seq::FirMemOp>()
+                     : seq::FirMemOp();
+  if (read) {
+    if (memory && memory.getReadLatency() > 0)
+      return;
+    edges.push_back({read.getAddress(), 2});
+    if (read.getEnable())
+      edges.push_back({read.getEnable(), 2});
+    return;
+  }
+  if (isa<seq::FirRegOp, seq::CompRegClockEnabledOp, seq::FirMemOp,
+          hw::InstanceOp>(op))
+    return;
+  int levels = stageOpLevels(op);
+  for (auto operand : op->getOperands())
+    if (!isa<seq::ClockType>(operand.getType()))
+      edges.push_back({operand, levels});
+}
+
+/// A port of a state op that the state pass writes: none of its clock or
+/// memory handle.
+static bool statePort(Value operand) {
+  return !isa<seq::ClockType, seq::FirMemType>(operand.getType());
+}
+
+/// A value's place in staged evaluation: its stage, and the levels from the
+/// stage's registers to it (-1: a constant, at any stage).
+struct Staging {
+  int stage = 0, levels = 0;
+};
+
+/// The staging of `root` and the values it depends on, into `memo`, soonest
+/// first: an op joins the latest stage of its operands unless its levels
+/// there would pass `limit`, and then starts the next stage, its operands
+/// taken through the stage registers; so no stage spans more than `limit`
+/// levels (or one op's). Depth first without recursion.
+static Staging stageOf(Value root, int limit, DenseMap<Value, Staging> &memo) {
+  SmallVector<std::pair<Value, bool>> stack{{root, false}};
+  SmallVector<std::pair<Value, int>> next;
+  while (!stack.empty()) {
+    auto [value, expanded] = stack.pop_back_val();
+    if (!expanded && memo.count(value))
+      continue;
+    if (auto *op = value.getDefiningOp();
+        op && isa<hw::ConstantOp, hw::AggregateConstantOp>(op)) {
+      memo[value] = {-1, 0};
+      continue;
+    }
+    next.clear();
+    depthEdges(value, next);
+    if (!expanded) {
+      // A placeholder against cycles, then the operands first.
+      memo[value] = {0, 0};
+      stack.push_back({value, true});
+      for (auto [operand, levels] : next)
+        if (!memo.count(operand))
+          stack.push_back({operand, false});
+      continue;
+    }
+    if (next.empty()) {
+      memo[value] = {0, 0};
+      continue;
+    }
+    int stage = 0, levels = next.front().second, at = 0;
+    for (auto [operand, add] : next)
+      stage = std::max(stage, memo.lookup(operand).stage);
+    for (auto [operand, add] : next)
+      if (auto s = memo.lookup(operand); s.stage == stage)
+        at = std::max(at, s.levels);
+    if (at > 0 && at + levels > limit) {
+      ++stage;
+      at = 0;
+    }
+    memo[value] = {stage, at + levels};
+  }
+  return memo.lookup(root);
+}
+
+/// The stage a write of `value` through `extra` more levels ends in.
+static int sinkStage(Value value, int extra, int limit,
+                     DenseMap<Value, Staging> &memo) {
+  if (!value)
+    return 0;
+  auto s = stageOf(value, limit, memo);
+  if (s.stage < 0)
+    return 0;
+  return s.stage + (s.levels > 0 && s.levels + extra > limit ? 1 : 0);
+}
+
+LogicalResult StaticFolder::chooseStages() {
+  std::optional<llvm::Regex> pattern;
+  if (!virtualMemoryPattern.empty())
+    pattern.emplace(virtualMemoryPattern);
+  // The classes whose virtual memories read at held addresses: the schedule
+  // keeps their state gap at the lead + 2, so that the requests leave from
+  // registers (the skip decided there), not from the target's address logic.
+  if (pattern && skipHeldReads)
+    for (auto &cls : classes) {
+      StringRef modelName = cls.splitFrom >= 0
+                                ? StringRef(classes[cls.splitFrom].name)
+                                : cls.name;
+      auto *folding = cls.folding.get();
+      for (auto memory : cls.model.getBodyBlock()->getOps<seq::FirMemOp>()) {
+        StringRef memName = memory.getName().value_or("");
+        if ((folding && folding->physical.contains(memory)) ||
+            memory.getReadLatency() != 1 ||
+            (!pattern->match(memName) &&
+             !pattern->match((modelName + ":" + memName).str())))
+          continue;
+        for (auto *user : memory->getUsers())
+          if (auto read = dyn_cast<seq::FirMemReadOp>(user)) {
+            comb::MuxOp mux;
+            bool onTrue;
+            cls.heldReads |= findHeldRead(read, mux, onTrue);
+          }
+      }
+    }
+  if (!stageLevels)
+    return success();
+  for (auto &cls : classes) {
+    // Not for a class with a late output (a ready pass, or a state pass that
+    // writes what its readers take in the frame), virtual memories, folded
+    // pipelines or black boxes, or pages off chip.
+    if (llvm::any_of(cls.late, [](bool late) { return late; }) ||
+        cls.pagesOffChip || (cls.folding && !cls.folding->folds.empty()))
+      continue;
+    auto *body = cls.model.getBodyBlock();
+    StringRef modelName =
+        cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : cls.name;
+    bool eligible = true;
+    for (auto &op : *body) {
+      if (isa<hw::InstanceOp>(op))
+        eligible = false;
+      auto memory = dyn_cast<seq::FirMemOp>(op);
+      if (memory && pattern) {
+        StringRef memName = memory.getName().value_or("");
+        if (pattern->match(memName) ||
+            pattern->match((modelName + ":" + memName).str()))
+          eligible = false;
+      }
+    }
+    if (!eligible)
+      continue;
+    // The last stage of a register's next value (its reset a choice more),
+    // a memory's write or registered read, and an early output's next value
+    // (its logic over the registers' next values, stages of it more).
+    DenseMap<Value, Staging> memo;
+    int limit = 2 * int(stageLevels), next = 0, last = 0;
+    for (auto &op : *body) {
+      if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
+        int add = reg.getReset() ? 1 : 0;
+        next = std::max({next, sinkStage(reg.getNext(), 2 * add, limit, memo),
+                         sinkStage(reg.getReset(), 2 * add, limit, memo)});
+      } else if (isa<seq::FirMemWriteOp>(op)) {
+        for (auto operand : op.getOperands())
+          if (statePort(operand))
+            last = std::max(last, sinkStage(operand, 0, limit, memo));
+      } else if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+        auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+        if (memory && memory.getReadLatency() > 0)
+          last = std::max({last, sinkStage(read.getAddress(), 0, limit, memo),
+                           sinkStage(read.getEnable(), 0, limit, memo)});
+      }
+    }
+    last = std::max(last, next);
+    for (int out : cls.outputDepth)
+      last = std::max(last, next + (out + limit - 1) / limit);
+    cls.stages = unsigned(last);
+
+    // Multicycle: the cone's depth over the levels a host cycle, as host
+    // cycles from the capture registers to the end registers (at least 1);
+    // the reads a position before the first, the state pass a position after
+    // the last.
+    StringRef baseName = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
+                                            : StringRef(cls.name);
+    bool listed = false;
+    unsigned given = 0;
+    for (auto &spec : multicycleSpecs) {
+      auto [pattern, cycles] = StringRef(spec).split(':');
+      if (auto glob = llvm::GlobPattern::create(pattern);
+          glob && glob->match(baseName)) {
+        listed = true;
+        if (!cycles.empty())
+          cycles.getAsInteger(10, given);
+      }
+    }
+    if (!listed || !cls.stages)
+      continue;
+    bool combReads = false;
+    for (auto read : body->getOps<seq::FirMemReadOp>()) {
+      auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+      combReads |= !memory || memory.getReadLatency() == 0;
+    }
+    if (combReads) {
+      llvm::errs() << "foldsim-fold-static: " << cls.name
+                   << " reads a memory combinationally: staged, not multicycle\n";
+      continue;
+    }
+    DenseMap<Value, Staging> depths;
+    constexpr int kUnbounded = std::numeric_limits<int>::max() / 4;
+    auto depthOf = [&](Value value, int extra) {
+      if (!value)
+        return 0;
+      auto s = stageOf(value, kUnbounded, depths);
+      return s.stage < 0 ? 0 : s.levels + extra;
+    };
+    int deepest = 0, nextDepth = 0;
+    for (auto &op : *body) {
+      if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
+        int add = reg.getReset() ? 1 : 0;
+        nextDepth = std::max({nextDepth, depthOf(reg.getNext(), 2 * add),
+                              depthOf(reg.getReset(), 2 * add)});
+      } else if (isa<seq::FirMemWriteOp>(op)) {
+        for (auto operand : op.getOperands())
+          if (statePort(operand))
+            deepest = std::max(deepest, depthOf(operand, 0));
+      } else if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+        deepest = std::max({deepest, depthOf(read.getAddress(), 0),
+                            depthOf(read.getEnable(), 0)});
+      }
+    }
+    deepest = std::max(deepest, nextDepth);
+    for (int out : cls.outputDepth)
+      deepest = std::max(deepest, nextDepth + 2 * out);
+    cls.multicycle = unsigned(std::max(1, (deepest + limit - 1) / limit));
+    // Given (<glob>:<cycles>, from the logic screen's count of the cone): the
+    // span, whatever the estimate.
+    if (given)
+      cls.multicycle = given;
+    cls.stages = cls.multicycle + 1;
+    llvm::errs() << "foldsim-fold-static: " << cls.name << " multicycle: "
+                 << deepest << " half levels estimated, over "
+                 << cls.multicycle << " host cycles ("
+                 << (given ? "given" : "estimated at " + std::to_string(limit) +
+                                           " half levels a host cycle")
+                 << "), state passes " << cls.multicycle
+                 << " positions apart\n";
+  }
+  for (auto &spec : multicycleSpecs) {
+    auto [pattern, cycles] = StringRef(spec).split(':');
+    unsigned n = 0;
+    if (!llvm::GlobPattern::create(pattern) ||
+        (!cycles.empty() && (cycles.getAsInteger(10, n) || n < 1)))
+      return netlist.emitError("multicycle: '")
+             << spec << "' is not <glob> or <glob>:<host cycles>";
+  }
   return success();
 }
 
@@ -1980,6 +2331,10 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   // Between SLR groups a link is registered on both sides of the crossing.
   if (crosses(producer.cls, c))
     return false;
+  // A staged reader reads its inputs from their read registers, its stages
+  // before its state pass.
+  if (classes[c].stages)
+    return false;
   if (zeroLatencyChains)
     return !cutLinks.count({p, c, input});
   auto &cls = classes[c];
@@ -2239,7 +2594,7 @@ int StaticFolder::stagedCopy(unsigned p, unsigned inst, unsigned reader,
       first = std::min(first, s);
       last = std::max(last, s);
     };
-    take(rcls.slot[kState][i]);
+    take(rcls.slot[kState][i] - int(rcls.stages));
     for (unsigned l = 0; l < rcls.readyLevels; ++l)
       take(rcls.readySlots(l)[i]);
   }
@@ -2606,11 +2961,13 @@ void StaticFolder::frameGraph(ArrayRef<bool> ready, ReadyWrites &writes,
             auto &producer = producers[piece.producer];
             if (producer.cls < 0 || !producer.late)
               continue;
+            // A staged reader reads its stages before its state pass.
             lateReads[c][i].push_back(
                 {input, unsigned(piece.producer), piece.inst,
                  zeroLink(piece.producer, c, input)
                      ? 0
-                     : int(linkLatency + crossDelay(producer.cls, c))});
+                     : int(linkLatency + crossDelay(producer.cls, c) +
+                           cls.stages)});
           }
         }
     }
@@ -2682,10 +3039,12 @@ static void assignSlots(const ReadyWrites &writes, ArrayRef<Node> nodes,
     slots[writes.row(node.cls, node.pass, node.level)][node.inst] = slotOf[n];
 }
 
-/// An instance's first evaluation of the frame.
+/// An instance's first evaluation of the frame, as the position it reads
+/// at: a staged class's state pass reads its stages before it.
 static int firstSlot(const ReadyWrites &writes,
-                     ArrayRef<SmallVector<int>> slots, unsigned c, unsigned i) {
-  int at = slots[c * 2 + kState][i];
+                     ArrayRef<SmallVector<int>> slots, unsigned c, unsigned i,
+                     unsigned stages) {
+  int at = slots[c * 2 + kState][i] - int(stages);
   for (unsigned l = 0; l < writes.passes[c]; ++l)
     at = std::min(at, slots[writes.row(c, kReady, l)][i]);
   return at;
@@ -2797,10 +3156,11 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
       heap.push_back(n);
   std::make_heap(heap.begin(), heap.end(), cmp);
   // A paged copy's state passes, each at least its page apart: the page
-  // port reads an instance's pages in the slots before its state pass.
+  // port reads an instance's pages in the slots before its state pass. A
+  // multicycle copy's, its multicycle span apart: one evaluation at a time.
   std::vector<std::set<int>> pageSlots(classes.size());
   auto pageClash = [&](unsigned c, int t) {
-    int p = classes[c].pageLead();
+    int p = passSpacing(c);
     auto &slots = pageSlots[c];
     auto it = slots.lower_bound(t - p + 1);
     return it != slots.end() && *it < t + p;
@@ -2817,11 +3177,12 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     std::pop_heap(heap.begin(), heap.end(), cmp);
     unsigned n = heap.back();
     heap.pop_back();
-    int earliest = 0;
+    // A staged state pass reads its stages before it, within the frame.
+    int earliest = nodes[n].pass == kState ? int(classes[nodes[n].cls].stages) : 0;
     for (auto [p, latency] : preds[n])
       earliest = std::max(earliest, slotOf[p] + latency);
     unsigned c = nodes[n].cls;
-    bool pages = nodes[n].pass == kState && paged(c);
+    bool pages = nodes[n].pass == kState && passSpacing(c);
     auto &taken = busy[c];
     bool spaced = classes[c].linkPage > 1;
     earliest = firstFree(taken, earliest, 0);
@@ -2850,7 +3211,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
   // threaded class's registers written a host cycle late, from a stage); an
   // early output's reads in the next frame after its write.
   auto first = [&](unsigned c, unsigned i) {
-    return firstSlot(writes, slots, c, i);
+    return firstSlot(writes, slots, c, i, classes[c].stages);
   };
   for (auto [c, cls] : llvm::enumerate(classes))
     for (unsigned i = 0; i < cls.threads(); ++i) {
@@ -2860,11 +3221,11 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
   // A paged copy: the next frame's first page-in after this frame's last
   // state pass, and an instance's next page-in after its write-back.
   for (auto [c, cls] : llvm::enumerate(classes))
-    if (paged(c) && !pageSlots[c].empty())
+    if (passSpacing(c) && !pageSlots[c].empty())
       length = std::max<int>(
           {length,
-           *pageSlots[c].rbegin() - *pageSlots[c].begin() + int(cls.pageLead()),
-           int(cls.pageLead()) + 4});
+           *pageSlots[c].rbegin() - *pageSlots[c].begin() + int(passSpacing(c)),
+           paged(c) ? int(cls.pageLead()) + 4 : 0});
   // Paged links: the next frame's first pass a link page after the last.
   for (auto [c, cls] : llvm::enumerate(classes))
     if (cls.linkPage > 1 && !linkSlots[c].empty())
@@ -2999,8 +3360,9 @@ unsigned StaticFolder::placeModulo(
   // Nor than a paged copy's state passes, each its page apart, nor its
   // page recurrence.
   for (auto [c, cls] : llvm::enumerate(classes))
-    if (paged(c) && cls.threads())
-      lower = std::max({lower, cls.pageLead() * cls.threads(), cls.pageLead() + 4});
+    if (passSpacing(c) && cls.threads())
+      lower = std::max({lower, passSpacing(c) * cls.threads(),
+                        paged(c) ? cls.pageLead() + 4 : 0u});
   // Nor than a copy with paged links' passes, each its link page apart.
   for (auto [c, cls] : llvm::enumerate(classes))
     if (cls.linkPage > 1)
@@ -3085,8 +3447,9 @@ unsigned StaticFolder::placeModulo(
         each(0, start + lead - int(period));
       }
     };
+    // A multicycle copy's evaluation holds its span's (passSpacing).
     auto window = [&](unsigned c, int t, auto &&each) {
-      windowOf(classes[c].pageLead(), t, each);
+      windowOf(passSpacing(c), t, each);
     };
     auto linkFree = [&](unsigned c, int t) {
       auto &port = linkPort[c];
@@ -3129,7 +3492,7 @@ unsigned StaticFolder::placeModulo(
       });
     };
     auto pages = [&](unsigned n) {
-      return nodes[n].pass == kState && paged(nodes[n].cls);
+      return nodes[n].pass == kState && passSpacing(nodes[n].cls) > 0;
     };
     SmallVector<unsigned> waiting(nodes.size(), 0);
     for (unsigned n = 0; n < nodes.size(); ++n)
@@ -3144,7 +3507,8 @@ unsigned StaticFolder::placeModulo(
       std::pop_heap(heap.begin(), heap.end(), cmp);
       unsigned n = heap.back();
       heap.pop_back();
-      int earliest = 0;
+      int earliest =
+          nodes[n].pass == kState ? int(classes[nodes[n].cls].stages) : 0;
       for (auto [p, latency] : preds[n])
         earliest = std::max(earliest, slotOf[p] + latency);
       unsigned c = nodes[n].cls;
@@ -3245,7 +3609,7 @@ unsigned StaticFolder::placeModulo(
 
     assignSlots(writes, nodes, slotOf, slots, classes);
     auto first = [&](unsigned c, unsigned i) {
-      return firstSlot(writes, slots, c, i);
+      return firstSlot(writes, slots, c, i, classes[c].stages);
     };
     auto last = [&](unsigned c, unsigned i) {
       int at = slots[c * 2 + kState][i];
@@ -4306,18 +4670,29 @@ int StaticFolder::minStateGap(const Class &cls) const {
   if (cls.minGap >= 0)
     return cls.minGap;
   int gap = writeBackLatency(cls);
+  // A staged paged class: an instance's write-back, its page a host cycle
+  // after the state pass, ends before its next fetch, a page before the
+  // next evaluation's read.
+  if (cls.stages && cls.page)
+    gap = std::max(gap, 2 * int(cls.pageLead()) + 2);
+  // A staged class's writes reach its next evaluation's reads through its
+  // stores alone, no bypass.
+  if (cls.stages)
+    gap = std::max(gap, 4);
   if (!virtualMemoryPattern.empty()) {
     llvm::Regex pattern(virtualMemoryPattern);
     StringRef model = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
                                          : StringRef(cls.name);
     auto *folding = cls.folding.get();
     // As buildCopy finds its virtual memories: by name or <class model>:<name>.
+    // A held-read class's requests leave a host cycle after the state pass:
+    // a host cycle more.
     for (auto memory :
          const_cast<hw::HWModuleOp &>(cls.model).getBodyBlock()->getOps<seq::FirMemOp>()) {
       StringRef name = memory.getName().value_or("");
       if (!(folding && folding->physical.contains(memory)) &&
           (pattern.match(name) || pattern.match((model + ":" + name).str()))) {
-        gap = std::max(gap, decisionLead() + 1);
+        gap = std::max(gap, decisionLead() + (cls.heldReads ? 2 : 1));
         break;
       }
     }
@@ -4762,7 +5137,7 @@ LogicalResult StaticFolder::schedule() {
     cls.stateGap = std::numeric_limits<int>::max();
     for (unsigned i = 0; i < cls.threads(); ++i) {
       int s = cls.slot[kState][i];
-      int first = firstSlot(best.writes, best.slots, c, i);
+      int first = firstSlot(best.writes, best.slots, c, i, cls.stages);
       cls.stateGap = std::min(cls.stateGap, first + int(ii) - s);
     }
   }
@@ -4858,6 +5233,10 @@ LogicalResult StaticFolder::schedule() {
                           : std::string())
        << " state gap "
        << cls.stateGap;
+    if (cls.stages)
+      os << " stages " << cls.stages;
+    if (cls.multicycle)
+      os << " multicycle " << cls.multicycle;
     if (cls.page)
       os << " page " << cls.page << (cls.pagesOffChip ? " off chip" : "");
     if (nest)
@@ -5524,24 +5903,23 @@ static Value nextValue(ImplicitLocOpBuilder &b, Value root,
   return nexts.lookup(root);
 }
 
-/// A registered read's hold condition (--vmem-skip-held-reads): an i1 that,
-/// true in a target cycle, makes the read's address that of the previous
-/// target cycle. Found where the address is a function of one value M alone
-/// (side-effect-free combinational ops and constants), M = mux(c, A, q) or
-/// mux(c, q, A), q a register without reset on the read's clock whose next
-/// value is M: with c low (high) M is q, the previous cycle's M. This is a
-/// registered read address with an enable, as front ends emit SRAMs and
-/// `if (en) raddr_q <= raddr; rdata = mem[raddr_q]` imports. The condition
-/// is built as an op of its own next to the mux, so that registers replaced
-/// later reach it; so is the held row, the address's function applied to q
-/// (the address whenever the condition holds, without the mux and what
-/// computes c and A in its path). Null where the pattern is not found.
-struct HeldRead {
-  Value held, row;
-};
-static HeldRead heldReadCondition(seq::FirMemReadOp read) {
-  comb::MuxOp found;
-  bool qOnTrue = false;
+/// A registered read's previous row (--vmem-skip-held-reads): the row the
+/// read took in the previous target cycle. Found where the address is a
+/// function f of one value M alone (side-effect-free combinational ops and
+/// constants), M = mux(c, A, q) or mux(c, q, A), q a register without reset
+/// on the read's clock whose next value is M: q is the previous cycle's M, so
+/// f(q) is the previous cycle's address. This is a registered read address
+/// with an enable, as front ends emit SRAMs and `if (en) raddr_q <= raddr;
+/// rdata = mem[raddr_q]` imports (c low: the address holds). The address
+/// cone is cloned with q in place of the mux, next to it, so that registers
+/// replaced later reach it; it is a register and a few levels, off the path
+/// that computes c and A. Null where the pattern is not found.
+/// The mux of such a held address, and whether q is its true value; false
+/// where the pattern is not found. Changes nothing.
+static bool findHeldRead(seq::FirMemReadOp read, comb::MuxOp &found,
+                         bool &qOnTrue) {
+  found = {};
+  qOnTrue = false;
   SmallVector<Value> work{read.getAddress()};
   DenseSet<Value> seen;
   while (!work.empty()) {
@@ -5549,10 +5927,10 @@ static HeldRead heldReadCondition(seq::FirMemReadOp read) {
     if (!seen.insert(value).second)
       continue;
     if (seen.size() > 256)
-      return {};
+      return false;
     auto *op = value.getDefiningOp();
     if (!op)
-      return {};
+      return false;
     if (isa<hw::ConstantOp>(op))
       continue;
     if (auto mux = dyn_cast<comb::MuxOp>(op)) {
@@ -5564,7 +5942,7 @@ static HeldRead heldReadCondition(seq::FirMemReadOp read) {
             reg.getClk() != read.getClk())
           continue;
         if (found && found != mux)
-          return {};
+          return false;
         found = mux;
         qOnTrue = onTrue;
         matched = true;
@@ -5574,20 +5952,22 @@ static HeldRead heldReadCondition(seq::FirMemReadOp read) {
         continue;
     }
     if (!isa<comb::CombDialect>(op->getDialect()) && !isa<hw::BitcastOp>(op))
-      return {};
+      return false;
     if (op->getNumRegions() || !isMemoryEffectFree(op))
-      return {};
+      return false;
     for (auto operand : op->getOperands())
       work.push_back(operand);
   }
-  if (!found)
+  return bool(found);
+}
+
+static Value heldReadRow(seq::FirMemReadOp read) {
+  comb::MuxOp found;
+  bool qOnTrue;
+  if (!findHeldRead(read, found, qOnTrue))
     return {};
   OpBuilder b(found->getContext());
   b.setInsertionPointAfter(found);
-  Location loc = found.getLoc();
-  Value flip = hw::ConstantOp::create(b, loc, b.getI1Type(), qOnTrue ? 0 : 1);
-  HeldRead result;
-  result.held = comb::XorOp::create(b, loc, found.getCond(), flip);
   // The address cone again, q in place of the mux.
   IRMapping mapping;
   mapping.map(found.getResult(),
@@ -5603,8 +5983,7 @@ static HeldRead heldReadCondition(seq::FirMemReadOp read) {
     b.clone(*op, mapping);
     return mapping.lookup(value);
   };
-  result.row = rebuild(read.getAddress());
-  return result;
+  return rebuild(read.getAddress());
 }
 
 /// Sets an operation's Vivado ram_style, replacing any it has.
@@ -5676,6 +6055,576 @@ StaticFolder::StorageRule *StaticFolder::storageFor(const Class &cls,
   return best;
 }
 
+/// Staged evaluation (`stage-levels`): cuts the target logic of a copy (the
+/// model's ops spliced into `body`, before its state is replaced) into
+/// `cls.stages + 1` segments by stage registers, so that no segment spans
+/// more than about `stageLevels` estimated levels. Each op goes to the stage
+/// its depth from the state and inputs falls in; an operand from an earlier
+/// stage is taken through the stage registers between. The state pass's
+/// writes (registers' next values, memories' writes and registered reads, the
+/// copy's outputs, `held`'s operands) take the last stage's values.
+///
+/// The stage registers step with the positions (`live1`, a host cycle before
+/// the copy's `now`: whether the position then is one, not idle), so that an
+/// evaluation read at a position reaches its state pass `cls.stages`
+/// positions on, with bubbles or idle host cycles between as anywhere.
+/// A register's next value is split into its write enable and data first
+/// (peelHolds) and its hold left at the write, so that the old value need
+/// not cross the stages: a store's write is enabled, a kept register holds
+/// its own value until its state pass. With `keepOld` (a dense page word,
+/// which writes the old value back) the whole next value crosses them.
+/// A combinational read at stage k reads the instance the stage holds:
+/// `readInst` maps each to `rinst` (the evaluated instance at its read)
+/// through k stage registers.
+LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
+                                       Operation *held, Value hostClock,
+                                       Value live1, Value pre1, Value rinst,
+                                       bool keepOld,
+                                       DenseMap<Operation *, Value> &readInst) {
+  unsigned stages = cls.stages;
+  ImplicitLocOpBuilder b(cls.model.getLoc(), body, body->end());
+
+  // Registers: each replaced by one whose next value is set below, from its
+  // write enable and data at the last stage.
+  struct RegWrite {
+    seq::FirRegOp reg;
+    Backedge next;
+    Value enable, data;
+    bool holds = false;
+  };
+  BackedgeBuilder edges(b, cls.model.getLoc());
+  SmallVector<RegWrite> writes;
+  SmallVector<seq::FirRegOp> regs;
+  for (auto &op : *body)
+    if (auto reg = dyn_cast<seq::FirRegOp>(op))
+      regs.push_back(reg);
+  for (auto reg : regs) {
+    b.setLoc(reg.getLoc());
+    Value next = reg.getNext();
+    if (reg.getReset())
+      next = comb::MuxOp::create(b, reg.getReset(), reg.getResetValue(), next);
+    RegWrite write;
+    if (keepOld) {
+      write.data = next;
+    } else {
+      auto peeled = foldsim::peelHolds(b, next, reg.getResult());
+      write.holds = peeled.holds;
+      write.enable = peeled.enable;
+      write.data = peeled.holds ? Value() : peeled.data ? peeled.data : next;
+    }
+    write.next = edges.get(reg.getType());
+    write.reg = seq::FirRegOp::create(b, write.next, reg.getClk(),
+                                      reg.getNameAttr());
+    reg.getResult().replaceAllUsesWith(write.reg.getResult());
+    reg.erase();
+    writes.push_back(write);
+  }
+  // The registers' old next values, now dead; the writes' values held as
+  // uses meanwhile (a value of the old next value may have had the register
+  // as its only user).
+  SmallVector<Value> kept;
+  for (auto &write : writes) {
+    if (write.enable)
+      kept.push_back(write.enable);
+    if (write.data)
+      kept.push_back(write.data);
+  }
+  auto *keeper = UnrealizedConversionCastOp::create(b, TypeRange{}, kept)
+                     .getOperation();
+  for (bool erased = true; erased;) {
+    erased = false;
+    for (auto &op : llvm::make_early_inc_range(llvm::reverse(*body)))
+      if (&op != held && &op != keeper &&
+          (isa<comb::CombDialect>(op.getDialect()) ||
+           isa<hw::ConstantOp, hw::AggregateConstantOp, hw::BitcastOp,
+               hw::ArrayCreateOp, hw::ArrayGetOp, hw::ArraySliceOp,
+               hw::ArrayConcatOp, hw::ArrayInjectOp, hw::StructCreateOp,
+               hw::StructExtractOp, hw::StructInjectOp, hw::StructExplodeOp,
+               seq::FirMemReadOp>(op)) &&
+          isOpTriviallyDead(&op)) {
+        op.erase();
+        erased = true;
+      }
+  }
+  {
+    unsigned k = 0;
+    for (auto &write : writes) {
+      if (write.enable)
+        write.enable = keeper->getOperand(k++);
+      if (write.data)
+        write.data = keeper->getOperand(k++);
+    }
+    keeper->erase();
+  }
+
+  // Multicycle: no stage registers. The logic's leaves (the state, the
+  // inputs, registered reads' data) are taken into capture registers at the
+  // read position (`live1`: cap, a host cycle ahead), the writes' values
+  // (registers' enables and data, memory ports, outputs) into end registers
+  // at the position before the state pass (`pre1`), which writes from them.
+  // Between the two the logic has the multicycle span, and the schedule
+  // takes no other read of the copy in it (its state passes that far apart).
+  if (cls.multicycle) {
+    auto isConstant = [](Value value) {
+      auto *op = value.getDefiningOp();
+      return op && isa<hw::ConstantOp, hw::AggregateConstantOp>(op);
+    };
+    DenseSet<Operation *> logic;
+    SmallVector<Operation *> ops;
+    for (auto &op : *body) {
+      if (&op == held || op.getNumResults() == 0 ||
+          isa<seq::FirRegOp, seq::CompRegClockEnabledOp, seq::FirMemOp,
+              seq::FirMemReadOp, hw::ConstantOp, hw::AggregateConstantOp,
+              UnrealizedConversionCastOp, hw::InstanceOp>(op))
+        continue;
+      logic.insert(&op);
+      ops.push_back(&op);
+    }
+    std::string prefix = "fsmc_" + cls.name + "__";
+    Value one = hw::ConstantOp::create(b, b.getI1Type(), 1);
+    // The enables, a copy per 512 registers.
+    struct Enable {
+      Value ahead, now;
+      unsigned uses = 512, made = 0;
+      const char *name;
+    } capEn{live1, Value(), 512, 0, "cap0_"}, endEn{pre1, Value(), 512, 0, "pre0_"};
+    auto enableOf = [&](Enable &en) {
+      if (en.uses == 512) {
+        en.now = seq::CompRegClockEnabledOp::create(
+            b, b.getI1Type(), en.ahead, hostClock, one,
+            b.getStringAttr(Twine(en.name) + Twine(en.made++)), Value(), Value(),
+            Value(), hw::InnerSymAttr{});
+        en.uses = 0;
+      }
+      ++en.uses;
+      return en.now;
+    };
+    unsigned caps = 0, ends = 0;
+    uint64_t capBits = 0, endBits = 0;
+    // DONT_TOUCH: the timing constraints name them, so synthesis must not
+    // retime, merge or absorb them (into a DSP's or ultra RAM's registers).
+    auto dontTouch = sv::SVAttributeAttr::get(b.getContext(), "DONT_TOUCH",
+                                              R"("true")",
+                                              /*emitAsComment=*/false);
+    auto take = [&](Value value, Enable &en, const Twine &name) -> Value {
+      Value bits = asBits(b, value);
+      auto regOp = seq::CompRegClockEnabledOp::create(
+          b, bits.getType(), bits, hostClock, enableOf(en), b.getStringAttr(name),
+          Value(), Value(), Value(), hw::InnerSymAttr{});
+      sv::addSVAttributes(regOp, {dontTouch});
+      Value reg = regOp;
+      if (reg.getType() != value.getType())
+        reg = b.createOrFold<hw::BitcastOp>(value.getType(), reg);
+      return reg;
+    };
+    DenseMap<Value, Value> captured, ended;
+    auto capture = [&](Value value) -> Value {
+      if (isConstant(value) || logic.contains(value.getDefiningOp()))
+        return value;
+      Value &known = captured[value];
+      if (!known) {
+        known = take(value, capEn, prefix + "cap" + Twine(caps++));
+        capBits += std::max<int64_t>(1, hw::getBitWidth(value.getType()));
+      }
+      return known;
+    };
+    auto ending = [&](Value value) -> Value {
+      if (!value || isConstant(value))
+        return value;
+      Value &known = ended[value];
+      if (!known) {
+        known = take(capture(value), endEn, prefix + "end" + Twine(ends++));
+        endBits += std::max<int64_t>(1, hw::getBitWidth(value.getType()));
+      }
+      return known;
+    };
+    // The logic reads the captures.
+    for (auto *op : ops)
+      for (auto &operand : op->getOpOperands())
+        if (statePort(operand.get()))
+          if (Value at = capture(operand.get()); at != operand.get())
+            operand.set(at);
+    // The writes, from the end registers.
+    for (auto &write : writes) {
+      b.setLoc(write.reg.getLoc());
+      if (write.holds) {
+        write.next.setValue(write.reg.getResult());
+        continue;
+      }
+      Value data = ending(write.data);
+      write.next.setValue(
+          write.enable ? Value(comb::MuxOp::create(b, ending(write.enable), data,
+                                                   write.reg.getResult()))
+                       : data);
+    }
+    for (auto &op : *body) {
+      bool sink = &op == held || isa<seq::FirMemWriteOp>(op);
+      if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+        auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+        sink = memory && memory.getReadLatency() > 0;
+      }
+      if (!sink)
+        continue;
+      for (auto &operand : op.getOpOperands())
+        if (statePort(operand.get()))
+          if (Value at = ending(operand.get()); at != operand.get())
+            operand.set(at);
+    }
+    // The schedule's side: the copy's state passes, modulo the frame, at
+    // least the span apart (no capture before the end registers are taken),
+    // and the reads the span and a position before them.
+    SmallVector<int> passes;
+    for (int s : cls.slot[kState])
+      passes.push_back(s % int(ii));
+    llvm::sort(passes);
+    for (unsigned k = 0; k < passes.size(); ++k) {
+      int gap = k + 1 < passes.size() ? passes[k + 1] - passes[k]
+                                      : passes[0] + int(ii) - passes[k];
+      if (passes.size() > 1 && gap < int(cls.multicycle))
+        return cls.model.emitError("multicycle: ")
+               << cls.name << "'s state passes " << gap
+               << " positions apart, under its span " << cls.multicycle;
+    }
+    if (int(ii) < int(cls.multicycle) * int(passes.size()))
+      return cls.model.emitError("multicycle: a frame of ")
+             << ii << " under " << cls.name << "'s evaluations";
+    // In simulation, the timing the constraints assume, checked on every
+    // run: no capture in an open evaluation (but at its end registers'
+    // host cycle), and from a capture to its end registers at least the span
+    // in host cycles.
+    {
+      auto i1 = b.getI1Type();
+      unsigned width = llvm::Log2_32_Ceil(cls.multicycle + 2);
+      auto cntType = b.getIntegerType(width);
+      auto top = cls.model->getParentOfType<ModuleOp>();
+      if (!top.lookupSymbol<sv::MacroDeclOp>("SYNTHESIS")) {
+        OpBuilder tb(top.getBody(), top.getBody()->begin());
+        sv::MacroDeclOp::create(tb, cls.model.getLoc(), "SYNTHESIS");
+      }
+      Value capNow = seq::CompRegClockEnabledOp::create(
+          b, i1, live1, hostClock, one, b.getStringAttr("mc_check_cap"), Value(),
+          Value(), Value(), hw::InnerSymAttr{});
+      Value preNow = seq::CompRegClockEnabledOp::create(
+          b, i1, pre1, hostClock, one, b.getStringAttr("mc_check_pre"), Value(),
+          Value(), Value(), hw::InnerSymAttr{});
+      BackedgeBuilder checks(b, cls.model.getLoc());
+      auto seenNext = checks.get(i1), pendingNext = checks.get(i1),
+           countNext = checks.get(cntType);
+      Value seen = seq::CompRegClockEnabledOp::create(
+          b, i1, seenNext, hostClock, one, b.getStringAttr("mc_check_seen"),
+          Value(), Value(), Value(), hw::InnerSymAttr{});
+      Value pending = seq::CompRegClockEnabledOp::create(
+          b, i1, pendingNext, hostClock, one, b.getStringAttr("mc_check_pending"),
+          Value(), Value(), Value(), hw::InnerSymAttr{});
+      Value count = seq::CompRegClockEnabledOp::create(
+          b, cntType, countNext, hostClock, one, b.getStringAttr("mc_check_count"),
+          Value(), Value(), Value(), hw::InnerSymAttr{});
+      Value cntMax = hw::ConstantOp::create(b, cntType, cls.multicycle);
+      Value notPre = comb::XorOp::create(b, preNow, one);
+      seenNext.setValue(comb::OrOp::create(b, seen, capNow));
+      pendingNext.setValue(comb::OrOp::create(
+          b, capNow, comb::AndOp::create(b, pending, notPre)));
+      Value full = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, count, cntMax);
+      Value inc = comb::AddOp::create(b, count, hw::ConstantOp::create(b, cntType, 1));
+      countNext.setValue(comb::MuxOp::create(
+          b, capNow, hw::ConstantOp::create(b, cntType, 0),
+          comb::MuxOp::create(b, full, count, inc)));
+      Value early = comb::AndOp::create(
+          b, capNow, comb::AndOp::create(b, pending, notPre));
+      Value short_ = comb::ICmpOp::create(
+          b, comb::ICmpPredicate::ult, count,
+          hw::ConstantOp::create(b, cntType, cls.multicycle - 1));
+      Value orphan = comb::XorOp::create(b, pending, one);
+      Value late = comb::AndOp::create(
+          b, comb::AndOp::create(b, preNow, seen),
+          comb::OrOp::create(b, orphan, short_));
+      Value clock = seq::FromClockOp::create(b, hostClock);
+      std::string what = ("foldsim: multicycle " + cls.name +
+                          ": an evaluation's capture and end registers under " +
+                          Twine(cls.multicycle) + " host cycles apart, or "
+                          "another capture between")
+                             .str();
+      // Off in synthesis, unless FOLDSIM_CHECKS is defined (a gate that
+      // simulates the synthesis view, -DSYNTHESIS, keeps it).
+      if (!top.lookupSymbol<sv::MacroDeclOp>("FOLDSIM_CHECKS")) {
+        OpBuilder tb(top.getBody(), top.getBody()->begin());
+        sv::MacroDeclOp::create(tb, cls.model.getLoc(), "FOLDSIM_CHECKS");
+      }
+      Value violation = comb::OrOp::create(b, early, late);
+      auto monitor = [&] {
+        sv::AlwaysOp::create(b, ArrayRef{sv::EventControl::AtPosEdge},
+                             ArrayRef{clock}, [&] {
+          sv::IfOp::create(b, violation, [&] {
+            sv::FatalProceduralOp::create(b, 1, b.getStringAttr(what));
+          });
+        });
+      };
+      sv::IfDefOp::create(b, "FOLDSIM_CHECKS", monitor, [&] {
+        sv::IfDefOp::create(b, "SYNTHESIS", [] {}, monitor);
+      });
+    }
+    cls.multicycleCaps = capBits;
+    cls.multicycleEnds = endBits;
+    llvm::errs() << "foldsim-fold-static: " << cls.name << " multicycle "
+                 << cls.multicycle << ": " << capBits << " capture bits ("
+                 << caps << " registers), " << endBits << " end bits (" << ends
+                 << " registers)\n";
+    return success();
+  }
+
+  // Each value's stage, soonest (stageOf). The writes are at the last stage;
+  // where the cone here (its enables and data split from the registers' next
+  // values) needs more stages than the schedule gave, the levels of a stage
+  // grow until it fits.
+  SmallVector<Value> sinks;
+  for (auto &write : writes) {
+    if (write.enable)
+      sinks.push_back(write.enable);
+    if (write.data)
+      sinks.push_back(write.data);
+  }
+  for (auto &op : *body) {
+    auto read = dyn_cast<seq::FirMemReadOp>(op);
+    auto memory = read ? read.getMemory().getDefiningOp<seq::FirMemOp>()
+                       : seq::FirMemOp();
+    if (&op == held || (read && memory && memory.getReadLatency() > 0) ||
+        isa<seq::FirMemWriteOp>(op))
+      for (auto operand : op.getOperands())
+        if (statePort(operand))
+          sinks.push_back(operand);
+  }
+  DenseMap<Value, Staging> memo;
+  int limit = std::max<int>(2, 2 * stageLevels);
+  for (;; ++limit) {
+    memo.clear();
+    int last = 0;
+    for (auto sink : sinks)
+      last = std::max(last, sinkStage(sink, 0, limit, memo));
+    if (last <= int(stages))
+      break;
+  }
+  for (auto &op : *body)
+    for (auto result : op.getResults())
+      if (!memo.count(result))
+        stageOf(result, limit, memo);
+
+  // The logic's ops, and the same cut latest first (each op in the latest
+  // stage its readers allow, the writes at the last): of the two, the one
+  // whose values cross fewer stage register bits.
+  auto isNode = [&](Operation *op) {
+    if (!op || op->getBlock() != body || op == held || op->getNumResults() == 0 ||
+        isa<seq::FirRegOp, seq::CompRegClockEnabledOp, seq::FirMemOp, hw::ConstantOp,
+            hw::AggregateConstantOp, UnrealizedConversionCastOp>(op))
+      return false;
+    if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+      auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+      return !(memory && memory.getReadLatency() > 0);
+    }
+    return true;
+  };
+  DenseSet<Value> sinkSet(sinks.begin(), sinks.end());
+  // Readers before their operands' producers: a depth-first post order on
+  // the operands, reversed.
+  SmallVector<Operation *> post;
+  {
+    DenseSet<Operation *> seen;
+    for (auto &root : *body) {
+      if (!isNode(&root) || seen.contains(&root))
+        continue;
+      SmallVector<std::pair<Operation *, unsigned>> stack{{&root, 0}};
+      seen.insert(&root);
+      while (!stack.empty()) {
+        auto &[op, next] = stack.back();
+        if (next < op->getNumOperands()) {
+          auto *def = op->getOperand(next++).getDefiningOp();
+          if (isNode(def) && seen.insert(def).second)
+            stack.push_back({def, 0});
+          continue;
+        }
+        post.push_back(op);
+        stack.pop_back();
+      }
+    }
+  }
+  DenseMap<Operation *, Staging> late;
+  int lateLast = 0;
+  for (auto *op : llvm::reverse(post)) {
+    int levels = 0;
+    if (auto read = dyn_cast<seq::FirMemReadOp>(op))
+      levels = 2;
+    else
+      levels = stageOpLevels(op);
+    int stage = 0, at = 0;
+    bool used = false;
+    for (auto result : op->getResults()) {
+      if (sinkSet.contains(result))
+        used = true;
+      for (auto *user : result.getUsers())
+        if (auto it = late.find(user); it != late.end()) {
+          used = true;
+          stage = std::max(stage, it->second.stage);
+        }
+    }
+    for (auto result : op->getResults())
+      for (auto *user : result.getUsers())
+        if (auto it = late.find(user); it != late.end() && it->second.stage == stage)
+          at = std::max(at, it->second.levels);
+    (void)used;
+    if (at > 0 && at + levels > limit) {
+      ++stage;
+      at = 0;
+    }
+    late[op] = {stage, at + levels};
+    lateLast = std::max(lateLast, stage);
+  }
+  // Stage register bits: each value from its stage to its latest reader's
+  // (a write's at the last).
+  auto crossing = [&](function_ref<int(Value)> at) {
+    uint64_t bits = 0;
+    DenseSet<Value> counted;
+    auto count = [&](Value value, int reader) {
+      int from = at(value);
+      if (from < 0 || reader <= from)
+        return;
+      (void)counted;
+      bits += uint64_t(std::max<int64_t>(1, hw::getBitWidth(value.getType()))) *
+              uint64_t(reader - from);
+    };
+    // The latest reader of each value.
+    DenseMap<Value, int> latest;
+    for (auto *op : post)
+      for (auto operand : op->getOperands())
+        if (statePort(operand))
+          latest[operand] = std::max(latest.lookup(operand), at(op->getResult(0)));
+    for (auto sink : sinks)
+      latest[sink] = int(stages);
+    for (auto [value, reader] : latest)
+      count(value, reader);
+    return bits;
+  };
+  auto constantAt = [](Value value) {
+    auto *op = value.getDefiningOp();
+    return op && isa<hw::ConstantOp, hw::AggregateConstantOp>(op);
+  };
+  auto soonest = [&](Value value) -> int {
+    if (constantAt(value))
+      return -1;
+    return std::min<int>(memo.lookup(value).stage, stages);
+  };
+  auto latest = [&](Value value) -> int {
+    if (constantAt(value))
+      return -1;
+    auto it = late.find(value.getDefiningOp());
+    if (it == late.end())
+      return 0;  // the state, the inputs, registered reads
+    return int(stages) - it->second.stage;
+  };
+  bool useLate = false;
+  if (lateLast <= int(stages)) {
+    uint64_t early = crossing(soonest), lateBits = crossing(latest);
+    useLate = lateBits < early;
+    // (FOLDSIM_STAGE_CUT=soonest|latest forces one, for the tests.)
+    if (const char *force = getenv("FOLDSIM_STAGE_CUT"))
+      useLate = StringRef(force) == "latest";
+    llvm::errs() << "foldsim-fold-static: " << cls.name << " staged: " << stages
+                 << " stages, soonest " << early << " stage register bits, latest "
+                 << lateBits << (useLate ? " (latest)" : " (soonest)") << "\n";
+  }
+  auto stageOf = [&](Value value) -> int {
+    return useLate ? latest(value) : soonest(value);
+  };
+
+  // A value at a later stage: through the stage registers, as bits. The
+  // registers' enable a copy per 512 of them.
+  DenseMap<std::pair<Value, unsigned>, Value> delays;
+  Value one = hw::ConstantOp::create(b, b.getI1Type(), 1);
+  Value live;
+  unsigned onLive = 0, made = 0;
+  std::function<Value(Value, unsigned)> delayed = [&](Value value,
+                                                      unsigned k) -> Value {
+    int from = stageOf(value);
+    if (from < 0 || from >= int(k))
+      return value;
+    if (Value known = delays.lookup({value, k}))
+      return known;
+    Value before = delayed(value, k - 1);
+    if (!live || onLive == 512) {
+      live = seq::CompRegClockEnabledOp::create(
+          b, live1.getType(), live1, hostClock, one,
+          b.getStringAttr("stage_live" + Twine(made / 512)), Value(), Value(),
+          Value(), hw::InnerSymAttr{});
+      onLive = 0;
+    }
+    ++onLive;
+    ++made;
+    Value bits = asBits(b, before);
+    Value staged = seq::CompRegClockEnabledOp::create(
+        b, bits.getType(), bits, hostClock, live,
+        b.getStringAttr("stage" + Twine(k)), Value(), Value(), Value(),
+        hw::InnerSymAttr{});
+    if (staged.getType() != value.getType())
+      staged = b.createOrFold<hw::BitcastOp>(value.getType(), staged);
+    delays[{value, k}] = staged;
+    return staged;
+  };
+
+  // The logic: each op's operands from its stage.
+  SmallVector<Operation *> nodes;
+  for (auto &op : *body) {
+    // (The copy's own control registers, made before the cut, are not the
+    // target's logic.)
+    if (&op == held || op.getNumResults() == 0 ||
+        isa<seq::FirRegOp, seq::CompRegClockEnabledOp, seq::FirMemOp,
+            hw::ConstantOp, hw::AggregateConstantOp>(op))
+      continue;
+    if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+      auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+      if (memory && memory.getReadLatency() > 0)
+        continue;
+    }
+    // The registers' next values, placeholders until set below.
+    if (isa<UnrealizedConversionCastOp>(op))
+      continue;
+    nodes.push_back(&op);
+  }
+  for (auto *op : nodes) {
+    unsigned k = std::max(0, stageOf(op->getResult(0)));
+    if (isa<seq::FirMemReadOp>(op) && rinst)
+      readInst[op] = delayed(rinst, k);
+    for (auto &operand : op->getOpOperands())
+      if (statePort(operand.get()))
+        if (Value at = delayed(operand.get(), k); at != operand.get())
+          operand.set(at);
+  }
+  // The writes: at the last stage.
+  for (auto &write : writes) {
+    b.setLoc(write.reg.getLoc());
+    if (write.holds) {
+      write.next.setValue(write.reg.getResult());
+      continue;
+    }
+    Value data = delayed(write.data, stages);
+    write.next.setValue(
+        write.enable ? Value(comb::MuxOp::create(b, delayed(write.enable, stages),
+                                                 data, write.reg.getResult()))
+                     : data);
+  }
+  for (auto &op : *body) {
+    bool sink = &op == held || isa<seq::FirMemWriteOp>(op);
+    if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+      auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+      sink = memory && memory.getReadLatency() > 0;
+    }
+    if (!sink)
+      continue;
+    for (auto &operand : op.getOpOperands())
+      if (statePort(operand.get()))
+        if (Value at = delayed(operand.get(), stages); at != operand.get())
+          operand.set(at);
+  }
+  return success();
+}
+
 LogicalResult StaticFolder::buildCopy(Class &cls) {
   auto model = cls.model;
   auto *context = model.getContext();
@@ -5687,7 +6636,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   unsigned entries = 1u << idxWidth;
   // Registers of so few instances, passed in a ring order, are a ring of
   // flops: no store, no read select and no bypass.
-  bool ring = !cls.page && threads > 1 && threads <= registerStateEntries &&
+  bool ring = !cls.stages && !cls.page && threads > 1 &&
+              threads <= registerStateEntries &&
               ringOrder(cls, ii);
   // A per-instance store this shallow is flops: Vivado would otherwise spend
   // a distributed RAM LUT's whole depth on a few words, and with two entries
@@ -5881,10 +6831,11 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     }
     // The lanes share the first's read address (sameRam), whose row the
     // requests carry.
-    if (skipHeldReads) {
-      auto held = heldReadCondition(portsOf(memory).first);
-      vm.held = held.held;
-      vm.heldRow = held.row;
+    // The skip's request leaves a host cycle later: the pending bit it sets
+    // must still be there for the decision on the instance's next evaluation.
+    if (skipHeldReads && cls.stateGap >= decisionLead() + 2) {
+      vm.heldRow = heldReadRow(portsOf(memory).first);
+      vm.delayed = bool(vm.heldRow);
     }
     for (auto lane : vm.lanes)
       virtualOf[lane] = cls.virtualMemories.size();
@@ -5900,7 +6851,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   std::pair<unsigned, uint64_t> rowMemories{0, 0};
   if (cls.page) {
     readyRegisters(cls, readyRegs);
-    if ((pageMemoryBits || !pageRows.empty()) && threads > 1)
+    if ((pageMemoryBits || !pageRows.empty()) && threads > 1 && !cls.stages)
       rowMemories = memoriesAsRows(cls, readyRegs, virtualOf);
   }
 
@@ -5950,6 +6901,24 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     addPort("ppage3", IntegerType::get(context, pageBits), true);
     addPort("pwrite3", IntegerType::get(context, 1), true);
     addPort("pwpage3", IntegerType::get(context, pageBits), true);
+  }
+  // Staged: the instance whose evaluation reads at the position three host
+  // cycles ahead (its state pass the stages on), and whether that position
+  // is one (not idle): the stages step with the positions.
+  // Multicycle: whether the position three host cycles ahead is a read
+  // (`cap3`, in place of `live3`) or the one before a state pass (`pre3`).
+  unsigned rinstArg = 0, liveArg = 0, preArg = 0;
+  if (cls.stages) {
+    if (threads > 1) {
+      rinstArg = numIn;
+      addPort("rinst3", IntegerType::get(context, idxWidth), true);
+    }
+    liveArg = numIn;
+    addPort(cls.multicycle ? "cap3" : "live3", IntegerType::get(context, 1), true);
+    if (cls.multicycle) {
+      preArg = numIn;
+      addPort("pre3", IntegerType::get(context, 1), true);
+    }
   }
   SmallVector<unsigned> inputArg(cls.inputNames.size(), 0);
   for (auto [i, name] : llvm::enumerate(cls.inputNames)) {
@@ -6011,16 +6980,54 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       offChip3.push_back(body->getArgument((fetches ? 5 : 3) + k));
   unsigned pages = cls.page ? unsigned(llvm::PowerOf2Ceil(cls.page)) : 0;
   unsigned pageWidth = pages > 1 ? llvm::Log2_32_Ceil(pages) : 0;
-  DenseMap<Value, Value> replaced;
+  // The copy's outputs are held as the operands of placeholder ops until its
+  // hw.output is built: registers, memory reads and paged registers are
+  // replaced and erased below, and only a use follows a replacement (a
+  // Value kept aside, or a map keyed by it, outlives the op it names).
+  auto hold = [&](ValueRange values) -> Operation * {
+    auto builder = OpBuilder::atBlockEnd(body);
+    return UnrealizedConversionCastOp::create(builder, model.getLoc(),
+                                              TypeRange{}, values);
+  };
+  auto release = [](Operation *held, SmallVectorImpl<Value> &into) {
+    into.append(held->operand_begin(), held->operand_end());
+    held->erase();
+  };
+  Operation *heldResults = hold(results);
   for (auto [i, arg] : llvm::enumerate(modelBody->getArguments())) {
     Value to = int(i) == cls.clockInput ? Value(hostClock)
                                         : Value(body->getArgument(inputArg[i]));
     arg.replaceAllUsesWith(to);
-    replaced[arg] = to;
   }
   ImplicitLocOpBuilder b(model.getLoc(), body, body->end());
   auto i1 = b.getI1Type();
   auto one = [&]() { return hw::ConstantOp::create(b, i1, 1); };
+
+  // Staged evaluation: the target logic cut into stages; its reads (the
+  // state's read registers, the inputs, combinational reads) at the read
+  // side's instance, `rinst3` on, its writes at the state pass's.
+  Value readInst3 = inst3;
+  DenseMap<Operation *, Value> readInst;
+  if (cls.stages) {
+    auto chain = [&](Value value, unsigned regs, const Twine &name) {
+      for (unsigned k = 0; k < regs; ++k)
+        value = seq::CompRegClockEnabledOp::create(
+            b, value.getType(), value, hostClock, one(),
+            b.getStringAttr(name + Twine(regs - 1 - k)), Value(), Value(),
+            Value(), hw::InnerSymAttr{});
+      return value;
+    };
+    if (threads > 1)
+      readInst3 = body->getArgument(rinstArg);
+    Value live1 = chain(body->getArgument(liveArg), 2,
+                        cls.multicycle ? "cap" : "live");
+    Value pre1 = cls.multicycle ? chain(body->getArgument(preArg), 2, "pre")
+                                : Value();
+    Value rinst = threads > 1 ? chain(readInst3, 3, "rinst") : Value();
+    if (failed(stageLogic(cls, body, heldResults, hostClock, live1, pre1, rinst,
+                          /*keepOld=*/cls.page && !pageMasks, readInst)))
+      return failure();
+  }
 
   // Regions of state, in name order so that a region is a submodule's: each
   // its own copy of the slot's controls, from the copy's, so that no control
@@ -6029,7 +7036,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // The controls two host cycles ahead, a copy for each group of
   // `kRegionsPerGroup` regions, so that the ports drive only the groups.
   struct Ahead {
-    Value state2, inst2;
+    Value state2, inst2, winst2;
     /// Paged: a fetch two host cycles ahead, and the page read address,
     /// {instance, page}: the fetched instance's page 0 two host cycles after
     /// the fetch's `fetch3`, its next pages one a host cycle.
@@ -6043,9 +7050,16 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       std::string prefix = ("ahead" + Twine(aheads.size())).str();
       ahead.state2 = keep(seq::FirRegOp::create(
           b, state3, hostClock, b.getStringAttr(prefix + "_state2")));
-      if (threads > 1)
+      if (threads > 1) {
         ahead.inst2 = keep(seq::FirRegOp::create(
-            b, inst3, hostClock, b.getStringAttr(prefix + "_inst2")));
+            b, readInst3, hostClock, b.getStringAttr(prefix + "_inst2")));
+        // Staged: the state pass's instance apart from the read's.
+        ahead.winst2 = readInst3 == inst3
+                           ? ahead.inst2
+                           : keep(seq::FirRegOp::create(
+                                 b, inst3, hostClock,
+                                 b.getStringAttr(prefix + "_winst2")));
+      }
       if (fetches) {
         ahead.fetch2 = keep(seq::FirRegOp::create(
             b, fetch3, hostClock, b.getStringAttr(prefix + "_fetch2")));
@@ -6100,7 +7114,13 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         region.inst1 = keep(seq::FirRegOp::create(
             b, ahead.inst2, hostClock, b.getStringAttr(prefix + "_inst1")));
         region.inst = keep(seq::FirRegOp::create(
-            b, region.inst1, hostClock, b.getStringAttr(prefix + "_inst")));
+            b,
+            ahead.winst2 == ahead.inst2
+                ? region.inst1
+                : Value(keep(seq::FirRegOp::create(
+                      b, ahead.winst2, hostClock,
+                      b.getStringAttr(prefix + "_winst1")))),
+            hostClock, b.getStringAttr(prefix + "_inst")));
       }
       regions.push_back(region);
       regionUsed = 0;
@@ -6113,7 +7133,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // instance's read data from its responses, kept like a registered read's
   // (no bypass: the state gap covers the buffer), and the instances whose
   // read is pending, set as it is issued and cleared as its response comes.
-  SmallVector<SmallVector<Value>> virtualPorts(cls.virtualMemories.size());
+  SmallVector<Operation *> virtualPorts(cls.virtualMemories.size(), nullptr);
   auto buildVirtualMemory = [&](seq::FirMemOp memory,
                                 unsigned k) -> SmallVector<Value> {
     auto &vm = cls.virtualMemories[k];
@@ -6237,7 +7257,6 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         Value slice = b.createOrFold<comb::ExtractOp>(intType(width), data, offset);
         slice = b.createOrFold<hw::BitcastOp>(read.getData().getType(), slice);
         read.getData().replaceAllUsesWith(slice);
-        replaced[read.getData()] = slice;
         read.erase();
       }
       for (auto lane : llvm::drop_begin(vm.lanes))
@@ -6278,7 +7297,6 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       Value data = readBuffer();
       data = b.createOrFold<hw::BitcastOp>(read.getData().getType(), data);
       read.getData().replaceAllUsesWith(data);
-      replaced[read.getData()] = data;
       read.erase();
     }
     memory.erase();
@@ -6286,50 +7304,73 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       return comb::ShlOp::create(b, hw::ConstantOp::create(b, intType(entries), 1),
                                  widen(index, entries));
     };
-    if (vm.held) {
-      // A held read (--vmem-skip-held-reads): its row is the instance's last
-      // read's, so its read data is still the row's unless the row was
-      // written since. `fresh` has a bit per instance: its read data is the
-      // row as its next read would see it, but for that read's own
-      // same-cycle write. Set at a state pass that issued (or skipped) its
-      // read, unless (read first) the same pass writes the row; cleared at
-      // a pass with the read's enable low; all clear after a reset. A held
-      // read of a fresh instance is skipped, unless (write first) the same
-      // pass writes its row.
+    if (vm.delayed) {
+      // A held read (--vmem-skip-held-reads). The requests leave a host cycle
+      // after the state pass, from registers, and the skip is decided there
+      // from registers alone: no request valid waits for the target's paths
+      // to the read's enable or the write's address.
+      // `fresh` has a bit per instance: its read data is the row its last read
+      // took, as a read of that row would see it now. Set at a state pass that
+      // issued (or skipped) its read, unless (read first) the same pass writes
+      // the row; cleared at a pass with the read's enable low; all clear after
+      // a reset. A read of a fresh instance's last row (the held row: the
+      // read's address register, so whenever its enable is low) is skipped,
+      // unless (write first) the same pass writes that row.
+      Value hostReset = body->getArgument(cls.resetInput);
+      auto stage = [&](Value value, StringRef suffix, bool reset) -> Value {
+        if (isa_and_nonnull<hw::ConstantOp>(value.getDefiningOp()))
+          return value;
+        auto name = b.getStringAttr(vm.name + "_q" + suffix);
+        if (!reset)
+          return seq::FirRegOp::create(b, value, hostClock, name);
+        return seq::FirRegOp::create(
+            b, value, hostClock, name, hostReset,
+            hw::ConstantOp::create(b, value.getType(), 0), hw::InnerSymAttr{},
+            /*isAsync=*/false, b.getIntegerAttr(value.getType(), 0));
+      };
+      Value stateQ = stage(region.state, "_state", true);
+      Value instQ = stage(inst, "_inst", false);
+      Value rdValidQ = stage(rdValid, "_rd_valid", true);
+      Value rdRowQ = stage(rdRow, "_rd_row", false);
+      Value heldRowQ = stage(widen(vm.heldRow, vm.rowWidth), "_held_row", false);
+      Value wrValidQ = stage(wrValid, "_wr_valid", true);
+      Value wrRowQ = stage(wrRow, "_wr_row", false);
+      Value wrDataQ = stage(wrData, "_wr_data", false);
+      Value wrMaskQ = stage(wrMask, "_wr_mask", false);
       Value ones = hw::ConstantOp::create(b, APInt::getAllOnes(entries));
       auto freshNext = edges.get(intType(entries));
       Value fresh = seq::FirRegOp::create(
           b, freshNext, hostClock, b.getStringAttr(vm.name + "_fresh"),
-          body->getArgument(cls.resetInput), zero(entries), hw::InnerSymAttr{},
+          hostReset, zero(entries), hw::InnerSymAttr{},
           /*isAsync=*/false, b.getIntegerAttr(intType(entries), 0));
       Value isFresh = b.createOrFold<comb::ExtractOp>(
-          intType(1), comb::ShrUOp::create(b, fresh, widen(inst, entries)), 0);
-      // Whether the pass writes the row it reads: against the held row for
-      // the skip (the read's row whenever it may skip; off the address's own
-      // path), against the read's row for a read-first instance's bit.
-      auto writes = [&](Value row) -> Value {
-        return comb::AndOp::create(
-            b, wrValid,
-            comb::ICmpOp::create(b, comb::ICmpPredicate::eq, wrRow, row));
-      };
-      Value skip = comb::AndOp::create(b, vm.held, isFresh);
+          intType(1), comb::ShrUOp::create(b, fresh, widen(instQ, entries)), 0);
+      // The pass writes the row it reads.
+      Value writesRow = comb::AndOp::create(
+          b, wrValidQ,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::eq, wrRowQ, rdRowQ));
+      Value notWrites = comb::XorOp::create(b, writesRow, one());
+      Value skip = comb::AndOp::create(
+          b, isFresh,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::eq, rdRowQ, heldRowQ));
       if (!vm.readFirst)
-        skip = comb::AndOp::create(
-            b, skip,
-            comb::XorOp::create(b, writes(widen(vm.heldRow, vm.rowWidth)), one()));
-      Value enabled = rdValid;
-      rdValid = comb::AndOp::create(b, rdValid,
-                                    comb::XorOp::create(b, skip, one()));
-      Value current =
-          vm.readFirst
-              ? Value(comb::AndOp::create(
-                    b, enabled, comb::XorOp::create(b, writes(rdRow), one())))
-              : enabled;
+        skip = comb::AndOp::create(b, skip, notWrites);
+      Value current = vm.readFirst
+                          ? Value(comb::AndOp::create(b, rdValidQ, notWrites))
+                          : rdValidQ;
       Value others = comb::AndOp::create(
-          b, fresh, comb::XorOp::create(b, bitOf(inst), ones));
+          b, fresh, comb::XorOp::create(b, bitOf(instQ), ones));
       Value updated = comb::OrOp::create(
-          b, others, comb::MuxOp::create(b, current, bitOf(inst), zero(entries)));
-      freshNext.setValue(comb::MuxOp::create(b, region.state, updated, fresh));
+          b, others, comb::MuxOp::create(b, current, bitOf(instQ), zero(entries)));
+      freshNext.setValue(comb::MuxOp::create(b, stateQ, updated, fresh));
+      rdValid = comb::AndOp::create(b, rdValidQ,
+                                    comb::XorOp::create(b, skip, one()));
+      inst = instQ;
+      rdRow = rdRowQ;
+      wrValid = wrValidQ;
+      wrRow = wrRowQ;
+      wrData = wrDataQ;
+      wrMask = wrMaskQ;
     }
     Value set = comb::MuxOp::create(b, rdValid, bitOf(inst), zero(entries));
     Value clear = comb::MuxOp::create(b, rspValid, bitOf(rspInst), zero(entries));
@@ -6380,7 +7421,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   SmallVector<PagedReg> pagedRegs;
   // Off chip, each page column's virtual memory and its outputs (requests
   // and pending reads), appended to the copy's ports once its body is built.
-  SmallVector<std::pair<unsigned, SmallVector<Value>>> pageRequests;
+  SmallVector<std::pair<unsigned, Operation *>> pageRequests;
   // With page masks, each enable's register, one per enable.
   DenseMap<std::pair<Value, unsigned>, Value> pagedEnableRegs;
   BackedgeBuilder pageEdges(b, model.getLoc());
@@ -6554,7 +7595,6 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         readNext.setValue(loaded);
       }
       reg.getResult().replaceAllUsesWith(value);
-      replaced[reg.getResult()] = value;
       reg.erase();
       continue;
     }
@@ -6564,7 +7604,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       auto &lanes = cls.virtualMemories[it->second].lanes;
       for (auto lane : lanes)
         laneDone.insert(lane);
-      virtualPorts[it->second] = buildVirtualMemory(lanes.front(), it->second);
+      virtualPorts[it->second] =
+          hold(buildVirtualMemory(lanes.front(), it->second));
       continue;
     }
     auto memType = memory.getType();
@@ -6594,14 +7635,18 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         folding->folds[it->second].threadedStore = threadedMemory;
     unsigned addrWidth = llvm::Log2_64_Ceil(threadedType.getDepth()) - idxWidth;
     // The instance in the low address bits.
-    auto addressOf = [&](Value addr) -> Value {
+    // Staged, a combinational read takes the instance of its stage.
+    auto addressOf = [&](Value addr, Operation *port = nullptr) -> Value {
+      Value inst = region.inst;
+      if (Value staged = port ? readInst.lookup(port) : Value())
+        inst = staged;
       if (!idxWidth)
         return addr;
       if (!addrWidth)
-        return region.inst;
+        return inst;
       Value low =
           b.createOrFold<comb::ExtractOp>(b.getIntegerType(addrWidth), addr, 0);
-      return b.createOrFold<comb::ConcatOp>(low, region.inst);
+      return b.createOrFold<comb::ConcatOp>(low, inst);
     };
     for (auto *user : llvm::make_early_inc_range(memory->getUsers())) {
       if (auto write = dyn_cast<seq::FirMemWriteOp>(user)) {
@@ -6618,7 +7663,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       Value data;
       if (memory.getReadLatency() == 0) {
         data = seq::FirMemReadOp::create(b, threadedMemory,
-                                         addressOf(read.getAddress()),
+                                         addressOf(read.getAddress(), read),
                                          hostClock, read.getEnable());
       } else {
         // A registered read on the state pass; its data, a host cycle later,
@@ -6683,7 +7728,6 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         }
       }
       read.getData().replaceAllUsesWith(data);
-      replaced[read.getData()] = data;
       read.erase();
     }
     memory.erase();
@@ -7108,7 +8152,6 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                               SmallVector<Value>(parts.rbegin(), parts.rend()));
       value = b.createOrFold<hw::BitcastOp>(Value(reg.value).getType(), value);
       reg.value.setValue(value);
-      replaced[reg.original] = value;
     }
     // Each column's write: page j's bits at its host cycle, and with masks
     // its bytes' enables. The page is chosen by its binary index (the write's
@@ -7179,7 +8222,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         }
         col.requests[6] = writeData;
         col.requests[7] = writeMask;
-        pageRequests.push_back({col.vm, col.requests});
+        pageRequests.push_back({col.vm, hold(col.requests)});
         continue;
       }
       // A column of one byte has a memory of mask width 1, which is no
@@ -7276,15 +8319,15 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   }
 
   SmallVector<Value> outputs;
-  for (auto value : results) {
-    auto it = replaced.find(value);
-    outputs.push_back(it == replaced.end() ? value : it->second);
-  }
-  for (auto &ports : virtualPorts)
-    outputs.append(ports.begin(), ports.end());
+  release(heldResults, outputs);
+  for (auto *held : virtualPorts)
+    if (held)
+      release(held, outputs);
   b.setInsertionPointToEnd(body);
   hw::OutputOp::create(b, outputs);
-  for (auto &[k, values] : pageRequests) {
+  for (auto &[k, held] : pageRequests) {
+    SmallVector<Value> values;
+    release(held, values);
     auto &vm = cls.virtualMemories[k];
     vm.firstOutput = copy.getNumOutputPorts();
     std::string name = ("vm" + Twine(k) + "_").str();
@@ -7299,6 +8342,91 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   }
   cls.copy = copy;
   model.erase();
+  if (cls.multicycle && failed(checkMulticycle(cls)))
+    return failure();
+  return success();
+}
+
+/// Logic between registers: what a multicycle path may pass through.
+static bool isPathLogic(Operation *op) {
+  return isa<comb::CombDialect>(op->getDialect()) ||
+         isa<hw::ConstantOp, hw::AggregateConstantOp, hw::BitcastOp,
+             hw::ArrayCreateOp, hw::ArrayGetOp, hw::ArraySliceOp,
+             hw::ArrayConcatOp, hw::ArrayInjectOp, hw::StructCreateOp,
+             hw::StructExtractOp, hw::StructInjectOp, hw::StructExplodeOp>(op);
+}
+
+LogicalResult StaticFolder::checkMulticycle(Class &cls) {
+  std::string prefix = "fsmc_" + cls.name + "__";
+  auto *body = cls.copy.getBodyBlock();
+  DenseSet<Operation *> caps, ends;
+  for (auto reg : body->getOps<seq::CompRegClockEnabledOp>()) {
+    StringRef name = reg.getName().value_or("");
+    if (!name.starts_with(prefix))
+      continue;
+    (name.substr(prefix.size()).starts_with("cap") ? caps : ends)
+        .insert(reg.getOperation());
+  }
+  // Forward: every path out of a capture register ends at an end
+  // register's data.
+  SmallVector<Value> work;
+  DenseSet<Operation *> seen;
+  for (auto *cap : caps)
+    work.push_back(cap->getResult(0));
+  while (!work.empty()) {
+    Value value = work.pop_back_val();
+    for (auto &use : value.getUses()) {
+      auto *user = use.getOwner();
+      if (auto reg = dyn_cast<seq::CompRegClockEnabledOp>(user);
+          reg && ends.contains(user) && use.get() == reg.getInput())
+        continue;
+      if (!isPathLogic(user))
+        return user->emitError("multicycle: a path from ")
+               << cls.name << "'s capture registers ends outside its end "
+                  "registers";
+      if (seen.insert(user).second)
+        for (auto result : user->getResults())
+          work.push_back(result);
+    }
+  }
+  // Backward: every path into an end register starts at a capture register
+  // or a constant.
+  seen.clear();
+  for (auto *end : ends)
+    work.push_back(cast<seq::CompRegClockEnabledOp>(end).getInput());
+  while (!work.empty()) {
+    Value value = work.pop_back_val();
+    auto *def = value.getDefiningOp();
+    if (def && caps.contains(def))
+      continue;
+    if (!def || !isPathLogic(def))
+      return cls.copy.emitError("multicycle: a path into ")
+             << cls.name << "'s end registers starts outside its capture "
+                "registers";
+    if (seen.insert(def).second)
+      for (auto operand : def->getOperands())
+        work.push_back(operand);
+  }
+  // And the enables: the capture registers' at the reads, the end
+  // registers' at the positions before the state passes, from the copy's
+  // ports alone through registers (no logic between).
+  auto enableFrom = [&](Operation *reg, StringRef port) -> bool {
+    Value en = cast<seq::CompRegClockEnabledOp>(reg).getClockEnable();
+    for (int k = 0; k < 3; ++k) {
+      auto r = en.getDefiningOp<seq::CompRegClockEnabledOp>();
+      if (!r)
+        return false;
+      en = r.getInput();
+    }
+    auto arg = dyn_cast<BlockArgument>(en);
+    return arg && cls.copy.getInputName(arg.getArgNumber()) == port;
+  };
+  for (auto *cap : caps)
+    if (!enableFrom(cap, "cap3"))
+      return cap->emitError("multicycle: a capture register not taken at the reads");
+  for (auto *end : ends)
+    if (!enableFrom(end, "pre3"))
+      return end->emitError("multicycle: an end register not taken before the state passes");
   return success();
 }
 
@@ -7350,6 +8478,22 @@ void StaticFolder::buildFrameTable(bool stalls) {
           at.tail = s >= ii;
         }
   }
+  // A staged class reads its stages before each state pass (which `place`
+  // puts at least that far into the frame).
+  readFrameAt = frameAt;
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    if (!cls.stages)
+      continue;
+    readFrameAt[c].assign(ii, Evaluation());
+    for (unsigned i = 0; i < cls.threads(); ++i) {
+      int r = cls.slot[kState][i] - int(cls.stages);
+      assert(r >= 0 && "a staged state pass reads within the frame");
+      auto &at = readFrameAt[c][r % ii];
+      at.inst = i;
+      at.state = true;
+      at.tail = r >= int(ii);
+    }
+  }
   this->stalls = stalls;
 }
 
@@ -7398,7 +8542,7 @@ bool StaticFolder::needsForward(unsigned p, unsigned c, ArrayRef<bool> takes,
     for (auto [pos, frames] : reach) {
       if (pos >= ii)
         continue;
-      auto &read = frameAt[c][pos];
+      auto &read = readFrameAt[c][pos];
       if (!read.runs() || !takes[read.inst])
         continue;
       if (threaded && from[read.inst] != write.inst)
@@ -7426,7 +8570,7 @@ bool StaticFolder::takesNow(unsigned p, unsigned c, ArrayRef<bool> takes,
   for (unsigned at = 0; at < ii; ++at) {
     if (!writesAt(producer, at))
       continue;
-    auto &read = frameAt[c][at];
+    auto &read = readFrameAt[c][at];
     if (!read.runs() || !takes[read.inst])
       continue;
     if (threaded && from[read.inst] != frameAt[producer.cls][at].inst)
@@ -7444,7 +8588,7 @@ bool StaticFolder::hitsOnlyTakes(unsigned p, unsigned c, ArrayRef<bool> takes,
   auto &producer = producers[p];
   bool threaded = classes[producer.cls].threads() > 1;
   for (unsigned at = 0; at < ii; ++at) {
-    auto &read = frameAt[c][at];
+    auto &read = readFrameAt[c][at];
     if (!writesAt(producer, at) || !read.runs() || takes[read.inst])
       continue;
     if (!threaded || from[read.inst] == frameAt[producer.cls][at].inst)
@@ -7708,8 +8852,19 @@ LogicalResult StaticFolder::buildSim() {
     Value inst1, inst, state, ready;
     /// The ready passes past the first, two host cycles ahead.
     SmallVector<Value> laterReady2;
+    /// Staged (read side): whether the position three host cycles ahead is
+    /// one, not idle; multicycle, whether it is a read, and (`pre3`) whether
+    /// it is the one before a state pass.
+    Value live3, pre3;
   };
   SmallVector<Controls> controls(classes.size());
+  // Staged classes: what each reads at a position, its stages before each
+  // state pass (its links' reads, the copy's reads of its state); the
+  // writes are `controls`'.
+  SmallVector<Controls> readControls(classes.size());
+  auto readCtl = [&](unsigned c) -> Controls & {
+    return classes[c].stages ? readControls[c] : controls[c];
+  };
   // Nested folding: the sequencer tree. Each class has its own sequencer,
   // the frame's position three host cycles ahead, kept in a register its
   // parent class's sequencer loads with its next position (the root's for a
@@ -7815,8 +8970,10 @@ LogicalResult StaticFolder::buildSim() {
       // Each state pass's page-in, a page before it in the position stream
       // (in the frame before for a slot within the page of the frame's start).
       SmallVector<uint64_t> fetchRow(ii + 1, 0), finstRow(ii + 1, 0);
+      // Staged, a page before the evaluation's read, its stages before.
       for (unsigned i = 0; i < threads; ++i) {
-        unsigned pos = wrap(cls.slot[kState][i] - int(cls.pageLead()));
+        unsigned pos = wrap(cls.slot[kState][i] - int(cls.pageLead()) -
+                            int(cls.stages));
         fetchRow[pos] = 1;
         finstRow[pos] = i;
       }
@@ -7850,6 +9007,41 @@ LogicalResult StaticFolder::buildSim() {
         later3 = comb::AndOp::create(b, later3, runs);
       ctl.laterReady2.push_back(
           reg(later3, prefix + "_ready_l" + Twine(l + 1) + "_2"));
+    }
+    // Staged: the read side, the stages before each state pass (within the
+    // frame, or past it as the state pass may be).
+    if (cls.stages) {
+      auto &rctl = readControls[c];
+      SmallVector<uint64_t> rinstRow(ii + 1, 0), rtailRow(ii + 1, 0),
+          liveRow(ii + 1, 1), preRow(ii + 1, 0);
+      liveRow[ii] = 0;
+      // Multicycle: the capture registers taken at the reads alone, the end
+      // registers at the positions before the state passes.
+      if (cls.multicycle)
+        llvm::fill(liveRow, 0);
+      for (unsigned i = 0; i < threads; ++i) {
+        int r = cls.slot[kState][i] - int(cls.stages);
+        rinstRow[r % ii] = i;
+        rtailRow[r % ii] = r >= int(ii);
+        if (cls.multicycle) {
+          liveRow[r % ii] = 1;
+          preRow[(cls.slot[kState][i] - 1) % ii] = 1;
+        }
+      }
+      rctl.at3 = at;
+      rctl.live3 = table(b, at, liveRow, 1);
+      if (cls.multicycle)
+        rctl.pre3 = table(b, at, preRow, 1);
+      if (threads > 1) {
+        rctl.inst3 = table(b, at, rinstRow, idxWidth);
+        rctl.inst2 = reg(rctl.inst3, prefix + "_rinst2");
+        rctl.inst1 = reg(rctl.inst2, prefix + "_rinst1");
+        rctl.inst = reg(rctl.inst1, prefix + "_rinst0");
+      }
+      if (overlapped) {
+        rctl.tail3 = table(b, at, rtailRow, 1);
+        rctl.tail2 = reg(rctl.tail3, prefix + "_rtail2");
+      }
     }
   }
 
@@ -7985,7 +9177,7 @@ LogicalResult StaticFolder::buildSim() {
   std::map<std::pair<unsigned, int>, Value> prevFrameInputNext;
   DenseMap<unsigned, Value> classTail1;
   auto frameInputFor = [&](unsigned p, unsigned c) -> Value {
-    if (!controls[c].tail2)
+    if (!readCtl(c).tail2)
       return frameInputNext[p];
     // One per SLR group, in the group.
     Value &prevNext = prevFrameInputNext[{p, slrOf.empty() ? -1 : slrOf[c]}];
@@ -7997,7 +9189,7 @@ LogicalResult StaticFolder::buildSim() {
     }
     Value &tail1 = classTail1[c];
     if (!tail1)
-      tail1 = reg(controls[c].tail2, classes[c].name + "_tail1");
+      tail1 = reg(readCtl(c).tail2, classes[c].name + "_tail1");
     return comb::MuxOp::create(b, tail1, prevNext, frameInputNext[p]);
   };
   // A class's own copy of a frame's input (as a reset, it drives much of the
@@ -8024,6 +9216,13 @@ LogicalResult StaticFolder::buildSim() {
     }
     if (cls.page && cls.pagesOffChip)
       operands.append(controls[c].offChip3.begin(), controls[c].offChip3.end());
+    if (cls.stages) {
+      if (cls.threads() > 1)
+        operands.push_back(readControls[c].inst3);
+      operands.push_back(readControls[c].live3);
+      if (cls.multicycle)
+        operands.push_back(readControls[c].pre3);
+    }
     for (auto [i, type] : llvm::enumerate(cls.inputTypes)) {
       if (int(i) == cls.clockInput)
         continue;
@@ -8770,7 +9969,8 @@ LogicalResult StaticFolder::buildSim() {
       continue;
     unsigned c = consumer.cls;
     auto &cls = classes[c];
-    auto &ctl = controls[c];
+    // A staged class reads its inputs at its read side.
+    auto &ctl = readCtl(c);
     unsigned threads = cls.threads();
     int to = slrOf.empty() ? -1 : slrOf[c];
     // What this input builds is in its class's SLR group, but for the
@@ -9031,14 +10231,19 @@ LogicalResult StaticFolder::buildSim() {
                         name + "_copy1"),
                 name + "_copy0");
             // Clock enables, as the flops take them: no select on the
-            // producer's path into the first register.
-            // Named, with no inner symbol: several links may share a name.
-            Value stageA = seq::CompRegClockEnabledOp::create(
-                b, data, hostClock, write, b.getStringAttr(name + "_staged"),
-                Value(), Value(), Value(), hw::InnerSymAttr());
-            Value stageB = seq::CompRegClockEnabledOp::create(
-                b, stageA, hostClock, copy, b.getStringAttr(name + "_held"),
-                Value(), Value(), Value(), hw::InnerSymAttr());
+            // producer's path into the first register. Named like the other
+            // link registers, without an inner symbol: the names repeat
+            // where one producer port feeds several instances of a reader
+            // (a bit each), which symbols may not.
+            auto enabledReg = [&](Value next, Value enable,
+                                  const Twine &regName) -> Value {
+              return seq::CompRegClockEnabledOp::create(
+                  b, next.getType(), next, hostClock, enable,
+                  b.getStringAttr(regName), Value(), Value(), Value(),
+                  hw::InnerSymAttr{});
+            };
+            Value stageA = enabledReg(data, write, name + "_staged");
+            Value stageB = enabledReg(stageA, copy, name + "_held");
             sourceData[index] = stageB;
             continue;
           }
@@ -9601,7 +10806,9 @@ LogicalResult StaticFolder::buildSim() {
       terms.push_back(comb::ICmpOp::create(
           b, comb::ICmpPredicate::uge, body->getArgument(v.firstInput + 3),
           constant(kVirtualFreeWidth,
-                   virtualRoom() + (v.stream ? linkStreams[v.k].pages + 1 : 0))));
+                   virtualRoom(!v.stream && !v.engine &&
+                               classes[v.cls].virtualMemories[v.k].delayed) +
+                       (v.stream ? linkStreams[v.k].pages + 1 : 0))));
     // An HBM link stream's landing at the position: the next slots to land
     // (as many as the landings decided and not yet run) answered.
     for (auto &v : simVirtuals) {
@@ -9739,6 +10946,17 @@ LogicalResult StaticFolder::buildSim() {
     sim->setAttr("foldsim.vmems", b.getArrayAttr(virtuals));
   }
   sim->setAttr("foldsim.frame", b.getI64IntegerAttr(ii));
+  // Multicycle copies, for the flow's timing constraints: the registers'
+  // name prefix (fsmc_<class>__, then cap<k> or end<k>), the host cycles
+  // from capture to end, and the bits of each.
+  SmallVector<Attribute> multicycles;
+  for (auto &cls : classes)
+    if (cls.multicycle)
+      multicycles.push_back(b.getStringAttr(
+          "fsmc_" + cls.name + "__:" + Twine(cls.multicycle) + ":" +
+          Twine(cls.multicycleCaps) + ":" + Twine(cls.multicycleEnds)));
+  if (!multicycles.empty())
+    sim->setAttr("foldsim.multicycle", b.getArrayAttr(multicycles));
   simModule = sim;
   return success();
 }
@@ -9944,7 +11162,7 @@ LogicalResult StaticFolder::run() {
         cls.folding->edges->abandon();
   };
   if (failed(parsePages()) || failed(parseStorage()) || failed(pagesOffChip()) ||
-      failed(schedule())) {
+      failed(chooseStages()) || failed(schedule())) {
     abandonFolds();
     return failure();
   }
@@ -9989,7 +11207,7 @@ void FoldStaticPass::runOnOperation() {
                       page, pageMasks, pageHbmColumnBits, pageHbmWindow,
                       pageEngines, pageMemoryBits, pageMemories, pageRows, compactLinks,
                       registeredLinks, shareLinks, stagedLinks, linkBlockDepth,
-                      linkUltraDepth, linkKinds);
+                      linkUltraDepth, linkKinds, stageLevels, multicycle);
   folder.moduloLinear = moduloLinear;
   if (failed(folder.run()))
     return signalPassFailure();

@@ -1425,9 +1425,10 @@ def with_pages(sched, pages, offchip=()):
     the models in `offchip` with their pages off chip."""
     def model(c):
         return re.sub(r'_copy\d+$', '', c)
-    return {c: (info if c == '__links__' else
-                dict(info, page=pages.get(model(c), 0) if info['n'] > 1 else 0,
-                     offchip=model(c) in offchip and info['n'] > 1))
+    # '__links__' (parse_links) is the links' storage, not a class.
+    return {c: info if c == '__links__' else
+            dict(info, page=pages.get(model(c), 0) if info['n'] > 1 else 0,
+                 offchip=model(c) in offchip and info['n'] > 1)
             for c, info in sched.items()}
 
 

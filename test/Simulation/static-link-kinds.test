@@ -30,6 +30,16 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/t/obj %S/Inputs/tb_reset.sv top.sv %t/t/foldsim_sim.sv > %t/t/build.log 2>&1
 # RUN: %t/t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +stall=30 | FileCheck %s
 # TREE: staged 11
+# One producer port, a bit to each of four readers (fsd_switch's out_valid
+# into fsd_link's in_valid): every reader's staged registers take the same
+# name, which an inner symbol each made a redefinition before (firtool failed).
+# RUN: cd %S/../Driver/Inputs/staged-bits
+# RUN: foldsim --srcs top.f --top Top --out %t/sb --static --nest --modulo --share-links --compact-links --staged-links Sw Lnk 2>&1 | FileCheck %s --check-prefix=SB
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/sb/obj %S/Inputs/tb_reset.sv top.sv %t/sb/foldsim_sim.sv > %t/sb/build.log 2>&1
+# RUN: %t/sb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +stall=0 | FileCheck %s
+# RUN: %t/sb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+10 +stall=30 | FileCheck %s
+# SB: staged: 13 links, 152 register bits
+# SB-NOT: redefinition of inner symbol
 # RUN: cd %S/../Driver/Inputs/stateless
 # RUN: foldsim --srcs top.f --top Top --out %t/blk --static --nest --modulo --compact-links --link-block-depth 2 Sm Agu 2>&1 | FileCheck %s --check-prefix=BLK
 # RUN: FileCheck %s --check-prefix=BLKSIM < %t/blk/foldsim_sim.mlir
