@@ -366,6 +366,8 @@ def frame_options(a):
         fold += f' link-ultra-depth={a.link_ultra_depth}'
     if getattr(a, 'registered_links', ''):
         fold += f' registered-links={a.registered_links}'
+    if getattr(a, 'stage_levels', 0):
+        fold += f' stage-levels={a.stage_levels}'
     return fold
 
 
@@ -871,6 +873,12 @@ def main():
                          'register (foldsim-fold-static; 0: none)')
     ap.add_argument('--link-ultra-depth', type=int, default=0, metavar='N',
                     help='as --link-block-depth, in ultra RAM (foldsim-fold-static; 0: none)')
+    ap.add_argument('--stage-levels', type=int, default=0, metavar='N',
+                    help='with --static: a class whose state cone is deeper than N estimated logic '
+                         'levels (no late output, virtual memory or black box) evaluates over '
+                         'several host cycles, its logic cut into segments of at most N levels by '
+                         'stage registers that step with the frame; its state and inputs read '
+                         'the stages before its state pass (foldsim-fold-static; 0: none)')
     ap.add_argument('--staged-links', action='store_true',
                     help="with --static: an early link of one producer instance in two registers, "
                          'copied at a fixed position of the frame, where the schedule allows '

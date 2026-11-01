@@ -545,6 +545,18 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "Outputs of a model driven by the same value (a bus broadcast to "
            "several children) are one producer: their readers share its "
            "links instead of one link per output">,
+    Option<"stageLevels", "stage-levels", "unsigned", "0",
+           "Staged evaluation: a class whose state cone (from its state and "
+           "inputs to its next state, memory ports and early outputs) is "
+           "deeper than this many estimated logic levels evaluates over "
+           "several host cycles: its logic cut into segments of at most this "
+           "many levels by registers that step with the frame's positions "
+           "(none moves in a bubble or between frames), its state and inputs "
+           "read the stages' positions before its state pass, which writes "
+           "as before. Only for a class with no late output, virtual memory "
+           "or black box. The schedule places such a state pass at least the "
+           "stages into the frame, its inputs' links the stages earlier, and "
+           "its state gap from the read. 0: none">,
     ListOption<"registeredLinks", "registered-links", "std::string",
                "Classes (globs; a copy goes by its class's name) whose links "
                "are never taken in their producer's host cycle: with "
