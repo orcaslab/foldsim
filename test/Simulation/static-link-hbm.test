@@ -39,6 +39,13 @@
 # RUN: %t/rc2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=60 | FileCheck %s
 # RUN: %t/rc2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=20 +stall=30 +full=20 | FileCheck %s
 # RC2: link stream {{.+}} 1 1 32
+# A late producer (Driver/Inputs/linklate: each unit's output passes its input
+# through) is no stream's: its readers take it in the frame it is written, and
+# a stream lands a frame on. The streams are laid out after the analysis that
+# marks it late (before, it was a member and the fold mismatched).
+# RUN: cd %S/../Driver/Inputs/linklate && foldsim --srcs top.f --top Top --out %t/late --static --nest --modulo --link-kinds Unit:Reader:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=LATE
+# LATE: II =
+# LATE-NOT: link stream
 # TWO: II = 64
 # TWO: link streams: 2 streams, 3 links, 2304 bits
 # TWO: link stream Reader Unit 1 0 32 32 1 16 16 1 {{[0-9]+}}
