@@ -1,0 +1,38 @@
+# REQUIRES: verilator
+# HBM link streams (`--link-kinds <producer>:<reader>:hbm`): the early links
+# from one producer class to one reader class kept in device memory behind a
+# virtual memory of one image (INSTANCES 1), a row a single address, the
+# request's tag a landing slot. The producer's bits the links read are held
+# at its pass and written a row a host cycle after it; each reader pass's
+# rows (Reader reads two Units' rows: two landings a pass) are requested
+# `lead` positions ahead and land over the host cycles before its slot, a
+# bubble where a landing's response is late. Exact against the target
+# (Inputs/tb_linkhbm.sv: the virtual memories' model, rows zero at start,
+# answered 1 to 60 host cycles on, `free` low at times), channels stalled or
+# not, with bubbles; one stream alone; and the report's stream lines.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/linkhbm
+# RUN: foldsim --srcs top.f --top Top --out %t/two --static --nest --modulo --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=TWO
+# RUN: FileCheck %s --check-prefix=VH < %t/two/foldsim_sim.vh
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/two -DVM1 -Mdir %t/two/obj %S/Inputs/tb_linkhbm.sv top.sv %t/two/foldsim_sim.sv > %t/two/build.log 2>&1
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bub --static --nest --modulo --bubbles --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/bub.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/bub -DVM1 -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_linkhbm.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +bubble=30 | FileCheck %s
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +bubble=30 +stall=30 +lo=1 +hi=30 +full=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/one --static --nest --modulo --link-kinds Reader:Unit:hbm Unit Reader > %t/one.log 2>&1
+# RUN: FileCheck %s --check-prefix=ONE < %t/one/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/one -Mdir %t/one/obj %S/Inputs/tb_linkhbm.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
+# TWO: II = 64
+# TWO: link streams: 2 streams, 3 links, 2304 bits
+# TWO: link stream Reader Unit 1 0 32 32 1 16 16 1
+# TWO: link stream Unit Reader 2 0 32 32 1 16 32 2
+# VH: `define FOLDSIM_VMEM_COUNT 2
+# VH: `define FOLDSIM_VMEM_0_INSTANCES 1
+# VH: `define FOLDSIM_VMEM_1_INSTANCES 1
+# ONE: link use Reader Unit 32 32 16 hbm 1
+# ONE: link stream Reader Unit 1 0 32 32 1 16 16 1
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL

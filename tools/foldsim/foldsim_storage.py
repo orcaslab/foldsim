@@ -204,14 +204,18 @@ def vmem_cache_rows(vmems, choice, budget):
     rows x instances. `auto`: rows / 16, at least 256; while the caches' data
     take more than `budget` RAMB36, the costliest halves (0 below 2 lines).
     `vmems`: dicts with instances, row_width (address bits) and data_width.
-    A cache's lines live in block RAM in one port pair (bram36)."""
-    caps = [pow2_floor(v['instances'] << v['row_width']) for v in vmems]
+    A cache's lines live in block RAM in one port pair (bram36). An HBM link
+    stream's (class `__link<k>`: every row written once and read once a
+    frame, in slot order) has none."""
+    caps = [0 if str(v.get('class', '')).startswith('__link') else
+            pow2_floor(v['instances'] << v['row_width']) for v in vmems]
     if choice != 'auto':
         n = int(choice)
         if n < 0 or n == 1 or n & (n - 1):
             sys.exit('--vmem-cache-rows: auto, 0 or a power of two of at least 2')
         return [min(n, c) for c in caps]
-    rows = [min(c, max(VMEM_CACHE_FLOOR, pow2_floor(c // VMEM_CACHE_FRACTION))) for c in caps]
+    rows = [min(c, max(VMEM_CACHE_FLOOR, pow2_floor(c // VMEM_CACHE_FRACTION))) if c else 0
+            for c in caps]
     cost = lambda k: bram36(rows[k], vmems[k]['data_width']) if rows[k] else 0
     while sum(cost(k) for k in range(len(rows))) > budget:
         k = max(range(len(rows)), key=cost)

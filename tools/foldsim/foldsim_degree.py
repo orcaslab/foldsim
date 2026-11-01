@@ -565,6 +565,10 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     # The links' storage, as the compiler emits it (the schedule report's
     # link kinds), in the base usage the stores' kinds are chosen against.
     lk = link_cost(cal, (sched or {}).get('__links__'))
+    # HBM link streams built (a schedule made with them): their logic, and
+    # their traffic in the HBM pool and H.
+    logic += lk['lut']
+    built_hbm = lk['hbm']
     # With the report's link uses, a pair of models' links that block or
     # ultra RAM may hold is a unit of its own (the link tier); the rest stays
     # in the base.
@@ -572,14 +576,15 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                     tiers.get('link_hbm', False), tiers['frame']) if tiers is not None else None
     if lu:
         units.extend(lu[0])
-        lk = dict(lu[1])
+        lk = dict(lu[1], lutram=lu[1]['lutram'] + lk['lutram'] -
+                  link_cost(cal, dict((sched or {}).get('__links__'), streams=[]))['lutram'])
     base = dict(sites=logic + storage.LUTRAM_SITES * (lk['lutram'] + base_lutram),
                 luts=storage.fold_load(logic + lk['lutram'] + base_lutram, cache + lk['bram'],
                                        lk['uram']),
                 bram=cache + lk['bram'], uram=lk['uram'])
     if tiers is not None:
         caps['hbm'] = max(0.0, storage.HBM_STATE_SHARE * tiers['frame'] *
-                          storage.HBM_BYTES_PER_CYCLE - tiers.get('base_hbm', 0.0))
+                          storage.HBM_BYTES_PER_CYCLE - tiers.get('base_hbm', 0.0) - built_hbm)
         caps['bubbles'] = max(0.0, storage.BUBBLE_SHARE * tiers['frame'] -
                               tiers.get('base_bubbles', 0.0))
         for u in units:
@@ -594,7 +599,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     per_copy = dict(copy_logic)
     rules, floor = [], 0
     off = dict(vmem_new=[], pages_offchip=[], rows_new=[], hbm_bytes=0.0, controllers=0,
-               bubbles=0.0)
+               bubbles=0.0, **({'link_hbm_bytes': built_hbm} if built_hbm else {}))
     link_rules = []
     for u, ch in zip(units, choice):
         (kind, _), = ch.items()     # one store a unit: never split
@@ -878,8 +883,21 @@ def parse_links(text):
                  producer_passes=int(u[13]), reader_passes=int(u[14]), page=int(u[15]))
             for u in re.findall(r'^    link use (\S+) (\S+) (\d+) (\d+) (\d+) (\S+) ([01]) (-?\d+) '
                                 r'(-?\d+) (-?\d+) (\d+) ([01]) (\d+) (\d+) (\d+) (\d+)$', text, re.M)]
+    # HBM link streams (foldsim-fold-static `link-kinds` kind hbm): every pair
+    # a stream could carry (`link pair`), and those built (`link stream`).
+    pairs = {(x[0], x[1]): dict(word=int(x[2]), dw=int(x[3]), pages=int(x[4]),
+                                max_need=int(x[5]), read_rows=int(x[6]), write_rows=int(x[7]),
+                                producer_passes=int(x[8]), reader_passes=int(x[9]))
+             for x in re.findall(r'^    link pair (\S+) (\S+) (\d+) (\d+) (\d+) (\d+) (\d+) (\d+) '
+                                 r'(\d+) (\d+)$', text, re.M)}
+    streams = [dict(p=x[0], r=x[1], kept=int(x[2]), dropped=int(x[3]), word=int(x[4]),
+                    dw=int(x[5]), pages=int(x[6]), write_rows=int(x[7]), read_rows=int(x[8]),
+                    max_need=int(x[9]))
+               for x in re.findall(r'^    link stream (\S+) (\S+) (\d+) (\d+) (\d+) (\d+) (\d+) '
+                                   r'(\d+) (\d+) (\d+)$', text, re.M)]
     return dict(lutram=float(g[2]), lutram_bits=int(g[1]), bram=float(g[5]), bram_bits=int(g[4]),
-                uram=float(g[8]), uram_bits=int(g[7]), ff=int(g[10]), uses=uses)
+                uram=float(g[8]), uram_bits=int(g[7]), ff=int(g[10]), uses=uses, pairs=pairs,
+                streams=streams)
 
 
 def link_lutram(depth, width):
@@ -958,6 +976,71 @@ def link_hbm_cost(u, frame, f=1.0):
                 ctl=cols)
 
 
+# HBM link streams (foldsim-fold-static `link-kinds` <P>:<R>:hbm, as built):
+# a pair's early links whose read comes late enough after the write (lead >=
+# LINK_STREAM_LEAD and the reader's landings and the write's pages) in device
+# memory behind one virtual memory of rows of `dw` bits; on chip its
+# controller (link_stream_ctl), a landing buffer of LINK_STREAM_SLOTS rows
+# in distributed RAM, the write's select of a row of the held word (as a
+# paged copy's: page_select_luts a row bit) and its word in flops, the read
+# registers' enables; HBM a row (at least a beat) per page written (every
+# producer instance's) and per landing a frame. Ports: the producer's passes
+# a write's pages apart, the reader's its landings + 2 apart, within
+# LINK_PORT_SHARE of the frame.
+LINK_STREAM_LEAD = 48
+# The fewest positions a request may precede its landing (the compiler's
+# linkHbmMinLead: the decisions in flight and a margin); a pair whose reads
+# come sooner after the writes than that and its landings stays on chip.
+LINK_STREAM_MIN_LEAD = 10
+LINK_STREAM_SLOTS = 64
+LINK_STREAM_ENABLE_LUTS = 2
+
+
+def link_stream_ctl(dw):
+    """A stream's controller (logic, LUTRAM LUTs): foldsim_vmem at INSTANCES 1,
+    a whole-row enable, no host cache."""
+    return storage.vmem_ctl(dw)
+
+
+def link_stream_cost(pair, uses, frame, f=1.0):
+    """A pair's links as an HBM stream (`pair`: its report line), the links it
+    cannot carry distributed; None where its ports do not fit `frame` or it
+    carries none."""
+    ports = max(pair['producer_passes'] * pair['pages'],
+                pair['reader_passes'] * (pair['max_need'] + 2))
+    if ports > LINK_PORT_SHARE * frame:
+        return None
+    need = LINK_STREAM_MIN_LEAD + pair['max_need'] + pair['pages'] + 6
+    carried = [u for u in uses if u['banked'] and u['entries'] > 1 and u['lead'] >= need]
+    if not carried:
+        return None
+    rest = sum(f * link_lutram(u['depth'], u['width']) for u in uses if u not in carried)
+    cl, cr = link_stream_ctl(pair['dw'])
+    row = max(storage.HBM_BEAT_BYTES, storage.vmem_row_bytes(pair['dw']))
+    slices = sum(math.ceil(u['width'] / pair['dw']) for u in carried)
+    return dict(lut=cl + pair['dw'] * storage.page_select_luts(pair['pages']) +
+                LINK_STREAM_ENABLE_LUTS * slices,
+                lutram=cr + link_lutram(LINK_STREAM_SLOTS, pair['dw']) + rest,
+                ff=pair['word'] + 32, bram=0.0, uram=0.0, ii_floor=0,
+                hbm=float((pair['read_rows'] + pair['write_rows']) * row), ctl=1)
+
+
+def link_streams_built(links):
+    """The streams a report's schedule built (`link stream` lines): their
+    on-chip cost and HBM bytes a frame, as link_stream_cost prices them."""
+    out = dict(lut=0.0, lutram=0.0, ff=0, hbm=0.0, ctl=0)
+    for s in (links or {}).get('streams', []):
+        cl, cr = link_stream_ctl(s['dw'])
+        row = max(storage.HBM_BEAT_BYTES, storage.vmem_row_bytes(s['dw']))
+        out['lut'] += cl + s['dw'] * storage.page_select_luts(s['pages']) + \
+            LINK_STREAM_ENABLE_LUTS * s['kept']
+        out['lutram'] += cr + link_lutram(LINK_STREAM_SLOTS, s['dw'])
+        out['ff'] += s['word'] + 32
+        out['hbm'] += (s['read_rows'] + s['write_rows']) * row
+        out['ctl'] += 1
+    return out
+
+
 def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0):
     """The links as storage_area units, a unit per pair of models with a
     link that block or ultra RAM may hold (foldsim-fold-static `link-kinds`):
@@ -994,7 +1077,17 @@ def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0):
                 for key in c:
                     c[key] += one.get(key, 0)
             costs[kind] = c
-        if hbm and frame:
+        pair = links.get('pairs', {}).get((p, r))
+        if hbm and frame and pair:
+            # The compiler's HBM stream (all the pair's links, not only those
+            # block or ultra RAM may hold).
+            every = [u for u in links['uses'] if u['p'] == p and u['r'] == r]
+            c = link_stream_cost(pair, every, frame, f)
+            if c is not None:
+                c['lutram'] -= sum(f * link_lutram(u['depth'], u['width'])
+                                   for u in every if not u['sync'])
+                costs['hbm'] = c
+        elif hbm and frame:
             parts = [link_hbm_cost(u, frame, f) for u in uses]
             if all(x is not None for x in parts):
                 c = dict(zero, hbm=0.0, ctl=0)
@@ -1018,11 +1111,13 @@ def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0):
 # 1-SM a1 fold's netlist).
 def link_cost(cal, links):
     if not links:
-        return dict(lutram=0.0, bram=0.0, uram=0.0, ff=0)
+        return dict(lutram=0.0, bram=0.0, uram=0.0, ff=0, lut=0.0, hbm=0.0, ctl=0)
     k = (cal or {}).get('links', {})
     f, b = k.get('lutram', 1.0), k.get('bits', 1.0)
-    return dict(lutram=f * links['lutram'], bram=b * links['bram'], uram=links['uram'],
-                ff=round(b * links['ff']))
+    st = link_streams_built(links)
+    return dict(lutram=f * links['lutram'] + st['lutram'], bram=b * links['bram'],
+                uram=links['uram'], ff=round(b * links['ff']) + st['ff'], lut=st['lut'],
+                hbm=st['hbm'], ctl=st['ctl'])
 
 
 def parse_classes(text):

@@ -590,11 +590,95 @@ private:
   /// distributed, block or ultra), parsed; a rule overrides the depths for
   /// the links between those models that block or ultra RAM may hold.
   std::string linkKindSpec;
+  /// Whether the links from producer `p` to class `reader` stream through
+  /// HBM (`link-kinds` kind `hbm`).
+  bool linkHbmRule(unsigned p, unsigned reader) const {
+    if (linkKinds.empty())
+      return false;
+    auto it = linkKinds.find({modelOf(producers[p].cls).str(), modelOf(reader).str()});
+    return it != linkKinds.end() && it->second.kind == "hbm";
+  }
   struct LinkKind {
     std::string kind;
     unsigned page = 0;
   };
   std::map<std::pair<std::string, std::string>, LinkKind> linkKinds;
+  /// HBM link streams (`link-kinds` kind `hbm`): the early links from one
+  /// producer class to one reader class, written at the same pass, kept in
+  /// device memory behind one virtual memory (a controller of the kernel, a
+  /// row of the image a single address: INSTANCES 1). The producer's bits
+  /// they read (`runs`, a word of `wordBits`) are held at its pass and written
+  /// a row (`dw` bits, `pages` rows an instance) a host cycle over the pages
+  /// after it, at {bank, instance, page}; the reader's passes read the rows
+  /// they need (`needs`: producer instance and page, per reader instance) in
+  /// slot order, each requested kLinkHbmLead positions before the host cycle
+  /// it lands in its read registers, the request's tag a slot of a landing
+  /// buffer the response fills. A position whose landing slot has no data
+  /// waits in a bubble; the controller keeps the RAM's order, so a read is
+  /// exact whenever its write was requested before it (the schedule's lead,
+  /// checked: a link whose write is not is built as the rule's fallback).
+  struct StreamRun {
+    unsigned producer, low, width, offset;
+  };
+  struct LinkStream {
+    unsigned pcls = 0, rcls = 0;
+    bool atReady = false;
+    unsigned level = 0;
+    SmallVector<StreamRun> runs;
+    unsigned wordBits = 0, dw = 0, pages = 0;
+    SmallVector<SmallVector<std::pair<uint64_t, unsigned>>> needs;
+    unsigned maxNeed = 0;
+    /// After the schedule: the members kept and dropped (too close a read).
+    unsigned kept = 0, dropped = 0;
+    /// Per position (ii + 1 rows, the last a bubble's): the landing of a row
+    /// (its reader instance, producer instance, page) and its request
+    /// (producer instance, page, the frame's flip for the bank).
+    SmallVector<uint64_t> popValid, popInst, popRow, popPage;
+    SmallVector<uint64_t> reqValid, reqRow, reqPage, reqFlip;
+    uint64_t readRows = 0;
+    /// The simulator's virtual memory serving it (port vm<k>), once built.
+    unsigned vm = 0;
+    /// Positions from a request to its landing: kLinkHbmLead, or less where
+    /// the kept links' writes come later.
+    unsigned lead = 0;
+    unsigned instBits() const {
+      return std::max(1u, llvm::Log2_32_Ceil(slots()));
+    }
+    unsigned slots() const { return llvm::PowerOf2Ceil(lead + 8); }
+  };
+  /// The most positions a stream's request precedes its landing (an HBM
+  /// round trip at the kernel's clock and a margin); the fewest are those
+  /// from a position's decision to its run and a margin, so that a landing's
+  /// request is issued, and pending, before the decision that waits for it.
+  static constexpr unsigned kLinkHbmLead = 48;
+  unsigned linkHbmMinLead() const { return decisionLead() + 6; }
+  std::vector<LinkStream> linkStreams;
+  /// Each candidate member by (reader class, input, its bit, producer, low):
+  /// its stream, its bits' offset in the stream's word, and whether the
+  /// schedule kept it.
+  struct StreamMember {
+    unsigned stream, offset;
+    bool kept = false;
+  };
+  std::map<std::tuple<unsigned, unsigned, unsigned, unsigned, unsigned>,
+           StreamMember>
+      streamMembers;
+  bool streamsPlanned = false;
+  /// The streams' layouts and the ports they need (before the schedule).
+  void layoutStreams();
+  /// The layouts of the streams of the links `pick` takes (of those a
+  /// stream may carry), into `out`, their members into `members` if given.
+  void layoutStreamsOf(function_ref<bool(const LinkUse &)> pick,
+                       std::vector<LinkStream> &out,
+                       decltype(streamMembers) *members) const;
+  /// The members the schedule keeps, and each stream's landings and
+  /// requests by position (after it).
+  LogicalResult planStreams();
+  unsigned streamRowBits(const LinkStream &s) const {
+    unsigned threads = classes[s.pcls].threads();
+    return 1 + (threads > 1 ? llvm::Log2_32_Ceil(threads) : 0) +
+           (s.pages > 1 ? llvm::Log2_32_Ceil(s.pages) : 0);
+  }
   /// The page of the links from producer `p` to class `reader` (0: none).
   unsigned linkPageRule(unsigned p, unsigned reader) const {
     if (linkKinds.empty())
@@ -617,8 +701,9 @@ private:
       auto it = linkKinds.find({modelOf(producers[p].cls).str(),
                                 modelOf(reader).str()});
       if (it != linkKinds.end())
-        return it->second.kind == "distributed" ? StringRef()
-                                                : StringRef(it->second.kind);
+        return it->second.kind == "distributed" || it->second.kind == "hbm"
+                   ? StringRef()
+                   : StringRef(it->second.kind);
     }
     return syncLinkStyle(depth, width);
   }
@@ -1405,14 +1490,14 @@ LogicalResult StaticFolder::parseLinkKinds() {
     rule.trim().split(parts, ':');
     unsigned page = 0;
     if ((parts.size() != 3 && parts.size() != 4) ||
-        !llvm::is_contained({"distributed", "block", "ultra"}, parts[2]) ||
+        !llvm::is_contained({"distributed", "block", "ultra", "hbm"}, parts[2]) ||
         (parts.size() == 4 &&
          (parts[3].getAsInteger(10, page) || page < 2 || page > 64 ||
-          parts[2] == "distributed")))
+          parts[2] == "distributed" || parts[2] == "hbm")))
       return netlist.emitError("link-kinds: '")
              << rule
              << "' is not <producer model>:<reader model>:"
-                "distributed|block|ultra[:<page 2..64>]";
+                "distributed|block|ultra[:<page 2..64>]|hbm";
     for (StringRef m : {parts[0], parts[1]})
       if (!models.count(m.str()))
         return netlist.emitError("link-kinds: no class model '") << m << "'";
@@ -1422,6 +1507,214 @@ LogicalResult StaticFolder::parseLinkKinds() {
       for (unsigned c = 0; c < classes.size(); ++c)
         if (modelOf(c) == parts[0] || modelOf(c) == parts[1])
           classes[c].linkPage = std::max(classes[c].linkPage, page);
+  }
+  layoutStreams();
+  return success();
+}
+
+void StaticFolder::layoutStreams() {
+  if (!llvm::any_of(linkKinds, [](auto &k) { return k.second.kind == "hbm"; }))
+    return;
+  layoutStreamsOf([&](const LinkUse &use) { return linkHbmRule(use.producer, use.reader); },
+                  linkStreams, &streamMembers);
+  // Ports: the producer's passes a write's pages apart, the reader's its
+  // landings and two more apart (the last lands two host cycles before
+  // the slot; the next pass's first after it).
+  for (auto &s : linkStreams)
+    for (unsigned c = 0; c < classes.size(); ++c) {
+      if (c == s.pcls)
+        classes[c].linkPage = std::max(classes[c].linkPage, s.pages);
+      if (c == s.rcls)
+        classes[c].linkPage = std::max(classes[c].linkPage, s.maxNeed + 2);
+    }
+}
+
+void StaticFolder::layoutStreamsOf(function_ref<bool(const LinkUse &)> pick,
+                                   std::vector<LinkStream> &out,
+                                   decltype(streamMembers) *members) const {
+  // Every link a stream may carry: early (banked), from a producer class of
+  // several instances, more than one entry kept.
+  std::vector<LinkUse> uses;
+  linkUses(uses);
+  std::map<std::tuple<unsigned, unsigned, bool, unsigned>, unsigned> streamOf;
+  std::vector<SmallVector<const LinkUse *>> usesOf;
+  for (auto &use : uses) {
+    auto &producer = producers[use.producer];
+    if (producer.cls < 0 || producer.late || classes[producer.cls].threads() < 2 ||
+        use.rows.size() < 2 || !slrOf.empty() || shortLead || !pick(use))
+      continue;
+    auto key = std::make_tuple(unsigned(producer.cls), use.reader, producer.atReady,
+                               producer.atReady ? producer.readyLevel : 0u);
+    auto [it, fresh] = streamOf.try_emplace(key, out.size());
+    if (fresh) {
+      LinkStream s;
+      s.pcls = producer.cls;
+      s.rcls = use.reader;
+      s.atReady = producer.atReady;
+      s.level = std::get<3>(key);
+      out.push_back(s);
+      usesOf.emplace_back();
+    }
+    usesOf[it->second].push_back(&use);
+  }
+  for (auto [k, s] : llvm::enumerate(out)) {
+    // The word: each producer's bits the members read, as runs of
+    // overlapping or adjacent bits, by producer and low bit.
+    std::map<unsigned, std::vector<std::pair<unsigned, unsigned>>> spans;
+    for (auto *use : usesOf[k])
+      spans[use->producer].push_back({use->low, use->low + use->width});
+    unsigned offset = 0;
+    for (auto &[p, list] : spans) {
+      llvm::sort(list);
+      unsigned lo = list[0].first, hi = list[0].second;
+      auto flush = [&] {
+        s.runs.push_back({p, lo, hi - lo, offset});
+        offset += hi - lo;
+      };
+      for (auto [a, e] : list) {
+        if (a > hi) {
+          flush();
+          lo = a;
+          hi = e;
+        } else {
+          hi = std::max(hi, e);
+        }
+      }
+      flush();
+    }
+    s.wordBits = offset;
+    s.dw = std::min(512u, offset);
+    s.pages = (offset + s.dw - 1) / s.dw;
+    auto offsetOf = [&](unsigned p, unsigned low) {
+      for (auto &run : s.runs)
+        if (run.producer == p && low >= run.low && low < run.low + run.width)
+          return run.offset + low - run.low;
+      llvm_unreachable("a member's bits in no run");
+    };
+    // What each reader instance's passes read: the rows and pages its
+    // members' bits are in.
+    unsigned rthreads = classes[s.rcls].threads();
+    std::vector<std::set<std::pair<uint64_t, unsigned>>> need(rthreads);
+    for (auto *use : usesOf[k]) {
+      unsigned off = offsetOf(use->producer, use->low);
+      if (members)
+        (*members)[{use->reader, use->port, use->at, use->producer, use->low}] =
+            StreamMember{unsigned(k), off, false};
+      for (auto [i, row] : llvm::zip(use->readers, use->readerRows))
+        for (unsigned j = off / s.dw; j <= (off + use->width - 1) / s.dw; ++j)
+          need[i].insert({row, j});
+    }
+    s.needs.resize(rthreads);
+    for (unsigned i = 0; i < rthreads; ++i) {
+      s.needs[i].assign(need[i].begin(), need[i].end());
+      s.maxNeed = std::max<unsigned>(s.maxNeed, need[i].size());
+      s.readRows += need[i].size() * (1 + classes[s.rcls].readyLevels);
+      s.kept += !need[i].empty();
+    }
+  }
+}
+
+LogicalResult StaticFolder::planStreams() {
+  if (streamsPlanned)
+    return success();
+  streamsPlanned = true;
+  int frame = int(ii);
+  auto mod = [&](int x) { return ((x % frame) + frame) % frame; };
+  auto floorDiv = [&](int x) {
+    return x >= 0 ? x / frame : -((-x + frame - 1) / frame);
+  };
+  auto passesOfInst = [&](const Class &cls, unsigned i) {
+    SmallVector<int> slots{cls.slot[kState][i]};
+    for (unsigned l = 0; l < cls.readyLevels; ++l)
+      slots.push_back(cls.readySlots(l)[i]);
+    return slots;
+  };
+  // Each candidate's room for the request's lead: its requests after its
+  // entry's write (the frame before's, every page, the write's register a
+  // host cycle on, and a margin: `most`), and its last before the next
+  // write of its bank (`least`). A stream's lead is kLinkHbmLead or its
+  // kept members' least room; one with less than linkHbmMinLead() is built
+  // as the rule's fallback.
+  std::vector<LinkUse> uses;
+  linkUses(uses);
+  struct Room {
+    decltype(streamMembers)::iterator member;
+    int most, least;
+  };
+  std::vector<Room> rooms;
+  for (auto &use : uses) {
+    auto it = streamMembers.find({use.reader, use.port, use.at, use.producer, use.low});
+    if (it == streamMembers.end())
+      continue;
+    auto &st = linkStreams[it->second.stream];
+    auto &producer = producers[use.producer];
+    auto &pcls = classes[producer.cls];
+    int most = std::numeric_limits<int>::max(), least = 0;
+    for (auto [i, row] : llvm::zip(use.readers, use.readerRows)) {
+      int w = producer.atReady ? pcls.readySlots(producer.readyLevel)[row]
+                               : pcls.slot[kState][row];
+      int n = int(st.needs[i].size());
+      for (int s : passesOfInst(classes[use.reader], i)) {
+        most = std::min(most, (s - n - 1) - (w + int(st.pages) + 4 - frame) - 1);
+        least = std::max(least, (s - 2) - (w + frame) + 1);
+      }
+    }
+    rooms.push_back({it, most, least});
+  }
+  for (auto &st : linkStreams) {
+    st.lead = kLinkHbmLead;
+    st.kept = 0;
+    st.readRows = 0;
+  }
+  for (auto &r : rooms)
+    if (r.most >= int(linkHbmMinLead()) && r.least <= r.most) {
+      auto &st = linkStreams[r.member->second.stream];
+      st.lead = std::min<unsigned>(st.lead, r.most);
+    }
+  for (auto &r : rooms) {
+    auto &st = linkStreams[r.member->second.stream];
+    bool ok = r.most >= int(st.lead) && r.least <= int(st.lead) &&
+              st.lead >= linkHbmMinLead();
+    r.member->second.kept = ok;
+    ++(ok ? st.kept : st.dropped);
+  }
+  for (auto &st : linkStreams) {
+    if (!st.kept)
+      continue;
+    auto &rcls = classes[st.rcls];
+    for (auto *v : {&st.popValid, &st.popInst, &st.popRow, &st.popPage,
+                    &st.reqValid, &st.reqRow, &st.reqPage, &st.reqFlip})
+      v->assign(ii + 1, 0);
+    // Each pass's landings: its rows over the host cycles before it, the
+    // last two before its slot; each requested `lead` positions earlier.
+    bool collide = false;
+    for (unsigned i = 0; i < rcls.threads(); ++i) {
+      unsigned n = st.needs[i].size();
+      if (!n)
+        continue;
+      for (int s : passesOfInst(rcls, i))
+        for (unsigned k = 0; k < n; ++k) {
+          int q = s - int(n) - 1 + int(k);
+          unsigned pos = mod(q);
+          if (st.popValid[pos])
+            collide = true;
+          st.popValid[pos] = 1;
+          st.popInst[pos] = i;
+          st.popRow[pos] = st.needs[i][k].first;
+          st.popPage[pos] = st.needs[i][k].second;
+          int t = q - int(st.lead);
+          unsigned tpos = mod(t);
+          st.reqValid[tpos] = 1;
+          st.reqRow[tpos] = st.needs[i][k].first;
+          st.reqPage[tpos] = st.needs[i][k].second;
+          st.reqFlip[tpos] = floorDiv(t) & 1;
+          ++st.readRows;
+        }
+    }
+    if (collide)
+      return netlist.emitError("link streams: ")
+             << modelOf(st.pcls) << " -> " << modelOf(st.rcls)
+             << ": two landings in one position (the reader's link port)";
   }
   return success();
 }
@@ -3922,8 +4215,15 @@ void StaticFolder::reportLinks(raw_ostream &os) {
     uint64_t bits = 0;
     double cost = 0;
   };
-  Kind distributed, block, ultra, registers, staged, paged;
+  Kind distributed, block, ultra, registers, staged, paged, hbm;
   std::vector<std::string> useLines;
+  if (haveSchedule && !linkStreams.empty())
+    (void)planStreams();
+  auto streamKept = [&](const LinkUse &use) {
+    auto it = streamMembers.find(
+        {use.reader, use.port, use.at, use.producer, use.low});
+    return it != streamMembers.end() && it->second.kept;
+  };
   uint64_t compactSaved = 0;
   unsigned compactMemories = 0;
   // By producer and reading class: (LUTRAM, bits).
@@ -3958,6 +4258,13 @@ void StaticFolder::reportLinks(raw_ostream &os) {
       depth = 2;
       staged.memories++;
       staged.bits += 2 * use.width;
+    } else if (haveSchedule && streamKept(use)) {
+      // In device memory, behind its stream's virtual memory.
+      kind = "hbm";
+      depth = linkDepth(entries, banked);
+      syncOk = true;
+      hbm.memories++;
+      hbm.bits += depth * use.width;
     } else {
       depth = linkDepth(entries, banked);
       StringRef style;
@@ -4088,6 +4395,36 @@ void StaticFolder::reportLinks(raw_ostream &os) {
      << registers.bits + staged.bits << "\n";
   for (auto &line : useLines)
     os << line;
+  // HBM link streams: for the fold-degree model, each one's word, rows and
+  // traffic a frame (rows written: every producer instance's pages; read:
+  // the landings).
+  if (haveSchedule && !linkStreams.empty()) {
+    unsigned built = 0;
+    for (auto &st : linkStreams)
+      built += st.kept > 0;
+    os << "  link streams: " << built << " streams, " << hbm.memories
+       << " links, " << hbm.bits << " bits\n";
+    for (auto &st : linkStreams)
+      if (st.kept)
+        os << "    link stream " << modelOf(st.pcls) << " " << modelOf(st.rcls)
+           << " " << st.kept << " " << st.dropped << " " << st.wordBits << " "
+           << st.dw << " " << st.pages << " "
+           << uint64_t(classes[st.pcls].threads()) * st.pages << " "
+           << st.readRows << " " << st.maxNeed << "\n";
+  }
+  // For the fold-degree model's link tier: every pair a stream could carry
+  // (rule or not): its word, row, rows an instance, the most rows a reader
+  // pass lands, and rows read and written a frame.
+  if (haveSchedule) {
+    std::vector<LinkStream> cands;
+    layoutStreamsOf([](const LinkUse &) { return true; }, cands, nullptr);
+    for (auto &st : cands)
+      os << "    link pair " << modelOf(st.pcls) << " " << modelOf(st.rcls) << " "
+         << st.wordBits << " " << st.dw << " " << st.pages << " " << st.maxNeed
+         << " " << st.readRows << " "
+         << uint64_t(classes[st.pcls].threads()) * st.pages << " "
+         << passesOf(st.pcls) << " " << passesOf(st.rcls) << "\n";
+  }
   // The largest in distributed RAM, by the classes they join.
   SmallVector<std::pair<std::pair<unsigned, unsigned>, std::pair<double, uint64_t>>>
       largest(byPair.begin(), byPair.end());
@@ -6907,8 +7244,12 @@ LogicalResult StaticFolder::buildSim() {
   // responses and free request entries in, its requests out.
   struct SimVirtual {
     unsigned cls, k, firstInput;
+    /// An HBM link stream's (`k` its index), not a class's.
+    bool stream = false;
   };
   SmallVector<SimVirtual> simVirtuals;
+  if (!linkStreams.empty() && failed(planStreams()))
+    return failure();
   for (auto [c, cls] : llvm::enumerate(classes))
     for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
       std::string name = ("vm" + Twine(simVirtuals.size()) + "_").str();
@@ -6930,6 +7271,30 @@ LogicalResult StaticFolder::buildSim() {
       addPort(name + "wr_data", IntegerType::get(context, vm.dataWidth), false);
       addPort(name + "wr_mask", IntegerType::get(context, vm.maskWidth), false);
     }
+  // Each HBM link stream's: its rows a single address (instances 1), the
+  // request's tag a landing slot.
+  for (auto [k, st] : llvm::enumerate(linkStreams)) {
+    if (!st.kept)
+      continue;
+    std::string name = ("vm" + Twine(simVirtuals.size()) + "_").str();
+    st.vm = simVirtuals.size();
+    simVirtuals.push_back({unsigned(k), unsigned(k), unsigned(numIn), true});
+    auto iw = IntegerType::get(context, st.instBits());
+    auto aw = IntegerType::get(context, streamRowBits(st));
+    auto dw = IntegerType::get(context, st.dw);
+    addPort(name + "rsp_valid", i1, true);
+    addPort(name + "rsp_inst", iw, true);
+    addPort(name + "rsp_data", dw, true);
+    addPort(name + "free", IntegerType::get(context, kVirtualFreeWidth), true);
+    addPort(name + "rd_valid", i1, false);
+    addPort(name + "rd_inst", iw, false);
+    addPort(name + "rd_row", aw, false);
+    addPort(name + "wr_valid", i1, false);
+    addPort(name + "wr_inst", iw, false);
+    addPort(name + "wr_row", aw, false);
+    addPort(name + "wr_data", dw, false);
+    addPort(name + "wr_mask", i1, false);
+  }
   OpBuilder tb(netlist);
   auto sim = hw::HWModuleOp::create(tb, netlist.getLoc(),
                                     StringAttr::get(context, simName),
@@ -7400,7 +7765,7 @@ LogicalResult StaticFolder::buildSim() {
     if (!cls.virtualMemories.empty())
       operands.push_back(hostReset);
     for (auto &v : simVirtuals)
-      if (v.cls == c)
+      if (!v.stream && v.cls == c)
         for (unsigned j = 0; j < 3; ++j)
           operands.push_back(body->getArgument(v.firstInput + j));
     copies[c] = hw::InstanceOp::create(b, cls.copy,
@@ -7886,7 +8251,7 @@ LogicalResult StaticFolder::buildSim() {
   // register (forwarded the host cycle the write lands), for the report.
   unsigned linkReads = 0, forwardedReads = 0, forwardedAfter = 0, nowReads = 0,
            lateReads = 0, forwardedLate = 0, compactReads = 0, stagedReads = 0,
-           syncReads = 0, earlyReads = 0, pagedReads = 0;
+           syncReads = 0, earlyReads = 0, pagedReads = 0, streamReads = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
   SmallVector<unsigned> classReaders(producers.size(), 0);
@@ -7901,6 +8266,202 @@ LogicalResult StaticFolder::buildSim() {
     for (int p : read)
       ++classReaders[p];
   }
+
+  // HBM link streams, built on their first member: the landings (tables of
+  // the reader's position, three host cycles ahead, registered to now) read
+  // the landing buffer at the pop pointer; the requests (tables likewise)
+  // issue at the request pointer, a landing slot each, pending until its
+  // response fills it; the producer's word held at its pass and written a
+  // row a host cycle. A landing whose request would have been issued before
+  // the first frame (a frame not run: `cross` frames before, more than have
+  // run) takes no slot and loads zero, the link's content before any write.
+  struct StreamBuilt {
+    Value pop1, inst1, row1, page1, data, popPtr, pending;
+    SmallVector<Value> outs;
+  };
+  std::vector<StreamBuilt> streamBuilt(linkStreams.size());
+  auto streamFor = [&](unsigned k) -> StreamBuilt & {
+    auto &sb = streamBuilt[k];
+    if (sb.data)
+      return sb;
+    auto &st = linkStreams[k];
+    auto &rctl = controls[st.rcls];
+    auto &pctl = controls[st.pcls];
+    std::string prefix = ("lks" + Twine(k)).str();
+    unsigned rthreads = classes[st.rcls].threads();
+    unsigned pthreads = classes[st.pcls].threads();
+    unsigned rIdx = rthreads > 1 ? llvm::Log2_32_Ceil(rthreads) : 0;
+    unsigned pIdx = pthreads > 1 ? llvm::Log2_32_Ceil(pthreads) : 0;
+    unsigned pgBits = st.pages > 1 ? llvm::Log2_32_Ceil(st.pages) : 0;
+    unsigned ib = st.instBits(), slots = st.slots();
+    Value rsp = body->getArgument(simVirtuals[st.vm].firstInput);
+    Value rspInst = body->getArgument(simVirtuals[st.vm].firstInput + 1);
+    Value rspData = body->getArgument(simVirtuals[st.vm].firstInput + 2);
+    auto chain3 = [&](Value v, const Twine &n) {
+      return reg(reg(reg(v, n + "2"), n + "1"), n + "0");
+    };
+    // Enables from reset registers: no request, write or landing from the
+    // host reset's random state.
+    auto chain3r = [&](Value v, const Twine &n) {
+      return resetReg(resetReg(resetReg(v, n + "2", 0), n + "1", 0), n + "0", 0);
+    };
+    // Frames run since the reset (saturating), and each landing's frames
+    // back to its request.
+    int frame = int(ii);
+    auto floorDiv = [&](int x) {
+      return x >= 0 ? x / frame : -((-x + frame - 1) / frame);
+    };
+    SmallVector<uint64_t> cross(ii + 1, 0), last(ii + 1, 0);
+    last[ii - 1] = 1;
+    unsigned maxCross = 0;
+    auto &rcls = classes[st.rcls];
+    for (unsigned i = 0; i < rthreads; ++i) {
+      unsigned n = st.needs[i].size();
+      SmallVector<int> passSlots{rcls.slot[kState][i]};
+      for (unsigned l = 0; l < rcls.readyLevels; ++l)
+        passSlots.push_back(rcls.readySlots(l)[i]);
+      for (int sl : n ? passSlots : SmallVector<int>{})
+        for (unsigned j = 0; j < n; ++j) {
+          int q = sl - int(n) - 1 + int(j);
+          unsigned c = floorDiv(q) - floorDiv(q - int(st.lead));
+          cross[((q % frame) + frame) % frame] = c;
+          maxCross = std::max(maxCross, c);
+        }
+    }
+    unsigned cb = std::max(1u, llvm::Log2_32_Ceil(maxCross + 1));
+    Value last1 = resetReg(resetReg(table(b, rctl.at3, last, 1), prefix + "_last2", 0),
+                           prefix + "_last1", 0);
+    auto ranNext = backedges.get(b.getIntegerType(cb));
+    Value ran = resetReg(ranNext, prefix + "_ran", 0);
+    Value full = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, ran,
+                                      constant(cb, maxCross));
+    Value last0 = resetReg(last1, prefix + "_last0", 0);
+    ranNext.setValue(comb::MuxOp::create(
+        b, comb::AndOp::create(b, last0, notOf(full)),
+        comb::AddOp::create(b, ran, constant(cb, 1)), ran));
+    // The landings, a host cycle ahead.
+    auto t1 = [&](ArrayRef<uint64_t> rows, unsigned w, const Twine &n) -> Value {
+      if (!w)
+        return Value();
+      return reg(reg(table(b, rctl.at3, rows, w), prefix + "_" + n + "2"),
+                 prefix + "_" + n + "1");
+    };
+    sb.pop1 = resetReg(resetReg(table(b, rctl.at3, st.popValid, 1), prefix + "_pop2", 0),
+                       prefix + "_pop1", 0);
+    sb.inst1 = t1(st.popInst, rIdx, "inst");
+    sb.row1 = t1(st.popRow, pIdx, "row");
+    sb.page1 = t1(st.popPage, pgBits, "page");
+    // Missing: requested in a frame before the first (cross > the frames
+    // run, which `ran` counts as the landing's host cycle runs).
+    Value skip0 = constant(1, 0);
+    if (maxCross)
+      skip0 = comb::ICmpOp::create(
+          b, comb::ICmpPredicate::ugt,
+          reg(t1(cross, cb, "cross"), prefix + "_cross0"), ran);
+    Value pop0 = resetReg(sb.pop1, prefix + "_pop0", 0);
+    Value take0 = comb::AndOp::create(b, pop0, notOf(skip0));
+    auto popNext = backedges.get(b.getIntegerType(ib));
+    sb.popPtr = resetReg(popNext, prefix + "_popptr", 0);
+    popNext.setValue(comb::AddOp::create(
+        b, sb.popPtr, b.createOrFold<comb::ConcatOp>(constant(ib - 1, 0), take0)));
+    auto landing = seq::FirMemOp::create(
+        b, seq::FirMemType::get(context, slots, st.dw, 1), /*readLatency=*/0,
+        /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
+        b.getStringAttr(prefix + "_landing"), hw::InnerSymAttr{},
+        seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+    seq::FirMemWriteOp::create(b, landing, rspInst, hostClock, rsp, rspData, Value{});
+    Value read = seq::FirMemReadOp::create(b, landing, sb.popPtr, hostClock,
+                                          constant(1, 1));
+    sb.data = comb::MuxOp::create(b, skip0, constant(st.dw, 0), read);
+    // The requests, now.
+    Value req0 = chain3r(table(b, rctl.at3, st.reqValid, 1), prefix + "_req");
+    Value flip0 = chain3(table(b, rctl.at3, st.reqFlip, 1), prefix + "_flip");
+    Value parity0 = reg(par1, prefix + "_parity0");
+    SmallVector<Value> rowBits{comb::XorOp::create(b, parity0, flip0)};
+    if (pIdx)
+      rowBits.push_back(chain3(table(b, rctl.at3, st.reqRow, pIdx), prefix + "_rrow"));
+    if (pgBits)
+      rowBits.push_back(chain3(table(b, rctl.at3, st.reqPage, pgBits), prefix + "_rpage"));
+    auto reqNext = backedges.get(b.getIntegerType(ib));
+    Value reqPtr = resetReg(reqNext, prefix + "_reqptr", 0);
+    reqNext.setValue(comb::AddOp::create(
+        b, reqPtr, b.createOrFold<comb::ConcatOp>(constant(ib - 1, 0), req0)));
+    // Pending slots: set by a request, cleared by its response.
+    auto pendNext = backedges.get(b.getIntegerType(slots));
+    sb.pending = resetReg(pendNext, prefix + "_pending", 0);
+    auto bitAt = [&](Value on, Value at) -> Value {
+      Value one = b.createOrFold<comb::ConcatOp>(constant(slots - 1, 0), on);
+      return comb::ShlOp::create(
+          b, one, b.createOrFold<comb::ConcatOp>(constant(slots - ib, 0), at));
+    };
+    Value set = comb::OrOp::create(b, sb.pending, bitAt(req0, reqPtr));
+    pendNext.setValue(comb::AndOp::create(
+        b, set, comb::XorOp::create(b, bitAt(rsp, rspInst), constant(slots, ~0ull))));
+    // The writes: the word held at the producer's pass, a row a host cycle
+    // over the pages after it, at {bank, instance, page}.
+    Value pass2 = !st.atReady ? pctl.state2
+                  : st.level  ? pctl.laterReady2[st.level - 1]
+                              : pctl.ready2;
+    Value we0 = resetReg(resetReg(pass2, prefix + "_we1", 0), prefix + "_we0", 0);
+    Value wparity = reg(par1, prefix + "_wparity0");
+    if (pctl.tail2)
+      wparity = comb::XorOp::create(
+          b, wparity, reg(reg(pctl.tail2, prefix + "_tail1"), prefix + "_tail0"));
+    SmallVector<Value> at{notOf(wparity)};
+    if (pIdx)
+      at.push_back(reg(reg(pctl.inst2, prefix + "_winst1"), prefix + "_winst0"));
+    SmallVector<Value> wordParts;
+    for (auto &run : llvm::reverse(st.runs))
+      wordParts.push_back(b.createOrFold<comb::ExtractOp>(
+          b.getIntegerType(run.width),
+          asBits(b, copies[st.pcls].getResult(producers[run.producer].port)),
+          run.low));
+    Value word = b.createOrFold<comb::ConcatOp>(wordParts);
+    Value held = seq::CompRegClockEnabledOp::create(
+        b, word, hostClock, we0, b.getStringAttr(prefix + "_word"), Value(),
+        Value(), Value(), hw::InnerSymAttr());
+    Value heldAt = seq::CompRegClockEnabledOp::create(
+        b, b.createOrFold<comb::ConcatOp>(at), hostClock, we0,
+        b.getStringAttr(prefix + "_word_at"), Value(), Value(), Value(),
+        hw::InnerSymAttr());
+    SmallVector<Value> step;
+    Value previous = we0;
+    for (unsigned j = 0; j < st.pages; ++j)
+      step.push_back(previous = resetReg(previous, prefix + "_wstep" + Twine(j), 0));
+    Value we = step[0];
+    for (unsigned j = 1; j < st.pages; ++j)
+      we = comb::OrOp::create(b, we, step[j]);
+    Value wrRow = heldAt, wrData;
+    unsigned padded = st.dw * st.pages;
+    Value wide = padded > st.wordBits
+                     ? b.createOrFold<comb::ConcatOp>(
+                           constant(padded - st.wordBits, 0), held)
+                     : held;
+    if (pgBits) {
+      SmallVector<Value> indexBits;
+      for (unsigned bit = 0; bit < pgBits; ++bit) {
+        Value v = constant(1, 0);
+        for (unsigned j = 0; j < st.pages; ++j)
+          if (j >> bit & 1)
+            v = comb::OrOp::create(b, v, step[j]);
+        indexBits.push_back(v);
+      }
+      Value index = b.createOrFold<comb::ConcatOp>(
+          SmallVector<Value>(indexBits.rbegin(), indexBits.rend()));
+      SmallVector<Value> chunks;
+      for (unsigned j = 1u << pgBits; j-- > 0;)
+        chunks.push_back(j < st.pages ? b.createOrFold<comb::ExtractOp>(
+                                            b.getIntegerType(st.dw), wide, j * st.dw)
+                                      : constant(st.dw, 0));
+      wrData = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), index);
+      wrRow = b.createOrFold<comb::ConcatOp>(heldAt, index);
+    } else {
+      wrData = wide;
+    }
+    sb.outs = {req0, reqPtr, b.createOrFold<comb::ConcatOp>(rowBits), we,
+               constant(ib, 0), wrRow, wrData, constant(1, 1)};
+    return sb;
+  };
 
   // Each model input: its pieces at positions common to every instance; at
   // each, the sources the instances take it from, each read at the slot's
@@ -8061,6 +8622,7 @@ LogicalResult StaticFolder::buildSim() {
           continue;
         }
         unsigned pThreads = classes[producer.cls].threads();
+        unsigned pThreadsAll = pThreads;
         SmallVector<uint64_t> rows;
         SmallVector<bool> takes;
         rowsOf(key, rows, takes);
@@ -8249,6 +8811,61 @@ LogicalResult StaticFolder::buildSim() {
             ++syncReads;
             ++earlyReads;
           }
+        }
+        // A member of an HBM link stream: its read registers loaded from
+        // the landings, page by page, each where its row lands.
+        auto member = streamMembers.find(
+            {c, consumer.port, at, unsigned(key.first), key.second});
+        if (member != streamMembers.end() && member->second.kept &&
+            linkStreams[member->second.stream].kept) {
+          auto &st = linkStreams[member->second.stream];
+          auto &sb = streamFor(member->second.stream);
+          unsigned off = member->second.offset;
+          unsigned pIdx = pThreadsAll > 1 ? llvm::Log2_32_Ceil(pThreadsAll) : 0;
+          unsigned pgBits = st.pages > 1 ? llvm::Log2_32_Ceil(st.pages) : 0;
+          std::string name = (producer.name + "_to_" + consumer.name + "_" +
+                              Twine(at) + "_hbm")
+                                 .str();
+          Value mine1 = sb.pop1;
+          if (threads > 1) {
+            SmallVector<uint64_t> takeRow(threads, 0);
+            for (unsigned i = 0; i < threads; ++i)
+              takeRow[i] = takes[i];
+            mine1 = comb::AndOp::create(b, mine1, table(b, sb.inst1, takeRow, 1));
+          }
+          if (pIdx) {
+            Value want = threads > 1 ? table(b, sb.inst1, rows, pIdx)
+                                     : constant(pIdx, rows[0]);
+            mine1 = comb::AndOp::create(
+                b, mine1,
+                comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.row1, want));
+          }
+          SmallVector<Value> slices;
+          for (unsigned j = off / st.dw; j <= (off + width - 1) / st.dw; ++j) {
+            unsigned lo = std::max(off, j * st.dw);
+            unsigned hi = std::min(off + width, (j + 1) * st.dw);
+            Value en1 = mine1;
+            if (pgBits)
+              en1 = comb::AndOp::create(
+                  b, en1,
+                  comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.page1,
+                                       constant(pgBits, j)));
+            Value en0 = resetReg(en1, name + "_en" + Twine(j), 0);
+            slices.push_back(seq::CompRegClockEnabledOp::create(
+                b,
+                b.createOrFold<comb::ExtractOp>(b.getIntegerType(hi - lo),
+                                                sb.data, lo - j * st.dw),
+                hostClock, en0, b.getStringAttr(name + Twine(j)), Value(),
+                Value(), Value(), hw::InnerSymAttr()));
+          }
+          std::reverse(slices.begin(), slices.end());
+          sourceData[index] = b.createOrFold<comb::ConcatOp>(slices);
+          ++streamReads;
+          // The only source: the read register (valid from the host cycle
+          // before the slot); one of several: as an early read's output.
+          if (sources.size() == 1)
+            syncPart = true;
+          continue;
         }
         if (page) {
           auto &g = gatherFor(c, page);
@@ -8457,6 +9074,8 @@ LogicalResult StaticFolder::buildSim() {
          << ")";
     if (pagedReads)
       os << "; paged " << pagedReads;
+    if (streamReads)
+      os << "; hbm " << streamReads;
     os << "\n";
     llvm::errs() << os.str();
     if (!reportPath.empty()) {
@@ -8668,7 +9287,31 @@ LogicalResult StaticFolder::buildSim() {
     for (auto &v : simVirtuals)
       terms.push_back(comb::ICmpOp::create(
           b, comb::ICmpPredicate::uge, body->getArgument(v.firstInput + 3),
-          constant(kVirtualFreeWidth, virtualRoom())));
+          constant(kVirtualFreeWidth,
+                   virtualRoom() + (v.stream ? linkStreams[v.k].pages + 1 : 0))));
+    // An HBM link stream's landing at the position: the next slots to land
+    // (as many as the landings decided and not yet run) answered.
+    for (auto &v : simVirtuals) {
+      if (!v.stream)
+        continue;
+      auto &st = linkStreams[v.k];
+      auto &sb = streamFor(v.k);
+      unsigned ib = st.instBits(), slots = st.slots();
+      SmallVector<Value> clear;
+      for (unsigned d = 0; d <= unsigned(decisionLead()) + 2; ++d) {
+        Value at = comb::AddOp::create(b, sb.popPtr, constant(ib, d));
+        Value bit = b.createOrFold<comb::ExtractOp>(
+            i1,
+            comb::ShrUOp::create(
+                b, sb.pending,
+                b.createOrFold<comb::ConcatOp>(constant(slots - ib, 0), at)),
+            0);
+        clear.push_back(notOf(bit));
+      }
+      terms.push_back(comb::OrOp::create(
+          b, notOf(table(b, next, st.popValid, 1)),
+          comb::AndOp::create(b, clear, false)));
+    }
     virtualReady.setValue(comb::AndOp::create(b, terms, false));
   }
 
@@ -8682,6 +9325,11 @@ LogicalResult StaticFolder::buildSim() {
     results.push_back(ready);
   results.append(portOutputs.begin(), portOutputs.end());
   for (auto &v : simVirtuals) {
+    if (v.stream) {
+      auto &outs = streamFor(v.k).outs;
+      results.append(outs.begin(), outs.end());
+      continue;
+    }
     auto &vm = classes[v.cls].virtualMemories[v.k];
     for (unsigned j = 0; j < 8; ++j)
       results.push_back(copies[v.cls].getResult(vm.firstOutput + j));
@@ -8698,6 +9346,14 @@ LogicalResult StaticFolder::buildSim() {
   if (!simVirtuals.empty()) {
     SmallVector<Attribute> virtuals;
     for (auto &v : simVirtuals) {
+      if (v.stream) {
+        auto &st = linkStreams[v.k];
+        virtuals.push_back(b.getStringAttr(
+            "link_" + modelOf(st.pcls) + "_" + modelOf(st.rcls) + ":__link" +
+            Twine(v.k) + ":" + Twine(st.instBits()) + ":" +
+            Twine(streamRowBits(st)) + ":" + Twine(st.dw) + ":1:0:1"));
+        continue;
+      }
       auto &cls = classes[v.cls];
       auto &vm = cls.virtualMemories[v.k];
       unsigned instWidth =

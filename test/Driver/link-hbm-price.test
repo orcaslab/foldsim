@@ -1,0 +1,20 @@
+# The fold-degree model's HBM link streams (foldsim_degree link_stream_cost,
+# link_streams_built): every pair a stream could carry, from the schedule
+# report's `link pair` lines, priced at a frame (a controller, a landing
+# buffer, rows a frame in device memory, 16 written and 16 or 32 read, a beat each);
+# none where the reader's landings do not fit the frame's link port share
+# (the report's own frames, 16 and 64 host cycles); and the streams a
+# schedule with the rule built (`link stream`).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/linkhbm && foldsim --srcs ../../../Driver/Inputs/linkhbm/top.f --top Top --out %t/no --static --nest --modulo --schedule-only Unit Reader > %t/no.log 2>&1
+# RUN: python3 %S/Inputs/linkhbm/price.py foldsim %t/no/schedule.txt | FileCheck %s --check-prefix=NO
+# RUN: foldsim --srcs ../../../Driver/Inputs/linkhbm/top.f --top Top --out %t/hbm --static --nest --modulo --schedule-only --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/hbm.log 2>&1
+# RUN: python3 %S/Inputs/linkhbm/price.py foldsim %t/hbm/schedule.txt | FileCheck %s --check-prefix=HBM
+# RUN: python3 %S/Inputs/linkhbm/price.py foldsim %t/hbm/schedule.txt 256 | FileCheck %s --check-prefix=LONG
+# NO: pair Reader Unit: word 32 rows 16+16 no stream
+# NO: pair Unit Reader: word 32 rows 32+16 no stream
+# NO: built: 0 streams, lut 0, hbm 0
+# LONG: pair Reader Unit: word 32 rows 16+16 stream lut {{[0-9]+}} lutram {{[0-9]+}} hbm 2048
+# LONG: pair Unit Reader: word 32 rows 32+16 stream lut {{[0-9]+}} lutram {{[0-9]+}} hbm 3072
+# HBM: pair Reader Unit: word 32 rows 16+16 no stream
+# HBM: pair Unit Reader: word 32 rows 32+16 no stream
+# HBM: built: 2 streams, lut {{[0-9]+}}, hbm 5120

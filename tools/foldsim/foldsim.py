@@ -1374,7 +1374,7 @@ def main():
         info['vmem_groups'] = vmem_groups(info['vmem'], a.vmem_group, weights, a.vmem_known_zero_bits)
         info['vmem_bytes'] = sum(-(-g['bytes'] // 4096) * 4096 for g in info['vmem_groups'])
         if a.vmem_cache_rows is not None:
-            pseudo = [{'instances': g['instances'] * g['rows'], 'row_width': 0,
+            pseudo = [{'instances': g['instances'] * g['rows'], 'row_width': 0, 'class': g['class'],
                        'data_width': g['data_width']} for g in info['vmem_groups']]
             for g, n in zip(info['vmem_groups'], vmem_cache_rows(pseudo, a.vmem_cache_rows,
                                                                  a.vmem_cache_budget)):
