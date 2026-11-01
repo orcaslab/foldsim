@@ -2241,78 +2241,104 @@ LogicalResult StaticFolder::assignPageEngines() {
   pageRowsOf.clear();
   if (!pageEngineCap)
     return success();
-  // Banks of engines, `width` engines a bank (the most columns of a copy):
-  // column k of a copy goes to engine k of its bank, so a copy's columns,
-  // which move together, read and write at the same positions on engines of
-  // their own. Each copy's page reads and writes are placed at positions of
-  // its windows free on its columns' engines, earliest first:
+  // Each engine takes a read and a write a position. The HBM link streams
+  // first, at their own positions (requests a lead before their landings,
+  // writes after their producer passes), each on the first engine free
+  // there, else a new one. Then each off-chip paged copy, on `columns`
+  // consecutive engines (its columns move together: column k on the k-th),
+  // the first run of engines (new ones past the last) on which its page
+  // reads and writes can be placed at positions free on all of them,
+  // earliest first:
   //  - page j of the instance of state pass s read within
   //    [min(previous state pass, s - lead), s - 1], page 0 by s - 2 (its
   //    read sets the instance's pending read, which the state pass's
-  //    decision must see), the pages in order (one
-  //    fetch at a time: the fetch buffer holds the instance before until its
-  //    state pass), after the frame before's write of the page (the
-  //    controller orders a read after an earlier write of its row);
+  //    decision must see), the pages in order (one fetch at a time: the
+  //    fetch buffer holds the instance before until its state pass), after
+  //    the frame before's write of the page (the controller orders a read
+  //    after an earlier write of its row);
   //  - page j written within [s + 1, next state pass] (the write-back buffer
-  //    holds it until then), in order.
-  // A copy goes to the first bank where all of it fits, else a new bank.
-  unsigned width = 0;
-  SmallVector<unsigned> paged;
+  //    holds it until then), in order;
+  //  - with an on-chip window (page-hbm-window), its prefetches at their own
+  //    positions (each instance's pages from the copy's state pass a window
+  //    before, in a row: its slot's counter expects them so), nothing moved.
+  // So copies and streams whose traffic falls in other positions share
+  // engines.
+  int frame = int(ii);
+  auto wrap = [&](int pos) { return unsigned(((pos % frame) + frame) % frame); };
+  auto newEngine = [&]() -> PageEngine & {
+    pageEngines.emplace_back();
+    pageEngines.back().reads.assign(ii + 1, 0);
+    pageEngines.back().writes.assign(ii + 1, 0);
+    return pageEngines.back();
+  };
+  for (auto [k, st] : llvm::enumerate(linkStreams)) {
+    if (!st.kept)
+      continue;
+    unsigned e = 0;
+    for (; e < pageEngines.size(); ++e) {
+      auto &eng = pageEngines[e];
+      bool clash = false;
+      for (unsigned q = 0; q < ii && !clash; ++q)
+        clash = (st.reqValid[q] && eng.reads[q]) || (st.writeValid[q] && eng.writes[q]);
+      if (!clash)
+        break;
+    }
+    if (e == pageEngines.size()) {
+      if (e >= pageEngineCap)
+        return netlist.emitError("page engines: ")
+               << pageEngineCap << " engines cannot carry the link stream "
+               << modelOf(st.pcls) << " -> " << modelOf(st.rcls);
+      newEngine();
+    }
+    auto &eng = pageEngines[e];
+    for (unsigned q = 0; q < ii; ++q) {
+      eng.reads[q] |= st.reqValid[q];
+      eng.writes[q] |= st.writeValid[q];
+    }
+    eng.streams.push_back(unsigned(k));
+    eng.dataWidth = std::max(eng.dataWidth, st.dw);
+    eng.instWidth = std::max(eng.instWidth, st.tagBits());
+    eng.addrWidth = std::max(eng.addrWidth, streamRowBits(st));
+  }
   for (auto [c, cls] : llvm::enumerate(classes)) {
     if (!cls.page || !cls.pagesOffChip)
       continue;
     unsigned columns = 0;
     for (auto &vm : cls.virtualMemories)
       columns += vm.pages;
-    width = std::max(width, columns);
-    paged.push_back(c);
-  }
-  int frame = int(ii);
-  auto wrap = [&](int pos) { return unsigned(((pos % frame) + frame) % frame); };
-  struct Bank {
-    SmallVector<uint64_t> reads, writes;
-  };
-  SmallVector<Bank> banks;
-  for (unsigned c : paged) {
-    auto &cls = classes[c];
+    if (!columns)
+      continue;
     unsigned p = cls.page, n = cls.threads();
     SmallVector<std::pair<int, unsigned>> states;
     for (unsigned i = 0; i < n; ++i)
       states.push_back({cls.slot[kState][i], i});
     llvm::sort(states);
-    // With an on-chip window (page-hbm-window), its prefetches at their own
-    // positions (each instance's pages from the copy's state pass a window
-    // before, in a row; its slot's counter expects them so): a bank where
-    // they fall free, nothing moved.
     PageRows fixed;
     if (cls.pageWindow)
       offChipRows(cls, fixed.read, fixed.inst, fixed.page, fixed.write, fixed.wpage);
-    // Try each bank, then a new one.
     PageRows rows;
-    unsigned bank = 0;
-    for (;; ++bank) {
-      if (bank == banks.size()) {
-        if ((bank + 1) * width > pageEngineCap)
-          return netlist.emitError("page engines: ")
-                 << pageEngineCap << " engines cannot carry the page columns of "
-                 << cls.name << " (" << width << " a bank)";
-        banks.push_back({SmallVector<uint64_t>(ii, 0), SmallVector<uint64_t>(ii, 0)});
-      }
-      auto &bk = banks[bank];
+    unsigned first = 0;
+    for (;; ++first) {
+      if (first + columns > pageEngineCap)
+        return netlist.emitError("page engines: ")
+               << pageEngineCap << " engines cannot carry the page columns of "
+               << cls.name << " (" << columns << " columns)";
+      // The run's positions taken (engines past the last: none).
+      SmallVector<uint64_t> reads(ii, 0), writes(ii, 0);
+      for (unsigned e = first; e < first + columns && e < pageEngines.size(); ++e)
+        for (unsigned q = 0; q < ii; ++q) {
+          reads[q] |= pageEngines[e].reads[q];
+          writes[q] |= pageEngines[e].writes[q];
+        }
       if (cls.pageWindow) {
         bool clash = false;
         for (unsigned q = 0; q < ii && !clash; ++q)
-          clash = (fixed.read[q] && bk.reads[q]) || (fixed.write[q] && bk.writes[q]);
+          clash = (fixed.read[q] && reads[q]) || (fixed.write[q] && writes[q]);
         if (clash)
           continue;
-        for (unsigned q = 0; q < ii; ++q) {
-          bk.reads[q] |= fixed.read[q];
-          bk.writes[q] |= fixed.write[q];
-        }
         rows = fixed;
         break;
       }
-      SmallVector<uint64_t> reads = bk.reads, writes = bk.writes;
       for (auto *row : {&rows.read, &rows.inst, &rows.page, &rows.write, &rows.wpage})
         row->assign(ii + 1, 0);
       bool fits = true;
@@ -2360,83 +2386,30 @@ LogicalResult StaticFolder::assignPageEngines() {
           lastRead = q;
         }
       }
-      if (!fits)
-        continue;
-      bk.reads = reads;
-      bk.writes = writes;
-      break;
+      if (fits)
+        break;
     }
-    pageRowsOf[c] = rows;
+    pageRowsOf[unsigned(c)] = rows;
+    while (pageEngines.size() < first + columns)
+      newEngine();
     unsigned column = 0;
     for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
       if (!vm.pages)
         continue;
-      unsigned e = bank * width + column++;
-      if (e >= pageEngines.size())
-        pageEngines.resize(e + 1);
-      auto &eng = pageEngines[e];
-      pageEngineOf[{c, unsigned(k)}] = {e, unsigned(eng.members.size())};
-      eng.members.push_back({c, unsigned(k)});
+      auto &eng = pageEngines[first + column++];
+      for (unsigned q = 0; q < ii; ++q) {
+        eng.reads[q] |= rows.read[q];
+        eng.writes[q] |= rows.write[q];
+      }
+      eng.members.push_back({unsigned(c), unsigned(k)});
       eng.dataWidth = std::max(eng.dataWidth, vm.dataWidth);
       eng.instWidth = std::max(eng.instWidth, vm.instWidth);
       eng.addrWidth = std::max(eng.addrWidth, vm.instWidth + vm.rowWidth);
       eng.readFirst = true;
     }
   }
-  // The HBM link streams, at their own positions (requests a lead before
-  // their landings, writes after their producer passes): each on the first
-  // engine where they fall free (a bank's engines are free where the bank
-  // is), else an engine of their own.
-  for (unsigned e = 0; e < pageEngines.size(); ++e)
-    if (width && e / width < banks.size()) {
-      pageEngines[e].reads.assign(banks[e / width].reads.begin(), banks[e / width].reads.end());
-      pageEngines[e].writes.assign(banks[e / width].writes.begin(), banks[e / width].writes.end());
-      pageEngines[e].reads.resize(ii + 1, 0);
-      pageEngines[e].writes.resize(ii + 1, 0);
-    }
-  for (auto [k, st] : llvm::enumerate(linkStreams)) {
-    if (!st.kept)
-      continue;
-    unsigned e = 0;
-    for (; e < pageEngines.size(); ++e) {
-      auto &eng = pageEngines[e];
-      if (eng.members.empty() && eng.streams.empty())
-        continue;
-      bool clash = false;
-      for (unsigned q = 0; q < ii && !clash; ++q)
-        clash = (st.reqValid[q] && eng.reads[q]) || (st.writeValid[q] && eng.writes[q]);
-      if (!clash)
-        break;
-    }
-    if (e == pageEngines.size()) {
-      unsigned built = 0;
-      for (auto &eng : pageEngines)
-        built += !eng.members.empty() || !eng.streams.empty();
-      if (built >= pageEngineCap)
-        return netlist.emitError("page engines: ")
-               << pageEngineCap << " engines cannot carry the link stream "
-               << modelOf(st.pcls) << " -> " << modelOf(st.rcls);
-      pageEngines.emplace_back();
-      pageEngines.back().reads.assign(ii + 1, 0);
-      pageEngines.back().writes.assign(ii + 1, 0);
-    }
-    auto &eng = pageEngines[e];
-    for (unsigned q = 0; q < ii; ++q) {
-      eng.reads[q] |= st.reqValid[q];
-      eng.writes[q] |= st.writeValid[q];
-    }
-    eng.streams.push_back(unsigned(k));
-    eng.dataWidth = std::max(eng.dataWidth, st.dw);
-    eng.instWidth = std::max(eng.instWidth, st.tagBits());
-    eng.addrWidth = std::max(eng.addrWidth, streamRowBits(st));
-  }
-  // Engines of a bank no copy needed (a narrower bank's): none built.
-  std::vector<PageEngine> used;
-  for (auto &eng : pageEngines)
-    if (!eng.members.empty() || !eng.streams.empty())
-      used.push_back(eng);
-  pageEngines.assign(used.begin(), used.end());
-  pageEngineOf.clear();
+  // Member numbers: a column's its place among the engine's columns, a
+  // stream's after them.
   for (auto [e, eng] : llvm::enumerate(pageEngines)) {
     for (auto [m, member] : llvm::enumerate(eng.members))
       pageEngineOf[member] = {unsigned(e), unsigned(m)};
