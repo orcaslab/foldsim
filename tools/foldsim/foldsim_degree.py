@@ -684,9 +684,11 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     # Page engines: the fold's, at least its widest copy's columns and the
     # shares' sum, whole (the shares are priced already; the rest added).
     page_engines = 0
-    if engine_cols:
+    # A schedule built with page engines: at least as many as it has.
+    built_engines = ((sched or {}).get('__links__') or {}).get('engines', 0)
+    if engine_cols or built_engines:
         share = sum(s for _, s in engine_cols)
-        page_engines = max(max(c for c, _ in engine_cols), math.ceil(share - 1e-9))
+        page_engines = max([c for c, _ in engine_cols] + [math.ceil(share - 1e-9), built_engines])
         el, er = storage.page_engine_ctl()
         logic += (page_engines - share) * el
         lutram += (page_engines - share) * er
@@ -933,9 +935,15 @@ def parse_links(text):
                     max_need=int(x[9]))
                for x in re.findall(r'^    link stream (\S+) (\S+) (\d+) (\d+) (\d+) (\d+) (\d+) '
                                    r'(\d+) (\d+) (\d+)(?: \d+)?$', text, re.M)]
+    # HBM page streams built (page-engines): the engines, and the link
+    # streams they carry (no controller of their own).
+    m = re.search(r'^  page engines: (\d+) engines', text, re.M)
+    on_engines = set(re.findall(r' link:(\S+)>(\S+)', '\n'.join(
+        re.findall(r'^    page engine \d+ .*$', text, re.M))))
     return dict(lutram=float(g[2]), lutram_bits=int(g[1]), bram=float(g[5]), bram_bits=int(g[4]),
                 uram=float(g[8]), uram_bits=int(g[7]), ff=int(g[10]), uses=uses, pairs=pairs,
-                streams=streams)
+                streams=streams, engines=int(m.group(1)) if m else 0,
+                engine_streams=on_engines)
 
 
 def link_lutram(depth, width):
@@ -1084,15 +1092,18 @@ def link_streams_built(links):
     """The streams a report's schedule built (`link stream` lines): their
     on-chip cost and HBM bytes a frame, as link_stream_cost prices them."""
     out = dict(lut=0.0, lutram=0.0, ff=0, hbm=0.0, ctl=0)
+    on_engines = (links or {}).get('engine_streams', set())
     for s in (links or {}).get('streams', []):
-        cl, cr = link_stream_ctl(s['dw'])
+        # A stream carried by the page engines: its controller is theirs
+        # (counted with the engines, area).
+        cl, cr = (0.0, 0.0) if (s['p'], s['r']) in on_engines else link_stream_ctl(s['dw'])
         row = max(storage.HBM_BEAT_BYTES, storage.vmem_row_bytes(s['dw']))
         out['lut'] += cl + s['dw'] * storage.page_select_luts(s['pages']) + \
             LINK_STREAM_ENABLE_LUTS * s['kept']
         out['lutram'] += cr + link_lutram(LINK_STREAM_SLOTS, s['dw'])
         out['ff'] += s['word'] + 32
         out['hbm'] += (s['read_rows'] + s['write_rows']) * row
-        out['ctl'] += 1
+        out['ctl'] += 0 if (s['p'], s['r']) in on_engines else 1
     return out
 
 

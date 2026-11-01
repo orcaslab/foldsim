@@ -21,3 +21,15 @@ pair = dict(producer_passes=16, pages=1, reader_passes=16, max_need=1, dw=64, wo
 uses = [dict(banked=True, entries=16, lead=200, width=64, depth=32)]
 own, eng = fd.link_stream_cost(pair, uses, 128), fd.link_stream_cost(pair, uses, 128, engines=True)
 print(f"stream at 128: own ctl {own['ctl']} lut {own['lut']:.0f}; engines ctl {eng['ctl']:.3f} lut {eng['lut']:.0f}")
+# Built (a schedule report with page engines): the engines counted, a stream an engine carries no controller of
+# its own, one that is not its own.
+rep = """  link kinds: distributed 1 64 36; block 0 0 0; ultra 0 0 0; registers 0 0
+    link stream A B 4 0 64 64 1 16 16 1 48
+    link stream C D 4 0 64 64 1 16 16 1 48
+  page engines: 3 engines, 2 page columns
+    page engine 0 512 bits, tag 5, row 9: X:region0_pages link:A>B
+"""
+lk = fd.parse_links(rep)
+b = fd.link_streams_built(lk)
+print(f"built: engines {lk['engines']} carried {sorted(lk['engine_streams'])} controllers {b['ctl']} "
+      f"lut {b['lut']:.0f}")
