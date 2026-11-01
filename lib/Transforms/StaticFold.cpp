@@ -1695,6 +1695,7 @@ LogicalResult StaticFolder::planStreams() {
   struct Room {
     decltype(streamMembers)::iterator member;
     int most, least, late;
+    const LinkUse *use;
   };
   std::vector<Room> rooms;
   for (auto &use : uses) {
@@ -1716,7 +1717,7 @@ LogicalResult StaticFolder::planStreams() {
         late = std::max(late, (s - 2) - (w + frame));
       }
     }
-    rooms.push_back({it, most, least, late});
+    rooms.push_back({it, most, least, late, &use});
   }
   for (auto &st : linkStreams) {
     st.lead = kLinkHbmLead;
@@ -1734,6 +1735,30 @@ LogicalResult StaticFolder::planStreams() {
               r.late <= 0 && st.lead >= linkHbmMinLead();
     r.member->second.kept = ok;
     ++(ok ? st.kept : st.dropped);
+  }
+  // Only the kept members' rows are requested and land: a dropped member's
+  // row may be written after the reads the stream would request of it (its
+  // reason to be dropped), and its links are built as before.
+  {
+    std::vector<std::vector<std::set<std::pair<uint64_t, unsigned>>>> need(linkStreams.size());
+    for (auto [k, st] : llvm::enumerate(linkStreams))
+      need[k].resize(classes[st.rcls].threads());
+    for (auto &r : rooms) {
+      if (!r.member->second.kept)
+        continue;
+      unsigned k = r.member->second.stream, off = r.member->second.offset;
+      auto &st = linkStreams[k];
+      for (auto [i, row] : llvm::zip(r.use->readers, r.use->readerRows))
+        for (unsigned j = off / st.dw; j <= (off + r.use->width - 1) / st.dw; ++j)
+          need[k][i].insert({row, j});
+    }
+    for (auto [k, st] : llvm::enumerate(linkStreams)) {
+      st.maxNeed = 0;
+      for (unsigned i = 0; i < st.needs.size(); ++i) {
+        st.needs[i].assign(need[k][i].begin(), need[k][i].end());
+        st.maxNeed = std::max<unsigned>(st.maxNeed, st.needs[i].size());
+      }
+    }
   }
   for (auto &st : linkStreams) {
     if (!st.kept)
@@ -1840,7 +1865,9 @@ LogicalResult StaticFolder::assignPageEngines() {
   // their own. Each copy's page reads and writes are placed at positions of
   // its windows free on its columns' engines, earliest first:
   //  - page j of the instance of state pass s read within
-  //    [min(previous state pass, s - lead), s - 1], the pages in order (one
+  //    [min(previous state pass, s - lead), s - 1], page 0 by s - 2 (its
+  //    read sets the instance's pending read, which the state pass's
+  //    decision must see), the pages in order (one
   //    fetch at a time: the fetch buffer holds the instance before until its
   //    state pass), after the frame before's write of the page (the
   //    controller orders a read after an earlier write of its row);
@@ -1923,7 +1950,10 @@ LogicalResult StaticFolder::assignPageEngines() {
           q = std::max(q, writeAt[i][j] - frame + 1);
           while (q < st && reads[wrap(q)])
             ++q;
-          if (q >= st || int(p - 1 - j) > st - 1 - q) {
+          // Page 0's read sets the instance's pending read at its decision:
+          // at least two positions before the state pass, whose decision
+          // must see it (the lead's reason).
+          if (q >= st || int(p - 1 - j) > st - 1 - q || (j == 0 && q > st - 2)) {
             fits = false;
             break;
           }
