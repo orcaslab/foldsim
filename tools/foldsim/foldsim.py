@@ -1367,6 +1367,11 @@ def main():
         v.update(row_bytes=row_bytes, base=offset, bytes=size)
         v['known_zero'], v['kz_shift'] = vmem_known_zero((1 << v['row_width']) * v['instances'],
                                                          a.vmem_known_zero_bits)
+        # An HBM link stream's rows: each written before it is read but in
+        # the first frames, whose reads the runtime's cleared image answers;
+        # no known-zero bits (a bit a row would be block RAM).
+        if v['class'].startswith('__link'):
+            v['known_zero'], v['kz_shift'] = 0, 0
         offset += -(-size // 4096) * 4096
     info['vmem_bytes'] = offset
     if a.vmem_group is not None and info['vmem']:

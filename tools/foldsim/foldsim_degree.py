@@ -996,10 +996,19 @@ LINK_STREAM_SLOTS = 64
 LINK_STREAM_ENABLE_LUTS = 2
 
 
+# A stream's controller: the V7B foldsim_vmem as the kernel instantiates it
+# for a stream (INSTANCES 1, a 6-bit tag, AW 16, a whole-row enable, no host
+# cache, no known-zero bits, QUEUE 32, OUTSTANDING 64), Vivado 2025.2
+# synthesis + opt_design out of context on the V80 (st32_1031/lk2/cal): DW
+# 512: 1,435 logic + 753 LUTRAM; 256: 1,302 + 457; no block RAM.
+LINK_STREAM_CTL_LOGIC = (1169.0, 0.52)
+LINK_STREAM_CTL_LUTRAM = (161.0, 1.156)
+
+
 def link_stream_ctl(dw):
-    """A stream's controller (logic, LUTRAM LUTs): foldsim_vmem at INSTANCES 1,
-    a whole-row enable, no host cache."""
-    return storage.vmem_ctl(dw)
+    """A stream's controller (logic, LUTRAM LUTs) for rows of `dw` bits."""
+    return (LINK_STREAM_CTL_LOGIC[0] + LINK_STREAM_CTL_LOGIC[1] * dw,
+            LINK_STREAM_CTL_LUTRAM[0] + LINK_STREAM_CTL_LUTRAM[1] * dw)
 
 
 def link_stream_cost(pair, uses, frame, f=1.0):
