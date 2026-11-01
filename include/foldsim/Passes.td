@@ -557,6 +557,21 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "or black box. The schedule places such a state pass at least the "
            "stages into the frame, its inputs' links the stages earlier, and "
            "its state gap from the read. 0: none">,
+    ListOption<"multicycle", "multicycle", "std::string",
+               "With stage-levels: classes (globs; a copy goes by its class's "
+               "name) staged without stage registers. A copy evaluates one "
+               "instance at a time over M host cycles, M the cone's estimated "
+               "levels over stage-levels: the state and inputs it reads are "
+               "taken into capture registers at the read position (the state "
+               "pass's M + 1 before), the logic computes from them over M "
+               "host cycles into end registers taken a position before the "
+               "state pass, which writes from them; nothing else reads a "
+               "capture register or writes an end register. The schedule "
+               "spaces the copy's state passes at least M positions apart, so "
+               "a capture holds until its end registers are taken. The "
+               "multicycle paths (capture to end, M host cycles) are listed "
+               "for the flow (`foldsim.multicycle`). Only for a class that "
+               "could be staged and reads no memory combinationally">,
     ListOption<"registeredLinks", "registered-links", "std::string",
                "Classes (globs; a copy goes by its class's name) whose links "
                "are never taken in their producer's host cycle: with "
