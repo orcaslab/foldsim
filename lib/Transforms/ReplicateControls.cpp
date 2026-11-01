@@ -187,14 +187,21 @@ void splitMemory(seq::FirMemOp memory, uint64_t loads) {
       for (auto &p : parts) {
         Value data = comb::ExtractOp::create(ub, loc, write.getData(), p.low,
                                              p.width);
-        Value mask;
-        if (write.getMask())
+        Value mask, enable = write.getEnable();
+        if (write.getMask()) {
           mask = comb::ExtractOp::create(
               ub, loc, write.getMask(), p.low / grain,
               std::max<uint64_t>(1, p.width / grain));
+          // A part of one mask bit has a memory of mask width 1, which is
+          // no mask (lowering ignores it): its bit enables the write.
+          if (p.width <= grain) {
+            enable = enable ? Value(comb::AndOp::create(ub, loc, enable, mask))
+                            : mask;
+            mask = Value();
+          }
+        }
         seq::FirMemWriteOp::create(ub, loc, p.memory, write.getAddress(),
-                                   write.getClk(), write.getEnable(), data,
-                                   mask);
+                                   write.getClk(), enable, data, mask);
       }
     }
     user->erase();
