@@ -47,6 +47,13 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/late -DBUBBLES -DVM1 -Mdir %t/late/obj %S/Inputs/tb_pages.sv top.sv %t/late/foldsim_sim.sv > %t/late/build.log 2>&1
 # RUN: %t/late/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s
 # RUN: %t/late/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=3 +bubble=20 | FileCheck %s
+# An on-chip window (--page-hbm-window: each instance prefetched a window of
+# state passes ahead into its slot) carried by engines: the prefetches at
+# their own positions, a bank where they fall free.
+# RUN: foldsim --srcs top.f --top Top --out %t/win --static --bubbles --page 2 --page-hbm-window 2 --copies Leaf:2 --interleave-copies --storage Leaf:pages=hbm --page-engines auto Leaf > %t/win.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/win -DBUBBLES -DVM1 -Mdir %t/win/obj %S/Inputs/tb_pages.sv top.sv %t/win/foldsim_sim.sv > %t/win/build.log 2>&1
+# RUN: %t/win/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s
+# RUN: %t/win/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=60 +stall=20 +full=20 +bubble=30 | FileCheck %s
 # A cap below a copy's columns.
 # RUN: not foldsim --srcs top.f --top Top --out %t/cap --static --page 1 --storage Leaf:pages=hbm --page-hbm-column-bits 64 --page-engines 2 Leaf 2>&1 | FileCheck %s --check-prefix=CAP
 # Two models sharing one engine, alone and beside link streams.

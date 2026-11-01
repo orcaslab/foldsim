@@ -1882,10 +1882,6 @@ LogicalResult StaticFolder::assignPageEngines() {
   for (auto [c, cls] : llvm::enumerate(classes)) {
     if (!cls.page || !cls.pagesOffChip)
       continue;
-    if (cls.pageWindow)
-      return netlist.emitError("page engines: ")
-             << cls.name << " has an on-chip page window (page-hbm-window); "
-             << "engines carry pages fetched directly";
     unsigned columns = 0;
     for (auto &vm : cls.virtualMemories)
       columns += vm.pages;
@@ -1907,6 +1903,13 @@ LogicalResult StaticFolder::assignPageEngines() {
     for (unsigned i = 0; i < n; ++i)
       states.push_back({cls.slot[kState][i], i});
     llvm::sort(states);
+    // With an on-chip window (page-hbm-window), its prefetches at their own
+    // positions (each instance's pages from the copy's state pass a window
+    // before, in a row; its slot's counter expects them so): a bank where
+    // they fall free, nothing moved.
+    PageRows fixed;
+    if (cls.pageWindow)
+      offChipRows(cls, fixed.read, fixed.inst, fixed.page, fixed.write, fixed.wpage);
     // Try each bank, then a new one.
     PageRows rows;
     unsigned bank = 0;
@@ -1919,6 +1922,19 @@ LogicalResult StaticFolder::assignPageEngines() {
         banks.push_back({SmallVector<uint64_t>(ii, 0), SmallVector<uint64_t>(ii, 0)});
       }
       auto &bk = banks[bank];
+      if (cls.pageWindow) {
+        bool clash = false;
+        for (unsigned q = 0; q < ii && !clash; ++q)
+          clash = (fixed.read[q] && bk.reads[q]) || (fixed.write[q] && bk.writes[q]);
+        if (clash)
+          continue;
+        for (unsigned q = 0; q < ii; ++q) {
+          bk.reads[q] |= fixed.read[q];
+          bk.writes[q] |= fixed.write[q];
+        }
+        rows = fixed;
+        break;
+      }
       SmallVector<uint64_t> reads = bk.reads, writes = bk.writes;
       for (auto *row : {&rows.read, &rows.inst, &rows.page, &rows.write, &rows.wpage})
         row->assign(ii + 1, 0);
