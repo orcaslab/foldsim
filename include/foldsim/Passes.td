@@ -538,6 +538,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "which is the read register (0: none)">,
     Option<"linkUltraDepth", "link-ultra-depth", "unsigned", "0",
            "As link-block-depth, in ultra RAM (0: none)">,
+    Option<"moduloLinear", "modulo-linear", "unsigned", "16",
+           "With modulo: the periods tried one at a time from the frame's "
+           "lower bound before the search skips ahead (a doubling step until "
+           "one schedules, then halving the interval to the last that did "
+           "not); the frame found may then be a few periods above the least">,
     Option<"linkKinds", "link-kinds", "std::string", "\"\"",
            "Per pair of models, the RAM of the links between them that "
            "link-block-depth's rules let block or ultra RAM hold, whatever "

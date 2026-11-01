@@ -304,6 +304,8 @@ def frame_options(a):
         fold += ' overlap-frames=false'
     if a.modulo:
         fold += ' modulo'
+    if getattr(a, 'modulo_linear', None) is not None:
+        fold += f' modulo-linear={a.modulo_linear}'
     if a.interleave_copies:
         fold += ' interleave-copies'
     if getattr(a, 'spec_groups', ''):
@@ -865,6 +867,9 @@ def main():
     ap.add_argument('--modulo', action='store_true',
                     help='with --static: overlap consecutive frames, a slot past the frame running in '
                          'the next frame\'s, when that frame is shorter')
+    ap.add_argument('--modulo-linear', type=int, metavar='N',
+                    help='with --modulo: the periods tried one at a time from the lower bound before '
+                         'the search skips ahead (foldsim-fold-static modulo-linear; default 16)')
     ap.add_argument('--axi-spec', nargs='?', type=int, const=1, default=0, choices=(1, 2),
                     metavar='DEPTH',
                     help="with --static: each AXI4 port's R and AR ready are offered by the "

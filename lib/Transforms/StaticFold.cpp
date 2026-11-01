@@ -292,6 +292,9 @@ struct Evaluation {
 
 class StaticFolder {
 public:
+  /// The modulo search's periods tried one at a time before it skips ahead
+  /// (pass option modulo-linear).
+  unsigned moduloLinear = 16;
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
                unsigned regionBits, StringRef report,
                ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
@@ -452,6 +455,8 @@ private:
       ArrayRef<SmallVector<std::pair<unsigned, int>>> succs,
       ArrayRef<int> height, const ReadyWrites &writes,
       SmallVectorImpl<SmallVector<int>> &slots, unsigned below);
+  /// The last modulo search: its lower bound and the periods it tried.
+  unsigned moduloLower = 0, moduloTried = 0;
   LogicalResult buildCopy(Class &cls);
   LogicalResult buildSim();
 
@@ -2477,8 +2482,42 @@ unsigned StaticFolder::placeModulo(
     return slack;
   };
   // A frame no shorter than `below` is of no use: the frames apart are.
-  for (unsigned period = lower; period <= 4 * lower + 64 && period < below;
-       ++period) {
+  // The periods tried: one at a time from the lower bound for the first
+  // kLinear, then skipping ahead by a doubling step until one schedules,
+  // then halving the interval between the last that did not and the first
+  // that did, down to adjacent periods (a modulo schedule's feasibility is
+  // not strictly monotone in the period, so the frame found may be a few
+  // periods above the least, never below one that failed). Each period is
+  // the same attempt; the one returned is re-run last when the search went
+  // past it, since an attempt leaves its slots in place.
+  const unsigned kLinear = std::max(1u, moduloLinear);
+  unsigned top = std::min(4 * lower + 64, below ? below - 1 : 0u);
+  unsigned failed = lower - 1, scheduled = 0, step = 1;
+  auto advance = [&](unsigned period, bool fits) -> unsigned {
+    if (fits)
+      scheduled = period;
+    else
+      failed = std::max(failed, period);
+    if (!scheduled) {
+      if (period >= top)
+        return 0;
+      if (period - lower + 1 < kLinear)
+        return period + 1;
+      unsigned next = std::min(top, period + step);
+      step *= 2;
+      return next;
+    }
+    if (scheduled - failed <= 1)
+      return scheduled;
+    return failed + (scheduled - failed) / 2;
+  };
+  bool fitsNow = false;
+  moduloLower = lower;
+  moduloTried = 0;
+  for (unsigned period = lower; period && period <= top;
+       period = advance(period, fitsNow)) {
+    fitsNow = false;
+    ++moduloTried;
     // List scheduling, a copy's slots taken modulo the frame; an evaluation
     // runs at most one frame late.
     SmallVector<int> slotOf(nodes.size(), -1);
@@ -2730,8 +2769,10 @@ unsigned StaticFolder::placeModulo(
       if (at + envSlack(k, period) > int(period))
         ok = false;
     }
-    if (ok)
+    // The least period not ruled out: done; otherwise search below it.
+    if (ok && period <= failed + 1)
       return period;
+    fitsNow = ok;
   }
   return 0;
 }
@@ -4154,6 +4195,9 @@ LogicalResult StaticFolder::schedule() {
   std::string text;
   llvm::raw_string_ostream os(text);
   os << "foldsim-fold-static: II = " << ii << "\n";
+  if (moduloTried)
+    os << "modulo search: lower bound " << moduloLower << ", " << moduloTried
+       << " periods tried\n";
   if (zeroLatencyLinks) {
     // Each class input fed by a late link, and those taken in its producer's
     // host cycle.
@@ -8920,6 +8964,7 @@ void FoldStaticPass::runOnOperation() {
                       pageMemoryBits, pageMemories, pageRows, compactLinks,
                       registeredLinks, shareLinks, stagedLinks, linkBlockDepth,
                       linkUltraDepth, linkKinds);
+  folder.moduloLinear = moduloLinear;
   if (failed(folder.run()))
     return signalPassFailure();
 }
