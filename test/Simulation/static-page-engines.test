@@ -59,13 +59,14 @@
 # Two models sharing one engine, alone and beside link streams.
 # RUN: cd %S/../Driver/Inputs/linkhbm
 # The link streams on engines too (their requests and writes at positions,
-# a member tag their landing slot or write tag): here each on one of its own.
+# a member tag their landing slot or write tag), placed first, the pages
+# around them: one stream shares the two models' page engine.
 # RUN: foldsim --srcs top.f --top Top --out %t/two --static --nest --modulo --page 1 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=TWO
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/two -DVM1 -DVM2 -Mdir %t/two/obj %S/Inputs/tb_linkhbm.sv top.sv %t/two/foldsim_sim.sv > %t/two/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/two -DVM1 -Mdir %t/two/obj %S/Inputs/tb_linkhbm.sv top.sv %t/two/foldsim_sim.sv > %t/two/build.log 2>&1
 # RUN: %t/two/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=60 | FileCheck %s
 # RUN: %t/two/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=1 +hi=20 +stall=30 +full=20 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/mix --static --nest --modulo --bubbles --page 2 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/mix.log 2>&1
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/mix -DVM1 -DVM2 -DVM3 -DBUBBLES -Mdir %t/mix/obj %S/Inputs/tb_linkhbm.sv top.sv %t/mix/foldsim_sim.sv > %t/mix/build.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/mix --static --nest --modulo --bubbles --page 2 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=MIX
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/mix -DVM1 -DBUBBLES -Mdir %t/mix/obj %S/Inputs/tb_linkhbm.sv top.sv %t/mix/foldsim_sim.sv > %t/mix/build.log 2>&1
 # RUN: %t/mix/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 +bubble=30 | FileCheck %s
 # RUN: %t/mix/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=1 +hi=30 +stall=30 +full=20 | FileCheck %s
 # C2: page engines: 2 engines, 2 page columns
@@ -79,12 +80,12 @@
 # VH: `define FOLDSIM_VMEM_0_INSTANCES 1
 # VH: `define FOLDSIM_VMEM_0_TAGW 4
 # VH: `define FOLDSIM_VMEM_0_KNOWN_ZERO 0
-# CAP: error: page engines: 2 engines cannot carry the page columns of Leaf (3 a bank)
-# TWO: page engines: 3 engines, 2 page columns
-# TWO: page engine 0 32 bits, tag 5, row 6: Unit:region1_pages Reader:region1_pages
-# TWO: page engine 1 32 bits, tag 7, row 6: link:Reader>Unit
-# TWO: page engine 2 32 bits, tag 7, row 6: link:Unit>Reader
+# CAP: error: page engines: 2 engines cannot carry the page columns of Leaf (3 columns)
+# TWO: page engines: 2 engines, 2 page columns
+# TWO: page engine 0 32 bits, tag 8, row 7: Unit:region1_pages Reader:region1_pages link:Reader>Unit
+# TWO: page engine 1 32 bits, tag 7, row 6: link:Unit>Reader
 # IL: page engines: 1 engines, 2 page columns
+# MIX: page engines: 2 engines, 2 page columns
 # CHECK-NOT: PROTOCOL
 # CHECK: {{^}}MATCH 196 cycles
 # CHECK-NOT: PROTOCOL
