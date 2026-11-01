@@ -10939,16 +10939,15 @@ LogicalResult StaticFolder::buildSim() {
       }
     }
     for (auto &v : simVirtuals) {
-      unsigned extra = v.stream ? linkStreams[v.k].pages + 1 : 0;
-      if (v.engine)
-        for (unsigned k : pageEngines[v.k].streams)
-          extra = std::max(extra, linkStreams[k].pages + 1);
+      // (An HBM link stream's page writes are at positions too, one a
+      // position: no room past the decisions' in flight. Before they were,
+      // its `pages` writes after a pass needed that many more, which a
+      // stream of more pages than the controller's queue could never get.)
       terms.push_back(comb::ICmpOp::create(
           b, comb::ICmpPredicate::uge, body->getArgument(v.firstInput + 3),
           constant(kVirtualFreeWidth,
                    virtualRoom(!v.stream && !v.engine &&
-                               classes[v.cls].virtualMemories[v.k].delayed) +
-                       extra)));
+                               classes[v.cls].virtualMemories[v.k].delayed))));
     }
     // An HBM link stream's landing at the position: the next slots to land
     // (as many as the landings decided and not yet run) answered.

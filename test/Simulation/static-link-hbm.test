@@ -53,6 +53,15 @@
 # RUN: cd %S/../Driver/Inputs/linklate && foldsim --srcs top.f --top Top --out %t/late --static --nest --modulo --link-kinds Unit:Reader:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=LATE
 # LATE: II =
 # LATE-NOT: link stream
+# A stream of 26 pages (Driver/Inputs/linkwide: a 13,000-bit word) behind a
+# controller of 32 entries' room: its page writes are at positions, one a
+# position, so it asks no more room than the decisions in flight take (before,
+# pages + 1 more: never there, no position ran).
+# RUN: cd %S/../Driver/Inputs/linkwide && foldsim --srcs top.f --top Top --out %t/wide --static --nest --modulo --link-kinds Unit:Reader:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=WIDE
+# RUN: cd %S/../Driver/Inputs/linkwide && %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/wide -Mdir %t/wide/obj %S/Inputs/tb_linkhbm.sv top.sv %t/wide/foldsim_sim.sv > %t/wide/build.log 2>&1
+# RUN: %t/wide/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=20 +room=32 | FileCheck %s
+# RUN: %t/wide/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +room=32 +full=20 | FileCheck %s
+# WIDE: link stream Unit Reader 1 0 13000 512 26
 # TWO: II = 64
 # TWO: link streams: 2 streams, 3 links, 2304 bits
 # TWO: link stream Reader Unit 1 0 32 32 1 16 16 1 {{[0-9]+}}
