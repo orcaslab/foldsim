@@ -5354,16 +5354,24 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
                           Twine(cls.multicycle) + " host cycles apart, or "
                           "another capture between")
                              .str();
-      sv::IfDefOp::create(
-          b, "SYNTHESIS", [] {},
-          [&] {
-            sv::AlwaysOp::create(b, ArrayRef{sv::EventControl::AtPosEdge},
-                                 ArrayRef{clock}, [&] {
-              sv::IfOp::create(b, comb::OrOp::create(b, early, late), [&] {
-                sv::FatalProceduralOp::create(b, 1, b.getStringAttr(what));
-              });
-            });
+      // Off in synthesis, unless FOLDSIM_CHECKS is defined (a gate that
+      // simulates the synthesis view, -DSYNTHESIS, keeps it).
+      if (!top.lookupSymbol<sv::MacroDeclOp>("FOLDSIM_CHECKS")) {
+        OpBuilder tb(top.getBody(), top.getBody()->begin());
+        sv::MacroDeclOp::create(tb, cls.model.getLoc(), "FOLDSIM_CHECKS");
+      }
+      Value violation = comb::OrOp::create(b, early, late);
+      auto monitor = [&] {
+        sv::AlwaysOp::create(b, ArrayRef{sv::EventControl::AtPosEdge},
+                             ArrayRef{clock}, [&] {
+          sv::IfOp::create(b, violation, [&] {
+            sv::FatalProceduralOp::create(b, 1, b.getStringAttr(what));
           });
+        });
+      };
+      sv::IfDefOp::create(b, "FOLDSIM_CHECKS", monitor, [&] {
+        sv::IfDefOp::create(b, "SYNTHESIS", [] {}, monitor);
+      });
     }
     cls.multicycleCaps = capBits;
     cls.multicycleEnds = endBits;
