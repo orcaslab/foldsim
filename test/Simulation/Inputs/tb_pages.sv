@@ -12,7 +12,11 @@
 // low on +full=<percent> of the host cycles. The channels stall on
 // +stall=<percent> of the host cycles; with BUBBLES, `advance` is low on
 // +bubble=<percent>. Prints MATCH or the first difference, and PROTOCOL if
-// the simulator issues a read of an instance whose read is still outstanding.
+// the simulator issues a read of an instance whose read is still outstanding,
+// or a write of one (the controller's guarantees hold per tag and instance:
+// an HBM page stream's engine, --page-engines, tags each request with its
+// column and the column's instance, the instance port's top
+// FOLDSIM_VMEM_<k>_TAGW bits, at rows of its own).
 // With REAL_VMEM, the kernel's own controller (foldsim_vmem.sv, given on the
 // command line) serves each one, in front of an AXI memory model.
 `include "foldsim_sim.vh"
@@ -48,6 +52,12 @@ module vmem_bytes_model #(parameter IW = 2, AW = 1, DW = 8, MW = 1) (
   end
   always @(posedge clk) if (!rst) begin
     if (rsp_valid) outstanding[rsp_inst] = 0;
+    // (A read and a write of an instance in one host cycle are a read-first
+    // pair: the write is checked against the reads before it.)
+    if (wr_valid && outstanding[wr_inst]) begin
+      if (ok) $display("PROTOCOL: write of instance %0d, whose read is outstanding, at host cycle %0d", wr_inst, cyc);
+      ok = 0;
+    end
     if (rd_valid) begin
       if (outstanding[rd_inst]) begin
         if (ok) $display("PROTOCOL: read of instance %0d at host cycle %0d", rd_inst, cyc);
@@ -145,7 +155,7 @@ module axi_mem_model #(parameter IDW = 4) (
   end
 endmodule
 
-module vmem_real #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 4) (
+module vmem_real #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 4, TAGW = 0) (
     input logic clk, rst,
     input int cyc, lo, hi, full,
     output logic rsp_valid, output logic [IW-1:0] rsp_inst, output logic [DW-1:0] rsp_data,
@@ -158,7 +168,7 @@ module vmem_real #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 4) (
   wire [63:0] awaddr, araddr; wire [63:0] wstrb; wire [511:0] wdata, rdata;
   wire [3:0] awid, bid, arid, rid; wire [7:0] awlen, arlen;
   wire [5:0] free6; wire moving;
-  foldsim_vmem #(.IW(IW), .AW(AW), .DW(DW), .MW(MW), .INSTANCES(INSTANCES)) ctl(
+  foldsim_vmem #(.IW(IW - TAGW), .TAGW(TAGW), .AW(AW), .DW(DW), .MW(MW), .INSTANCES(INSTANCES)) ctl(
     .clk, .reset(rst), .rd_valid, .rd_inst, .rd_row, .wr_valid, .wr_inst, .wr_row, .wr_data, .wr_mask,
     .rsp_valid, .rsp_inst, .rsp_data, .free(free6), .base(64'h0), .zero(1'b1), .move(1'b0), .moving,
     .m_awvalid(awvalid), .m_awready(awready), .m_awaddr(awaddr), .m_awid(awid), .m_awlen(awlen),
@@ -185,7 +195,11 @@ module vmem_real #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 4) (
   end
 endmodule
 `define VMEM_MODULE vmem_real
+`ifdef FOLDSIM_VMEM_TAGS
+`define VMEM_INSTANCES(k) , .INSTANCES(`FOLDSIM_VMEM_``k``_INSTANCES), .TAGW(`FOLDSIM_VMEM_``k``_TAGW)
+`else
 `define VMEM_INSTANCES(k) , .INSTANCES(`FOLDSIM_VMEM_``k``_INSTANCES)
+`endif
 `else
 `define VMEM_MODULE vmem_bytes_model
 `define VMEM_INSTANCES(k)

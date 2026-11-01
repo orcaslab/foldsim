@@ -360,6 +360,8 @@ def frame_options(a):
         fold += f' page-hbm-window={a.page_hbm_window}'
     if getattr(a, 'page_hbm_column_bits', None):
         fold += f' page-hbm-column-bits={a.page_hbm_column_bits}'
+    if getattr(a, 'page_engines', None):
+        fold += f' page-engines={4096 if a.page_engines == "auto" else int(a.page_engines)}'
     if getattr(a, 'compact_links', False):
         fold += ' compact-links'
     if getattr(a, 'share_links', False):
@@ -759,7 +761,7 @@ def vmem_groups(vmems, choice, weights=None, kz_bits=0):
         if first.get('tag_width'):
             g['tag_width'] = first['tag_width']
         # An HBM link stream's controller: no known-zero bits (as ungrouped).
-        if first['class'].startswith('__link'):
+        if first['class'].startswith(('__link', '__pages')):
             g['known_zero'], g['kz_shift'] = 0, 0
         for j, k in enumerate(ks):
             vmems[k].update(group=len(groups), group_member=j,
@@ -1000,6 +1002,12 @@ def main():
                     help='with --page and --storage <model>:pages=hbm: the most bits of a page word '
                          'in one virtual memory row (foldsim-fold-static page-hbm-column-bits; '
                          'default 4096)')
+    ap.add_argument('--page-engines', metavar='N|auto',
+                    help='with pages off chip: the page columns carried by at most N shared engines '
+                         '(HBM page streams: one virtual memory of tagged requests each, columns of '
+                         'copies whose page traffic falls in other positions sharing one), instead of '
+                         'a controller per column; auto: as few as the positions allow '
+                         '(foldsim-fold-static page-engines)')
     ap.add_argument('--no-page-masks', action='store_true',
                     help='with --page: a dense page word, a register under an enable writing its old '
                          'value where the enable is low, instead of byte write masks by enable '
@@ -1382,7 +1390,7 @@ def main():
         # An HBM link stream's rows: each written before it is read but in
         # the first frames, whose reads the runtime's cleared image answers;
         # no known-zero bits (a bit a row would be block RAM).
-        if v['class'].startswith('__link'):
+        if v['class'].startswith(('__link', '__pages')):
             v['known_zero'], v['kz_shift'] = 0, 0
         offset += -(-size // 4096) * 4096
     info['vmem_bytes'] = offset

@@ -415,6 +415,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     units, copy_logic, base_lutram = [], {}, 0.0
     page_of = {}
     paged = dict(bits=0, ff=0, ports=0, hbm=0)
+    # With page engines: each off-chip paged copy's (columns, engine share).
+    engine_cols = []
     for c, n in classes.items():
         k = degree.get(c, 1)
         kappa, lam = factors(cal, c, est[c]['lut'])
@@ -433,8 +435,14 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             if form == 'paged' and info.get('offchip'):
                 bits, mux, _ = paged_state(est[c])
                 pc = storage.page_cost(bits, t, info['page'], 'hbm')
-                # Its controllers (a column each) too.
-                cl, cr = storage.page_ctl(bits, info['page'], pc['controllers'])
+                # Its controllers (a column each) too; with page engines, its
+                # share of them (counted again for the fold below).
+                if tiers is not None and tiers.get('page_engines'):
+                    eng = storage.page_hbm_cost(bits, t, info['page'], tiers['frame'])
+                    cl, cr = eng['lut'] - pc['lut'], eng['lutram'] - pc['lutram']
+                    engine_cols.append((eng['engine_columns'], eng['ctl']))
+                else:
+                    cl, cr = storage.page_ctl(bits, info['page'], pc['controllers'])
                 logic += pc['lut'] + mux + cl
                 base_lutram += cr
                 copy_logic[(c, j)] += pc['lut'] + mux + cl
@@ -452,7 +460,9 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                 pcost = {k: dict(v, lutram=0.0, ii_floor=0) for k, v in pcost.items()}
                 if tiers is not None and (tiers.get('pages_hbm') or
                                           c in tiers.get('force_pages', ())):
-                    pcost['hbm'] = dict(storage.page_hbm_cost(bits, t, info['page']),
+                    pcost['hbm'] = dict(storage.page_hbm_cost(
+                                            bits, t, info['page'],
+                                            tiers['frame'] if tiers.get('page_engines') else None),
                                         ii_floor=0, bubbles=t * max(
                                             0, storage.HBM_ROUND_TRIP + 7 - tiers['frame'] // t))
                 units.append(dict(costs=pcost,
@@ -637,6 +647,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         u['kind'] = kind
         if kind == 'hbm' and u['store'] == 'pages':
             off['pages_offchip'].append(u['class'])
+            if 'engine_columns' in u['costs']['hbm']:
+                engine_cols.append((u['costs']['hbm']['engine_columns'], u['costs']['hbm']['ctl']))
             paged['ports'] -= u['costs']['block']['ports']
             paged['hbm'] += u['costs']['hbm']['hbm']
         elif kind == 'hbm':
@@ -654,6 +666,15 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             if key not in taken:
                 taken.add(key)
                 rules.append(rule)
+    # Page engines: the fold's, at least its widest copy's columns and the
+    # shares' sum, whole (the shares are priced already; the rest added).
+    page_engines = 0
+    if engine_cols:
+        share = sum(s for _, s in engine_cols)
+        page_engines = max(max(c for c, _ in engine_cols), math.ceil(share - 1e-9))
+        el, er = storage.page_engine_ctl()
+        logic += (page_engines - share) * el
+        lutram += (page_engines - share) * er
     sites = logic + storage.LUTRAM_SITES * lutram
     res = dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
                sites=round(sites), fits=fits, bram=round(bram, 1), uram=uram,
@@ -661,7 +682,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                link_uram=lk['uram'], link_ff=lk['ff'],
                largest_copy=round(max(per_copy.values())), storage=','.join(rules),
                **({'link_kinds': ','.join(link_rules)} if lu else {}),
-               **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged))
+               **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged),
+               **({'page_engines': page_engines} if page_engines else {}))
     if tiers is not None:
         res.update(off, hbm_bytes=round(off['hbm_bytes']), hbm_cap=round(caps['hbm']))
     return res
@@ -1586,7 +1608,7 @@ FRAME_STEPS = (1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8)
 def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True, vmem=None,
                  pattern='', weights=None, pages_hbm=True, row_bytes_min=1, max_ii=1 << 16,
                  page=True, link_pages=True, link_hbm=False, frame_growth=None,
-                 vmem_group=None):
+                 vmem_group=None, page_engines=False):
     """--state auto: where each class's state lives, three tiers, priced.
 
       on chip    register stores and memories in flops, distributed, block or
@@ -1687,7 +1709,7 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
             continue
         tiers = dict(frame=f, base_hbm=base_hbm, base_bubbles=base_bubbles, weights=weights,
                      pages_hbm=pages_hbm, row_bytes_min=row_bytes_min, link_pages=link_pages,
-                     link_hbm=link_hbm, vmem_group=vmem_group)
+                     link_hbm=link_hbm, vmem_group=vmem_group, page_engines=page_engines)
         if f == ii:
             res = area(cal, est, classes, {}, rest, sched, f, entries, 'auto', route, uram,
                        vmem=vmem, tiers=tiers)
@@ -1957,6 +1979,9 @@ def main():
     st.add_argument('--exact', action='store_true',
                     help='choose the kinds exactly (a 0-1 program, HiGHS through scipy) instead of '
                          'the repair and polish: the least routing load with every pool in cap')
+    st.add_argument('--page-engines', action='store_true',
+                    help='price off-chip pages carried by shared page engines (foldsim '
+                         '--page-engines: HBM page streams) instead of a controller per column')
     st.add_argument('--link-hbm', action='store_true',
                     help='price links in HBM too (a what-if: the compiler builds none)')
     st.add_argument('--links-from', default='', metavar='SCHEDULE',
@@ -2033,7 +2058,8 @@ def state_main(a):
                        weights=weights, pages_hbm=not a.no_pages_hbm,
                        row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page,
                        link_pages=not a.no_link_pages, link_hbm=a.link_hbm,
-                       frame_growth=a.frame_growth, vmem_group=a.vmem_group)
+                       frame_growth=a.frame_growth, vmem_group=a.vmem_group,
+                       page_engines=a.page_engines)
     if links:
         lk = link_cost(cal, links)
         print(f"links: {(links['lutram_bits'] + links['bram_bits'] + links['uram_bits']) / 1e6:.1f} "

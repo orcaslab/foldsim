@@ -206,8 +206,9 @@ def vmem_cache_rows(vmems, choice, budget):
     `vmems`: dicts with instances, row_width (address bits) and data_width.
     A cache's lines live in block RAM in one port pair (bram36). An HBM link
     stream's (class `__link<k>`: every row written once and read once a
-    frame, in slot order) has none."""
-    caps = [0 if str(v.get('class', '')).startswith('__link') else
+    frame, in slot order) has none, nor an HBM page stream's engine
+    (`__pages<k>`: each page row written and read once a frame)."""
+    caps = [0 if str(v.get('class', '')).startswith(('__link', '__pages')) else
             pow2_floor(v['instances'] << v['row_width']) for v in vmems]
     if choice != 'auto':
         n = int(choice)
@@ -429,10 +430,50 @@ def vmem_cost(depth, width, threads, weight=1.0, row_bytes_min=1):
                 ii_floor=0, hbm=2 * weight * threads * row, ctl=1)
 
 
-def page_hbm_cost(bits, threads, p):
+# HBM page streams (foldsim --page-engines): an off-chip page word in columns
+# of an AXI beat, carried by engines shared by copies (a page engine is one
+# foldsim_vmem of one image, INSTANCES 1, requests tagged by column and
+# instance, TAGW): each engine takes a read and a write a host cycle, so a
+# copy's page traffic, p x threads positions a frame on each of its columns'
+# engines, takes that share of `columns` engines. The engines a fold needs are
+# at least the most columns of a copy and the shares' sum (rounded up), as
+# many as the schedule's positions let the assignment share (foldsim-fold-
+# static assignPageEngines; more where copies' traffic collides).
+PAGE_ENGINE_BITS = 512
+# An engine's (logic, LUTRAM) LUTs, linear in its row's bits: calibrated
+# (virt_1101 cal/, Vivado 2025.2 synthesis + opt_design out of context on the
+# V80, V8B foldsim_vmem as foldsim_afu instantiates a page engine: INSTANCES 1,
+# IW 1, TAGW 10, AW 12, byte masks, QUEUE 32, OUTSTANDING 128, WRITES_OUT
+# 128). Until measured: the HBM link stream controller's (st32_1031 lk2/cal).
+PAGE_ENGINE_LOGIC = (1169.0, 0.52)
+PAGE_ENGINE_LUTRAM = (161.0, 1.156)
+
+
+def page_engine_ctl(row_bits=PAGE_ENGINE_BITS):
+    """A page engine's (logic LUTs, LUTRAM LUTs)."""
+    return (PAGE_ENGINE_LOGIC[0] + PAGE_ENGINE_LOGIC[1] * row_bits,
+            PAGE_ENGINE_LUTRAM[0] + PAGE_ENGINE_LUTRAM[1] * row_bits)
+
+
+def page_engine_share(bits, threads, p, frame):
+    """A copy's off-chip page columns (of PAGE_ENGINE_BITS) and its share of
+    engines: its columns times the frame's positions its page reads take."""
+    pw = math.ceil(bits / max(p, 1))
+    columns = math.ceil(pw / PAGE_ENGINE_BITS)
+    return columns, columns * min(1.0, max(p, 2) * threads / max(frame, 1))
+
+
+def page_hbm_cost(bits, threads, p, engines_frame=None):
     """Paged register state off chip (pages=hbm) as a relief kind: page_cost's
-    'hbm' with its traffic in the `hbm` pool."""
+    'hbm' with its traffic in the `hbm` pool. With `engines_frame` (HBM page
+    streams at that frame): its share of page engines (`ctl`, fractional;
+    `engine_columns`) instead of a controller per column."""
     c = page_cost(bits, threads, p, 'hbm')
+    if engines_frame:
+        columns, share = page_engine_share(bits, threads, p, engines_frame)
+        cl, cr = page_engine_ctl()
+        return dict(c, lut=c['lut'] + share * cl, lutram=c['lutram'] + share * cr,
+                    hbm=c['hbm_bytes'], ctl=share, engine_columns=columns)
     cl, cr = page_ctl(bits, p, c['controllers'])
     return dict(c, lut=c['lut'] + cl, lutram=c['lutram'] + cr, hbm=c['hbm_bytes'],
                 ctl=c['controllers'])

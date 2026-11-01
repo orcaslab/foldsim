@@ -48,16 +48,8 @@ module vmem_bytes_model #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 
   end
   always @(posedge clk) if (!rst) begin
     if (rsp_valid) outstanding[rsp_inst] = 0;
-    if (rd_valid) begin
-      if (outstanding[rd_inst]) begin
-        if (ok) $display("PROTOCOL: read of instance %0d at host cycle %0d", rd_inst, cyc);
-        ok = 0;
-      end
-      outstanding[rd_inst] = 1;
-      row_of[rd_inst] = rd_row;
-      due[rd_inst] = cyc + lo + int'($urandom % (hi - lo + 1));
-      data[rd_inst] = mem[img(rd_inst)][rd_row];
-    end
+    // (A read and a write in one host cycle: the write is checked against
+    // the reads before it, as the controller orders such a pair.)
     if (wr_valid) begin
       if (outstanding[wr_inst]) begin
         if (ok) $display("PROTOCOL: write of tag %0d, whose read is outstanding, at host cycle %0d", wr_inst, cyc);
@@ -69,9 +61,20 @@ module vmem_bytes_model #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 
           ok = 0;
         end
     end
+    if (rd_valid) begin
+      if (outstanding[rd_inst]) begin
+        if (ok) $display("PROTOCOL: read of instance %0d at host cycle %0d", rd_inst, cyc);
+        ok = 0;
+      end
+      outstanding[rd_inst] = 1;
+      row_of[rd_inst] = rd_row;
+      due[rd_inst] = cyc + lo + int'($urandom % (hi - lo + 1));
+      data[rd_inst] = mem[img(rd_inst)][rd_row];
+    end
     if ($test$plusargs("trace")) begin
       if (rd_valid) $display("%0d rd tag %0d row %0d -> %h", cyc, rd_inst, rd_row, mem[img(rd_inst)][rd_row]);
-      if (wr_valid) $display("%0d wr row %0d %h", cyc, wr_row, wr_data);
+      if (wr_valid) $display("%0d wr tag %0d row %0d %h", cyc, wr_inst, wr_row, wr_data);
+      if (rsp_valid) $display("%0d rsp tag %0d %h", cyc, rsp_inst, rsp_data);
     end
     if (wr_valid)
       for (int k = 0; k < MW; k++)

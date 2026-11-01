@@ -310,8 +310,8 @@ public:
                unsigned forwardAfterLevels, bool shareLinkWrites,
                unsigned zeroChainHops, ArrayRef<std::string> page,
                bool pageMasks, unsigned pageHbmColumnBits,
-               unsigned pageHbmWindow, unsigned pageMemoryBits,
-               StringRef pageMemories, StringRef pageRows, bool compactLinks,
+               unsigned pageHbmWindow, unsigned pageEngines,
+               unsigned pageMemoryBits, StringRef pageMemories, StringRef pageRows, bool compactLinks,
                ArrayRef<std::string> registeredLinks, bool shareLinks,
                bool stagedLinks, unsigned linkBlockDepth,
                unsigned linkUltraDepth, StringRef linkKindSpec)
@@ -332,6 +332,7 @@ public:
         shareLinkWrites(shareLinkWrites), zeroChainHops(zeroChainHops),
         pageSpecs(page), pageMasks(pageMasks),
         pageHbmColumnBits(pageHbmColumnBits), pageHbmWindow(pageHbmWindow),
+        pageEngineCap(pageEngines),
         pageMemoryBits(pageMemoryBits), pageMemories(pageMemories.str()),
         pageRows(pageRows.str()), compactLinks(compactLinks),
         registeredLinkSpecs(registeredLinks), shareLinks(shareLinks),
@@ -681,6 +682,46 @@ private:
   /// The members the schedule keeps, and each stream's landings and
   /// requests by position (after it).
   LogicalResult planStreams();
+  /// Off chip (pages=hbm): each position's page read [valid, instance, page]
+  /// and page write [valid, page] of `cls` (ii + 1 entries each, the last a
+  /// bubble's), as its controls' tables have them.
+  void offChipRows(const Class &cls, SmallVectorImpl<uint64_t> &readRow,
+                   SmallVectorImpl<uint64_t> &instRow,
+                   SmallVectorImpl<uint64_t> &pageRow,
+                   SmallVectorImpl<uint64_t> &writeRow,
+                   SmallVectorImpl<uint64_t> &wpageRow) const;
+  /// HBM page streams (`page-engines`): off-chip page columns carried by
+  /// shared engines. An engine is one virtual memory of one image
+  /// (INSTANCES 1) whose rows are {member, instance, row}; a request's tag
+  /// (foldsim_vmem TAGW) is {member, instance}, so the controller's
+  /// guarantees per tag are each column's per instance (a read outstanding
+  /// per instance and page at most; no write of one whose read is
+  /// outstanding: its state pass waited for it). Its members never request
+  /// at the same position (a read and a write a position at most, checked):
+  /// the frame's static order multiplexes them, without FIFOs or arbiters.
+  struct PageEngine {
+    /// (class, virtual memory) of each column it carries.
+    SmallVector<std::pair<unsigned, unsigned>> members;
+    /// Positions with a page read, a page write (ii + 1 each).
+    SmallVector<uint64_t> reads, writes;
+    unsigned dataWidth = 0, instWidth = 0, rowWidth = 0;
+    unsigned memberBits() const {
+      return std::max(1u, llvm::Log2_32_Ceil(members.size()));
+    }
+    unsigned tagBits() const { return memberBits() + instWidth; }
+    unsigned rowBits() const { return tagBits() + rowWidth; }
+  };
+  std::vector<PageEngine> pageEngines;
+  /// With engines: each off-chip paged class's page reads and writes at the
+  /// positions the engines' assignment chose (offChipRows' rows).
+  struct PageRows {
+    SmallVector<uint64_t> read, inst, page, write, wpage;
+  };
+  std::map<unsigned, PageRows> pageRowsOf;
+  /// Each carried column's engine and member index.
+  std::map<std::pair<unsigned, unsigned>, std::pair<unsigned, unsigned>>
+      pageEngineOf;
+  LogicalResult assignPageEngines();
   unsigned streamRowBits(const LinkStream &s) const {
     unsigned threads = classes[s.pcls].threads();
     return 1 + (threads > 1 ? llvm::Log2_32_Ceil(threads) : 0) +
@@ -776,6 +817,9 @@ private:
   unsigned pageHbmColumnBits;
   /// The most instance slots of an off-chip page window (0: none).
   unsigned pageHbmWindow;
+  /// The most shared engines carrying off-chip page columns (0: a
+  /// controller per column; `page-engines`).
+  unsigned pageEngineCap;
   /// The most bits of a combinationally read memory paged as rows, and a
   /// regex of the memories that may (empty: any).
   unsigned pageMemoryBits;
@@ -1728,6 +1772,201 @@ LogicalResult StaticFolder::planStreams() {
       return netlist.emitError("link streams: ")
              << modelOf(st.pcls) << " -> " << modelOf(st.rcls)
              << ": two landings in one position (the reader's link port)";
+  }
+  return success();
+}
+
+void StaticFolder::offChipRows(const Class &cls,
+                           SmallVectorImpl<uint64_t> &readRow,
+                           SmallVectorImpl<uint64_t> &instRow,
+                           SmallVectorImpl<uint64_t> &pageRow,
+                           SmallVectorImpl<uint64_t> &writeRow,
+                           SmallVectorImpl<uint64_t> &wpageRow) const {
+  if (auto it = pageRowsOf.find(unsigned(&cls - &classes[0]));
+      it != pageRowsOf.end()) {
+    auto &r = it->second;
+    readRow.assign(r.read.begin(), r.read.end());
+    instRow.assign(r.inst.begin(), r.inst.end());
+    pageRow.assign(r.page.begin(), r.page.end());
+    writeRow.assign(r.write.begin(), r.write.end());
+    wpageRow.assign(r.wpage.begin(), r.wpage.end());
+    return;
+  }
+  unsigned threads = cls.threads();
+  auto wrap = [&](int pos) { return unsigned(((pos % int(ii)) + int(ii)) % int(ii)); };
+  for (auto *row : {&readRow, &instRow, &pageRow, &writeRow, &wpageRow})
+    row->assign(ii + 1, 0);
+  // Each fetch as early as the fetch buffer allows: at the copy's state
+  // pass before it (the one before the first in the frame before), so
+  // its pages' round trip hides in the slots between; the schedule keeps
+  // them at least the lead apart.
+  // With a window, each instance's pages prefetched at the copy's state
+  // pass `pageWindow` before its own, into its slot, and fetched from
+  // the window a lead before its state pass, as on chip.
+  SmallVector<int> states(cls.slot[kState].begin(), cls.slot[kState].end());
+  llvm::sort(states);
+  unsigned back = cls.pageWindow ? cls.pageWindow : 1;
+  auto fetchOf = [&](int s) {
+    int k = int(llvm::lower_bound(states, s) - states.begin()) - int(back);
+    int frames = k < 0 ? -1 : 0;
+    int n = int(states.size());
+    return states[((k % n) + n) % n] + frames * int(ii);
+  };
+  for (unsigned i = 0; i < threads; ++i) {
+    int s = cls.slot[kState][i];
+    int f = cls.pageWindow ? fetchOf(s)
+                           : std::min(fetchOf(s), s - int(cls.pageLead()));
+    for (unsigned j = 0; j < cls.page; ++j) {
+      unsigned pos = wrap(f + int(j));
+      readRow[pos] = 1;
+      instRow[pos] = i;
+      pageRow[pos] = j;
+      unsigned wpos = wrap(s + 1 + int(j));
+      writeRow[wpos] = 1;
+      wpageRow[wpos] = j;
+    }
+  }
+}
+
+LogicalResult StaticFolder::assignPageEngines() {
+  pageEngines.clear();
+  pageEngineOf.clear();
+  pageRowsOf.clear();
+  if (!pageEngineCap)
+    return success();
+  // Banks of engines, `width` engines a bank (the most columns of a copy):
+  // column k of a copy goes to engine k of its bank, so a copy's columns,
+  // which move together, read and write at the same positions on engines of
+  // their own. Each copy's page reads and writes are placed at positions of
+  // its windows free on its columns' engines, earliest first:
+  //  - page j of the instance of state pass s read within
+  //    [min(previous state pass, s - lead), s - 1], the pages in order (one
+  //    fetch at a time: the fetch buffer holds the instance before until its
+  //    state pass), after the frame before's write of the page (the
+  //    controller orders a read after an earlier write of its row);
+  //  - page j written within [s + 1, next state pass] (the write-back buffer
+  //    holds it until then), in order.
+  // A copy goes to the first bank where all of it fits, else a new bank.
+  unsigned width = 0;
+  SmallVector<unsigned> paged;
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    if (!cls.page || !cls.pagesOffChip)
+      continue;
+    if (cls.pageWindow)
+      return netlist.emitError("page engines: ")
+             << cls.name << " has an on-chip page window (page-hbm-window); "
+             << "engines carry pages fetched directly";
+    unsigned columns = 0;
+    for (auto &vm : cls.virtualMemories)
+      columns += vm.pages;
+    width = std::max(width, columns);
+    paged.push_back(c);
+  }
+  if (paged.empty())
+    return success();
+  int frame = int(ii);
+  auto wrap = [&](int pos) { return unsigned(((pos % frame) + frame) % frame); };
+  struct Bank {
+    SmallVector<uint64_t> reads, writes;
+  };
+  SmallVector<Bank> banks;
+  for (unsigned c : paged) {
+    auto &cls = classes[c];
+    unsigned p = cls.page, n = cls.threads();
+    SmallVector<std::pair<int, unsigned>> states;
+    for (unsigned i = 0; i < n; ++i)
+      states.push_back({cls.slot[kState][i], i});
+    llvm::sort(states);
+    // Try each bank, then a new one.
+    PageRows rows;
+    unsigned bank = 0;
+    for (;; ++bank) {
+      if (bank == banks.size()) {
+        if ((bank + 1) * width > pageEngineCap)
+          return netlist.emitError("page engines: ")
+                 << pageEngineCap << " engines cannot carry the page columns of "
+                 << cls.name << " (" << width << " a bank)";
+        banks.push_back({SmallVector<uint64_t>(ii, 0), SmallVector<uint64_t>(ii, 0)});
+      }
+      auto &bk = banks[bank];
+      SmallVector<uint64_t> reads = bk.reads, writes = bk.writes;
+      for (auto *row : {&rows.read, &rows.inst, &rows.page, &rows.write, &rows.wpage})
+        row->assign(ii + 1, 0);
+      bool fits = true;
+      // Writes first (each read must follow the frame before's write).
+      SmallVector<SmallVector<int>> writeAt(n, SmallVector<int>(p, 0));
+      int lastWrite = std::numeric_limits<int>::min();
+      for (unsigned x = 0; x < n && fits; ++x) {
+        auto [st, i] = states[x];
+        int next = x + 1 < n ? states[x + 1].first : states[0].first + frame;
+        int q = std::max(st + 1, lastWrite + 1);
+        for (unsigned j = 0; j < p && fits; ++j, ++q) {
+          while (q <= next && writes[wrap(q)])
+            ++q;
+          if (q > next || int(p - 1 - j) > next - q) {
+            fits = false;
+            break;
+          }
+          writes[wrap(q)] = 1;
+          rows.write[wrap(q)] = 1;
+          rows.wpage[wrap(q)] = j;
+          writeAt[i][j] = q;
+          lastWrite = q;
+        }
+      }
+      int lastRead = std::numeric_limits<int>::min();
+      for (unsigned x = 0; x < n && fits; ++x) {
+        auto [st, i] = states[x];
+        int prev = x ? states[x - 1].first : states[n - 1].first - frame;
+        int q = std::max(std::min(prev, st - int(cls.pageLead())), lastRead + 1);
+        for (unsigned j = 0; j < p && fits; ++j, ++q) {
+          q = std::max(q, writeAt[i][j] - frame + 1);
+          while (q < st && reads[wrap(q)])
+            ++q;
+          if (q >= st || int(p - 1 - j) > st - 1 - q) {
+            fits = false;
+            break;
+          }
+          reads[wrap(q)] = 1;
+          rows.read[wrap(q)] = 1;
+          rows.inst[wrap(q)] = i;
+          rows.page[wrap(q)] = j;
+          lastRead = q;
+        }
+      }
+      if (!fits)
+        continue;
+      bk.reads = reads;
+      bk.writes = writes;
+      break;
+    }
+    pageRowsOf[c] = rows;
+    unsigned column = 0;
+    for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
+      if (!vm.pages)
+        continue;
+      unsigned e = bank * width + column++;
+      if (e >= pageEngines.size())
+        pageEngines.resize(e + 1);
+      auto &eng = pageEngines[e];
+      pageEngineOf[{c, unsigned(k)}] = {e, unsigned(eng.members.size())};
+      eng.members.push_back({c, unsigned(k)});
+      eng.dataWidth = std::max(eng.dataWidth, vm.dataWidth);
+      eng.instWidth = std::max(eng.instWidth, vm.instWidth);
+      eng.rowWidth = std::max(eng.rowWidth, vm.rowWidth);
+    }
+  }
+  // Engines of a bank no copy needed (a narrower bank's): none built.
+  SmallVector<PageEngine> used;
+  for (auto &eng : pageEngines)
+    if (!eng.members.empty())
+      used.push_back(eng);
+  if (used.size() != pageEngines.size()) {
+    pageEngines.assign(used.begin(), used.end());
+    pageEngineOf.clear();
+    for (auto [e, eng] : llvm::enumerate(pageEngines))
+      for (auto [m, member] : llvm::enumerate(eng.members))
+        pageEngineOf[member] = {unsigned(e), unsigned(m)};
   }
   return success();
 }
@@ -6563,7 +6802,6 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         };
         Value inst0 = chain(offChip3[1], "pinst");
         Value page0 = chain(offChip3[2], "ppage");
-        Value write0 = chain(offChip3[3], "pwrite");
         Value wpage0 = chain(offChip3[4], "pwpage");
         auto low = [&](Value v) -> Value {
           return b.createOrFold<comb::ExtractOp>(bits(pageWidth), v, 0);
@@ -6595,6 +6833,20 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           cls.resetInput = arg.getArgNumber();
         }
         Value hostReset = body->getArgument(cls.resetInput);
+        // The requests' valids from reset registers: no request from the
+        // host reset's state (a stray read's answer would end a fetch).
+        auto chainR = [&](Value v3, const Twine &what) -> Value {
+          Value v = v3;
+          for (unsigned d = 3; d-- > 0;) {
+            auto type = v.getType();
+            v = keep(seq::FirRegOp::create(
+                b, v, hostClock, b.getStringAttr(prefix + "_" + what + Twine(d)),
+                hostReset, hw::ConstantOp::create(b, type, 0), hw::InnerSymAttr{},
+                /*isAsync=*/false, b.getIntegerAttr(type, 0)));
+          }
+          return v;
+        };
+        Value write0 = chainR(offChip3[3], "pwrite");
         // A page read only within a fetch that started (its page 0 read):
         // a fetch that wraps into the frame before is partial in the first
         // frame, and its other pages' reads would go out unaccounted.
@@ -6611,7 +6863,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             comb::OrOp::create(b, first3, active)));
         Value read3 = comb::AndOp::create(
             b, offChip3[0], comb::OrOp::create(b, first3, active));
-        Value read0 = chain(read3, "pread");
+        Value read0 = chainR(read3, "pread");
         std::string vmName = ("vm" + Twine(cls.virtualMemories.size()) + "_").str();
         auto rspValid = copy.appendInput(vmName + "rsp_valid", b.getI1Type()).second;
         vm.firstInput = rspValid.getArgNumber();
@@ -7259,12 +7511,21 @@ LogicalResult StaticFolder::buildSim() {
     unsigned cls, k, firstInput;
     /// An HBM link stream's (`k` its index), not a class's.
     bool stream = false;
+    /// An HBM page stream's engine (`k` its index), not a class's.
+    bool engine = false;
   };
   SmallVector<SimVirtual> simVirtuals;
   if (!linkStreams.empty() && failed(planStreams()))
     return failure();
+  if (failed(assignPageEngines()))
+    return failure();
+  // Each class virtual memory's, unless an engine carries it.
+  std::map<std::pair<unsigned, unsigned>, unsigned> simOf;
   for (auto [c, cls] : llvm::enumerate(classes))
     for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
+      if (pageEngineOf.count({unsigned(c), unsigned(k)}))
+        continue;
+      simOf[{unsigned(c), unsigned(k)}] = simVirtuals.size();
       std::string name = ("vm" + Twine(simVirtuals.size()) + "_").str();
       unsigned instWidth =
           vm.instWidth ? vm.instWidth
@@ -7307,6 +7568,30 @@ LogicalResult StaticFolder::buildSim() {
     addPort(name + "wr_row", aw, false);
     addPort(name + "wr_data", dw, false);
     addPort(name + "wr_mask", i1, false);
+  }
+  // Each page engine's: {tag, instance 0} requests, {member, instance, row}
+  // rows, byte masks.
+  SmallVector<unsigned> engineSim;
+  for (auto [e, eng] : llvm::enumerate(pageEngines)) {
+    std::string name = ("vm" + Twine(simVirtuals.size()) + "_").str();
+    engineSim.push_back(simVirtuals.size());
+    simVirtuals.push_back({unsigned(e), unsigned(e), unsigned(numIn), false, true});
+    auto iw = IntegerType::get(context, eng.tagBits() + 1);
+    auto aw = IntegerType::get(context, eng.rowBits());
+    auto dw = IntegerType::get(context, eng.dataWidth);
+    auto mw = IntegerType::get(context, eng.dataWidth / 8);
+    addPort(name + "rsp_valid", i1, true);
+    addPort(name + "rsp_inst", iw, true);
+    addPort(name + "rsp_data", dw, true);
+    addPort(name + "free", IntegerType::get(context, kVirtualFreeWidth), true);
+    addPort(name + "rd_valid", i1, false);
+    addPort(name + "rd_inst", iw, false);
+    addPort(name + "rd_row", aw, false);
+    addPort(name + "wr_valid", i1, false);
+    addPort(name + "wr_inst", iw, false);
+    addPort(name + "wr_row", aw, false);
+    addPort(name + "wr_data", dw, false);
+    addPort(name + "wr_mask", mw, false);
   }
   OpBuilder tb(netlist);
   auto sim = hw::HWModuleOp::create(tb, netlist.getLoc(),
@@ -7542,24 +7827,8 @@ LogicalResult StaticFolder::buildSim() {
       // j-th position, and written at the j-th after the state pass.
       unsigned pageBits = std::max(
           1u, llvm::Log2_32_Ceil(unsigned(llvm::PowerOf2Ceil(cls.page))));
-      SmallVector<uint64_t> readRow(ii + 1, 0), instRow(ii + 1, 0),
-          pageRow(ii + 1, 0), writeRow(ii + 1, 0), wpageRow(ii + 1, 0);
-      // Each fetch as early as the fetch buffer allows: at the copy's state
-      // pass before it (the one before the first in the frame before), so
-      // its pages' round trip hides in the slots between; the schedule keeps
-      // them at least the lead apart.
-      // With a window, each instance's pages prefetched at the copy's state
-      // pass `pageWindow` before its own, into its slot, and fetched from
-      // the window a lead before its state pass, as on chip.
-      SmallVector<int> states(cls.slot[kState].begin(), cls.slot[kState].end());
-      llvm::sort(states);
-      unsigned back = cls.pageWindow ? cls.pageWindow : 1;
-      auto fetchOf = [&](int s) {
-        int k = int(llvm::lower_bound(states, s) - states.begin()) - int(back);
-        int frames = k < 0 ? -1 : 0;
-        int n = int(states.size());
-        return states[((k % n) + n) % n] + frames * int(ii);
-      };
+      SmallVector<uint64_t> readRow, instRow, pageRow, writeRow, wpageRow;
+      offChipRows(cls, readRow, instRow, pageRow, writeRow, wpageRow);
       if (cls.pageWindow) {
         SmallVector<uint64_t> fetchRow(ii + 1, 0), fslotRow(ii + 1, 0);
         for (unsigned i = 0; i < threads; ++i) {
@@ -7570,20 +7839,6 @@ LogicalResult StaticFolder::buildSim() {
         ctl.fetch3 = table(b, at, fetchRow, 1);
         ctl.finst3 = table(b, at, fslotRow,
                            cls.pageWindow > 1 ? llvm::Log2_32_Ceil(cls.pageWindow) : 1);
-      }
-      for (unsigned i = 0; i < threads; ++i) {
-        int s = cls.slot[kState][i];
-        int f = cls.pageWindow ? fetchOf(s)
-                               : std::min(fetchOf(s), s - int(cls.pageLead()));
-        for (unsigned j = 0; j < cls.page; ++j) {
-          unsigned pos = wrap(f + int(j));
-          readRow[pos] = 1;
-          instRow[pos] = i;
-          pageRow[pos] = j;
-          unsigned wpos = wrap(s + 1 + int(j));
-          writeRow[wpos] = 1;
-          wpageRow[wpos] = j;
-        }
       }
       ctl.offChip3 = {table(b, at, readRow, 1), table(b, at, instRow, idxWidth),
                       table(b, at, pageRow, pageBits), table(b, at, writeRow, 1),
@@ -7777,10 +8032,30 @@ LogicalResult StaticFolder::buildSim() {
     }
     if (!cls.virtualMemories.empty())
       operands.push_back(hostReset);
-    for (auto &v : simVirtuals)
-      if (!v.stream && v.cls == c)
+    // Each virtual memory's responses, in the class's order: its own, or its
+    // engine's where the tag names it (the instance its low bits).
+    for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
+      auto carried = pageEngineOf.find({unsigned(c), unsigned(k)});
+      if (carried == pageEngineOf.end()) {
+        auto &v = simVirtuals[simOf.at({unsigned(c), unsigned(k)})];
         for (unsigned j = 0; j < 3; ++j)
           operands.push_back(body->getArgument(v.firstInput + j));
+        continue;
+      }
+      auto [e, m] = carried->second;
+      auto &eng = pageEngines[e];
+      auto &v = simVirtuals[engineSim[e]];
+      Value tag = b.createOrFold<comb::ExtractOp>(
+          b.getIntegerType(eng.tagBits()), body->getArgument(v.firstInput + 1), 1);
+      Value member = b.createOrFold<comb::ExtractOp>(
+          b.getIntegerType(eng.memberBits()), tag, eng.instWidth);
+      operands.push_back(comb::AndOp::create(
+          b, body->getArgument(v.firstInput), eq(member, m)));
+      operands.push_back(b.createOrFold<comb::ExtractOp>(
+          b.getIntegerType(vm.instWidth), tag, 0));
+      operands.push_back(b.createOrFold<comb::ExtractOp>(
+          b.getIntegerType(vm.dataWidth), body->getArgument(v.firstInput + 2), 0));
+    }
     copies[c] = hw::InstanceOp::create(b, cls.copy,
                                        b.getStringAttr(cls.name + "_copy"),
                                        operands);
@@ -9099,6 +9374,22 @@ LogicalResult StaticFolder::buildSim() {
     if (streamReads)
       os << "; hbm " << streamReads;
     os << "\n";
+    // HBM page streams: each engine's columns (class:column), width, tag.
+    if (!pageEngines.empty()) {
+      unsigned columns = 0;
+      for (auto &eng : pageEngines)
+        columns += eng.members.size();
+      os << "  page engines: " << pageEngines.size() << " engines, " << columns
+         << " page columns\n";
+      for (auto [e, eng] : llvm::enumerate(pageEngines)) {
+        os << "    page engine " << e << " " << eng.dataWidth << " bits, tag "
+           << eng.tagBits() << ", row " << eng.rowBits() << ":";
+        for (auto [c, k] : eng.members)
+          os << " " << classes[c].name << ":"
+             << classes[c].virtualMemories[k].name;
+        os << "\n";
+      }
+    }
     llvm::errs() << os.str();
     if (!reportPath.empty()) {
       std::error_code ec;
@@ -9352,6 +9643,53 @@ LogicalResult StaticFolder::buildSim() {
       results.append(outs.begin(), outs.end());
       continue;
     }
+    if (v.engine) {
+      // A page engine's requests: its members', at most one read and one
+      // write a host cycle (their positions differ), each tagged
+      // {member, instance} and at the row {member, instance, row}.
+      auto &eng = pageEngines[v.k];
+      unsigned tw = eng.tagBits(), rw = eng.rowBits(), dw = eng.dataWidth;
+      auto zext = [&](Value x, unsigned w) -> Value {
+        unsigned have = hw::getBitWidth(x.getType());
+        return have == w ? x
+                         : b.createOrFold<comb::ConcatOp>(constant(w - have, 0), x);
+      };
+      SmallVector<Value> rdValid, rdInst, rdRow, wrValid, wrInst, wrRow, wrData, wrMask;
+      for (auto [m, member] : llvm::enumerate(eng.members)) {
+        auto [c, k] = member;
+        auto &vm = classes[c].virtualMemories[k];
+        auto out = [&](unsigned j) { return copies[c].getResult(vm.firstOutput + j); };
+        auto tagOf = [&](Value inst) -> Value {
+          return b.createOrFold<comb::ConcatOp>(
+              constant(eng.memberBits(), m), zext(inst, eng.instWidth));
+        };
+        auto when = [&](Value valid, Value x) -> Value {
+          return comb::MuxOp::create(b, valid, x,
+                                     constant(hw::getBitWidth(x.getType()), 0));
+        };
+        Value rv = out(0), wv = out(3);
+        rdValid.push_back(rv);
+        wrValid.push_back(wv);
+        rdInst.push_back(when(rv, b.createOrFold<comb::ConcatOp>(
+                                      tagOf(out(1)), constant(1, 0))));
+        rdRow.push_back(when(rv, b.createOrFold<comb::ConcatOp>(
+                                     tagOf(out(1)), zext(out(2), eng.rowWidth))));
+        wrInst.push_back(when(wv, b.createOrFold<comb::ConcatOp>(
+                                      tagOf(out(4)), constant(1, 0))));
+        wrRow.push_back(when(wv, b.createOrFold<comb::ConcatOp>(
+                                     tagOf(out(4)), zext(out(5), eng.rowWidth))));
+        wrData.push_back(when(wv, zext(out(6), dw)));
+        wrMask.push_back(when(wv, zext(out(7), dw / 8)));
+      }
+      auto any = [&](SmallVector<Value> &xs) -> Value {
+        return xs.size() == 1 ? xs[0] : Value(comb::OrOp::create(b, xs, false));
+      };
+      (void)tw;
+      (void)rw;
+      results.append({any(rdValid), any(rdInst), any(rdRow), any(wrValid),
+                      any(wrInst), any(wrRow), any(wrData), any(wrMask)});
+      continue;
+    }
     auto &vm = classes[v.cls].virtualMemories[v.k];
     for (unsigned j = 0; j < 8; ++j)
       results.push_back(copies[v.cls].getResult(vm.firstOutput + j));
@@ -9368,6 +9706,15 @@ LogicalResult StaticFolder::buildSim() {
   if (!simVirtuals.empty()) {
     SmallVector<Attribute> virtuals;
     for (auto &v : simVirtuals) {
+      if (v.engine) {
+        auto &eng = pageEngines[v.k];
+        virtuals.push_back(b.getStringAttr(
+            "page_engine" + Twine(v.k) + ":__pages" + Twine(v.k) + ":" +
+            Twine(eng.tagBits() + 1) + ":" + Twine(eng.rowBits()) + ":" +
+            Twine(eng.dataWidth) + ":" + Twine(eng.dataWidth / 8) + ":1:1:" +
+            Twine(eng.tagBits())));
+        continue;
+      }
       if (v.stream) {
         auto &st = linkStreams[v.k];
         virtuals.push_back(b.getStringAttr(
@@ -9640,7 +9987,7 @@ void FoldStaticPass::runOnOperation() {
                       slrCapacity, slrAssign, storage, readyLevels,
                       forwardAfterLevels, shareLinkWrites, zeroChainHops,
                       page, pageMasks, pageHbmColumnBits, pageHbmWindow,
-                      pageMemoryBits, pageMemories, pageRows, compactLinks,
+                      pageEngines, pageMemoryBits, pageMemories, pageRows, compactLinks,
                       registeredLinks, shareLinks, stagedLinks, linkBlockDepth,
                       linkUltraDepth, linkKinds);
   folder.moduloLinear = moduloLinear;

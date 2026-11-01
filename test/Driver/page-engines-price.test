@@ -1,0 +1,11 @@
+# The fold-degree model's HBM page streams (foldsim_storage page_hbm_cost with
+# an engines frame): an off-chip page word in columns of an AXI beat (512
+# bits), each copy's share of engines its columns times the positions its
+# page reads take of the frame (p x instances), the fold's engines at least
+# its widest copy's columns and the shares' sum; against a controller per
+# column of up to 4,096 bits.
+# RUN: python3 %S/Inputs/paged/engines_price.py foldsim | FileCheck %s
+# CHECK: p 4 frame 64: columns 2 share 2.000 engines lut {{[0-9]+}} lutram {{[0-9]+}}; per column 1 lut {{[0-9]+}} lutram {{[0-9]+}}
+# CHECK: p 4 frame 256: columns 2 share 0.500
+# CHECK: p 8 frame 128: columns 1 share 1.000
+# CHECK: fold at 256: 5 engines, engine lut 1435 lutram 753

@@ -480,6 +480,17 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "most bits of a page word in one virtual memory's row (a multiple "
            "of 8); each such column is a virtual memory of its own, served by "
            "a controller of its own">,
+    Option<"pageEngines", "page-engines", "unsigned", "0",
+           "With a model's pages off chip: its page columns carried by "
+           "shared engines (HBM page streams), at most this many, instead of "
+           "a controller per column. An engine is one virtual memory of one "
+           "image (INSTANCES 1) whose rows are {member, instance, page}; its "
+           "requests are tagged by member and instance (foldsim_vmem TAGW), "
+           "and the columns it carries never request at the same position "
+           "(the frame's static order, checked): no member FIFO, no "
+           "arbitration. Columns of one copy move together, so a copy's "
+           "columns need engines of their own; copies whose page traffic "
+           "falls in other positions share them. 0: a controller per column">,
     Option<"pageHbmWindow", "page-hbm-window", "unsigned", "0",
            "With a model's pages off chip: an on-chip window of at most this "
            "many instances' pages per copy, filled from the virtual memories "
