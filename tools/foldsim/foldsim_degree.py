@@ -433,8 +433,11 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             if form == 'paged' and info.get('offchip'):
                 bits, mux, _ = paged_state(est[c])
                 pc = storage.page_cost(bits, t, info['page'], 'hbm')
-                logic += pc['lut'] + mux
-                copy_logic[(c, j)] += pc['lut'] + mux
+                # Its controllers (a column each) too.
+                cl, cr = storage.page_ctl(bits, info['page'], pc['controllers'])
+                logic += pc['lut'] + mux + cl
+                base_lutram += cr
+                copy_logic[(c, j)] += pc['lut'] + mux + cl
                 paged['ff'] += pc['ff']
                 paged['bits'] += bits * t
                 paged['hbm'] += pc['hbm_bytes']
@@ -459,6 +462,12 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                 paged['ff'] += pcost['block']['ff']
                 paged['ports'] += pcost['block']['ports']
                 paged['bits'] += bits * t
+        # The controllers of its memories already virtual (the pattern's), one
+        # a memory of each copy, in the kernel.
+        for m in est[c].get('vmems', []):
+            cl, cr = storage.vmem_ctl(m[2])
+            logic += k * cl
+            base_lutram += k * cr
         deep = [f for f in forms if f[2] == 'lutram']
         regs_free = all(f[2] in ('lutram', 'one') for f in forms)
         for w, cnt in sorted(est[c]['regw'].items()):
@@ -564,8 +573,9 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     if lu:
         units.extend(lu[0])
         lk = dict(lu[1])
-    base = dict(sites=logic + storage.LUTRAM_SITES * lk['lutram'],
-                luts=storage.fold_load(logic + lk['lutram'], cache + lk['bram'], lk['uram']),
+    base = dict(sites=logic + storage.LUTRAM_SITES * (lk['lutram'] + base_lutram),
+                luts=storage.fold_load(logic + lk['lutram'] + base_lutram, cache + lk['bram'],
+                                       lk['uram']),
                 bram=cache + lk['bram'], uram=lk['uram'])
     if tiers is not None:
         caps['hbm'] = max(0.0, storage.HBM_STATE_SHARE * tiers['frame'] *
@@ -579,7 +589,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                                   dict(luts=storage.route_luts(slrs)) if route else None,
                                   price_extra=tiers is not None)
     fits = all(used[p] <= caps[p] + 1e-9 for p in caps)
-    lutram, uram = lk['lutram'], lk['uram']
+    lutram, uram = lk['lutram'] + base_lutram, lk['uram']
     bram = cache + lk['bram']
     per_copy = dict(copy_logic)
     rules, floor = [], 0
@@ -889,7 +899,7 @@ def link_lutram(depth, width):
 # `link-kinds` with a page): an early link, its input's only source, as p rows
 # an entry of a p-th of its bits, its write held (W flops) and paged out over
 # the p host cycles after the pass, its read gathered page by page into W
-# flops; the select of the write's page as a paged copy's (ceil(p / 3) LUTs a
+# flops; the select of the write's page as a paged copy's (page_select_luts LUTs a
 # page bit). Paging spaces both models' passes p apart (their link ports): a
 # page is offered only where that takes at most LINK_PORT_SHARE of the frame
 # priced (a longer frame lets more links page, the schedule then stretching
@@ -991,7 +1001,9 @@ def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0):
                 for x in parts:
                     for key in c:
                         c[key] += x.get(key, 0)
-                c['lut'] += storage.VMEM_CTL_LUTS * max(x['ctl'] for x in parts)
+                cl, cr = storage.vmem_ctl(storage.HBM_COLUMN_BITS)
+                c['lut'] += cl * max(x['ctl'] for x in parts)
+                c['lutram'] += cr * max(x['ctl'] for x in parts)
                 c['ctl'] = max(x['ctl'] for x in parts)
                 costs['hbm'] = c
         units.append(dict(costs=costs, per={kind: [(0, c)] for kind, c in costs.items()},
@@ -1522,9 +1534,12 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
         moved = res.get('vmem_new', [])
         pat = join_patterns(pattern, tiers_pattern(moved))
         # Pages off chip: those moved, and those the schedule has already.
+        # (A model paged anew at this point keeps its pages where the area put
+        # them, not where the schedule had them.)
         off = sorted({re.sub(r'_copy\d+$', '', c) for c in res.get('pages_offchip', [])} |
                      {re.sub(r'_copy\d+$', '', c) for c, info in (sched or {}).items()
-                      if c != '__links__' and info.get('offchip')})
+                      if c != '__links__' and info.get('offchip') and
+                      re.sub(r'_copy\d+$', '', c) not in (pages or {})})
         full = {c: dict(e, vmems=e.get('vmems', [])) for c, e in est.items()}
         # project_h splits by the whole pattern from the raw memories.
         raw = {c: dict(e, mems=e['mems'] + e.get('vmems', []), vmems=[]) for c, e in full.items()}

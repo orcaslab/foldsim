@@ -26,8 +26,8 @@ Paged register state (foldsim-fold-static `page`, `page_cost`). A copy of
 `threads` instances whose registers page keeps them in one page RAM of
 pow2(threads) x pow2(p) rows of ceil(bits / p) bits (block or ultra RAM), a
 fetch buffer and a write-back buffer of `bits` flops each and the RAM's
-output register; the write-back's page select is about ceil(p / 3) LUTs a
-page bit. Its state passes are p host cycles apart, so the frame is at least
+output register; the write-back's page select is ceil((p - 1) / 3) LUTs a
+page bit (page_select_luts, calibrated). Its state passes are p host cycles apart, so the frame is at least
 p x threads (and p + 4). A RAM of P 72-bit ports moves 72 P bits a host
 cycle, so a copy's II is at least threads x ceil(bits / (72 P)) (`page_bound`):
 the bits/ports bound, which p x threads meets up to rounding.
@@ -295,13 +295,18 @@ def page_select_luts(p):
     return PAGE_SELECT_LUTS(p) if p > 1 else 0
 
 
-def _select_one_hot(p):
-    # The page's bits AND-ed with its one-hot write strobe, OR-ed over the
-    # pages: three (bit, strobe) pairs a LUT6.
-    return math.ceil(p / 3)
+def _select_mux(p):
+    # The page indexed by its binary counter (foldsim-fold-static since
+    # 518ccdb; paged links alike): a tree of LUT6 4:1 multiplexers, each
+    # taking 3 of the p inputs off, ceil((p - 1) / 3) LUTs a page bit (the
+    # Versal CLB has no MUXF7/F8). Calibrated (st32_1031 §10.2, Vivado
+    # 2025.2 synthesis + opt_design of a paged copy, the opc unit, out of
+    # context on the V80): 1.00 LUT a page bit at p 2, 1.00 at p 4, 2.97 at
+    # p 8 (cones of the page RAMs' write-data pins).
+    return math.ceil((p - 1) / 3)
 
 
-PAGE_SELECT_LUTS = _select_one_hot
+PAGE_SELECT_LUTS = _select_mux
 
 
 def page_cost(bits, threads, p, kind):
@@ -355,9 +360,23 @@ HBM_BEAT_BYTES = 64
 RELIEF_KINDS = ('hbm',)
 # A virtual memory's controller in the kernel (foldsim_vmem: request queue,
 # tags, write buffer, AXI master; its host cache is block RAM, priced apart):
-# LUTs, an estimate. It makes moving a small store off chip cost more logic
-# than it frees.
-VMEM_CTL_LUTS = 3000
+# logic LUTs and distributed-RAM LUTs, linear in its row's bits (the write
+# buffer holds QUEUE = 32 rows in distributed RAM). Calibrated (st32_1031
+# §10.2): the v7 kernel's foldsim_vmem as the 16-SM image instantiates it
+# (IW 9, AW 1, byte masks, known-zero rows, QUEUE 32), Vivado 2025.2
+# synthesis + opt_design out of context on the V80: DW 512: 1,391 logic +
+# 821 LUTRAM; 1024: 2,039 + 1,950; 4096: 5,333 + 8,707. It makes moving a
+# small store off chip cost more than it frees, and a wide row costly.
+VMEM_CTL_LOGIC = (828.0, 1.10)
+VMEM_CTL_LUTRAM = (-305.0, 2.2)
+
+
+def vmem_ctl(row_bits):
+    """A virtual memory controller's (logic LUTs, LUTRAM LUTs) for rows of
+    `row_bits` (VMEM_CTL_LOGIC, VMEM_CTL_LUTRAM)."""
+    rb = max(int(row_bits), 64)
+    return (VMEM_CTL_LOGIC[0] + VMEM_CTL_LOGIC[1] * rb,
+            max(0.0, VMEM_CTL_LUTRAM[0] + VMEM_CTL_LUTRAM[1] * rb))
 
 
 def vmem_row_bytes(width, row_bytes_min=1):
@@ -393,14 +412,16 @@ def vmem_cost(depth, width, threads, weight=1.0, row_bytes_min=1):
     """What a memory costs kept in HBM (a virtual memory): no RAM of its own
     on chip; its read buffer (a row per instance, read registered: in flops
     for one instance, else distributed or block RAM as Vivado infers it),
-    the controller (VMEM_CTL_LUTS, shared when grouped: counted whole), and
+    the controller (vmem_ctl: logic in `lut`, its write buffer in `lutram`;
+    the logic shared when grouped), and
     `hbm` bytes a frame: each instance's state pass reads a row and writes
     one, `weight` times (accesses per instance and target cycle; 1 at most),
     each at least an AXI beat."""
     row = max(vmem_row_bytes(width, row_bytes_min), HBM_BEAT_BYTES)
     th = 1 << (threads - 1).bit_length() if threads > 1 else 1
     lr, br = cost.mem_cost(th, width, 1, 1) if threads > 1 else (0.0, 0.0)
-    return dict(lut=float(VMEM_CTL_LUTS), lutram=lr, ff=width, bram=br, uram=0,
+    cl, cr = vmem_ctl(width)
+    return dict(lut=cl, lutram=lr + cr, ff=width, bram=br, uram=0,
                 ii_floor=0, hbm=2 * weight * threads * row, ctl=1)
 
 
@@ -408,8 +429,17 @@ def page_hbm_cost(bits, threads, p):
     """Paged register state off chip (pages=hbm) as a relief kind: page_cost's
     'hbm' with its traffic in the `hbm` pool."""
     c = page_cost(bits, threads, p, 'hbm')
-    return dict(c, lut=c['lut'] + VMEM_CTL_LUTS * c['controllers'], hbm=c['hbm_bytes'],
+    cl, cr = page_ctl(bits, p, c['controllers'])
+    return dict(c, lut=c['lut'] + cl, lutram=c['lutram'] + cr, hbm=c['hbm_bytes'],
                 ctl=c['controllers'])
+
+
+def page_ctl(bits, p, controllers):
+    """The (logic, LUTRAM) LUTs of an off-chip page word's controllers: a
+    column of the page word (ceil(bits / p) bits) each."""
+    pw = math.ceil(bits / max(p, 1))
+    cl, cr = vmem_ctl(math.ceil(pw / max(controllers, 1)))
+    return cl * controllers, cr * controllers
 
 
 def page_bound(bits, threads, ports):
