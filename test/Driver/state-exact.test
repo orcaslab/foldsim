@@ -1,0 +1,10 @@
+# foldsim_degree.py state --exact: the kinds of --state auto as a 0-1 program
+# (foldsim_storage.assign_exact, HiGHS through scipy): the least routing load
+# with every pool within its cap, where the repair and polish stop short.
+# REQUIRES: scipy
+# RUN: %scipy_python %S/Inputs/state/exact.py foldsim | FileCheck %s
+# CHECK: exact ['distributed', 'block', 'block'] bram 10.0 load 1231
+# CHECK: over ['distributed', 'block', 'block'] load 1231
+# CHECK: none None
+# CHECK: assign ['distributed', 'block', 'block']
+# CHECK: opc: frame 4096 H 4096 fits True routes True moved {{[0-9]+}}

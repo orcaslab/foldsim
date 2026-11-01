@@ -1850,6 +1850,9 @@ def main():
     st.add_argument('--links-as-built', action='store_true',
                     help="the links' storage as the report gives it (their kinds fixed: a "
                          'schedule made with a link-kinds choice), not a tier to choose')
+    st.add_argument('--exact', action='store_true',
+                    help='choose the kinds exactly (a 0-1 program, HiGHS through scipy) instead of '
+                         'the repair and polish: the least routing load with every pool in cap')
     st.add_argument('--link-hbm', action='store_true',
                     help='price links in HBM too (a what-if: the compiler builds none)')
     st.add_argument('--links-from', default='', metavar='SCHEDULE',
@@ -1899,6 +1902,8 @@ def main():
 
 
 def state_main(a):
+    if a.exact:
+        storage.ASSIGN_EXACT = True
     if a.route_limit is not None:
         storage.ROUTE_LIMIT = a.route_limit
     cal = json.load(open(a.calibration)) if a.calibration else None

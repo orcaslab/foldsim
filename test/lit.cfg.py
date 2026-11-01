@@ -29,3 +29,12 @@ if (config.verilator and os.path.isfile(config.verilator) and
         shutil.which("firtool", path=os.pathsep.join([config.circt_tools_dir, config.llvm_tools_dir]))):
     config.available_features.add("verilator")
     config.substitutions.append(("%verilator", config.verilator))
+
+# foldsim_degree.py state --exact solves a 0-1 program with scipy (HiGHS):
+# FOLDSIM_PYTHON, a python that has it, else python3 if it has it.
+import subprocess
+_py = os.environ.get("FOLDSIM_PYTHON") or shutil.which("python3")
+if _py and subprocess.run([_py, "-c", "import scipy.optimize"],
+                          capture_output=True).returncode == 0:
+    config.available_features.add("scipy")
+    config.substitutions.append(("%scipy_python", _py))

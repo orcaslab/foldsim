@@ -723,6 +723,10 @@ def assign(units, base, caps, extra=None, paging=False, price_extra=False):
             repair(pools)
         return choice, used
 
+    if ASSIGN_EXACT and price_extra:
+        found = assign_exact(units, base, caps, extra, paging)
+        if found is not None:
+            return found
     priced = dict(caps, **(extra or {})) if price_extra else caps
     weight = {p: 1 / v for p, v in priced.items() if v}
     choice, used = solve(weight)
@@ -905,6 +909,74 @@ def mw_search(units, base, limit, pools, order, admissible, offchip):
 # they leave alone (off chip: HBM traffic and the bubbles it costs).
 POLISH_ROUNDS = 3
 OFFCHIP_POOLS = ('hbm', 'bubbles')
+
+# assign's exact mode (foldsim_degree.py state --exact): the kinds as a
+# 0-1 program solved by HiGHS (scipy.optimize.milp), not the repair and the
+# polish. Its time limit in seconds (the best choice found by then is kept).
+ASSIGN_EXACT = False
+EXACT_SECONDS = 120
+# What the exact choice weighs beside the routing load: the off-chip pools,
+# so that of two choices of one load the one with less state off chip wins
+# (the least state leaves the chip).
+EXACT_OFFCHIP_WEIGHT = 1e-4
+
+
+def assign_exact(units, base, caps, extra=None, paging=False):
+    """assign's choice as a 0-1 program: a kind per unit (all its stores),
+    every pool of `caps` within its cap, the routing load (the 'luts' pool;
+    usage) as low as it goes, and within `extra` where some choice is (else
+    the least load: the caller sees it over). Off-chip kinds are kinds like
+    any other here; the off-chip pools weigh EXACT_OFFCHIP_WEIGHT of their
+    share. Returns assign's (choice, used), or None where no choice meets
+    `caps`. Needs scipy (HiGHS)."""
+    import numpy as np
+    from scipy.optimize import Bounds, LinearConstraint, milp
+    limit = dict(caps, **(extra or {}))
+    pools = list(limit)
+    var = []
+    for i, u in enumerate(units):
+        if u.get('fixed') in u['costs']:
+            kinds = [u['fixed']]
+        else:
+            kinds = [k for k, c in u['costs'].items()
+                     if c is not None and (paging or not c['ii_floor'])]
+        var.extend((i, k) for k in kinds)
+    if not var:
+        return None
+    use = {p: np.array([units[i]['count'] * usage(units[i]['costs'][k], p) for i, k in var])
+           for p in set(pools) | {'luts'}}
+    load = use['luts'] / (limit.get('luts') or route_luts())
+    cost = load + sum(EXACT_OFFCHIP_WEIGHT * use[p] / limit[p] for p in OFFCHIP_POOLS
+                      if p in limit and limit[p])
+    one = np.zeros((len(units), len(var)))
+    for j, (i, _) in enumerate(var):
+        one[i, j] = 1.0
+
+    def solve(hard):
+        rows, hi = [one], [np.ones(len(units))]
+        for p in hard:
+            s = max(limit[p], 1.0)
+            rows.append((use[p] / s)[None, :])
+            hi.append(np.array([(limit[p] - base.get(p, 0.0)) / s]))
+        lo = np.concatenate([np.ones(len(units))] + [np.full(1, -np.inf)] * len(hard))
+        r = milp(cost, constraints=LinearConstraint(np.vstack(rows), lo, np.concatenate(hi)),
+                 integrality=np.ones(len(var)), bounds=Bounds(0, 1),
+                 options=dict(time_limit=EXACT_SECONDS))
+        return r.x if r.x is not None and r.status in (0, 1) else None
+
+    x = solve(pools)
+    if x is None and extra:
+        x = solve(list(caps))
+    if x is None:
+        return None
+    choice = [dict() for _ in units]
+    for j, (i, k) in enumerate(var):
+        if x[j] > 0.5:
+            choice[i] = {k: units[i]['count']}
+    used = {p: base.get(p, 0.0) + sum(units[i]['count'] * usage(units[i]['costs'][k], p)
+                                      for i, ch in enumerate(choice) for k in ch)
+            for p in pools}
+    return choice, used
 
 
 def read_points(path):
