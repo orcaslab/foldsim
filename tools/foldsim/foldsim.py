@@ -763,8 +763,12 @@ def vmem_groups(vmems, choice, weights=None, kz_bits=0):
     its image's offset in the vmem space. Updates `vmems` in place."""
     keys = {}
     for k, v in enumerate(vmems):
+        # foldsim_vmem_group keeps one instance for a member's read and write
+        # of a host cycle: an off-chip page column (a read of one instance's
+        # page and a write of another's in one host cycle) has a controller
+        # of its own.
         keys.setdefault((v['class'], v['instances'], v['inst_width'], v['row_bytes'],
-                         v['read_first']), []).append(k)
+                         v['read_first'], k if v.get('pages') else -1), []).append(k)
     groups, offset = [], 0
     for ks in vmem_partition(vmems, list(keys.values()), choice, weights):
         first = vmems[ks[0]]
@@ -1424,12 +1428,16 @@ def main():
         # An optional ninth field: the tag bits at the top of the instance
         # port (an HBM link stream's landing tags; foldsim_vmem TAGW): the
         # controller's instance index is the port's other bits.
+        # A tenth, `pages`: an off-chip page column, whose read and write of a
+        # host cycle may be of two instances (never in a group).
         name, cls, iw, aw, dw, mw, rf, insts, *tag = entry.split(':')
         info['vmem'].append({'port': f'vm{k}', 'memory': name, 'class': cls, 'inst_width': int(iw),
                              'row_width': int(aw), 'data_width': int(dw), 'mask_width': int(mw),
                              'read_first': rf == '1', 'instances': int(insts)})
         if tag and int(tag[0]):
             info['vmem'][-1]['tag_width'] = int(tag[0])
+        if len(tag) > 1 and tag[1] == 'pages':
+            info['vmem'][-1]['pages'] = True
     # Each memory's region in the kernel's vmem space (VMEM_INTERFACE.md):
     # row r of instance i at ((r * INSTANCES + i) << log2(ROW_BYTES)), a row
     # its bytes rounded up to a power of two, at least --vmem-row-bytes-min
