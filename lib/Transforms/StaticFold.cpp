@@ -1746,12 +1746,25 @@ LogicalResult StaticFolder::planStreams() {
       auto &st = linkStreams[r.member->second.stream];
       st.lead = std::min<unsigned>(st.lead, r.most);
     }
+  // A member (a reader input's bits from a producer output) may stand for
+  // several uses (other readers and rows of the same wiring): kept only if
+  // every one of them is.
+  for (auto &r : rooms)
+    r.member->second.kept = true;
   for (auto &r : rooms) {
     auto &st = linkStreams[r.member->second.stream];
     bool ok = r.most >= int(st.lead) && r.least <= int(st.lead) &&
               r.late <= 0 && st.lead >= linkHbmMinLead();
-    r.member->second.kept = ok;
-    ++(ok ? st.kept : st.dropped);
+    if (!ok)
+      r.member->second.kept = false;
+  }
+  {
+    std::set<decltype(streamMembers)::iterator::pointer> counted;
+    for (auto &r : rooms)
+      if (counted.insert(&*r.member).second) {
+        auto &st = linkStreams[r.member->second.stream];
+        ++(r.member->second.kept ? st.kept : st.dropped);
+      }
   }
   // Only the kept members' rows are requested and land: a dropped member's
   // row may be written after the reads the stream would request of it (its
