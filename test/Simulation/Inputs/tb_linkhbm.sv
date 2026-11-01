@@ -23,6 +23,9 @@ module vmem_bytes_model #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 
     input logic wr_valid, input logic [IW-1:0] wr_inst, input logic [AW-1:0] wr_row,
     input logic [DW-1:0] wr_data, input logic [MW-1:0] wr_mask,
     output bit ok);
+  // The room it offers (+room=<n>, default 64; the kernel's controller: 32).
+  int room = 64;
+  initial void'($value$plusargs("room=%d", room));
   localparam INSTS = 1 << IW, ROWS = 1 << AW, G = DW / MW;
   // INSTANCES 1: one image, the instance a tag (an HBM link stream).
   logic [DW-1:0] mem [INSTS][ROWS];
@@ -39,7 +42,7 @@ module vmem_bytes_model #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 
     end
   end
   always @(negedge clk) begin
-    free = ($urandom % 100 >= full) ? 16'd64 : 16'd0;
+    free = ($urandom % 100 >= full) ? 16'(room) : 16'd0;
     rsp_valid = 0;
     for (int i = 0; i < INSTS; i++)
       if (!rsp_valid && outstanding[i] && cyc >= due[i]) begin
