@@ -383,6 +383,7 @@ private:
 
   void inlineNetlists();
   LogicalResult collect();
+  void propagateConstants();
   LogicalResult resolveEnvironment();
   /// Host cycles from a netlist output's slot to the end of the frame it
   /// must precede: 1 for an early token or one the environment never waits
@@ -582,6 +583,8 @@ private:
   /// `share-links`: outputs of a model driven by one value are one producer.
   bool shareLinks;
   unsigned sharedOutputs = 0;
+  /// Outputs taken by their readers as constants (propagateConstants).
+  unsigned constantOutputs = 0;
   /// One link memory (a read of a producer's bits by a class input, a run of
   /// bits with the same sources): the producer, its bits, and the producer
   /// instances the reader takes, sorted and distinct.
@@ -1212,6 +1215,7 @@ LogicalResult StaticFolder::collect() {
                          consumer.pieces.emplace_back())))
       return failure();
   }
+  propagateConstants();
   // Outputs of a model driven by the same value (a bus broadcast to several
   // children: a crossbar's data to each of its port arbiters) are one
   // producer: every reader of them takes the first, so they share links.
@@ -1241,6 +1245,154 @@ LogicalResult StaticFolder::collect() {
         if (piece.producer >= 0)
           producers[piece.producer].read = true;
   return success();
+}
+
+/// Outputs of a model that are constants of each instance -- functions of
+/// its static inputs (driven by constants alone in every instance, as an
+/// identity a parent passes on: `base + i`) and of constants, through no
+/// register, memory, black box or other input -- are taken by their readers
+/// as the constants they are. A link would hold the value too, but an early
+/// link's storage is written a frame ahead, so the first frame would read
+/// it unwritten, while the target has the value from its first cycle (and
+/// may use it in reset: a memory written then keeps it). Iterated: an input
+/// that becomes constant in every instance is static in turn, and a reader
+/// may pass it on. An output whose logic does not fold to a constant stays
+/// a link.
+void StaticFolder::propagateConstants() {
+  // Evaluates `root` with the static inputs' values, on clones of the cone's
+  // operations (folding may rewrite an operation in place).
+  auto evaluate = [&](Value root, DenseMap<Value, Attribute> &values) -> Attribute {
+    SmallVector<std::pair<Value, bool>> stack{{root, false}};
+    while (!stack.empty()) {
+      auto [value, expanded] = stack.pop_back_val();
+      if (values.count(value))
+        continue;
+      auto *op = value.getDefiningOp();
+      if (!op || op->getNumRegions() || !isMemoryEffectFree(op) ||
+          isa<seq::FirRegOp, seq::CompRegOp, seq::FirMemReadOp, hw::InstanceOp>(op))
+        return {};
+      if (!expanded) {
+        stack.push_back({value, true});
+        for (auto operand : op->getOperands())
+          if (!values.count(operand))
+            stack.push_back({operand, false});
+        continue;
+      }
+      SmallVector<Attribute> operands;
+      for (auto operand : op->getOperands()) {
+        auto attr = values.lookup(operand);
+        if (!attr)
+          return {};
+        operands.push_back(attr);
+      }
+      auto *clone = op->clone();
+      SmallVector<OpFoldResult> results;
+      bool folded = succeeded(clone->fold(operands, results)) &&
+                    results.size() == op->getNumResults();
+      SmallVector<Attribute> attrs;
+      if (folded)
+        for (auto [r, result] : llvm::enumerate(results)) {
+          Attribute attr;
+          if (auto a = dyn_cast<Attribute>(result))
+            attr = a;
+          else if (auto v = dyn_cast<Value>(result)) {
+            // An operand of the clone: the original's at that index.
+            for (auto [k, operand] : llvm::enumerate(clone->getOperands()))
+              if (operand == v)
+                attr = operands[k];
+          }
+          if (!isa_and_nonnull<IntegerAttr>(attr)) {
+            folded = false;
+            break;
+          }
+          attrs.push_back(attr);
+        }
+      clone->destroy();
+      if (!folded)
+        return {};
+      for (auto [r, attr] : llvm::enumerate(attrs))
+        values[op->getResult(r)] = attr;
+    }
+    return values.lookup(root);
+  };
+  // A value of every instance's pieces, if all are constants.
+  auto constantOf = [](const Pieces &pieces) -> std::optional<APInt> {
+    std::optional<APInt> value;
+    for (auto &piece : pieces) {
+      if (piece.producer >= 0)
+        return std::nullopt;
+      value = value ? piece.constant.concat(*value) : piece.constant;
+    }
+    return value;
+  };
+  DenseSet<unsigned> replaced;
+  for (bool changed = true; changed;) {
+    changed = false;
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      auto *body = cls.model.getBodyBlock();
+      unsigned numInputs = cls.inputNames.size();
+      // Each instance's static inputs' values.
+      SmallVector<SmallVector<std::optional<APInt>>> statics(
+          cls.threads(), SmallVector<std::optional<APInt>>(numInputs));
+      for (unsigned i = 0; i < numInputs; ++i) {
+        int k = cls.consumerOf[i];
+        if (k < 0 || !isa<IntegerType>(cls.inputTypes[i]))
+          continue;
+        SmallVector<std::optional<APInt>> each;
+        for (auto &pieces : consumers[k].pieces)
+          each.push_back(constantOf(pieces));
+        if (llvm::all_of(each, [](auto &v) { return v.has_value(); }))
+          for (auto [inst, v] : llvm::enumerate(each))
+            statics[inst][i] = v;
+      }
+      auto *output = body->getTerminator();
+      for (auto [o, value] : llvm::enumerate(output->getOperands())) {
+        unsigned p = cls.producerOf[o];
+        if (!isa<IntegerType>(value.getType()) || replaced.contains(p))
+          continue;
+        SmallVector<APInt> each;
+        for (unsigned inst = 0; inst < cls.threads(); ++inst) {
+          DenseMap<Value, Attribute> values;
+          for (unsigned i = 0; i < numInputs; ++i)
+            if (statics[inst][i])
+              values[body->getArgument(i)] =
+                  IntegerAttr::get(cls.inputTypes[i], *statics[inst][i]);
+          auto attr = evaluate(value, values);
+          if (!attr)
+            break;
+          each.push_back(cast<IntegerAttr>(attr).getValue());
+        }
+        if (each.size() != cls.threads())
+          continue;
+        for (auto &consumer : consumers)
+          for (auto &pieces : consumer.pieces) {
+            if (llvm::none_of(pieces, [&](const Piece &q) {
+                  return q.producer == int(p);
+                }))
+              continue;
+            Pieces rebuilt;
+            for (auto &q : pieces) {
+              Piece piece = q;
+              if (q.producer == int(p))
+                piece = Piece{-1, 0, 0, q.width,
+                              each[q.inst].extractBits(q.width, q.low)};
+              if (!rebuilt.empty() && piece.producer < 0 &&
+                  rebuilt.back().producer < 0) {
+                auto &last = rebuilt.back();
+                last.constant = piece.constant.concat(last.constant);
+                last.width += piece.width;
+                continue;
+              }
+              rebuilt.push_back(piece);
+            }
+            pieces = std::move(rebuilt);
+          }
+        replaced.insert(p);
+        ++constantOutputs;
+        changed = true;
+      }
+    }
+  }
 }
 
 LogicalResult StaticFolder::splitCopies() {
@@ -5103,6 +5255,9 @@ void StaticFolder::reportLinks(raw_ostream &os) {
       *dump << "\n";
     }
   }
+  if (constantOutputs)
+    os << "  constant outputs: " << constantOutputs
+       << " (taken by their readers as constants)\n";
   os << "  link storage: " << distributed.memories + block.memories +
                                   ultra.memories
      << " memories, "
