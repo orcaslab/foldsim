@@ -36,6 +36,11 @@ def main():
     for r in csv.DictReader(open(a.endpoints)):
         levels, start, end = int(r['levels']), r['start'], r['end']
         judged, cycles = levels, 1
+        # A register's own hold (its clock enable, which the screen counts
+        # as a choice of its old value) is no path between registers.
+        if re.sub(r'\[\d+\]$', '', start) == re.sub(r'\.\w+\[\d+\]$', '', end):
+            hist[judged] += 1
+            continue
         for e in mc:
             p = e['prefix']
             s_cap, e_end = f'{p}cap' in start, f'{p}end' in end

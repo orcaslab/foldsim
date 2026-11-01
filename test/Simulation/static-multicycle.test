@@ -49,6 +49,12 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/m24 --static --bubbles --modulo --stage-levels 24 --multicycle Leaf Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/m24/obj %S/Inputs/tb_late.sv top.sv %t/m24/foldsim_sim.sv > %t/m24/build.log 2>&1
 # RUN: %t/m24/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +bubble=30 +stall=20 | FileCheck %s
+# The span given (Leaf:5, as from the logic screen's count): 5 host cycles.
+# RUN: foldsim --srcs top.f --top Top --out %t/g5 --static --bubbles --modulo --stage-levels 6 --multicycle Leaf:5 Leaf > %t/g5.log 2>&1
+# RUN: FileCheck %s --check-prefix=G5 < %t/g5.log
+# RUN: FileCheck %s --check-prefix=XDC5 < %t/g5/foldsim_multicycle.xdc
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/g5/obj %S/Inputs/tb_late.sv top.sv %t/g5/foldsim_sim.sv > %t/g5/build.log 2>&1
+# RUN: %t/g5/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +bubble=30 +stall=20 | FileCheck %s
 # A class that reads a memory combinationally (Driver/Inputs/deep) stays staged.
 # RUN: cd %S/../Driver/Inputs/deep && foldsim --srcs top.f --top Top --out %t/comb --static --stage-levels 6 --multicycle Leaf Leaf > %t/comb.log 2>&1
 # RUN: FileCheck %s --check-prefix=COMB < %t/comb.log
@@ -57,7 +63,7 @@
 # 11; every path from the capture registers ends at the end registers and is
 # judged per host cycle at no more than 6 levels, the rest at most 6.
 # DEEP: #1 levels 46:
-# M6: Leaf multicycle: {{[0-9]+}} half levels over 8 host cycles (12 a host cycle), state passes 8 positions apart
+# M6: Leaf multicycle: {{[0-9]+}} half levels estimated, over 8 host cycles (estimated at 12 half levels a host cycle), state passes 8 positions apart
 # M6: Leaf x4 state gap {{[0-9]+}} stages 9 multicycle 8
 # M6: Leaf multicycle 8: {{[0-9]+}} capture bits ({{[0-9]+}} registers), {{[0-9]+}} end bits ({{[0-9]+}} registers)
 # XDC: set_multicycle_path 8 -setup -from [get_cells -hierarchical -filter {IS_SEQUENTIAL && NAME =~ "*fsmc_Leaf__cap*"}] -to [get_cells -hierarchical -filter {IS_SEQUENTIAL && NAME =~ "*fsmc_Leaf__end*"}]
@@ -69,6 +75,10 @@
 # JUDGE6: at or above 7 levels per host cycle: 0
 # JUDGE6-NOT: OUTSIDE
 # M4: Leaf x4 state gap {{[0-9]+}} stages 12 multicycle 11
+# G5: Leaf multicycle: {{[0-9]+}} half levels estimated, over 5 host cycles (given), state passes 5 positions apart
+# G5: Leaf x4 state gap {{[0-9]+}} stages 6 multicycle 5
+# XDC5: set_multicycle_path 5 -setup
+# XDC5: set_multicycle_path 4 -hold
 # COMB: Leaf reads a memory combinationally: staged, not multicycle
 # COMB: Leaf x4 state gap 4 stages 9{{$}}
 # CHECK: {{^}}MATCH 196 cycles

@@ -1573,9 +1573,16 @@ LogicalResult StaticFolder::chooseStages() {
     StringRef baseName = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
                                             : StringRef(cls.name);
     bool listed = false;
-    for (auto &spec : multicycleSpecs)
-      if (auto glob = llvm::GlobPattern::create(spec); glob && glob->match(baseName))
+    unsigned given = 0;
+    for (auto &spec : multicycleSpecs) {
+      auto [pattern, cycles] = StringRef(spec).split(':');
+      if (auto glob = llvm::GlobPattern::create(pattern);
+          glob && glob->match(baseName)) {
         listed = true;
+        if (!cycles.empty())
+          cycles.getAsInteger(10, given);
+      }
+    }
     if (!listed || !cls.stages)
       continue;
     bool combReads = false;
@@ -1615,16 +1622,26 @@ LogicalResult StaticFolder::chooseStages() {
     for (int out : cls.outputDepth)
       deepest = std::max(deepest, nextDepth + 2 * out);
     cls.multicycle = unsigned(std::max(1, (deepest + limit - 1) / limit));
+    // Given (<glob>:<cycles>, from the logic screen's count of the cone): the
+    // span, whatever the estimate.
+    if (given)
+      cls.multicycle = given;
     cls.stages = cls.multicycle + 1;
     llvm::errs() << "foldsim-fold-static: " << cls.name << " multicycle: "
-                 << deepest << " half levels over " << cls.multicycle
-                 << " host cycles (" << limit << " a host cycle), state passes "
-                 << cls.multicycle << " positions apart\n";
+                 << deepest << " half levels estimated, over "
+                 << cls.multicycle << " host cycles ("
+                 << (given ? "given" : "estimated at " + std::to_string(limit) +
+                                           " half levels a host cycle")
+                 << "), state passes " << cls.multicycle
+                 << " positions apart\n";
   }
   for (auto &spec : multicycleSpecs) {
-    auto glob = llvm::GlobPattern::create(spec);
-    if (!glob)
-      return netlist.emitError("multicycle: '") << spec << "' is not a glob";
+    auto [pattern, cycles] = StringRef(spec).split(':');
+    unsigned n = 0;
+    if (!llvm::GlobPattern::create(pattern) ||
+        (!cycles.empty() && (cycles.getAsInteger(10, n) || n < 1)))
+      return netlist.emitError("multicycle: '")
+             << spec << "' is not <glob> or <glob>:<host cycles>";
   }
   return success();
 }

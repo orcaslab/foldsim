@@ -901,10 +901,10 @@ def main():
                          'several host cycles, its logic cut into segments of at most N levels by '
                          'stage registers that step with the frame; its state and inputs read '
                          'the stages before its state pass (foldsim-fold-static; 0: none)')
-    ap.add_argument('--multicycle', default='', metavar='CLASS,...',
+    ap.add_argument('--multicycle', default='', metavar='CLASS[:M],...',
                     help='with --stage-levels: these classes (globs) staged without stage registers: '
                          'one evaluation at a time over M host cycles (the cone over the levels a '
-                         'host cycle), from capture registers taken at the read to end registers '
+                         'host cycle, or M as given), from capture registers taken at the read to end registers '
                          'taken before the state pass; the schedule spaces their state passes M '
                          'apart. <out>/foldsim_multicycle.xdc gives the flow the M-cycle paths, '
                          'foldsim_sim.json lists them (foldsim-fold-static)')
