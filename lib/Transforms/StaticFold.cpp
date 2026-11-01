@@ -644,6 +644,13 @@ private:
     unsigned instBits() const {
       return std::max(1u, llvm::Log2_32_Ceil(slots()));
     }
+    /// The controller's view (foldsim_vmem TAGW): one instance (an index
+    /// bit, always 0) under a tag of instBits() + 1 bits: a read's tag is its
+    /// landing slot, a write's has the top bit set, so no write ever carries
+    /// the tag of an outstanding read (the controller's guarantees hold per
+    /// tag and instance). The port's width is both.
+    unsigned tagBits() const { return instBits() + 1; }
+    unsigned portInstBits() const { return tagBits() + 1; }
     unsigned slots() const { return llvm::PowerOf2Ceil(lead + 8); }
   };
   /// The most positions a stream's request precedes its landing (an HBM
@@ -1637,9 +1644,13 @@ LogicalResult StaticFolder::planStreams() {
   // as the rule's fallback.
   std::vector<LinkUse> uses;
   linkUses(uses);
+  // And no landing after the next write of its row (its bank's, a frame
+  // on): the controller orders a read after an earlier write of its row, not
+  // a write after an earlier read, so a read must be answered (its landing
+  // run) before the row's next write is requested (`late` <= 0).
   struct Room {
     decltype(streamMembers)::iterator member;
-    int most, least;
+    int most, least, late;
   };
   std::vector<Room> rooms;
   for (auto &use : uses) {
@@ -1649,7 +1660,8 @@ LogicalResult StaticFolder::planStreams() {
     auto &st = linkStreams[it->second.stream];
     auto &producer = producers[use.producer];
     auto &pcls = classes[producer.cls];
-    int most = std::numeric_limits<int>::max(), least = 0;
+    int most = std::numeric_limits<int>::max(), least = 0,
+        late = std::numeric_limits<int>::min();
     for (auto [i, row] : llvm::zip(use.readers, use.readerRows)) {
       int w = producer.atReady ? pcls.readySlots(producer.readyLevel)[row]
                                : pcls.slot[kState][row];
@@ -1657,9 +1669,10 @@ LogicalResult StaticFolder::planStreams() {
       for (int s : passesOfInst(classes[use.reader], i)) {
         most = std::min(most, (s - n - 1) - (w + int(st.pages) + 4 - frame) - 1);
         least = std::max(least, (s - 2) - (w + frame) + 1);
+        late = std::max(late, (s - 2) - (w + frame));
       }
     }
-    rooms.push_back({it, most, least});
+    rooms.push_back({it, most, least, late});
   }
   for (auto &st : linkStreams) {
     st.lead = kLinkHbmLead;
@@ -1667,14 +1680,14 @@ LogicalResult StaticFolder::planStreams() {
     st.readRows = 0;
   }
   for (auto &r : rooms)
-    if (r.most >= int(linkHbmMinLead()) && r.least <= r.most) {
+    if (r.most >= int(linkHbmMinLead()) && r.least <= r.most && r.late <= 0) {
       auto &st = linkStreams[r.member->second.stream];
       st.lead = std::min<unsigned>(st.lead, r.most);
     }
   for (auto &r : rooms) {
     auto &st = linkStreams[r.member->second.stream];
     bool ok = r.most >= int(st.lead) && r.least <= int(st.lead) &&
-              st.lead >= linkHbmMinLead();
+              r.late <= 0 && st.lead >= linkHbmMinLead();
     r.member->second.kept = ok;
     ++(ok ? st.kept : st.dropped);
   }
@@ -7279,7 +7292,7 @@ LogicalResult StaticFolder::buildSim() {
     std::string name = ("vm" + Twine(simVirtuals.size()) + "_").str();
     st.vm = simVirtuals.size();
     simVirtuals.push_back({unsigned(k), unsigned(k), unsigned(numIn), true});
-    auto iw = IntegerType::get(context, st.instBits());
+    auto iw = IntegerType::get(context, st.portInstBits());
     auto aw = IntegerType::get(context, streamRowBits(st));
     auto dw = IntegerType::get(context, st.dw);
     addPort(name + "rsp_valid", i1, true);
@@ -8295,7 +8308,9 @@ LogicalResult StaticFolder::buildSim() {
     unsigned pgBits = st.pages > 1 ? llvm::Log2_32_Ceil(st.pages) : 0;
     unsigned ib = st.instBits(), slots = st.slots();
     Value rsp = body->getArgument(simVirtuals[st.vm].firstInput);
-    Value rspInst = body->getArgument(simVirtuals[st.vm].firstInput + 1);
+    // A response's landing slot: its tag's low bits, above the instance bit.
+    Value rspInst = b.createOrFold<comb::ExtractOp>(
+        b.getIntegerType(ib), body->getArgument(simVirtuals[st.vm].firstInput + 1), 1);
     Value rspData = body->getArgument(simVirtuals[st.vm].firstInput + 2);
     auto chain3 = [&](Value v, const Twine &n) {
       return reg(reg(reg(v, n + "2"), n + "1"), n + "0");
@@ -8458,8 +8473,15 @@ LogicalResult StaticFolder::buildSim() {
     } else {
       wrData = wide;
     }
-    sb.outs = {req0, reqPtr, b.createOrFold<comb::ConcatOp>(rowBits), we,
-               constant(ib, 0), wrRow, wrData, constant(1, 1)};
+    // Requests' {tag, instance}: a read's tag its slot, a write's the top
+    // bit alone; instance 0.
+    sb.outs = {req0,
+               b.createOrFold<comb::ConcatOp>(
+                   ValueRange{constant(1, 0), reqPtr, constant(1, 0)}),
+               b.createOrFold<comb::ConcatOp>(rowBits), we,
+               b.createOrFold<comb::ConcatOp>(
+                   ValueRange{constant(1, 1), constant(ib, 0), constant(1, 0)}),
+               wrRow, wrData, constant(1, 1)};
     return sb;
   };
 
@@ -9350,8 +9372,9 @@ LogicalResult StaticFolder::buildSim() {
         auto &st = linkStreams[v.k];
         virtuals.push_back(b.getStringAttr(
             "link_" + modelOf(st.pcls) + "_" + modelOf(st.rcls) + ":__link" +
-            Twine(v.k) + ":" + Twine(st.instBits()) + ":" +
-            Twine(streamRowBits(st)) + ":" + Twine(st.dw) + ":1:0:1"));
+            Twine(v.k) + ":" + Twine(st.portInstBits()) + ":" +
+            Twine(streamRowBits(st)) + ":" + Twine(st.dw) + ":1:0:1:" +
+            Twine(st.tagBits())));
         continue;
       }
       auto &cls = classes[v.cls];

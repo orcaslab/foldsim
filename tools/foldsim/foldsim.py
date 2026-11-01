@@ -747,6 +747,8 @@ def vmem_groups(vmems, choice, weights=None, kz_bits=0):
         # The controller's rows are whole bytes (a member's data is
         # zero-extended to them).
         dw = -(-max(vmems[k]['data_width'] for k in ks) // 8) * 8
+        if len(ks) > 1 and any(vmems[k].get('tag_width') for k in ks):
+            raise SystemExit('foldsim: a virtual memory with tagged requests shares a controller')
         g = {'members': ks, 'size': len(ks), 'class': first['class'],
              'inst_width': first['inst_width'], 'instances': first['instances'],
              'rows': grow, 'row_width': max(1, (grow - 1).bit_length()), 'data_width': dw,
@@ -754,6 +756,11 @@ def vmem_groups(vmems, choice, weights=None, kz_bits=0):
              'read_first': first['read_first'], 'row_bytes': first['row_bytes'],
              'base': offset, 'bytes': grow * first['instances'] * first['row_bytes']}
         g['known_zero'], g['kz_shift'] = vmem_known_zero((1 << g['row_width']) * g['instances'], kz_bits)
+        if first.get('tag_width'):
+            g['tag_width'] = first['tag_width']
+        # An HBM link stream's controller: no known-zero bits (as ungrouped).
+        if first['class'].startswith('__link'):
+            g['known_zero'], g['kz_shift'] = 0, 0
         for j, k in enumerate(ks):
             vmems[k].update(group=len(groups), group_member=j,
                             base=offset + vmems[k]['group_row'] * first['instances'] * first['row_bytes'])
@@ -1351,10 +1358,15 @@ def main():
     vmems = re.search(r'foldsim\.vmems = \[(.*?)\]', sim_text)
     info['vmem'] = []
     for k, entry in enumerate(re.findall(r'"([^"]*)"', vmems.group(1)) if vmems else []):
-        name, cls, iw, aw, dw, mw, rf, insts = entry.split(':')
+        # An optional ninth field: the tag bits at the top of the instance
+        # port (an HBM link stream's landing tags; foldsim_vmem TAGW): the
+        # controller's instance index is the port's other bits.
+        name, cls, iw, aw, dw, mw, rf, insts, *tag = entry.split(':')
         info['vmem'].append({'port': f'vm{k}', 'memory': name, 'class': cls, 'inst_width': int(iw),
                              'row_width': int(aw), 'data_width': int(dw), 'mask_width': int(mw),
                              'read_first': rf == '1', 'instances': int(insts)})
+        if tag and int(tag[0]):
+            info['vmem'][-1]['tag_width'] = int(tag[0])
     # Each memory's region in the kernel's vmem space (VMEM_INTERFACE.md):
     # row r of instance i at ((r * INSTANCES + i) << log2(ROW_BYTES)), a row
     # its bytes rounded up to a power of two, at least --vmem-row-bytes-min
@@ -1407,11 +1419,18 @@ def main():
             f.write('`define FOLDSIM_ADVANCE\n')
         if info['vmem']:
             f.write(f'`define FOLDSIM_VMEM_COUNT {len(info["vmem"])}\n')
+            # Tagged requests (TAGW, the port's top bits): every memory's
+            # TAGW then (0 but the tagged), and every group's.
+            tags = any(v.get('tag_width') for v in info['vmem'])
+            if tags:
+                f.write('`define FOLDSIM_VMEM_TAGS\n')
             for k, v in enumerate(info['vmem']):
                 for key, d in (('IW', 'inst_width'), ('AW', 'row_width'), ('DW', 'data_width'),
                                ('MW', 'mask_width'), ('INSTANCES', 'instances')):
                     f.write(f'`define FOLDSIM_VMEM_{k}_{key} {v[d]}\n')
                 f.write(f'`define FOLDSIM_VMEM_{k}_RDWRF {int(v["read_first"])}\n')
+                if tags:
+                    f.write(f'`define FOLDSIM_VMEM_{k}_TAGW {v.get("tag_width", 0)}\n')
                 f.write(f'`define FOLDSIM_VMEM_{k}_BASE 64\'h{v["base"]:x}\n')
                 f.write(f'`define FOLDSIM_VMEM_{k}_ROW_BYTES {v["row_bytes"]}\n')
                 if 'vmem_groups' not in info:
@@ -1430,6 +1449,8 @@ def main():
                                    ('INSTANCES', 'instances')):
                         f.write(f'`define FOLDSIM_VMEM_G{g}_{key} {v[d]}\n')
                     f.write(f'`define FOLDSIM_VMEM_G{g}_RDWRF {int(v["read_first"])}\n')
+                    if tags:
+                        f.write(f'`define FOLDSIM_VMEM_G{g}_TAGW {v.get("tag_width", 0)}\n')
                     f.write(f'`define FOLDSIM_VMEM_G{g}_BASE 64\'h{v["base"]:x}\n')
                     f.write(f'`define FOLDSIM_VMEM_G{g}_ROW_BYTES {v["row_bytes"]}\n')
                     f.write(f'`define FOLDSIM_VMEM_G{g}_KNOWN_ZERO {v["known_zero"]}\n')

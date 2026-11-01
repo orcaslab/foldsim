@@ -30,8 +30,12 @@
 # TWO: link stream Reader Unit 1 0 32 32 1 16 16 1
 # TWO: link stream Unit Reader 2 0 32 32 1 16 32 2
 # VH: `define FOLDSIM_VMEM_COUNT 2
+# VH: `define FOLDSIM_VMEM_TAGS
+# VH: `define FOLDSIM_VMEM_0_IW 7
 # VH: `define FOLDSIM_VMEM_0_INSTANCES 1
+# VH: `define FOLDSIM_VMEM_0_TAGW 6
 # VH: `define FOLDSIM_VMEM_1_INSTANCES 1
+# VH: `define FOLDSIM_VMEM_1_TAGW 6
 # ONE: link use Reader Unit 32 32 16 hbm 1
 # ONE: link stream Reader Unit 1 0 32 32 1 16 16 1
 # CHECK: {{^}}MATCH 196 cycles

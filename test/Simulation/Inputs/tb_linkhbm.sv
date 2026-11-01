@@ -7,7 +7,11 @@
 // or with REAL_VMEM the kernel's foldsim_vmem.sv before an AXI memory model.
 // Channels stalled on +stall, `advance` low on +bubble (BUBBLES). Prints
 // MATCH or the first difference, and PROTOCOL for a read of a tag still
-// outstanding. VM1 .. VM3: more virtual memories.
+// outstanding, a write of a tag whose read is outstanding (the controller's
+// guarantees hold per tag and instance), or a write of a row whose read is
+// outstanding (the controller orders no write after an earlier read).
+// VM1 .. VM3: more virtual memories. The tag bits (foldsim_vmem TAGW) are the
+// instance port's top FOLDSIM_VMEM_<k>_TAGW bits.
 `include "foldsim_sim.vh"
 
 module vmem_bytes_model #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 1 << IW) (
@@ -26,6 +30,7 @@ module vmem_bytes_model #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 
   bit outstanding [INSTS];
   int due [INSTS];
   logic [DW-1:0] data [INSTS];
+  logic [AW-1:0] row_of [INSTS];
   initial begin
     ok = 1;
     for (int i = 0; i < INSTS; i++) begin
@@ -49,8 +54,20 @@ module vmem_bytes_model #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 
         ok = 0;
       end
       outstanding[rd_inst] = 1;
+      row_of[rd_inst] = rd_row;
       due[rd_inst] = cyc + lo + int'($urandom % (hi - lo + 1));
       data[rd_inst] = mem[img(rd_inst)][rd_row];
+    end
+    if (wr_valid) begin
+      if (outstanding[wr_inst]) begin
+        if (ok) $display("PROTOCOL: write of tag %0d, whose read is outstanding, at host cycle %0d", wr_inst, cyc);
+        ok = 0;
+      end
+      for (int i = 0; i < INSTS; i++)
+        if (outstanding[i] && img(IW'(i)) == img(wr_inst) && row_of[i] == wr_row) begin
+          if (ok) $display("PROTOCOL: write of row %0d, whose read (tag %0d) is outstanding, at host cycle %0d", wr_row, i, cyc);
+          ok = 0;
+        end
     end
     if ($test$plusargs("trace")) begin
       if (rd_valid) $display("%0d rd tag %0d row %0d -> %h", cyc, rd_inst, rd_row, mem[img(rd_inst)][rd_row]);
@@ -144,7 +161,7 @@ module axi_mem_model #(parameter IDW = 4) (
   end
 endmodule
 
-module vmem_real #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 4) (
+module vmem_real #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 4, TAGW = 0) (
     input logic clk, rst,
     input int cyc, lo, hi, full,
     output logic rsp_valid, output logic [IW-1:0] rsp_inst, output logic [DW-1:0] rsp_data,
@@ -157,7 +174,7 @@ module vmem_real #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 4) (
   wire [63:0] awaddr, araddr; wire [63:0] wstrb; wire [511:0] wdata, rdata;
   wire [3:0] awid, bid, arid, rid; wire [7:0] awlen, arlen;
   wire [5:0] free6; wire moving;
-  foldsim_vmem #(.IW(IW), .AW(AW), .DW(DW), .MW(MW), .INSTANCES(INSTANCES)) ctl(
+  foldsim_vmem #(.IW(IW - TAGW), .TAGW(TAGW), .AW(AW), .DW(DW), .MW(MW), .INSTANCES(INSTANCES)) ctl(
     .clk, .reset(rst), .rd_valid, .rd_inst, .rd_row, .wr_valid, .wr_inst, .wr_row, .wr_data, .wr_mask,
     .rsp_valid, .rsp_inst, .rsp_data, .free(free6), .base(64'h0), .zero(1'b1), .move(1'b0), .moving,
     .m_awvalid(awvalid), .m_awready(awready), .m_awaddr(awaddr), .m_awid(awid), .m_awlen(awlen),
@@ -184,7 +201,11 @@ module vmem_real #(parameter IW = 2, AW = 1, DW = 8, MW = 1, INSTANCES = 4) (
   end
 endmodule
 `define VMEM_MODULE vmem_real
+`ifdef FOLDSIM_VMEM_TAGS
+`define VMEM_INSTANCES(k) , .INSTANCES(`FOLDSIM_VMEM_``k``_INSTANCES), .TAGW(`FOLDSIM_VMEM_``k``_TAGW)
+`else
 `define VMEM_INSTANCES(k) , .INSTANCES(`FOLDSIM_VMEM_``k``_INSTANCES)
+`endif
 `else
 `define VMEM_MODULE vmem_bytes_model
 `define VMEM_INSTANCES(k) , .INSTANCES(`FOLDSIM_VMEM_``k``_INSTANCES)
