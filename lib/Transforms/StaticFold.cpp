@@ -295,6 +295,9 @@ public:
   /// The modulo search's periods tried one at a time before it skips ahead
   /// (pass option modulo-linear).
   unsigned moduloLinear = 16;
+  /// `link-hbm-lead`: the most positions a stream's request precedes its
+  /// landing.
+  unsigned linkHbmLead = kLinkHbmLead;
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
                unsigned regionBits, StringRef report,
                ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
@@ -1662,7 +1665,7 @@ LogicalResult StaticFolder::planStreams() {
     rooms.push_back({it, most, least});
   }
   for (auto &st : linkStreams) {
-    st.lead = kLinkHbmLead;
+    st.lead = linkHbmLead;
     st.kept = 0;
     st.readRows = 0;
   }
@@ -4410,7 +4413,7 @@ void StaticFolder::reportLinks(raw_ostream &os) {
            << " " << st.kept << " " << st.dropped << " " << st.wordBits << " "
            << st.dw << " " << st.pages << " "
            << uint64_t(classes[st.pcls].threads()) * st.pages << " "
-           << st.readRows << " " << st.maxNeed << "\n";
+           << st.readRows << " " << st.maxNeed << " " << st.lead << "\n";
   }
   // For the fold-degree model's link tier: every pair a stream could carry
   // (rule or not): its word, row, rows an instance, the most rows a reader
@@ -9621,6 +9624,7 @@ void FoldStaticPass::runOnOperation() {
                       registeredLinks, shareLinks, stagedLinks, linkBlockDepth,
                       linkUltraDepth, linkKinds);
   folder.moduloLinear = moduloLinear;
+  folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   if (failed(folder.run()))
     return signalPassFailure();
 }
