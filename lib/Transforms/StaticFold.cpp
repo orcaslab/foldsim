@@ -1899,26 +1899,22 @@ LogicalResult StaticFolder::chooseStages() {
     return success();
   for (auto &cls : classes) {
     // Not for a class with a late output (a ready pass, or a state pass that
-    // writes what its readers take in the frame), virtual memories, folded
-    // pipelines or black boxes, or pages off chip.
+    // writes what its readers take in the frame), folded pipelines or black
+    // boxes, pages off chip, or virtual memories read at held addresses (their
+    // requests leave from the skip's registers, decided on the unstaged
+    // logic). Virtual memories otherwise stage as the stores do: a request
+    // leaves at the state pass with the last stage's row and data, and its
+    // response is waited for by the next evaluation's read position (the
+    // state gap counts from the state pass to that read, firstSlot).
     if (llvm::any_of(cls.late, [](bool late) { return late; }) ||
-        cls.pagesOffChip || (cls.folding && !cls.folding->folds.empty()))
+        cls.pagesOffChip || cls.heldReads ||
+        (cls.folding && !cls.folding->folds.empty()))
       continue;
     auto *body = cls.model.getBodyBlock();
-    StringRef modelName =
-        cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : cls.name;
     bool eligible = true;
-    for (auto &op : *body) {
+    for (auto &op : *body)
       if (isa<hw::InstanceOp>(op))
         eligible = false;
-      auto memory = dyn_cast<seq::FirMemOp>(op);
-      if (memory && pattern) {
-        StringRef memName = memory.getName().value_or("");
-        if (pattern->match(memName) ||
-            pattern->match((modelName + ":" + memName).str()))
-          eligible = false;
-      }
-    }
     if (!eligible)
       continue;
     // The last stage of a register's next value (its reset a choice more),
@@ -11050,9 +11046,12 @@ LogicalResult StaticFolder::buildSim() {
         for (auto pass : {kReady, kState}) {
           if (pass == kReady && !cls.hasReady)
             continue;
-          unsigned s = cls.slot[pass][i];
-          useRow[s % ii] = 1;
-          instRow[s % ii] = i;
+          // Staged, the read data is used at the evaluation's read position,
+          // the stages before its state pass.
+          int s = cls.slot[pass][i] - (pass == kState ? int(cls.stages) : 0);
+          unsigned at = unsigned(((s % int(ii)) + int(ii)) % int(ii));
+          useRow[at] = 1;
+          instRow[at] = i;
         }
       Value use = table(b, next, useRow, 1);
       Value inst = threads > 1 ? table(b, next, instRow, idxWidth) : Value();
