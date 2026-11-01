@@ -9891,7 +9891,11 @@ LogicalResult StaticFolder::buildSim() {
           vm.name + ":" + cls.name + ":" + Twine(instWidth) + ":" +
           Twine(vm.rowWidth) + ":" + Twine(vm.dataWidth) + ":" +
           Twine(vm.maskWidth) + ":" + Twine(vm.readFirst ? 1 : 0) + ":" +
-          Twine(vm.instances ? vm.instances : cls.threads())));
+          Twine(vm.instances ? vm.instances : cls.threads()) +
+          // A page column (its read and write of a host cycle may be of
+          // two instances: never in a controller group, whose FIFO entry
+          // keeps one instance for both).
+          (vm.pages ? ":0:pages" : "")));
     }
     sim->setAttr("foldsim.vmems", b.getArrayAttr(virtuals));
   }
