@@ -179,7 +179,8 @@ def axi_spec_groups(top, design_text, depth):
 
 
 # The V80 builds that calibrate --copies auto by default (foldsim_degree.py
-# calibrate): area, placement capacity and the period fit.
+# calibrate): area, placement capacity and the period fit. Area factors fitted
+# on another estimator than Beacon's area are not used (LUTs at the Beacon device scale, lutScale).
 DEGREE_CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'foldsim_v80.json')
 
@@ -215,9 +216,12 @@ def choose_copies(a, foldsim_opt, flat, passes, out):
     if not result['pick']:
         sys.exit(f'--copies auto: no choice that places within {a.lut_budget or "any"} LUTs; see {out("degree.txt")}')
     pick = result['pick']
+    calibration = os.path.basename(path) if cal else 'uncalibrated'
+    if cal and not result['area_calibrated']:
+        calibration += ': LUTs at the Beacon device scale'
     timing = (f", {pick['mhz']} MHz, {pick['ns']} ns per cycle" if 'ns' in pick else '')
     print(f"foldsim: copies {pick['copies']}: II {pick['ii']}, about {pick['luts']} LUTs"
-          f"{timing} ({os.path.basename(path) if cal else 'uncalibrated'})", file=sys.stderr)
+          f"{timing} ({calibration})", file=sys.stderr)
     return '' if pick['copies'] == '-' else pick['copies']
 
 

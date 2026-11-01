@@ -1,6 +1,7 @@
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-beacon-map,foldsim-estimate-timing{output=- report= top=Top})' -o /dev/null | FileCheck %s
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-beacon-map{target=virtexuplusHBM},foldsim-estimate-timing{output=- report= top=Top target=virtexuplusHBM})' -o /dev/null | FileCheck %s
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-beacon-map{target=asap7},foldsim-estimate-timing{output=- report= top=Top target=asap7})' -o /dev/null | FileCheck %s --check-prefix=ASAP7
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-beacon-map{target=virtexuplusHBM area},foldsim-estimate-area{output=- report= top=Top target=virtexuplusHBM lut-scale=1})' -o /dev/null | FileCheck %s --check-prefix=AREA
 
 // An equality compare of two bits and the AND after it pack into one LUT6,
 // across the boundary of the inlined `Eq`.
@@ -11,6 +12,10 @@
 // CHECK: 3,3,d,reg,{{[0-9]+}},0,0,a[0],0,s.d[15]
 // On ASAP7, a prefix adder: 2 + log2(16) stages.
 // ASAP7: 6,6,d,reg,{{[0-9]+}},0,0,a[0],0,s.d[15]
+// Mapped for area, `Eq` keeps its instance and its own LUT; Top has the AND's
+// LUT and the adder's 16, and 49 register bits.
+// AREA: 0,,Top,17,0,49,0.0,0,0,0,18,0,49,0.0,0,0,0
+// AREA-NEXT: 1,eq,Eq,1,0,0,0.0,0,0,0,1,0,0,0.0,0,0,0
 hw.module private @Eq(in %x : i2, in %y : i2, out o : i1) {
   %eq = comb.icmp eq %x, %y : i2
   hw.output %eq : i1

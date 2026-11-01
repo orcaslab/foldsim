@@ -1,4 +1,5 @@
 {
+ "estimator_note": "The area factors of these builds (est_logic, est_lutram, kappa, lam; the FireSim builds' est_logic, est_lutram) were fitted on foldsim_cost.py, the retired Python estimator, and foldsim_degree.py does not use them: Beacon's area (beacon-area) differs from it per design by x0.89 to x2.31 in logic LUTs and x1.00 to x1.10 in distributed RAM over 12 Vortex units, too unevenly to convert. Their measured LUTs, period, largest copy and depth still serve the period fit. Re-fit each build with `foldsim_degree.py calibrate` on its models to restore the area calibration.",
  "builds": [
   {
    "name": "full_lkg",
@@ -48,7 +49,8 @@
     }
    },
    "max_copy": 341551.0,
-   "depth": 12.778
+   "depth": 12.778,
+   "estimator": "foldsim_cost.py"
   },
   {
    "name": "mini_slc4o",
@@ -78,7 +80,8 @@
     }
    },
    "max_copy": 128210.0,
-   "depth": 13.429
+   "depth": 13.429,
+   "estimator": "foldsim_cost.py"
   },
   {
    "name": "mid_c8o",
@@ -128,7 +131,8 @@
     }
    },
    "max_copy": 117957.0,
-   "depth": 13.724
+   "depth": 13.724,
+   "estimator": "foldsim_cost.py"
   },
   {
    "name": "full_fo",
@@ -178,7 +182,8 @@
     }
    },
    "max_copy": 348909.0,
-   "depth": 12.778
+   "depth": 12.778,
+   "estimator": "foldsim_cost.py"
   },
   {
    "name": "full_s3",
@@ -228,7 +233,8 @@
     }
    },
    "max_copy": 295218.0,
-   "depth": 13.45
+   "depth": 13.45,
+   "estimator": "foldsim_cost.py"
   },
   {
    "name": "f_k2",
@@ -280,7 +286,8 @@
    "logic": 752165,
    "lutram": 377258,
    "depth": 12.888,
-   "max_copy": 349216.0
+   "max_copy": 349216.0,
+   "estimator": "foldsim_cost.py"
   },
   {
    "name": "m_k8",
@@ -332,7 +339,8 @@
    "logic": 467642,
    "lutram": 221262,
    "depth": 14.057,
-   "max_copy": 123934.0
+   "max_copy": 123934.0,
+   "estimator": "foldsim_cost.py"
   },
   {
    "name": "s_rt4ro",
@@ -392,7 +400,8 @@
    "logic": 453772,
    "lutram": 43958,
    "max_copy": 78135.0,
-   "period_fit": false
+   "period_fit": false,
+   "estimator": "foldsim_cost.py"
   },
   {
    "name": "m_rt4c8",
@@ -452,7 +461,8 @@
    "logic": 775282,
    "lutram": 176188,
    "max_copy": 78361.0,
-   "period_fit": false
+   "period_fit": false,
+   "estimator": "foldsim_cost.py"
   }
  ],
  "firesim": [
@@ -463,7 +473,8 @@
    "lutram": 97970,
    "period": 9.653,
    "est_logic": 821002,
-   "est_lutram": 55400
+   "est_lutram": 55400,
+   "estimator": "foldsim_cost.py"
   },
   {
    "name": "firesim_small",
@@ -472,7 +483,8 @@
    "lutram": 76322,
    "period": 8.747,
    "est_logic": 427547,
-   "est_lutram": 28219
+   "est_lutram": 28219,
+   "estimator": "foldsim_cost.py"
   }
  ]
 }

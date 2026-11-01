@@ -14,6 +14,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "BeaconOps.h"
 #include "foldsim/Beacon.h"
 #include "foldsim/Passes.h"
 #include "circt/Dialect/Comb/CombOps.h"
@@ -48,6 +49,10 @@ using namespace mlir;
 using namespace circt;
 using foldsim::BeaconTarget;
 using foldsim::lookupBeaconTarget;
+using foldsim::beacon::kMaxTableBits;
+using foldsim::beacon::significantBits;
+using foldsim::beacon::variableBits;
+using foldsim::beacon::widthOf;
 
 namespace {
 
@@ -166,11 +171,6 @@ struct Edge {
 
 constexpr unsigned kNone = ~0u;
 
-unsigned widthOf(Value value) {
-  int64_t width = hw::getBitWidth(value.getType());
-  return width < 0 ? 0 : width;
-}
-
 /// ceil(log6(n)): the levels of a LUT6 tree over n signals.
 /// Whether module `name` is `wanted` or one of its specializations
 /// (`<wanted>_<n>`).
@@ -196,33 +196,12 @@ unsigned lut6Depth(unsigned n) {
 /// (CARRY8 or LOOKAHEAD8) between the input's block and the output's.
 int carryLevels(unsigned in, unsigned out) { return 2 + out / 8 - in / 8; }
 
-/// The most bits a divider can depend on for synthesis to write it out as a
-/// table over them; also the dividend widths whose quotient and remainder by
-/// a constant foldsim-lower-constant-division writes out.
-constexpr unsigned kMaxTableBits = 10;
-
 /// The most nodes searched for the bits a divider depends on.
 constexpr unsigned kMaxSupportCone = 4096;
 
 /// Levels of a table over `bits` inputs: a LUT6 for six, and a level of 4:1
 /// multiplexers per two more.
 int tableLevels(unsigned bits) { return bits <= 6 ? 1 : 1 + (bits - 5) / 2; }
-
-/// The low bits of `value` that are not known zero: a zero-extension is a
-/// concatenation under a zero constant.
-unsigned significantBits(Value value) {
-  unsigned width = widthOf(value);
-  if (auto concat = value.getDefiningOp<comb::ConcatOp>())
-    if (auto top = concat.getInputs().front().getDefiningOp<hw::ConstantOp>())
-      if (top.getValue().isZero())
-        return width - widthOf(top);
-  return width;
-}
-
-/// The bits of `value` a product depends on: none for a constant.
-unsigned variableBits(Value value) {
-  return value.getDefiningOp<hw::ConstantOp>() ? 0 : significantBits(value);
-}
 
 class Timing {
 public:

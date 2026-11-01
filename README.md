@@ -16,9 +16,9 @@ LLVM: CIRCT imports and lowers the design (`circt-verilog`, `circt-opt`,
 
 | Path | What |
 |---|---|
-| `lib/Transforms` | the passes: `foldsim-extract-models`, `foldsim-fuse-models`, `foldsim-fame5`, `foldsim-compose`, and Beacon, `foldsim-beacon-map` and `foldsim-estimate-timing` |
+| `lib/Transforms` | the passes: `foldsim-extract-models`, `foldsim-fuse-models`, `foldsim-fame5`, `foldsim-compose`, and Beacon, `foldsim-beacon-map`, `foldsim-estimate-timing` and `foldsim-estimate-area` (logic levels and area before synthesis) |
 | `tools/foldsim-opt` | runs them, with CIRCT's HW, Comb, Seq and SV passes |
-| `tools/foldsim` | the driver: design in, simulator out; `foldsim-lift`, plain-port boundaries for interface-port units; the fold-degree search and its cost model |
+| `tools/foldsim` | the driver: design in, simulator out; `foldsim-lift`, plain-port boundaries for interface-port units; the fold-degree search, priced by `foldsim-estimate-area` |
 | `shell/rtl` | the FPGA shell around a simulator: the control endpoint (target reset, start, register writes, busy), a memory endpoint per AXI4 port with its DRAM bank timing model, and the token plumbing |
 | `shell/include`, `shell/emul` | the shell's register map for a host runtime, and the shell simulated in-process with Verilator |
 | `shell/model` | the normative DRAM bank model the memory endpoint implements, in C++ |

@@ -7,10 +7,12 @@
 //===----------------------------------------------------------------------===//
 //
 // Beacon estimates the logic levels of every register-to-register path of a
-// design on a target: `foldsim-beacon-map{target=<name>}` maps the design to
-// the target's cells and `foldsim-estimate-timing{target=<name>}` counts
-// them. A target is named after its FPGA family as hw/syn/xilinx/platforms
-// names it, or after hw/syn/yosys's PDK, so a flow passes the name it has.
+// design on a target, and its area: `foldsim-beacon-map{target=<name>}` maps
+// the design to the target's cells, `foldsim-estimate-timing{target=<name>}`
+// counts their levels, and on a mapping for area (`area`)
+// `foldsim-estimate-area{target=<name>}` counts them. A target is named after
+// its FPGA family as hw/syn/xilinx/platforms names it, or after hw/syn/yosys's
+// PDK, so a flow passes the name it has.
 //
 //===----------------------------------------------------------------------===//
 
@@ -45,6 +47,11 @@ struct BeaconTarget {
   /// flip-flop's QN, slew).
   bool asic = false;
   int stagePs = 0, clk2qPs = 0, setupPs = 0, pathPs = 0;
+  /// Vivado's LUTs per LUT of foldsim-beacon-map's area mapping, fitted on
+  /// routed builds: Vivado's area recovery, LUT combining and clock-enable
+  /// and reset pins leave fewer LUTs than a cut mapper's cover (1 on an
+  /// ASIC, which counts cells).
+  double lutScale = 1.0;
 };
 
 /// The target of a name, or null.

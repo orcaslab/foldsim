@@ -1,12 +1,21 @@
-# --copies auto prices every fold degree with the V80 calibration by default
-# (area, placement capacity, the period fit) and picks the fastest that
-# places; with `none`, uncalibrated LUTs and II alone.
+# --copies auto prices every fold degree with Beacon's area
+# (foldsim-estimate-area) and the V80 calibration by default (area, placement
+# capacity, the period fit) and picks the fastest that places; with `none`,
+# LUTs at Beacon's device scale and II alone. The shipped V80 builds' area
+# factors were fitted on another area model, so they are not used and LUTs
+# take the device scale; the period fit still is.
 # RUN: rm -rf %t && cd %S/Inputs/source-list
 # RUN: foldsim --srcs top.f --top Top --out %t/cal --static --copies auto Leaf 2>&1 | FileCheck %s --check-prefix=CAL
 # RUN: FileCheck %s --check-prefix=TABLE < %t/cal/degree.txt
 # RUN: foldsim --srcs top.f --top Top --out %t/none --static --copies auto --degree-calibration none Leaf 2>&1 | FileCheck %s --check-prefix=NONE
-# CAL: foldsim: copies {{.*}}: II {{[0-9]+}}, about {{[0-9]+}} LUTs, {{[0-9.]+}} MHz, {{[0-9.]+}} ns per cycle (foldsim_v80.json)
+# CAL: foldsim_degree: the area factors of full_lkg, {{.*}} were fitted on another estimator than Beacon's (beacon-area) and are not used: LUTs at the Beacon device scale
+# CAL: foldsim: copies {{.*}}: II {{[0-9]+}}, about {{[0-9]+}} LUTs, {{[0-9.]+}} MHz, {{[0-9.]+}} ns per cycle (foldsim_v80.json: LUTs at the Beacon device scale)
 # TABLE: copies ii luts {{.*}} mhz ns
 # TABLE: <- pick
+# TABLE: area factors not used (fitted on another estimator than beacon-area): full_lkg, {{.*}}; LUTs at the Beacon device scale
 # TABLE: period = {{[0-9.]+}} + {{.*}} copies (held to
+# RUN: FileCheck %s --check-prefix=AREA < %t/cal/degree/area.json
+# AREA: "Leaf": {
+# AREA: "state": {
+# AREA: "target": "versal"
 # NONE: foldsim: copies {{.*}}: II {{[0-9]+}}, about {{[0-9]+}} LUTs (uncalibrated)

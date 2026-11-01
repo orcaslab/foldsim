@@ -657,10 +657,19 @@ def BeaconMap : Pass<"foldsim-beacon-map", "::mlir::ModuleOp"> {
     equality comparisons become logic so they pack with their neighbours;
     adders, order comparisons, multipliers and dividers stay word-level, as
     carry chains and DSPs.
+
+    With `area`, the netlist is mapped for `foldsim-estimate-area` instead:
+    every module kept, so each instance's resources stay its own (inlining
+    changes the count by a few percent); no balancing, common subexpressions
+    shared, each cone covered by the fewest LUTs, as Vivado maps the logic
+    off its critical paths. A depth-oriented mapping duplicates logic to save
+    levels, so its cells are no measure of area.
   }];
   let options = [
     Option<"target", "target", "std::string", "\"versal\"",
            "The Beacon target to map to">,
+    Option<"area", "area", "bool", "false",
+           "Map for area (foldsim-estimate-area) instead of depth">,
   ];
 }
 
@@ -772,6 +781,85 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     Option<"retimeLevels", "retime-levels", "unsigned", "0",
            "Also estimate each end point's depth after Vivado's retiming "
            "to a period of this many levels (0: off)">,
+  ];
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect",
+    "circt::seq::SeqDialect"
+  ];
+}
+
+def EstimateArea : Pass<"foldsim-estimate-area", "::mlir::ModuleOp"> {
+  let summary = "Count the cells, memories and DSPs a design maps to";
+  let description = [{
+    Estimates the resources of the design elaborated from `top` on the
+    `target` device, per instance: the input is a design mapped by
+    `foldsim-beacon-map` for the same `target`, as for
+    `foldsim-estimate-timing`, so both read one netlist.
+
+    On an FPGA family:
+
+    - `comb.truth_table`: a LUT. An and-inverter gate the mapper left: a
+      LUT per five more inputs.
+    - `comb.add`/`comb.sub`: a LUT per bit into the carry chain; an order
+      `comb.icmp`, a LUT per two bits.
+    - `comb.mul`: times a constant, shifts and adders, a LUT per bit; a
+      table in LUTs, one per output bit up to the inputs' count, if its
+      operands have at most ten variable bits; otherwise DSPs, the fewer of
+      the two orientations over the significant bits of the operands
+      (27 x 24 on Versal, 27 x 18 on UltraScale+).
+    - dividers: a table over at most ten variable bits, else a subtracter
+      per quotient bit; as many output bits as the dividend has.
+    - registers: a flip-flop per bit.
+    - `seq.firmem`: placed as Vivado infers it. A `ram_style` the RTL asks
+      for (`block`, `distributed`, `ultra`, `registers`) wins; otherwise a
+      read of latency 0 is distributed RAM, and a registered read of at
+      least 32 words and 2 Kb is block RAM. Distributed RAM takes 0.57 LUTs
+      a bit up to 32 words (RAM32M16) and 1.14 per 64 words beyond (RAM64M8)
+      per read port, with a multiplexer tree over the 64-word LUTs. Block
+      RAM takes the fewest 36 Kb blocks (or 18 Kb halves) of any shape, a
+      copy per two ports (a read-write port is one); UltraRAM, 4096 x 72.
+    - Vivado floating-point cores (`xil_*`, external modules): their
+      measured LUTs, flip-flops and DSPs.
+
+    On an ASIC library (`asap7`), `lut` counts cells: a 3-input cut is a
+    cell, an adder a prefix adder, a product partial products and a Dadda
+    tree, a memory without a macro flip-flops and multiplexers; an external
+    module (an SRAM macro) counts as a macro.
+
+    The mapping's LUTs are a cut mapper's cover: every output scales them by
+    the target's `lutScale` (`lut-scale` overrides it), fitted on routed
+    Vivado builds, and adds the memories' read multiplexers and vendor IP's
+    measured LUTs, which no mapper covers.
+
+    Writes the instances depth first to `output` (CSV: the instance's own
+    resources and its subtree's), the memories and their placement to
+    `memories`, each module's totals to `modules` (JSON), and a summary to
+    `report`. With `state-threads`, `modules` also gives, per module and
+    thread count, the distributed and block RAM of its registers (one memory
+    of a word per thread) and of its memories that many times deeper, as a
+    folded copy stores its instances' state. Leaves the design as it is.
+  }];
+  let options = [
+    Option<"topName", "top", "std::string", "",
+           "The top module (the one no other instantiates if empty)">,
+    Option<"target", "target", "std::string", "\"versal\"",
+           "The Beacon target whose cells to count">,
+    Option<"output", "output", "std::string", "",
+           "Instance table (CSV)">,
+    Option<"memoryTable", "memories", "std::string", "",
+           "Memory table (CSV)">,
+    Option<"moduleTable", "modules", "std::string", "",
+           "Per-module totals (JSON)">,
+    Option<"report", "report", "std::string", "\"-\"",
+           "Summary (text)">,
+    ListOption<"blackBoxes", "black-boxes", "std::string",
+               "Modules to leave out, as a harness stubs them">,
+    ListOption<"stateThreads", "state-threads", "unsigned",
+               "Thread counts at which `modules` prices folded state">,
+    Option<"lutScale", "lut-scale", "double", "-1",
+           "Device LUTs per mapped LUT in `output` and `report` (default: "
+           "the target's lutScale)">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",
