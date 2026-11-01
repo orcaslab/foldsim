@@ -2025,8 +2025,10 @@ LogicalResult StaticFolder::planStreams() {
   auto floorDiv = [&](int x) {
     return x >= 0 ? x / frame : -((-x + frame - 1) / frame);
   };
+  // A reader's passes as its links are read: a staged class reads its
+  // stages before each state pass.
   auto passesOfInst = [&](const Class &cls, unsigned i) {
-    SmallVector<int> slots{cls.slot[kState][i]};
+    SmallVector<int> slots{cls.slot[kState][i] - int(cls.stages)};
     for (unsigned l = 0; l < cls.readyLevels; ++l)
       slots.push_back(cls.readySlots(l)[i]);
     return slots;
@@ -9364,7 +9366,8 @@ LogicalResult StaticFolder::buildSim() {
       return x >= 0 ? x / int(ii) : -((-x + int(ii) - 1) / int(ii));
     };
     for (unsigned i = 0; i < threads; ++i) {
-      SmallVector<int> slots{cls.slot[kState][i]};
+      // (A staged reader reads its stages before its state pass.)
+      SmallVector<int> slots{cls.slot[kState][i] - int(cls.stages)};
       for (unsigned l = 0; l < cls.readyLevels; ++l)
         slots.push_back(cls.readySlots(l)[i]);
       for (int s : slots)
@@ -9806,7 +9809,8 @@ LogicalResult StaticFolder::buildSim() {
     auto &rcls = classes[st.rcls];
     for (unsigned i = 0; i < rthreads; ++i) {
       unsigned n = st.needs[i].size();
-      SmallVector<int> passSlots{rcls.slot[kState][i]};
+      // (A staged reader reads its stages before its state pass.)
+      SmallVector<int> passSlots{rcls.slot[kState][i] - int(rcls.stages)};
       for (unsigned l = 0; l < rcls.readyLevels; ++l)
         passSlots.push_back(rcls.readySlots(l)[i]);
       for (int sl : n ? passSlots : SmallVector<int>{})
