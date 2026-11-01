@@ -9,5 +9,5 @@
 # CHECK: p 4 frame 64: columns 2 share 2.000 engines lut {{[0-9]+}} lutram {{[0-9]+}}; per column 1 lut {{[0-9]+}} lutram {{[0-9]+}}
 # CHECK: p 4 frame 256: columns 2 share 0.500
 # CHECK: p 8 frame 128: columns 1 share 1.000
-# CHECK: fold at 256: 5 engines, engine lut 1435 lutram 753
+# CHECK: fold at 256: 5 engines, engine lut 1657 lutram 866
 # CHECK: stream at 128: own ctl 1.0 lut {{[0-9]+}}; engines ctl 0.375 lut {{[0-9]+}}

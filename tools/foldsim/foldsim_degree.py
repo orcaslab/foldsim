@@ -678,6 +678,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         el, er = storage.page_engine_ctl()
         logic += (page_engines - share) * el
         lutram += (page_engines - share) * er
+        bram += (page_engines - share) * storage.PAGE_ENGINE_BRAM
     sites = logic + storage.LUTRAM_SITES * lutram
     res = dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
                sites=round(sites), fits=fits, bram=round(bram, 1), uram=uram,
