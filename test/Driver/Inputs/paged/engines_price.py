@@ -15,3 +15,9 @@ el, er = st.page_engine_ctl()
 shares = [st.page_engine_share(3976, 16, 4, 256), st.page_engine_share(4752, 4, 2, 256)]
 n = max(max(c for c, _ in shares), math.ceil(sum(s for _, s in shares) - 1e-9))
 print(f"fold at 256: {n} engines, engine lut {el:.0f} lutram {er:.0f}")
+# A link stream on the engines: its controller a share of one (the positions its requests take), against its own.
+import foldsim_degree as fd
+pair = dict(producer_passes=16, pages=1, reader_passes=16, max_need=1, dw=64, word=64, read_rows=16, write_rows=16)
+uses = [dict(banked=True, entries=16, lead=200, width=64, depth=32)]
+own, eng = fd.link_stream_cost(pair, uses, 128), fd.link_stream_cost(pair, uses, 128, engines=True)
+print(f"stream at 128: own ctl {own['ctl']} lut {own['lut']:.0f}; engines ctl {eng['ctl']:.3f} lut {eng['lut']:.0f}")

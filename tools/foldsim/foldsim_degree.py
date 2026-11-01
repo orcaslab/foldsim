@@ -583,7 +583,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     # ultra RAM may hold is a unit of its own (the link tier); the rest stays
     # in the base.
     lu = link_units(cal, (sched or {}).get('__links__'), ii, tiers.get('link_pages', True),
-                    tiers.get('link_hbm', False), tiers['frame']) if tiers is not None else None
+                    tiers.get('link_hbm', False), tiers['frame'],
+                    tiers.get('page_engines', False)) if tiers is not None else None
     if lu:
         units.extend(lu[0])
         lk = dict(lu[1], lutram=lu[1]['lutram'] + lk['lutram'] -
@@ -619,6 +620,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                 off['hbm_bytes'] += c['hbm']
                 off['controllers'] += c['ctl']
                 off.setdefault('links_hbm', []).append(u['store'])
+                if 'engine_columns' in c:
+                    engine_cols.append((1, c['ctl']))
                 off['link_hbm_bytes'] = off.get('link_hbm_bytes', 0.0) + c['hbm']
             lk['ff'] += c['ff']
             lk['lutram'] += c['lutram']
@@ -1033,10 +1036,12 @@ def link_stream_ctl(dw):
             LINK_STREAM_CTL_LUTRAM[0] + LINK_STREAM_CTL_LUTRAM[1] * dw)
 
 
-def link_stream_cost(pair, uses, frame, f=1.0):
+def link_stream_cost(pair, uses, frame, f=1.0, engines=False):
     """A pair's links as an HBM stream (`pair`: its report line), the links it
     cannot carry distributed; None where its ports do not fit `frame` or it
-    carries none."""
+    carries none. With `engines` (foldsim --page-engines: streams ride the
+    shared page engines), its controller is its share of an engine, the
+    positions its requests take of the frame (`ctl`, `engine_columns` 1)."""
     ports = max(pair['producer_passes'] * pair['pages'],
                 pair['reader_passes'] * (pair['max_need'] + 2))
     if ports > LINK_PORT_SHARE * frame:
@@ -1047,13 +1052,19 @@ def link_stream_cost(pair, uses, frame, f=1.0):
         return None
     rest = sum(f * link_lutram(u['depth'], u['width']) for u in uses if u not in carried)
     cl, cr = link_stream_ctl(pair['dw'])
+    share = 1.0
+    if engines:
+        share = min(1.0, ports / max(frame, 1))
+        el, er = storage.page_engine_ctl()
+        cl, cr = share * el, share * er
     row = max(storage.HBM_BEAT_BYTES, storage.vmem_row_bytes(pair['dw']))
     slices = sum(math.ceil(u['width'] / pair['dw']) for u in carried)
     return dict(lut=cl + pair['dw'] * storage.page_select_luts(pair['pages']) +
                 LINK_STREAM_ENABLE_LUTS * slices,
                 lutram=cr + link_lutram(LINK_STREAM_SLOTS, pair['dw']) + rest,
                 ff=pair['word'] + 32, bram=0.0, uram=0.0, ii_floor=0,
-                hbm=float((pair['read_rows'] + pair['write_rows']) * row), ctl=1)
+                hbm=float((pair['read_rows'] + pair['write_rows']) * row), ctl=share,
+                **({'engine_columns': 1} if engines else {}))
 
 
 def link_streams_built(links):
@@ -1072,7 +1083,7 @@ def link_streams_built(links):
     return out
 
 
-def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0):
+def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0, engines=False):
     """The links as storage_area units, a unit per pair of models with a
     link that block or ultra RAM may hold (foldsim-fold-static `link-kinds`):
     its cost in each of LINK_KINDS, paged (`<kind>:<p>`, at the schedule's
@@ -1113,7 +1124,7 @@ def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0):
             # The compiler's HBM stream (all the pair's links, not only those
             # block or ultra RAM may hold).
             every = [u for u in links['uses'] if u['p'] == p and u['r'] == r]
-            c = link_stream_cost(pair, every, frame, f)
+            c = link_stream_cost(pair, every, frame, f, engines)
             if c is not None:
                 c['lutram'] -= sum(f * link_lutram(u['depth'], u['width'])
                                    for u in every if not u['sync'])
