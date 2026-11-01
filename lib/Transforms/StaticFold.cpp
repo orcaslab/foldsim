@@ -2568,6 +2568,11 @@ LogicalResult StaticFolder::assignPageEngines() {
       eng.readFirst = true;
     }
   }
+  // An engine's row is whole bytes (foldsim_vmem: a byte mask of DW/8 bits
+  // covers DW only when DW is a multiple of 8): a link stream's row of any
+  // width, and the columns' masks (a bit a byte of theirs), fit under it.
+  for (auto &eng : pageEngines)
+    eng.dataWidth = unsigned(llvm::alignTo(eng.dataWidth, 8));
   // Member numbers: a column's its place among the engine's columns, a
   // stream's after them.
   for (auto [e, eng] : llvm::enumerate(pageEngines)) {

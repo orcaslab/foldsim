@@ -69,6 +69,16 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/mix -DVM1 -DBUBBLES -Mdir %t/mix/obj %S/Inputs/tb_linkhbm.sv top.sv %t/mix/foldsim_sim.sv > %t/mix/build.log 2>&1
 # RUN: %t/mix/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 +bubble=30 | FileCheck %s
 # RUN: %t/mix/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=1 +hi=30 +stall=30 +full=20 | FileCheck %s
+# Streams of words not whole bytes (29 bits): an engine's row is whole bytes,
+# its byte mask covering the stream's row (the stream alone on an engine was
+# 29 bits under a 3-bit mask, its top bits never written; the compiler
+# stopped building the mask).
+# RUN: cd %S/../Driver/Inputs/linkodd
+# RUN: foldsim --srcs top.f --top Top --out %t/odd --static --nest --modulo --page 1 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=ODD
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/odd -DVM1 -Mdir %t/odd/obj %S/Inputs/tb_linkhbm.sv top.sv %t/odd/foldsim_sim.sv > %t/odd/build.log 2>&1
+# RUN: %t/odd/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/odd/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=1 +hi=20 +stall=30 +full=20 | FileCheck %s
+# ODD: page engine 1 32 bits, tag 7, row 6: link:Unit>Reader
 # C2: page engines: 2 engines, 2 page columns
 # C2: page engine 0 64 bits, tag 4, row 5: Leaf:region1_pages
 # C2: page engine 1 64 bits, tag 4, row 5: Leaf_copy1:region1_pages
