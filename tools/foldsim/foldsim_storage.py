@@ -440,13 +440,16 @@ def vmem_cost(depth, width, threads, weight=1.0, row_bytes_min=1):
 # many as the schedule's positions let the assignment share (foldsim-fold-
 # static assignPageEngines; more where copies' traffic collides).
 PAGE_ENGINE_BITS = 512
-# An engine's (logic, LUTRAM) LUTs, linear in its row's bits: calibrated
-# (virt_1101 cal/, Vivado 2025.2 synthesis + opt_design out of context on the
-# V80, V8B foldsim_vmem as foldsim_afu instantiates a page engine: INSTANCES 1,
-# IW 1, TAGW 10, AW 12, byte masks, QUEUE 32, OUTSTANDING 128, WRITES_OUT
-# 128). Until measured: the HBM link stream controller's (st32_1031 lk2/cal).
-PAGE_ENGINE_LOGIC = (1169.0, 0.52)
-PAGE_ENGINE_LUTRAM = (161.0, 1.156)
+# An engine's (logic, LUTRAM) LUTs, linear in its row's bits, and its block
+# RAM: calibrated (virt_1101 cal/, Vivado 2025.2 synthesis + opt_design out of
+# context on the V80, the image kernel's V8B foldsim_vmem as foldsim_afu
+# instantiates a page engine: INSTANCES 1, IW 1, TAGW 10, AW 12, byte masks,
+# read-first, QUEUE 32, OUTSTANDING 128, WRITES_OUT 128, no host cache, no
+# known-zero rows): DW 512: 1,657 logic + 866 LUTRAM + 1 RAMB36; DW 256:
+# 1,509 + 550 + 1 (the write-out sequence table).
+PAGE_ENGINE_LOGIC = (1361.0, 0.578)
+PAGE_ENGINE_LUTRAM = (234.0, 1.234)
+PAGE_ENGINE_BRAM = 1.0
 
 
 def page_engine_ctl(row_bits=PAGE_ENGINE_BITS):
@@ -473,6 +476,7 @@ def page_hbm_cost(bits, threads, p, engines_frame=None):
         columns, share = page_engine_share(bits, threads, p, engines_frame)
         cl, cr = page_engine_ctl()
         return dict(c, lut=c['lut'] + share * cl, lutram=c['lutram'] + share * cr,
+                    bram=c['bram'] + share * PAGE_ENGINE_BRAM,
                     hbm=c['hbm_bytes'], ctl=share, engine_columns=columns)
     cl, cr = page_ctl(bits, p, c['controllers'])
     return dict(c, lut=c['lut'] + cl, lutram=c['lutram'] + cr, hbm=c['hbm_bytes'],
