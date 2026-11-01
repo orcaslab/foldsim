@@ -1130,6 +1130,7 @@ LogicalResult StaticFolder::nestInstances() {
 
 static bool findHeldRead(seq::FirMemReadOp read, comb::MuxOp &found,
                          bool &qOnTrue);
+static int stageOpFullLevels(Operation *op);
 
 /// The logic levels a link taken in its producer's host cycle may span: the
 /// logic screen's gate.
@@ -1326,12 +1327,20 @@ LogicalResult StaticFolder::analyze(Class &cls) {
   return success();
 }
 
-/// An op's logic levels for staged evaluation, by width as the logic screen
-/// counts them on the V80's fabric (foldsim-estimate-timing): an adder or an
-/// ordering compare a LUT and a carry chain of 8-bit blocks, an equality
-/// compare 3-bit matches ANDed in LUT6 trees, a wide AND/OR/XOR a LUT6 tree;
-/// otherwise as `logicLevels`.
+/// An op's logic levels for staged evaluation, in half levels, by width as the
+/// logic screen counts them on the V80's fabric (foldsim-estimate-timing): an
+/// adder or an ordering compare a LUT and a carry chain of 8-bit blocks, an
+/// equality compare 3-bit matches ANDed in LUT6 trees, a wide AND/OR/XOR a
+/// LUT6 tree; a choice or a gate of two or three inputs half a level (a LUT6
+/// takes two of them chained); otherwise as `logicLevels`.
 static int stageOpLevels(Operation *op) {
+  if (isa<comb::MuxOp, comb::AndOp, comb::OrOp, comb::XorOp>(op) &&
+      op->getNumOperands() <= 3)
+    return 1;
+  return 2 * stageOpFullLevels(op);
+}
+
+static int stageOpFullLevels(Operation *op) {
   auto lut6 = [](int64_t inputs) {
     int levels = 1;
     for (int64_t n = 6; n < inputs; n *= 6)
@@ -1373,9 +1382,9 @@ static void depthEdges(Value value,
   if (read) {
     if (memory && memory.getReadLatency() > 0)
       return;
-    edges.push_back({read.getAddress(), 1});
+    edges.push_back({read.getAddress(), 2});
     if (read.getEnable())
-      edges.push_back({read.getEnable(), 1});
+      edges.push_back({read.getEnable(), 2});
     return;
   }
   if (isa<seq::FirRegOp, seq::CompRegClockEnabledOp, seq::FirMemOp,
@@ -1515,12 +1524,12 @@ LogicalResult StaticFolder::chooseStages() {
     // a memory's write or registered read, and an early output's next value
     // (its logic over the registers' next values, stages of it more).
     DenseMap<Value, Staging> memo;
-    int limit = int(stageLevels), next = 0, last = 0;
+    int limit = 2 * int(stageLevels), next = 0, last = 0;
     for (auto &op : *body) {
       if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
         int add = reg.getReset() ? 1 : 0;
-        next = std::max({next, sinkStage(reg.getNext(), add, limit, memo),
-                         sinkStage(reg.getReset(), add, limit, memo)});
+        next = std::max({next, sinkStage(reg.getNext(), 2 * add, limit, memo),
+                         sinkStage(reg.getReset(), 2 * add, limit, memo)});
       } else if (isa<seq::FirMemWriteOp>(op)) {
         for (auto operand : op.getOperands())
           if (statePort(operand))
@@ -5094,7 +5103,7 @@ void StaticFolder::stageLogic(Class &cls, Block *body, Operation *held,
           sinks.push_back(operand);
   }
   DenseMap<Value, Staging> memo;
-  int limit = std::max<int>(1, stageLevels);
+  int limit = std::max<int>(2, 2 * stageLevels);
   for (;; ++limit) {
     memo.clear();
     int last = 0;
@@ -5107,11 +5116,131 @@ void StaticFolder::stageLogic(Class &cls, Block *body, Operation *held,
     for (auto result : op.getResults())
       if (!memo.count(result))
         stageOf(result, limit, memo);
-  auto stageOf = [&](Value value) -> int {
-    if (auto *op = value.getDefiningOp())
-      if (isa<hw::ConstantOp, hw::AggregateConstantOp>(op))
-        return -1;
+
+  // The logic's ops, and the same cut latest first (each op in the latest
+  // stage its readers allow, the writes at the last): of the two, the one
+  // whose values cross fewer stage register bits.
+  auto isNode = [&](Operation *op) {
+    if (!op || op->getBlock() != body || op == held || op->getNumResults() == 0 ||
+        isa<seq::FirRegOp, seq::CompRegClockEnabledOp, seq::FirMemOp, hw::ConstantOp,
+            hw::AggregateConstantOp, UnrealizedConversionCastOp>(op))
+      return false;
+    if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+      auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+      return !(memory && memory.getReadLatency() > 0);
+    }
+    return true;
+  };
+  DenseSet<Value> sinkSet(sinks.begin(), sinks.end());
+  // Readers before their operands' producers: a depth-first post order on
+  // the operands, reversed.
+  SmallVector<Operation *> post;
+  {
+    DenseSet<Operation *> seen;
+    for (auto &root : *body) {
+      if (!isNode(&root) || seen.contains(&root))
+        continue;
+      SmallVector<std::pair<Operation *, unsigned>> stack{{&root, 0}};
+      seen.insert(&root);
+      while (!stack.empty()) {
+        auto &[op, next] = stack.back();
+        if (next < op->getNumOperands()) {
+          auto *def = op->getOperand(next++).getDefiningOp();
+          if (isNode(def) && seen.insert(def).second)
+            stack.push_back({def, 0});
+          continue;
+        }
+        post.push_back(op);
+        stack.pop_back();
+      }
+    }
+  }
+  DenseMap<Operation *, Staging> late;
+  int lateLast = 0;
+  for (auto *op : llvm::reverse(post)) {
+    int levels = 0;
+    if (auto read = dyn_cast<seq::FirMemReadOp>(op))
+      levels = 2;
+    else
+      levels = stageOpLevels(op);
+    int stage = 0, at = 0;
+    bool used = false;
+    for (auto result : op->getResults()) {
+      if (sinkSet.contains(result))
+        used = true;
+      for (auto *user : result.getUsers())
+        if (auto it = late.find(user); it != late.end()) {
+          used = true;
+          stage = std::max(stage, it->second.stage);
+        }
+    }
+    for (auto result : op->getResults())
+      for (auto *user : result.getUsers())
+        if (auto it = late.find(user); it != late.end() && it->second.stage == stage)
+          at = std::max(at, it->second.levels);
+    (void)used;
+    if (at > 0 && at + levels > limit) {
+      ++stage;
+      at = 0;
+    }
+    late[op] = {stage, at + levels};
+    lateLast = std::max(lateLast, stage);
+  }
+  // Stage register bits: each value from its stage to its latest reader's
+  // (a write's at the last).
+  auto crossing = [&](function_ref<int(Value)> at) {
+    uint64_t bits = 0;
+    DenseSet<Value> counted;
+    auto count = [&](Value value, int reader) {
+      int from = at(value);
+      if (from < 0 || reader <= from)
+        return;
+      (void)counted;
+      bits += uint64_t(std::max<int64_t>(1, hw::getBitWidth(value.getType()))) *
+              uint64_t(reader - from);
+    };
+    // The latest reader of each value.
+    DenseMap<Value, int> latest;
+    for (auto *op : post)
+      for (auto operand : op->getOperands())
+        if (statePort(operand))
+          latest[operand] = std::max(latest.lookup(operand), at(op->getResult(0)));
+    for (auto sink : sinks)
+      latest[sink] = int(stages);
+    for (auto [value, reader] : latest)
+      count(value, reader);
+    return bits;
+  };
+  auto constantAt = [](Value value) {
+    auto *op = value.getDefiningOp();
+    return op && isa<hw::ConstantOp, hw::AggregateConstantOp>(op);
+  };
+  auto soonest = [&](Value value) -> int {
+    if (constantAt(value))
+      return -1;
     return std::min<int>(memo.lookup(value).stage, stages);
+  };
+  auto latest = [&](Value value) -> int {
+    if (constantAt(value))
+      return -1;
+    auto it = late.find(value.getDefiningOp());
+    if (it == late.end())
+      return 0;  // the state, the inputs, registered reads
+    return int(stages) - it->second.stage;
+  };
+  bool useLate = false;
+  if (lateLast <= int(stages)) {
+    uint64_t early = crossing(soonest), lateBits = crossing(latest);
+    useLate = lateBits < early;
+    // (FOLDSIM_STAGE_CUT=soonest|latest forces one, for the tests.)
+    if (const char *force = getenv("FOLDSIM_STAGE_CUT"))
+      useLate = StringRef(force) == "latest";
+    llvm::errs() << "foldsim-fold-static: " << cls.name << " staged: " << stages
+                 << " stages, soonest " << early << " stage register bits, latest "
+                 << lateBits << (useLate ? " (latest)" : " (soonest)") << "\n";
+  }
+  auto stageOf = [&](Value value) -> int {
+    return useLate ? latest(value) : soonest(value);
   };
 
   // A value at a later stage: through the stage registers, as bits. The
@@ -5151,9 +5280,11 @@ void StaticFolder::stageLogic(Class &cls, Block *body, Operation *held,
   // The logic: each op's operands from its stage.
   SmallVector<Operation *> nodes;
   for (auto &op : *body) {
+    // (The copy's own control registers, made before the cut, are not the
+    // target's logic.)
     if (&op == held || op.getNumResults() == 0 ||
-        isa<seq::FirRegOp, seq::FirMemOp, hw::ConstantOp,
-            hw::AggregateConstantOp>(op))
+        isa<seq::FirRegOp, seq::CompRegClockEnabledOp, seq::FirMemOp,
+            hw::ConstantOp, hw::AggregateConstantOp>(op))
       continue;
     if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
       auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();

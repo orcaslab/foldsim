@@ -41,17 +41,23 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/nest --static --bubbles --nest --modulo --short-lead --copies Leaf:2 --page 2 --stage-levels 8 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_late.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
 # RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +bubble=30 +stall=20 | FileCheck %s
+# The cut soonest first, forced: the same against the target.
+# RUN: env FOLDSIM_STAGE_CUT=soonest foldsim --srcs top.f --top Top --out %t/early --static --bubbles --modulo --page 2 --stage-levels 6 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/early/obj %S/Inputs/tb_late.sv top.sv %t/early/foldsim_sim.sv > %t/early/build.log 2>&1
+# RUN: %t/early/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +bubble=30 +stall=20 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/zl --static --bubbles --modulo --zero-latency-links --zero-latency-chains --share-links --staged-links --compact-links --stage-levels 6 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/zl/obj %S/Inputs/tb_late.sv top.sv %t/zl/foldsim_sim.sv > %t/zl/build.log 2>&1
 # RUN: %t/zl/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +bubble=30 +stall=20 | FileCheck %s
 # Unstaged, the leaf's cone is one host cycle of 49 estimated levels; at 6 and
 # 4 levels a stage (counted as the logic screen does: a 12-bit compare or adder
-# a LUT and a carry block), it spans 9 and 18 stage registers and no end point
-# is deeper than a stage.
+# a LUT and a carry block, two chained choices a LUT), it spans 9 and 14 stage
+# registers and no end point is much deeper than a stage. Of the cut soonest
+# and the cut latest, the one of fewer stage register bits (STAGEBITS).
 # PLAIN: Leaf x4 state gap {{[0-9]+}}{{$}}
 # DEEP: #1 levels 49:
 # S6: Leaf x4 state gap 4 stages 9
-# CUT6: #1 levels {{[4-6]}}:
-# S4: Leaf x4 state gap 4 stages 18
-# CUT4: #1 levels {{[3-4]}}:
+# S6: Leaf staged: 9 stages, soonest {{[0-9]+}} stage register bits, latest {{[0-9]+}} (latest)
+# CUT6: #1 levels {{[4-7]}}:
+# S4: Leaf x4 state gap 4 stages 14
+# CUT4: #1 levels {{[3-6]}}:
 # CHECK: {{^}}MATCH 196 cycles
