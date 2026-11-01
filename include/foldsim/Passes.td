@@ -551,6 +551,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "which is the read register (0: none)">,
     Option<"linkUltraDepth", "link-ultra-depth", "unsigned", "0",
            "As link-block-depth, in ultra RAM (0: none)">,
+    Option<"linkHbmLead", "link-hbm-lead", "unsigned", "48",
+           "HBM link streams (link-kinds kind hbm): the most positions a "
+           "row's request precedes its landing (the memory's round trip in "
+           "host cycles and a margin; less where a stream's writes come "
+           "later)">,
     Option<"moduloLinear", "modulo-linear", "unsigned", "16",
            "With modulo: the periods tried one at a time from the frame's "
            "lower bound before the search skips ahead (a doubling step until "

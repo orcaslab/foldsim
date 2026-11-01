@@ -372,6 +372,8 @@ def frame_options(a):
         fold += f' link-block-depth={a.link_block_depth}'
     if getattr(a, 'link_ultra_depth', 0):
         fold += f' link-ultra-depth={a.link_ultra_depth}'
+    if getattr(a, 'link_hbm_lead', 0):
+        fold += f' link-hbm-lead={a.link_hbm_lead}'
     if getattr(a, 'link_kinds', ''):
         fold += f' link-kinds={a.link_kinds}'
     if getattr(a, 'registered_links', ''):
@@ -985,6 +987,10 @@ def main():
                          'register (foldsim-fold-static; 0: none)')
     ap.add_argument('--link-ultra-depth', type=int, default=0, metavar='N',
                     help='as --link-block-depth, in ultra RAM (foldsim-fold-static; 0: none)')
+    ap.add_argument('--link-hbm-lead', type=int, default=0, metavar='N',
+                    help='with --static and hbm link kinds: the most positions a stream row\'s request '
+                         'precedes its landing, the memory\'s round trip in host cycles and a margin '
+                         '(foldsim-fold-static; 0: its default, 48)')
     ap.add_argument('--link-kinds', default='', metavar='P:R:KIND,...',
                     help='with --static: the RAM (distributed, block or ultra) of the links from model P '
                          'to model R that --link-block-depth\'s rules let block or ultra RAM hold, '

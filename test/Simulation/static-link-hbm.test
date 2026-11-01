@@ -23,6 +23,11 @@
 # RUN: %t/bub/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +bubble=30 +stall=30 +lo=1 +hi=30 +full=20 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/one --static --nest --modulo --link-kinds Reader:Unit:hbm Unit Reader > %t/one.log 2>&1
 # RUN: FileCheck %s --check-prefix=ONE < %t/one/schedule.txt
+# A shorter lead (--link-hbm-lead): requests 10 positions ahead (the fewest: the decisions in flight + 6), more bubbles, as exact.
+# RUN: foldsim --srcs top.f --top Top --out %t/lead --static --nest --modulo --link-hbm-lead 10 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/lead.log 2>&1
+# RUN: FileCheck %s --check-prefix=LEAD < %t/lead/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/lead -DVM1 -Mdir %t/lead/obj %S/Inputs/tb_linkhbm.sv top.sv %t/lead/foldsim_sim.sv > %t/lead/build.log 2>&1
+# RUN: %t/lead/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=8 +hi=40 | FileCheck %s
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/one -Mdir %t/one/obj %S/Inputs/tb_linkhbm.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
 # A staged reader (--stage-levels: Reader evaluates over its stages, its links
@@ -43,7 +48,7 @@
 # RC2: link stream {{.+}} 1 1 32
 # TWO: II = 64
 # TWO: link streams: 2 streams, 3 links, 2304 bits
-# TWO: link stream Reader Unit 1 0 32 32 1 16 16 1
+# TWO: link stream Reader Unit 1 0 32 32 1 16 16 1 {{[0-9]+}}
 # TWO: link stream Unit Reader 2 0 32 32 1 16 32 2
 # VH: `define FOLDSIM_VMEM_COUNT 2
 # VH: `define FOLDSIM_VMEM_TAGS
@@ -54,5 +59,6 @@
 # VH: `define FOLDSIM_VMEM_1_TAGW 6
 # ONE: link use Reader Unit 32 32 16 hbm 1
 # ONE: link stream Reader Unit 1 0 32 32 1 16 16 1
+# LEAD: link stream Reader Unit 1 0 32 32 1 16 16 1 10{{$}}
 # CHECK: {{^}}MATCH 196 cycles
 # CHECK-NOT: PROTOCOL
