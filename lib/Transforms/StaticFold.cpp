@@ -1927,7 +1927,6 @@ LogicalResult StaticFolder::parseLinkKinds() {
         if (modelOf(c) == parts[0] || modelOf(c) == parts[1])
           classes[c].linkPage = std::max(classes[c].linkPage, page);
   }
-  layoutStreams();
   return success();
 }
 
@@ -11324,6 +11323,10 @@ LogicalResult StaticFolder::run() {
   for (auto &cls : classes)
     if (failed(analyze(cls)))
       return failure();
+  // The HBM link streams' layouts, once the analysis has told which
+  // producers are late (a late output is no stream's: its readers take it
+  // in the frame it is written).
+  layoutStreams();
   // The links' storage alone, before any schedule (it does not depend on
   // one): for a quick look at a large design.
   if (getenv("FOLDSIM_LINKS_ONLY")) {
