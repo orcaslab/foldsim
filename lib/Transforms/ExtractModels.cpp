@@ -822,6 +822,37 @@ void LogicAbsorber::run() {
       };
       DenseSet<Value> differing;
       bool same = matchAll(exclusive ? &differing : nullptr);
+      // A differing constant that only indexes arrays in the logic (each
+      // instance's element of a bus, wiring): the element is the leaf, not
+      // the constant and the whole array, so the model takes the element's
+      // bits rather than every instance's bus.
+      if (same && !differing.empty()) {
+        DenseSet<Operation *> inCone(ops.begin(), ops.end());
+        SmallVector<Value> elements, constants;
+        for (Value value : differing) {
+          if (!value.getDefiningOp<hw::ConstantOp>())
+            continue;
+          SmallVector<Value> gets;
+          bool onlyIndex = true;
+          for (auto &use : value.getUses()) {
+            if (!inCone.contains(use.getOwner()))
+              continue;
+            auto get = dyn_cast<hw::ArrayGetOp>(use.getOwner());
+            if (!get || use.getOperandNumber() != 1) {
+              onlyIndex = false;
+              break;
+            }
+            gets.push_back(get.getResult());
+          }
+          if (!onlyIndex || gets.empty())
+            continue;
+          constants.push_back(value);
+          elements.append(gets);
+        }
+        for (Value value : constants)
+          differing.erase(value);
+        differing.insert(elements.begin(), elements.end());
+      }
       if (same && !differing.empty()) {
         ops.clear();
         leaves.clear();
