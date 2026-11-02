@@ -397,10 +397,12 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
 # simulator top level's logic per link register bit (read registers and
 # selects, staged copies, slot tables), a threaded copy's thread controls,
 # and whether memories the model gives ultra RAM get it (Vivado put them in
-# block RAM). On with --kernel-terms (KERNEL['on']); `mem_ports` from the
+# block RAM); the simulator's channel queues of each memory port (census of
+# the top level: 3.5k LUTs a port, 0.27 a link register bit besides). On with --kernel-terms (KERNEL['on']); `mem_ports` from the
 # report (the netlist's m_axi_mem ports).
 KERNEL = dict(on=False, mem_ports=0, endpoint_logic=24565.0, endpoint_lutram=4718.0,
-              top_logic_per_link_bit=0.38, threaded_copy_logic=1500.0, uram_memories=False)
+              port_channel_logic=3500.0, top_logic_per_link_bit=0.27, threaded_copy_logic=1500.0,
+              uram_memories=False)
 
 
 def kernel_mem_ports(text):
@@ -433,7 +435,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     logic = rest
     units, copy_logic, base_lutram = [], {}, 0.0
     if KERNEL['on']:
-        logic += KERNEL['mem_ports'] * KERNEL['endpoint_logic']
+        logic += KERNEL['mem_ports'] * (KERNEL['endpoint_logic'] + KERNEL['port_channel_logic'])
         base_lutram += KERNEL['mem_ports'] * KERNEL['endpoint_lutram']
         logic += KERNEL['top_logic_per_link_bit'] * ((sched or {}).get('__links__') or {}).get('ff', 0)
         logic += KERNEL['threaded_copy_logic'] * sum(1 for c, n in classes.items() if n > 1)
