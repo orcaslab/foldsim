@@ -36,6 +36,33 @@
 # RUN: FileCheck %s --check-prefix=MINL < %t/minl/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/minl -DVM1 -Mdir %t/minl/obj %S/Inputs/tb_linkhbm.sv top.sv %t/minl/foldsim_sim.sv > %t/minl/build.log 2>&1
 # RUN: %t/minl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=1 +hi=60 | FileCheck %s
+# A stream none of whose members is kept builds nothing, so its ports space
+# no pass: it is excluded and the frame scheduled again without it. At 100
+# no member has the room: both streams excluded, the frame the stream-free
+# fold's (no hbm rule; before, II 64 against 16: the dropped streams' ports
+# still spaced the passes), every link on chip, exact. At 20 Reader -> Unit
+# keeps none: excluded, and Unit -> Reader's members planned anew on the
+# frame without its spacing (both kept, lead 40), exact.
+# RUN: foldsim --srcs top.f --top Top --out %t/free --static --nest --modulo Unit Reader > %t/free.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/drop --static --nest --modulo --link-hbm-min-lead 100 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/drop.log 2>&1
+# RUN: cat %t/free.log %t/drop.log | FileCheck %s --check-prefix=DROP
+# RUN: FileCheck %s --check-prefix=DROPX < %t/drop.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/drop/obj %S/Inputs/tb_reset.sv top.sv %t/drop/foldsim_sim.sv > %t/drop/build.log 2>&1
+# RUN: %t/drop/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/drop/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/drop1 --static --nest --modulo --link-hbm-min-lead 20 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=DROP1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/drop1 -Mdir %t/drop1/obj %S/Inputs/tb_linkhbm.sv top.sv %t/drop1/foldsim_sim.sv > %t/drop1/build.log 2>&1
+# RUN: %t/drop1/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/drop1/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
+# DROP: II = [[II:[0-9]+]]{{$}}
+# DROP: II = [[II]]{{$}}
+# DROP: link streams: 0 streams, 0 links, 0 bits
+# DROPX: link stream Reader -> Unit keeps no member
+# DROPX: link stream Unit -> Reader keeps no member
+# DROP1: link stream Reader -> Unit keeps no member
+# DROP1-NOT: Unit -> Reader keeps no member
+# DROP1: link streams: 1 streams, 2 links
+# DROP1: link stream Unit Reader 2 0 32 32 1 16 32 2 40{{$}}
 # --link-hbm-row-bits: a stream's row (its controller's data width) at most
 # that many bits; a wider word is cut into rows, written one a host cycle
 # after the producer's pass and landing one a host cycle before the
