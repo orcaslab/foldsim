@@ -403,7 +403,7 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
 KERNEL = dict(on=False, mem_ports=0, endpoint_logic=24565.0, endpoint_lutram=4718.0,
               port_channel_logic=3500.0, top_logic_per_link_bit=0.27, threaded_copy_logic=1500.0,
               uram_memories=False, fold_ports=False, folded_logic=40000.0, folded_lutram=5000.0,
-              folded_uram_bits_per_port=330000.0, copy_logic=None)
+              folded_uram_bits_per_port=330000.0, folded_measured=None, copy_logic=None)
 # fold_ports (a what-if, not built): the memory ports as one replicated unit
 # folded like a class: one bank-model engine, one endpoint shell and one
 # token-queue engine (`folded_logic`, `folded_lutram`) serving the channels in
@@ -411,7 +411,10 @@ KERNEL = dict(on=False, mem_ports=0, endpoint_logic=24565.0, endpoint_lutram=471
 # buffers: ~4.7k LUTRAM + 7.7k flops + 2.9k LUTRAM measured a port) in ultra
 # RAM. copy_logic: {class model: synthesized logic LUTs of its copy} (measured,
 # st32_1031/lk2/img4dbg/class_table.md) in place of kappa x estimate + state
-# logic and the threaded-copy term.
+# logic and the threaded-copy term. folded_measured (--fold-ports-measured): the
+# folded memory endpoint as built and synthesized out of context (foldsim_mem_fold,
+# lk2/ooc): {logic, lutram, ramb36, uram} for all the ports, in place of the
+# what-if's folded_* estimates.
 
 
 def kernel_mem_ports(text):
@@ -443,9 +446,14 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     left (`pages_offchip`), with their traffic (`hbm_bytes`)."""
     logic = rest
     units, copy_logic, base_lutram = [], {}, 0.0
-    kernel_uram = 0.0
+    kernel_uram = kernel_bram = 0.0
     if KERNEL['on']:
-        if KERNEL['fold_ports']:
+        if KERNEL['fold_ports'] and KERNEL['folded_measured']:
+            fm = KERNEL['folded_measured']
+            logic += fm['logic']
+            base_lutram += fm['lutram']
+            kernel_bram, kernel_uram = fm['ramb36'], fm['uram']
+        elif KERNEL['fold_ports']:
             logic += KERNEL['folded_logic']
             base_lutram += KERNEL['folded_lutram']
             kernel_uram = math.ceil(KERNEL['mem_ports'] * KERNEL['folded_uram_bits_per_port'] /
@@ -632,7 +640,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         units.extend(lu[0])
         lk = dict(lu[1], lutram=lu[1]['lutram'] + lk['lutram'] -
                   link_cost(cal, dict((sched or {}).get('__links__'), streams=[]))['lutram'])
-    lk = dict(lk, uram=lk['uram'] + kernel_uram)
+    lk = dict(lk, uram=lk['uram'] + kernel_uram, bram=lk['bram'] + kernel_bram)
     base = dict(sites=logic + storage.LUTRAM_SITES * (lk['lutram'] + base_lutram),
                 luts=storage.fold_load(logic + lk['lutram'] + base_lutram, cache + lk['bram'],
                                        lk['uram']),
@@ -2013,6 +2021,9 @@ def main():
     st.add_argument('--fold-ports', action='store_true',
                     help='with --kernel-terms: the memory ports folded like a class (a what-if: shared '
                          'engines, each channel\'s state in ultra RAM)')
+    st.add_argument('--fold-ports-measured', default='', metavar='LOGIC,LUTRAM,RAMB36,URAM',
+                    help='with --fold-ports: the folded memory endpoint as synthesized (all ports), in '
+                         'place of the what-if estimates')
     st.add_argument('--uram-memories', action='store_true',
                     help='with --kernel-terms: memories may take ultra RAM (as the storage rules ask)')
     st.add_argument('--copy-logic', default='', metavar='JSON',
@@ -2083,6 +2094,9 @@ def state_main(a):
     if getattr(a, 'kernel_terms', False):
         KERNEL.update(on=True, mem_ports=kernel_mem_ports(text),
                       fold_ports=getattr(a, 'fold_ports', False),
+                      folded_measured=dict(zip(('logic', 'lutram', 'ramb36', 'uram'),
+                                               map(float, a.fold_ports_measured.split(','))))
+                      if getattr(a, 'fold_ports_measured', '') else None,
                       uram_memories=getattr(a, 'uram_memories', False),
                       copy_logic=json.load(open(a.copy_logic)) if getattr(a, 'copy_logic', '') else None)
     m = re.search(r'virtual-memories=(\S+)', a.fold_options)
