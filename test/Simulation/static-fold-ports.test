@@ -32,7 +32,9 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/sp -DSPEC -Mdir %t/sp/obj %S/Inputs/tb_ports.sv top.sv %t/sp/foldsim_sim.sv > %t/sp/build.log 2>&1
 # RUN: %t/sp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 +stall=30 | FileCheck %s
 # RUN: %t/sp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=100 +hi=400 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/bu --static --nest --modulo --bubbles --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst Unit > %t/bu.log 2>&1
+# (A prefix, the same bundles: mp_<k>_<field>.)
+# RUN: foldsim --srcs top.f --top Top --out %t/bu --static --nest --modulo --bubbles --fold-ports mp_ --fold-ports-reset rst Unit > %t/bu.log 2>&1
+# RUN: FileCheck %s --check-prefix=VH < %t/bu/foldsim_sim.vh
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/bu -DBUBBLES -Mdir %t/bu/obj %S/Inputs/tb_ports.sv top.sv %t/bu/foldsim_sim.sv > %t/bu/build.log 2>&1
 # RUN: %t/bu/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +lo=1 +hi=30 +bubble=30 +stall=30 | FileCheck %s
 # Errors: bundles not numbered from 0; no such reset input.

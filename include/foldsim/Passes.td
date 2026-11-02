@@ -579,7 +579,8 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"foldPorts", "fold-ports", "std::string", "\"\"",
            "Netlist ports as bundles folded into two record streams: a "
            "regex whose first capture is the bundle (an index 0..N-1) and "
-           "whose second the field (POSIX extended, e.g. m_axi_mem_([0-9]+)_(.*)). Each "
+           "whose second the field (POSIX extended, e.g. m_axi_mem_([0-9]+)_(.*)), "
+           "or, without a group, a prefix: <prefix><bundle>_<field>. Each "
            "bundle's outputs of a target cycle leave as one request record "
            "(req_valid / req_ready / req_chan / req_treset / req_bits, the "
            "fields low first in netlist order), its inputs come as one "

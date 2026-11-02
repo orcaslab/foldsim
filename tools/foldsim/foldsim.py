@@ -1040,7 +1040,8 @@ def main():
     ap.add_argument('--fold-ports', default='', metavar='REGEX',
                     help='with --static: netlist port bundles folded into two record streams (req_* / rsp_*), '
                          'the regex\'s first capture the bundle index, its second the field, e.g. '
-                         '\'m_axi_mem_([0-9]+)_(.*)\' (POSIX extended; foldsim-fold-static; foldsim_sim.vh FOLDSIM_PORTS_*)')
+                         '\'m_axi_mem_([0-9]+)_(.*)\' (POSIX extended), or without a group a prefix: '
+                         'm_axi_mem_ for m_axi_mem_<bundle>_<field> (foldsim-fold-static; foldsim_sim.vh FOLDSIM_PORTS_*)')
     ap.add_argument('--fold-ports-reset', default='reset', metavar='INPUT',
                     help='with --fold-ports: the netlist input whose frame token rides on each request record')
     ap.add_argument('--link-kinds', default='', metavar='P:R:KIND,...',

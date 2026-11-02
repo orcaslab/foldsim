@@ -403,7 +403,17 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
 KERNEL = dict(on=False, mem_ports=0, endpoint_logic=24565.0, endpoint_lutram=4718.0,
               port_channel_logic=3500.0, top_logic_per_link_bit=0.27, threaded_copy_logic=1500.0,
               uram_memories=False, fold_ports=False, folded_logic=40000.0, folded_lutram=5000.0,
-              folded_uram_bits_per_port=330000.0, copy_logic=None)
+              folded_uram_bits_per_port=330000.0, copy_logic=None,
+              sim_ports_folded=False, sim_port_folded_logic=1100.0,
+              sim_ports_shared_logic=8200.0, sim_ports_shared_lutram=1700.0)
+# sim_ports_folded (foldsim --fold-ports, built): the simulator's side of the
+# memory ports as request / response record streams. Per port what stays:
+# the inputs' tokens and frame registers (rdata's 4 copies and its frame:
+# ~1.0k LUTs at 4 SMs, census_cells.txt) and the outputs' counters and
+# pointers (~0.1k); shared: the record memories' write selects (a 32-way
+# AND-OR a request bit, ~11 LUTs a bit of 744) and their LUTRAM (744 bits x
+# 2 blocks of 64 rows). Estimates from the 4-SM census and the generated
+# netlist (foldsim_cost: -42.7k raw at 4 SMs), not yet a Vivado point.
 # fold_ports (a what-if, not built): the memory ports as one replicated unit
 # folded like a class: one bank-model engine, one endpoint shell and one
 # token-queue engine (`folded_logic`, `folded_lutram`) serving the channels in
@@ -451,8 +461,13 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             kernel_uram = math.ceil(KERNEL['mem_ports'] * KERNEL['folded_uram_bits_per_port'] /
                                     (storage.URAM[0] * storage.URAM[1]))
         else:
-            logic += KERNEL['mem_ports'] * (KERNEL['endpoint_logic'] + KERNEL['port_channel_logic'])
+            channel = KERNEL['sim_port_folded_logic'] if KERNEL['sim_ports_folded'] \
+                else KERNEL['port_channel_logic']
+            logic += KERNEL['mem_ports'] * (KERNEL['endpoint_logic'] + channel)
             base_lutram += KERNEL['mem_ports'] * KERNEL['endpoint_lutram']
+            if KERNEL['sim_ports_folded']:
+                logic += KERNEL['sim_ports_shared_logic']
+                base_lutram += KERNEL['sim_ports_shared_lutram']
         logic += KERNEL['top_logic_per_link_bit'] * ((sched or {}).get('__links__') or {}).get('ff', 0)
         if not KERNEL['copy_logic']:
             logic += KERNEL['threaded_copy_logic'] * sum(1 for c, n in classes.items() if n > 1)
@@ -2109,6 +2124,10 @@ def main():
     st.add_argument('--fold-ports', action='store_true',
                     help='with --kernel-terms: the memory ports folded like a class (a what-if: shared '
                          'engines, each channel\'s state in ultra RAM)')
+    st.add_argument('--sim-ports-folded', action='store_true',
+                    help='with --kernel-terms and the endpoints as built: the simulator\'s side of the memory '
+                         'ports folded into record streams (foldsim --fold-ports): its per-port channel queues '
+                         'priced as what stays a port plus the shared record memories')
     st.add_argument('--uram-memories', action='store_true',
                     help='with --kernel-terms: memories may take ultra RAM (as the storage rules ask)')
     st.add_argument('--copy-logic', default='', metavar='JSON',
@@ -2190,6 +2209,7 @@ def state_main(a):
     if getattr(a, 'kernel_terms', False):
         KERNEL.update(on=True, mem_ports=kernel_mem_ports(text),
                       fold_ports=getattr(a, 'fold_ports', False),
+                      sim_ports_folded=getattr(a, 'sim_ports_folded', False),
                       uram_memories=getattr(a, 'uram_memories', False),
                       copy_logic=json.load(open(a.copy_logic)) if getattr(a, 'copy_logic', '') else None)
     m = re.search(r'virtual-memories=(\S+)', a.fold_options)

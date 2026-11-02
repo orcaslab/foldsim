@@ -12116,7 +12116,11 @@ LogicalResult StaticFolder::resolvePortFold() {
   pf.producerField.assign(producers.size(), -1);
   if (foldPortsSpec.empty())
     return success();
-  llvm::Regex re("^(" + foldPortsSpec + ")$");
+  // A spec without a group is a prefix: <prefix><bundle>_<field>.
+  std::string spec = StringRef(foldPortsSpec).contains('(')
+                         ? foldPortsSpec
+                         : llvm::Regex::escape(foldPortsSpec) + "([0-9]+)_(.*)";
+  llvm::Regex re("^(" + spec + ")$");
   std::string error;
   if (!re.isValid(error))
     return netlist.emitError("fold-ports: ") << error;
