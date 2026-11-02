@@ -321,6 +321,9 @@ public:
   /// member with less room is built as an on-chip link: its landing would
   /// wait for the memory's round trip every frame.
   unsigned linkHbmMinLeadOpt = 0;
+  /// `link-hbm-row-bits`: the most bits of an HBM link stream's row (its
+  /// controller's DW): a wider word is cut into rows (pages) of this many.
+  unsigned linkHbmRowBits = 512;
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
                unsigned regionBits, StringRef report,
                ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
@@ -2052,6 +2055,9 @@ LogicalResult StaticFolder::parseRegisteredLinks() {
 }
 
 LogicalResult StaticFolder::parseLinkKinds() {
+  if (linkHbmRowBits < 8 || linkHbmRowBits > 4096)
+    return netlist.emitError("link-hbm-row-bits: ")
+           << linkHbmRowBits << " is not 8 to 4096";
   if (linkKindSpec.empty())
     return success();
   std::set<std::string> models;
@@ -2156,7 +2162,7 @@ void StaticFolder::layoutStreamsOf(function_ref<bool(const LinkUse &)> pick,
       flush();
     }
     s.wordBits = offset;
-    s.dw = std::min(512u, offset);
+    s.dw = std::min(linkHbmRowBits, offset);
     s.pages = (offset + s.dw - 1) / s.dw;
     auto offsetOf = [&](unsigned p, unsigned low) {
       for (auto &run : s.runs)
@@ -11553,6 +11559,7 @@ void FoldStaticPass::runOnOperation() {
   folder.moduloLinear = moduloLinear;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
+  folder.linkHbmRowBits = linkHbmRowBits;
   if (failed(folder.run()))
     return signalPassFailure();
 }

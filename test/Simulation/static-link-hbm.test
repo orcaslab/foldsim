@@ -36,6 +36,16 @@
 # RUN: FileCheck %s --check-prefix=MINL < %t/minl/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/minl -DVM1 -Mdir %t/minl/obj %S/Inputs/tb_linkhbm.sv top.sv %t/minl/foldsim_sim.sv > %t/minl/build.log 2>&1
 # RUN: %t/minl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=1 +hi=60 | FileCheck %s
+# --link-hbm-row-bits: a stream's row (its controller's data width) at most
+# that many bits; a wider word is cut into rows, written one a host cycle
+# after the producer's pass and landing one a host cycle before the
+# reader's (16: two rows a 32-bit word, the passes spaced, a longer frame).
+# RUN: foldsim --srcs top.f --top Top --out %t/rowb --static --nest --modulo --link-hbm-row-bits 16 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/rowb.log 2>&1
+# RUN: FileCheck %s --check-prefix=ROWB < %t/rowb/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/rowb -DVM1 -Mdir %t/rowb/obj %S/Inputs/tb_linkhbm.sv top.sv %t/rowb/foldsim_sim.sv > %t/rowb/build.log 2>&1
+# RUN: %t/rowb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/rowb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
+# RUN: not foldsim --srcs top.f --top Top --out %t/rowbad --static --link-hbm-row-bits 5000 --link-kinds Unit:Reader:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=ROWBAD
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/one -Mdir %t/one/obj %S/Inputs/tb_linkhbm.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
 # A staged reader (--stage-levels: Reader evaluates over its stages, its links
@@ -85,6 +95,10 @@
 # ONE: link stream Reader Unit 1 0 32 32 1 16 16 1
 # LEAD: link stream Reader Unit 1 0 32 32 1 16 16 1 10{{$}}
 # MINL: link stream Reader Unit 1 0 32 32 1 16 16 1 11{{$}}
+# ROWB: II = 80
+# ROWB: link stream Reader Unit 1 0 32 16 2 32 32 2
+# ROWB: link stream Unit Reader 1 1 32 16 2 32 32 2
+# ROWBAD: link-hbm-row-bits: 5000 is not 8 to 4096
 # MINL: link stream Unit Reader 1 1 32 32 1 16 16 1 48{{$}}
 # CHECK: {{^}}MATCH 196 cycles
 # CHECK-NOT: PROTOCOL

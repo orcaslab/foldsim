@@ -556,6 +556,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "row's request precedes its landing (the memory's round trip in "
            "host cycles and a margin; less where a stream's writes come "
            "later)">,
+    Option<"linkHbmRowBits", "link-hbm-row-bits", "unsigned", "512",
+           "HBM link streams: the most bits of a stream's row (its "
+           "controller's data width, 8 to 4096): a wider word is cut into "
+           "that many rows, written one a host cycle after the producer's "
+           "pass and landing one a host cycle before the reader's, which "
+           "spaces their passes">,
     Option<"linkHbmMinLead", "link-hbm-min-lead", "unsigned", "0",
            "HBM link streams: the least positions from a row's write to its "
            "landing for a link to be streamed; one with less stays an on-chip "

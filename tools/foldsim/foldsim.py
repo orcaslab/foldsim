@@ -374,6 +374,8 @@ def frame_options(a):
         fold += f' link-ultra-depth={a.link_ultra_depth}'
     if getattr(a, 'link_hbm_lead', 0):
         fold += f' link-hbm-lead={a.link_hbm_lead}'
+    if getattr(a, 'link_hbm_row_bits', 0):
+        fold += f' link-hbm-row-bits={a.link_hbm_row_bits}'
     if getattr(a, 'link_hbm_min_lead', 0):
         fold += f' link-hbm-min-lead={a.link_hbm_min_lead}'
     if getattr(a, 'link_kinds', ''):
@@ -997,6 +999,10 @@ def main():
                     help='with --static and hbm link kinds: the most positions a stream row\'s request '
                          'precedes its landing, the memory\'s round trip in host cycles and a margin '
                          '(foldsim-fold-static; 0: its default, 48)')
+    ap.add_argument('--link-hbm-row-bits', type=int, default=0, metavar='N',
+                    help='with --static and hbm link kinds: the most bits of a stream row, its controller\'s '
+                         'data width (8 to 4096; foldsim-fold-static; 0: its default, 512). A wider word is cut '
+                         'into rows a host cycle each, which spaces the producer\'s and reader\'s passes')
     ap.add_argument('--link-hbm-min-lead', type=int, default=0, metavar='N',
                     help='with --static and hbm link kinds: the least positions from a row\'s write to its '
                          'landing for a link to be streamed; less stays an on-chip link (foldsim-fold-static; '
