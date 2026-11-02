@@ -16,12 +16,15 @@
 # bubbles, PROTOCOL for a read or write of an instance whose read is
 # outstanding), from zero state (Driver/Inputs/paged_staged: registered
 # outputs, a RAM read through a register): staged; multicycle; bubbles with
-# overlapped frames; copies under nested sequencers; the dense page word
+# overlapped frames; copies under nested sequencers, and multicycle; the
+# dense page word
 # (its old value crosses the stages); a window, also multicycle with nested
 # sequencers and a short lead; page engines; the leaves' RAM virtual too.
 # Waiting for the pages at the state pass instead mismatches MC (seed 1,
 # PROTOCOL at seed 3); fetching a lead before the state pass instead of the
-# read mismatches ST and MC at every seed.
+# read mismatches ST and MC at every seed; fetching a page before the frame
+# before's write-back of it (no s - ii + 2 bound: it binds in CP and CPMC, two
+# instances a copy) reads the old page (PROTOCOL and MISMATCH in CP).
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/paged_staged
 # RUN: foldsim --srcs top.f --top Top --out %t/st --static --page 2 --storage Leaf:pages=hbm --stage-levels 1 Leaf > %t/st.log 2>&1
 # RUN: FileCheck %s --check-prefix=ST < %t/st/schedule.txt
@@ -43,6 +46,10 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/cp -DBUBBLES -DVM1 -Mdir %t/cp/obj %S/Inputs/tb_pages.sv top.sv %t/cp/foldsim_sim.sv > %t/cp/build.log 2>&1
 # RUN: %t/cp/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=40 +stall=20 +full=20 +bubble=20 | FileCheck %s
 # RUN: %t/cp/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 +bubble=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/cpmc --static --page 3 --storage Leaf:pages=hbm --copies Leaf:2 --multicycle Leaf:3 --stage-levels 1 Leaf > %t/cpmc.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/cpmc -DVM1 -Mdir %t/cpmc/obj %S/Inputs/tb_pages.sv top.sv %t/cpmc/foldsim_sim.sv > %t/cpmc/build.log 2>&1
+# RUN: %t/cpmc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/cpmc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 +stall=20 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/dense --static --page 3 --storage Leaf:pages=hbm --no-page-masks --modulo --stage-levels 1 Leaf > %t/dense.log 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/dense -Mdir %t/dense/obj %S/Inputs/tb_pages.sv top.sv %t/dense/foldsim_sim.sv > %t/dense/build.log 2>&1
 # RUN: %t/dense/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=3 +hi=10 +stall=10 | FileCheck %s
