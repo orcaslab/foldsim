@@ -33,6 +33,21 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/room --static --nest --modulo --min-ii 160 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-shift 40 --link-hbm-lead 160 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm Unit Vnit Reader Sink 2>&1 | FileCheck %s --check-prefix=ROOM
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/room -DVM1 -DVM2 -Mdir %t/room/obj %S/Inputs/tb_linkhbm.sv top.sv %t/room/foldsim_sim.sv > %t/room/build.log 2>&1
 # RUN: %t/room/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 | FileCheck %s
+# --link-hbm-fit-slots: each stream takes the fewest landing slots its
+# requests need (16 here, not lead + 8 = 64), shared or not, exact with
+# answers as late as the lead (40 to 60 host cycles: a slot reused too soon
+# would answer a landing with another's row).
+# RUN: foldsim --srcs top.f --top Top --out %t/fit --static --nest --modulo --min-ii 160 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-fit-slots --link-hbm-shift 8 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm Unit Vnit Reader Sink 2>&1 | FileCheck %s --check-prefix=FIT
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/fit -Mdir %t/fit/obj %S/Inputs/tb_linkhbm.sv top.sv %t/fit/foldsim_sim.sv > %t/fit/build.log 2>&1
+# RUN: %t/fit/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/fit/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=40 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/fitm --static --nest --modulo --min-ii 64 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-fit-slots --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm Unit Vnit Reader Sink 2>&1 | FileCheck %s --check-prefix=FITM
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/fitm -DVM1 -DVM2 -Mdir %t/fitm/obj %S/Inputs/tb_linkhbm.sv top.sv %t/fitm/foldsim_sim.sv > %t/fitm/build.log 2>&1
+# RUN: %t/fitm/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +lo=40 +hi=60 +full=30 | FileCheck %s
+# FIT: page engines: 1 engines, 0 page columns
+# FIT: link stream slots: 16 16 16
+# FITM: page engines: 3 engines, 0 page columns
+# FITM: link stream slots: 16 16 16
 # OWN: page engines: 3 engines, 0 page columns
 # OWN-NOT: page engine shifts
 # SH: page engines: 1 engines, 0 page columns

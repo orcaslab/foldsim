@@ -940,6 +940,12 @@ def parse_links(text):
                     max_need=int(x[9]))
                for x in re.findall(r'^    link stream (\S+) (\S+) (\d+) (\d+) (\d+) (\d+) (\d+) '
                                    r'(\d+) (\d+) (\d+)(?: \d+)?$', text, re.M)]
+    # Their landing slots where the schedule fitted them (link-hbm-fit-slots:
+    # a line of each built stream's, in their order), else LINK_STREAM_SLOTS.
+    m = re.search(r'^  link stream slots:((?: \d+)*)$', text, re.M)
+    if m and len(m.group(1).split()) == len(streams):
+        for st, k in zip(streams, m.group(1).split()):
+            st['slots'] = int(k)
     # HBM page streams built (page-engines): the engines, and the link
     # streams they carry (no controller of their own).
     m = re.search(r'^  page engines: (\d+) engines, (\d+) page columns', text, re.M)
@@ -1105,7 +1111,7 @@ def link_streams_built(links):
         row = max(storage.HBM_BEAT_BYTES, storage.vmem_row_bytes(s['dw']))
         out['lut'] += cl + s['dw'] * storage.page_select_luts(s['pages']) + \
             LINK_STREAM_ENABLE_LUTS * s['kept']
-        out['lutram'] += cr + link_lutram(LINK_STREAM_SLOTS, s['dw'])
+        out['lutram'] += cr + link_lutram(s.get('slots', LINK_STREAM_SLOTS), s['dw'])
         out['ff'] += s['word'] + 32
         out['hbm'] += (s['read_rows'] + s['write_rows']) * row
         out['ctl'] += 0 if (s['p'], s['r']) in on_engines else 1

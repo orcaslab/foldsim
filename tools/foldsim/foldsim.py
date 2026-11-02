@@ -382,6 +382,8 @@ def frame_options(a):
         fold += f' link-hbm-min-lead={a.link_hbm_min_lead}'
     if getattr(a, 'link_hbm_shift', 0):
         fold += f' link-hbm-shift={a.link_hbm_shift}'
+    if getattr(a, 'link_hbm_fit_slots', False):
+        fold += ' link-hbm-fit-slots'
     if getattr(a, 'link_kinds', ''):
         fold += f' link-kinds={a.link_kinds}'
     if getattr(a, 'registered_links', ''):
@@ -1025,6 +1027,9 @@ def main():
                          'request moves earlier, or its write later, so that streams whose requests or writes '
                          'fall at the same positions share an engine (within the room from the row\'s write to '
                          'its request; foldsim-fold-static; 0: none)')
+    ap.add_argument('--link-hbm-fit-slots', action='store_true',
+                    help='with --static, hbm link kinds and --page-engines: each stream takes the fewest landing '
+                         'slots its requests need (a power of two, at least 8; foldsim-fold-static)')
     ap.add_argument('--link-kinds', default='', metavar='P:R:KIND,...',
                     help='with --static: the RAM (distributed, block or ultra) of the links from model P '
                          'to model R that --link-block-depth\'s rules let block or ultra RAM hold, '

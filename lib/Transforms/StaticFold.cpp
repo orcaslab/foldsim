@@ -319,6 +319,9 @@ public:
   /// `link-hbm-shift`: the most positions a stream's request moves earlier,
   /// or its write later, to share a page engine (0: none).
   unsigned linkHbmShift = 0;
+  /// `link-hbm-fit-slots`: a stream on the page engines takes the fewest
+  /// landing slots its requests need.
+  bool linkHbmFitSlots = false;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
   /// landing) a member is streamed with (0: the decision lead + 6). A
   /// member with less room is built as an on-chip link: its landing would
@@ -734,7 +737,11 @@ private:
     /// tag and instance). The port's width is both.
     unsigned tagBits() const { return instBits() + 1; }
     unsigned portInstBits() const { return tagBits() + 1; }
-    unsigned slots() const { return llvm::PowerOf2Ceil(lead + 8); }
+    /// `link-hbm-fit-slots`: the landing slots the placement needs (0: the
+    /// most a lead takes, pow2(lead + 8)).
+    unsigned slotCount = 0;
+    unsigned leadSlots() const { return llvm::PowerOf2Ceil(lead + 8); }
+    unsigned slots() const { return slotCount ? slotCount : leadSlots(); }
   };
   /// The most positions a stream's request precedes its landing (an HBM
   /// round trip at the kernel's clock and a margin); the fewest are those
@@ -798,9 +805,14 @@ private:
   /// engine leaves free (`reads`, `writes`), each at most `maxShift` from its
   /// own; false if none.
   bool placeStream(const LinkStream &st, ArrayRef<uint64_t> reads,
-                   ArrayRef<uint64_t> writes, unsigned maxShift,
+                   ArrayRef<uint64_t> writes, unsigned maxShift, unsigned slots,
                    SmallVectorImpl<int> &requests,
                    SmallVectorImpl<int> &writeAt) const;
+  /// The landing slots a stream's requests need (`link-hbm-fit-slots`): the
+  /// fewest, a power of two, with each request at least 8 positions after
+  /// the landing of its slot's last use, as `lead + 8` slots give at its
+  /// lead.
+  unsigned fitSlots(const LinkStream &st, ArrayRef<int> requests) const;
   /// Off chip (pages=hbm): each position's page read [valid, instance, page]
   /// and page write [valid, page] of `cls` (ii + 1 entries each, the last a
   /// bubble's), as its controls' tables have them.
@@ -2480,7 +2492,7 @@ void StaticFolder::setStreamTables(LinkStream &st, ArrayRef<int> requests,
 
 bool StaticFolder::placeStream(const LinkStream &st, ArrayRef<uint64_t> reads,
                                ArrayRef<uint64_t> writes, unsigned maxShift,
-                               SmallVectorImpl<int> &requests,
+                               unsigned slotCount, SmallVectorImpl<int> &requests,
                                SmallVectorImpl<int> &writeAt) const {
   // Requests in landing order (a landing takes the next slot: the landing
   // buffer's pointers count both in order), placed from the last: each at
@@ -2502,7 +2514,7 @@ bool StaticFolder::placeStream(const LinkStream &st, ArrayRef<uint64_t> reads,
   unsigned slack = std::min(maxShift, st.room - st.lead);
   requests.clear();
   writeAt.clear();
-  int n = int(st.landings.size()), slots = int(st.slots());
+  int n = int(st.landings.size()), slots = int(slotCount);
   // A landing's position in the frame of the landing `k` (k < 0: the frame
   // before's).
   auto landingAt = [&](int k) {
@@ -2549,6 +2561,29 @@ bool StaticFolder::placeStream(const LinkStream &st, ArrayRef<uint64_t> reads,
     }
   }
   return true;
+}
+
+unsigned StaticFolder::fitSlots(const LinkStream &st, ArrayRef<int> requests) const {
+  int frame = int(ii), n = int(st.landings.size());
+  auto mod = [&](int x) { return int(((x % frame) + frame) % frame); };
+  auto landingAt = [&](int k) {
+    int back = k < 0 ? (-k + n - 1) / n : 0;
+    return mod(st.landings[k + back * n].q) - back * frame;
+  };
+  // (The slots ahead of the next landing the decisions check: a few more
+  // than the decisions in flight.)
+  unsigned least = std::max(8u, unsigned(llvm::PowerOf2Ceil(decisionLead() + 3)));
+  for (unsigned slots = least; slots < st.leadSlots(); slots *= 2) {
+    bool ok = true;
+    for (int k = 0; k < n && ok; ++k) {
+      // The request in its landing's frame.
+      int at = landingAt(k) - (st.landings[k].q - requests[k]);
+      ok = at >= landingAt(k - int(slots)) + 8;
+    }
+    if (ok)
+      return slots;
+  }
+  return st.leadSlots();
 }
 
 void StaticFolder::offChipRows(const Class &cls,
@@ -2655,13 +2690,25 @@ LogicalResult StaticFolder::assignPageEngines() {
       continue;
     // At its own positions, or within `link-hbm-shift` of them where an
     // engine leaves them taken; on a new engine at its own.
+    // With `link-hbm-fit-slots`, the fewest landing slots its own positions
+    // need, else (to share an engine) as many as its lead takes.
     SmallVector<int> requests, writes;
+    for (auto &l : st.landings)
+      requests.push_back(l.q - int(st.lead));
+    unsigned own = linkHbmFitSlots ? fitSlots(st, requests) : st.leadSlots();
+    unsigned slots = own;
     unsigned e = 0;
     for (; e < pageEngines.size(); ++e)
       if (placeStream(st, pageEngines[e].reads, pageEngines[e].writes, linkHbmShift,
-                      requests, writes))
+                      own, requests, writes))
         break;
+    if (e == pageEngines.size() && own != st.leadSlots())
+      for (e = 0, slots = st.leadSlots(); e < pageEngines.size(); ++e)
+        if (placeStream(st, pageEngines[e].reads, pageEngines[e].writes, linkHbmShift,
+                        slots, requests, writes))
+          break;
     if (e == pageEngines.size()) {
+      slots = own;
       if (e >= pageEngineCap)
         return netlist.emitError("page engines: ")
                << pageEngineCap << " engines cannot carry the link stream "
@@ -2677,6 +2724,7 @@ LogicalResult StaticFolder::assignPageEngines() {
     }
     bool collide = false;
     setStreamTables(st, requests, writes, collide);
+    st.slotCount = linkHbmFitSlots ? slots : 0;
     auto &eng = pageEngines[e];
     for (unsigned q = 0; q < ii; ++q) {
       eng.reads[q] |= st.reqValid[q];
@@ -2846,6 +2894,15 @@ void StaticFolder::reportPageEngines(raw_ostream &os) {
       }
     os << "  page engine shifts: " << moved << " streams moved, requests up to "
        << most << ", writes up to " << mostWrite << " positions\n";
+  }
+  if (linkHbmFitSlots) {
+    // Each built stream's landing slots, in the order of its `link stream`
+    // line.
+    os << "  link stream slots:";
+    for (auto &st : linkStreams)
+      if (st.kept)
+        os << " " << st.slots();
+    os << "\n";
   }
 }
 
@@ -11860,6 +11917,7 @@ void FoldStaticPass::runOnOperation() {
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
   folder.linkHbmShift = linkHbmShift;
+  folder.linkHbmFitSlots = linkHbmFitSlots;
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.minII = minII;
   if (failed(folder.run()))
