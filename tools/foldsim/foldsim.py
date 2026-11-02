@@ -970,6 +970,12 @@ def main():
     ap.add_argument('--vmem-known-zero-bits', type=int, default=1 << 16, metavar='N',
                     help="with --virtual-memories: each controller's known-zero bits at most (a bit per "
                          "block of rows, the smallest block within N; default %(default)s); 0: none")
+    ap.add_argument('--vmem-forward', type=int, choices=(0, 1), default=1,
+                    help="with virtual memories (or page engines, link streams): whether a read is "
+                         "answered from its controller's write buffer (1, default) or waits for the "
+                         "write's B and reads memory (0: the kernel's foldsim_vmem FORWARD 0, the "
+                         'buffer with one read port; for folds whose static order puts a row\'s read '
+                         'long after its write)')
     ap.add_argument('--vmem-cache-budget', type=float, default=VMEM_CACHE_BUDGET, metavar='RAMB36',
                     help='with --vmem-cache-rows auto: the block RAM all the host caches\' lines may '
                          'take, in RAMB36 (default %(default)g, 5%% of the V80 dynamic region\'s)')
@@ -1487,6 +1493,8 @@ def main():
         info['multicycle'].append({'prefix': prefix, 'cycles': int(cycles),
                                    'capture_bits': int(caps), 'end_bits': int(ends)})
     write_multicycle_xdc(info['multicycle'], out('foldsim_multicycle.xdc'))
+    if info.get('vmem'):
+        info['vmem_forward'] = a.vmem_forward
     with open(out('foldsim_sim.json'), 'w') as f:
         json.dump(info, f, indent=1)
     # The kernel's view of it: how many classes report their finishes, bit c
@@ -1499,6 +1507,8 @@ def main():
             f.write('`define FOLDSIM_ADVANCE\n')
         if info['vmem']:
             f.write(f'`define FOLDSIM_VMEM_COUNT {len(info["vmem"])}\n')
+            if not a.vmem_forward:
+                f.write('`define FOLDSIM_VMEM_FORWARD 0\n')
             # Tagged requests (TAGW, the port's top bits): every memory's
             # TAGW then (0 but the tagged), and every group's.
             tags = any(v.get('tag_width') for v in info['vmem'])

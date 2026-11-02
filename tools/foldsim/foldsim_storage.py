@@ -452,6 +452,29 @@ PAGE_ENGINE_LUTRAM = (234.0, 1.234)
 PAGE_ENGINE_BRAM = 1.0
 
 
+# Controllers that answer no read from their write buffer (the kernel's
+# foldsim_vmem FORWARD 0, foldsim --vmem-forward 0): the buffer keeps one read
+# port and the answer's mux loses its input. Calibrated (a64_1101 cal/, Vivado
+# 2025.2 synthesis + opt_design out of context on the V80, V8B + FORWARD, DW
+# 512): a page engine 1,657 -> 1,220 logic, 866 -> 570 LUTRAM (1 RAMB36
+# both); a virtual memory's controller (IW 9, AW 1, known-zero rows) 1,646 ->
+# 1,324 logic, 833 -> 537 LUTRAM. Taken as factors of the calibrated lines.
+NO_FORWARD_ENGINE = (1220.0 / 1657.0, 570.0 / 866.0)
+NO_FORWARD_VMEM = (1324.0 / 1646.0, 537.0 / 833.0)
+
+
+def no_forward():
+    """Price every controller (virtual memories', page engines', link
+    streams' own) as FORWARD 0."""
+    global VMEM_CTL_LOGIC, VMEM_CTL_LUTRAM, PAGE_ENGINE_LOGIC, PAGE_ENGINE_LUTRAM
+    fl, fr = NO_FORWARD_VMEM
+    VMEM_CTL_LOGIC = (VMEM_CTL_LOGIC[0] * fl, VMEM_CTL_LOGIC[1] * fl)
+    VMEM_CTL_LUTRAM = (VMEM_CTL_LUTRAM[0] * fr, VMEM_CTL_LUTRAM[1] * fr)
+    fl, fr = NO_FORWARD_ENGINE
+    PAGE_ENGINE_LOGIC = (PAGE_ENGINE_LOGIC[0] * fl, PAGE_ENGINE_LOGIC[1] * fl)
+    PAGE_ENGINE_LUTRAM = (PAGE_ENGINE_LUTRAM[0] * fr, PAGE_ENGINE_LUTRAM[1] * fr)
+
+
 def page_engine_ctl(row_bits=PAGE_ENGINE_BITS):
     """A page engine's (logic LUTs, LUTRAM LUTs)."""
     return (PAGE_ENGINE_LOGIC[0] + PAGE_ENGINE_LOGIC[1] * row_bits,

@@ -69,6 +69,14 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/mix -DVM1 -DBUBBLES -Mdir %t/mix/obj %S/Inputs/tb_linkhbm.sv top.sv %t/mix/foldsim_sim.sv > %t/mix/build.log 2>&1
 # RUN: %t/mix/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 +bubble=30 | FileCheck %s
 # RUN: %t/mix/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=1 +hi=30 +stall=30 +full=20 | FileCheck %s
+# --vmem-forward 0: the kernel's controllers answer no read from their write
+# buffers (foldsim_vmem FORWARD 0), a define in the simulator's header.
+# RUN: cd %S/../Driver/Inputs/paged
+# RUN: foldsim --srcs top.f --top Top --out %t/nf --static --page 4 --storage Leaf:pages=hbm --page-hbm-column-bits 64 --page-engines auto --vmem-forward 0 Leaf > %t/nf.log 2>&1
+# RUN: FileCheck %s --check-prefix=NF < %t/nf/foldsim_sim.vh
+# RUN: FileCheck %s --check-prefix=VH --implicit-check-not=FOLDSIM_VMEM_FORWARD < %t/c2/foldsim_sim.vh
+# NF: `define FOLDSIM_VMEM_COUNT
+# NF-NEXT: `define FOLDSIM_VMEM_FORWARD 0
 # Schedule only: the engines the build would take for its link streams in the
 # report too (a cost model prices the schedule as built); the page columns are
 # laid out with the copies, so only streams are listed.

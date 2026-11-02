@@ -33,3 +33,9 @@ lk = fd.parse_links(rep)
 b = fd.link_streams_built(lk)
 print(f"built: engines {lk['engines']} carried {sorted(lk['engine_streams'])} controllers {b['ctl']} "
       f"lut {b['lut']:.0f}")
+# Without forwarding from the write buffers (--vmem-forward 0): the calibrated controllers at 512 bits.
+v0 = st.vmem_ctl(512)
+st.no_forward()
+el0, er0 = st.page_engine_ctl()
+v1 = st.vmem_ctl(512)
+print(f"no forward: engine lut {el0:.0f} lutram {er0:.0f}; vmem 512 {v0[0]:.0f}+{v0[1]:.0f} -> {v1[0]:.0f}+{v1[1]:.0f}")

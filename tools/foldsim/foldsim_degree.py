@@ -2035,6 +2035,9 @@ def main():
                     help='frames up to this many times the schedule\'s')
     st.add_argument('--max-frame', type=int, default=1 << 16,
                     help='frames up to this many host cycles')
+    st.add_argument('--vmem-forward', type=int, choices=(0, 1), default=1,
+                    help='0: controllers priced without forwarding from their write buffers '
+                         '(foldsim --vmem-forward 0, the kernel\'s FORWARD 0)')
     st.add_argument('--frames', default='', metavar='F,...',
                     help='only these frames, each with every number of models paged '
                          '(the least load that fits)')
@@ -2096,8 +2099,16 @@ def main():
 
 
 def state_main(a):
+    global LINK_STREAM_CTL_LOGIC, LINK_STREAM_CTL_LUTRAM
     if a.exact:
         storage.ASSIGN_EXACT = True
+    if a.vmem_forward == 0:
+        # Controllers without forwarding from their write buffers (the
+        # kernel's FORWARD 0; the json carries it to the build).
+        storage.no_forward()
+        fl, fr = storage.NO_FORWARD_VMEM
+        LINK_STREAM_CTL_LOGIC = (LINK_STREAM_CTL_LOGIC[0] * fl, LINK_STREAM_CTL_LOGIC[1] * fl)
+        LINK_STREAM_CTL_LUTRAM = (LINK_STREAM_CTL_LUTRAM[0] * fr, LINK_STREAM_CTL_LUTRAM[1] * fr)
     if a.route_limit is not None:
         storage.ROUTE_LIMIT = a.route_limit
     cal = json.load(open(a.calibration)) if a.calibration else None
@@ -2141,6 +2152,7 @@ def state_main(a):
     print(f'II {ii} (schedule)')
     print(state_table(out, classes, est))
     if a.out:
+        out['vmem_forward'] = a.vmem_forward
         json.dump(out, open(a.out, 'w'), indent=1, default=str)
     return 0
 
