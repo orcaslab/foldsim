@@ -319,6 +319,9 @@ public:
   /// `link-hbm-shift`: the most positions a stream's request moves earlier,
   /// or its write later, to share a page engine (0: none).
   unsigned linkHbmShift = 0;
+  /// `fold-ports` / `fold-ports-reset`: the port bundles folded into record
+  /// streams (empty: none).
+  std::string foldPortsSpec, foldPortsReset = "reset";
   /// `link-hbm-fit-slots`: a stream on the page engines takes the fewest
   /// landing slots its requests need.
   bool linkHbmFitSlots = false;
@@ -404,6 +407,30 @@ private:
   LogicalResult collect();
   void propagateConstants();
   LogicalResult resolveEnvironment();
+  /// `fold-ports`: the netlist's port bundles. A bundle's outputs of a
+  /// target cycle leave as one request record and its inputs come as one
+  /// response record, each on a stream shared by the bundles and tagged with
+  /// the bundle; the fields of a record in netlist order, low first.
+  struct PortFold {
+    bool on = false;
+    unsigned ports = 0, chanWidth = 1, reqWidth = 0, rspWidth = 0;
+    struct Field {
+      std::string name;
+      unsigned width = 0, lo = 0;
+    };
+    SmallVector<Field> req, rsp;
+    /// The consumer of (bundle, request field), the producer of (bundle,
+    /// response field).
+    SmallVector<SmallVector<unsigned>> reqOf, rspOf;
+    /// Each consumer's and producer's bundle and field (-1: not folded).
+    SmallVector<int> consumerPort, consumerField, producerPort, producerField;
+    /// The netlist input whose frame token rides on each request record.
+    int reset = -1;
+  } portFold;
+  LogicalResult resolvePortFold();
+  /// The pushes of a folded field, one bundle a host cycle: each bundle's
+  /// at its own slot or the first after the previous bundle's.
+  void staggerPortPushes();
   /// Host cycles from a netlist output's slot to the end of the frame it
   /// must precede: 1 for an early token or one the environment never waits
   /// for, the environment's round trip for a late one, and for a select of
@@ -3860,6 +3887,15 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
                             linkLatency - 1);
     }
     outputSlot[k] = at;
+  }
+  // Folded port bundles: a field's pushes one bundle a host cycle.
+  staggerPortPushes();
+  for (auto [k, consumer] : llvm::enumerate(consumers)) {
+    if (consumer.cls >= 0)
+      continue;
+    // (A folded bundle's request record leaves a host cycle after its last
+    // push, from the record memories.)
+    int at = outputSlot[k] + (portFold.on && portFold.consumerPort[k] >= 0 ? 1 : 0);
     if (envSink[k]) {
       length = std::max(length, at + 1);
     } else if (outputEarly[k]) {
@@ -4262,9 +4298,13 @@ unsigned StaticFolder::placeModulo(
                               linkLatency - 1);
       }
       outputSlot[k] = at;
-      if (at + envSlack(k, period) > int(period))
-        ok = false;
     }
+    staggerPortPushes();
+    for (auto [k, consumer] : llvm::enumerate(consumers))
+      if (consumer.cls < 0 &&
+          outputSlot[k] + (portFold.on && portFold.consumerPort[k] >= 0 ? 1 : 0) +
+                  envSlack(k, period) > int(period))
+        ok = false;
     // The least period not ruled out: done; otherwise search below it.
     if (ok && period <= failed + 1)
       return period;
@@ -9242,8 +9282,11 @@ LogicalResult StaticFolder::buildSim() {
     unsigned valid, bits;
   };
   SmallVector<InputPorts> inputPorts(producers.size());
+  auto &pf = portFold;
+  auto folded = [&](unsigned p) { return pf.on && pf.producerPort[p] >= 0; };
+  auto foldedOut = [&](unsigned k) { return pf.on && pf.consumerPort[k] >= 0; };
   for (auto [p, producer] : llvm::enumerate(producers)) {
-    if (producer.cls >= 0)
+    if (producer.cls >= 0 || folded(p))
       continue;
     addPort(producer.name + "_ready", i1, false);
     inputPorts[p].valid = numIn;
@@ -9256,9 +9299,18 @@ LogicalResult StaticFolder::buildSim() {
                                             (specOf[p] >= 0 ? specValues() : 1)),
               true);
   }
+  // Folded port bundles: the response records in, a record a host cycle.
+  unsigned rspPort = 0;
+  if (pf.on && pf.rspWidth) {
+    addPort("rsp_ready", i1, false);
+    rspPort = numIn;
+    addPort("rsp_valid", i1, true);
+    addPort("rsp_chan", IntegerType::get(context, pf.chanWidth), true);
+    addPort("rsp_bits", IntegerType::get(context, pf.rspWidth), true);
+  }
   SmallVector<unsigned> outputReady(consumers.size(), 0);
   for (auto [k, consumer] : llvm::enumerate(consumers)) {
-    if (consumer.cls >= 0)
+    if (consumer.cls >= 0 || foldedOut(k))
       continue;
     outputReady[k] = numIn;
     addPort(consumer.name + "_ready", i1, true);
@@ -9266,6 +9318,16 @@ LogicalResult StaticFolder::buildSim() {
     if (consumer.width > 0)
       addPort(consumer.name + "_bits", IntegerType::get(context, consumer.width),
               false);
+  }
+  // And the request records out.
+  unsigned reqPort = 0;
+  if (pf.on) {
+    reqPort = numIn;
+    addPort("req_ready", i1, true);
+    addPort("req_valid", i1, false);
+    addPort("req_chan", IntegerType::get(context, pf.chanWidth), false);
+    addPort("req_treset", i1, false);
+    addPort("req_bits", IntegerType::get(context, pf.reqWidth), false);
   }
   unsigned advancePort = numIn;
   if (bubbles)
@@ -9691,6 +9753,7 @@ LogicalResult StaticFolder::buildSim() {
         comb::MuxOp::create(b, load, minus, decidedUnloaded)));
   }
   DenseMap<unsigned, Value> frameInput, frameInputNext;
+  Value rspReadyOut;
   // Each group's select: its valid input and select output, both of the
   // frame before the one loading; at depth 2, also the one of the frame
   // before that, kept from the load before.
@@ -9711,11 +9774,39 @@ LogicalResult StaticFolder::buildSim() {
   }
   SmallVector<Value> inputValid;
   SmallVector<std::pair<unsigned, Value>> inputReady;
+  // Folded port bundles: a response record is taken whole, by the bundle it
+  // names, when every field of that bundle has room (the fields' queues move
+  // together: a token each, taken and loaded at once).
+  SmallVector<Backedge> rspReady;
+  SmallVector<Value> rspFor;
+  SmallVector<SmallVector<Value>> rspSpace;
+  if (pf.on && pf.rspWidth) {
+    Value chan = body->getArgument(rspPort + 1);
+    for (unsigned port = 0; port < pf.ports; ++port) {
+      rspReady.push_back(backedges.get(i1));
+      rspFor.push_back(comb::AndOp::create(
+          b, body->getArgument(rspPort),
+          comb::AndOp::create(
+              b, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, chan,
+                                      constant(pf.chanWidth, port)),
+              rspReady.back())));
+    }
+    rspSpace.resize(pf.ports);
+  }
   for (auto [p, producer] : llvm::enumerate(producers)) {
     if (producer.cls >= 0)
       continue;
-    Value valid = body->getArgument(inputPorts[p].valid);
-    Value bits = producer.width ? body->getArgument(inputPorts[p].bits) : Value();
+    Value valid, bits;
+    if (folded(p)) {
+      auto &field = pf.rsp[pf.producerField[p]];
+      valid = rspFor[pf.producerPort[p]];
+      if (producer.width)
+        bits = b.createOrFold<comb::ExtractOp>(
+            b.getIntegerType(field.width), body->getArgument(rspPort + 2), field.lo);
+    } else {
+      valid = body->getArgument(inputPorts[p].valid);
+      bits = producer.width ? body->getArgument(inputPorts[p].bits) : Value();
+    }
     unsigned tokenWidth = producer.width * (specOf[p] >= 0 ? specValues() : 1);
     Value head;
     if (holdDepth == 1) {
@@ -9795,6 +9886,28 @@ LogicalResult StaticFolder::buildSim() {
     next.setValue(taken);
     frameInput[p] = x;
     frameInputNext[p] = taken;
+  }
+  // A bundle's record taken when all its fields have room; the stream's
+  // ready that of the bundle it names.
+  if (pf.on && pf.rspWidth) {
+    SmallVector<std::pair<unsigned, Value>> kept;
+    for (auto &[p, ready] : inputReady) {
+      if (folded(p))
+        rspSpace[pf.producerPort[p]].push_back(ready);
+      else
+        kept.push_back({p, ready});
+    }
+    inputReady = std::move(kept);
+    SmallVector<Value> any;
+    Value chan = body->getArgument(rspPort + 1);
+    for (unsigned port = 0; port < pf.ports; ++port) {
+      Value ready = comb::AndOp::create(b, rspSpace[port], false);
+      rspReady[port].setValue(ready);
+      any.push_back(comb::AndOp::create(
+          b, ready, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, chan,
+                                         constant(pf.chanWidth, port))));
+    }
+    rspReadyOut = comb::OrOp::create(b, any, false);
   }
   // The frame's input as a class's evaluation a host cycle ahead reads it:
   // in a slot past the frame, the frame before's.
@@ -11242,6 +11355,18 @@ LogicalResult StaticFolder::buildSim() {
   // cycle), the first token of an early one there from reset.
   SmallVector<Value> roomTerms;
   SmallVector<Value> portOutputs;
+  // Folded port bundles: each output's token pushed into its field's
+  // record memory (a row a target cycle a bundle), its queue only counted
+  // here; a bundle's record leaves whole (`reqSent`), a host cycle after
+  // the last of its pushes.
+  SmallVector<Backedge> reqSent;
+  struct FoldOut {
+    Value push, data, queued;
+    unsigned capacity = 0;
+  };
+  std::map<unsigned, FoldOut> foldOut;
+  for (unsigned port = 0; pf.on && port < pf.ports; ++port)
+    reqSent.push_back(backedges.get(i1));
   for (auto [k, consumer] : llvm::enumerate(consumers)) {
     if (consumer.cls >= 0)
       continue;
@@ -11293,7 +11418,8 @@ LogicalResult StaticFolder::buildSim() {
       groupSelect[g].setValue(comb::AndOp::create(
           b, frameInput[specGroups[g].valid], sel));
     }
-    Value readyIn = body->getArgument(outputReady[k]);
+    Value readyIn = foldedOut(k) ? Value(reqSent[pf.consumerPort[k]])
+                                 : body->getArgument(outputReady[k]);
     uint64_t initCount = outputEarly[k] ? 1 : 0;
     // Overlapped, a frame is decided four host cycles before its first slot,
     // so the pushes of decided frames may still be due: the queue holds one
@@ -11308,7 +11434,7 @@ LogicalResult StaticFolder::buildSim() {
     Value count = resetReg(countNext, consumer.name + "_count", initCount);
     Value queued = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, count,
                                         constant(qWidth, 0));
-    Value valid = comb::OrOp::create(b, queued, push);
+    Value valid = foldedOut(k) ? queued : comb::OrOp::create(b, queued, push);
     Value pop = comb::AndOp::create(b, readyIn, valid);
     Value popQueued = comb::AndOp::create(b, pop, queued);
     Value pushQueued =
@@ -11337,6 +11463,10 @@ LogicalResult StaticFolder::buildSim() {
                                   constant(qWidth, capacity));
     }
     roomTerms.push_back(room);
+    if (foldedOut(k)) {
+      foldOut[k] = {push, data, queued, capacity};
+      continue;
+    }
     portOutputs.push_back(valid);
     if (width > 0) {
       // Entries from the head; popping moves them down, and a queued push
@@ -11360,6 +11490,150 @@ LogicalResult StaticFolder::buildSim() {
       }
       portOutputs.push_back(comb::MuxOp::create(b, queued, entries[0], data));
     }
+  }
+
+  // Folded port bundles: each field's tokens in a memory of a row per bundle
+  // and queue entry (the bundle's row in turn: a write pointer per output),
+  // written at the field's pushes, one bundle a host cycle (staggered). A
+  // bundle's record is sendable once every field holds a token; the lowest
+  // such bundle is offered, its fields read at its read pointer, an early
+  // field's first token (the queue's from reset) zero, and the frame's reset
+  // token stored beside the record at a late field's push.
+  Value reqValidOut, reqChanOut, reqTresetOut, reqBitsOut;
+  if (pf.on) {
+    unsigned P = pf.ports, cw = pf.chanWidth;
+    unsigned cap = 2;
+    for (auto &[k, fo] : foldOut)
+      cap = std::max(cap, fo.capacity);
+    unsigned rows = unsigned(llvm::PowerOf2Ceil(cap)), rw = llvm::Log2_32_Ceil(rows);
+    // The field whose push carries the frame's reset token: a late one.
+    int resetField = -1;
+    for (unsigned f = 0; f < pf.req.size() && resetField < 0; ++f)
+      if (!outputEarly[pf.reqOf[0][f]])
+        resetField = f;
+    if (resetField < 0)
+      return netlist.emitError("fold-ports: the bundles have no late output to "
+                               "carry the frame's reset token");
+    // Lowest sendable bundle: a tree of (any, index) over the bundles.
+    SmallVector<Value> sendable;
+    for (unsigned port = 0; port < P; ++port) {
+      SmallVector<Value> all;
+      for (unsigned k : pf.reqOf[port])
+        all.push_back(foldOut[k].queued);
+      sendable.push_back(comb::AndOp::create(b, all, false));
+    }
+    std::function<std::pair<Value, Value>(unsigned, unsigned)> lowest =
+        [&](unsigned lo, unsigned n) -> std::pair<Value, Value> {
+      if (n == 1)
+        return {sendable[lo], Value()};
+      unsigned half = unsigned(llvm::PowerOf2Ceil(n)) / 2;
+      auto [la, li] = lowest(lo, half);
+      if (n == half)
+        return {la, li};
+      auto [ra, ri] = lowest(lo + half, n - half);
+      unsigned bits = llvm::Log2_32(half);
+      auto pad = [&](Value v) -> Value {
+        if (!bits)
+          return constant(0, 0);
+        if (!v)
+          return constant(bits, 0);
+        unsigned have = hw::getBitWidth(v.getType());
+        return have == bits ? v
+                            : b.createOrFold<comb::ConcatOp>(constant(bits - have, 0), v);
+      };
+      Value idx = bits ? b.createOrFold<comb::ConcatOp>(
+                             notOf(la), comb::MuxOp::create(b, la, pad(li), pad(ri)))
+                       : notOf(la);
+      return {comb::OrOp::create(b, la, ra), idx};
+    };
+    auto [any, low] = lowest(0, P);
+    Value chan = !low ? constant(cw, 0)
+                 : hw::getBitWidth(low.getType()) == cw
+                     ? low
+                     : b.createOrFold<comb::ConcatOp>(
+                           constant(cw - hw::getBitWidth(low.getType()), 0), low);
+    Value sent = comb::AndOp::create(b, any, body->getArgument(reqPort));
+    // Per bundle: read pointer and whether its first record is still to go.
+    SmallVector<Value> rp, first;
+    for (unsigned port = 0; port < P; ++port) {
+      Value mine = comb::AndOp::create(
+          b, sent, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, chan,
+                                        constant(cw, port)));
+      reqSent[port].setValue(mine);
+      auto rpNext = backedges.get(b.getIntegerType(rw));
+      Value r = resetReg(rpNext, "ports_rp" + Twine(port), 0);
+      rpNext.setValue(comb::MuxOp::create(
+          b, mine, comb::AddOp::create(b, r, constant(rw, 1)), r));
+      rp.push_back(r);
+      auto firstNext = backedges.get(i1);
+      Value fs = resetReg(firstNext, "ports_first" + Twine(port), 1);
+      firstNext.setValue(comb::MuxOp::create(b, mine, constant(1, 0), fs));
+      first.push_back(fs);
+    }
+    auto pick = [&](ArrayRef<Value> perPort) -> Value {
+      SmallVector<Value> elems;
+      unsigned n = 1u << cw;
+      for (unsigned j = n; j-- > 0;)
+        elems.push_back(perPort[std::min(j, P - 1)]);
+      return hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elems), chan);
+    };
+    Value rpSel = pick(rp), firstSel = pick(first);
+    Value readAddr = b.createOrFold<comb::ConcatOp>(chan, rpSel);
+    unsigned depth = (1u << cw) * rows;
+    auto memory = [&](const Twine &name, unsigned width,
+                      ArrayRef<std::pair<Value, Value>> writes,
+                      ArrayRef<Value> pointers) -> Value {
+      // One write a host cycle (the pushes are staggered): its bundle's row
+      // at its pointer.
+      SmallVector<Value> en, addr, data;
+      for (auto [port, w] : llvm::enumerate(writes)) {
+        en.push_back(w.first);
+        Value a = b.createOrFold<comb::ConcatOp>(constant(cw, port), pointers[port]);
+        addr.push_back(comb::MuxOp::create(b, w.first, a, constant(cw + rw, 0)));
+        data.push_back(comb::MuxOp::create(b, w.first, w.second, constant(width, 0)));
+      }
+      auto mem = seq::FirMemOp::create(
+          b, seq::FirMemType::get(context, depth, width, 1), /*readLatency=*/0,
+          /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
+          b.getStringAttr(name), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+          StringAttr{}, Attribute{});
+      seq::FirMemWriteOp::create(b, mem, comb::OrOp::create(b, addr, false), hostClock,
+                                 comb::OrOp::create(b, en, false),
+                                 comb::OrOp::create(b, data, false), Value{});
+      return seq::FirMemReadOp::create(b, mem, readAddr, hostClock, constant(1, 1));
+    };
+    SmallVector<Value> fieldBits;
+    Value resetBits;
+    for (auto [f, field] : llvm::enumerate(pf.req)) {
+      SmallVector<std::pair<Value, Value>> writes;
+      SmallVector<Value> pointers;
+      for (unsigned port = 0; port < P; ++port) {
+        unsigned k = pf.reqOf[port][f];
+        auto &fo = foldOut[k];
+        writes.push_back({fo.push, fo.data});
+        // The output's write pointer: past its reset token for an early one.
+        auto wpNext = backedges.get(b.getIntegerType(rw));
+        Value wp = resetReg(wpNext, consumers[k].name + "_wp", outputEarly[k] ? 1 : 0);
+        wpNext.setValue(comb::MuxOp::create(
+            b, fo.push, comb::AddOp::create(b, wp, constant(rw, 1)), wp));
+        pointers.push_back(wp);
+      }
+      Value got = memory("ports_" + field.name, field.width, writes, pointers);
+      if (outputEarly[pf.reqOf[0][f]])
+        got = comb::MuxOp::create(b, firstSel, constant(field.width, 0), got);
+      fieldBits.push_back(got);
+      if (int(f) == resetField) {
+        SmallVector<std::pair<Value, Value>> resets;
+        for (auto &w : writes)
+          resets.push_back({w.first, frameInput[pf.reset]});
+        resetBits = memory("ports_treset", 1, resets, pointers);
+      }
+    }
+    reqValidOut = any;
+    reqChanOut = chan;
+    reqTresetOut = resetBits;
+    reqBitsOut = b.createOrFold<comb::ConcatOp>(
+        SmallVector<Value>(fieldBits.rbegin(), fieldBits.rend()));
   }
 
   // The next frame starts when every input has its token, held or offered
@@ -11485,7 +11759,15 @@ LogicalResult StaticFolder::buildSim() {
   results.push_back(b.createOrFold<comb::ConcatOp>(finishes));
   for (auto &[p, ready] : inputReady)
     results.push_back(ready);
+  if (rspReadyOut)
+    results.push_back(rspReadyOut);
   results.append(portOutputs.begin(), portOutputs.end());
+  if (pf.on) {
+    results.push_back(reqValidOut);
+    results.push_back(reqChanOut);
+    results.push_back(reqTresetOut);
+    results.push_back(reqBitsOut);
+  }
   for (auto &v : simVirtuals) {
     if (v.stream) {
       auto &outs = streamFor(v.k).outs;
@@ -11626,6 +11908,19 @@ LogicalResult StaticFolder::buildSim() {
     sim->setAttr("foldsim.vmems", b.getArrayAttr(virtuals));
   }
   sim->setAttr("foldsim.frame", b.getI64IntegerAttr(ii));
+  // Folded port bundles, for the kernel's header: the record layouts
+  // ("REQ:<field>:<lo>:<width>", "RSP:...") after "ports:<n>:<chan bits>".
+  if (portFold.on) {
+    SmallVector<Attribute> fields{b.getStringAttr(
+        ("ports:" + Twine(portFold.ports) + ":" + Twine(portFold.chanWidth)).str())};
+    for (auto &f : portFold.req)
+      fields.push_back(b.getStringAttr(
+          ("REQ:" + f.name + ":" + Twine(f.lo) + ":" + Twine(f.width)).str()));
+    for (auto &f : portFold.rsp)
+      fields.push_back(b.getStringAttr(
+          ("RSP:" + f.name + ":" + Twine(f.lo) + ":" + Twine(f.width)).str()));
+    sim->setAttr("foldsim.ports", b.getArrayAttr(fields));
+  }
   // Multicycle copies, for the flow's timing constraints: the registers'
   // name prefix (fsmc_<class>__, then cap<k> or end<k>), the host cycles
   // from capture to end, and the bits of each.
@@ -11813,9 +12108,129 @@ LogicalResult StaticFolder::resolveEnvironment() {
   return success();
 }
 
+LogicalResult StaticFolder::resolvePortFold() {
+  auto &pf = portFold;
+  pf.consumerPort.assign(consumers.size(), -1);
+  pf.consumerField.assign(consumers.size(), -1);
+  pf.producerPort.assign(producers.size(), -1);
+  pf.producerField.assign(producers.size(), -1);
+  if (foldPortsSpec.empty())
+    return success();
+  llvm::Regex re("^(" + foldPortsSpec + ")$");
+  std::string error;
+  if (!re.isValid(error))
+    return netlist.emitError("fold-ports: ") << error;
+  // (The regex is wrapped in a group of its own: its captures are 2 and 3.)
+  auto split = [&](StringRef name, unsigned &port, std::string &field) {
+    SmallVector<StringRef> m;
+    if (!re.match(name, &m) || m.size() < 4)
+      return false;
+    if (m[2].getAsInteger(10, port))
+      return false;
+    field = m[3].str();
+    return true;
+  };
+  // Each bundle's fields, in netlist order (the consumers' and producers'
+  // order of the netlist's ports).
+  std::map<unsigned, SmallVector<std::pair<std::string, unsigned>>> outs, ins;
+  for (auto [k, consumer] : llvm::enumerate(consumers)) {
+    unsigned port;
+    std::string field;
+    if (consumer.cls >= 0 || !split(consumer.name, port, field))
+      continue;
+    if (envSink[k])
+      return netlist.emitError("fold-ports: '") << consumer.name
+             << "' is an env-sinks output";
+    outs[port].push_back({field, unsigned(k)});
+  }
+  for (auto [p, producer] : llvm::enumerate(producers)) {
+    unsigned port;
+    std::string field;
+    if (producer.cls >= 0 || !split(producer.name, port, field))
+      continue;
+    ins[port].push_back({field, unsigned(p)});
+  }
+  if (outs.empty())
+    return netlist.emitError("fold-ports: no netlist output matches '")
+           << foldPortsSpec << "'";
+  pf.ports = outs.size();
+  if (outs.rbegin()->first + 1 != pf.ports || ins.size() != (ins.empty() ? 0 : pf.ports) ||
+      (!ins.empty() && ins.rbegin()->first + 1 != pf.ports))
+    return netlist.emitError("fold-ports: the bundles are not numbered 0 to ")
+           << pf.ports - 1 << " with outputs and inputs in each";
+  pf.chanWidth = std::max(1u, llvm::Log2_32_Ceil(pf.ports));
+  auto tokenWidth = [&](unsigned p) {
+    return producers[p].width * (specOf[p] >= 0 ? specValues() : 1);
+  };
+  for (auto &[name, k] : outs.begin()->second) {
+    pf.req.push_back({name, consumers[k].width, pf.reqWidth});
+    pf.reqWidth += consumers[k].width;
+  }
+  if (!ins.empty())
+    for (auto &[name, p] : ins.begin()->second) {
+      pf.rsp.push_back({name, tokenWidth(p), pf.rspWidth});
+      pf.rspWidth += tokenWidth(p);
+    }
+  pf.reqOf.assign(pf.ports, {});
+  pf.rspOf.assign(pf.ports, {});
+  for (unsigned port = 0; port < pf.ports; ++port) {
+    auto &o = outs[port];
+    if (o.size() != pf.req.size())
+      return netlist.emitError("fold-ports: bundle ") << port << " has "
+             << o.size() << " outputs, bundle 0 " << pf.req.size();
+    for (auto [f, entry] : llvm::enumerate(o)) {
+      auto &[name, k] = entry;
+      if (name != pf.req[f].name || consumers[k].width != pf.req[f].width)
+        return netlist.emitError("fold-ports: output '") << consumers[k].name
+               << "' is not field " << f << " ('" << pf.req[f].name << "', "
+               << pf.req[f].width << " bits) of bundle 0";
+      pf.reqOf[port].push_back(k);
+      pf.consumerPort[k] = port;
+      pf.consumerField[k] = f;
+    }
+    if (ins.empty())
+      continue;
+    auto &i = ins[port];
+    if (i.size() != pf.rsp.size())
+      return netlist.emitError("fold-ports: bundle ") << port << " has "
+             << i.size() << " inputs, bundle 0 " << pf.rsp.size();
+    for (auto [f, entry] : llvm::enumerate(i)) {
+      auto &[name, p] = entry;
+      if (name != pf.rsp[f].name || tokenWidth(p) != pf.rsp[f].width)
+        return netlist.emitError("fold-ports: input '") << producers[p].name
+               << "' is not field " << f << " ('" << pf.rsp[f].name << "', "
+               << pf.rsp[f].width << " bits) of bundle 0";
+      pf.rspOf[port].push_back(p);
+      pf.producerPort[p] = port;
+      pf.producerField[p] = f;
+    }
+  }
+  for (auto [p, producer] : llvm::enumerate(producers))
+    if (producer.cls < 0 && producer.name == foldPortsReset)
+      pf.reset = p;
+  if (pf.reset < 0 || pf.producerPort[pf.reset] >= 0 || producers[pf.reset].width != 1)
+    return netlist.emitError("fold-ports-reset: no one-bit netlist input '")
+           << foldPortsReset << "' outside the bundles";
+  pf.on = true;
+  return success();
+}
+
+void StaticFolder::staggerPortPushes() {
+  if (!portFold.on)
+    return;
+  for (unsigned f = 0; f < portFold.req.size(); ++f) {
+    int prev = std::numeric_limits<int>::min();
+    for (unsigned port = 0; port < portFold.ports; ++port) {
+      int &at = outputSlot[portFold.reqOf[port][f]];
+      at = std::max(at, prev + 1);
+      prev = at;
+    }
+  }
+}
+
 LogicalResult StaticFolder::run() {
   inlineNetlists();
-  if (failed(collect()) || failed(resolveEnvironment()) ||
+  if (failed(collect()) || failed(resolveEnvironment()) || failed(resolvePortFold()) ||
       failed(parseRegisteredLinks()) || failed(parseLinkKinds()))
     return failure();
   for (auto &cls : classes)
@@ -11917,6 +12332,8 @@ void FoldStaticPass::runOnOperation() {
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
   folder.linkHbmShift = linkHbmShift;
+  folder.foldPortsSpec = foldPorts;
+  folder.foldPortsReset = foldPortsReset;
   folder.linkHbmFitSlots = linkHbmFitSlots;
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.minII = minII;

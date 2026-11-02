@@ -576,6 +576,20 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "row's write to its request (both moves together), requests in "
            "their landings' order, writes in order and before the producer's "
            "next pass; a landing slot for each position more (0: none)">,
+    Option<"foldPorts", "fold-ports", "std::string", "\"\"",
+           "Netlist ports as bundles folded into two record streams: a "
+           "regex whose first capture is the bundle (an index 0..N-1) and "
+           "whose second the field (POSIX extended, e.g. m_axi_mem_([0-9]+)_(.*)). Each "
+           "bundle's outputs of a target cycle leave as one request record "
+           "(req_valid / req_ready / req_chan / req_treset / req_bits, the "
+           "fields low first in netlist order), its inputs come as one "
+           "response record (rsp_valid / rsp_ready / rsp_chan / rsp_bits); "
+           "the outputs' token queues are memories indexed by bundle, "
+           "written one bundle a host cycle (the pushes spread over the "
+           "frame). Empty: none">,
+    Option<"foldPortsReset", "fold-ports-reset", "std::string", "\"reset\"",
+           "With fold-ports: the netlist input whose frame token rides on "
+           "each request record (req_treset)">,
     Option<"linkHbmFitSlots", "link-hbm-fit-slots", "bool", "false",
            "HBM link streams on page engines: each takes the fewest landing "
            "slots (a power of two, at least 8) its requests need, each request "

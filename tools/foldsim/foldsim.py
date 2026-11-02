@@ -384,6 +384,10 @@ def frame_options(a):
         fold += f' link-hbm-shift={a.link_hbm_shift}'
     if getattr(a, 'link_hbm_fit_slots', False):
         fold += ' link-hbm-fit-slots'
+    if getattr(a, 'fold_ports', ''):
+        fold += f' fold-ports={a.fold_ports}'
+        if a.fold_ports_reset != 'reset':
+            fold += f' fold-ports-reset={a.fold_ports_reset}'
     if getattr(a, 'link_kinds', ''):
         fold += f' link-kinds={a.link_kinds}'
     if getattr(a, 'registered_links', ''):
@@ -922,6 +926,9 @@ def main():
     ap.add_argument('--modulo-linear', type=int, metavar='N',
                     help='with --modulo: the periods tried one at a time from the lower bound before '
                          'the search skips ahead (foldsim-fold-static modulo-linear; default 16)')
+    ap.add_argument('--spec-groups', default='', metavar='OUT=VALID:IN:...,...',
+                    help='with --static: inputs the environment offers for either value of a one-bit select '
+                         'output (foldsim-fold-static spec-groups; --axi-spec derives them for AXI4 ports)')
     ap.add_argument('--axi-spec', nargs='?', type=int, const=1, default=0, choices=(1, 2),
                     metavar='DEPTH',
                     help="with --static: each AXI4 port's R and AR ready are offered by the "
@@ -1030,6 +1037,12 @@ def main():
     ap.add_argument('--link-hbm-fit-slots', action='store_true',
                     help='with --static, hbm link kinds and --page-engines: each stream takes the fewest landing '
                          'slots its requests need (a power of two, at least 8; foldsim-fold-static)')
+    ap.add_argument('--fold-ports', default='', metavar='REGEX',
+                    help='with --static: netlist port bundles folded into two record streams (req_* / rsp_*), '
+                         'the regex\'s first capture the bundle index, its second the field, e.g. '
+                         '\'m_axi_mem_([0-9]+)_(.*)\' (POSIX extended; foldsim-fold-static; foldsim_sim.vh FOLDSIM_PORTS_*)')
+    ap.add_argument('--fold-ports-reset', default='reset', metavar='INPUT',
+                    help='with --fold-ports: the netlist input whose frame token rides on each request record')
     ap.add_argument('--link-kinds', default='', metavar='P:R:KIND,...',
                     help='with --static: the RAM (distributed, block or ultra) of the links from model P '
                          'to model R that --link-block-depth\'s rules let block or ultra RAM hold, '
@@ -1524,6 +1537,15 @@ def main():
     write_multicycle_xdc(info['multicycle'], out('foldsim_multicycle.xdc'))
     if info.get('vmem'):
         info['vmem_forward'] = a.vmem_forward
+    # Folded port bundles: the records' layouts (foldsim.ports).
+    pf = re.search(r'foldsim\.ports = \[(.*?)\]', sim_text)
+    if pf:
+        entries = re.findall(r'"([^"]*)"', pf.group(1))
+        _, n, cw = entries[0].split(':')
+        info['port_bundles'] = {'count': int(n), 'chan_width': int(cw), 'req': [], 'rsp': []}
+        for e in entries[1:]:
+            kind, name, lo, w = e.split(':')
+            info['port_bundles'][kind.lower()].append({'name': name, 'lo': int(lo), 'width': int(w)})
     with open(out('foldsim_sim.json'), 'w') as f:
         json.dump(info, f, indent=1)
     # The kernel's view of it: how many classes report their finishes, bit c
@@ -1534,6 +1556,16 @@ def main():
                 f'`define FOLDSIM_NUM_CLASSES {len(info["threads"])}\n')
         if any(p['name'] == 'advance' for p in info['ports']):
             f.write('`define FOLDSIM_ADVANCE\n')
+        if 'port_bundles' in info:
+            pf = info['port_bundles']
+            f.write(f'`define FOLDSIM_PORTS {pf["count"]}\n')
+            f.write(f'`define FOLDSIM_PORTS_CW {pf["chan_width"]}\n')
+            for kind in ('req', 'rsp'):
+                total = sum(x['width'] for x in pf[kind])
+                f.write(f'`define FOLDSIM_PORTS_{kind.upper()}_W {total}\n')
+                for x in pf[kind]:
+                    f.write(f'`define FOLDSIM_PORTS_{kind.upper()}_{x["name"].upper()}_LO {x["lo"]}\n')
+                    f.write(f'`define FOLDSIM_PORTS_{kind.upper()}_{x["name"].upper()}_W {x["width"]}\n')
         if info['vmem']:
             f.write(f'`define FOLDSIM_VMEM_COUNT {len(info["vmem"])}\n')
             if not a.vmem_forward:
