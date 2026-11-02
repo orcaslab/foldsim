@@ -390,6 +390,25 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
                 link_uram=lk['uram'], link_ff=lk['ff'])
 
 
+# The kernel and the simulator's own level, which the class estimates do not
+# see (st32_1031/lk2/img4dbg/FINDINGS.md, cost_terms.md: the 4-SM A100-class
+# image, Vivado 2025.2 synthesis on the V80): each memory endpoint of the
+# kernel (V7B foldsim_mem, its DRAM bank model; default synthesis), the
+# simulator top level's logic per link register bit (read registers and
+# selects, staged copies, slot tables), a threaded copy's thread controls,
+# and whether memories the model gives ultra RAM get it (Vivado put them in
+# block RAM). On with --kernel-terms (KERNEL['on']); `mem_ports` from the
+# report (the netlist's m_axi_mem ports).
+KERNEL = dict(on=False, mem_ports=0, endpoint_logic=24565.0, endpoint_lutram=4718.0,
+              top_logic_per_link_bit=0.38, threaded_copy_logic=1500.0, uram_memories=False)
+
+
+def kernel_mem_ports(text):
+    """The netlist's memory ports (m_axi_mem_<k>) a schedule report names."""
+    ks = {int(k) for k in re.findall(r'\bm_axi_mem_(\d+)_', text)}
+    return max(ks) + 1 if ks else 0
+
+
 def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram=True,
                  slrs=None, cache=0.0, tiers=None):
     """area() with a kind chosen per store (foldsim_storage.assign) against
@@ -413,6 +432,11 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     left (`pages_offchip`), with their traffic (`hbm_bytes`)."""
     logic = rest
     units, copy_logic, base_lutram = [], {}, 0.0
+    if KERNEL['on']:
+        logic += KERNEL['mem_ports'] * KERNEL['endpoint_logic']
+        base_lutram += KERNEL['mem_ports'] * KERNEL['endpoint_lutram']
+        logic += KERNEL['top_logic_per_link_bit'] * ((sched or {}).get('__links__') or {}).get('ff', 0)
+        logic += KERNEL['threaded_copy_logic'] * sum(1 for c, n in classes.items() if n > 1)
     page_of = {}
     paged = dict(bits=0, ff=0, ports=0, hbm=0)
     # With page engines: each off-chip paged copy's (columns, engine share).
@@ -576,6 +600,14 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     if not uram:
         for u in units:
             u['costs'].pop('ultra', None)
+    if KERNEL['on'] and not KERNEL['uram_memories']:
+        # Memories (not pages, not links) in ultra RAM: Vivado inferred block
+        # RAM for most of them; priced as it builds them.
+        for u in units:
+            if (not u.get('link') and u['store'] != 'pages' and len(u['costs']) > 1 and
+                    u.get('fixed') != 'ultra'):
+                u['costs'].pop('ultra', None)
+                u['per'].pop('ultra', None)
     caps = {p: storage.MARGIN * storage.REGION[p] for p in ('sites', 'bram', 'uram')}
     # The links' storage, as the compiler emits it (the schedule report's
     # link kinds), in the base usage the stores' kinds are chosen against.
@@ -2047,6 +2079,10 @@ def main():
     st.add_argument('--frames', default='', metavar='F,...',
                     help='only these frames, each with every number of models paged '
                          '(the least load that fits)')
+    st.add_argument('--kernel-terms', action='store_true',
+                    help='price the kernel memory endpoints (x the netlist memory ports), the simulator '
+                         "top level's logic per link register bit, a threaded copy's controls, and "
+                         'memories in block rather than ultra RAM (KERNEL; st32_1031 4-SM calibration)')
     st.add_argument('--links-as-built', action='store_true',
                     help="the links' storage as the report gives it (their kinds fixed: a "
                          'schedule made with a link-kinds choice), not a tier to choose')
@@ -2121,6 +2157,8 @@ def state_main(a):
     text = open(a.schedule).read()
     ii, classes, _ = parse_schedule(text)
     sched = parse_classes(text)
+    if getattr(a, 'kernel_terms', False):
+        KERNEL.update(on=True, mem_ports=kernel_mem_ports(text))
     m = re.search(r'virtual-memories=(\S+)', a.fold_options)
     pattern = m.group(1) if m else ''
     names = sorted({re.sub(r'_copy\d+$', '', c) for c in classes})
