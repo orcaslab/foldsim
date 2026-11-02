@@ -1916,15 +1916,17 @@ LogicalResult StaticFolder::chooseStages() {
   for (auto &cls : classes) {
     // Not for a class with a late output (a ready pass, or a state pass that
     // writes what its readers take in the frame), folded pipelines or black
-    // boxes, pages off chip, or virtual memories read at held addresses (their
-    // requests leave from the skip's registers, decided on the unstaged
-    // logic). Virtual memories otherwise stage as the stores do: a request
-    // leaves at the state pass with the last stage's row and data, and its
-    // response is waited for by the next evaluation's read position (the
-    // state gap counts from the state pass to that read, firstSlot).
+    // boxes, or virtual memories read at held addresses (their requests leave
+    // from the skip's registers, decided on the unstaged logic). Virtual
+    // memories otherwise stage as the stores do: a request leaves at the
+    // state pass with the last stage's row and data, and its response is
+    // waited for by the next evaluation's read position (the state gap counts
+    // from the state pass to that read, firstSlot). Pages off chip stage as
+    // on chip: an instance's pages are fetched (and waited for) by its
+    // evaluation's read position, the stages before its state pass, and
+    // written back after the state pass (offChipRows).
     if (llvm::any_of(cls.late, [](bool late) { return late; }) ||
-        cls.pagesOffChip || cls.heldReads ||
-        (cls.folding && !cls.folding->folds.empty()))
+        cls.heldReads || (cls.folding && !cls.folding->folds.empty()))
       continue;
     auto *body = cls.model.getBodyBlock();
     bool eligible = true;
@@ -2388,7 +2390,15 @@ void StaticFolder::offChipRows(const Class &cls,
   // them at least the lead apart.
   // With a window, each instance's pages prefetched at the copy's state
   // pass `pageWindow` before its own, into its slot, and fetched from
-  // the window a lead before its state pass, as on chip.
+  // the window a lead before its state pass, as on chip (staged, both at
+  // the read positions, the stages before: the slot's last fetch from the
+  // window is a lead before the prefetch; chooseWindows).
+  // Staged, the fetch buffer is read at the evaluation's read position, the
+  // stages before its state pass: each direct fetch as early as the copy's
+  // read position before it, and a lead before its own; but after the frame
+  // before's write-back of each page (at the state pass + 1 + page), which
+  // the schedule's state gap leaves room for (minStateGap). Unstaged, that
+  // bound never binds (the copy's other passes are a lead apart).
   SmallVector<int> states(cls.slot[kState].begin(), cls.slot[kState].end());
   llvm::sort(states);
   unsigned back = cls.pageWindow ? cls.pageWindow : 1;
@@ -2400,8 +2410,11 @@ void StaticFolder::offChipRows(const Class &cls,
   };
   for (unsigned i = 0; i < threads; ++i) {
     int s = cls.slot[kState][i];
-    int f = cls.pageWindow ? fetchOf(s)
-                           : std::min(fetchOf(s), s - int(cls.pageLead()));
+    int stages = int(cls.stages);
+    int f = cls.pageWindow
+                ? fetchOf(s) - stages
+                : std::max(std::min(fetchOf(s), s - int(cls.pageLead())) - stages,
+                           s - int(ii) + 2);
     for (unsigned j = 0; j < cls.page; ++j) {
       unsigned pos = wrap(f + int(j));
       readRow[pos] = 1;
@@ -2542,10 +2555,14 @@ LogicalResult StaticFolder::assignPageEngines() {
           lastWrite = q;
         }
       }
+      // Staged, the reads are placed by the evaluations' read positions, the
+      // stages before the state passes (the fetch buffer is read there).
       int lastRead = std::numeric_limits<int>::min();
       for (unsigned x = 0; x < n && fits; ++x) {
-        auto [st, i] = states[x];
-        int prev = x ? states[x - 1].first : states[n - 1].first - frame;
+        auto [sp, i] = states[x];
+        int st = sp - int(cls.stages);
+        int prev = (x ? states[x - 1].first : states[n - 1].first - frame) -
+                   int(cls.stages);
         int q = std::max(std::min(prev, st - int(cls.pageLead())), lastRead + 1);
         for (unsigned j = 0; j < p && fits; ++j, ++q) {
           q = std::max(q, writeAt[i][j] - frame + 1);
@@ -5034,10 +5051,14 @@ void StaticFolder::chooseWindows() {
         continue;
       bool ok = true;
       for (int k = 0; ok && k < int(n); ++k) {
-        int s = stateAt(k), prefetch = stateAt(k - int(w));
-        // Its pages pending before its fetch is decided, and the next
+        // Staged, the prefetch is at the read position w before (its slot's
+        // last fetch from the window is a lead before it).
+        int s = stateAt(k), prefetch = stateAt(k - int(w)) - int(cls.stages);
+        // Its pages pending before its fetch is decided (a lead before its
+        // evaluation's read, the stages before its state pass), and the next
         // frame's prefetch after this frame's write-back.
-        ok = prefetch + 2 <= s - lead && prefetch + int(ii) >= s + 2;
+        ok = prefetch + 2 <= s - int(cls.stages) - lead &&
+             prefetch + int(ii) >= s + 2;
       }
       if (!ok)
         continue;
@@ -9297,9 +9318,12 @@ LogicalResult StaticFolder::buildSim() {
       SmallVector<uint64_t> readRow, instRow, pageRow, writeRow, wpageRow;
       offChipRows(cls, readRow, instRow, pageRow, writeRow, wpageRow);
       if (cls.pageWindow) {
+        // The fetch from the window, a lead before the evaluation's read
+        // (staged, its stages before the state pass), as on chip.
         SmallVector<uint64_t> fetchRow(ii + 1, 0), fslotRow(ii + 1, 0);
         for (unsigned i = 0; i < threads; ++i) {
-          unsigned pos = wrap(cls.slot[kState][i] - int(cls.pageLead()));
+          unsigned pos = wrap(cls.slot[kState][i] - int(cls.pageLead()) -
+                              int(cls.stages));
           fetchRow[pos] = 1;
           fslotRow[pos] = cls.windowSlot[i];
         }
@@ -11086,20 +11110,24 @@ LogicalResult StaticFolder::buildSim() {
       Value use = table(b, next, useRow, 1);
       Value inst = threads > 1 ? table(b, next, instRow, idxWidth) : Value();
       Value classInst = inst;
-      // A page word off chip is waited for by the state pass alone.
-      // With a window, by the fetch from it, a lead before.
+      // A page word off chip is waited for by the state pass alone (staged,
+      // by its evaluation's read position, the stages before it, where the
+      // fetch buffer is read). With a window, by the fetch from it, a lead
+      // before.
       Value stateUse, pageInst = inst;
       if (cls.pagesOffChip && !cls.pageWindow) {
         // (The instance a state pass loads is the slot's: instRow names it
-        // at every pass.)
+        // at every pass, staged at its read position.)
         SmallVector<uint64_t> stateRow(ii + 1, 0);
-        for (unsigned i = 0; i < threads; ++i)
-          stateRow[cls.slot[kState][i] % ii] = 1;
+        for (unsigned i = 0; i < threads; ++i) {
+          int r = cls.slot[kState][i] - int(cls.stages);
+          stateRow[unsigned(((r % int(ii)) + int(ii)) % int(ii))] = 1;
+        }
         stateUse = table(b, next, stateRow, 1);
       } else if (cls.pagesOffChip) {
         SmallVector<uint64_t> fetchRow(ii + 1, 0), fetchInst(ii + 1, 0);
         for (unsigned i = 0; i < threads; ++i) {
-          int f = cls.slot[kState][i] - int(cls.pageLead());
+          int f = cls.slot[kState][i] - int(cls.pageLead()) - int(cls.stages);
           unsigned pos = unsigned(((f % int(ii)) + int(ii)) % int(ii));
           fetchRow[pos] = 1;
           fetchInst[pos] = i;
