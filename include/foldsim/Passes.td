@@ -567,6 +567,10 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "landing for a link to be streamed; one with less stays an on-chip "
            "link (0: the decision lead + 6). Set to the memory's round trip "
            "in host cycles, no landing waits for it">,
+    Option<"minII", "min-ii", "unsigned", "0",
+           "With modulo: the shortest frame (host cycles) the search starts "
+           "from; positions past the schedule's own stay idle (a longer "
+           "prefetch distance for every request a pass issues)">,
     Option<"moduloLinear", "modulo-linear", "unsigned", "16",
            "With modulo: the periods tried one at a time from the frame's "
            "lower bound before the search skips ahead (a doubling step until "

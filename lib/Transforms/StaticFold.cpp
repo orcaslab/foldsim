@@ -324,6 +324,11 @@ public:
   /// `link-hbm-row-bits`: the most bits of an HBM link stream's row (its
   /// controller's DW): a wider word is cut into rows (pages) of this many.
   unsigned linkHbmRowBits = 512;
+  /// `min-ii` (with modulo): the shortest frame the search starts from; the
+  /// positions beyond the schedule's own stay idle. A longer frame is a
+  /// longer prefetch distance for every request a pass issues (for studies
+  /// of latency hiding, or a host rate matched to another simulator's).
+  unsigned minII = 0;
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
                unsigned regionBits, StringRef report,
                ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
@@ -3582,7 +3587,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     outputSlot = aloneSlot;
     outputEarly = aloneEarly;
   }
-  return length;
+  // `min-ii`: the frame alone, its positions past the schedule's idle.
+  return std::max(length, int(minII));
 }
 
 SmallVector<unsigned> StaticFolder::readersOf(ArrayRef<Node> cycle, unsigned k,
@@ -3639,6 +3645,8 @@ unsigned StaticFolder::placeModulo(
   for (auto [c, cls] : llvm::enumerate(classes))
     if (cls.linkPage > 1)
       lower = std::max(lower, cls.linkPage * evaluations[c]);
+  // Nor than `min-ii`.
+  lower = std::max(lower, minII);
   auto cmp = [&](unsigned a, unsigned b) {
     if (height[a] != height[b])
       return height[a] < height[b];
@@ -11560,6 +11568,7 @@ void FoldStaticPass::runOnOperation() {
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
   folder.linkHbmRowBits = linkHbmRowBits;
+  folder.minII = minII;
   if (failed(folder.run()))
     return signalPassFailure();
 }

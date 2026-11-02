@@ -304,6 +304,8 @@ def frame_options(a):
         fold += ' overlap-frames=false'
     if a.modulo:
         fold += ' modulo'
+    if getattr(a, 'min_ii', 0):
+        fold += f' min-ii={a.min_ii}'
     if getattr(a, 'modulo_linear', None) is not None:
         fold += f' modulo-linear={a.modulo_linear}'
     if a.interleave_copies:
@@ -907,6 +909,9 @@ def main():
                     help='with --static: no forwarding into link reads (a reader two host cycles after its producer)')
     ap.add_argument('--serial-frames', action='store_true',
                     help='with --static: decide the next frame only after every output of this one is pushed')
+    ap.add_argument('--min-ii', type=int, default=0, metavar='N',
+                    help='with --static --modulo: the shortest frame in host cycles (foldsim-fold-static '
+                         'min-ii); positions past the schedule\'s own stay idle, a longer prefetch distance')
     ap.add_argument('--modulo', action='store_true',
                     help='with --static: overlap consecutive frames, a slot past the frame running in '
                          'the next frame\'s, when that frame is shorter')
