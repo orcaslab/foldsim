@@ -402,7 +402,16 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
 # report (the netlist's m_axi_mem ports).
 KERNEL = dict(on=False, mem_ports=0, endpoint_logic=24565.0, endpoint_lutram=4718.0,
               port_channel_logic=3500.0, top_logic_per_link_bit=0.27, threaded_copy_logic=1500.0,
-              uram_memories=False)
+              uram_memories=False, fold_ports=False, folded_logic=40000.0, folded_lutram=5000.0,
+              folded_uram_bits_per_port=330000.0, copy_logic=None)
+# fold_ports (a what-if, not built): the memory ports as one replicated unit
+# folded like a class: one bank-model engine, one endpoint shell and one
+# token-queue engine (`folded_logic`, `folded_lutram`) serving the channels in
+# turn, each channel's state (calendars, bank table, queues, the shell's
+# buffers: ~4.7k LUTRAM + 7.7k flops + 2.9k LUTRAM measured a port) in ultra
+# RAM. copy_logic: {class model: synthesized logic LUTs of its copy} (measured,
+# st32_1031/lk2/img4dbg/class_table.md) in place of kappa x estimate + state
+# logic and the threaded-copy term.
 
 
 def kernel_mem_ports(text):
@@ -434,11 +443,19 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     left (`pages_offchip`), with their traffic (`hbm_bytes`)."""
     logic = rest
     units, copy_logic, base_lutram = [], {}, 0.0
+    kernel_uram = 0.0
     if KERNEL['on']:
-        logic += KERNEL['mem_ports'] * (KERNEL['endpoint_logic'] + KERNEL['port_channel_logic'])
-        base_lutram += KERNEL['mem_ports'] * KERNEL['endpoint_lutram']
+        if KERNEL['fold_ports']:
+            logic += KERNEL['folded_logic']
+            base_lutram += KERNEL['folded_lutram']
+            kernel_uram = math.ceil(KERNEL['mem_ports'] * KERNEL['folded_uram_bits_per_port'] /
+                                    (storage.URAM[0] * storage.URAM[1]))
+        else:
+            logic += KERNEL['mem_ports'] * (KERNEL['endpoint_logic'] + KERNEL['port_channel_logic'])
+            base_lutram += KERNEL['mem_ports'] * KERNEL['endpoint_lutram']
         logic += KERNEL['top_logic_per_link_bit'] * ((sched or {}).get('__links__') or {}).get('ff', 0)
-        logic += KERNEL['threaded_copy_logic'] * sum(1 for c, n in classes.items() if n > 1)
+        if not KERNEL['copy_logic']:
+            logic += KERNEL['threaded_copy_logic'] * sum(1 for c, n in classes.items() if n > 1)
     page_of = {}
     paged = dict(bits=0, ff=0, ports=0, hbm=0)
     # With page engines: each off-chip paged copy's (columns, engine share).
@@ -453,6 +470,9 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             form, bypass = state_form(t, info, ii, entries) if sched is not None else \
                 ('one' if t == 1 else 'lutram', False)
             cl = kappa * est[c]['lut'] + state_logic(cal, form, bypass, est[c]['ff'])
+            if KERNEL['on'] and KERNEL['copy_logic'] and \
+                    re.sub(r'_copy\d+$', '', c) in KERNEL['copy_logic']:
+                cl = float(KERNEL['copy_logic'][re.sub(r'_copy\d+$', '', c)])
             logic += cl
             copy_logic[(c, j)] = cl
             forms.append((j, t, form, info['gap'] if info else None))
@@ -628,6 +648,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         units.extend(lu[0])
         lk = dict(lu[1], lutram=lu[1]['lutram'] + lk['lutram'] -
                   link_cost(cal, dict((sched or {}).get('__links__'), streams=[]))['lutram'])
+    lk = dict(lk, uram=lk['uram'] + kernel_uram)
     base = dict(sites=logic + storage.LUTRAM_SITES * (lk['lutram'] + base_lutram),
                 luts=storage.fold_load(logic + lk['lutram'] + base_lutram, cache + lk['bram'],
                                        lk['uram']),
@@ -2085,6 +2106,13 @@ def main():
                     help='price the kernel memory endpoints (x the netlist memory ports), the simulator '
                          "top level's logic per link register bit, a threaded copy's controls, and "
                          'memories in block rather than ultra RAM (KERNEL; st32_1031 4-SM calibration)')
+    st.add_argument('--fold-ports', action='store_true',
+                    help='with --kernel-terms: the memory ports folded like a class (a what-if: shared '
+                         'engines, each channel\'s state in ultra RAM)')
+    st.add_argument('--uram-memories', action='store_true',
+                    help='with --kernel-terms: memories may take ultra RAM (as the storage rules ask)')
+    st.add_argument('--copy-logic', default='', metavar='JSON',
+                    help='with --kernel-terms: measured logic LUTs of each class model\'s copy')
     st.add_argument('--links-as-built', action='store_true',
                     help="the links' storage as the report gives it (their kinds fixed: a "
                          'schedule made with a link-kinds choice), not a tier to choose')
@@ -2160,7 +2188,10 @@ def state_main(a):
     ii, classes, _ = parse_schedule(text)
     sched = parse_classes(text)
     if getattr(a, 'kernel_terms', False):
-        KERNEL.update(on=True, mem_ports=kernel_mem_ports(text))
+        KERNEL.update(on=True, mem_ports=kernel_mem_ports(text),
+                      fold_ports=getattr(a, 'fold_ports', False),
+                      uram_memories=getattr(a, 'uram_memories', False),
+                      copy_logic=json.load(open(a.copy_logic)) if getattr(a, 'copy_logic', '') else None)
     m = re.search(r'virtual-memories=(\S+)', a.fold_options)
     pattern = m.group(1) if m else ''
     names = sorted({re.sub(r'_copy\d+$', '', c) for c in classes})
