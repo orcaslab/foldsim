@@ -880,6 +880,21 @@ void LogicAbsorber::run() {
         if (own)
           ownOutput[k] = result.getResultNumber();
       }
+      // One value broadcast to every instance (a sequencer's control): the
+      // parent computes it once, so the model takes it as it is unless its
+      // logic reads no more bits than it has. Absorbed, every instance would
+      // read all of the logic's operands and compute it again.
+      if (instances.size() > 1 &&
+          llvm::all_of(instances, [&](hw::InstanceOp instance) {
+            return instance.getOperand(index) == instances[0].getOperand(index);
+          })) {
+        int64_t leafBits = 0;
+        for (auto [k, leaf] : llvm::enumerate(leaves))
+          if (!ownOutput[k])
+            leafBits += hw::getBitWidth(leaf.getType());
+        if (leafBits > hw::getBitWidth(arg.getType()))
+          continue;
+      }
       IRMapping mapping;
       auto baseName = model.getInputName(index);
       SmallVector<bool> newPort(leaves.size(), false);
