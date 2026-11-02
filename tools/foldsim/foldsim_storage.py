@@ -452,6 +452,29 @@ PAGE_ENGINE_LUTRAM = (234.0, 1.234)
 PAGE_ENGINE_BRAM = 1.0
 
 
+# Controllers that answer no read from their write buffer (the kernel's
+# foldsim_vmem FORWARD 0, foldsim --vmem-forward 0): the buffer keeps one read
+# port and the answer's mux loses its input. Calibrated (a64_1101 cal/, Vivado
+# 2025.2 synthesis + opt_design out of context on the V80, V8B + FORWARD, DW
+# 512): a page engine 1,657 -> 1,220 logic, 866 -> 570 LUTRAM (1 RAMB36
+# both); a virtual memory's controller (IW 9, AW 1, known-zero rows) 1,646 ->
+# 1,324 logic, 833 -> 537 LUTRAM. Taken as factors of the calibrated lines.
+NO_FORWARD_ENGINE = (1220.0 / 1657.0, 570.0 / 866.0)
+NO_FORWARD_VMEM = (1324.0 / 1646.0, 537.0 / 833.0)
+
+
+def no_forward():
+    """Price every controller (virtual memories', page engines', link
+    streams' own) as FORWARD 0."""
+    global VMEM_CTL_LOGIC, VMEM_CTL_LUTRAM, PAGE_ENGINE_LOGIC, PAGE_ENGINE_LUTRAM
+    fl, fr = NO_FORWARD_VMEM
+    VMEM_CTL_LOGIC = (VMEM_CTL_LOGIC[0] * fl, VMEM_CTL_LOGIC[1] * fl)
+    VMEM_CTL_LUTRAM = (VMEM_CTL_LUTRAM[0] * fr, VMEM_CTL_LUTRAM[1] * fr)
+    fl, fr = NO_FORWARD_ENGINE
+    PAGE_ENGINE_LOGIC = (PAGE_ENGINE_LOGIC[0] * fl, PAGE_ENGINE_LOGIC[1] * fl)
+    PAGE_ENGINE_LUTRAM = (PAGE_ENGINE_LUTRAM[0] * fr, PAGE_ENGINE_LUTRAM[1] * fr)
+
+
 def page_engine_ctl(row_bits=PAGE_ENGINE_BITS):
     """A page engine's (logic LUTs, LUTRAM LUTs)."""
     return (PAGE_ENGINE_LOGIC[0] + PAGE_ENGINE_LOGIC[1] * row_bits,
@@ -464,6 +487,25 @@ def page_engine_share(bits, threads, p, frame):
     pw = math.ceil(bits / max(p, 1))
     columns = math.ceil(pw / PAGE_ENGINE_BITS)
     return columns, columns * min(1.0, max(p, 2) * threads / max(frame, 1))
+
+
+# Off-chip pages on engines take their copy's page word in columns of
+# PAGE_ENGINE_BITS, and the columns of a copy move together (an engine each),
+# so the fold needs at least the widest copy's columns of engines: a copy of
+# 259k state bits at p 15 takes 34. Deeper pages narrow the word (the write-
+# back select stays about a third of a LUT a state bit at any large p), so off
+# chip a copy pages at least deep enough to take PAGE_ENGINE_COLUMNS columns,
+# where its state passes still fit the page port share of the frame.
+PAGE_ENGINE_COLUMNS = 4
+
+
+def page_hbm_depth(bits, threads, p, frame, port_share=0.5):
+    """The page of a copy's state off chip on engines (page_hbm_cost at a
+    `frame`): `p` (its on-chip page), or deeper, up to its word taking
+    PAGE_ENGINE_COLUMNS columns, within p x threads <= port_share x frame."""
+    top = max(1, int(port_share * frame) // max(threads, 1))
+    want = math.ceil(bits / (PAGE_ENGINE_BITS * max(PAGE_ENGINE_COLUMNS, 1)))
+    return max(p, min(top, want))
 
 
 def page_hbm_cost(bits, threads, p, engines_frame=None):

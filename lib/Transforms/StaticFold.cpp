@@ -789,6 +789,7 @@ private:
   std::map<std::pair<unsigned, unsigned>, std::pair<unsigned, unsigned>>
       pageEngineOf;
   LogicalResult assignPageEngines();
+  void reportPageEngines(raw_ostream &os);
   unsigned streamRowBits(const LinkStream &s) const {
     unsigned threads = classes[s.pcls].threads();
     return 1 + (threads > 1 ? llvm::Log2_32_Ceil(threads) : 0) +
@@ -2586,6 +2587,11 @@ LogicalResult StaticFolder::assignPageEngines() {
       eng.readFirst = true;
     }
   }
+  // An engine's row is whole bytes (foldsim_vmem: a byte mask of DW/8 bits
+  // covers DW only when DW is a multiple of 8): a link stream's row of any
+  // width, and the columns' masks (a bit a byte of theirs), fit under it.
+  for (auto &eng : pageEngines)
+    eng.dataWidth = unsigned(llvm::alignTo(eng.dataWidth, 8));
   // Member numbers: a column's its place among the engine's columns, a
   // stream's after them.
   for (auto [e, eng] : llvm::enumerate(pageEngines)) {
@@ -2597,6 +2603,27 @@ LogicalResult StaticFolder::assignPageEngines() {
     }
   }
   return success();
+}
+
+void StaticFolder::reportPageEngines(raw_ostream &os) {
+  // HBM page streams: each engine's columns (class:column), width, tag.
+  if (pageEngines.empty())
+    return;
+  unsigned columns = 0;
+  for (auto &eng : pageEngines)
+    columns += eng.members.size();
+  os << "  page engines: " << pageEngines.size() << " engines, " << columns
+     << " page columns\n";
+  for (auto [e, eng] : llvm::enumerate(pageEngines)) {
+    os << "    page engine " << e << " " << eng.dataWidth << " bits, tag "
+       << eng.tagBits() << ", row " << eng.rowBits() << ":";
+    for (auto [c, k] : eng.members)
+      os << " " << classes[c].name << ":" << classes[c].virtualMemories[k].name;
+    for (unsigned k : eng.streams)
+      os << " link:" << modelOf(linkStreams[k].pcls) << ">"
+         << modelOf(linkStreams[k].rcls);
+    os << "\n";
+  }
 }
 
 bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
@@ -10884,25 +10911,7 @@ LogicalResult StaticFolder::buildSim() {
     if (streamReads)
       os << "; hbm " << streamReads;
     os << "\n";
-    // HBM page streams: each engine's columns (class:column), width, tag.
-    if (!pageEngines.empty()) {
-      unsigned columns = 0;
-      for (auto &eng : pageEngines)
-        columns += eng.members.size();
-      os << "  page engines: " << pageEngines.size() << " engines, " << columns
-         << " page columns\n";
-      for (auto [e, eng] : llvm::enumerate(pageEngines)) {
-        os << "    page engine " << e << " " << eng.dataWidth << " bits, tag "
-           << eng.tagBits() << ", row " << eng.rowBits() << ":";
-        for (auto [c, k] : eng.members)
-          os << " " << classes[c].name << ":"
-             << classes[c].virtualMemories[k].name;
-        for (unsigned k : eng.streams)
-          os << " link:" << modelOf(linkStreams[k].pcls) << ">"
-             << modelOf(linkStreams[k].rcls);
-        os << "\n";
-      }
-    }
+    reportPageEngines(os);
     llvm::errs() << os.str();
     if (!reportPath.empty()) {
       std::error_code ec;
@@ -11524,6 +11533,27 @@ LogicalResult StaticFolder::run() {
   }
   chooseWindows();
   if (scheduleOnly) {
+    // The page engines the build would take (and the link streams they
+    // carry), in the report too: a cost model prices a schedule as built.
+    if (pageEngineCap) {
+      if ((!linkStreams.empty() && failed(planStreams())) || failed(assignPageEngines())) {
+        abandonFolds();
+        return failure();
+      }
+      std::string text;
+      llvm::raw_string_ostream os(text);
+      reportPageEngines(os);
+      llvm::errs() << os.str();
+      if (!reportPath.empty() && !text.empty()) {
+        std::error_code ec;
+        llvm::raw_fd_ostream file(reportPath, ec, llvm::sys::fs::OF_Append);
+        if (ec) {
+          abandonFolds();
+          return netlist.emitError("report: ") << ec.message();
+        }
+        file << text;
+      }
+    }
     abandonFolds();
     return success();
   }

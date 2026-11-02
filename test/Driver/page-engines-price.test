@@ -11,3 +11,5 @@
 # CHECK: p 8 frame 128: columns 1 share 1.000
 # CHECK: fold at 256: 5 engines, engine lut 1657 lutram 866
 # CHECK: stream at 128: own ctl 1.0 lut {{[0-9]+}}; engines ctl 0.375 lut {{[0-9]+}}
+# CHECK: built: engines 3 carried [('A', 'B')] controllers 1 lut {{[0-9]+}}
+# CHECK: no forward: engine lut 1220 lutram 570; vmem 512 {{[0-9]+}}+{{[0-9]+}} -> {{[0-9]+}}+{{[0-9]+}}

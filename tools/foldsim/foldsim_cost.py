@@ -9,6 +9,12 @@ search calibrates these per class against Vivado (foldsim_degree.py).
 import json, math, re, sys
 from collections import defaultdict
 
+# A wide constant's decimal text (hw.constant of a 16,861-bit word: 5,076
+# digits in the A100-class models at 64 SMs) is past Python's default limit
+# on int() of a string (4,300 digits).
+if hasattr(sys, 'set_int_max_str_digits'):
+    sys.set_int_max_str_digits(0)
+
 SSA = r'%[\w.$-]+'
 FREE = {'comb.extract', 'comb.concat', 'hw.bitcast', 'hw.struct_extract', 'hw.struct_create',
         'hw.array_create', 'hw.wire', 'comb.replicate', 'hw.array_concat', 'hw.struct_explode',

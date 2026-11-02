@@ -1,0 +1,12 @@
+# Off-chip pages on engines at their own depth (foldsim_storage page_hbm_depth,
+# foldsim_degree's 'hbm' kind of a paged copy): a copy's page word takes one
+# engine column of 512 bits a 512 bits, and a copy's columns move together, so
+# the fold needs its widest copy's columns of engines (34 for a 259k-bit copy
+# at p 15). Off chip the copy pages deeper, to PAGE_ENGINE_COLUMNS (4)
+# columns, within half the frame (p x instances); the write-back select stays
+# about a third of a LUT a state bit. A page already deeper stays.
+# RUN: python3 %S/Inputs/paged/engines_depth.py foldsim | FileCheck %s
+# CHECK: p 15 frame 147456: page 127 columns 4 (at p 15: 34) share 0.882
+# CHECK: p 15 frame 16384: page 32 columns 16 (at p 15: 34) share 8.000
+# CHECK: p 15 frame 4096: page 15 columns 34 (at p 15: 34)
+# CHECK: p 200 frame 147456: page 200 columns 3 (at p 200: 3)

@@ -460,10 +460,15 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                 pcost = {k: dict(v, lutram=0.0, ii_floor=0) for k, v in pcost.items()}
                 if tiers is not None and (tiers.get('pages_hbm') or
                                           c in tiers.get('force_pages', ())):
+                    # On engines, off chip at its own depth (page_hbm_depth:
+                    # few columns, so few engines).
+                    ph = storage.page_hbm_depth(bits, t, info['page'], tiers['frame'],
+                                                PAGE_PORT_SHARE) \
+                        if tiers.get('page_engines') else info['page']
                     pcost['hbm'] = dict(storage.page_hbm_cost(
-                                            bits, t, info['page'],
+                                            bits, t, ph,
                                             tiers['frame'] if tiers.get('page_engines') else None),
-                                        ii_floor=0, bubbles=t * max(
+                                        ii_floor=0, page=ph, bubbles=t * max(
                                             0, storage.HBM_ROUND_TRIP + 7 - tiers['frame'] // t))
                 units.append(dict(costs=pcost,
                                   per={k: [(j, v)] for k, v in pcost.items()}, count=1,
@@ -650,6 +655,13 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         u['kind'] = kind
         if kind == 'hbm' and u['store'] == 'pages':
             off['pages_offchip'].append(u['class'])
+            # The model's page off chip (a model's copies take one page: the
+            # shallowest of theirs).
+            model = re.sub(r'_copy\d+$', '', u['class'])
+            ph = u['costs']['hbm'].get('page')
+            if ph:
+                off.setdefault('page_hbm', {})
+                off['page_hbm'][model] = min(off['page_hbm'].get(model, ph), ph)
             if 'engine_columns' in u['costs']['hbm']:
                 engine_cols.append((u['costs']['hbm']['engine_columns'], u['costs']['hbm']['ctl']))
             paged['ports'] -= u['costs']['block']['ports']
@@ -672,9 +684,16 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     # Page engines: the fold's, at least its widest copy's columns and the
     # shares' sum, whole (the shares are priced already; the rest added).
     page_engines = 0
-    if engine_cols:
+    # A schedule built with page engines: at least as many as it has. A
+    # schedule-only report lists the engines of its link streams alone (the
+    # page columns are laid out with the copies): the pages' engines on top.
+    built = (sched or {}).get('__links__') or {}
+    built_engines = built.get('engines', 0)
+    if engine_cols or built_engines:
         share = sum(s for _, s in engine_cols)
-        page_engines = max(max(c for c, _ in engine_cols), math.ceil(share - 1e-9))
+        own = max([c for c, _ in engine_cols] + [math.ceil(share - 1e-9)])
+        page_engines = max(own, built_engines) if built.get('engine_columns') else \
+            own + built_engines
         el, er = storage.page_engine_ctl()
         logic += (page_engines - share) * el
         lutram += (page_engines - share) * er
@@ -921,9 +940,15 @@ def parse_links(text):
                     max_need=int(x[9]))
                for x in re.findall(r'^    link stream (\S+) (\S+) (\d+) (\d+) (\d+) (\d+) (\d+) '
                                    r'(\d+) (\d+) (\d+)(?: \d+)?$', text, re.M)]
+    # HBM page streams built (page-engines): the engines, and the link
+    # streams they carry (no controller of their own).
+    m = re.search(r'^  page engines: (\d+) engines, (\d+) page columns', text, re.M)
+    on_engines = set(re.findall(r' link:(\S+)>(\S+)', '\n'.join(
+        re.findall(r'^    page engine \d+ .*$', text, re.M))))
     return dict(lutram=float(g[2]), lutram_bits=int(g[1]), bram=float(g[5]), bram_bits=int(g[4]),
                 uram=float(g[8]), uram_bits=int(g[7]), ff=int(g[10]), uses=uses, pairs=pairs,
-                streams=streams)
+                streams=streams, engines=int(m.group(1)) if m else 0,
+                engine_columns=int(m.group(2)) if m else 0, engine_streams=on_engines)
 
 
 def link_lutram(depth, width):
@@ -1072,15 +1097,18 @@ def link_streams_built(links):
     """The streams a report's schedule built (`link stream` lines): their
     on-chip cost and HBM bytes a frame, as link_stream_cost prices them."""
     out = dict(lut=0.0, lutram=0.0, ff=0, hbm=0.0, ctl=0)
+    on_engines = (links or {}).get('engine_streams', set())
     for s in (links or {}).get('streams', []):
-        cl, cr = link_stream_ctl(s['dw'])
+        # A stream carried by the page engines: its controller is theirs
+        # (counted with the engines, area).
+        cl, cr = (0.0, 0.0) if (s['p'], s['r']) in on_engines else link_stream_ctl(s['dw'])
         row = max(storage.HBM_BEAT_BYTES, storage.vmem_row_bytes(s['dw']))
         out['lut'] += cl + s['dw'] * storage.page_select_luts(s['pages']) + \
             LINK_STREAM_ENABLE_LUTS * s['kept']
         out['lutram'] += cr + link_lutram(LINK_STREAM_SLOTS, s['dw'])
         out['ff'] += s['word'] + 32
         out['hbm'] += (s['read_rows'] + s['write_rows']) * row
-        out['ctl'] += 1
+        out['ctl'] += 0 if (s['p'], s['r']) in on_engines else 1
     return out
 
 
@@ -1621,7 +1649,7 @@ FRAME_STEPS = (1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8)
 def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True, vmem=None,
                  pattern='', weights=None, pages_hbm=True, row_bytes_min=1, max_ii=1 << 16,
                  page=True, link_pages=True, link_hbm=False, frame_growth=None,
-                 vmem_group=None, page_engines=False):
+                 vmem_group=None, page_engines=False, only_frames=None):
     """--state auto: where each class's state lives, three tiers, priced.
 
       on chip    register stores and memories in flops, distributed, block or
@@ -1675,6 +1703,9 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
         # Pages off chip: those moved, and those the schedule has already.
         # (A model paged anew at this point keeps its pages where the area put
         # them, not where the schedule had them.)
+        # Pages off chip at their own depth (page_hbm_depth), where deeper.
+        pages = dict(pages or {}, **{m: p for m, p in res.get('page_hbm', {}).items()
+                                     if pages and m in pages and p > pages[m]})
         off = sorted({re.sub(r'_copy\d+$', '', c) for c in res.get('pages_offchip', [])} |
                      {re.sub(r'_copy\d+$', '', c) for c, info in (sched or {}).items()
                       if c != '__links__' and info.get('offchip') and
@@ -1697,7 +1728,10 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
                     link_kinds=res.get('link_kinds', ''), links_hbm=res.get('links_hbm', []))
 
     lk = link_cost(cal, (sched or {}).get('__links__'))
-    lu = link_units(cal, (sched or {}).get('__links__'))
+    top = min(max_ii, (frame_growth or FRAME_GROWTH) * ii)
+    # With HBM link streams, at the longest frame tried (their ports fit the
+    # longest best): a pair a stream may carry is at its least there too.
+    lu = link_units(cal, (sched or {}).get('__links__'), 0, True, link_hbm, top, page_engines)
     if lu:
         # The links that may move are the tier's: the rest alone, each group
         # at its least in every pool.
@@ -1712,10 +1746,17 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
              storage.route_luts())):
         return None
     deep = sorted({n for n in classes.values() if n > 1})
-    top = min(max_ii, (frame_growth or FRAME_GROWTH) * ii)
     steps = {round(ii * x) for x in FRAME_STEPS if ii * x <= top}
     frames = sorted({f for n in deep for f in range(n * ((ii + n - 1) // n), top + 1, n)} |
                     {ii} | steps)
+    if only_frames:
+        # Given frames only, each paging every number of models (the
+        # least load that fits and routes): a large fold's frame is set by
+        # its HBM bytes far past the schedule's, where the first-fit search
+        # over every frame takes hours, and the load is not monotonic in
+        # the models paged (selects against freed RAM).
+        frames = sorted(set(only_frames))
+        steps = set(frames)
     last = None
     for f in frames:
         if f < ii:
@@ -1750,6 +1791,12 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
                 tried[k] = (some, area(cal, est, classes, {}, rest, with_pages(sched, some), f,
                                        entries, 'auto', route, uram, vmem=vmem, tiers=tiers))
             return tried[k]
+        if only_frames:
+            fit = [k for k in range(0, len(order) + 1) if ok(at(k)[1])]
+            if not fit:
+                continue
+            k = min(fit, key=lambda k: (at(k)[1].get('congestion', at(k)[1]['luts']), at(k)[1]['luts'], k))
+            return outcome(at(k)[1], at(k)[0], f)
         if not ok(at(len(order))[1]):
             # Paging costs logic (the write-back's selects): where the
             # routing binds, paging every model may not route while paging
@@ -1986,6 +2033,14 @@ def main():
                          'routing headroom for a build')
     st.add_argument('--frame-growth', type=int, default=FRAME_GROWTH,
                     help='frames up to this many times the schedule\'s')
+    st.add_argument('--max-frame', type=int, default=1 << 16,
+                    help='frames up to this many host cycles')
+    st.add_argument('--vmem-forward', type=int, choices=(0, 1), default=1,
+                    help='0: controllers priced without forwarding from their write buffers '
+                         '(foldsim --vmem-forward 0, the kernel\'s FORWARD 0)')
+    st.add_argument('--frames', default='', metavar='F,...',
+                    help='only these frames, each with every number of models paged '
+                         '(the least load that fits)')
     st.add_argument('--links-as-built', action='store_true',
                     help="the links' storage as the report gives it (their kinds fixed: a "
                          'schedule made with a link-kinds choice), not a tier to choose')
@@ -2044,8 +2099,16 @@ def main():
 
 
 def state_main(a):
+    global LINK_STREAM_CTL_LOGIC, LINK_STREAM_CTL_LUTRAM
     if a.exact:
         storage.ASSIGN_EXACT = True
+    if a.vmem_forward == 0:
+        # Controllers without forwarding from their write buffers (the
+        # kernel's FORWARD 0; the json carries it to the build).
+        storage.no_forward()
+        fl, fr = storage.NO_FORWARD_VMEM
+        LINK_STREAM_CTL_LOGIC = (LINK_STREAM_CTL_LOGIC[0] * fl, LINK_STREAM_CTL_LOGIC[1] * fl)
+        LINK_STREAM_CTL_LUTRAM = (LINK_STREAM_CTL_LUTRAM[0] * fr, LINK_STREAM_CTL_LUTRAM[1] * fr)
     if a.route_limit is not None:
         storage.ROUTE_LIMIT = a.route_limit
     cal = json.load(open(a.calibration)) if a.calibration else None
@@ -2071,8 +2134,9 @@ def state_main(a):
                        weights=weights, pages_hbm=not a.no_pages_hbm,
                        row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page,
                        link_pages=not a.no_link_pages, link_hbm=a.link_hbm,
-                       frame_growth=a.frame_growth, vmem_group=a.vmem_group,
-                       page_engines=a.page_engines)
+                       frame_growth=a.frame_growth, vmem_group=a.vmem_group, max_ii=a.max_frame,
+                       page_engines=a.page_engines,
+                       only_frames=[int(x) for x in a.frames.split(',') if x])
     if links:
         lk = link_cost(cal, links)
         print(f"links: {(links['lutram_bits'] + links['bram_bits'] + links['uram_bits']) / 1e6:.1f} "
@@ -2088,6 +2152,7 @@ def state_main(a):
     print(f'II {ii} (schedule)')
     print(state_table(out, classes, est))
     if a.out:
+        out['vmem_forward'] = a.vmem_forward
         json.dump(out, open(a.out, 'w'), indent=1, default=str)
     return 0
 
