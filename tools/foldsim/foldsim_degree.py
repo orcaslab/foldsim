@@ -684,11 +684,16 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     # Page engines: the fold's, at least its widest copy's columns and the
     # shares' sum, whole (the shares are priced already; the rest added).
     page_engines = 0
-    # A schedule built with page engines: at least as many as it has.
-    built_engines = ((sched or {}).get('__links__') or {}).get('engines', 0)
+    # A schedule built with page engines: at least as many as it has. A
+    # schedule-only report lists the engines of its link streams alone (the
+    # page columns are laid out with the copies): the pages' engines on top.
+    built = (sched or {}).get('__links__') or {}
+    built_engines = built.get('engines', 0)
     if engine_cols or built_engines:
         share = sum(s for _, s in engine_cols)
-        page_engines = max([c for c, _ in engine_cols] + [math.ceil(share - 1e-9), built_engines])
+        own = max([c for c, _ in engine_cols] + [math.ceil(share - 1e-9)])
+        page_engines = max(own, built_engines) if built.get('engine_columns') else \
+            own + built_engines
         el, er = storage.page_engine_ctl()
         logic += (page_engines - share) * el
         lutram += (page_engines - share) * er
@@ -937,13 +942,13 @@ def parse_links(text):
                                    r'(\d+) (\d+) (\d+)(?: \d+)?$', text, re.M)]
     # HBM page streams built (page-engines): the engines, and the link
     # streams they carry (no controller of their own).
-    m = re.search(r'^  page engines: (\d+) engines', text, re.M)
+    m = re.search(r'^  page engines: (\d+) engines, (\d+) page columns', text, re.M)
     on_engines = set(re.findall(r' link:(\S+)>(\S+)', '\n'.join(
         re.findall(r'^    page engine \d+ .*$', text, re.M))))
     return dict(lutram=float(g[2]), lutram_bits=int(g[1]), bram=float(g[5]), bram_bits=int(g[4]),
                 uram=float(g[8]), uram_bits=int(g[7]), ff=int(g[10]), uses=uses, pairs=pairs,
                 streams=streams, engines=int(m.group(1)) if m else 0,
-                engine_streams=on_engines)
+                engine_columns=int(m.group(2)) if m else 0, engine_streams=on_engines)
 
 
 def link_lutram(depth, width):
