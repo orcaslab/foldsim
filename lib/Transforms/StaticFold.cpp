@@ -682,6 +682,9 @@ private:
     unsigned maxNeed = 0;
     /// After the schedule: the members kept and dropped (too close a read).
     unsigned kept = 0, dropped = 0;
+    /// A schedule kept none of its members: it builds nothing, spaces no
+    /// pass (layoutStreams' ports), and keeps no member of a later one.
+    bool excluded = false;
     /// Per position (ii + 1 rows, the last a bubble's): the landing of a row
     /// (its reader instance, producer instance, page) and its request
     /// (producer instance, page, the frame's flip for the bank).
@@ -732,8 +735,30 @@ private:
            StreamMember>
       streamMembers;
   bool streamsPlanned = false;
+  /// The streams as laid out (before planStreams narrows their needs to
+  /// the kept members'), and each class's link page without them (the
+  /// `link-kinds` pages).
+  std::vector<LinkStream> laidOutStreams;
+  SmallVector<unsigned> linkPageKinds;
   /// The streams' layouts and the ports they need (before the schedule).
   void layoutStreams();
+  /// Each class's link page: its `link-kinds` page, raised by the ports of
+  /// the streams not excluded.
+  void streamPages();
+  /// A reader instance's passes as its links are read: a staged class reads
+  /// its stages before each state pass.
+  SmallVector<int> streamReadPasses(const Class &cls, unsigned i) const;
+  /// A stream member's use and its room for the request's lead.
+  struct StreamRoom {
+    decltype(streamMembers)::iterator member;
+    int most, least, late;
+    const LinkUse *use;
+  };
+  /// The members the schedule keeps (streamMembers' kept; each stream's
+  /// lead, kept and dropped), from the laid-out needs; `uses` (linkUses')
+  /// back `rooms`.
+  void keepStreamMembers(const std::vector<LinkUse> &uses,
+                         std::vector<StreamRoom> &rooms);
   /// The layouts of the streams of the links `pick` takes (of those a
   /// stream may carry), into `out`, their members into `members` if given.
   void layoutStreamsOf(function_ref<bool(const LinkUse &)> pick,
@@ -2102,16 +2127,25 @@ void StaticFolder::layoutStreams() {
     return;
   layoutStreamsOf([&](const LinkUse &use) { return linkHbmRule(use.producer, use.reader); },
                   linkStreams, &streamMembers);
+  laidOutStreams = linkStreams;
+  linkPageKinds.clear();
+  for (auto &cls : classes)
+    linkPageKinds.push_back(cls.linkPage);
+  streamPages();
+}
+
+void StaticFolder::streamPages() {
   // Ports: the producer's passes a write's pages apart, the reader's its
   // landings and two more apart (the last lands two host cycles before
   // the slot; the next pass's first after it).
-  for (auto &s : linkStreams)
-    for (unsigned c = 0; c < classes.size(); ++c) {
-      if (c == s.pcls)
-        classes[c].linkPage = std::max(classes[c].linkPage, s.pages);
-      if (c == s.rcls)
-        classes[c].linkPage = std::max(classes[c].linkPage, s.maxNeed + 2);
-    }
+  for (unsigned c = 0; c < classes.size(); ++c)
+    classes[c].linkPage = linkPageKinds[c];
+  for (auto &s : laidOutStreams) {
+    if (s.excluded)
+      continue;
+    classes[s.pcls].linkPage = std::max(classes[s.pcls].linkPage, s.pages);
+    classes[s.rcls].linkPage = std::max(classes[s.rcls].linkPage, s.maxNeed + 2);
+  }
 }
 
 void StaticFolder::layoutStreamsOf(function_ref<bool(const LinkUse &)> pick,
@@ -2199,41 +2233,28 @@ void StaticFolder::layoutStreamsOf(function_ref<bool(const LinkUse &)> pick,
   }
 }
 
-LogicalResult StaticFolder::planStreams() {
-  if (streamsPlanned)
-    return success();
-  streamsPlanned = true;
+SmallVector<int> StaticFolder::streamReadPasses(const Class &cls,
+                                                unsigned i) const {
+  SmallVector<int> slots{cls.slot[kState][i] - int(cls.stages)};
+  for (unsigned l = 0; l < cls.readyLevels; ++l)
+    slots.push_back(cls.readySlots(l)[i]);
+  return slots;
+}
+
+void StaticFolder::keepStreamMembers(const std::vector<LinkUse> &uses,
+                                     std::vector<StreamRoom> &rooms) {
   int frame = int(ii);
-  auto mod = [&](int x) { return ((x % frame) + frame) % frame; };
-  auto floorDiv = [&](int x) {
-    return x >= 0 ? x / frame : -((-x + frame - 1) / frame);
-  };
-  // A reader's passes as its links are read: a staged class reads its
-  // stages before each state pass.
-  auto passesOfInst = [&](const Class &cls, unsigned i) {
-    SmallVector<int> slots{cls.slot[kState][i] - int(cls.stages)};
-    for (unsigned l = 0; l < cls.readyLevels; ++l)
-      slots.push_back(cls.readySlots(l)[i]);
-    return slots;
-  };
   // Each candidate's room for the request's lead: its requests after its
   // entry's write (the frame before's, every page, the write's register a
   // host cycle on, and a margin: `most`), and its last before the next
   // write of its bank (`least`). A stream's lead is kLinkHbmLead or its
   // kept members' least room; one with less than linkHbmMinLead() is built
   // as the rule's fallback.
-  std::vector<LinkUse> uses;
-  linkUses(uses);
   // And no landing after the next write of its row (its bank's, a frame
   // on): the controller orders a read after an earlier write of its row, not
   // a write after an earlier read, so a read must be answered (its landing
   // run) before the row's next write is requested (`late` <= 0).
-  struct Room {
-    decltype(streamMembers)::iterator member;
-    int most, least, late;
-    const LinkUse *use;
-  };
-  std::vector<Room> rooms;
+  rooms.clear();
   for (auto &use : uses) {
     auto it = streamMembers.find({use.reader, use.port, use.at, use.producer, use.low});
     if (it == streamMembers.end())
@@ -2247,7 +2268,7 @@ LogicalResult StaticFolder::planStreams() {
       int w = producer.atReady ? pcls.readySlots(producer.readyLevel)[row]
                                : pcls.slot[kState][row];
       int n = int(st.needs[i].size());
-      for (int s : passesOfInst(classes[use.reader], i)) {
+      for (int s : streamReadPasses(classes[use.reader], i)) {
         most = std::min(most, (s - n - 1) - (w + int(st.pages) + 4 - frame) - 1);
         least = std::max(least, (s - 2) - (w + frame) + 1);
         late = std::max(late, (s - 2) - (w + frame));
@@ -2258,6 +2279,7 @@ LogicalResult StaticFolder::planStreams() {
   for (auto &st : linkStreams) {
     st.lead = linkHbmLead;
     st.kept = 0;
+    st.dropped = 0;
     st.readRows = 0;
   }
   for (auto &r : rooms)
@@ -2273,18 +2295,31 @@ LogicalResult StaticFolder::planStreams() {
   for (auto &r : rooms) {
     auto &st = linkStreams[r.member->second.stream];
     bool ok = r.most >= int(st.lead) && r.least <= int(st.lead) &&
-              r.late <= 0 && st.lead >= linkHbmMinLead();
+              r.late <= 0 && st.lead >= linkHbmMinLead() && !st.excluded;
     if (!ok)
       r.member->second.kept = false;
   }
-  {
-    std::set<decltype(streamMembers)::iterator::pointer> counted;
-    for (auto &r : rooms)
-      if (counted.insert(&*r.member).second) {
-        auto &st = linkStreams[r.member->second.stream];
-        ++(r.member->second.kept ? st.kept : st.dropped);
-      }
-  }
+  std::set<decltype(streamMembers)::iterator::pointer> counted;
+  for (auto &r : rooms)
+    if (counted.insert(&*r.member).second) {
+      auto &st = linkStreams[r.member->second.stream];
+      ++(r.member->second.kept ? st.kept : st.dropped);
+    }
+}
+
+LogicalResult StaticFolder::planStreams() {
+  if (streamsPlanned)
+    return success();
+  streamsPlanned = true;
+  int frame = int(ii);
+  auto mod = [&](int x) { return ((x % frame) + frame) % frame; };
+  auto floorDiv = [&](int x) {
+    return x >= 0 ? x / frame : -((-x + frame - 1) / frame);
+  };
+  std::vector<LinkUse> uses;
+  std::vector<StreamRoom> rooms;
+  linkUses(uses);
+  keepStreamMembers(uses, rooms);
   // Only the kept members' rows are requested and land: a dropped member's
   // row may be written after the reads the stream would request of it (its
   // reason to be dropped), and its links are built as before.
@@ -2323,7 +2358,7 @@ LogicalResult StaticFolder::planStreams() {
       unsigned n = st.needs[i].size();
       if (!n)
         continue;
-      for (int s : passesOfInst(rcls, i))
+      for (int s : streamReadPasses(rcls, i))
         for (unsigned k = 0; k < n; ++k) {
           int q = s - int(n) - 1 + int(k);
           unsigned pos = mod(q);
@@ -5465,6 +5500,33 @@ LogicalResult StaticFolder::schedule() {
     }
   if (unpaged)
     return schedule();
+  // An HBM link stream the schedule keeps no member of builds nothing (its
+  // links are on chip), so the spacing its ports asked for is dropped: such
+  // streams are excluded and the frame scheduled again without them. Once
+  // excluded a stream stays so (none of its members kept), so the streams
+  // excluded only grow and this ends. The members kept are planned anew on
+  // the schedule that stays (planStreams, from the streams as laid out).
+  if (!laidOutStreams.empty()) {
+    linkStreams = laidOutStreams;
+    streamsPlanned = false;
+    std::vector<LinkUse> uses;
+    std::vector<StreamRoom> rooms;
+    linkUses(uses);
+    keepStreamMembers(uses, rooms);
+    bool excluded = false;
+    for (auto [k, st] : llvm::enumerate(linkStreams))
+      if (!st.excluded && !st.kept) {
+        llvm::errs() << "foldsim-fold-static: link stream " << modelOf(st.pcls)
+                     << " -> " << modelOf(st.rcls) << " keeps no member at II "
+                     << ii << "; scheduled again without its spacing\n";
+        laidOutStreams[k].excluded = true;
+        excluded = true;
+      }
+    if (excluded) {
+      streamPages();
+      return schedule();
+    }
+  }
 
   std::string text;
   llvm::raw_string_ostream os(text);
