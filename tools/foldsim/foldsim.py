@@ -380,6 +380,8 @@ def frame_options(a):
         fold += f' link-hbm-row-bits={a.link_hbm_row_bits}'
     if getattr(a, 'link_hbm_min_lead', 0):
         fold += f' link-hbm-min-lead={a.link_hbm_min_lead}'
+    if getattr(a, 'link_hbm_shift', 0):
+        fold += f' link-hbm-shift={a.link_hbm_shift}'
     if getattr(a, 'link_kinds', ''):
         fold += f' link-kinds={a.link_kinds}'
     if getattr(a, 'registered_links', ''):
@@ -1018,6 +1020,11 @@ def main():
                     help='with --static and hbm link kinds: the least positions from a row\'s write to its '
                          'landing for a link to be streamed; less stays an on-chip link (foldsim-fold-static; '
                          '0: the decision lead + 6). The memory\'s round trip: no landing waits for it')
+    ap.add_argument('--link-hbm-shift', type=int, default=0, metavar='N',
+                    help='with --static, hbm link kinds and --page-engines: the most positions a stream\'s '
+                         'request moves earlier, or its write later, so that streams whose requests or writes '
+                         'fall at the same positions share an engine (within the room from the row\'s write to '
+                         'its request; foldsim-fold-static; 0: none)')
     ap.add_argument('--link-kinds', default='', metavar='P:R:KIND,...',
                     help='with --static: the RAM (distributed, block or ultra) of the links from model P '
                          'to model R that --link-block-depth\'s rules let block or ultra RAM hold, '

@@ -567,6 +567,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "landing for a link to be streamed; one with less stays an on-chip "
            "link (0: the decision lead + 6). Set to the memory's round trip "
            "in host cycles, no landing waits for it">,
+    Option<"linkHbmShift", "link-hbm-shift", "unsigned", "0",
+           "HBM link streams on page engines (page-engines): the most "
+           "positions a stream's request may move earlier than `lead` before "
+           "its landing, and a page write later than its own after the "
+           "producer's pass, so that streams whose requests or writes fall "
+           "at the same positions share an engine. Within the room from the "
+           "row's write to its request (both moves together), requests in "
+           "their landings' order, writes in order and before the producer's "
+           "next pass; a landing slot for each position more (0: none)">,
     Option<"minII", "min-ii", "unsigned", "0",
            "With modulo: the shortest frame (host cycles) the search starts "
            "from; positions past the schedule's own stay idle (a longer "

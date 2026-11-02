@@ -316,6 +316,9 @@ public:
   /// `link-hbm-lead`: the most positions a stream's request precedes its
   /// landing.
   unsigned linkHbmLead = kLinkHbmLead;
+  /// `link-hbm-shift`: the most positions a stream's request moves earlier,
+  /// or its write later, to share a page engine (0: none).
+  unsigned linkHbmShift = 0;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
   /// landing) a member is streamed with (0: the decision lead + 6). A
   /// member with less room is built as an on-chip link: its landing would
@@ -703,6 +706,24 @@ private:
     /// Positions from a request to its landing: kLinkHbmLead, or less where
     /// the kept links' writes come later.
     unsigned lead = 0;
+    /// The kept members' least room (positions from the row's write, the
+    /// frame before's, to the request: `lead` at most), so `room - lead`
+    /// is what a request may move earlier and a write later together
+    /// (`link-hbm-shift`); and the most a request and a write were moved.
+    unsigned room = 0, shift = 0, writeShift = 0;
+    /// Each landing (by position q of the frame, from the reader's first
+    /// pass: possibly negative) and its row, page and reader instance, in
+    /// order; each producer pass (its writes' positions follow it).
+    struct Landing {
+      int q;
+      unsigned inst;
+      uint64_t row, page;
+    };
+    SmallVector<Landing> landings;
+    SmallVector<int> writePasses;
+    /// Per position (ii + 1): a landing's positions back to its request
+    /// (`lead`, more where it was moved).
+    SmallVector<uint64_t> popLead;
     unsigned instBits() const {
       return std::max(1u, llvm::Log2_32_Ceil(slots()));
     }
@@ -767,6 +788,19 @@ private:
   /// The members the schedule keeps, and each stream's landings and
   /// requests by position (after it).
   LogicalResult planStreams();
+  /// A stream's tables from its requests (a landing's, in `landings`'
+  /// order, by position: before the frame's first one or past it where
+  /// the request is a frame before or after) and its writes (each pass's
+  /// pages in turn).
+  void setStreamTables(LinkStream &st, ArrayRef<int> requests,
+                       ArrayRef<int> writes, bool &collide);
+  /// `link-hbm-shift`: a stream's requests and writes placed at positions an
+  /// engine leaves free (`reads`, `writes`), each at most `maxShift` from its
+  /// own; false if none.
+  bool placeStream(const LinkStream &st, ArrayRef<uint64_t> reads,
+                   ArrayRef<uint64_t> writes, unsigned maxShift,
+                   SmallVectorImpl<int> &requests,
+                   SmallVectorImpl<int> &writeAt) const;
   /// Off chip (pages=hbm): each position's page read [valid, instance, page]
   /// and page write [valid, page] of `cls` (ii + 1 entries each, the last a
   /// bubble's), as its controls' tables have them.
@@ -2315,9 +2349,6 @@ LogicalResult StaticFolder::planStreams() {
   streamsPlanned = true;
   int frame = int(ii);
   auto mod = [&](int x) { return ((x % frame) + frame) % frame; };
-  auto floorDiv = [&](int x) {
-    return x >= 0 ? x / frame : -((-x + frame - 1) / frame);
-  };
   std::vector<LinkUse> uses;
   std::vector<StreamRoom> rooms;
   linkUses(uses);
@@ -2346,57 +2377,178 @@ LogicalResult StaticFolder::planStreams() {
       }
     }
   }
+  // The least room of the kept members (at least the lead, the least of
+  // every member's room or kLinkHbmLead).
+  for (auto &st : linkStreams)
+    st.room = st.lead;
+  {
+    std::vector<int> least(linkStreams.size(), std::numeric_limits<int>::max());
+    for (auto &r : rooms)
+      if (r.member->second.kept)
+        least[r.member->second.stream] = std::min(least[r.member->second.stream], r.most);
+    for (auto [k, st] : llvm::enumerate(linkStreams))
+      if (st.kept && least[k] != std::numeric_limits<int>::max())
+        st.room = std::max<unsigned>(st.lead, unsigned(least[k]));
+  }
   for (auto &st : linkStreams) {
     if (!st.kept)
       continue;
     auto &rcls = classes[st.rcls];
-    for (auto *v : {&st.popValid, &st.popInst, &st.popRow, &st.popPage,
-                    &st.reqValid, &st.reqRow, &st.reqPage, &st.reqFlip})
-      v->assign(ii + 1, 0);
     // Each pass's landings: its rows over the host cycles before it, the
-    // last two before its slot; each requested `lead` positions earlier.
-    bool collide = false;
+    // last two before its slot.
+    st.landings.clear();
     for (unsigned i = 0; i < rcls.threads(); ++i) {
       unsigned n = st.needs[i].size();
       if (!n)
         continue;
       for (int s : streamReadPasses(rcls, i))
-        for (unsigned k = 0; k < n; ++k) {
-          int q = s - int(n) - 1 + int(k);
-          unsigned pos = mod(q);
-          if (st.popValid[pos])
-            collide = true;
-          st.popValid[pos] = 1;
-          st.popInst[pos] = i;
-          st.popRow[pos] = st.needs[i][k].first;
-          st.popPage[pos] = st.needs[i][k].second;
-          int t = q - int(st.lead);
-          unsigned tpos = mod(t);
-          st.reqValid[tpos] = 1;
-          st.reqRow[tpos] = st.needs[i][k].first;
-          st.reqPage[tpos] = st.needs[i][k].second;
-          st.reqFlip[tpos] = floorDiv(t) & 1;
-          ++st.readRows;
-        }
+        for (unsigned k = 0; k < n; ++k)
+          st.landings.push_back({s - int(n) - 1 + int(k), i, st.needs[i][k].first,
+                                 st.needs[i][k].second});
     }
-    // Its writes: page j at the j-th position after each producer pass.
-    st.writeValid.assign(ii + 1, 0);
-    st.writePage.assign(ii + 1, 0);
+    // In the frame's order (by position; a landing keeps its q, whose frame
+    // gives its request's bank flip).
+    llvm::stable_sort(st.landings,
+                      [&](auto &a, auto &b) { return mod(a.q) < mod(b.q); });
+    st.readRows = st.landings.size();
+    // Each producer pass (its position in the frame): its pages written
+    // after it.
+    st.writePasses.clear();
     auto &pc = classes[st.pcls];
-    for (unsigned i = 0; i < pc.threads(); ++i) {
-      int w = !st.atReady ? pc.slot[kState][i] : pc.readySlots(st.level)[i];
-      for (unsigned j = 0; j < st.pages; ++j) {
-        unsigned pos = mod(w + 1 + int(j));
-        st.writeValid[pos] = 1;
-        st.writePage[pos] = j;
-      }
-    }
+    for (unsigned i = 0; i < pc.threads(); ++i)
+      st.writePasses.push_back(mod(!st.atReady ? pc.slot[kState][i]
+                                               : pc.readySlots(st.level)[i]));
+    llvm::sort(st.writePasses);
+    // Each landing requested `lead` positions earlier, page j written at the
+    // j-th position after each producer pass (assignPageEngines may move
+    // them, `link-hbm-shift`).
+    SmallVector<int> requests, writes;
+    for (auto &l : st.landings)
+      requests.push_back(l.q - int(st.lead));
+    for (int w : st.writePasses)
+      for (unsigned j = 0; j < st.pages; ++j)
+        writes.push_back(w + 1 + int(j));
+    bool collide = false;
+    setStreamTables(st, requests, writes, collide);
     if (collide)
       return netlist.emitError("link streams: ")
              << modelOf(st.pcls) << " -> " << modelOf(st.rcls)
              << ": two landings in one position (the reader's link port)";
   }
   return success();
+}
+
+void StaticFolder::setStreamTables(LinkStream &st, ArrayRef<int> requests,
+                                   ArrayRef<int> writes, bool &collide) {
+  int frame = int(ii);
+  auto mod = [&](int x) { return unsigned(((x % frame) + frame) % frame); };
+  auto floorDiv = [&](int x) {
+    return x >= 0 ? x / frame : -((-x + frame - 1) / frame);
+  };
+  for (auto *v : {&st.popValid, &st.popInst, &st.popRow, &st.popPage, &st.popLead,
+                  &st.reqValid, &st.reqRow, &st.reqPage, &st.reqFlip,
+                  &st.writeValid, &st.writePage})
+    v->assign(ii + 1, 0);
+  st.shift = 0;
+  for (auto [l, t] : llvm::zip(st.landings, requests)) {
+    unsigned pos = mod(l.q);
+    if (st.popValid[pos])
+      collide = true;
+    st.popValid[pos] = 1;
+    st.popInst[pos] = l.inst;
+    st.popRow[pos] = l.row;
+    st.popPage[pos] = l.page;
+    st.popLead[pos] = unsigned(l.q - t);
+    st.shift = std::max(st.shift, unsigned(l.q - t) - st.lead);
+    unsigned tpos = mod(t);
+    st.reqValid[tpos] = 1;
+    st.reqRow[tpos] = l.row;
+    st.reqPage[tpos] = l.page;
+    st.reqFlip[tpos] = floorDiv(t) & 1;
+  }
+  unsigned x = 0;
+  st.writeShift = 0;
+  for (size_t p = 0; p < st.writePasses.size(); ++p)
+    for (unsigned j = 0; j < st.pages; ++j) {
+      st.writeShift = std::max(
+          st.writeShift, unsigned(writes[x] - (st.writePasses[p] + 1 + int(j))));
+      unsigned pos = mod(writes[x++]);
+      st.writeValid[pos] = 1;
+      st.writePage[pos] = j;
+    }
+}
+
+bool StaticFolder::placeStream(const LinkStream &st, ArrayRef<uint64_t> reads,
+                               ArrayRef<uint64_t> writes, unsigned maxShift,
+                               SmallVectorImpl<int> &requests,
+                               SmallVectorImpl<int> &writeAt) const {
+  // Requests in landing order (a landing takes the next slot: the landing
+  // buffer's pointers count both in order), placed from the last: each at
+  // the latest position free on the engine at most `maxShift` before its own
+  // (`lead` before its landing) and before the next request, and at least 8
+  // positions after the landing `slots` before it (its slot's last use, the
+  // margin the landing slots have at `lead`: the slots are not grown); the
+  // first after the last of the frame before. Then each write in order at
+  // the earliest position free within the room the requests left after its
+  // own (`pages` after the pass, page j at j), at most at the producer's
+  // next pass (the held word is the pass's until then). A request `d`
+  // earlier and a write `e` later keep a read after the frame before's
+  // write when d + e <= room - lead (the room is measured to the write of
+  // the last page at its own). (Order is the frame's: landings by
+  // position, each request compared at its landing's position less its
+  // lead, the last a frame before the first.)
+  int frame = int(ii);
+  auto mod = [&](int x) { return int(((x % frame) + frame) % frame); };
+  unsigned slack = std::min(maxShift, st.room - st.lead);
+  requests.clear();
+  writeAt.clear();
+  int n = int(st.landings.size()), slots = int(st.slots());
+  // A landing's position in the frame of the landing `k` (k < 0: the frame
+  // before's).
+  auto landingAt = [&](int k) {
+    int back = k < 0 ? (-k + n - 1) / n : 0;
+    return mod(st.landings[k + back * n].q) - back * frame;
+  };
+  SmallVector<int> at(n);
+  unsigned used = 0;
+  for (int k = n - 1; k >= 0; --k) {
+    int own = landingAt(k) - int(st.lead);
+    int hi = k == n - 1 ? own : std::min(own, at[k + 1] - 1);
+    int lo = own - int(slack);
+    lo = std::max(lo, landingAt(k - slots) + 8);
+    int t = hi;
+    while (t >= lo && reads[mod(t)])
+      --t;
+    if (t < lo)
+      return false;
+    at[k] = t;
+    used = std::max(used, unsigned(own - t));
+  }
+  if (n && at[0] <= at[n - 1] - frame)
+    return false;
+  for (int k = 0; k < n; ++k)
+    requests.push_back(st.landings[k].q - int(st.lead) -
+                       ((landingAt(k) - int(st.lead)) - at[k]));
+  unsigned wslack = std::min(maxShift, slack - used);
+  size_t np = st.writePasses.size();
+  for (size_t p = 0; p < np; ++p) {
+    int w = st.writePasses[p];
+    int next = p + 1 < np ? st.writePasses[p + 1] : st.writePasses[0] + frame;
+    int last = writeAt.empty() ? std::numeric_limits<int>::min() : writeAt.back();
+    for (unsigned j = 0; j < st.pages; ++j) {
+      int own = w + 1 + int(j);
+      int lo = std::max(own, last + 1),
+          hi = std::min(own + int(wslack), next - int(st.pages - 1 - j));
+      int q = lo;
+      while (q <= hi && writes[mod(q)])
+        ++q;
+      if (q > hi)
+        return false;
+      writeAt.push_back(q);
+      last = q;
+    }
+  }
+  return true;
 }
 
 void StaticFolder::offChipRows(const Class &cls,
@@ -2501,22 +2653,30 @@ LogicalResult StaticFolder::assignPageEngines() {
   for (auto [k, st] : llvm::enumerate(linkStreams)) {
     if (!st.kept)
       continue;
+    // At its own positions, or within `link-hbm-shift` of them where an
+    // engine leaves them taken; on a new engine at its own.
+    SmallVector<int> requests, writes;
     unsigned e = 0;
-    for (; e < pageEngines.size(); ++e) {
-      auto &eng = pageEngines[e];
-      bool clash = false;
-      for (unsigned q = 0; q < ii && !clash; ++q)
-        clash = (st.reqValid[q] && eng.reads[q]) || (st.writeValid[q] && eng.writes[q]);
-      if (!clash)
+    for (; e < pageEngines.size(); ++e)
+      if (placeStream(st, pageEngines[e].reads, pageEngines[e].writes, linkHbmShift,
+                      requests, writes))
         break;
-    }
     if (e == pageEngines.size()) {
       if (e >= pageEngineCap)
         return netlist.emitError("page engines: ")
                << pageEngineCap << " engines cannot carry the link stream "
                << modelOf(st.pcls) << " -> " << modelOf(st.rcls);
       newEngine();
+      requests.clear();
+      writes.clear();
+      for (auto &l : st.landings)
+        requests.push_back(l.q - int(st.lead));
+      for (int w : st.writePasses)
+        for (unsigned j = 0; j < st.pages; ++j)
+          writes.push_back(w + 1 + int(j));
     }
+    bool collide = false;
+    setStreamTables(st, requests, writes, collide);
     auto &eng = pageEngines[e];
     for (unsigned q = 0; q < ii; ++q) {
       eng.reads[q] |= st.reqValid[q];
@@ -2675,6 +2835,17 @@ void StaticFolder::reportPageEngines(raw_ostream &os) {
       os << " link:" << modelOf(linkStreams[k].pcls) << ">"
          << modelOf(linkStreams[k].rcls);
     os << "\n";
+  }
+  if (linkHbmShift) {
+    unsigned moved = 0, most = 0, mostWrite = 0;
+    for (auto &st : linkStreams)
+      if (st.kept && st.engine >= 0) {
+        moved += st.shift || st.writeShift;
+        most = std::max(most, st.shift);
+        mostWrite = std::max(mostWrite, st.writeShift);
+      }
+    os << "  page engine shifts: " << moved << " streams moved, requests up to "
+       << most << ", writes up to " << mostWrite << " positions\n";
   }
 }
 
@@ -10227,7 +10398,8 @@ LogicalResult StaticFolder::buildSim() {
       for (int sl : n ? passSlots : SmallVector<int>{})
         for (unsigned j = 0; j < n; ++j) {
           int q = sl - int(n) - 1 + int(j);
-          unsigned c = floorDiv(q) - floorDiv(q - int(st.lead));
+          unsigned c = floorDiv(q) -
+                       floorDiv(q - int(st.popLead[((q % frame) + frame) % frame]));
           cross[((q % frame) + frame) % frame] = c;
           maxCross = std::max(maxCross, c);
         }
@@ -11687,6 +11859,7 @@ void FoldStaticPass::runOnOperation() {
   folder.moduloLinear = moduloLinear;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
+  folder.linkHbmShift = linkHbmShift;
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.minII = minII;
   if (failed(folder.run()))
