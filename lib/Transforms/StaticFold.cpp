@@ -316,6 +316,11 @@ public:
   /// `link-hbm-lead`: the most positions a stream's request precedes its
   /// landing.
   unsigned linkHbmLead = kLinkHbmLead;
+  /// `link-hbm-min-lead`: the least room (positions from a row's write to its
+  /// landing) a member is streamed with (0: the decision lead + 6). A
+  /// member with less room is built as an on-chip link: its landing would
+  /// wait for the memory's round trip every frame.
+  unsigned linkHbmMinLeadOpt = 0;
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
                unsigned regionBits, StringRef report,
                ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
@@ -704,7 +709,9 @@ private:
   /// from a position's decision to its run and a margin, so that a landing's
   /// request is issued, and pending, before the decision that waits for it.
   static constexpr unsigned kLinkHbmLead = 48;
-  unsigned linkHbmMinLead() const { return decisionLead() + 6; }
+  unsigned linkHbmMinLead() const {
+    return std::max(unsigned(decisionLead() + 6), linkHbmMinLeadOpt);
+  }
   std::vector<LinkStream> linkStreams;
   /// Each candidate member by (reader class, input, its bit, producer, low):
   /// its stream, its bits' offset in the stream's word, and whether the
@@ -11545,6 +11552,7 @@ void FoldStaticPass::runOnOperation() {
                       linkUltraDepth, linkKinds, stageLevels, multicycle);
   folder.moduloLinear = moduloLinear;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
+  folder.linkHbmMinLeadOpt = linkHbmMinLead;
   if (failed(folder.run()))
     return signalPassFailure();
 }

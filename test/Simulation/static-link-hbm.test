@@ -28,6 +28,14 @@
 # RUN: FileCheck %s --check-prefix=LEAD < %t/lead/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/lead -DVM1 -Mdir %t/lead/obj %S/Inputs/tb_linkhbm.sv top.sv %t/lead/foldsim_sim.sv > %t/lead/build.log 2>&1
 # RUN: %t/lead/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=8 +hi=40 | FileCheck %s
+# --link-hbm-min-lead: a member with less room from its row's write to its
+# landing than that is an on-chip link (its landing would wait for the
+# memory's round trip every frame): of Unit -> Reader's two members, the one
+# with room 10 stays on chip at 11, and the stream's lead is the other's.
+# RUN: foldsim --srcs top.f --top Top --out %t/minl --static --nest --modulo --link-hbm-min-lead 11 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/minl.log 2>&1
+# RUN: FileCheck %s --check-prefix=MINL < %t/minl/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/minl -DVM1 -Mdir %t/minl/obj %S/Inputs/tb_linkhbm.sv top.sv %t/minl/foldsim_sim.sv > %t/minl/build.log 2>&1
+# RUN: %t/minl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=1 +hi=60 | FileCheck %s
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/one -Mdir %t/one/obj %S/Inputs/tb_linkhbm.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
 # A staged reader (--stage-levels: Reader evaluates over its stages, its links
@@ -76,5 +84,7 @@
 # ONE: link use Reader Unit 32 32 16 hbm 1
 # ONE: link stream Reader Unit 1 0 32 32 1 16 16 1
 # LEAD: link stream Reader Unit 1 0 32 32 1 16 16 1 10{{$}}
+# MINL: link stream Reader Unit 1 0 32 32 1 16 16 1 11{{$}}
+# MINL: link stream Unit Reader 1 1 32 32 1 16 16 1 48{{$}}
 # CHECK: {{^}}MATCH 196 cycles
 # CHECK-NOT: PROTOCOL

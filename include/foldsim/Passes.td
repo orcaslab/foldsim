@@ -556,6 +556,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "row's request precedes its landing (the memory's round trip in "
            "host cycles and a margin; less where a stream's writes come "
            "later)">,
+    Option<"linkHbmMinLead", "link-hbm-min-lead", "unsigned", "0",
+           "HBM link streams: the least positions from a row's write to its "
+           "landing for a link to be streamed; one with less stays an on-chip "
+           "link (0: the decision lead + 6). Set to the memory's round trip "
+           "in host cycles, no landing waits for it">,
     Option<"moduloLinear", "modulo-linear", "unsigned", "16",
            "With modulo: the periods tried one at a time from the frame's "
            "lower bound before the search skips ahead (a doubling step until "
