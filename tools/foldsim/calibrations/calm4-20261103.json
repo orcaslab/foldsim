@@ -1,0 +1,286 @@
+{
+ "name": "calm4-20261103",
+ "source": "st32_1031/lk2/calm4: a100_lite_m4 (a100/config 9dcc73c2a), gen/m4 II 512, v7 kernel V7B; Vivado 2025.2 synthesis only, image mode (RuntimeOptimized, hierarchy kept, global retiming), V80; priced as built (foldsim_degree state --kernel-terms --links-as-built --no-page)",
+ "synth_per_routed": 1.038,
+ "families": [
+  {
+   "family": "l1req",
+   "match": "^l1req_",
+   "logic": 5.073,
+   "copies": 1,
+   "measured": {
+    "logic": 50580.0,
+    "lutram": 38199.0
+   },
+   "priced": {
+    "logic": 9606,
+    "lutram": 36792
+   },
+   "lutram": 1.0
+  },
+  {
+   "family": "lmq",
+   "match": "^lmq_",
+   "logic": 2.509,
+   "copies": 1,
+   "measured": {
+    "logic": 22975.0,
+    "lutram": 776.0
+   },
+   "priced": {
+    "logic": 8821,
+    "lutram": 388
+   },
+   "lutram": 1.927
+  },
+  {
+   "family": "l1rsp",
+   "match": "^l1rsp$",
+   "logic": 3.098,
+   "copies": 1,
+   "measured": {
+    "logic": 7992.0,
+    "lutram": 5510.0
+   },
+   "priced": {
+    "logic": 2485,
+    "lutram": 4774
+   },
+   "lutram": 1.112
+  },
+  {
+   "family": "switches",
+   "match": "^(l1sw|l2sw|l2fs|axix|l2mo|l2rs|l2nb|kmub|lms)(_\\d+)?(_copy\\d+)?$",
+   "logic": 2.756,
+   "copies": 16,
+   "measured": {
+    "logic": 26666.0,
+    "lutram": 3972.0
+   },
+   "priced": {
+    "logic": 9321,
+    "lutram": 10563
+   },
+   "lutram": 0.362
+  },
+  {
+   "family": "fdiv_fsqrt",
+   "match": "^VX_(fdiv|fsqrt)_unit$",
+   "logic": 6.124,
+   "copies": 2,
+   "measured": {
+    "logic": 5174.0,
+    "lutram": 9353.0
+   },
+   "priced": {
+    "logic": 814,
+    "lutram": 0
+   },
+   "lutram": 1.0,
+   "lutram_add": 4505
+  },
+  {
+   "family": "mufu_pe",
+   "match": "^VX_mufu_pe$",
+   "logic": 0.1,
+   "copies": 1,
+   "measured": {
+    "logic": 897.0,
+    "lutram": 348.0
+   },
+   "priced": {
+    "logic": 8655,
+    "lutram": 618
+   },
+   "lutram": 0.542
+  },
+  {
+   "family": "tcu_fedp",
+   "match": "^VX_tcu_fedp",
+   "logic": 0.616,
+   "copies": 1,
+   "measured": {
+    "logic": 4427.0,
+    "lutram": 2309.0
+   },
+   "priced": {
+    "logic": 6921,
+    "lutram": 275
+   },
+   "lutram": 8.089
+  },
+  {
+   "family": "compute_slice",
+   "match": "^VX_compute_slice__lift_model$",
+   "logic": 0.904,
+   "copies": 1,
+   "measured": {
+    "logic": 252392.0,
+    "lutram": 217907.0
+   },
+   "priced": {
+    "logic": 268900,
+    "lutram": 145770
+   },
+   "lutram": 1.44
+  },
+  {
+   "family": "socket",
+   "match": "^VX_socket__lift_model$",
+   "logic": 1.139,
+   "copies": 1,
+   "measured": {
+    "logic": 98697.0,
+    "lutram": 66338.0
+   },
+   "priced": {
+    "logic": 83512,
+    "lutram": 30375
+   },
+   "lutram": 2.104
+  },
+  {
+   "family": "core",
+   "match": "^VX_core__lift_model$",
+   "logic": 1.077,
+   "copies": 1,
+   "measured": {
+    "logic": 63271.0,
+    "lutram": 14292.0
+   },
+   "priced": {
+    "logic": 56606,
+    "lutram": 7647
+   },
+   "lutram": 1.801
+  },
+  {
+   "family": "l2req",
+   "match": "^l2req_",
+   "logic": 0.934,
+   "copies": 1,
+   "measured": {
+    "logic": 37956.0,
+    "lutram": 14814.0
+   },
+   "priced": {
+    "logic": 39141,
+    "lutram": 11116
+   },
+   "lutram": 1.284
+  },
+  {
+   "family": "opc",
+   "match": "^VX_opc_unit$",
+   "logic": 0.947,
+   "copies": 1,
+   "measured": {
+    "logic": 19754.0,
+    "lutram": 9996.0
+   },
+   "priced": {
+    "logic": 20089,
+    "lutram": 19357
+   },
+   "lutram": 0.497
+  },
+  {
+   "family": "icache",
+   "match": "^VX_cache_bank__lift_icache$",
+   "logic": 0.993,
+   "copies": 1,
+   "measured": {
+    "logic": 4586.0,
+    "lutram": 5037.0
+   },
+   "priced": {
+    "logic": 4450,
+    "lutram": 4103
+   },
+   "lutram": 1.183
+  },
+  {
+   "family": "target",
+   "match": "^foldsim_target_model$",
+   "logic": 1.272,
+   "copies": 1,
+   "measured": {
+    "logic": 19526.0,
+    "lutram": 1136.0
+   },
+   "priced": {
+    "logic": 14789,
+    "lutram": 1769
+   },
+   "lutram": 0.619
+  },
+  {
+   "family": "fcvt",
+   "match": "^VX_fcvt_unit$",
+   "logic": 0.82,
+   "copies": 1,
+   "measured": {
+    "logic": 1960.0,
+    "lutram": 1674.0
+   },
+   "priced": {
+    "logic": 2303,
+    "lutram": 30
+   },
+   "lutram": 1.0,
+   "lutram_add": 1583
+  },
+  {
+   "family": "fncp",
+   "match": "^VX_fncp_unit$",
+   "logic": 0.694,
+   "copies": 1,
+   "measured": {
+    "logic": 204.0,
+    "lutram": 8.0
+   },
+   "priced": {
+    "logic": 283,
+    "lutram": 10
+   },
+   "lutram": 0.771
+  }
+ ],
+ "rest": 0.0,
+ "links_measured": {
+  "lutram": 115174,
+  "ramb36": 439.0,
+  "priced_lutram": 111002,
+  "priced_ramb36": 405.5
+ },
+ "top_logic_per_link_bit": 0.474,
+ "link_lutram": 1.0,
+ "vmem_ctl": {
+  "logic": 0.418,
+  "lutram": 0.148,
+  "measured": {
+   "logic": 5950,
+   "lutram": 2400,
+   "ramb36": 32.0
+  },
+  "priced": {
+   "lut": 13714.4,
+   "lutram": 15671.1,
+   "bram": 124.0
+  }
+ },
+ "fixed": {
+  "logic": 4144,
+  "lutram": 31,
+  "ramb36": 0,
+  "what": "the control endpoint (foldsim_ctrl)"
+ },
+ "measured_total": {
+  "logic": 827462,
+  "lutram": 530427,
+  "ff": 1613806,
+  "ramb36": 1147,
+  "ramb18": 716,
+  "uram": 228
+ }
+}

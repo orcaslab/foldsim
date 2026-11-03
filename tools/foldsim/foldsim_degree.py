@@ -403,7 +403,8 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
 KERNEL = dict(on=False, mem_ports=0, endpoint_logic=24565.0, endpoint_lutram=4718.0,
               port_channel_logic=3500.0, top_logic_per_link_bit=0.27, threaded_copy_logic=1500.0,
               uram_memories=False, fold_ports=False, folded_logic=40000.0, folded_lutram=5000.0,
-              folded_uram_bits_per_port=330000.0, folded_measured=None, copy_logic=None)
+              folded_uram_bits_per_port=330000.0, folded_measured=None, copy_logic=None,
+              calibration=None)
 # fold_ports (a what-if, not built): the memory ports as one replicated unit
 # folded like a class: one bank-model engine, one endpoint shell and one
 # token-queue engine (`folded_logic`, `folded_lutram`) serving the channels in
@@ -415,6 +416,62 @@ KERNEL = dict(on=False, mem_ports=0, endpoint_logic=24565.0, endpoint_lutram=471
 # folded memory endpoint as built and synthesized out of context (foldsim_mem_fold,
 # lk2/ooc): {logic, lutram, ramb36, uram} for all the ports, in place of the
 # what-if's folded_* estimates.
+
+
+# A whole-design calibration (--calibrate <file>, calibrations/*.json): per class
+# family (a regex on the class model's name, first match) a factor on its copy's
+# logic and store select logic and one on its stores' LUTRAM; the top level's
+# logic per link register bit; a factor on the links' LUTRAM; and fixed kernel
+# terms (vmem controllers, the control endpoint) the model has no estimate of.
+# Factors are synthesized / priced x SYNTH_PER_ROUTED, fitted on one whole-design
+# synthesis (the file says which); classes no family names keep 1.
+def cal_factors(c):
+    cal = KERNEL['calibration']
+    if not cal:
+        return 1.0, 1.0
+    model = re.sub(r'_copy\d+$', '', c)
+    for fam in cal['families']:
+        if re.search(fam['match'], model):
+            return fam['logic'], fam['lutram']
+    return 1.0, 1.0
+
+
+def cal_lutram_add(c):
+    """LUTRAM a copy of the class has that no store prices (calibrated)."""
+    cal = KERNEL['calibration']
+    if not cal:
+        return 0.0
+    model = re.sub(r'_copy\d+$', '', c)
+    for fam in cal['families']:
+        if re.search(fam['match'], model):
+            return fam.get('lutram_add', 0.0)
+    return 0.0
+
+
+def calibrate_units(units):
+    """The units' costs with the calibration's factors (copies of the cost
+    dicts, so a unit shared between calls is not scaled twice)."""
+    cal = KERNEL['calibration']
+    if not cal:
+        return
+    for u in units:
+        if u.get('link'):
+            fl, fr = 1.0, cal['link_lutram']
+        else:
+            fl, fr = cal_factors(u['class'])
+        def scale(c, k):
+            if c is None:
+                return c
+            # A store in HBM costs its virtual-memory controller: the
+            # calibration's controller factors, whatever the class.
+            gl, gr = (cal['vmem_ctl']['logic'], cal['vmem_ctl']['lutram']) if k == 'hbm' else (fl, fr)
+            c = dict(c)
+            c['lut'] = c.get('lut', 0.0) * gl
+            c['lutram'] = c.get('lutram', 0.0) * gr
+            return c
+        u['costs'] = {k: scale(c, k) for k, c in u['costs'].items()}
+        if 'per' in u:
+            u['per'] = {k: [(j, scale(c, k)) for j, c in v] for k, v in u['per'].items()}
 
 
 def kernel_mem_ports(text):
@@ -444,7 +501,9 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     force_pages (moves already chosen, kept). The result names the memories
     moved (`vmem_new`: (class, memory) pairs) and the classes whose pages
     left (`pages_offchip`), with their traffic (`hbm_bytes`)."""
-    logic = rest
+    # A calibration's class families were fitted on whole copies: the copies'
+    # thread controls and the estimate of the rest are inside them (`rest`).
+    logic = rest * (KERNEL['calibration'].get('rest', 1.0) if KERNEL['on'] and KERNEL['calibration'] else 1.0)
     units, copy_logic, base_lutram = [], {}, 0.0
     kernel_uram = kernel_bram = 0.0
     if KERNEL['on']:
@@ -461,8 +520,15 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         else:
             logic += KERNEL['mem_ports'] * (KERNEL['endpoint_logic'] + KERNEL['port_channel_logic'])
             base_lutram += KERNEL['mem_ports'] * KERNEL['endpoint_lutram']
-        logic += KERNEL['top_logic_per_link_bit'] * ((sched or {}).get('__links__') or {}).get('ff', 0)
-        if not KERNEL['copy_logic']:
+        tlb = KERNEL['calibration']['top_logic_per_link_bit'] if KERNEL['calibration'] \
+            else KERNEL['top_logic_per_link_bit']
+        logic += tlb * ((sched or {}).get('__links__') or {}).get('ff', 0)
+        if KERNEL['calibration']:
+            fx = KERNEL['calibration']['fixed']
+            logic += fx['logic']
+            base_lutram += fx['lutram']
+            kernel_bram += fx['ramb36']
+        if not KERNEL['copy_logic'] and not KERNEL['calibration']:
             logic += KERNEL['threaded_copy_logic'] * sum(1 for c, n in classes.items() if n > 1)
     page_of = {}
     paged = dict(bits=0, ff=0, ports=0, hbm=0)
@@ -479,6 +545,9 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             if KERNEL['on'] and KERNEL['copy_logic'] and \
                     re.sub(r'_copy\d+$', '', c) in KERNEL['copy_logic']:
                 cl = float(KERNEL['copy_logic'][re.sub(r'_copy\d+$', '', c)])
+            elif KERNEL['on']:
+                cl *= cal_factors(c)[0]
+                base_lutram += cal_lutram_add(c)
             logic += cl
             copy_logic[(c, j)] = cl
             forms.append((j, t, form, info['gap'] if info else None))
@@ -653,6 +722,12 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         for u in units:
             if u['store'] == 'pages' and u['class'] in tiers.get('force_pages', ()):
                 u['fixed'] = 'hbm'
+    calibrate_units(units)
+    if KERNEL['calibration']:
+        # The links' LUTRAM in the base (those no tier chooses) too.
+        lk = dict(lk, lutram=lk['lutram'] * KERNEL['calibration']['link_lutram'])
+        base = dict(base, sites=logic + storage.LUTRAM_SITES * (lk['lutram'] + base_lutram),
+                    luts=storage.fold_load(logic + lk['lutram'] + base_lutram, cache + lk['bram'], lk['uram']))
     choice, used = storage.assign(units, base, caps,
                                   dict(luts=storage.route_luts(slrs)) if route else None,
                                   price_extra=tiers is not None)
@@ -660,6 +735,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     lutram, uram = lk['lutram'] + base_lutram, lk['uram']
     bram = cache + lk['bram']
     per_copy = dict(copy_logic)
+    store_lut, store_lutram = {}, {}
+    vmem_ctl = dict(lut=0.0, lutram=0.0, bram=0.0)
     rules, floor = [], 0
     off = dict(vmem_new=[], pages_offchip=[], rows_new=[], hbm_bytes=0.0, controllers=0,
                bubbles=0.0, **({'link_hbm_bytes': built_hbm} if built_hbm else {}))
@@ -693,6 +770,12 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                 floor = max(floor, c['ii_floor'])
             per_copy[(u['class'], j)] += c['lut'] + c['lutram']
             if kind == 'hbm':
+                for x in ('lut', 'lutram', 'bram'):
+                    vmem_ctl[x] += c[x]
+            else:
+                store_lut[(u['class'], j)] = store_lut.get((u['class'], j), 0.0) + c['lut']
+                store_lutram[(u['class'], j)] = store_lutram.get((u['class'], j), 0.0) + c['lutram']
+            if kind == 'hbm':
                 off['hbm_bytes'] += c['hbm']
                 off['controllers'] += c['ctl']
         if kind == 'hbm':
@@ -723,8 +806,13 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                link_lutram=round(lk['lutram']), link_bram=round(lk['bram'], 1),
                link_uram=lk['uram'], link_ff=lk['ff'],
                largest_copy=round(max(per_copy.values())),
-               copies={f'{c}#{j}': dict(logic=round(copy_logic[(c, j)]), total=round(per_copy[(c, j)]))
+               copies={f'{c}#{j}': dict(logic=round(copy_logic[(c, j)]), total=round(per_copy[(c, j)]),
+                                        store_lut=round(store_lut.get((c, j), 0.0)),
+                                        store_lutram=round(store_lutram.get((c, j), 0.0)))
                        for (c, j) in per_copy},
+               vmem_ctl={x: round(v, 1) for x, v in vmem_ctl.items()},
+               top_logic=round((KERNEL['calibration']['top_logic_per_link_bit'] if KERNEL['calibration']
+                                else KERNEL['top_logic_per_link_bit']) * lk['ff']) if KERNEL['on'] else 0,
                storage=','.join(rules),
                **({'link_kinds': ','.join(link_rules)} if lu else {}),
                **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged))
@@ -2027,6 +2115,9 @@ def main():
     st.add_argument('--fold-ports-measured', default='', metavar='LOGIC,LUTRAM,RAMB36,URAM',
                     help='with --fold-ports: the folded memory endpoint as synthesized (all ports), in '
                          'place of the what-if estimates')
+    st.add_argument('--calibrate', default='', metavar='JSON',
+                    help='with --kernel-terms: a whole-design calibration (calibrations/*.json): per class '
+                         'family factors, the top level per link bit, the links\' LUTRAM, fixed kernel terms')
     st.add_argument('--uram-memories', action='store_true',
                     help='with --kernel-terms: memories may take ultra RAM (as the storage rules ask)')
     st.add_argument('--copy-logic', default='', metavar='JSON',
@@ -2100,6 +2191,7 @@ def state_main(a):
                       folded_measured=dict(zip(('logic', 'lutram', 'ramb36', 'uram'),
                                                map(float, a.fold_ports_measured.split(','))))
                       if getattr(a, 'fold_ports_measured', '') else None,
+                      calibration=json.load(open(a.calibrate)) if getattr(a, 'calibrate', '') else None,
                       uram_memories=getattr(a, 'uram_memories', False),
                       copy_logic=json.load(open(a.copy_logic)) if getattr(a, 'copy_logic', '') else None)
     m = re.search(r'virtual-memories=(\S+)', a.fold_options)
