@@ -722,7 +722,10 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                sites=round(sites), fits=fits, bram=round(bram, 1), uram=uram,
                link_lutram=round(lk['lutram']), link_bram=round(lk['bram'], 1),
                link_uram=lk['uram'], link_ff=lk['ff'],
-               largest_copy=round(max(per_copy.values())), storage=','.join(rules),
+               largest_copy=round(max(per_copy.values())),
+               copies={f'{c}#{j}': dict(logic=round(copy_logic[(c, j)]), total=round(per_copy[(c, j)]))
+                       for (c, j) in per_copy},
+               storage=','.join(rules),
                **({'link_kinds': ','.join(link_rules)} if lu else {}),
                **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged))
     if tiers is not None:
