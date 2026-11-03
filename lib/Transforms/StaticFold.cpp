@@ -9227,11 +9227,14 @@ LogicalResult StaticFolder::buildSim() {
   // instance it loads has no read pending, and each controller has room for
   // the requests the decisions in flight may issue. It is the position after
   // the decision's, without a bubble: the one a bubble would delay.
+  // The next position is taken as the frame going on (at a frame's end, the
+  // next frame's first): with no next frame no position runs, so its wait is
+  // only a bubble more, and the readiness does not chain after the frame's
+  // go (every output's room) into the position's next.
   if (virtualReady) {
     Value end = comb::OrOp::create(b, eq(posD, ii - 1), eq(posD, ii));
     Value next = comb::MuxOp::create(
-        b, end,
-        comb::MuxOp::create(b, go, constant(posWidth, 0), constant(posWidth, ii)),
+        b, end, constant(posWidth, 0),
         comb::AddOp::create(b, posD, constant(posWidth, 1)));
     SmallVector<Value> terms;
     for (auto [c, cls] : llvm::enumerate(classes)) {
