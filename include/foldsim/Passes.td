@@ -792,6 +792,25 @@ def KeepModules : Pass<"foldsim-keep-modules", "::mlir::ModuleOp"> {
   ];
 }
 
+def BoundaryArrivals : Pass<"foldsim-boundary-arrivals", "::mlir::ModuleOp"> {
+  let summary = "Give each module its hierarchy's arrival times at its ports";
+  let description = [{
+    Reads `file`, the `arrivals` of `foldsim-estimate-timing` over a mapping
+    of the same design, and sets `synth.input_arrival_times` on each module
+    it lists (its input ports) and `synth.output_arrival_times` on each of
+    their instances (their outputs), which `synth-generic-lut-mapper` with a
+    `carry-block-size` takes as the arrival times of those values. A module
+    mapped apart from the rest of its hierarchy then times a late input, or
+    an instance's late output, as a mapping of the flattened design would,
+    and keeps it out of deep cones. Ports missing from the file, or of
+    another width, arrive at 0.
+  }];
+  let options = [
+    Option<"file", "file", "std::string", "",
+           "The arrival times (JSON) of foldsim-estimate-timing's `arrivals`">,
+  ];
+}
+
 def SyncAsyncResets : Pass<"foldsim-sync-async-resets", "::circt::hw::HWModuleOp"> {
   let summary = "Simulate registers with an asynchronous reset cycle by cycle";
   let description = [{
@@ -1012,6 +1031,15 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     through a distributed RAM or a DSP. Top ports and the pins of
     `black-boxes` count as registers with empty neighbour stages, as a gate
     harness registers them. Without it, `retimed` is the depth.
+
+    `arrivals` writes, for every module instantiated below `top`, the levels
+    at which each bit of its ports arrives, the worst over its instances: an
+    input's in the instantiating module, an output's behind it. It is JSON,
+    `{"<module>": {"in": {"<port>": [levels per bit]}, "out": {...}}}`, a
+    single element when every bit has it, and no entry for a port whose bits
+    all arrive at 0. It is what
+    `foldsim-boundary-arrivals` reads to map each module again with its
+    hierarchy's arrival times at its boundary.
   }];
   let options = [
     Option<"topName", "top", "std::string", "",
@@ -1047,6 +1075,9 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     Option<"retimeLevels", "retime-levels", "unsigned", "0",
            "Also estimate each end point's depth after Vivado's retiming "
            "to a period of this many levels (0: off)">,
+    Option<"arrivals", "arrivals", "std::string", "",
+           "Per-bit arrival times at every instantiated module's ports, "
+           "the worst over its instances (JSON)">,
   ];
   let dependentDialects = [
     "circt::hw::HWDialect",

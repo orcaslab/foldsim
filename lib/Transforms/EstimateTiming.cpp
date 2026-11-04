@@ -22,17 +22,20 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Support/FileUtilities.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/ToolOutputFile.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
 
 namespace foldsim {
+#define GEN_PASS_DEF_BOUNDARYARRIVALS
 #define GEN_PASS_DEF_ESTIMATETIMING
 #define GEN_PASS_DEF_FOLDZEROWIDTH
 #define GEN_PASS_DEF_KEEPMODULES
@@ -278,6 +281,7 @@ public:
   void writeEndPoints(raw_ostream &os, unsigned minLevels);
   void writeInstances(raw_ostream &os);
   void writePorts(raw_ostream &os, ArrayRef<std::string> modules);
+  void writeArrivals(raw_ostream &os);
   void writePaths(raw_ostream &os, unsigned minLevels);
   void writeReport(raw_ostream &os, unsigned topPaths,
                    ArrayRef<std::string> trace);
@@ -1126,6 +1130,75 @@ void Timing::writePorts(raw_ostream &os, ArrayRef<std::string> modules) {
   }
 }
 
+/// For every module instantiated below the top, the levels at which each bit
+/// of its ports arrives, the worst over its instances: an input's in the
+/// instantiating module, an output's behind it (constants arrive at 0).
+void Timing::writeArrivals(raw_ostream &os) {
+  using Bits = SmallVector<int, 0>;
+  struct Ports {
+    hw::HWModuleOp module;
+    std::vector<Bits> in, out;
+  };
+  llvm::MapVector<Operation *, Ports> byModule;
+  auto merge = [&](Bits &bits, unsigned ctx, Value value) {
+    unsigned width = widthOf(value);
+    bits.resize(width, 0);
+    for (unsigned bit = 0; bit < width; ++bit) {
+      unsigned id = resolve(ctx, value, bit);
+      if (id == kNone)
+        continue;
+      evaluate(id);
+      bits[bit] = std::max<int>(bits[bit], nodes[id].levels);
+    }
+  };
+  for (unsigned ctx = 1, e = contexts.size(); ctx < e; ++ctx) {
+    auto &c = contexts[ctx];
+    auto &ports = byModule[c.module];
+    ports.module = c.module;
+    ports.in.resize(c.inst.getNumOperands());
+    for (auto [i, operand] : llvm::enumerate(c.inst.getOperands()))
+      if (!isa<seq::ClockType>(operand.getType()))
+        merge(ports.in[i], c.parent, operand);
+    auto *output = c.module.getBodyBlock()->getTerminator();
+    ports.out.resize(output->getNumOperands());
+    for (auto [i, operand] : llvm::enumerate(output->getOperands()))
+      if (!isa<seq::ClockType>(operand.getType()))
+        merge(ports.out[i], ctx, operand);
+  }
+  // A port whose bits all arrive together is one element; one whose bits
+  // all arrive at 0 is left out.
+  auto late = [](const Bits &bits) {
+    return llvm::any_of(bits, [](int l) { return l > 0; });
+  };
+  auto array = [](const Bits &bits) {
+    llvm::json::Array a;
+    if (llvm::all_equal(bits))
+      a.push_back(bits.front());
+    else
+      for (int l : bits)
+        a.push_back(l);
+    return a;
+  };
+  llvm::json::OStream json(os);
+  json.object([&] {
+    for (auto &[op, ports] : byModule) {
+      json.attributeObject(ports.module.getModuleName(), [&] {
+        json.attributeObject("in", [&] {
+          for (auto [i, bits] : llvm::enumerate(ports.in))
+            if (late(bits))
+              json.attribute(ports.module.getInputName(i), array(bits));
+        });
+        json.attributeObject("out", [&] {
+          for (auto [i, bits] : llvm::enumerate(ports.out))
+            if (late(bits))
+              json.attribute(ports.module.getOutputName(i), array(bits));
+        });
+      });
+    }
+  });
+  os << '\n';
+}
+
 /// One JSON line per pair of start and end registers whose deepest bit has
 /// at least `minLevels` levels, deepest first: that bit's path op by op, from
 /// the end point back to its start, and the pair's end point bits. The bits
@@ -1429,6 +1502,12 @@ struct KeepModulesPass
   }
 };
 
+struct BoundaryArrivalsPass
+    : public foldsim::impl::BoundaryArrivalsBase<BoundaryArrivalsPass> {
+  using BoundaryArrivalsBase::BoundaryArrivalsBase;
+  void runOnOperation() override;
+};
+
 struct LowerConstantDivisionPass
     : public foldsim::impl::LowerConstantDivisionBase<
           LowerConstantDivisionPass> {
@@ -1542,6 +1621,66 @@ struct EstimateTimingPass
 };
 } // namespace
 
+void BoundaryArrivalsPass::runOnOperation() {
+  auto design = getOperation();
+  auto buffer = llvm::MemoryBuffer::getFile(file);
+  if (!buffer) {
+    design.emitError("cannot read '") << file << "'";
+    return signalPassFailure();
+  }
+  auto json = llvm::json::parse((*buffer)->getBuffer());
+  auto *top = json ? json->getAsObject() : nullptr;
+  if (!top) {
+    if (!json)
+      llvm::consumeError(json.takeError());
+    design.emitError("'") << file << "' is not an arrival time object";
+    return signalPassFailure();
+  }
+  MLIRContext *context = &getContext();
+  auto empty = DenseI64ArrayAttr::get(context, {});
+  // The per-port arrival arrays of `ports` (port name -> bits) in the order
+  // of `names`, of the widths of `types`; null if none arrives late.
+  auto attribute = [&](const llvm::json::Object *ports, ArrayRef<Attribute>
+                       names, TypeRange types) -> ArrayAttr {
+    if (!ports)
+      return {};
+    SmallVector<Attribute> attrs;
+    bool late = false;
+    for (auto [name, type] : llvm::zip(names, types)) {
+      SmallVector<int64_t> bits;
+      if (auto *a = ports->getArray(cast<StringAttr>(name).getValue())) {
+        for (auto &v : *a)
+          bits.push_back(v.getAsInteger().value_or(0));
+        int64_t width = hw::getBitWidth(type);
+        if (bits.size() > 1 && (int64_t)bits.size() != width)
+          bits.clear();
+      }
+      late |= llvm::any_of(bits, [](int64_t l) { return l > 0; });
+      attrs.push_back(bits.empty() ? empty
+                                   : DenseI64ArrayAttr::get(context, bits));
+    }
+    return late ? ArrayAttr::get(context, attrs) : ArrayAttr();
+  };
+  DenseMap<StringAttr, ArrayAttr> outputs;
+  for (auto module : design.getOps<hw::HWModuleOp>()) {
+    auto *ports = top->getObject(module.getModuleName());
+    if (!ports)
+      continue;
+    auto type = module.getHWModuleType();
+    if (auto in = attribute(ports->getObject("in"),
+                            type.getInputNames(), type.getInputTypes()))
+      module->setAttr("synth.input_arrival_times", in);
+    if (auto out = attribute(ports->getObject("out"),
+                             type.getOutputNames(), type.getOutputTypes()))
+      outputs[module.getModuleNameAttr()] = out;
+  }
+  design.walk([&](hw::InstanceOp inst) {
+    if (auto out = outputs.lookup(inst.getModuleNameAttr().getAttr()))
+      inst->setAttr("synth.output_arrival_times", out);
+  });
+  markAllAnalysesPreserved();
+}
+
 void EstimateTimingPass::runOnOperation() {
   auto design = getOperation();
   hw::HWModuleOp top;
@@ -1597,6 +1736,8 @@ void EstimateTimingPass::runOnOperation() {
       failed(write(ports, [&](raw_ostream &os) {
         timing.writePorts(os, portModules);
       })) ||
+      failed(write(arrivals,
+                   [&](raw_ostream &os) { timing.writeArrivals(os); })) ||
       failed(write(paths, [&](raw_ostream &os) {
         timing.writePaths(os, pathLevels);
       })) ||
