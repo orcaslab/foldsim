@@ -23,9 +23,12 @@
 #include "circt/Dialect/Synth/SynthDialect.h"
 #include "circt/Dialect/Synth/Transforms/SynthPasses.h"
 #include "circt/Support/Version.h"
+#include "mlir/Pass/PassOptions.h"
 #include "mlir/Pass/PassRegistry.h"
 #include "mlir/Tools/mlir-opt/MlirOptMain.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/Support/Format.h"
+#include "llvm/Support/raw_ostream.h"
 
 // The netlist the logic screen counts: an and-inverter graph balanced for
 // depth, with adders, compares, multipliers and dividers kept word-level.
@@ -49,10 +52,26 @@
 /// is depth-oriented, as Vivado restructures chains of associative logic and
 /// priority muxes into trees; equality comparisons become logic so they pack
 /// into LUTs with their neighbours; adders, order comparisons and multipliers
-/// stay word-level, as carry chains and DSPs.
+/// stay word-level, as carry chains and DSPs. The mapper times the bits of
+/// adders, comparators and distributed-RAM reads as the 8-bit carry blocks
+/// and LUT RAMs deliver them (as foldsim-estimate-timing counts them), so a
+/// late carry is not buried under a deep cone as Vivado would not bury it.
 static const char *const screenMapPipeline =
     SCREEN_MAP_PREFIX
-    "synth-generic-lut-mapper{max-lut-size=6 strategy=timing},cse)";
+    "synth-generic-lut-mapper{max-lut-size=6 strategy=timing "
+    "carry-block-size=%u},cse)";
+
+namespace {
+struct ScreenMapOptions : public mlir::PassPipelineOptions<ScreenMapOptions> {
+  Option<unsigned> carryBlockSize{
+      *this, "carry-block-size",
+      llvm::cl::desc("Bits per carry block the mapper times adders and "
+                     "comparators with (0: their bits arrive at 0, as before "
+                     "arrival-aware mapping)"),
+      llvm::cl::init(8)};
+};
+} // namespace
+
 /// The same netlist mapped to 3-input cuts, for an ASIC library: a cut is one
 /// cell (NAND, AOI, MAJ, XOR). Against OpenSTA on five ASAP7 DUTs, 3-input
 /// cuts convert at the library's own cell delay; raw and-inverter gates and
@@ -78,10 +97,13 @@ int main(int argc, char **argv) {
   mlir::registerCSEPass();
   mlir::registerSymbolDCEPass();
   mlir::registerTopologicalSortPass();
-  mlir::PassPipelineRegistration<>(
+  mlir::PassPipelineRegistration<ScreenMapOptions>(
       "foldsim-screen-map", "Map a design to LUT6 for foldsim-estimate-timing",
-      [](mlir::OpPassManager &pm) {
-        if (failed(mlir::parsePassPipeline(screenMapPipeline, pm)))
+      [](mlir::OpPassManager &pm, const ScreenMapOptions &options) {
+        std::string pipeline;
+        llvm::raw_string_ostream(pipeline) << llvm::format(
+            screenMapPipeline, (unsigned)options.carryBlockSize);
+        if (failed(mlir::parsePassPipeline(pipeline, pm)))
           llvm::report_fatal_error("invalid foldsim-screen-map pipeline");
       });
   mlir::PassPipelineRegistration<>(
