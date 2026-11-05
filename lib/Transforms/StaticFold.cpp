@@ -205,6 +205,10 @@ struct Class {
   /// each instance's slot.
   unsigned pageWindow = 0;
   SmallVector<unsigned> windowSlot;
+  /// Off chip on engines with `page-write-gate`: each page's write-back bits
+  /// through a gated register, the column's write data their OR; its page
+  /// writes two host cycles after the state pass at the earliest.
+  bool pageGate = false;
   /// The fewest host cycles from a state pass to the instance's next
   /// evaluation its stores allow (StaticFolder::minStateGap), once known.
   mutable int minGap = -1;
@@ -326,6 +330,9 @@ public:
   /// `link-hbm-fit-slots`: a stream on the page engines takes the fewest
   /// landing slots its requests need.
   bool linkHbmFitSlots = false;
+  /// `page-write-gate`: off-chip pages on engines written back through
+  /// per-page gated registers and an OR (choosePageGates, Class::pageGate).
+  bool pageWriteGate = false;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
   /// landing) a member is streamed with (0: the decision lead + 6). A
   /// member with less room is built as an on-chip link: its landing would
@@ -1060,6 +1067,7 @@ private:
                  const DenseMap<Operation *, unsigned> &virtualOf);
   /// Chooses each off-chip paged copy's window from its schedule.
   void chooseWindows();
+  void choosePageGates();
   LogicalResult parsePages();
   /// Marks the paged classes whose pages a storage rule keeps off chip.
   LogicalResult pagesOffChip();
@@ -2951,6 +2959,13 @@ void StaticFolder::reportPageEngines(raw_ostream &os) {
     for (unsigned k : eng.streams)
       os << " link:" << modelOf(linkStreams[k].pcls) << ">"
          << modelOf(linkStreams[k].rcls);
+    os << "\n";
+  }
+  if (pageWriteGate) {
+    os << "  page write gate:";
+    for (auto &cls : classes)
+      if (cls.pageGate)
+        os << " " << cls.name;
     os << "\n";
   }
   if (linkHbmShift) {
@@ -5469,6 +5484,14 @@ int StaticFolder::minStateGap(const Class &cls) const {
   }
   cls.minGap = gap;
   return gap;
+}
+
+void StaticFolder::choosePageGates() {
+  // `page-write-gate`: an off-chip paged class on engines, of more than one
+  // page and without a window.
+  for (auto &cls : classes)
+    cls.pageGate = pageWriteGate && pageEngineCap && cls.page >= 2 &&
+                   cls.pagesOffChip && !cls.pageWindow;
 }
 
 void StaticFolder::chooseWindows() {
@@ -8659,6 +8682,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       unsigned vm = 0, vmWidth = 0;
       Value writeValid;
       SmallVector<Value> requests;
+      /// Gated (Class::pageGate): per page, the synchronous reset of its
+      /// write-back register (low the host cycle before the page's write).
+      SmallVector<Value> gateReset;
     };
     std::vector<Column> cols(columns);
     // Each column's controls: a region of its own.
@@ -8899,6 +8925,17 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           col.writing.push_back(comb::AndOp::create(b, write0, isPage(wpage0, j)));
         if (pageWidth)
           col.writeIndex = low(wpage0);
+        if (cls.pageGate) {
+          // Each page's gated register loads the host cycle before the
+          // page's write: the write tables a register earlier.
+          auto earlier = [](Value v) {
+            return v.getDefiningOp<seq::FirRegOp>().getNext();
+          };
+          Value write1 = earlier(write0), wpage1 = earlier(wpage0);
+          for (unsigned j = 0; j < p; ++j)
+            col.gateReset.push_back(comb::XorOp::create(
+                b, comb::AndOp::create(b, write1, isPage(wpage1, j)), one()));
+        }
         col.writeValid = comb::AndOp::create(b, write0, wb);
         Value zero1 = hw::ConstantOp::create(b, b.getI1Type(), 0);
         col.requests = {read0, virtualInst(inst0, page0), zero1, col.writeValid,
@@ -8985,8 +9022,25 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             b, col.land[j],
             b.createOrFold<comb::ExtractOp>(bits(n), col.out, offset), fetched));
         parts.push_back(fetched);
-        col.parts[j].push_back(
-            {offset, b.createOrFold<comb::ExtractOp>(bits(n), reg.writeBack, lo)});
+        Value back = b.createOrFold<comb::ExtractOp>(bits(n), reg.writeBack, lo);
+        if (!col.gateReset.empty()) {
+          // Gated: zero but the host cycle of page j's write (its
+          // synchronous reset, a FF's SR pin), so the column ORs its pages.
+          // Pages are written in order from the state pass + 1, so only page
+          // 0 may load at the state pass itself: from what the write-back
+          // register loads then (its next value), the others from it.
+          Value from = j ? back
+                         : b.createOrFold<comb::ExtractOp>(
+                               bits(n),
+                               reg.writeBack.getDefiningOp<seq::FirRegOp>().getNext(),
+                               lo);
+          auto zero = hw::ConstantOp::create(b, bits(n), 0);
+          back = seq::FirRegOp::create(
+              b, from, hostClock, b.getStringAttr(name + "_gate" + Twine(j)),
+              col.gateReset[j], zero, hw::InnerSymAttr{}, /*isAsync=*/false,
+              b.getIntegerAttr(bits(n), 0));
+        }
+        col.parts[j].push_back({offset, back});
         lo += n;
       }
       Value value = parts.size() == 1
@@ -9052,7 +9106,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         return hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elems),
                                       col.writeIndex);
       };
-      writeData = select(words, col.width);
+      // Gated: every page's word zero but the one being written: their OR.
+      writeData = !col.gateReset.empty()
+                      ? Value(comb::OrOp::create(b, words, false))
+                      : select(words, col.width);
       if (bytesMasked)
         writeMask = select(masks, bytes);
       if (offChip) {
@@ -12524,6 +12581,7 @@ LogicalResult StaticFolder::run() {
     return failure();
   }
   chooseWindows();
+  choosePageGates();
   if (scheduleOnly) {
     // The page engines the build would take (and the link streams they
     // carry), in the report too: a cost model prices a schedule as built.
@@ -12593,6 +12651,7 @@ void FoldStaticPass::runOnOperation() {
   folder.foldPortsSpec = foldPorts;
   folder.foldPortsReset = foldPortsReset;
   folder.linkHbmFitSlots = linkHbmFitSlots;
+  folder.pageWriteGate = pageWriteGate;
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.minII = minII;
   folder.stagedLinkMemories = stagedLinks && stagedLinkMemories;

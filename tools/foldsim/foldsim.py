@@ -384,6 +384,8 @@ def frame_options(a):
         fold += f' link-hbm-min-lead={a.link_hbm_min_lead}'
     if getattr(a, 'link_hbm_shift', 0):
         fold += f' link-hbm-shift={a.link_hbm_shift}'
+    if getattr(a, 'page_write_gate', False):
+        fold += ' page-write-gate'
     if getattr(a, 'link_hbm_fit_slots', False):
         fold += ' link-hbm-fit-slots'
     if getattr(a, 'fold_ports', ''):
@@ -1044,6 +1046,12 @@ def main():
                          'request moves earlier, or its write later, so that streams whose requests or writes '
                          'fall at the same positions share an engine (within the room from the row\'s write to '
                          'its request; foldsim-fold-static; 0: none)')
+    ap.add_argument('--page-write-gate', action='store_true',
+                    help='with --static and --page-engines: off-chip pages written back through a gated '
+                         'register a page (loaded the host cycle before its write, else held at zero) and an OR '
+                         'of the pages, instead of a p:1 select by the page index: about (p - 1) / 5 LUTs a '
+                         'page bit instead of (p - 1) / 3, at a register a paged bit (foldsim-fold-static '
+                         'page-write-gate)')
     ap.add_argument('--link-hbm-fit-slots', action='store_true',
                     help='with --static, hbm link kinds and --page-engines: each stream takes the fewest landing '
                          'slots its requests need (a power of two, at least 8; foldsim-fold-static)')

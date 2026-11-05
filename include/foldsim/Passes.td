@@ -605,6 +605,17 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"foldPortsReset", "fold-ports-reset", "std::string", "\"reset\"",
            "With fold-ports: the netlist input whose frame token rides on "
            "each request record (req_treset)">,
+    Option<"pageWriteGate", "page-write-gate", "bool", "false",
+           "Off-chip pages on page engines (page-engines): each page's "
+           "write-back bits through a register of its own, loaded the host "
+           "cycle before the page's write and held at zero (its synchronous "
+           "reset) otherwise, so that a column's write data is the OR of its "
+           "pages (a six-input OR a LUT: about (p - 1) / 5 LUTs a page bit) "
+           "instead of a p:1 select by the page index (about (p - 1) / 3), "
+           "at a register a paged bit; page 0's register loads what the "
+           "write-back register loads at the state pass (a 2:1 select a bit "
+           "of one page). A class with a page window keeps the select (the "
+           "report's `page write gate` line names the classes gated)">,
     Option<"linkHbmFitSlots", "link-hbm-fit-slots", "bool", "false",
            "HBM link streams on page engines: each takes the fewest landing "
            "slots (a power of two, at least 8) its requests need, each request "

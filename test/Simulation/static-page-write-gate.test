@@ -1,0 +1,51 @@
+# REQUIRES: verilator
+# Gated page write-back (--page-write-gate, off-chip pages on page engines):
+# each page's write-back bits through a register of their own, loaded the
+# host cycle before the page's write (page 0 with what the write-back
+# register loads at the state pass, the others from it) and held at zero by
+# its synchronous reset otherwise, so a column's write data is the OR of its
+# pages (about (p - 1) / 5 LUTs a page bit) instead of a p:1 select by the
+# page index (about (p - 1) / 3). Against the target from zero state
+# (tb_pages.sv: a model per virtual memory answering 1 to 60 host cycles on,
+# `free` low at times): copies, overlapped zero-latency links, bubbles,
+# nested sequencers with a short lead, staged evaluation, multicycle; two
+# models' pages beside HBM link streams on shared engines (tb_linkhbm.sv).
+# The report names the classes gated; the netlist has the gated registers and
+# no page select.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/paged
+# RUN: foldsim --srcs top.f --top Top --out %t/c2 --static --page 4 --storage Leaf:pages=hbm --copies Leaf:2 --zero-latency-links --zero-latency-chains --page-hbm-column-bits 64 --page-engines auto --page-write-gate Leaf > %t/c2.log 2>&1
+# RUN: FileCheck %s --check-prefix=C2 < %t/c2/schedule.txt
+# RUN: FileCheck %s --check-prefix=SV < %t/c2/foldsim_sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/c2 -DVM1 -Mdir %t/c2/obj %S/Inputs/tb_pages.sv top.sv %t/c2/foldsim_sim.sv > %t/c2/build.log 2>&1
+# RUN: %t/c2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=30 +stall=30 | FileCheck %s
+# RUN: %t/c2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=60 +full=20 | FileCheck %s
+# RUN: %t/c2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=1 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bub --static --page 3 --storage Leaf:pages=hbm --bubbles --modulo --page-hbm-column-bits 32 --page-engines auto --page-write-gate Leaf > %t/bub.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/bub -DBUBBLES -DVM1 -Mdir %t/bub/obj %S/Inputs/tb_pages.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=1 +bubble=50 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --page 4 --storage Leaf:pages=hbm --nest --short-lead --bubbles --page-engines auto --page-write-gate Leaf > %t/nest.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/nest -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_pages.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=20 +bubble=20 +stall=20 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/paged_staged
+# RUN: foldsim --srcs top.f --top Top --out %t/st --static --page 2 --storage Leaf:pages=hbm --stage-levels 1 --page-engines auto --page-write-gate Leaf > %t/st.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/st -Mdir %t/st/obj %S/Inputs/tb_pages.sv top.sv %t/st/foldsim_sim.sv > %t/st/build.log 2>&1
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=40 +stall=20 +full=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/mc --static --page 3 --storage Leaf:pages=hbm --multicycle Leaf:3 --stage-levels 1 --page-engines auto --page-write-gate Leaf > %t/mc.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/mc -Mdir %t/mc/obj %S/Inputs/tb_pages.sv top.sv %t/mc/foldsim_sim.sv > %t/mc/build.log 2>&1
+# RUN: %t/mc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/mc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=40 +stall=20 +full=20 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/linkhbm
+# RUN: foldsim --srcs top.f --top Top --out %t/mix --static --nest --modulo --bubbles --page 2 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --page-write-gate --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/mix.log 2>&1
+# RUN: FileCheck %s --check-prefix=MIX < %t/mix/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/mix -DVM1 -DBUBBLES -Mdir %t/mix/obj %S/Inputs/tb_linkhbm.sv top.sv %t/mix/foldsim_sim.sv > %t/mix/build.log 2>&1
+# RUN: %t/mix/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 +bubble=30 | FileCheck %s
+# RUN: %t/mix/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=1 +hi=30 +stall=30 +full=20 | FileCheck %s
+# C2: page write gate: Leaf Leaf_copy1
+# SV: _gate0
+# SV: _gate3
+# MIX: page write gate: Unit Reader
+# CHECK-NOT: PROTOCOL
+# CHECK: {{^}}MATCH {{[0-9]+}} cycles
+# CHECK-NOT: PROTOCOL

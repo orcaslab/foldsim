@@ -646,19 +646,22 @@ ENGINE_PAGE_OCC = 0.1
 ENGINE_STREAM_OCC = 1.0
 
 
-def engines_first_fit(copies, streams, shift=0):
+def engines_first_fit(copies, streams, shift=0, members=False):
     """The page engines of a fold: `copies` [(columns, share of the frame a
     column's page traffic takes)] in the compiler's class order, `streams`
     [share of the frame its requests take]; `shift` the compiler's
-    link-hbm-shift. Returns the engine count."""
-    occ = []
+    link-hbm-shift. Returns the engine count, with `members` also each
+    engine's member count (columns and streams it carries)."""
+    occ, mem = [], []
     for u in streams:
         for e in range(len(occ) if shift > 0 else 0):
             if occ[e] + u <= ENGINE_STREAM_OCC:
                 occ[e] += u
+                mem[e] += 1
                 break
         else:
             occ.append(u)
+            mem.append(1)
     for cols, u in copies:
         cols = max(int(cols), 1)
         first = 0
@@ -667,9 +670,28 @@ def engines_first_fit(copies, streams, shift=0):
         for e in range(first, first + cols):
             if e < len(occ):
                 occ[e] += u
+                mem[e] += 1
             else:
                 occ.append(u)
-    return len(occ)
+                mem.append(1)
+    return (len(occ), mem) if members else len(occ)
+
+
+# An engine carrying m > 1 members (page columns, streams) takes their
+# requests through the simulator's AND-OR (foldsim-fold-static: each member's
+# read / write valid, tag, row, data and mask gated by its valid and OR-ed):
+# ENGINE_MEMBER_BITS bits (a 512-bit row, its mask, tags and rows of both
+# requests and the valids), each a LUT6 for three members' (valid, bit)
+# pairs and an OR tree of those (six to a LUT).
+ENGINE_MEMBER_BITS = PAGE_ENGINE_BITS + PAGE_ENGINE_BITS // 8 + 64
+
+
+def engine_member_luts(m, bits=ENGINE_MEMBER_BITS):
+    """The LUTs of an engine's request select over `m` members."""
+    if m <= 1:
+        return 0.0
+    first = -(-m // 3)
+    return float(bits * (first + -(-(first - 1) // 5)))
 
 
 def page_engine_ctl(row_bits=PAGE_ENGINE_BITS):
@@ -705,12 +727,30 @@ def page_hbm_depth(bits, threads, p, frame, port_share=0.5):
     return max(p, min(top, want))
 
 
+# foldsim --page-write-gate (foldsim-fold-static page-write-gate): an
+# off-chip copy on engines writes its pages back through a gated register a
+# page (zero but the host cycle before its write, its FF's synchronous reset)
+# and an OR of them: ceil((p - 1) / 5) LUTs a page bit (six-input ORs)
+# instead of the p:1 select's ceil((p - 1) / 3), half a LUT a bit of page 0
+# (it loads the write-back register's next value), and a register a paged bit.
+PAGE_WRITE_GATE = False
+
+
+def page_gate_luts(p):
+    """LUTs a page bit of a gated write-back's OR (p pages), page 0's load
+    select spread over the pages."""
+    return math.ceil((p - 1) / 5) + 0.5 / p if p > 1 else 0
+
+
 def page_hbm_cost(bits, threads, p, engines_frame=None):
     """Paged register state off chip (pages=hbm) as a relief kind: page_cost's
     'hbm' with its traffic in the `hbm` pool. With `engines_frame` (HBM page
     streams at that frame): its share of page engines (`ctl`, fractional;
     `engine_columns`) instead of a controller per column."""
     c = page_cost(bits, threads, p, 'hbm')
+    if engines_frame and PAGE_WRITE_GATE and p > 1:
+        pw = math.ceil(bits / p)
+        c = dict(c, lut=float(pw * page_gate_luts(p)), ff=c['ff'] + bits)
     if engines_frame:
         columns, share = page_engine_share(bits, threads, p, engines_frame)
         cl, cr = page_engine_ctl()

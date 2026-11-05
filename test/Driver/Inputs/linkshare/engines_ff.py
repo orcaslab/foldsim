@@ -16,6 +16,9 @@ if sys.argv[2] == '--regimes':
     c = [(1 + k % 4, 0.001) for k in range(18)]
     print('large', st.engines_first_fit(c, [0.01] * 26), st.engines_first_fit(c, [0.01] * 26, 256),
           'dense', st.engines_first_fit([(9, 0.5)], [0.01]))
+    # The engines' request selects over their members (engine_member_luts): the large fold with the shift.
+    n, mem = st.engines_first_fit(c, [0.01] * 26, 256, members=True)
+    print('members', sorted(mem, reverse=True), 'luts', int(sum(st.engine_member_luts(m) for m in mem)))
     sys.exit(0)
 text = open(sys.argv[2]).read()
 shift = int(sys.argv[3]) if len(sys.argv) > 3 else 0

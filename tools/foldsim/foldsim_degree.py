@@ -995,6 +995,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     # and 14 streams, 24 for 16 and 14, where the shares' sum gave 4; the
     # columns alone (or the streams alone) 27 / 16.
     page_engines = 0
+    member_luts = 0.0
     # A schedule built with page engines: at least as many as it has. A
     # schedule-only report lists the engines of its link streams alone (the
     # page columns are laid out with the copies): the pages' engines on top.
@@ -1004,13 +1005,18 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         share = sum(e[1] for e in engine_cols)
         cols = sum(e[0] for e in engine_cols if len(e) < 3)
         streams = sum(1 for e in engine_cols if len(e) == 3)
+        member_luts = 0.0
         if ENGINES['rule'] == 'first-fit':
             # As the compiler assigns them (storage.engines_first_fit): the
             # page columns on the streams' engines where their traffic finds
-            # room, the streams sharing under link-hbm-shift.
-            own = max([e[0] for e in engine_cols] + [math.ceil(share - 1e-9), storage.engines_first_fit(
+            # room, the streams sharing under link-hbm-shift; each engine's
+            # request select over its members (engine_member_luts).
+            ff, members = storage.engines_first_fit(
                 [(e[0], e[1] / max(e[0], 1)) for e in engine_cols if len(e) < 3],
-                [e[1] for e in engine_cols if len(e) == 3], ENGINES['shift'])])
+                [e[1] for e in engine_cols if len(e) == 3], ENGINES['shift'], members=True)
+            own = max([e[0] for e in engine_cols] + [math.ceil(share - 1e-9), ff])
+            member_luts = sum(storage.engine_member_luts(m) for m in members)
+            logic += member_luts
         else:
             own = max([e[0] for e in engine_cols] + [math.ceil(share - 1e-9), cols + streams])
         page_engines = max(own, built_engines) if built.get('engine_columns') else \
@@ -1075,6 +1081,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                **({'link_kinds': ','.join(link_rules)} if lu else {}),
                **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged),
                **({'page_engines': page_engines} if page_engines else {}),
+               **({'engine_member_luts': round(member_luts)} if page_engines and member_luts else {}),
                kernel_controllers=round(n_ctl, 1),
                **({'platform': {k: round(v) for k, v in platform.items()}} if platform else {}))
     if platform or BUILT is not None:
@@ -2487,6 +2494,9 @@ def main():
     st.add_argument('--link-hbm-shift', type=int, default=0, metavar='N',
                     help="the fold's foldsim --link-hbm-shift (streams on the page engines move their "
                          "requests up to N positions to share an engine), for --engine-rule first-fit")
+    st.add_argument('--page-write-gate', action='store_true',
+                    help='with --page-engines: off-chip pages written back gated (foldsim --page-write-gate): '
+                         "an OR of the pages' gated registers instead of the p:1 select")
     st.add_argument('--masters-by-traffic', action='store_true',
                     help="the controllers' masters (FOLDSIM_VMEM_MASTERS) of least LUTs that carry the "
                          "point's own HBM bytes a host cycle (x storage.MASTER_HEADROOM), not the whole HBM "
@@ -2548,6 +2558,7 @@ def state_main(a):
     global BUILT
     ENGINES.update(rule=getattr(a, 'engine_rule', 'max'), shift=getattr(a, 'link_hbm_shift', 0))
     PLATFORM.update(by_traffic=getattr(a, 'masters_by_traffic', False))
+    storage.PAGE_WRITE_GATE = getattr(a, 'page_write_gate', False)
     if a.exact:
         storage.ASSIGN_EXACT = True
     if a.vmem_forward == 0:
