@@ -772,7 +772,9 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             # a register may page as rows too (foldsim-fold-static
             # page-memories): a kind priced as paged_state prices the small
             # ones, its page RAM a share of the class's (URAM).
-            if tiers is not None and not tiers.get('as_built') and nameable and \
+            as_row = BUILT is not None and BUILT.get('rows') and \
+                re.search(BUILT['rows'], f"{re.sub(r'_copy\\d+$', '', c)}:{name}")
+            if tiers is not None and (not tiers.get('as_built') or as_row) and nameable and \
                     len(per) == len(forms) and rl <= 1 and \
                     all(f == 'paged' for _, _, f, _ in forms) and \
                     d * w <= tiers.get('row_bits_max', ROW_BITS_MAX):
@@ -793,7 +795,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                             rc[key] += v[key]
                 u['costs']['rows'] = rc
                 u['per']['rows'] = parts
-                if (c, name) in tiers.get('force_rows', ()):
+                if (c, name) in tiers.get('force_rows', ()) or as_row:
                     u['fixed'] = 'rows'
             units.append(u)
     if not uram:
@@ -838,6 +840,32 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         for u in units:
             if u['store'] == 'pages' and u['class'] in tiers.get('force_pages', ()):
                 u['fixed'] = 'hbm'
+    if BUILT is not None and BUILT.get('storage') is not None:
+        # As built: each store at the kind the generation's --storage rules
+        # gave it (a memory its rule's or Vivado's default; register stores
+        # by width, the largest bound at most theirs, distributed below).
+        mem_rules, reg_rules = {}, {}
+        for rule in filter(None, BUILT['storage'].split(',')):
+            key, _, kind = rule.rpartition('=')
+            model, _, store = key.partition(':')
+            if store.startswith('regs>='):
+                reg_rules.setdefault(model, []).append((int(store[6:]), kind))
+            else:
+                mem_rules[(model, store)] = kind
+        for u in units:
+            if u.get('link') or u.get('fixed'):
+                continue
+            model = re.sub(r'_copy\d+$', '', u['class'])
+            if u['store'].startswith('regs>='):
+                w = int(u['store'][6:])
+                kind = 'distributed'
+                for bound, k in sorted(reg_rules.get(model, [])):
+                    if bound <= w:
+                        kind = k
+            else:
+                kind = mem_rules.get((model, u['store']), u.get('default'))
+            if kind in u['costs']:
+                u['fixed'] = kind
     calibrate_units(units)
     if KERNEL['calibration']:
         # The links' LUTRAM in the base (those no tier chooses) too.
@@ -2460,6 +2488,12 @@ def state_main(a):
         # build).
         storage.no_forward()
     BUILT = read_built(a.built_json) if getattr(a, 'built_json', '') else None
+    if BUILT is not None:
+        m = re.search(r'(?:^| )storage=(\S+)', a.fold_options)
+        BUILT['storage'] = m.group(1) if m else ''
+        # The memories the generation paged as rows (--page-rows).
+        m = re.search(r'(?:^| )page-rows=(\S+)', a.fold_options)
+        BUILT['rows'] = m.group(1) if m else ''
     if a.route_limit is not None:
         storage.ROUTE_LIMIT = a.route_limit
     cal = json.load(open(a.calibration)) if a.calibration else None
