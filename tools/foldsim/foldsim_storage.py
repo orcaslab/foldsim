@@ -628,18 +628,21 @@ def no_forward():
 # (reads; writes alike), in the model's shares (page_engine_share, a copy's
 # max(p, 2) x instances; link_stream_cost's ports, a stream's). A copy's page
 # reads go in the window between its state passes, in page order after the
-# frame before's writes, page 0 two positions before the pass, so it shares
-# a run only where the run's occupancy plus its own stays within
-# ENGINE_PAGE_OCC: the 16-SM g16c put a 9-column copy of share 0.5 beside a
-# stream on 9 engines of its own (10), the 64-SM m_p64 49 columns and 8
-# streams on 20. A stream's requests sit a lead before its landings: at its
-# own positions an engine each (streams landing at the same passes collide:
-# the 32-SM schedule g32cs put 17 on 15); with link-hbm-shift (requests up
-# to N positions earlier, writes later) on the first engine within
+# frame before's writes, page 0 two positions before the pass, and a copy's
+# state passes may sit close together in the frame, so it shares a run only
+# where the run's occupancy plus its own stays within ENGINE_PAGE_OCC. 0.1 is
+# the largest that bounds every as-built fold from above (pg_1105 occfit.py,
+# built / first-fit at 0.1 / 0.25 / 'max'): a64 m_p64 (II 1,016) 20 / 24 / 16
+# / 57, s_p64 14 / 16 / 11 / 26, m_a64 42 / 78 / 70 / 88, s_a64 35 / 59 / 54 /
+# 59, g16b and g16c 10 / 10 / 10 / 10, a128 fake_S1_s4 (shift 256) 4 / 5 / 5 /
+# 32. A stream's requests sit a lead before its landings: at its own
+# positions an engine each (streams landing at the same passes collide: the
+# 32-SM schedule g32cs put 17 on 15); with link-hbm-shift (requests up to N
+# positions earlier, writes later) on the first engine within
 # ENGINE_STREAM_OCC (Driver/engines-first-fit.test: three streams of share
 # 0.3 on one; a64 S2_m64, shift 256 at II 81,922: 20 streams 16 -> 7
 # engines; a128 fake_S1_s4: 32 streams and a page column on 4).
-ENGINE_PAGE_OCC = 0.5
+ENGINE_PAGE_OCC = 0.1
 ENGINE_STREAM_OCC = 1.0
 
 

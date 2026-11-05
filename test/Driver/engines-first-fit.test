@@ -16,8 +16,9 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/sh --static --nest --modulo --min-ii 160 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-shift 8 --schedule-only --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm Unit Vnit Reader Sink > %t/sh.log 2>&1
 # RUN: python3 engines_ff.py foldsim %t/sh/schedule.txt 8 | FileCheck %s --check-prefix=SH
 # Two models' off-chip pages beside two streams (Inputs/linkhbm, frame 160):
-# the pages ride the streams' engines; without the shift one copy is priced
-# on an engine of its own (3, built 2: the bound), with it exact (2).
+# the compiler puts the pages on the streams' engines (2, with the shift or
+# not); priced at ENGINE_PAGE_OCC 0.1 (the bound of every as-built fold) the
+# copies (a share of 0.2 each) take engines of their own: 4 and 3.
 # RUN: cd %S/Inputs/linkhbm
 # RUN: foldsim --srcs top.f --top Top --out %t/two --static --nest --modulo --min-ii 160 --page 1 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/two.log 2>&1
 # RUN: python3 ../linkshare/engines_ff.py foldsim %t/two/schedule.txt 0 | FileCheck %s --check-prefix=TWO
@@ -27,6 +28,6 @@
 # RUN: python3 %S/Inputs/linkshare/engines_ff.py foldsim --regimes | FileCheck %s --check-prefix=FF
 # OWN: engines: first-fit 3, max 3, built 3
 # SH: engines: first-fit 1, max 3, built 1
-# TWO: engines: first-fit 3, max 4, built 2
-# TWOS: engines: first-fit 2, max 4, built 2
-# FF: large 26 4 dense 10
+# TWO: engines: first-fit 4, max 4, built 2
+# TWOS: engines: first-fit 3, max 4, built 2
+# FF: large 26 5 dense 10

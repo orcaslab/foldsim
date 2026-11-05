@@ -11,7 +11,7 @@ import foldsim_degree as fd
 import foldsim_storage as st
 if sys.argv[2] == '--regimes':
     # A large fold's (the 128-SM point: 18 copies of 1 to 4 columns at shares of 1e-3, 26 streams of 1e-2): the
-    # streams' engines without the shift, the widest copy's columns with it; a dense one (16-SM g16c: a 9-column
+    # streams' engines without the shift, a few with it; a dense one (16-SM g16c: a 9-column
     # copy at 0.5 beside a stream): a run of its own.
     c = [(1 + k % 4, 0.001) for k in range(18)]
     print('large', st.engines_first_fit(c, [0.01] * 26), st.engines_first_fit(c, [0.01] * 26, 256),
