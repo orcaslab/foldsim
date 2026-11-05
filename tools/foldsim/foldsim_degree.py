@@ -199,7 +199,7 @@ def read_built(path):
     m = re.search(r'FOLDSIM_VMEM_FORWARD (\d)', vh)
     forward = int(m.group(1)) if m else int(j.get('vmem_forward', 1))
     m = re.search(r'FOLDSIM_VMEM_MASTERS (\d+)', vh)
-    vmasters = int(m.group(1)) if m else None
+    vmasters = int(m.group(1)) if m else 0 if 'FOLDSIM_VMEM_ON_PORTS' in vh else None
     m = re.search(r'FOLDSIM_MEM_PORTS (\d+)', vh)
     ports = int(m.group(1)) if m else None
     ctls = j.get('vmem_groups') or j.get('vmem') or []
@@ -932,11 +932,13 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     # (assignPageEngines: streams first, each its own engine unless another
     # stream's requests leave its positions free; then each off-chip copy's
     # columns on a run of engines where its page traffic finds free positions,
-    # around the streams): at least every off-chip copy's columns and at least
-    # the streams. Copies' page traffic falls at their state passes, so
-    # copies rarely share an engine: the 16-SM fold g16 (virtA_1105) built 23
-    # engines for 27 page columns and 14 streams, where the shares' sum (all
-    # this priced before) gave 4.
+    # around the streams): priced at most, every off-chip copy's columns
+    # and every stream on an engine of its own (sharing is left to the
+    # compiler, which takes fewer). Copies' page traffic falls at their state
+    # passes, so the shares' sum (all this priced before) is far too few: the
+    # 16-SM folds g16 / g16b (virtA_1105) built 23 engines for 27 page columns
+    # and 14 streams, 24 for 16 and 14, where the shares' sum gave 4; the
+    # columns alone (or the streams alone) 27 / 16.
     page_engines = 0
     # A schedule built with page engines: at least as many as it has. A
     # schedule-only report lists the engines of its link streams alone (the
@@ -947,7 +949,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         share = sum(e[1] for e in engine_cols)
         cols = sum(e[0] for e in engine_cols if len(e) < 3)
         streams = sum(1 for e in engine_cols if len(e) == 3)
-        own = max([e[0] for e in engine_cols] + [math.ceil(share - 1e-9), cols, streams])
+        own = max([e[0] for e in engine_cols] + [math.ceil(share - 1e-9), cols + streams])
         page_engines = max(own, built_engines) if built.get('engine_columns') else \
             own + built_engines
         el, er = storage.page_engine_ctl()
