@@ -5,7 +5,7 @@
 //   host_req (write): addr[11:10] the tile, addr[9:0] the word: loads the tile's RAM while the cores are held.
 //   go:               releases the cores (they run from address 0 until each traps).
 //   host_req (read):  answered the next cycle on host_rsp: addr 0 the checksum of every output token, 1 the trapped
-//                     tiles, 2 the output tokens, 3 the target cycles since go, 4 + t tile t's last output token.
+//                     tiles, 2 the output tokens, 3 the target cycles the cores ran (go until every tile trapped), 4 + t tile t's last output token.
 //   running:          the cores run and not every tile has trapped.
 // The kernel binds at least one AXI4 memory port; the array has no memory outside its tiles, so m_axi_mem_0 is
 // idle (no request ever issued, every response taken).
@@ -73,7 +73,7 @@ module pico_v80 #(
       host_rsp_data  <= '0;
     end else begin
       if (go) run <= 1'b1;
-      if (run) cycles <= cycles + 1;
+      if (running) cycles <= cycles + 1;
       for (int t = 0; t < N; t++)
         if (out_valid[t]) last[t] <= out_data[t];
       tokens <= tokens + 32'($countones(out_valid));
