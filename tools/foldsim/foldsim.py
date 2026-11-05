@@ -370,6 +370,8 @@ def frame_options(a):
         fold += ' share-links'
     if getattr(a, 'staged_links', False):
         fold += ' staged-links'
+        if getattr(a, 'staged_link_memories', False):
+            fold += ' staged-link-memories'
     if getattr(a, 'link_block_depth', 0):
         fold += f' link-block-depth={a.link_block_depth}'
     if getattr(a, 'link_ultra_depth', 0):
@@ -1065,6 +1067,10 @@ def main():
                     help="with --static: an early link of one producer instance in two registers, "
                          'copied at a fixed position of the frame, where the schedule allows '
                          '(foldsim-fold-static)')
+    ap.add_argument('--staged-link-memories', action='store_true',
+                    help="with --staged-links: the staged links of one producer port to one reader class "
+                         "keep their first registers as one distributed-RAM memory, each link's second "
+                         "register loaded from it at its own copy position (foldsim-fold-static)")
     ap.add_argument('--share-links', action='store_true',
                     help='with --static: outputs of a model driven by the same value (a bus broadcast '
                          'to several children) share one link (foldsim-fold-static)')

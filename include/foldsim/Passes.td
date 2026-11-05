@@ -619,6 +619,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "producer's pass, copied at a fixed position of the frame to the "
            "one the reader reads, between the last read of the frame before "
            "and the first of this one; no memory and no bank select">,
+    Option<"stagedLinkMemories", "staged-link-memories", "bool", "false",
+           "With staged-links: the staged links of one producer port (its "
+           "bits) to one reader class, two or more, keep their first "
+           "registers as one memory of an entry per producer instance they "
+           "take (distributed RAM), written at the producer's passes; each "
+           "link's second register is loaded from it at its own copy "
+           "position (distinct positions in the frame: one read port)">,
     Option<"shareLinks", "share-links", "bool", "false",
            "Outputs of a model driven by the same value (a bus broadcast to "
            "several children) are one producer: their readers share its "

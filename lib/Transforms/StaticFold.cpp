@@ -41,6 +41,7 @@
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/raw_ostream.h"
 #include <deque>
+#include <optional>
 #include <map>
 #include <numeric>
 #include <set>
@@ -338,6 +339,8 @@ public:
   /// longer prefetch distance for every request a pass issues (for studies
   /// of latency hiding, or a host rate matched to another simulator's).
   unsigned minII = 0;
+  /// `staged-link-memories` (with `staged-links`): see stagedMemories.
+  bool stagedLinkMemories = false;
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
                unsigned regionBits, StringRef report,
                ArrayRef<std::string> copies, bool nest, bool scheduleOnly,
@@ -655,6 +658,43 @@ private:
   /// that position (0 to II-1), or -1 where the schedule leaves none.
   int stagedCopy(unsigned p, unsigned inst, unsigned reader,
                  ArrayRef<unsigned> readers) const;
+  /// The host cycles stagedCopy may copy at: [low, high] before reducing
+  /// modulo II (high - low < II), or none.
+  std::optional<std::pair<int, int>>
+  stagedWindow(unsigned p, unsigned inst, unsigned reader,
+               ArrayRef<unsigned> readers) const;
+  /// `staged-link-memories`: the staged links of one producer port's bits
+  /// (producer, low, width) to one reader class, two or more, keep their
+  /// first registers as one memory, an entry per producer instance they take
+  /// (`insts`, sorted), written at the producer's passes as the registers
+  /// were; each link's second register loads the memory's read at its own
+  /// copy position, the positions of a group distinct (one read port). A
+  /// copy position of the window that stagedCopy chose from, so the second
+  /// register takes what the first held there: the frame's values are as
+  /// with registers, cycle for cycle.
+  struct StagedGroup {
+    unsigned producer, low, width, reader;
+    SmallVector<uint64_t> insts;
+    /// Each member's copy position and its entry, by position.
+    std::map<int, unsigned> entryAt;
+  };
+  struct StagedMember {
+    unsigned group, entry;
+    int copyAt;
+  };
+  std::vector<StagedGroup> stagedGroups;
+  /// By (reader class, reader input, its bit, producer, low).
+  std::map<std::tuple<unsigned, unsigned, unsigned, unsigned, unsigned>,
+           StagedMember>
+      stagedMembers;
+  bool stagedPlanned = false;
+  void planStagedMemories();
+  const StagedMember *stagedMemberOf(unsigned reader, unsigned port,
+                                     unsigned at, unsigned p,
+                                     unsigned low) const {
+    auto it = stagedMembers.find({reader, port, at, p, low});
+    return it == stagedMembers.end() ? nullptr : &it->second;
+  }
   bool stagedLinks;
   /// `link-block-depth`, `link-ultra-depth`: a link memory at least this
   /// deep, the only source of its reader's bits and never forwarded or
@@ -3186,11 +3226,21 @@ unsigned StaticFolder::linkPaged(const LinkUse &use, bool banked,
 
 int StaticFolder::stagedCopy(unsigned p, unsigned inst, unsigned reader,
                              ArrayRef<unsigned> readers) const {
-  if (!stagedLinks || ii == 0)
+  auto window = stagedWindow(p, inst, reader, readers);
+  if (!window)
     return -1;
+  int high = window->second;
+  return ((high % int(ii)) + int(ii)) % int(ii);
+}
+
+std::optional<std::pair<int, int>>
+StaticFolder::stagedWindow(unsigned p, unsigned inst, unsigned reader,
+                           ArrayRef<unsigned> readers) const {
+  if (!stagedLinks || ii == 0)
+    return std::nullopt;
   auto &producer = producers[p];
   if (producer.late)
-    return -1;
+    return std::nullopt;
   auto &pcls = classes[producer.cls];
   // The producer's write: at the end of its pass's slot, visible after it.
   int written = producer.atReady
@@ -3210,7 +3260,7 @@ int StaticFolder::stagedCopy(unsigned p, unsigned inst, unsigned reader,
       take(rcls.readySlots(l)[i]);
   }
   if (readers.empty())
-    return -1;
+    return std::nullopt;
   // The copy at the end of a host cycle t of frame f (t past the frame's
   // first, II earlier for the frame before) takes the producer's write of
   // frame f-1: after it lands (t >= written + 1 - II), before the write of
@@ -3220,8 +3270,92 @@ int StaticFolder::stagedCopy(unsigned p, unsigned inst, unsigned reader,
   int low = std::max(written + 1, last - 1) - int(ii);
   int high = std::min(written, first - 2);
   if (low > high)
-    return -1;
-  return ((high % int(ii)) + int(ii)) % int(ii);
+    return std::nullopt;
+  return std::make_pair(low, high);
+}
+
+void StaticFolder::planStagedMemories() {
+  if (stagedPlanned)
+    return;
+  stagedPlanned = true;
+  if (!stagedLinkMemories || !stagedLinks || ii == 0 || !slrOf.empty())
+    return;
+  // The staged links, as the report and buildSim find them: an early link
+  // of one producer instance with a copy position.
+  std::vector<LinkUse> uses;
+  linkUses(uses);
+  struct Candidate {
+    unsigned port, at;
+    uint64_t inst;
+    int low, high;
+  };
+  std::map<std::tuple<unsigned, unsigned, unsigned, unsigned>,
+           SmallVector<Candidate>>
+      byGroup;
+  for (auto &use : uses) {
+    auto &producer = producers[use.producer];
+    if (producer.late)
+      continue;
+    unsigned threads = classes[producer.cls].threads();
+    bool compact = compacted(use.producer, use.rows.size());
+    unsigned entries = compact ? use.rows.size() : threads;
+    if (entries != 1)
+      continue;
+    uint64_t inst = compact ? use.rows[0] : 0;
+    auto window = stagedWindow(use.producer, unsigned(inst), use.reader,
+                               use.readers);
+    if (!window)
+      continue;
+    byGroup[{use.producer, use.low, use.width, use.reader}].push_back(
+        {use.port, use.at, inst, window->first, window->second});
+  }
+  int frame = int(ii);
+  auto mod = [&](int t) { return ((t % frame) + frame) % frame; };
+  for (auto &[key, candidates] : byGroup) {
+    if (candidates.size() < 2)
+      continue;
+    // Distinct copy positions, one read port: the tightest windows first,
+    // each at the latest free position of its window (stagedCopy's choice
+    // where free).
+    SmallVector<unsigned> order(candidates.size());
+    for (unsigned k = 0; k < order.size(); ++k)
+      order[k] = k;
+    llvm::stable_sort(order, [&](unsigned x, unsigned y) {
+      auto &a = candidates[x], &b = candidates[y];
+      return std::make_tuple(a.high - a.low, a.port, a.at) <
+             std::make_tuple(b.high - b.low, b.port, b.at);
+    });
+    std::set<int> taken;
+    SmallVector<std::pair<unsigned, int>> placed;
+    for (unsigned k : order) {
+      auto &cand = candidates[k];
+      for (int t = cand.high; t >= cand.low && t > cand.high - frame; --t)
+        if (!taken.count(mod(t))) {
+          taken.insert(mod(t));
+          placed.push_back({k, mod(t)});
+          break;
+        }
+    }
+    if (placed.size() < 2)
+      continue;
+    StagedGroup group{std::get<0>(key), std::get<1>(key), std::get<2>(key),
+                      std::get<3>(key), {}, {}};
+    for (auto [k, at] : placed)
+      group.insts.push_back(candidates[k].inst);
+    llvm::sort(group.insts);
+    group.insts.erase(std::unique(group.insts.begin(), group.insts.end()),
+                      group.insts.end());
+    unsigned g = stagedGroups.size();
+    for (auto [k, at] : placed) {
+      auto &cand = candidates[k];
+      unsigned entry =
+          llvm::lower_bound(group.insts, cand.inst) - group.insts.begin();
+      group.entryAt[at] = entry;
+      stagedMembers[{group.reader, cand.port, cand.at, group.producer,
+                     group.low}] = {g, entry, at};
+    }
+    stagedGroups.push_back(std::move(group));
+  }
 }
 
 //===----------------------------------------------------------------------===//
@@ -5475,6 +5609,12 @@ void StaticFolder::reportLinks(raw_ostream &os) {
   };
   Kind distributed, block, ultra, registers, staged, paged, hbm;
   std::vector<std::string> useLines;
+  if (haveSchedule)
+    planStagedMemories();
+  // `staged-link-memories`: each group's memory, once (distributed RAM, an
+  // entry per producer instance), and its links' second registers.
+  Kind stagedMemories;
+  std::set<unsigned> stagedGroupsSeen;
   if (haveSchedule && !linkStreams.empty())
     (void)planStreams();
   auto streamKept = [&](const LinkUse &use) {
@@ -5515,7 +5655,36 @@ void StaticFolder::reportLinks(raw_ostream &os) {
       kind = "staged";
       depth = 2;
       staged.memories++;
-      staged.bits += 2 * use.width;
+      if (auto *member = stagedMemberOf(use.reader, use.port, use.at,
+                                        use.producer, use.low)) {
+        staged.bits += use.width;
+        if (stagedGroupsSeen.insert(member->group).second) {
+          auto &group = stagedGroups[member->group];
+          uint64_t rows = group.insts.size();
+          stagedMemories.memories++;
+          stagedMemories.bits += rows * use.width;
+          stagedMemories.cost += lutram(rows, use.width);
+          distributed.memories++;
+          distributed.bits += rows * use.width;
+          distributed.cost += lutram(rows, use.width);
+          auto &pair = byPair[{unsigned(producer.cls), use.reader}];
+          pair.first += lutram(rows, use.width);
+          pair.second += rows * use.width;
+          // For the fold-degree model's link tiers: a distributed RAM
+          // only (read at each link's copy position, not the reader's).
+          std::string line;
+          llvm::raw_string_ostream ls(line);
+          ls << "    link use " << modelOf(producer.cls) << " "
+             << modelOf(use.reader) << " " << use.width << " " << rows << " "
+             << rows << " distributed 0 " << int(ii) << " " << int(ii) << " "
+             << int(ii) << " " << group.entryAt.size() << " 0 1 "
+             << passesOf(producer.cls) << " " << passesOf(use.reader)
+             << " 0\n";
+          useLines.push_back(std::move(line));
+        }
+      } else {
+        staged.bits += 2 * use.width;
+      }
     } else if (haveSchedule && streamKept(use)) {
       // In device memory, behind its stream's virtual memory.
       kind = "hbm";
@@ -5637,6 +5806,10 @@ void StaticFolder::reportLinks(raw_ostream &os) {
   if (stagedLinks)
     os << "; staged: " << staged.memories << " links, " << staged.bits
        << " register bits";
+  if (stagedLinkMemories)
+    os << "; staged memories: " << stagedMemories.memories << " ("
+       << stagedMembers.size() << " links), " << stagedMemories.bits
+       << " bits, " << uint64_t(stagedMemories.cost) << " LUTRAM LUTs";
   if (compactLinks)
     os << "; compact: " << compactMemories << " links, " << compactSaved
        << " bits saved";
@@ -10719,6 +10892,62 @@ LogicalResult StaticFolder::buildSim() {
     return sb;
   };
 
+  // `staged-link-memories`: a group's memory (StagedGroup), built at its
+  // first link: written at the producer's passes of the instances it keeps,
+  // as their first registers were, and read at each link's copy position.
+  planStagedMemories();
+  SmallVector<Value> stagedMemReads(stagedGroups.size());
+  auto stagedMemoryRead = [&](const StagedMember &member, Value data) -> Value {
+    Value &read = stagedMemReads[member.group];
+    if (read)
+      return read;
+    auto &group = stagedGroups[member.group];
+    auto &producer = producers[group.producer];
+    auto &pctl = controls[producer.cls];
+    std::string name =
+        (producer.name + "_staged_mem" + Twine(member.group)).str();
+    unsigned depth = std::max<unsigned>(group.insts.size(), 2);
+    unsigned aw = llvm::Log2_32_Ceil(depth);
+    unsigned pThreads = classes[producer.cls].threads();
+    Value pass3 = !producer.atReady ? pctl.state2
+                  : producer.readyLevel
+                      ? pctl.laterReady2[producer.readyLevel - 1]
+                      : pctl.ready2;
+    Value write = copyReg(copyReg(pass3, name + "_we1"), name + "_we0");
+    Value writeAt = constant(aw, 0);
+    if (pThreads > 1) {
+      SmallVector<uint64_t> kept(pThreads, 0), index(pThreads, 0);
+      for (auto [k, r] : llvm::enumerate(group.insts)) {
+        kept[r] = 1;
+        index[r] = k;
+      }
+      write = comb::AndOp::create(
+          b, write,
+          copyReg(copyReg(table(b, pctl.inst2, kept, 1), name + "_mine1"),
+                  name + "_mine0"));
+      writeAt = copyReg(copyReg(table(b, pctl.inst2, index, aw), name + "_at1"),
+                        name + "_at0");
+    }
+    auto memory = seq::FirMemOp::create(
+        b, seq::FirMemType::get(context, depth, group.width, 1),
+        /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined,
+        seq::WUW::Undefined, b.getStringAttr(name), hw::InnerSymAttr{},
+        seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+    seq::FirMemWriteOp::create(b, memory, writeAt, hostClock, write, data,
+                               Value{});
+    // The entry each copy position loads, as the copies' enables are timed.
+    SmallVector<uint64_t> entryRow(ii + 1, 0);
+    for (auto [pos, entry] : group.entryAt)
+      entryRow[pos] = entry;
+    Value readAt = copyReg(
+        copyReg(copyReg(table(b, pctl.at3, entryRow, aw), name + "_ra2"),
+                name + "_ra1"),
+        name + "_ra0");
+    read = seq::FirMemReadOp::create(b, memory, readAt, hostClock,
+                                     constant(1, 1));
+    return read;
+  };
+
   // Each model input: its pieces at positions common to every instance; at
   // each, the sources the instances take it from, each read at the slot's
   // instance's producer instance, chosen by the instance, into the read
@@ -10958,6 +11187,14 @@ LogicalResult StaticFolder::buildSim() {
               readers.push_back(i);
           unsigned inst = kept.empty() ? 0 : unsigned(kept[0]);
           int copyAt = stagedCopy(key.first, inst, c, readers);
+          // `staged-link-memories`: the group's memory in place of the
+          // first register, read at this link's own copy position.
+          const StagedMember *gathered =
+              copyAt >= 0 ? stagedMemberOf(c, consumer.port, at, key.first,
+                                           key.second)
+                          : nullptr;
+          if (gathered)
+            copyAt = gathered->copyAt;
           if (copyAt >= 0) {
             ++stagedReads;
             auto &pctl = controls[producer.cls];
@@ -11002,6 +11239,11 @@ LogicalResult StaticFolder::buildSim() {
                   b.getStringAttr(regName), Value(), Value(), Value(),
                   hw::InnerSymAttr{});
             };
+            if (gathered) {
+              Value read = stagedMemoryRead(*gathered, data);
+              sourceData[index] = enabledReg(read, copy, name + "_held");
+              continue;
+            }
             Value stageA = enabledReg(data, write, name + "_staged");
             Value stageB = enabledReg(stageA, copy, name + "_held");
             sourceData[index] = stageB;
@@ -12344,6 +12586,7 @@ void FoldStaticPass::runOnOperation() {
   folder.linkHbmFitSlots = linkHbmFitSlots;
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.minII = minII;
+  folder.stagedLinkMemories = stagedLinks && stagedLinkMemories;
   if (failed(folder.run()))
     return signalPassFailure();
 }
