@@ -45,6 +45,8 @@ def read_module(path, module):
     hdr = re.compile(r'^\s*hw\.module(?:\.extern)?(?:\s+private)?\s+@([\w$.]+)(?:<[^>]*>)?\((.*)\)')
     ops, costs, types = {}, {}, {}
     sinks = []                       # operands of non-logic users (registers, memories, outputs, instances)
+    regops = {}                      # register -> its next, reset and reset value operands
+    outputs, outnames = [], []
     cur = None
     for line in open(path):
         s = line.strip()
@@ -53,11 +55,13 @@ def read_module(path, module):
                 m = hdr.match(line)
                 if m and m.group(1) == module:
                     cur = cost.Mod(module, m.group(2))
+                    outnames = re.findall(r'\bout\s+"?([\w$.]+)"?\s*:', m.group(2))
             continue
         if s.startswith('hw.output') or s.startswith('seq.firmem.write_port') or \
                 s.startswith('seq.firmem.read_write_port'):
             sinks += re.findall(SSA, s.split(' : ')[0])
             if s.startswith('hw.output'):
+                outputs = re.findall(SSA, s.split(' : ')[0])
                 break
             continue
         if ' = ' not in s or not s.startswith('%'):
@@ -77,6 +81,9 @@ def read_module(path, module):
             sinks += operands
             if op in cost.REGS and operands:
                 cur.regs[res[0]] = operands[0]
+                if op == 'seq.firreg':
+                    # %next clock %clk [reset sync|async %rst, %rv]
+                    regops[res[0]] = [operands[0]] + operands[2:4]
             continue
         c = 0.0
         if op not in cost.FREE:
@@ -109,20 +116,21 @@ def read_module(path, module):
             users[o] += 1
     for o in sinks:
         users[o] += 1
+    read_module.extra = dict(regops=regops, outputs=outputs, outnames=outnames)
     return ops, users, costs, types, set(sinks), cur.consts, set(cur.regs)
 
 
 GATHER = ('hw.array_create', 'comb.concat', 'hw.array_inject', 'hw.struct_create')
 
 
-def mffc(root, ops, users):
+def mffc(root, ops, users, within=None):
     """The fanout-free cone of `root`: root and every logic op all of whose uses
-    are inside it (reference counting)."""
+    are inside it (reference counting); with `within`, only ops in it."""
     cone, ref, stack = {root}, {}, [root]
     while stack:
         v = stack.pop()
         for o in ops[v][1]:
-            if o not in ops or o in cone:
+            if o not in ops or o in cone or (within is not None and o not in within):
                 continue
             ref[o] = ref.get(o, users[o]) - 1
             if ref[o] == 0:
@@ -158,9 +166,59 @@ def signature(root, cone, ops, types):
     return (tuple(sig), tuple(t for _, t in leaves)), [l for l, _ in leaves], list(index)
 
 
-def census(path, module, passes=(2, 4, 8, 16, 32), min_ops=2, max_cone=20000):
+def deferrable(ops, users, extra, late):
+    """foldsim-fold-static's deferred-lane logic: the ops only registers' next
+    values use, an early output's registers' next values taken as used
+    elsewhere (pinned). `late`: output names that are late (the schedule's)."""
+    regops = extra['regops']
+    pinned = set()
+    work = [v for n, v in zip(extra['outnames'], extra['outputs']) if n not in late]
+    seen = set()
+    while work:
+        v = work.pop()
+        if v in seen:
+            continue
+        seen.add(v)
+        if v in regops:
+            pinned.update(regops[v])
+        elif v in ops:
+            work.extend(ops[v][1])
+    left = {v: users[v] + (1 if v in pinned else 0) for v in ops}
+    E, stack = set(), []
+    def drop(v):
+        if v in left and v not in E:
+            left[v] -= 1
+            if left[v] == 0:
+                E.add(v); stack.append(v)
+    for r, opnds in regops.items():
+        for v in opnds:
+            drop(v)
+    while stack:
+        for o in ops[stack.pop()][1]:
+            drop(o)
+    return E
+
+
+def late_outputs(schedule, model):
+    """Output names the schedule marks late for a class (model)."""
+    late, cur = set(), None
+    for line in open(schedule):
+        m = re.match(r'^  ([\w$.]+) x\d+', line)
+        if m:
+            cur = m.group(1)
+            continue
+        m = re.match(r'^    late (\S+) @', line)
+        if m and cur == model:
+            late.add(m.group(1))
+    return late
+
+
+def census(path, module, passes=(2, 4, 8, 16, 32), min_ops=2, max_cone=20000, schedule=None):
     ops, users, costs, types, sinks, consts, regs = read_module(path, module)
     total = sum(costs.values())
+    within = None
+    if schedule:
+        within = deferrable(ops, users, read_module.extra, late_outputs(schedule, module))
     # Candidate roots: a fanout point, a value leaving the logic, or a part of a gather.
     cand = []
     for v, (n, operands) in ops.items():
@@ -171,9 +229,11 @@ def census(path, module, passes=(2, 4, 8, 16, 32), min_ops=2, max_cone=20000):
         if n.startswith(GATHER):
             gathered.update(o for o in operands if o in ops and users[o] == 1)
     cand = list(dict.fromkeys(cand + sorted(gathered)))
+    if within is not None:
+        cand = [v for v in cand if v in within]
     groups = defaultdict(list)
     for v in cand:
-        cone = mffc(v, ops, users)
+        cone = mffc(v, ops, users, within)
         if len(cone) < min_ops or len(cone) > max_cone:
             continue
         key, leaves, order = signature(v, cone, ops, types)
@@ -274,11 +334,13 @@ def main():
     ap.add_argument('--passes', default='2,4,8,16,32')
     ap.add_argument('--top', type=int, default=15, help='groups listed per module')
     ap.add_argument('--json', default='')
+    ap.add_argument('--schedule', default='', help="the gen's schedule.txt: only the deferred-lane logic "
+                    "(the compiler's --pass-split), late outputs from it")
     a = ap.parse_args()
     passes = [int(x) for x in a.passes.split(',')]
     res = {}
     for m in a.module:
-        total, groups = census(a.models, m, passes)
+        total, groups = census(a.models, m, passes, schedule=a.schedule or None)
         rows = summary(total, groups, passes)
         res[m] = dict(lut=round(total, 1), groups=len(groups),
                       lane_lut=round(sum(g['lut'] * g['replicas'] for g in groups), 1),

@@ -2230,10 +2230,8 @@ LogicalResult StaticFolder::planPassSplits() {
       refuse("staged");
       continue;
     }
-    if (cls.heldReads || (cls.folding && !cls.folding->folds.empty())) {
-      refuse("held reads or folded pipelines");
-      continue;
-    }
+    // Held reads keep their address registers: the read address uses the
+    // hold's choice, so it is never logic only next state uses.
     // The next values an early output's next value reads (buildCopy's
     // nextValue): the registers in an early output's cone, through logic.
     auto *body = cls.model.getBodyBlock();
@@ -2262,6 +2260,11 @@ LogicalResult StaticFolder::planPassSplits() {
       for (auto operand : def->getOperands())
         work.push_back(operand);
     }
+    // A folded pipeline's registers are written as its results come back.
+    if (auto *folding = cls.folding.get())
+      for (auto *op : folding->physical)
+        if (auto reg = dyn_cast<seq::FirRegOp>(op))
+          pinned.push_back(reg.getNext());
     auto plan = foldsim::planDeferred(body, pinned, passes);
     if (!plan.stats.groups) {
       refuse("no lanes in the logic only next state uses");
@@ -7984,7 +7987,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       return v;
     };
     std::string prefix = "fsps_" + cls.name + "__";
-    auto plan = foldsim::planDeferred(body, {}, cls.passSplit);
+    SmallVector<Value> pinned;
+    if (folding)
+      for (auto *op : folding->physical)
+        if (auto reg = dyn_cast<seq::FirRegOp>(op))
+          pinned.push_back(reg.getNext());
+    auto plan = foldsim::planDeferred(body, pinned, cls.passSplit);
     // The state pass, as the regions see it (three host cycles on).
     Value stateNow = chain(state3, 3, prefix + "state", true);
     auto st = foldsim::applyDeferred(b, plan, hostClock, stateNow,
