@@ -1455,10 +1455,14 @@ struct SplitMaskedMemoriesPass
         StringAttr name;
         if (auto n = memory.getNameAttr())
           name = b.getStringAttr(n.getValue() + "_c" + Twine(c));
-        parts.push_back(seq::FirMemOp::create(
+        auto part = seq::FirMemOp::create(
             b, memory.getLoc(), columnType, memory.getReadLatency(),
             memory.getWriteLatency(), memory.getRuw(), memory.getWuw(), name,
-            {}, {}, memory.getPrefixAttr(), memory.getOutputFileAttr()));
+            {}, {}, memory.getPrefixAttr(), memory.getOutputFileAttr());
+        // A column is the memory's: its storage (the ram_style a storage
+        // rule or the RTL set) goes with it.
+        part->setDialectAttrs(memory->getDialectAttrs());
+        parts.push_back(part);
       }
       for (auto *user : llvm::make_early_inc_range(memory->getUsers())) {
         OpBuilder ub(user);
