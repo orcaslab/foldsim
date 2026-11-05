@@ -40,3 +40,15 @@
 # RUN: %t/sb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+10 +stall=30 | FileCheck %s
 # SB: staged: 13 links, 88 register bits; staged memories: 2 (8 links), 64 bits
 # CHECK: {{^}}MATCH 196 cycles
+# With SLR groups (`--slr-groups`), a staged link (and its memory) within one group as without groups; one between
+# groups is registered at its producer's group instead (never staged). Both exact.
+# RUN: cd %S/../Driver/Inputs/broadcast
+# RUN: foldsim --srcs top.f --top Top --out %t/sgs --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --slr-groups --slr-count 2 --slr-assign Lane:0,Top_model:0 Lane 2>&1 | FileCheck %s --check-prefix=SGS
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/sgs/obj %S/Inputs/tb_reset.sv top.sv %t/sgs/foldsim_sim.sv > %t/sgs/build.log 2>&1
+# RUN: %t/sgs/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=60 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/sgx --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --slr-groups --slr-count 2 --slr-assign Lane:0,Top_model:1 Lane 2>&1 | FileCheck %s --check-prefix=SGX
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/sgx/obj %S/Inputs/tb_reset.sv top.sv %t/sgx/foldsim_sim.sv > %t/sgx/build.log 2>&1
+# RUN: %t/sgx/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=60 | FileCheck %s
+# SGS: staged: 11 links, 168 register bits; staged memories: 1 (4 links)
+# SGX: slr links registered: 11 of 11 links
+# SGX: staged: 0 links, 0 register bits

@@ -689,6 +689,7 @@ private:
       stagedMembers;
   /// The II the groups were planned at (-1: not yet): replanned if it moves.
   int stagedPlannedII = -1;
+  SmallVector<int> stagedPlannedSlr;
   void planStagedMemories();
   const StagedMember *stagedMemberOf(unsigned reader, unsigned port,
                                      unsigned at, unsigned p,
@@ -3242,6 +3243,10 @@ StaticFolder::stagedWindow(unsigned p, unsigned inst, unsigned reader,
   auto &producer = producers[p];
   if (producer.late)
     return std::nullopt;
+  // With SLR groups, only a link within one group: one between groups is
+  // registered at its producer's group and read into its reader's.
+  if (!slrOf.empty() && slrOf[producer.cls] != slrOf[reader])
+    return std::nullopt;
   auto &pcls = classes[producer.cls];
   // The producer's write: at the end of its pass's slot, visible after it.
   int written = producer.atReady
@@ -3276,12 +3281,13 @@ StaticFolder::stagedWindow(unsigned p, unsigned inst, unsigned reader,
 }
 
 void StaticFolder::planStagedMemories() {
-  if (stagedPlannedII == int(ii))
+  if (stagedPlannedII == int(ii) && stagedPlannedSlr == slrOf)
     return;
   stagedPlannedII = int(ii);
+  stagedPlannedSlr = slrOf;
   stagedGroups.clear();
   stagedMembers.clear();
-  if (!stagedLinkMemories || !stagedLinks || ii == 0 || !slrOf.empty())
+  if (!stagedLinkMemories || !stagedLinks || ii == 0)
     return;
   // The staged links, as the report and buildSim find them: an early link
   // of one producer instance with a copy position.
@@ -11183,7 +11189,7 @@ LogicalResult StaticFolder::buildSim() {
         // instance in two registers, the first written at the producer's
         // pass, the second, which the reader reads, loaded from it at a
         // position of the frame between the reads of consecutive frames.
-        if (!producer.late && pThreads == 1 && slrOf.empty()) {
+        if (!producer.late && pThreads == 1) {
           SmallVector<unsigned> readers;
           for (unsigned i = 0; i < threads; ++i)
             if (takes[i])
