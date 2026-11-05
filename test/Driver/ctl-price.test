@@ -17,5 +17,6 @@
 # CHECK: platform 16 0 None: logic 40192 lutram 19064 masters 16 shares 0 sc_nodes 8
 # CHECK: platform 8 0 None: logic 0 lutram 0 masters 8 shares 0 sc_nodes 0
 # CHECK: platform 32 60 None: logic 135320 lutram 41868 masters 32 shares 32 sc_nodes 8
+# CHECK: platform best 16 27: logic 67934 lutram 24013 masters 16 shares 16 sc_nodes 8 vmem_masters 0
 # CHECK: built: 3 [('engine', 1), ('link', 1), ('vmem', 1)] forward 0 ports 1 logic 3983 lutram 1677 bram 19
 # CHECK: controllers: 3 2 [(64, 13, 2), (512, 9, 1)]

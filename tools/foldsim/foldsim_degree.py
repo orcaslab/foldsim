@@ -978,8 +978,10 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         ports = KERNEL['mem_ports']
         if BUILT is not None and BUILT.get('mem_ports') is not None:
             ports = BUILT['mem_ports']
+        # Built: the kernel's masters as generated; planned: the count of least
+        # LUTs (FOLDSIM_VMEM_MASTERS, a flow setting, recorded in the outcome).
         platform = storage.platform_cost(ports, math.ceil(n_ctl - 1e-9),
-                                         BUILT.get('vmem_masters') if BUILT else None)
+                                         BUILT.get('vmem_masters') if BUILT else 'best')
         logic += platform['logic']
         lutram += platform['lutram']
     sites = logic + storage.LUTRAM_SITES * lutram

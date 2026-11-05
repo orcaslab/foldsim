@@ -22,6 +22,9 @@ print('kz 37888:', st.ctl_cost('vmem', 80, 0, 1, kz=37888)['bram'], 'kz 65536:',
 # already has 8 sc_mem of 2; 32 ports and 60 controllers: on the ports' masters.
 for p, n, m in ((1, 11, None), (1, 40, 31), (16, 0, None), (8, 0, None), (32, 60, None)):
     print(f'platform {p} {n} {m}:', r(st.platform_cost(p, n, m)))
+# The planner's master count (FOLDSIM_VMEM_MASTERS, a flow setting): the least LUTs with enough masters for the
+# controllers' traffic (640 B a host cycle: 10 AXI beats): 16 ports and 27 controllers on the ports' masters.
+print('platform best 16 27:', r(st.platform_cost(16, 27, 'best')))
 # As built: a generation's json (two grouped virtual memories of a copy, a stream, an engine), FORWARD 0.
 d = sys.argv[2]
 os.makedirs(d, exist_ok=True)
