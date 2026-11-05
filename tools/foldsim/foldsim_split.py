@@ -139,23 +139,60 @@ def mffc(root, ops, users, within=None):
     return cone
 
 
+COMMUTATIVE = ('comb.and ', 'comb.or ', 'comb.xor ', 'comb.add ', 'comb.mul ', 'comb.icmp eq ',
+               'comb.icmp ne ')
+CANON = True
+
+
 def signature(root, cone, ops, types):
     """(structure, leaves): the cone in post-order from root, operands as cone
-    indices or leaf positions; leaves = [(value, type)] by position."""
+    indices or leaf positions; leaves = [(value, type)] by position. With
+    CANON, a commutative op's operands are visited in the order of their
+    subtrees' structure (a canonical tree key), so replicas that differ only
+    in operand order of and / or / xor / add / mul / eq / ne match."""
+    keys = {}
+    def key(v):
+        if v in keys:
+            return keys[v]
+        stack = [(v, False)]
+        while stack:
+            u, done = stack.pop()
+            if u in keys:
+                continue
+            kids = [o for o in ops[u][1] if o in cone]
+            if not done:
+                stack.append((u, True))
+                stack.extend((o, False) for o in kids if o not in keys)
+                continue
+            ch = [keys[o] if o in cone else ('L', types.get(o, '?')) for o in ops[u][1]]
+            if CANON and ops[u][0].startswith(COMMUTATIVE):
+                ch = sorted(ch, key=repr)
+            keys[u] = hash((ops[u][0], tuple(hash(c) if not isinstance(c, int) else c for c in ch)))
+        return keys[v]
+    def order(u):
+        idx = list(range(len(ops[u][1])))
+        if CANON and ops[u][0].startswith(COMMUTATIVE):
+            ck = [repr(key(o)) if o in cone else repr(('L', types.get(o, '?'))) for o in ops[u][1]]
+            idx.sort(key=lambda i: ck[i])
+        return idx
     index, sig, leaves = {}, [], []
     stack = [(root, False)]
     while stack:
         v, done = stack.pop()
         if v in index:
             continue
+        opnds = ops[v][1]
+        perm = order(v)
         if not done:
             stack.append((v, True))
-            for o in reversed(ops[v][1]):
+            for i in reversed(perm):
+                o = opnds[i]
                 if o in cone and o not in index:
                     stack.append((o, False))
             continue
         refs = []
-        for o in ops[v][1]:
+        for i in perm:
+            o = opnds[i]
             if o in cone:
                 refs.append(index[o])
             else:
@@ -334,10 +371,13 @@ def main():
     ap.add_argument('--passes', default='2,4,8,16,32')
     ap.add_argument('--top', type=int, default=15, help='groups listed per module')
     ap.add_argument('--json', default='')
+    ap.add_argument('--no-canon', action='store_true', help='operands of commutative ops in their order')
     ap.add_argument('--schedule', default='', help="the gen's schedule.txt: only the deferred-lane logic "
                     "(the compiler's --pass-split), late outputs from it")
     a = ap.parse_args()
     passes = [int(x) for x in a.passes.split(',')]
+    global CANON
+    CANON = not a.no_canon
     res = {}
     for m in a.module:
         total, groups = census(a.models, m, passes, schedule=a.schedule or None)

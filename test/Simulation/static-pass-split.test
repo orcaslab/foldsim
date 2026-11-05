@@ -10,7 +10,8 @@
 # structure computing the next `acc` and a generate block of four counters.
 # Against the target (tb_late.sv), from zero state, with bubbles and stalled
 # channels: P = 4, 8, 3 with a span of 2, two copies, a copy per instance
-# (one instance: kept registers), paged state, nested sequencers with a short
+# (one instance: kept registers), paged state (the deferred registers paged
+# too: their write-back loaded late, the page writes from then on), nested sequencers with a short
 # lead. Driver/Inputs/lanes: lanes that also feed an early output's next value
 # are not deferred (only the counters split). A staged class is refused. The
 # mutant (lane 5 a shift of 2, not 3) leaves its group and matches its own
@@ -34,6 +35,7 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/one/obj %S/Inputs/tb_late.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +bubble=30 +stall=20 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/pg --static --bubbles --modulo --page 2 --pass-split Leaf:4 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=PG < %t/pg/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/pg/obj %S/Inputs/tb_late.sv top.sv %t/pg/foldsim_sim.sv > %t/pg/build.log 2>&1
 # RUN: %t/pg/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +bubble=30 +stall=20 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/nest --static --bubbles --nest --modulo --short-lead --copies Leaf:2 --page 2 --pass-split Leaf:4 Leaf > /dev/null 2>&1
@@ -56,15 +58,18 @@
 # RUN: FileCheck %s --check-prefix=STAGED < %t/staged.log
 # P4: Leaf pass-split: 4 passes of 1 host cycles, 3 registers written 5 host cycles after the state pass; planned 2 lane groups
 # P4: Leaf x4 (ready pass) state gap {{[0-9]+}} pass-split 4
-# P4: Leaf pass-split 4: 3 deferred registers, 2 lane groups, 10 replicas on 3 lanes, {{.*}} (groups x8 x2)
-# P8: Leaf pass-split 8: 3 deferred registers, 2 lane groups, 10 replicas on 2 lanes
+# P4: Leaf pass-split 4: 3 deferred registers ({{[0-9]+}} bits), 2 lane groups, 10 replicas on 3 lanes, {{.*}} (groups x8 x2)
+# P8: Leaf pass-split 8: 3 deferred registers ({{[0-9]+}} bits), 2 lane groups, 10 replicas on 2 lanes
 # P8: Leaf_copy1 pass-split 8: 3 deferred registers
 # P3: Leaf pass-split: 3 passes of 2 host cycles, 3 registers written 8 host cycles after the state pass
 # XDC3: # fsps_Leaf__: 3 passes of 2 host cycles
 # XDC3: set_multicycle_path 2 -setup {{.*}}fsps_Leaf__cap{{.*}}fsps_Leaf__hold
+# The deferred registers page with the rest (their write-back parts loaded
+# deferSpan on, the page writes from there).
+# PG: pages Leaf: p 2, 18 registers, {{.*}}; kept 1 registers, 8 bits;
 # ONE: Leaf_copy3 pass-split 4: 3 deferred registers
-# MUT: Leaf pass-split 4: 3 deferred registers, {{.*}} (groups x7 x2)
-# EARLY: Leaf pass-split 4: {{[1-9][0-9]*}} deferred registers, {{[1-9]}} lane groups
+# MUT: Leaf pass-split 4: 3 deferred registers ({{[0-9]+}} bits), {{.*}} (groups x7 x2)
+# EARLY: Leaf pass-split 4: {{[1-9][0-9]*}} deferred registers ({{[0-9]+}} bits), {{[1-9]}} lane groups
 # STAGED: Leaf not split: staged
 # CHECK: {{^}}MATCH 196 cycles
 # DIFF: {{^}}MISMATCH cycle

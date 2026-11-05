@@ -983,8 +983,9 @@ private:
   /// Multicycle: the positions a copy's state passes are kept apart by the
   /// schedule (its page lead, or its multicycle span), 0 for none.
   unsigned passSpacing(unsigned c) const {
-    return std::max({classes[c].pageLead(), classes[c].multicycle,
-                     classes[c].deferSpan ? classes[c].deferSpan + 1 : 0u});
+    auto &cls = classes[c];
+    unsigned defer = cls.deferSpan ? cls.deferSpan + 1 + cls.page : 0u;
+    return std::max({cls.pageLead(), cls.multicycle, defer});
   }
   /// `pass-split`: each named class's deferred lanes, planned on its model.
   LogicalResult planPassSplits();
@@ -5563,7 +5564,8 @@ int StaticFolder::minStateGap(const Class &cls) const {
   // Pass splitting: the deferred writes land before the next evaluation's
   // reads (a block RAM store's a host cycle early), no bypass.
   if (cls.deferSpan)
-    gap = std::max(gap, int(cls.deferSpan) + 4);
+    gap = std::max(gap, int(cls.deferSpan) + 4 +
+                            (cls.page ? 2 * int(cls.page) + int(cls.pageLead()) : 0));
   if (!virtualMemoryPattern.empty()) {
     llvm::Regex pattern(virtualMemoryPattern);
     StringRef model = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
@@ -8005,9 +8007,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           b, inst3.getType(), chain(inst3, 3, prefix + "inst", false),
           hostClock, stateNow, b.getStringAttr(prefix + "winst"), Value(),
           Value(), Value(), hw::InnerSymAttr{});
+    uint64_t deferredBits = 0;
+    for (auto *op : plan.regs)
+      deferredBits += hw::getBitWidth(op->getResult(0).getType());
     llvm::errs() << "foldsim-fold-static: " << cls.name << " pass-split "
                  << cls.passSplit << ": " << plan.regs.size()
-                 << " deferred registers, " << st.groups << " lane groups, "
+                 << " deferred registers (" << deferredBits << " bits), " << st.groups << " lane groups, "
                  << st.replicas << " replicas on " << st.lanes << " lanes, "
                  << llvm::format("%.0f", st.before) << " -> "
                  << llvm::format("%.0f", st.after) << " LUTs estimated, "
@@ -8456,8 +8461,17 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         next = comb::MuxOp::create(b, reg.getReset(), reg.getResetValue(), next);
       Value value;
       // Pass splitting: written deferSpan host cycles after the state pass,
-      // the whole next value, at the instance captured there.
-      if (auto it = deferredNext.find(reg); it != deferredNext.end()) {
+      // the whole next value, at the instance captured there. A paged one
+      // (pages on chip) loads its write-back register then instead; the
+      // copy's page writes start then (below).
+      bool deferLoad = false;
+      auto deferred = deferredNext.find(reg);
+      if (deferred != deferredNext.end() && cls.page && !cls.pagesOffChip &&
+          threads > 1 && width && !readyRegs.contains(reg)) {
+        deferLoad = true;
+        next = deferred->second;
+      } else if (deferred != deferredNext.end()) {
+        auto it = deferred;
         auto &region = regionFor(width);
         Value data = asBits(b, it->second);
         if (threads == 1) {
@@ -8491,7 +8505,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         reg.erase();
         continue;
       }
-      auto write = foldsim::peelHolds(b, next, reg.getResult());
+      auto write = deferLoad ? foldsim::HeldWrite{} :
+                   foldsim::peelHolds(b, next, reg.getResult());
       if (!write.holds && !write.enable)
         write.data = next;
       auto &region = regionFor(width);
@@ -8562,7 +8577,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         Value back = seq::FirRegOp::create(
             b, backNext, hostClock,
             b.getStringAttr(reg.getName() + "_writeback"));
-        backNext.setValue(comb::MuxOp::create(b, region.state, next, back));
+        backNext.setValue(comb::MuxOp::create(b, deferLoad ? deferWen : region.state,
+                                              next, back));
         pagedRegs.push_back({reg.getResult(), placeholder, unsigned(width),
                              back, reg.getName().str(), enable});
         value = placeholder;
@@ -9144,9 +9160,14 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       col.parts.resize(p);
       // Write-back: page j a host cycle + j after the state pass, at the
       // instance of that pass.
+      // Pass splitting: the writes start once the deferred registers'
+      // write-back parts are loaded, deferSpan host cycles on (the schedule
+      // keeps the copy's state passes and the instance's next fetch apart
+      // from them).
+      Value writeStart = cls.deferSpan ? deferWen : region.state;
       auto &writing = col.writing;
       writing.push_back(keep(seq::FirRegOp::create(
-          b, region.state, hostClock, b.getStringAttr(prefix + "_write0"))));
+          b, writeStart, hostClock, b.getStringAttr(prefix + "_write0"))));
       for (unsigned j = 1; j < p; ++j)
         writing.push_back(keep(seq::FirRegOp::create(
             b, writing.back(), hostClock,
@@ -9162,7 +9183,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         Value page = keep(seq::FirRegOp::create(
             b, pageNext, hostClock, b.getStringAttr(prefix + "_write_page")));
         pageNext.setValue(comb::MuxOp::create(
-            b, region.state, hw::ConstantOp::create(b, bits(pageWidth), 0),
+            b, writeStart, hw::ConstantOp::create(b, bits(pageWidth), 0),
             comb::AddOp::create(b, page,
                                 hw::ConstantOp::create(b, bits(pageWidth), 1))));
         writeAt = comb::ConcatOp::create(b, writeInst, page);
