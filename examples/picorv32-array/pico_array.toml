@@ -1,0 +1,28 @@
+# Target manifest: pico_array, four PicoRV32 tiles in a mailbox ring (gen_1105, task D). Nothing of this
+# design is in the compiler: its RTL, its class and its options are all here.
+[design]
+format = 1
+name = "picorv32-array4"
+description = "4 x PicoRV32 (rv32im) with private 4 KiB RAMs and a mailbox ring"
+top = "pico_array"
+
+[rtl]
+files = ["upstream/picorv32.v", "pico_array.sv"]
+# PicoRV32 writes `assert(x) as a call of an empty task outside formal runs; CIRCT's importer keeps a call
+# of a task (an llhd coroutine) in the process and cannot lower it. The same no-op, written as nothing:
+rewrite = [
+  { file = "upstream/picorv32.v", from = "`define assert(assert_expr) empty_statement", to = "`define assert(assert_expr)" },
+]
+
+[classes]
+modules = ["pico_tile"]          # the repeating tile: one threaded copy, four threads
+
+[options]
+static = true
+zero_latency_links = true
+zero_latency_chains = true
+bubbles = true
+
+[flow]
+clock = "clk"                    # the target clock (foldsim_gate.py --clock)
+workload = "sw/work.c"           # sorted words, checksum, sieve, ring exchange (gate.sh, stim.py)
