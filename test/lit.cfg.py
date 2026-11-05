@@ -20,6 +20,8 @@ llvm_config.with_environment("PATH", config.llvm_tools_dir, append_path=True)
 # in a directory of its own.
 if config.circt_tools_dir and config.circt_tools_dir != config.llvm_tools_dir:
     llvm_config.with_environment("PATH", config.circt_tools_dir, append_path=True)
+# The driver's Python tools beside it (foldsim_manifest.py, foldsim_gate.py, ...).
+config.substitutions.append(("%foldsim_tools", config.foldsim_tools_dir))
 llvm_config.add_tool_substitutions(["foldsim-opt", "foldsim"],
                                   [config.foldsim_tools_dir])
 

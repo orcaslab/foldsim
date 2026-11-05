@@ -1,0 +1,8 @@
+# A source read from a rewritten copy: a comment of top.sv changed (the design unchanged).
+[design]
+top = "Top"
+[rtl]
+files = ["${TREE}/top.sv"]
+rewrite = [{ file = "${TREE}/top.sv", from = "A round-robin arbiter tree", to = "REWRITTEN arbiter tree" }]
+[classes]
+modules = ["Bank"]

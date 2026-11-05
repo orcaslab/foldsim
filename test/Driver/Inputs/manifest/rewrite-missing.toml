@@ -1,0 +1,5 @@
+[design]
+top = "Top"
+[rtl]
+files = ["../tree-arb/top.sv"]
+rewrite = [{ file = "../tree-arb/top.sv", from = "no such text", to = "x" }]
