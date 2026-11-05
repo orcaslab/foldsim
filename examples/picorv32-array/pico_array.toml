@@ -8,11 +8,9 @@ top = "pico_array"
 
 [rtl]
 files = ["upstream/picorv32.v", "pico_array.sv"]
-# PicoRV32 writes `assert(x) as a call of an empty task outside formal runs; CIRCT's importer keeps a call
-# of a task (an llhd coroutine) in the process and cannot lower it. The same no-op, written as nothing:
-rewrite = [
-  { file = "upstream/picorv32.v", from = "`define assert(assert_expr) empty_statement", to = "`define assert(assert_expr)" },
-]
+# PicoRV32's non-formal `assert` calls an empty task: CIRCT lowers it with the coroutine inlining of
+# CIRCT foldsim/inline-task-calls ec301d974 (before it, [rtl] rewrite = [{ file = "upstream/picorv32.v", from =
+# "`define assert(assert_expr) empty_statement", to = "`define assert(assert_expr)" }] worked around it).
 
 [classes]
 modules = ["pico_tile"]          # the repeating tile: one threaded copy, four threads

@@ -2,7 +2,8 @@
 # gate.sh <foldsim bin dir> <out dir> [T] [stall:bubble:seed ...]: pico_array (four PicoRV32 tiles in a mailbox ring) folded
 # from pico_array.toml alone, gated cycle-exact against the unfolded RTL (upstream/picorv32.v unmodified) in Verilator on
 # the workload sw/work.c (sort, checksum, sieve, ring exchange). Needs: ./fetch.sh, riscv32-unknown-elf-gcc and
-# verilator on PATH, CIRCT (circt-verilog, circt-opt, firtool) on PATH or CIRCT_BIN.
+# verilator on PATH, CIRCT (circt-verilog, circt-opt, firtool) on PATH or CIRCT_BIN, with llhd-inline-calls inlining
+# coroutines that never suspend (CIRCT foldsim/inline-task-calls ec301d974).
 # 2026-11-05: class pico_tile x4 (and picorv32 x4), II 6, H 6.00 / 6.18 / 8.57 / 8.61, 400,000 cycles EXACT.
 set -eu
 E=$(cd "$(dirname "$0")" && pwd); B=$1; O=$(mkdir -p "$2" && cd "$2" && pwd); T=${3:-400000}; shift $(( $# < 3 ? $# : 3 ))
