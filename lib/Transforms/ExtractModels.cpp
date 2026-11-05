@@ -966,9 +966,12 @@ void LogicAbsorber::run() {
           clockArg = a;
           break;
         }
+      // (Only for moved registers: other logic takes a clock as any input.)
+      bool movesRegs = llvm::any_of(
+          ops, [](Operation *op) { return isa<seq::FirRegOp>(op); });
       bool clocksOk = true;
       for (auto [k, leaf] : llvm::enumerate(leaves)) {
-        if (!isa<seq::ClockType>(leaf.getType()))
+        if (!movesRegs || !isa<seq::ClockType>(leaf.getType()))
           continue;
         clocksOk &= clockArg.has_value();
         for (auto [i, instance] : llvm::enumerate(instances))
@@ -1031,7 +1034,7 @@ void LogicAbsorber::run() {
           mapping.map(leaf, output->getOperand(*ownOutput[k]));
           continue;
         }
-        if (isa<seq::ClockType>(leaf.getType())) {
+        if (movesRegs && isa<seq::ClockType>(leaf.getType())) {
           mapping.map(leaf, model.getBodyBlock()->getArgument(*clockArg));
           continue;
         }
