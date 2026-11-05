@@ -494,6 +494,25 @@ KERNEL = dict(on=False, mem_ports=0, endpoint_logic=24565.0, endpoint_lutram=471
 # what-if's folded_* estimates.
 
 
+def top_link_logic(links):
+    """The simulator top level's logic the links carry. A calibration with
+    `top_logic_terms` prices it per driver: staged link register bits
+    (`staged`: a staged register loads at its producer's pass, an enable and
+    no select), the other link register bits (`reg`) and the read-select bits
+    of reader inputs with several sources (`select`: width x (sources - 1)
+    over the link uses); else one ratio on all link register bits
+    (`top_logic_per_link_bit`)."""
+    links = links or {}
+    cal = KERNEL['calibration']
+    terms = cal.get('top_logic_terms') if cal else None
+    if terms:
+        staged = links.get('staged_ff', 0)
+        return (terms['staged'] * staged + terms['reg'] * (links.get('ff', 0) - staged) +
+                terms['select'] * links.get('select_bits', 0))
+    tlb = cal['top_logic_per_link_bit'] if cal else KERNEL['top_logic_per_link_bit']
+    return tlb * links.get('ff', 0)
+
+
 # A whole-design calibration (--calibrate <file>, calibrations/*.json): per class
 # family (a regex on the class model's name, first match) a factor on its copy's
 # logic and store select logic and one on its stores' LUTRAM; the top level's
@@ -602,9 +621,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             if KERNEL['sim_ports_folded']:
                 logic += KERNEL['sim_ports_shared_logic']
                 base_lutram += KERNEL['sim_ports_shared_lutram']
-        tlb = KERNEL['calibration']['top_logic_per_link_bit'] if KERNEL['calibration'] \
-            else KERNEL['top_logic_per_link_bit']
-        logic += tlb * ((sched or {}).get('__links__') or {}).get('ff', 0)
+        logic += top_link_logic((sched or {}).get('__links__'))
         if KERNEL['calibration']:
             fx = KERNEL['calibration']['fixed']
             logic += fx['logic']
@@ -1031,8 +1048,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                                         store_lutram=round(store_lutram.get((c, j), 0.0)))
                        for (c, j) in per_copy},
                vmem_ctl={x: round(v, 1) for x, v in vmem_ctl.items()},
-               top_logic=round((KERNEL['calibration']['top_logic_per_link_bit'] if KERNEL['calibration']
-                                else KERNEL['top_logic_per_link_bit']) * lk['ff']) if KERNEL['on'] else 0,
+               top_logic=round(top_link_logic((sched or {}).get('__links__'))) if KERNEL['on'] else 0,
                storage=','.join(rules),
                **({'link_kinds': ','.join(link_rules)} if lu else {}),
                **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged),
@@ -1288,8 +1304,14 @@ def parse_links(text):
     m = re.search(r'^  page engines: (\d+) engines, (\d+) page columns', text, re.M)
     on_engines = set(re.findall(r' link:(\S+)>(\S+)', '\n'.join(
         re.findall(r'^    page engine \d+ .*$', text, re.M))))
+    # The staged links' register bits (of `ff`, link storage line) and the
+    # read-select bits of reader inputs with several sources (top_link_logic).
+    ms = re.search(r'^  link storage: .*; staged: \d+ links, (\d+) register bits', text, re.M)
+    staged_ff = int(ms.group(1)) if ms else 0
+    select_bits = sum(u['width'] * (u['sources'] - 1) for u in uses if u['sources'] > 1)
     return dict(lutram=float(g[2]), lutram_bits=int(g[1]), bram=float(g[5]), bram_bits=int(g[4]),
                 uram=float(g[8]), uram_bits=int(g[7]), ff=int(g[10]), uses=uses, pairs=pairs,
+                staged_ff=staged_ff, select_bits=select_bits,
                 streams=streams, engines=int(m.group(1)) if m else 0,
                 engine_columns=int(m.group(2)) if m else 0, engine_streams=on_engines)
 

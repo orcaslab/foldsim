@@ -1,0 +1,9 @@
+# The simulator top level's logic the links carry (foldsim_degree.top_link_logic): a calibration with
+# top_logic_terms prices staged link register bits, the other link register bits and the read-select bits of
+# reader inputs with several sources apart (parse_links: the link storage line's staged bits, width x (sources - 1)
+# over the link uses); without it one ratio on every link register bit.
+# RUN: python3 %S/Inputs/state/top_terms.py foldsim | FileCheck %s
+# CHECK: parsed: ff 1200 staged 1000 select 96
+# CHECK: ratio: 378.0
+# CHECK: terms: 58.0
+# CHECK: no staged line: ff 1200 staged 0 select 0
