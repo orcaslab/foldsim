@@ -7,6 +7,9 @@ configure_file(foldsim_storage.py ${CMAKE_BINARY_DIR}/bin/foldsim_storage.py COP
 # Target manifests: a design's whole recipe in one file (--manifest).
 configure_file(foldsim_manifest.py ${CMAKE_BINARY_DIR}/bin/foldsim_manifest.py COPYONLY)
 install(PROGRAMS foldsim_manifest.py DESTINATION bin)
+# A design's simulator gated against its own RTL in Verilator, by its ports.
+configure_file(foldsim_gate.py ${CMAKE_BINARY_DIR}/bin/foldsim_gate.py COPYONLY)
+install(PROGRAMS foldsim_gate.py DESTINATION bin)
 install(PROGRAMS foldsim_degree.py DESTINATION bin)
 install(FILES foldsim_cost.py DESTINATION bin)
 install(PROGRAMS foldsim_storage.py DESTINATION bin)
