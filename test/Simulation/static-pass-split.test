@@ -52,6 +52,15 @@
 # RUN: FileCheck %s --check-prefix=ENG < %t/eng/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/eng -DVM1 -DVM2 -Mdir %t/eng/obj %S/Inputs/tb_pages.sv top.sv %t/eng/foldsim_sim.sv > %t/eng/build.log 2>&1
 # RUN: %t/eng/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+# With the page write gate (each page's write-back bits gated by its write's
+# host cycle): on chip, off chip on page engines with zero-latency links and
+# a link-hbm shift.
+# RUN: foldsim --srcs top.f --top Top --out %t/gpg --static --bubbles --modulo --page 2 --page-write-gate --pass-split Leaf:4 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/gpg/obj %S/Inputs/tb_late.sv top.sv %t/gpg/foldsim_sim.sv > %t/gpg/build.log 2>&1
+# RUN: %t/gpg/obj/Vtb +verilator+rand+reset+0 +verilator+seed+12 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/geng --static --modulo --page 4 --storage Leaf:pages=hbm --copies Leaf:2 --zero-latency-links --zero-latency-chains --page-hbm-column-bits 64 --page-engines auto --page-write-gate --link-hbm-shift 256 --pass-split Leaf:4 Leaf > %t/geng.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/geng -DVM1 -DVM2 -Mdir %t/geng/obj %S/Inputs/tb_pages.sv top.sv %t/geng/foldsim_sim.sv > %t/geng/build.log 2>&1
+# RUN: %t/geng/obj/Vtb +verilator+rand+reset+0 +verilator+seed+13 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
 # The mutant: folded, lane 5 leaves the group; the unmutated P = 4 simulator
 # against the mutant target mismatches.
 # RUN: foldsim --srcs top_mut.f --top Top --out %t/mut --static --bubbles --pass-split Leaf:4 Leaf > %t/mut.log 2>&1
