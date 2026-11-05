@@ -1,0 +1,35 @@
+# The frame the link kinds let (foldsim_degree link_spacing / link_ii): a
+# paged rule spaces every class of both models its page apart, an HBM stream
+# the producer's passes by its pages and the reader's by its landings + 2;
+# the schedule is at least the spacing x the passes. The model, on the
+# report the planner prices (no link kinds), predicts the II the compiler
+# builds with the kinds: pages 4 / 2 -> 16, page 8 -> 32, HBM streams -> 64.
+# The planner offers a page only where the models' most passes fit the link
+# port share of the frame. Two different rules for one pair of models are an
+# error (the last took the storage while the first's page still spaced).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/linkpage
+# RUN: foldsim --srcs top.f --top Top --out %t/no --static --nest --modulo --link-block-depth 2 --schedule-only Unit Reader > %t/no.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/p4 --static --nest --modulo --link-block-depth 2 --schedule-only --link-kinds Unit:Reader:block:4,Reader:Unit:block:2 Unit Reader > %t/p4.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/p8 --static --nest --modulo --link-block-depth 2 --schedule-only --link-kinds Unit:Reader:block:8 Unit Reader > %t/p8.log 2>&1
+# RUN: python3 %S/Inputs/linkii/ii.py foldsim %t/no/schedule.txt Unit:Reader:block:4,Reader:Unit:block:2 %t/p4/schedule.txt | FileCheck %s --check-prefix=P4
+# RUN: python3 %S/Inputs/linkii/ii.py foldsim %t/no/schedule.txt Unit:Reader:block:8 %t/p8/schedule.txt | FileCheck %s --check-prefix=P8
+# RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --nest --modulo --schedule-only --link-kinds Unit:Reader:block:4,Unit:Reader:distributed Unit Reader 2>&1 | FileCheck %s --check-prefix=BAD
+# RUN: foldsim --srcs top.f --top Top --out %t/dup --static --nest --modulo --link-block-depth 2 --schedule-only --link-kinds Unit:Reader:block:4,Unit:Reader:block:4 Unit Reader 2>&1 | FileCheck %s --check-prefix=DUP
+# RUN: cd %S/Inputs/linkhbm
+# RUN: foldsim --srcs top.f --top Top --out %t/hno --static --nest --modulo --schedule-only Unit Reader > %t/hno.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/hbm --static --nest --modulo --schedule-only --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/hbm.log 2>&1
+# RUN: python3 %S/Inputs/linkii/ii.py foldsim %t/hno/schedule.txt Unit:Reader:hbm,Reader:Unit:hbm %t/hbm/schedule.txt | FileCheck %s --check-prefix=HBM
+# P4: spacing Reader:4 Unit:4 passes Reader:4 Top_model:1 Unit:4
+# P4-NEXT: link_ii 16
+# P4-NEXT: built II 16
+# P4-NEXT: offer 32: A:B -; A:C -
+# P4-NEXT: offer 64: A:B block:2 ultra:2; A:C block:2 ultra:2
+# P4-NEXT: offer 128: A:B block:2 block:4 ultra:2 ultra:4; A:C block:2 block:4 ultra:2 ultra:4
+# P8: spacing Reader:8 Unit:8
+# P8-NEXT: link_ii 32
+# P8-NEXT: built II 32
+# BAD: link-kinds: 'Unit:Reader:distributed' conflicts with an earlier rule for Unit:Reader
+# DUP: II = 16
+# HBM: spacing Reader:4 Unit:3 passes Reader:16 Top_model:1 Unit:16
+# HBM-NEXT: link_ii 64
+# HBM-NEXT: built II 64

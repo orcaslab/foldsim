@@ -2229,7 +2229,15 @@ LogicalResult StaticFolder::parseLinkKinds() {
     for (StringRef m : {parts[0], parts[1]})
       if (!models.count(m.str()))
         return netlist.emitError("link-kinds: no class model '") << m << "'";
-    linkKinds[{parts[0].str(), parts[1].str()}] = {parts[2].str(), page};
+    // A pair of models takes one kind: a second, different rule for it is
+    // an error (the last would win the storage while the first's page still
+    // spaced the passes).
+    auto [kit, fresh] = linkKinds.try_emplace({parts[0].str(), parts[1].str()},
+                                              LinkKind{parts[2].str(), page});
+    if (!fresh && (kit->second.kind != parts[2] || kit->second.page != page))
+      return netlist.emitError("link-kinds: '")
+             << rule << "' conflicts with an earlier rule for " << parts[0]
+             << ":" << parts[1];
     // Both models' copies space their passes by the page.
     if (page)
       for (unsigned c = 0; c < classes.size(); ++c)

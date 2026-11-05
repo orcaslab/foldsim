@@ -1051,6 +1051,10 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                top_logic=round(top_link_logic((sched or {}).get('__links__'))) if KERNEL['on'] else 0,
                storage=','.join(rules),
                **({'link_kinds': ','.join(link_rules)} if lu else {}),
+               # The frame the chosen link kinds let (link_ii): the
+               # projection's H where longer than the frame priced.
+               **({'link_ii': lii} if (lii := link_ii((sched or {}).get('__links__'),
+                                                      link_rules)) else {}),
                **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged),
                **({'page_engines': page_engines} if page_engines else {}),
                kernel_controllers=round(n_ctl, 1),
@@ -1480,6 +1484,57 @@ def link_streams_built(links):
     return out
 
 
+def model_passes(links):
+    """Each model's most passes a frame (instances x (1 + ready passes)) over
+    its classes, from a report's `link use` and `link pair` lines."""
+    out = {}
+    for u in (links or {}).get('uses', []):
+        out[u['p']] = max(out.get(u['p'], 0), u['producer_passes'])
+        out[u['r']] = max(out.get(u['r'], 0), u['reader_passes'])
+    for (p, r), pair in (links or {}).get('pairs', {}).items():
+        out[p] = max(out.get(p, 0), pair['producer_passes'])
+        out[r] = max(out.get(r, 0), pair['reader_passes'])
+    return out
+
+
+def link_spacing(links, kinds):
+    """The positions foldsim-fold-static keeps each model's passes apart for
+    the link kinds `kinds` (its `link-kinds` rules, a comma separated string
+    or a list, `<producer model>:<reader model>:<kind>[:<page>]`): a paged
+    rule spaces every class of both models its page apart (parseLinkKinds);
+    an HBM stream (a pair the report lists as `link pair`) the producer's by
+    its pages and the reader's by its landings + 2 (streamPages). The most
+    over the rules naming a model; {model: spacing}, spacings of 2 or more."""
+    out = {}
+    pairs = (links or {}).get('pairs', {})
+    rules = kinds.split(',') if isinstance(kinds, str) else list(kinds or ())
+    for rule in (r.strip() for r in rules):
+        parts = rule.split(':')
+        if len(parts) < 3:
+            continue
+        p, r, kind = parts[:3]
+        if kind == 'hbm':
+            pair = pairs.get((p, r))
+            if pair:
+                out[p] = max(out.get(p, 0), pair['pages'])
+                out[r] = max(out.get(r, 0), pair['max_need'] + 2)
+        elif len(parts) > 3 and int(parts[3]) > 1:
+            for m in (p, r):
+                out[m] = max(out.get(m, 0), int(parts[3]))
+    return {m: s for m, s in out.items() if s > 1}
+
+
+def link_ii(links, kinds):
+    """The shortest frame the link kinds `kinds` let the schedule take: each
+    class's passes their model's link spacing apart, the next frame's first
+    a spacing after the last (foldsim-fold-static placeModulo: spacing x
+    passes). A frame shorter than this stretches to it: the projected H
+    takes the longer (link_spacing; 0 without spaced models)."""
+    passes = model_passes(links)
+    return max([s * passes.get(m, 0) for m, s in link_spacing(links, kinds).items()],
+               default=0)
+
+
 def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0, engines=False):
     """The links as storage_area units, a unit per pair of models with a
     link that block or ultra RAM may hold (foldsim-fold-static `link-kinds`):
@@ -1501,11 +1556,15 @@ def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0, engines=False):
             continue
         groups.setdefault((u['p'], u['r']), []).append(u)
     units = []
+    # A page spaces every class of both models (not only the uses that page):
+    # offered where their most passes fit the port share (link_spacing).
+    passes = model_passes(links)
     for (p, r), uses in sorted(groups.items()):
         kinds = list(LINK_KINDS)
         if pages and ii:
             kinds += [f'{kind}:{q}' for kind in ('block', 'ultra') for q in LINK_PAGES
-                      if any(link_page_ok(u, q, ii) for u in uses)]
+                      if any(link_page_ok(u, q, ii) for u in uses) and
+                      max(passes.get(p, 0), passes.get(r, 0)) * q <= LINK_PORT_SHARE * ii]
         costs = {}
         for kind in kinds:
             q = int(kind.partition(':')[2] or 0)
@@ -2094,6 +2153,12 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
             h['hbm_bytes'] += round(res['link_hbm_bytes'])
             h['hbm_ii'] = math.ceil(h['hbm_bytes'] / storage.HBM_BYTES_PER_CYCLE)
             h['h'] = max(h['ii'], h['hbm_ii']) + h['bubbles']
+        if res.get('link_ii', 0) > h['ii']:
+            # The link kinds' spacing stretches the frame (link_ii): H is
+            # the stretched frame's.
+            h['link_ii'] = res['link_ii']
+            h['ii'] = res['link_ii']
+            h['h'] = max(h['ii'], h['hbm_ii']) + h['bubbles']
         spec = ','.join(f'{m}:{p}' for m, p in sorted((pages or {}).items()))
         return dict(page=spec, pattern=pat, storage=res.get('storage', ''), frame=frame,
                     res=res, h=h, moved=moved, pages_offchip=off,
@@ -2139,18 +2204,29 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
         # the models paged (selects against freed RAM).
         frames = sorted(set(only_frames))
         steps = set(frames)
-    last = None
+    # Each frame's point is projected with the H its link kinds give
+    # (link_ii): a point whose kinds stretch the frame is kept while the
+    # shorter frames are tried, and the least H wins.
+    last, best = None, None
+
+    def take(o):
+        nonlocal best
+        if best is None or o['h']['h'] < best['h']['h']:
+            best = o
+        return 'link_ii' not in o['h']
     for f in frames:
         if f < ii:
             continue
+        if best is not None and f >= best['h']['h']:
+            break
         tiers = dict(frame=f, base_hbm=base_hbm, base_bubbles=base_bubbles, weights=weights,
                      pages_hbm=pages_hbm, row_bytes_min=row_bytes_min, link_pages=link_pages,
                      link_hbm=link_hbm, vmem_group=vmem_group, page_engines=page_engines)
         if f == ii:
             res = area(cal, est, classes, {}, rest, sched, f, entries, 'auto', route, uram,
                        vmem=vmem, tiers=tiers)
-            if ok(res):
-                return outcome(res, {}, f)
+            if ok(res) and take(outcome(res, {}, f)):
+                return best
         pages = page_pick(est, classes, f, sched=sched) if page else None
         # A longer frame helps through deeper pages, and through the HBM
         # bytes and link pages it carries: frames where the pages deepen,
@@ -2178,7 +2254,9 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
             if not fit:
                 continue
             k = min(fit, key=lambda k: (at(k)[1].get('congestion', at(k)[1]['luts']), at(k)[1]['luts'], k))
-            return outcome(at(k)[1], at(k)[0], f)
+            if take(outcome(at(k)[1], at(k)[0], f)):
+                return best
+            continue
         if not ok(at(len(order))[1]):
             # Paging costs logic (the write-back's selects): where the
             # routing binds, paging every model may not route while paging
@@ -2187,7 +2265,9 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
                          if ok(at(k)[1])), None)
             if some is None:
                 continue
-            return outcome(at(some)[1], at(some)[0], f)
+            if take(outcome(at(some)[1], at(some)[0], f)):
+                return best
+            continue
         lo, hi = 1, len(order)
         while lo < hi:
             mid = (lo + hi) // 2
@@ -2196,8 +2276,9 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
             else:
                 lo = mid + 1
         some, res = at(lo)
-        return outcome(res, some, f)
-    return None
+        if take(outcome(res, some, f)):
+            return best
+    return best
 
 
 def state_table(out, classes, est):
@@ -2205,7 +2286,8 @@ def state_table(out, classes, est):
     res, h = out['res'], out['h']
     lines = [f"frame {out['frame']}: projected H {h['h']} (II {h['ii']}, HBM {h['hbm_bytes']} "
              f"bytes a frame = {h['hbm_ii']} host cycles at {storage.HBM_BYTES_PER_CYCLE} B, "
-             f"bubbles at most {h['bubbles']})",
+             f"bubbles at most {h['bubbles']})" +
+             (f"; the link kinds stretch the frame to {h['link_ii']}" if h.get('link_ii') else ''),
              f"area: {res['luts']} LUTs ({res['logic']} logic + {res['lutram']} LUTRAM), "
              f"{res['bram']} RAMB36, {res.get('uram', 0)} URAM288, fits {res['fits']}"
              + (f", congestion {res['congestion']} % routes {res['routes']}"
