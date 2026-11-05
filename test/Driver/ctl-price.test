@@ -2,7 +2,8 @@
 # virtual memory or group with its host cache and known-zero bits, a stream's
 # own, a page engine), the platform's way into device memory the controllers
 # add to (platform_cost: shares beyond the kernel's 32 masters, SLASH's sc_mem
-# SmartConnects past 8 masters), and a generation's controllers as built
+# SmartConnects past 8 masters; folded memory ports bind one master), and a
+# generation's controllers as built
 # (state --built-json: foldsim_degree.read_built). The routed images' numbers
 # are in the input's comments.
 # RUN: python3 %S/Inputs/state/ctl_price.py foldsim %t | FileCheck %s
@@ -18,5 +19,7 @@
 # CHECK: platform 8 0 None: logic 0 lutram 0 masters 8 shares 0 sc_nodes 0
 # CHECK: platform 32 60 None: logic 135320 lutram 41868 masters 32 shares 32 sc_nodes 8
 # CHECK: platform best 16 27: logic 67934 lutram 24013 masters 16 shares 16 sc_nodes 8 vmem_masters 0
+# CHECK: platform best 1 27: logic 32534 lutram 10244 masters 11 shares 10 sc_nodes 3 vmem_masters 10
 # CHECK: built: 3 [('engine', 1), ('link', 1), ('vmem', 1)] forward 0 ports 1 logic 3983 lutram 1677 bram 19
+# CHECK: built folded: ports 1 vmem masters 2
 # CHECK: controllers: 3 2 [(64, 13, 2), (512, 9, 1)]

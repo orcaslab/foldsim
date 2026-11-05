@@ -200,7 +200,9 @@ def read_built(path):
     forward = int(m.group(1)) if m else int(j.get('vmem_forward', 1))
     m = re.search(r'FOLDSIM_VMEM_MASTERS (\d+)', vh)
     vmasters = int(m.group(1)) if m else 0 if 'FOLDSIM_VMEM_ON_PORTS' in vh else None
-    m = re.search(r'FOLDSIM_MEM_PORTS (\d+)', vh)
+    # The memory ports' masters (FOLDSIM_MEM_MASTERS: one where the ports are
+    # folded); a kernel.vh before it bound one per port.
+    m = re.search(r'FOLDSIM_MEM_MASTERS (\d+)', vh) or re.search(r'FOLDSIM_MEM_PORTS (\d+)', vh)
     ports = int(m.group(1)) if m else None
     ctls = j.get('vmem_groups') or j.get('vmem') or []
     save = storage.CTL_FORWARD
@@ -1005,7 +1007,11 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                 if kind == 'hbm' and u.get('link') and 'engine_columns' not in u['costs']['hbm']) + \
             link_cost(cal, (sched or {}).get('__links__'))['ctl'] + page_engines
     if KERNEL['on'] and (KERNEL['mem_ports'] or n_ctl):
+        # The memory ports' masters: one where they are folded (the folded
+        # endpoint's, the only one the kernel flow binds).
         ports = KERNEL['mem_ports']
+        if KERNEL['fold_ports'] or KERNEL['sim_ports_folded']:
+            ports = min(ports, 1)
         if BUILT is not None and BUILT.get('mem_ports') is not None:
             ports = BUILT['mem_ports']
         # Built: the kernel's masters as generated; planned: the count of least

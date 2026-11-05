@@ -25,6 +25,8 @@ for p, n, m in ((1, 11, None), (1, 40, 31), (16, 0, None), (8, 0, None), (32, 60
 # The planner's master count (FOLDSIM_VMEM_MASTERS, a flow setting): the least LUTs with enough masters for the
 # controllers' traffic (640 B a host cycle: 10 AXI beats): 16 ports and 27 controllers on the ports' masters.
 print('platform best 16 27:', r(st.platform_cost(16, 27, 'best')))
+# The same 16 ports folded (foldsim --fold-ports): the folded endpoint's one master, then the controllers' own.
+print('platform best 1 27:', r(st.platform_cost(1, 27, 'best')))
 # As built: a generation's json (two grouped virtual memories of a copy, a stream, an engine), FORWARD 0.
 d = sys.argv[2]
 os.makedirs(d, exist_ok=True)
@@ -39,6 +41,11 @@ open(d + '/foldsim_kernel.vh', 'w').write('`define FOLDSIM_MEM_PORTS 1\n')
 b = fd.read_built(d + '/foldsim_sim.json')
 print(f"built: {len(b['controllers'])} {sorted(b['counts'].items())} forward {b['forward']} ports {b['mem_ports']} "
       f"logic {b['logic']:.0f} lutram {b['lutram']:.0f} bram {b['bram']:.0f}")
+# A kernel of 16 folded memory ports binds the folded endpoint's master alone (FOLDSIM_MEM_MASTERS 1).
+open(d + '/foldsim_kernel.vh', 'w').write('`define FOLDSIM_MEM_PORTS 16\n`define FOLDSIM_MEM_MASTERS 1\n'
+                                          '`define FOLDSIM_VMEM_MASTERS 2\n')
+b = fd.read_built(d + '/foldsim_sim.json')
+print(f"built folded: ports {b['mem_ports']} vmem masters {b['vmem_masters']}")
 # A copy's virtual memories as controllers: one a memory, or one a row size with --vmem-group copy.
 mems = [('a', 4096, 64, 1, 1, 1, None, 8, True), ('b', 1024, 32, 1, 1, 1, None, 4, True),
         ('c', 512, 512, 1, 1, 1, None, 64, True)]

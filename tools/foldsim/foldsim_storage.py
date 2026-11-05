@@ -443,11 +443,13 @@ def ctl_cost(kind, dw, cache_rows=0, members=1, image_rows=0, kz=None):
 # The kernel's device-memory masters and the platform's way into device
 # memory, which every controller adds to (hw/syn/foldsim/vmem_ports.py,
 # SLASH linker/slashkit mem_ctx.py). The kernel has at most MAX_MASTERS
-# masters: one per memory port of the target (bound even where the port fold
-# leaves all but the first idle), then one per controller as far as they go;
-# beyond, controller k shares master k mod M (foldsim_vmem_share), or with no
-# master left (memory ports = MAX_MASTERS) memory port k mod P's with its
-# endpoint. SLASH binds the masters round robin to SC_MEM_PORTS HBM vNoC
+# masters: one per memory port of the target, or one in all where the ports
+# are folded (foldsim --fold-ports: the folded endpoint has one master; the
+# kernel flow binds only that one, FOLDSIM_MEM_MASTERS), then one per
+# controller as far as they go; beyond, controller k shares master k mod M
+# (foldsim_vmem_share), or with no master left (or FOLDSIM_VMEM_MASTERS 0)
+# the memory ports' master k mod P with its endpoint. `mem_ports` below is
+# the memory ports' masters. SLASH binds the masters round robin to SC_MEM_PORTS HBM vNoC
 # ports and puts a SmartConnect (sc_mem, at most SC_MAX_SI inputs) on every
 # port with more than one. Routed (virtA_1105/cal ctl_fit.py): a share
 # 70 logic + 284 LUTRAM LUTs with one input, 986 + 15 more an input
@@ -466,7 +468,7 @@ SC_NODE_LUTRAM = (781.0, 801.0)
 
 def platform_cost(mem_ports, controllers, vmem_masters=None):
     """The masters' shares and SLASH's sc_mem tree for a kernel of
-    `mem_ports` memory ports and `controllers` foldsim_vmem controllers
+    `mem_ports` memory-port masters and `controllers` foldsim_vmem controllers
     (`vmem_masters`: the kernel's FOLDSIM_VMEM_MASTERS, default as many as
     fit; 'best': the count of least LUTs, which the flow's
     FOLDSIM_VMEM_MASTERS sets): dict(logic, lutram, masters, shares, sc_nodes,
