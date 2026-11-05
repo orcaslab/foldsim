@@ -142,6 +142,7 @@ def mffc(root, ops, users, within=None):
 COMMUTATIVE = ('comb.and ', 'comb.or ', 'comb.xor ', 'comb.add ', 'comb.mul ', 'comb.icmp eq ',
                'comb.icmp ne ')
 CANON = True
+ALL_ROOTS = False
 
 
 def signature(root, cone, ops, types):
@@ -266,6 +267,9 @@ def census(path, module, passes=(2, 4, 8, 16, 32), min_ops=2, max_cone=20000, sc
         if n.startswith(GATHER):
             gathered.update(o for o in operands if o in ops and users[o] == 1)
     cand = list(dict.fromkeys(cand + sorted(gathered)))
+    if ALL_ROOTS:
+        # Every op a root: a sub-cone of a cone with no partner can still match.
+        cand = list(ops)
     if within is not None:
         cand = [v for v in cand if v in within]
     groups = defaultdict(list)
@@ -371,13 +375,15 @@ def main():
     ap.add_argument('--passes', default='2,4,8,16,32')
     ap.add_argument('--top', type=int, default=15, help='groups listed per module')
     ap.add_argument('--json', default='')
+    ap.add_argument('--all-roots', action='store_true', help='every op a candidate root (sub-cones too)')
     ap.add_argument('--no-canon', action='store_true', help='operands of commutative ops in their order')
     ap.add_argument('--schedule', default='', help="the gen's schedule.txt: only the deferred-lane logic "
                     "(the compiler's --pass-split), late outputs from it")
     a = ap.parse_args()
     passes = [int(x) for x in a.passes.split(',')]
-    global CANON
+    global CANON, ALL_ROOTS
     CANON = not a.no_canon
+    ALL_ROOTS = a.all_roots
     res = {}
     for m in a.module:
         total, groups = census(a.models, m, passes, schedule=a.schedule or None)
