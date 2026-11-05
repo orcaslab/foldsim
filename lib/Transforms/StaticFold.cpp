@@ -2072,16 +2072,38 @@ LogicalResult StaticFolder::chooseStages() {
     // on chip: an instance's pages are fetched (and waited for) by its
     // evaluation's read position, the stages before its state pass, and
     // written back after the state pass (offChipRows).
-    if (llvm::any_of(cls.late, [](bool late) { return late; }) ||
-        cls.heldReads || (cls.folding && !cls.folding->folds.empty()))
+    // A class pass splitting names but cannot take says why.
+    auto splitNamed = [&] {
+      StringRef base = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
+                                          : StringRef(cls.name);
+      for (auto &spec : passSplitSpecs)
+        if (auto glob = llvm::GlobPattern::create(StringRef(spec).split(':').first);
+            glob && glob->match(base))
+          return true;
+      return false;
+    };
+    auto notSplit = [&](StringRef why) {
+      if (splitNamed())
+        llvm::errs() << "foldsim-fold-static: " << cls.name << " not split: " << why
+                     << "\n";
+    };
+    if (llvm::any_of(cls.late, [](bool late) { return late; })) {
+      notSplit("a late output");
       continue;
+    }
+    if (cls.heldReads || (cls.folding && !cls.folding->folds.empty())) {
+      notSplit("held reads or folded pipelines");
+      continue;
+    }
     auto *body = cls.model.getBodyBlock();
     bool eligible = true;
     for (auto &op : *body)
       if (isa<hw::InstanceOp>(op))
         eligible = false;
-    if (!eligible)
+    if (!eligible) {
+      notSplit("a black box");
       continue;
+    }
     // The last stage of a register's next value (its reset a choice more),
     // a memory's write or registered read, and an early output's next value
     // (its logic over the registers' next values, stages of it more).
@@ -2132,7 +2154,7 @@ LogicalResult StaticFolder::chooseStages() {
           split > 1)
         listed = true;
     }
-    if (!listed || !cls.stages)
+    if (!listed || (!cls.stages && !split))
       continue;
     bool combReads = false;
     for (auto read : body->getOps<seq::FirMemReadOp>()) {
