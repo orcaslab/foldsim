@@ -717,14 +717,12 @@ def write_multicycle_xdc(entries, path, splits=()):
                     f'-from [get_cells -hierarchical -filter {{IS_SEQUENTIAL && NAME =~ "*{p}cap*"}}] '
                     f'-to [get_cells -hierarchical -filter {{IS_SEQUENTIAL && NAME =~ "*{p}end*"}}]\n')
         # Pass splitting: a pass of `span` host cycles from the captures and the pass counters to
-        # the holds, and the span again from the holds to the end registers.
+        # the holds (the holds' paths to the deferred writes stay single-cycle).
         for e in splits:
             m, p = e['span'], e['prefix']
             if m < 2:
                 continue
-            mc = 'fsmc_' + p[len('fsps_'):]
-            pairs = [(f'*{mc}cap*', f'*{p}hold*'), (f'*{p}pass*', f'*{p}hold*'), (f'*{p}sub*', f'*{p}hold*'),
-                     (f'*{p}hold*', f'*{mc}end*')]
+            pairs = [(f'*{p}cap*', f'*{p}hold*'), (f'*{p}pass*', f'*{p}hold*'), (f'*{p}sub*', f'*{p}hold*')]
             f.write(f'# {p}: {e["passes"]} passes of {m} host cycles, {e["hold_bits"]} hold bits\n')
             for a_, b_ in pairs:
                 for kind, n in (('setup', m), ('hold', m - 1)):
@@ -1081,11 +1079,11 @@ def main():
                          'apart. <out>/foldsim_multicycle.xdc gives the flow the M-cycle paths, '
                          'foldsim_sim.json lists them (foldsim-fold-static)')
     ap.add_argument('--pass-split', default='', metavar='CLASS:P,...',
-                    help='with --stage-levels: these classes (globs) multicycle, over P passes of their '
-                         'span: the copy\'s isomorphic fanout-free cones (lanes) run on ceil(R/P) shared '
-                         'lanes, one replica a pass, each result held from its pass to the end registers; '
-                         'the span is (P + 1) x the multicycle span. foldsim_multicycle.xdc gives the flow '
-                         'the passes\' paths (foldsim-fold-static)')
+                    help='these classes (globs; CLASS:P[:S]): the isomorphic fanout-free cones (lanes) of '
+                         'the logic only registers\' next values use run on ceil(R/P) shared lanes, one '
+                         'replica a pass of S host cycles after the state pass, from its leaves captured '
+                         'there; those registers are written (P + 1) x S host cycles after it. '
+                         'foldsim_multicycle.xdc gives the flow the passes\' paths (foldsim-fold-static)')
     ap.add_argument('--staged-links', action='store_true',
                     help="with --static: an early link of one producer instance in two registers, "
                          'copied at a fixed position of the frame, where the schedule allows '

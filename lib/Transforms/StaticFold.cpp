@@ -139,6 +139,9 @@ struct Class {
   /// Pass splitting (`pass-split`): the passes of an evaluation (0: none)
   /// and the host cycles of each (the multicycle span without splitting).
   unsigned passSplit = 0, passSpan = 0;
+  /// Pass splitting: host cycles from the state pass to the deferred
+  /// registers' writes, (passSplit + 1) x passSpan (0: none).
+  unsigned deferSpan = 0;
   uint64_t passHoldBits = 0;
   /// With --vmem-skip-held-reads: a virtual memory of it reads at a held
   /// address (heldReadRow), so its requests leave from registers a host
@@ -980,8 +983,11 @@ private:
   /// Multicycle: the positions a copy's state passes are kept apart by the
   /// schedule (its page lead, or its multicycle span), 0 for none.
   unsigned passSpacing(unsigned c) const {
-    return std::max(classes[c].pageLead(), classes[c].multicycle);
+    return std::max({classes[c].pageLead(), classes[c].multicycle,
+                     classes[c].deferSpan ? classes[c].deferSpan + 1 : 0u});
   }
+  /// `pass-split`: each named class's deferred lanes, planned on its model.
+  LogicalResult planPassSplits();
   StringRef syncLinkStyle(uint64_t depth, unsigned width) const {
     if (linkUltraDepth && depth >= linkUltraDepth)
       return "ultra";
@@ -2072,38 +2078,16 @@ LogicalResult StaticFolder::chooseStages() {
     // on chip: an instance's pages are fetched (and waited for) by its
     // evaluation's read position, the stages before its state pass, and
     // written back after the state pass (offChipRows).
-    // A class pass splitting names but cannot take says why.
-    auto splitNamed = [&] {
-      StringRef base = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
-                                          : StringRef(cls.name);
-      for (auto &spec : passSplitSpecs)
-        if (auto glob = llvm::GlobPattern::create(StringRef(spec).split(':').first);
-            glob && glob->match(base))
-          return true;
-      return false;
-    };
-    auto notSplit = [&](StringRef why) {
-      if (splitNamed())
-        llvm::errs() << "foldsim-fold-static: " << cls.name << " not split: " << why
-                     << "\n";
-    };
-    if (llvm::any_of(cls.late, [](bool late) { return late; })) {
-      notSplit("a late output");
+    if (llvm::any_of(cls.late, [](bool late) { return late; }) ||
+        cls.heldReads || (cls.folding && !cls.folding->folds.empty()))
       continue;
-    }
-    if (cls.heldReads || (cls.folding && !cls.folding->folds.empty())) {
-      notSplit("held reads or folded pipelines");
-      continue;
-    }
     auto *body = cls.model.getBodyBlock();
     bool eligible = true;
     for (auto &op : *body)
       if (isa<hw::InstanceOp>(op))
         eligible = false;
-    if (!eligible) {
-      notSplit("a black box");
+    if (!eligible)
       continue;
-    }
     // The last stage of a register's next value (its reset a choice more),
     // a memory's write or registered read, and an early output's next value
     // (its logic over the registers' next values, stages of it more).
@@ -2137,7 +2121,7 @@ LogicalResult StaticFolder::chooseStages() {
     StringRef baseName = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
                                             : StringRef(cls.name);
     bool listed = false;
-    unsigned given = 0, split = 0;
+    unsigned given = 0;
     for (auto &spec : multicycleSpecs) {
       auto [pattern, cycles] = StringRef(spec).split(':');
       if (auto glob = llvm::GlobPattern::create(pattern);
@@ -2147,14 +2131,7 @@ LogicalResult StaticFolder::chooseStages() {
           cycles.getAsInteger(10, given);
       }
     }
-    for (auto &spec : passSplitSpecs) {
-      auto [pattern, count] = StringRef(spec).split(':');
-      if (auto glob = llvm::GlobPattern::create(pattern);
-          glob && glob->match(baseName) && !count.getAsInteger(10, split) &&
-          split > 1)
-        listed = true;
-    }
-    if (!listed || (!cls.stages && !split))
+    if (!listed || !cls.stages)
       continue;
     bool combReads = false;
     for (auto read : body->getOps<seq::FirMemReadOp>()) {
@@ -2163,8 +2140,7 @@ LogicalResult StaticFolder::chooseStages() {
     }
     if (combReads) {
       llvm::errs() << "foldsim-fold-static: " << cls.name
-                   << " reads a memory combinationally: staged, not multicycle"
-                   << (split ? ", not split" : "") << "\n";
+                   << " reads a memory combinationally: staged, not multicycle\n";
       continue;
     }
     DenseMap<Value, Staging> depths;
@@ -2198,16 +2174,6 @@ LogicalResult StaticFolder::chooseStages() {
     // span, whatever the estimate.
     if (given)
       cls.multicycle = given;
-    // Pass splitting: P passes of the span, and the span again for the logic
-    // after the held results.
-    if (split > 1) {
-      cls.passSplit = split;
-      cls.passSpan = cls.multicycle;
-      cls.multicycle *= split + 1;
-      llvm::errs() << "foldsim-fold-static: " << cls.name << " pass-split: "
-                   << split << " passes of " << cls.passSpan
-                   << " host cycles, span " << cls.multicycle << "\n";
-    }
     cls.stages = cls.multicycle + 1;
     llvm::errs() << "foldsim-fold-static: " << cls.name << " multicycle: "
                  << deepest << " half levels estimated, over "
@@ -2217,13 +2183,6 @@ LogicalResult StaticFolder::chooseStages() {
                  << "), state passes " << cls.multicycle
                  << " positions apart\n";
   }
-  for (auto &spec : passSplitSpecs) {
-    auto [pattern, count] = StringRef(spec).split(':');
-    unsigned n = 0;
-    if (!llvm::GlobPattern::create(pattern) || count.getAsInteger(10, n) || n < 2)
-      return netlist.emitError("pass-split: '")
-             << spec << "' is not <glob>:<passes>, passes at least 2";
-  }
   for (auto &spec : multicycleSpecs) {
     auto [pattern, cycles] = StringRef(spec).split(':');
     unsigned n = 0;
@@ -2231,6 +2190,93 @@ LogicalResult StaticFolder::chooseStages() {
         (!cycles.empty() && (cycles.getAsInteger(10, n) || n < 1)))
       return netlist.emitError("multicycle: '")
              << spec << "' is not <glob> or <glob>:<host cycles>";
+  }
+  return success();
+}
+
+LogicalResult StaticFolder::planPassSplits() {
+  for (auto &spec : passSplitSpecs) {
+    SmallVector<StringRef> parts;
+    StringRef(spec).split(parts, ':');
+    unsigned n = 0, span = 1;
+    if (parts.size() < 2 || parts.size() > 3 ||
+        !llvm::GlobPattern::create(parts[0]) || parts[1].getAsInteger(10, n) ||
+        n < 2 || (parts.size() == 3 && (parts[2].getAsInteger(10, span) || !span)))
+      return netlist.emitError("pass-split: '")
+             << spec << "' is not <glob>:<passes>[:<span>], passes at least 2";
+  }
+  for (auto &cls : classes) {
+    StringRef base = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
+                                        : StringRef(cls.name);
+    unsigned passes = 0, span = 1;
+    for (auto &spec : passSplitSpecs) {
+      SmallVector<StringRef> parts;
+      StringRef(spec).split(parts, ':');
+      if (auto glob = llvm::GlobPattern::create(parts[0]);
+          glob && glob->match(base)) {
+        parts[1].getAsInteger(10, passes);
+        span = 1;
+        if (parts.size() == 3)
+          parts[2].getAsInteger(10, span);
+      }
+    }
+    if (passes < 2)
+      continue;
+    auto refuse = [&](StringRef why) {
+      llvm::errs() << "foldsim-fold-static: " << cls.name << " not split: " << why
+                   << "\n";
+    };
+    if (cls.stages) {
+      refuse("staged");
+      continue;
+    }
+    if (cls.heldReads || (cls.folding && !cls.folding->folds.empty())) {
+      refuse("held reads or folded pipelines");
+      continue;
+    }
+    // The next values an early output's next value reads (buildCopy's
+    // nextValue): the registers in an early output's cone, through logic.
+    auto *body = cls.model.getBodyBlock();
+    auto *output = body->getTerminator();
+    SmallVector<Value> pinned;
+    DenseSet<Operation *> seen;
+    SmallVector<Value> work;
+    for (auto [o, value] : llvm::enumerate(output->getOperands()))
+      if (!cls.late[o])
+        work.push_back(value);
+    while (!work.empty()) {
+      Value v = work.pop_back_val();
+      auto *def = v.getDefiningOp();
+      if (!def || !seen.insert(def).second)
+        continue;
+      if (auto reg = dyn_cast<seq::FirRegOp>(def)) {
+        pinned.push_back(reg.getNext());
+        if (reg.getReset()) {
+          pinned.push_back(reg.getReset());
+          pinned.push_back(reg.getResetValue());
+        }
+        continue;
+      }
+      if (isa<seq::FirMemOp, seq::FirMemReadOp, hw::InstanceOp>(def))
+        continue;
+      for (auto operand : def->getOperands())
+        work.push_back(operand);
+    }
+    auto plan = foldsim::planDeferred(body, pinned, passes);
+    if (!plan.stats.groups) {
+      refuse("no lanes in the logic only next state uses");
+      continue;
+    }
+    cls.passSplit = passes;
+    cls.passSpan = span;
+    cls.deferSpan = (passes + 1) * span;
+    llvm::errs() << "foldsim-fold-static: " << cls.name << " pass-split: "
+                 << passes << " passes of " << span << " host cycles, "
+                 << plan.regs.size() << " registers written "
+                 << cls.deferSpan << " host cycles after the state pass; planned "
+                 << plan.stats.groups << " lane groups, "
+                 << llvm::format("%.0f", plan.stats.before) << " -> "
+                 << llvm::format("%.0f", plan.stats.after) << " LUTs estimated\n";
   }
   return success();
 }
@@ -5511,6 +5557,10 @@ int StaticFolder::minStateGap(const Class &cls) const {
   // stores alone, no bypass.
   if (cls.stages)
     gap = std::max(gap, 4);
+  // Pass splitting: the deferred writes land before the next evaluation's
+  // reads (a block RAM store's a host cycle early), no bypass.
+  if (cls.deferSpan)
+    gap = std::max(gap, int(cls.deferSpan) + 4);
   if (!virtualMemoryPattern.empty()) {
     llvm::Regex pattern(virtualMemoryPattern);
     StringRef model = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
@@ -7177,31 +7227,6 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
           if (Value at = ending(operand.get()); at != operand.get())
             operand.set(at);
     }
-    // Pass splitting: the logic's lanes over the passes, counted from the
-    // captures' host cycle (a register of live1, as their enables).
-    if (cls.passSplit) {
-      SmallVector<Operation *> live;
-      for (auto *op : ops)
-        live.push_back(op);
-      std::string psPrefix = "fsps_" + cls.name + "__";
-      Value capNow = seq::CompRegClockEnabledOp::create(
-          b, b.getI1Type(), live1, hostClock, one,
-          b.getStringAttr(psPrefix + "cap"), Value(), Value(), Value(),
-          hw::InnerSymAttr{});
-      auto st = foldsim::foldLanes(b, live, hostClock, capNow, cls.passSplit,
-                                   cls.passSpan, psPrefix);
-      cls.passHoldBits = st.holdBits;
-      llvm::errs() << "foldsim-fold-static: " << cls.name << " pass-split "
-                   << cls.passSplit << ": " << st.groups << " lane groups, "
-                   << st.replicas << " replicas on " << st.lanes << " lanes, "
-                   << llvm::format("%.0f", st.before) << " -> "
-                   << llvm::format("%.0f", st.after) << " LUTs estimated, "
-                   << st.holdBits << " hold bits, " << st.selectBits
-                   << " chosen leaf bits (groups";
-      for (unsigned n : st.sizes)
-        llvm::errs() << " x" << n;
-      llvm::errs() << ")\n";
-    }
     // The schedule's side: the copy's state passes, modulo the frame, at
     // least the span apart (no capture before the end registers are taken),
     // and the reads the span and a position before them.
@@ -7568,7 +7593,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   unsigned entries = 1u << idxWidth;
   // Registers of so few instances, passed in a ring order, are a ring of
   // flops: no store, no read select and no bypass.
-  bool ring = !cls.stages && !cls.page && threads > 1 &&
+  bool ring = !cls.stages && !cls.page && !cls.deferSpan && threads > 1 &&
               threads <= registerStateEntries &&
               ringOrder(cls, ii);
   // A per-instance store this shallow is flops: Vivado would otherwise spend
@@ -7934,6 +7959,56 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   ImplicitLocOpBuilder b(model.getLoc(), body, body->end());
   auto i1 = b.getI1Type();
   auto one = [&]() { return hw::ConstantOp::create(b, i1, 1); };
+
+  // Pass splitting (deferred lanes): the logic only some registers' next
+  // values use, its leaves captured at the state pass, its lanes over the
+  // passes after it; those registers written deferSpan host cycles after
+  // their state pass (at the instance captured there), before the next
+  // evaluation reads them (the state gap) and the next capture (the pass
+  // spacing). Nothing else reads that logic, so the state pass is unchanged.
+  DenseMap<Operation *, Value> deferredNext;
+  // Its controls: registers of the copy, not target state.
+  DenseSet<Operation *> deferControls;
+  Value deferWen, deferInst;
+  if (cls.deferSpan) {
+    auto chain = [&](Value v, unsigned n, const Twine &name, bool preset) {
+      for (unsigned k = 0; k < n; ++k) {
+        auto reg = preset ? seq::FirRegOp::create(
+                                b, v, hostClock, b.getStringAttr(name + Twine(k)),
+                                hw::InnerSymAttr{}, b.getIntegerAttr(i1, 0))
+                          : seq::FirRegOp::create(
+                                b, v, hostClock, b.getStringAttr(name + Twine(k)));
+        deferControls.insert(reg);
+        v = reg;
+      }
+      return v;
+    };
+    std::string prefix = "fsps_" + cls.name + "__";
+    auto plan = foldsim::planDeferred(body, {}, cls.passSplit);
+    // The state pass, as the regions see it (three host cycles on).
+    Value stateNow = chain(state3, 3, prefix + "state", true);
+    auto st = foldsim::applyDeferred(b, plan, hostClock, stateNow,
+                                     cls.passSplit, cls.passSpan, prefix,
+                                     deferredNext);
+    cls.passHoldBits = st.holdBits;
+    deferWen = chain(stateNow, cls.deferSpan, prefix + "wen", true);
+    if (threads > 1)
+      deferInst = seq::CompRegClockEnabledOp::create(
+          b, inst3.getType(), chain(inst3, 3, prefix + "inst", false),
+          hostClock, stateNow, b.getStringAttr(prefix + "winst"), Value(),
+          Value(), Value(), hw::InnerSymAttr{});
+    llvm::errs() << "foldsim-fold-static: " << cls.name << " pass-split "
+                 << cls.passSplit << ": " << plan.regs.size()
+                 << " deferred registers, " << st.groups << " lane groups, "
+                 << st.replicas << " replicas on " << st.lanes << " lanes, "
+                 << llvm::format("%.0f", st.before) << " -> "
+                 << llvm::format("%.0f", st.after) << " LUTs estimated, "
+                 << st.captureBits << " capture bits, " << st.holdBits
+                 << " hold bits, " << st.selectBits << " chosen leaf bits (groups";
+    for (unsigned n : st.sizes)
+      llvm::errs() << " x" << n;
+    llvm::errs() << ")\n";
+  }
 
   // Staged evaluation: the target logic cut into stages; its reads (the
   // state's read registers, the inputs, combinational reads) at the read
@@ -8321,7 +8396,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   SmallVector<seq::FirRegOp> registers;
   SmallVector<seq::FirMemOp> memories;
   for (auto &op : *body) {
-    if (physical(&op))
+    if (physical(&op) || deferControls.contains(&op))
       continue;
     if (auto reg = dyn_cast<seq::FirRegOp>(op))
       registers.push_back(reg);
@@ -8371,11 +8446,47 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       Value next = reg.getNext();
       if (reg.getReset())
         next = comb::MuxOp::create(b, reg.getReset(), reg.getResetValue(), next);
+      Value value;
+      // Pass splitting: written deferSpan host cycles after the state pass,
+      // the whole next value, at the instance captured there.
+      if (auto it = deferredNext.find(reg); it != deferredNext.end()) {
+        auto &region = regionFor(width);
+        Value data = asBits(b, it->second);
+        if (threads == 1) {
+          BackedgeBuilder backedge(b, reg.getLoc());
+          auto nextEdge = backedge.get(data.getType());
+          Value kept = seq::FirRegOp::create(b, nextEdge, hostClock,
+                                             reg.getNameAttr());
+          nextEdge.setValue(comb::MuxOp::create(b, deferWen, data, kept));
+          value = b.createOrFold<hw::BitcastOp>(reg.getType(), kept);
+        } else {
+          auto *rule = storageFor(cls, reg.getName(), /*reg=*/true, width);
+          bool block = rule && (rule->kind == "block" || rule->kind == "ultra");
+          auto memType = seq::FirMemType::get(context, entries, width, 1);
+          auto memory = seq::FirMemOp::create(
+              b, memType, /*readLatency=*/block ? 1 : 0, /*writeLatency=*/1,
+              block ? seq::RUW::Old : seq::RUW::Undefined, seq::WUW::Undefined,
+              reg.getNameAttr(), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+              StringAttr{}, Attribute{});
+          keepShallowInFlops(memory);
+          if (rule)
+            setRamStyle(memory, rule->kind);
+          Value rdata = seq::FirMemReadOp::create(
+              b, memory, block ? region.inst2 : region.inst1, hostClock, one());
+          Value read = seq::FirRegOp::create(
+              b, rdata, hostClock, b.getStringAttr(reg.getName() + "_read"));
+          seq::FirMemWriteOp::create(b, memory, deferInst, hostClock, deferWen,
+                                     data, Value{});
+          value = b.createOrFold<hw::BitcastOp>(reg.getType(), read);
+        }
+        reg.getResult().replaceAllUsesWith(value);
+        reg.erase();
+        continue;
+      }
       auto write = foldsim::peelHolds(b, next, reg.getResult());
       if (!write.holds && !write.enable)
         write.data = next;
       auto &region = regionFor(width);
-      Value value;
       if (ring && !write.holds) {
         // The ring: the head is the evaluated instance's state; its state
         // pass moves each register one place toward the head and puts the
@@ -12631,7 +12742,8 @@ LogicalResult StaticFolder::run() {
         cls.folding->edges->abandon();
   };
   if (failed(parsePages()) || failed(parseStorage()) || failed(pagesOffChip()) ||
-      failed(chooseStages()) || failed(schedule())) {
+      failed(chooseStages()) || failed(planPassSplits()) ||
+      failed(schedule())) {
     abandonFolds();
     return failure();
   }

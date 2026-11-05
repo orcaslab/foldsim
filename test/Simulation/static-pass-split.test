@@ -1,55 +1,70 @@
 # REQUIRES: verilator
-# Pass splitting (--pass-split <class>:P): a multicycle class's lanes -- the
-# isomorphic fanout-free cones of its logic (Driver/Inputs/lanes: eight lanes
-# of one structure per leaf, each reading its own element of a register
-# array, a key all share and its index as constants, its result read by its
-# register and by a sum over the lanes; four counters of a generate block) --
-# evaluated on shared lanes, one replica a pass, each result held from its
-# pass to the end registers. Against the target (tb_late.sv), from zero
-# state, with bubbles and stalled channels: P = 4, 8 and 3 (a span of 2 per
-# pass), two copies, paged state, nested sequencers with a short lead, and
-# the multicycle check on every run. The mutant (Inputs/lanes/top_mut.sv:
-# lane 5 a shift of 2, not 3) is not of its lanes' structure: folded, its
-# lanes' group has one replica less and matches its target; the unmutated simulator
-# against the mutant target does not match (the harness sees one lane).
-# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/lanes
-# RUN: foldsim --srcs top.f --top Top --out %t/p4 --static --bubbles --stage-levels 6 --pass-split Leaf:4 Leaf > %t/p4.log 2>&1
+# Pass splitting (--pass-split <class>:P[:S]): the isomorphic fanout-free
+# cones (lanes) of the logic only registers' next values use, run on shared
+# lanes one replica a pass after the state pass, from that logic's leaves
+# captured there; those registers are written (P + 1) x S host cycles after
+# it, before the instance's next evaluation (the state gap) and the copy's
+# next capture (its state passes that far apart). Driver/Inputs/lanes_late:
+# a leaf with a late output (its input to its output in the same cycle, a
+# chain of four leaves within a cycle: a ready pass), eight lanes of one
+# structure computing the next `acc` and a generate block of four counters.
+# Against the target (tb_late.sv), from zero state, with bubbles and stalled
+# channels: P = 4, 8, 3 with a span of 2, two copies, a copy per instance
+# (one instance: kept registers), paged state, nested sequencers with a short
+# lead. Driver/Inputs/lanes: lanes that also feed an early output's next value
+# are not deferred (only the counters split). A staged class is refused. The
+# mutant (lane 5 a shift of 2, not 3) leaves its group and matches its own
+# target; the unmutated simulator against the mutant target mismatches.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/lanes_late
+# RUN: foldsim --srcs top.f --top Top --out %t/p4 --static --bubbles --pass-split Leaf:4 Leaf > %t/p4.log 2>&1
 # RUN: FileCheck %s --check-prefix=P4 < %t/p4.log
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/p4/obj %S/Inputs/tb_late.sv top.sv %t/p4/foldsim_sim.sv > %t/p4/build.log 2>&1
 # RUN: %t/p4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +bubble=30 +stall=20 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/p8 --static --bubbles --modulo --copies Leaf:2 --stage-levels 6 --pass-split Leaf:8 Leaf > %t/p8.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/p8 --static --bubbles --modulo --copies Leaf:2 --pass-split Leaf:8 Leaf > %t/p8.log 2>&1
 # RUN: FileCheck %s --check-prefix=P8 < %t/p8.log
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/p8/obj %S/Inputs/tb_late.sv top.sv %t/p8/foldsim_sim.sv > %t/p8/build.log 2>&1
 # RUN: %t/p8/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +bubble=30 +stall=20 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/p3 --static --bubbles --modulo --stage-levels 6 --multicycle Leaf:2 --pass-split Leaf:3 Leaf > %t/p3.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/p3 --static --bubbles --modulo --pass-split Leaf:3:2 Leaf > %t/p3.log 2>&1
 # RUN: FileCheck %s --check-prefix=P3 < %t/p3.log
 # RUN: FileCheck %s --check-prefix=XDC3 < %t/p3/foldsim_multicycle.xdc
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/p3/obj %S/Inputs/tb_late.sv top.sv %t/p3/foldsim_sim.sv > %t/p3/build.log 2>&1
 # RUN: %t/p3/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +bubble=30 +stall=20 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/pg --static --bubbles --modulo --page 2 --stage-levels 6 --pass-split Leaf:4 Leaf > /dev/null 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/one --static --bubbles --copies Leaf:4 --pass-split Leaf:4 Leaf > %t/one.log 2>&1
+# RUN: FileCheck %s --check-prefix=ONE < %t/one.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/one/obj %S/Inputs/tb_late.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/pg --static --bubbles --modulo --page 2 --pass-split Leaf:4 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/pg/obj %S/Inputs/tb_late.sv top.sv %t/pg/foldsim_sim.sv > %t/pg/build.log 2>&1
-# RUN: %t/pg/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +bubble=30 +stall=20 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --bubbles --nest --modulo --short-lead --copies Leaf:2 --page 2 --stage-levels 8 --pass-split Leaf:4 Leaf > /dev/null 2>&1
+# RUN: %t/pg/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --bubbles --nest --modulo --short-lead --copies Leaf:2 --page 2 --pass-split Leaf:4 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_late.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
-# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +bubble=30 +stall=20 | FileCheck %s
-# The mutant: folded, lane 5 stays out of its group; the unmutated P = 4
-# simulator against the mutant target mismatches.
-# RUN: foldsim --srcs top_mut.f --top Top --out %t/mut --static --bubbles --stage-levels 6 --pass-split Leaf:4 Leaf > %t/mut.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +bubble=30 +stall=20 | FileCheck %s
+# The mutant: folded, lane 5 leaves the group; the unmutated P = 4 simulator
+# against the mutant target mismatches.
+# RUN: foldsim --srcs top_mut.f --top Top --out %t/mut --static --bubbles --pass-split Leaf:4 Leaf > %t/mut.log 2>&1
 # RUN: FileCheck %s --check-prefix=MUT < %t/mut.log
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/mut/obj %S/Inputs/tb_late.sv top_mut.sv %t/mut/foldsim_sim.sv > %t/mut/build.log 2>&1
-# RUN: %t/mut/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +bubble=30 +stall=20 | FileCheck %s
+# RUN: %t/mut/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +bubble=30 +stall=20 | FileCheck %s
 # RUN: mkdir -p %t/x && %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/x/obj %S/Inputs/tb_late.sv top_mut.sv %t/p4/foldsim_sim.sv > %t/x.log 2>&1
 # RUN: %t/x/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +bubble=30 +stall=20 | FileCheck %s --check-prefix=DIFF
-# P4: Leaf pass-split: 4 passes of {{[0-9]+}} host cycles, span {{[0-9]+}}
-# P4: Leaf x4 state gap {{[0-9]+}} stages {{[0-9]+}} multicycle {{[0-9]+}} pass-split 4
-# P4: Leaf pass-split 4: {{[1-9][0-9]*}} lane groups, {{[0-9]+}} replicas on {{[0-9]+}} lanes
-# P8: Leaf pass-split 8: {{[1-9][0-9]*}} lane groups
-# P3: Leaf pass-split: 3 passes of 2 host cycles, span 8
-# P3: Leaf pass-split 3: {{[1-9][0-9]*}} lane groups
-# XDC3: set_multicycle_path 8 -setup
+# Lanes an early output's next value reads stay; a staged class is refused.
+# RUN: cd %S/../Driver/Inputs/lanes && foldsim --srcs top.f --top Top --out %t/early --static --bubbles --pass-split Leaf:4 Leaf > %t/early.log 2>&1
+# RUN: FileCheck %s --check-prefix=EARLY < %t/early.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/early/obj %S/Inputs/tb_late.sv top.sv %t/early/foldsim_sim.sv > %t/early/build.log 2>&1
+# RUN: %t/early/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/staged --static --stage-levels 6 --multicycle Leaf --pass-split Leaf:4 Leaf > %t/staged.log 2>&1
+# RUN: FileCheck %s --check-prefix=STAGED < %t/staged.log
+# P4: Leaf pass-split: 4 passes of 1 host cycles, 3 registers written 5 host cycles after the state pass; planned 2 lane groups
+# P4: Leaf x4 (ready pass) state gap {{[0-9]+}} pass-split 4
+# P4: Leaf pass-split 4: 3 deferred registers, 2 lane groups, 10 replicas on 3 lanes, {{.*}} (groups x8 x2)
+# P8: Leaf pass-split 8: 3 deferred registers, 2 lane groups, 10 replicas on 2 lanes
+# P8: Leaf_copy1 pass-split 8: 3 deferred registers
+# P3: Leaf pass-split: 3 passes of 2 host cycles, 3 registers written 8 host cycles after the state pass
 # XDC3: # fsps_Leaf__: 3 passes of 2 host cycles
-# XDC3: set_multicycle_path 2 -setup {{.*}}fsmc_Leaf__cap{{.*}}fsps_Leaf__hold
-# XDC3: set_multicycle_path 2 -setup {{.*}}fsps_Leaf__hold{{.*}}fsmc_Leaf__end
-# MUT: Leaf pass-split 4: {{[1-9][0-9]*}} lane groups
+# XDC3: set_multicycle_path 2 -setup {{.*}}fsps_Leaf__cap{{.*}}fsps_Leaf__hold
+# ONE: Leaf_copy3 pass-split 4: 3 deferred registers
+# MUT: Leaf pass-split 4: 3 deferred registers, {{.*}} (groups x7 x2)
+# EARLY: Leaf pass-split 4: {{[1-9][0-9]*}} deferred registers, {{[1-9]}} lane groups
+# STAGED: Leaf not split: staged
 # CHECK: {{^}}MATCH 196 cycles
 # DIFF: {{^}}MISMATCH cycle

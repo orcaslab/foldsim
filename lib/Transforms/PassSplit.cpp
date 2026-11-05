@@ -23,6 +23,7 @@
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "mlir/IR/BuiltinOps.h"
 #include "circt/Support/BackedgeBuilder.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -127,6 +128,14 @@ std::string keyOf(Operation *op) {
 PassSplitStats foldLanes(ImplicitLocOpBuilder &b, ArrayRef<Operation *> logicOps,
                          Value hostClock, Value capNow, unsigned passes,
                          unsigned span, StringRef prefix) {
+  return findLanes(&b, logicOps, hostClock, capNow, passes, span, prefix,
+                   nullptr);
+}
+
+PassSplitStats findLanes(ImplicitLocOpBuilder *apply,
+                         ArrayRef<Operation *> logicOps, Value hostClock,
+                         Value capNow, unsigned passes, unsigned span,
+                         StringRef prefix, SmallVectorImpl<Value> *rootsOut) {
   PassSplitStats stats;
   if (passes < 2 || span < 1)
     return stats;
@@ -337,6 +346,27 @@ PassSplitStats foldLanes(ImplicitLocOpBuilder &b, ArrayRef<Operation *> logicOps
   }
   if (chosen.empty())
     return stats;
+  // Planning only: the groups' sizes, savings and roots.
+  if (!apply) {
+    for (auto &g : chosen) {
+      unsigned r = g.members.size(), p = std::min(passes, r);
+      unsigned lanes = (r + p - 1) / p;
+      stats.groups += 1;
+      stats.replicas += r;
+      stats.lanes += lanes;
+      stats.sizes.push_back(r);
+      stats.before += g.members[0]->luts * r;
+      stats.after += g.members[0]->luts * r - g.saving;
+      stats.selectBits += g.selectBits;
+      for (auto *m : g.members) {
+        stats.holdBits += bitsOf(m->root.getType());
+        if (rootsOut)
+          rootsOut->push_back(m->root);
+      }
+    }
+    return stats;
+  }
+  ImplicitLocOpBuilder &b = *apply;
 
   // The pass: `pass` counts the passes from the capture (0 in the host cycle
   // after capNow's), `sub` the host cycles of one; a pass ends (its holds
@@ -467,6 +497,168 @@ PassSplitStats foldLanes(ImplicitLocOpBuilder &b, ArrayRef<Operation *> logicOps
           op->erase();
   }
   return stats;
+}
+
+
+namespace {
+bool isLogicOp(Operation &op) {
+  return op.getNumResults() == 1 && op.getNumRegions() == 0 &&
+         !isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp,
+              seq::FirMemOp, seq::FirMemReadOp, hw::ConstantOp,
+              hw::AggregateConstantOp, UnrealizedConversionCastOp,
+              hw::InstanceOp>(op) &&
+         op.getDialect() &&
+         (isa<comb::CombDialect, hw::HWDialect>(op.getDialect()));
+}
+
+/// The logic only the next values (and resets) of `regs` use: reference
+/// counting from those uses down (a value in `pinned` has a use outside).
+SmallVector<Operation *> exclusiveOf(Block *body, ArrayRef<Operation *> regs,
+                                     const DenseSet<Value> &pinned) {
+  DenseMap<Operation *, unsigned> left;
+  for (auto &op : *body)
+    if (isLogicOp(op)) {
+      unsigned n = 0;
+      for (auto &use : op.getResult(0).getUses()) {
+        (void)use;
+        ++n;
+      }
+      left[&op] = n + (pinned.contains(op.getResult(0)) ? 1 : 0);
+    }
+  DenseSet<Operation *> in;
+  SmallVector<Operation *> work, order;
+  auto drop = [&](Value v) {
+    auto *def = v ? v.getDefiningOp() : nullptr;
+    if (!def || !left.count(def) || in.contains(def))
+      return;
+    if (--left[def] == 0) {
+      in.insert(def);
+      work.push_back(def);
+    }
+  };
+  for (auto *op : regs) {
+    auto reg = cast<seq::FirRegOp>(op);
+    drop(reg.getNext());
+    if (reg.getReset()) {
+      drop(reg.getReset());
+      drop(reg.getResetValue());
+    }
+  }
+  while (!work.empty()) {
+    auto *op = work.pop_back_val();
+    order.push_back(op);
+    for (auto operand : op->getOperands())
+      drop(operand);
+  }
+  return order;
+}
+} // namespace
+
+DeferPlan planDeferred(Block *body, ArrayRef<Value> pinnedValues,
+                       unsigned passes) {
+  DeferPlan plan;
+  DenseSet<Value> pinned(pinnedValues.begin(), pinnedValues.end());
+  SmallVector<Operation *> regs;
+  for (auto reg : body->getOps<seq::FirRegOp>())
+    regs.push_back(reg);
+  auto logic = exclusiveOf(body, regs, pinned);
+  SmallVector<Value> roots;
+  auto first = findLanes(nullptr, logic, Value(), Value(), passes, 1, "", &roots);
+  if (!first.groups)
+    return plan;
+  // The registers the lanes reach, through that logic.
+  DenseSet<Operation *> logicSet(logic.begin(), logic.end());
+  DenseSet<Operation *> seen, reached;
+  SmallVector<Value> work(roots.begin(), roots.end());
+  while (!work.empty()) {
+    Value v = work.pop_back_val();
+    for (auto *user : v.getUsers()) {
+      if (logicSet.contains(user)) {
+        if (seen.insert(user).second)
+          work.push_back(user->getResult(0));
+      } else if (isa<seq::FirRegOp>(user)) {
+        reached.insert(user);
+      }
+    }
+  }
+  for (auto *reg : regs)
+    if (reached.contains(reg))
+      plan.regs.push_back(reg);
+  plan.logic = exclusiveOf(body, plan.regs, pinned);
+  plan.stats = findLanes(nullptr, plan.logic, Value(), Value(), passes, 1, "",
+                         nullptr);
+  if (!plan.stats.groups) {
+    plan.regs.clear();
+    plan.logic.clear();
+  }
+  return plan;
+}
+
+PassSplitStats applyDeferred(ImplicitLocOpBuilder &b, DeferPlan &plan,
+                             Value hostClock, Value stateNow, unsigned passes,
+                             unsigned span, StringRef prefix,
+                             DenseMap<Operation *, Value> &next) {
+  PassSplitStats stats;
+  if (plan.regs.empty())
+    return stats;
+  DenseSet<Operation *> logic(plan.logic.begin(), plan.logic.end());
+  SmallVector<Operation *> ops(plan.logic.begin(), plan.logic.end());
+  // Each register's whole next value (its reset a choice), as logic of the
+  // plan: the capture below takes what it reads at the state pass.
+  SmallVector<Value> nexts;
+  for (auto *op : plan.regs) {
+    auto reg = cast<seq::FirRegOp>(op);
+    b.setLoc(reg.getLoc());
+    Value v = reg.getNext();
+    if (reg.getReset()) {
+      auto mux = comb::MuxOp::create(b, reg.getReset(), reg.getResetValue(), v);
+      logic.insert(mux);
+      ops.push_back(mux);
+      v = mux;
+    }
+    nexts.push_back(v);
+  }
+  // The leaves: captured at the state pass, held to the next one.
+  DenseMap<Value, Value> captured;
+  unsigned caps = 0;
+  Value one = hw::ConstantOp::create(b, b.getI1Type(), 1);
+  (void)one;
+  auto capture = [&](Value v) -> Value {
+    if (isConstant(v))
+      return v;
+    if (auto *def = v.getDefiningOp(); def && logic.contains(def))
+      return v;
+    Value &c = captured[v];
+    if (!c) {
+      auto width = hw::getBitWidth(v.getType());
+      Value bits = v;
+      if (!isa<IntegerType>(v.getType()))
+        bits = b.createOrFold<hw::BitcastOp>(b.getIntegerType(width), v);
+      Value reg = seq::CompRegClockEnabledOp::create(
+          b, bits.getType(), bits, hostClock, stateNow,
+          b.getStringAttr(prefix + "cap" + Twine(caps++)), Value(), Value(),
+          Value(), hw::InnerSymAttr{});
+      if (reg.getType() != v.getType())
+        reg = b.createOrFold<hw::BitcastOp>(v.getType(), reg);
+      c = reg;
+      stats.captureBits += width;
+    }
+    return c;
+  };
+  for (auto *op : ops)
+    for (auto &operand : op->getOpOperands())
+      if (Value at = capture(operand.get()); at != operand.get())
+        operand.set(at);
+  for (auto &v : nexts)
+    v = capture(v);
+  // Held as a placeholder's operands: the lanes replace their roots.
+  auto held = UnrealizedConversionCastOp::create(b, TypeRange{}, nexts);
+  auto st = foldLanes(b, ops, hostClock, stateNow, passes, span, prefix);
+  st.captureBits = stats.captureBits;
+  for (auto [i, op] : llvm::enumerate(plan.regs))
+    next[op] = held->getOperand(i);
+  held->erase();
+  return st;
 }
 
 } // namespace foldsim
