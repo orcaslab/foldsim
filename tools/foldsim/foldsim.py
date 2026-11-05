@@ -1575,12 +1575,13 @@ def main():
         info['multicycle'].append({'prefix': prefix, 'cycles': int(cycles),
                                    'capture_bits': int(caps), 'end_bits': int(ends)})
     ps = re.search(r'foldsim\.pass_split = \[(.*?)\]', sim_text)
-    info['pass_split'] = []
+    splits = []
     for e in re.findall(r'"([^"]*)"', ps.group(1)) if ps else []:
         prefix, span, passes, hold = e.rsplit(':', 3)
-        info['pass_split'].append({'prefix': prefix, 'span': int(span), 'passes': int(passes),
-                                   'hold_bits': int(hold)})
-    write_multicycle_xdc(info['multicycle'], out('foldsim_multicycle.xdc'), info['pass_split'])
+        splits.append({'prefix': prefix, 'span': int(span), 'passes': int(passes), 'hold_bits': int(hold)})
+    if splits:
+        info['pass_split'] = splits
+    write_multicycle_xdc(info['multicycle'], out('foldsim_multicycle.xdc'), splits)
     if info.get('vmem'):
         info['vmem_forward'] = a.vmem_forward
     # Folded port bundles: the records' layouts (foldsim.ports).
