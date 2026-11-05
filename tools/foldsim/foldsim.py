@@ -384,6 +384,8 @@ def frame_options(a):
         fold += f' link-hbm-min-lead={a.link_hbm_min_lead}'
     if getattr(a, 'link_hbm_shift', 0):
         fold += f' link-hbm-shift={a.link_hbm_shift}'
+    if getattr(a, 'page_write_gate', False):
+        fold += ' page-write-gate'
     if getattr(a, 'link_hbm_fit_slots', False):
         fold += ' link-hbm-fit-slots'
     if getattr(a, 'fold_ports', ''):
@@ -904,6 +906,14 @@ def main():
                          "alone, the rest as inputs: a per-port select in front of a per-port "
                          "class is then one copy in the class (foldsim-extract-models "
                          "absorb-exclusive)")
+    ap.add_argument('--absorb-registers', action='store_true',
+                    help="with --absorb-exclusive: the logic a model input alone reads may pass "
+                         "through registers (a per-port pipeline register and the select in front "
+                         "of it), which move into the model as its state (foldsim-extract-models "
+                         "absorb-registers)")
+    ap.add_argument('--absorb-register-logic', type=int, default=0, metavar='N',
+                    help='with --absorb-registers: the most ops a model input\'s logic through '
+                         'registers may take (default: the absorb limit, %d)' % ABSORB_LOGIC)
     ap.add_argument('--nest', action='store_true',
                     help="fold nested classes recursively: each class's threads numbered so "
                          "that a thread and its parent's are current together (foldsim-compose); with "
@@ -1051,6 +1061,12 @@ def main():
                          'request moves earlier, or its write later, so that streams whose requests or writes '
                          'fall at the same positions share an engine (within the room from the row\'s write to '
                          'its request; foldsim-fold-static; 0: none)')
+    ap.add_argument('--page-write-gate', action='store_true',
+                    help='with --static and --page-engines: off-chip pages written back through a gated '
+                         'register a page (loaded the host cycle before its write, else held at zero) and an OR '
+                         'of the pages, instead of a p:1 select by the page index: about (p - 1) / 5 LUTs a '
+                         'page bit instead of (p - 1) / 3, at a register a paged bit (foldsim-fold-static '
+                         'page-write-gate)')
     ap.add_argument('--link-hbm-fit-slots', action='store_true',
                     help='with --static, hbm link kinds and --page-engines: each stream takes the fewest landing '
                          'slots its requests need (a power of two, at least 8; foldsim-fold-static)')
@@ -1325,6 +1341,10 @@ def main():
     for m in order:
         models = f' models={",".join(sorted(children[m]))}' if children[m] else ''
         exclusive = f' absorb-exclusive={a.absorb_exclusive}' if a.absorb_exclusive else ''
+        if a.absorb_exclusive and a.absorb_registers:
+            exclusive += ' absorb-registers'
+            if a.absorb_register_logic:
+                exclusive += f' absorb-register-logic={a.absorb_register_logic}'
         passes.append(f'foldsim-extract-models{{module={m}{models} netlist absorb-logic={ABSORB_LOGIC}{exclusive}}}')
         fused = [g for g in groups if set(g) <= children[m]]
         if fused:

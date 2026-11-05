@@ -1,0 +1,13 @@
+# The platform's masters for the kernel's controllers (foldsim_storage
+# platform_cost 'best', the FOLDSIM_VMEM_MASTERS the flow sets): by the whole
+# HBM share (HBM_BYTES_PER_CYCLE: 10 beats a host cycle, 10 masters, 3
+# sc_mem nodes past the 8 HBM ports) or, with a point's own traffic
+# (foldsim_degree state --masters-by-traffic), its beats x MASTER_HEADROOM:
+# a light 128-SM point (35 bytes a host cycle) takes 7 (8 masters with the
+# folded port's: no sc_mem node), never more than the share's (480 bytes).
+# RUN: python3 %S/Inputs/platform/masters.py foldsim | FileCheck %s
+# CHECK: ctl 13 traffic None: vmem masters 10 masters 11 shares 10 sc_nodes 3 luts 28764
+# CHECK: ctl 13 traffic 35.3: vmem masters 7 masters 8 shares 7 sc_nodes 0 luts 8484
+# CHECK: ctl 13 traffic 480.0: vmem masters 10 masters 11 shares 10 sc_nodes 3 luts 28764
+# CHECK: ctl 84 traffic None: vmem masters 10 masters 11 shares 10 sc_nodes 3 luts 99835
+# CHECK: ctl 84 traffic 72.2: vmem masters 7 masters 8 shares 7 sc_nodes 0 luts 79555

@@ -1,0 +1,21 @@
+# REQUIRES: verilator
+# `--absorb-exclusive Lane --absorb-registers` (foldsim-extract-models absorb-registers): each lane's two pipeline
+# registers in the top (one selected from a shared bank by a dynamic offset plus the lane's own constant, one holding
+# its value unless the lane's enable bit is set) move into the lane model with their selects; exact against the
+# target, channels stalled or not, at the host cycles of the same fold without it. The mutant (lane 2's select takes
+# another bank entry, top_mut.sv), folded the same way, mismatches the target.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/pipein
+# RUN: foldsim --srcs top.f --top Top --out %t/ab --static --nest --modulo --compact-links --share-links --zero-latency-links --absorb-exclusive Lane --absorb-registers Lane 2>&1 | FileCheck %s --check-prefix=CMD
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/ab/obj %S/Inputs/tb_reset.sv top.sv %t/ab/foldsim_sim.sv > %t/ab/build.log 2>&1
+# RUN: %t/ab/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s --check-prefix=H0
+# RUN: %t/ab/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=60 | FileCheck %s --check-prefix=H60
+# RUN: foldsim --srcs top.f --top Top --out %t/pl --static --nest --modulo --compact-links --share-links --zero-latency-links Lane > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/pl/obj %S/Inputs/tb_reset.sv top.sv %t/pl/foldsim_sim.sv > %t/pl/build.log 2>&1
+# RUN: %t/pl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s --check-prefix=H0
+# RUN: foldsim --srcs top_mut.f --top Top --out %t/mu --static --nest --modulo --compact-links --share-links --zero-latency-links --absorb-exclusive Lane --absorb-registers Lane > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/mu/obj %S/Inputs/tb_reset.sv top.sv %t/mu/foldsim_sim.sv > %t/mu/build.log 2>&1
+# RUN: %t/mu/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s --check-prefix=MUT
+# CMD: absorb-exclusive=Lane absorb-registers
+# H0: {{^}}MATCH 196 cycles in 1200 host cycles
+# H60: {{^}}MATCH 196 cycles in
+# MUT: {{^}}MISMATCH cycle

@@ -1,0 +1,36 @@
+# The fold-degree model's page engines as foldsim-fold-static assigns them
+# (foldsim_storage.engines_first_fit, foldsim_degree state --engine-rule
+# first-fit, --link-hbm-shift): the link streams first, each on an engine of
+# its own unless link-hbm-shift lets it share one within ENGINE_STREAM_OCC of
+# the frame; then each off-chip copy's columns on the first run of engines
+# whose occupancy leaves its page traffic room (ENGINE_PAGE_OCC), new ones
+# past the last. Against the compiler's own assignment (the report's `page
+# engines` line) of the same folds: never fewer (an upper bound), equal where
+# the shares leave no doubt; the rule of before ('max': every copy's columns
+# and every stream on engines of their own) prices every stream and column
+# apart.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/linkshare
+# Three streams, no shift: an engine each; with --link-hbm-shift 8 one.
+# RUN: foldsim --srcs top.f --top Top --out %t/own --static --nest --modulo --min-ii 160 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --schedule-only --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm Unit Vnit Reader Sink > %t/own.log 2>&1
+# RUN: python3 engines_ff.py foldsim %t/own/schedule.txt 0 | FileCheck %s --check-prefix=OWN
+# RUN: foldsim --srcs top.f --top Top --out %t/sh --static --nest --modulo --min-ii 160 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-shift 8 --schedule-only --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm Unit Vnit Reader Sink > %t/sh.log 2>&1
+# RUN: python3 engines_ff.py foldsim %t/sh/schedule.txt 8 | FileCheck %s --check-prefix=SH
+# Two models' off-chip pages beside two streams (Inputs/linkhbm, frame 160):
+# the compiler puts the pages on the streams' engines (2, with the shift or
+# not); priced at ENGINE_PAGE_OCC 0.1 (the bound of every as-built fold) the
+# copies (a share of 0.2 each) take engines of their own: 4 and 3.
+# RUN: cd %S/Inputs/linkhbm
+# RUN: foldsim --srcs top.f --top Top --out %t/two --static --nest --modulo --min-ii 160 --page 1 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/two.log 2>&1
+# RUN: python3 ../linkshare/engines_ff.py foldsim %t/two/schedule.txt 0 | FileCheck %s --check-prefix=TWO
+# RUN: foldsim --srcs top.f --top Top --out %t/twos --static --nest --modulo --min-ii 160 --page 1 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-hbm-shift 8 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/twos.log 2>&1
+# RUN: python3 ../linkshare/engines_ff.py foldsim %t/twos/schedule.txt 8 | FileCheck %s --check-prefix=TWOS
+# A large fold's regime and a dense one (engines_ff.py --regimes), and the
+# large one's request selects over each engine's members (engine_member_luts:
+# AND-OR, three members a LUT, an OR tree of those).
+# RUN: python3 %S/Inputs/linkshare/engines_ff.py foldsim --regimes | FileCheck %s --check-prefix=FF
+# OWN: engines: first-fit 3, max 3, built 3
+# SH: engines: first-fit 1, max 3, built 1
+# TWO: engines: first-fit 4, max 4, built 2
+# TWOS: engines: first-fit 3, max 4, built 2
+# FF: large 26 5 dense 10
+# FF-NEXT: members [26, 18, 13, 8, 4] luts 19840

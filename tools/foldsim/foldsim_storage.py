@@ -466,13 +466,23 @@ SC_NODE_LOGIC = (808.0, 2108.0)
 SC_NODE_LUTRAM = (781.0, 801.0)
 
 
-def platform_cost(mem_ports, controllers, vmem_masters=None):
+# The masters the controllers' traffic needs where it is known (platform_cost
+# `bytes_per_cycle`: a fold's HBM bytes a frame over the frame): its AXI beats
+# a host cycle with MASTER_HEADROOM for the static order's bursts (the
+# positions where several engines and controllers request at once), at least
+# one, at most what the whole HBM share needs (HBM_BYTES_PER_CYCLE, the need
+# without it).
+MASTER_HEADROOM = 4.0
+
+
+def platform_cost(mem_ports, controllers, vmem_masters=None, bytes_per_cycle=None):
     """The masters' shares and SLASH's sc_mem tree for a kernel of
     `mem_ports` memory-port masters and `controllers` foldsim_vmem controllers
     (`vmem_masters`: the kernel's FOLDSIM_VMEM_MASTERS, default as many as
     fit; 'best': the count of least LUTs, which the flow's
-    FOLDSIM_VMEM_MASTERS sets): dict(logic, lutram, masters, shares, sc_nodes,
-    vmem_masters)."""
+    FOLDSIM_VMEM_MASTERS sets; `bytes_per_cycle`: the traffic the 'best'
+    count must carry, else the whole HBM share): dict(logic, lutram, masters,
+    shares, sc_nodes, vmem_masters)."""
     if vmem_masters == 'best':
         # The controllers' traffic needs masters: at least HBM_BYTES_PER_CYCLE
         # of AXI beats a host cycle (or one each), on their own masters or on
@@ -480,6 +490,8 @@ def platform_cost(mem_ports, controllers, vmem_masters=None):
         p, n = max(int(mem_ports), 0), max(int(controllers), 0)
         top = min(n, max(0, MAX_MASTERS - p))
         need = min(n, math.ceil(HBM_BYTES_PER_CYCLE / HBM_BEAT_BYTES))
+        if bytes_per_cycle is not None:
+            need = min(need, max(1, math.ceil(MASTER_HEADROOM * bytes_per_cycle / HBM_BEAT_BYTES - 1e-9)))
         ms = [m for m in range(top + 1) if (m if m else min(n, p)) >= need] or [top]
         return min((platform_cost(p, n, m) for m in ms),
                    key=lambda c: (c['logic'] + c['lutram'], -c['vmem_masters']))
@@ -607,6 +619,81 @@ def no_forward():
     CTL_FORWARD = 0
 
 
+# The engines a fold takes, as foldsim-fold-static assigns them
+# (assignPageEngines), from occupancies (`engines_first_fit`): the link
+# streams first, then each off-chip copy's columns on the first run of
+# `columns` consecutive engines (new ones past the last) whose positions
+# leave its page traffic room. Positions are not known before a schedule,
+# so a position's use is an occupancy: an engine's share of the frame taken
+# (reads; writes alike), in the model's shares (page_engine_share, a copy's
+# max(p, 2) x instances; link_stream_cost's ports, a stream's). A copy's page
+# reads go in the window between its state passes, in page order after the
+# frame before's writes, page 0 two positions before the pass, and a copy's
+# state passes may sit close together in the frame, so it shares a run only
+# where the run's occupancy plus its own stays within ENGINE_PAGE_OCC. 0.1 is
+# the largest that bounds every as-built fold from above (pg_1105 occfit.py,
+# built / first-fit at 0.1 / 0.25 / 'max'): a64 m_p64 (II 1,016) 20 / 24 / 16
+# / 57, s_p64 14 / 16 / 11 / 26, m_a64 42 / 78 / 70 / 88, s_a64 35 / 59 / 54 /
+# 59, g16b and g16c 10 / 10 / 10 / 10, a128 fake_S1_s4 (shift 256) 4 / 5 / 5 /
+# 32. A stream's requests sit a lead before its landings: at its own
+# positions an engine each (streams landing at the same passes collide: the
+# 32-SM schedule g32cs put 17 on 15); with link-hbm-shift (requests up to N
+# positions earlier, writes later) on the first engine within
+# ENGINE_STREAM_OCC (Driver/engines-first-fit.test: three streams of share
+# 0.3 on one; a64 S2_m64, shift 256 at II 81,922: 20 streams 16 -> 7
+# engines; a128 fake_S1_s4: 32 streams and a page column on 4).
+ENGINE_PAGE_OCC = 0.1
+ENGINE_STREAM_OCC = 1.0
+
+
+def engines_first_fit(copies, streams, shift=0, members=False):
+    """The page engines of a fold: `copies` [(columns, share of the frame a
+    column's page traffic takes)] in the compiler's class order, `streams`
+    [share of the frame its requests take]; `shift` the compiler's
+    link-hbm-shift. Returns the engine count, with `members` also each
+    engine's member count (columns and streams it carries)."""
+    occ, mem = [], []
+    for u in streams:
+        for e in range(len(occ) if shift > 0 else 0):
+            if occ[e] + u <= ENGINE_STREAM_OCC:
+                occ[e] += u
+                mem[e] += 1
+                break
+        else:
+            occ.append(u)
+            mem.append(1)
+    for cols, u in copies:
+        cols = max(int(cols), 1)
+        first = 0
+        while any(occ[e] + u > ENGINE_PAGE_OCC for e in range(first, min(first + cols, len(occ)))):
+            first += 1
+        for e in range(first, first + cols):
+            if e < len(occ):
+                occ[e] += u
+                mem[e] += 1
+            else:
+                occ.append(u)
+                mem.append(1)
+    return (len(occ), mem) if members else len(occ)
+
+
+# An engine carrying m > 1 members (page columns, streams) takes their
+# requests through the simulator's AND-OR (foldsim-fold-static: each member's
+# read / write valid, tag, row, data and mask gated by its valid and OR-ed):
+# ENGINE_MEMBER_BITS bits (a 512-bit row, its mask, tags and rows of both
+# requests and the valids), each a LUT6 for three members' (valid, bit)
+# pairs and an OR tree of those (six to a LUT).
+ENGINE_MEMBER_BITS = PAGE_ENGINE_BITS + PAGE_ENGINE_BITS // 8 + 64
+
+
+def engine_member_luts(m, bits=ENGINE_MEMBER_BITS):
+    """The LUTs of an engine's request select over `m` members."""
+    if m <= 1:
+        return 0.0
+    first = -(-m // 3)
+    return float(bits * (first + -(-(first - 1) // 5)))
+
+
 def page_engine_ctl(row_bits=PAGE_ENGINE_BITS):
     """A page engine's (logic LUTs, LUTRAM LUTs)."""
     c = ctl_cost('engine', row_bits)
@@ -640,12 +727,30 @@ def page_hbm_depth(bits, threads, p, frame, port_share=0.5):
     return max(p, min(top, want))
 
 
+# foldsim --page-write-gate (foldsim-fold-static page-write-gate): an
+# off-chip copy on engines writes its pages back through a gated register a
+# page (zero but the host cycle before its write, its FF's synchronous reset)
+# and an OR of them: ceil((p - 1) / 5) LUTs a page bit (six-input ORs)
+# instead of the p:1 select's ceil((p - 1) / 3), half a LUT a bit of page 0
+# (it loads the write-back register's next value), and a register a paged bit.
+PAGE_WRITE_GATE = False
+
+
+def page_gate_luts(p):
+    """LUTs a page bit of a gated write-back's OR (p pages), page 0's load
+    select spread over the pages."""
+    return math.ceil((p - 1) / 5) + 0.5 / p if p > 1 else 0
+
+
 def page_hbm_cost(bits, threads, p, engines_frame=None):
     """Paged register state off chip (pages=hbm) as a relief kind: page_cost's
     'hbm' with its traffic in the `hbm` pool. With `engines_frame` (HBM page
     streams at that frame): its share of page engines (`ctl`, fractional;
     `engine_columns`) instead of a controller per column."""
     c = page_cost(bits, threads, p, 'hbm')
+    if engines_frame and PAGE_WRITE_GATE and p > 1:
+        pw = math.ceil(bits / p)
+        c = dict(c, lut=float(pw * page_gate_luts(p)), ff=c['ff'] + bits)
     if engines_frame:
         columns, share = page_engine_share(bits, threads, p, engines_frame)
         cl, cr = page_engine_ctl()
