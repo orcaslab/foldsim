@@ -732,7 +732,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             nameable = named and not re.search(r'[,=:{}\s]', name)
             u = unit(c, name, per, lam, None if nameable else default)
             u['default'] = default
-            if tiers is not None and nameable and len(per) == len(forms) and all(
+            if tiers is not None and not tiers.get('as_built') and nameable and \
+                    len(per) == len(forms) and all(
                     not storage.vmem_eligible((name, d, w, r, wr, rl, st, mask, named), gap)
                     for _, _, _, gap in forms):
                 weights = tiers.get('weights') or {}
@@ -771,7 +772,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             # a register may page as rows too (foldsim-fold-static
             # page-memories): a kind priced as paged_state prices the small
             # ones, its page RAM a share of the class's (URAM).
-            if tiers is not None and nameable and len(per) == len(forms) and rl <= 1 and \
+            if tiers is not None and not tiers.get('as_built') and nameable and \
+                    len(per) == len(forms) and rl <= 1 and \
                     all(f == 'paged' for _, _, f, _ in forms) and \
                     d * w <= tiers.get('row_bits_max', ROW_BITS_MAX):
                 rc = dict(lut=0.0, lutram=0.0, ff=0, bram=0.0, uram=0.0, ii_floor=0)
@@ -987,7 +989,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                **({'link_kinds': ','.join(link_rules)} if lu else {}),
                **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged),
                **({'page_engines': page_engines} if page_engines else {}),
-               controllers=round(n_ctl, 1),
+               kernel_controllers=round(n_ctl, 1),
                **({'platform': {k: round(v) for k, v in platform.items()}} if platform else {}))
     if platform or BUILT is not None:
         # The controllers and the platform terms are priced after the kinds:
@@ -2031,8 +2033,11 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
     if BUILT is not None:
         # As built (--built-json): the schedule's frame, its pages, virtual
         # memories and link kinds as generated; nothing moves.
+        tiers = dict(frame=ii, base_hbm=base_hbm, base_bubbles=base_bubbles, weights=weights,
+                     pages_hbm=False, row_bytes_min=row_bytes_min, link_pages=link_pages,
+                     link_hbm=False, vmem_group=vmem_group, page_engines=page_engines, as_built=True)
         res = area(cal, est, classes, {}, rest, sched, ii, entries, 'auto', route, uram,
-                   vmem=None, tiers=None)
+                   vmem=None, tiers=tiers)
         return outcome(res, {}, ii)
     lk = link_cost(cal, (sched or {}).get('__links__'))
     top = min(max_ii, (frame_growth or FRAME_GROWTH) * ii)
