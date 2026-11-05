@@ -191,6 +191,9 @@ BUILT = None
 # foldsim-fold-static assigns them (storage.engines_first_fit), `shift` the
 # fold's link-hbm-shift (state --engine-rule, --link-hbm-shift).
 ENGINES = dict(rule='max', shift=0)
+# The platform's masters (storage.platform_cost 'best'): by the whole HBM share
+# (default) or by the point's own HBM traffic (state --masters-by-traffic).
+PLATFORM = dict(by_traffic=False)
 
 
 def read_built(path):
@@ -1046,8 +1049,14 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             ports = BUILT['mem_ports']
         # Built: the kernel's masters as generated; planned: the count of least
         # LUTs (FOLDSIM_VMEM_MASTERS, a flow setting, recorded in the outcome).
+        # With --masters-by-traffic the count of least LUTs that carries this
+        # point's HBM bytes a host cycle (storage.MASTER_HEADROOM), not the whole
+        # HBM share.
+        bpc = None
+        if PLATFORM['by_traffic'] and tiers is not None and BUILT is None:
+            bpc = (off['hbm_bytes'] + tiers.get('base_hbm', 0.0) + built_hbm) / max(tiers['frame'], 1)
         platform = storage.platform_cost(ports, math.ceil(n_ctl - 1e-9),
-                                         BUILT.get('vmem_masters') if BUILT else 'best')
+                                         BUILT.get('vmem_masters') if BUILT else 'best', bpc)
         logic += platform['logic']
         lutram += platform['lutram']
     sites = logic + storage.LUTRAM_SITES * lutram
@@ -2478,6 +2487,10 @@ def main():
     st.add_argument('--link-hbm-shift', type=int, default=0, metavar='N',
                     help="the fold's foldsim --link-hbm-shift (streams on the page engines move their "
                          "requests up to N positions to share an engine), for --engine-rule first-fit")
+    st.add_argument('--masters-by-traffic', action='store_true',
+                    help="the controllers' masters (FOLDSIM_VMEM_MASTERS) of least LUTs that carry the "
+                         "point's own HBM bytes a host cycle (x storage.MASTER_HEADROOM), not the whole HBM "
+                         'share: fewer masters, shares and sc_mem nodes where the traffic is light')
     st.add_argument('--link-hbm', action='store_true',
                     help='price links in HBM too (a what-if: the compiler builds none)')
     st.add_argument('--built-json', default='', metavar='JSON',
@@ -2534,6 +2547,7 @@ def main():
 def state_main(a):
     global BUILT
     ENGINES.update(rule=getattr(a, 'engine_rule', 'max'), shift=getattr(a, 'link_hbm_shift', 0))
+    PLATFORM.update(by_traffic=getattr(a, 'masters_by_traffic', False))
     if a.exact:
         storage.ASSIGN_EXACT = True
     if a.vmem_forward == 0:

@@ -466,13 +466,23 @@ SC_NODE_LOGIC = (808.0, 2108.0)
 SC_NODE_LUTRAM = (781.0, 801.0)
 
 
-def platform_cost(mem_ports, controllers, vmem_masters=None):
+# The masters the controllers' traffic needs where it is known (platform_cost
+# `bytes_per_cycle`: a fold's HBM bytes a frame over the frame): its AXI beats
+# a host cycle with MASTER_HEADROOM for the static order's bursts (the
+# positions where several engines and controllers request at once), at least
+# one, at most what the whole HBM share needs (HBM_BYTES_PER_CYCLE, the need
+# without it).
+MASTER_HEADROOM = 4.0
+
+
+def platform_cost(mem_ports, controllers, vmem_masters=None, bytes_per_cycle=None):
     """The masters' shares and SLASH's sc_mem tree for a kernel of
     `mem_ports` memory-port masters and `controllers` foldsim_vmem controllers
     (`vmem_masters`: the kernel's FOLDSIM_VMEM_MASTERS, default as many as
     fit; 'best': the count of least LUTs, which the flow's
-    FOLDSIM_VMEM_MASTERS sets): dict(logic, lutram, masters, shares, sc_nodes,
-    vmem_masters)."""
+    FOLDSIM_VMEM_MASTERS sets; `bytes_per_cycle`: the traffic the 'best'
+    count must carry, else the whole HBM share): dict(logic, lutram, masters,
+    shares, sc_nodes, vmem_masters)."""
     if vmem_masters == 'best':
         # The controllers' traffic needs masters: at least HBM_BYTES_PER_CYCLE
         # of AXI beats a host cycle (or one each), on their own masters or on
@@ -480,6 +490,8 @@ def platform_cost(mem_ports, controllers, vmem_masters=None):
         p, n = max(int(mem_ports), 0), max(int(controllers), 0)
         top = min(n, max(0, MAX_MASTERS - p))
         need = min(n, math.ceil(HBM_BYTES_PER_CYCLE / HBM_BEAT_BYTES))
+        if bytes_per_cycle is not None:
+            need = min(need, max(1, math.ceil(MASTER_HEADROOM * bytes_per_cycle / HBM_BEAT_BYTES - 1e-9)))
         ms = [m for m in range(top + 1) if (m if m else min(n, p)) >= need] or [top]
         return min((platform_cost(p, n, m) for m in ms),
                    key=lambda c: (c['logic'] + c['lutram'], -c['vmem_masters']))
