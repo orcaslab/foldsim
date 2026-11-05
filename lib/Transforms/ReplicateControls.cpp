@@ -58,6 +58,27 @@ bool isWiring(Operation *op) {
   return false;
 }
 
+/// Logic of one LUT: a one-bit result of at most six input bits. With
+/// `fanout-logic`, copied along with a replica like wiring, so that the
+/// loads past it are bounded too.
+bool isLutLogic(Operation *op) {
+  if (!isa<comb::AndOp, comb::OrOp, comb::XorOp, comb::MuxOp, comb::ICmpOp>(op) ||
+      op->getNumResults() != 1 || hw::getBitWidth(op->getResult(0).getType()) != 1)
+    return false;
+  int64_t bits = 0;
+  for (auto operand : op->getOperands())
+    bits += hw::getBitWidth(operand.getType());
+  return bits <= 6;
+}
+
+bool isDontTouch(Operation *op) {
+  auto attrs = sv::getSVAttributes(op);
+  return attrs && llvm::any_of(attrs, [](Attribute a) {
+           auto sva = dyn_cast<sv::SVAttributeAttr>(a);
+           return sva && sva.getName().getValue() == "DONT_TOUCH";
+         });
+}
+
 uint64_t widthOf(Value value) {
   return std::max<int64_t>(1, hw::getBitWidth(value.getType()));
 }
@@ -108,14 +129,14 @@ struct Fanout {
   llvm::SmallPtrSet<Operation *, 8> wiring;
 };
 
-Fanout fanoutOf(Value reg) {
+Fanout fanoutOf(Value reg, bool logic = false) {
   Fanout fanout;
   SmallVector<Value> worklist{reg};
   while (!worklist.empty()) {
     Value value = worklist.pop_back_val();
     for (auto &use : value.getUses()) {
       auto *owner = use.getOwner();
-      if (isWiring(owner)) {
+      if (isWiring(owner) || (logic && isLutLogic(owner))) {
         if (fanout.wiring.insert(owner).second)
           for (auto result : owner->getResults())
             worklist.push_back(result);
@@ -251,17 +272,34 @@ struct ReplicateControlsPass
       if (reg->hasAttr(foldsim::kControlAttrName))
         controls.push_back(reg);
     if (loads) {
-      splitWidePorts(controls);
-      replicate(body, controls);
+      splitWidePorts(controls, loads);
+      replicate(body, controls, loads);
     }
     for (auto reg : body->getOps<seq::FirRegOp>())
       reg->removeAttr(foldsim::kControlAttrName);
+    // `fanout`: any register of more loads, the target's own included (a
+    // reset or select a copy's state takes from one flop).
+    if (fanout) {
+      SmallVector<seq::FirRegOp> heavy;
+      for (auto reg : body->getOps<seq::FirRegOp>()) {
+        // Not a control replicated above (DONT_TOUCH: it and its replicas).
+        if (reg.getInnerSymAttr() || isDontTouch(reg))
+          continue;
+        uint64_t total = 0;
+        for (auto *use : fanoutOf(reg.getResult(), fanoutLogic).sinks)
+          total += loadsOf(*use);
+        if (total > fanout)
+          heavy.push_back(reg);
+      }
+      splitWidePorts(heavy, fanout);
+      replicate(body, heavy, fanout, fanoutLogic);
+    }
   }
 
   /// A memory of LUTs, or a select, whose one port a control drives with
   /// more than `loads` pins, split by bits so that the parts' ports can take
   /// replicas of their own.
-  void splitWidePorts(ArrayRef<seq::FirRegOp> controls) {
+  void splitWidePorts(ArrayRef<seq::FirRegOp> controls, uint64_t loads) {
     llvm::SetVector<Operation *> memories, muxes;
     for (auto reg : controls) {
       for (auto *use : fanoutOf(reg.getResult()).sinks) {
@@ -296,7 +334,8 @@ struct ReplicateControlsPass
   /// group of its loads in module order. A replica's driver, itself a
   /// control or its replica, comes first in the module, so the controls are
   /// taken last first: a driver counts the replicas of what it drives.
-  void replicate(Block *body, ArrayRef<seq::FirRegOp> controls) {
+  void replicate(Block *body, ArrayRef<seq::FirRegOp> controls, uint64_t loads,
+                 bool logic = false) {
     auto *context = body->getParentOp()->getContext();
     // Kept apart: replicas are equal registers, which synthesis merges back
     // into one (Vivado's equivalent register removal) unless each is kept,
@@ -317,7 +356,7 @@ struct ReplicateControlsPass
     for (auto reg : llvm::reverse(controls)) {
       if (reg.getInnerSymAttr())
         continue;
-      auto fanout = fanoutOf(reg.getResult());
+      auto fanout = fanoutOf(reg.getResult(), logic);
       uint64_t total = 0;
       for (auto *use : fanout.sinks)
         total += loadsOf(*use);

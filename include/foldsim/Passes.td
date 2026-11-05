@@ -998,11 +998,27 @@ def ReplicateControls
     `DONT_TOUCH`. The simulator's behavior is the same on every host cycle.
 
     The marks are removed in any case; `loads` 0 replicates nothing.
+
+    With `fanout` N, any other register of more than N loads is replicated
+    the same way (groups of at most N), muxes and LUT memories it drives over
+    N split first; with `fanout-logic` the loads are counted, and the logic
+    copied, through one-LUT logic (`isLutLogic`) as well. Replicas hold the
+    register's value on every host cycle and copied logic computes the same
+    function of them: cycle for cycle the same simulator.
   }];
   let options = [
     Option<"loads", "loads", "unsigned", "96",
            "The most loads a marked register or a replica drives; 0: none "
            "replicated">,
+    Option<"fanout", "fanout", "unsigned", "0",
+           "Also every other register (the copies' own state and the "
+           "simulator's read selects) of more loads than this: replicated "
+           "the same way, each replica at most this many; 0: none">,
+    Option<"fanoutLogic", "fanout-logic", "bool", "false",
+           "With fanout: the one-LUT logic between such a register and its "
+           "loads (a one-bit result of at most six input bits: a reset or "
+           "enable decoded from a few flops) is copied with each replica, so "
+           "the net past it is bounded too">,
   ];
   let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect",
                            "circt::sv::SVDialect"];

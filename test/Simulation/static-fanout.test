@@ -1,0 +1,21 @@
+# REQUIRES: verilator
+# `--fanout N --fanout-logic` (foldsim-replicate-controls fanout / fanout-logic): every register of more than N
+# loads, the copies' own state and the simulator's read selects included, is replicated in lockstep (and the one-LUT
+# logic past it copied per replica); exact against the target, channels stalled or not, at the host cycles of the
+# same fold without it (static-link-kinds.test's designs and flags, N = 4 so that the small designs replicate).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/tree-arb
+# RUN: foldsim --srcs top.f --top Top --out %t/tz --static --nest --modulo --compact-links --staged-links --share-links --zero-latency-links --zero-latency-chains --fanout 4 --fanout-logic --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=CMD
+# RUN: FileCheck %s --check-prefix=SIM < %t/tz/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/tz/obj %S/Inputs/tb_reset.sv top.sv %t/tz/foldsim_sim.sv > %t/tz/build.log 2>&1
+# RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s --check-prefix=H0
+# RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=60 | FileCheck %s --check-prefix=H60
+# RUN: cd %S/../Driver/Inputs/broadcast
+# RUN: foldsim --srcs top.f --top Top --out %t/bc --static --nest --modulo --share-links --compact-links --staged-links --fanout 4 --fanout-logic Lane > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=SIM < %t/bc/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/bc/obj %S/Inputs/tb_reset.sv top.sv %t/bc/foldsim_sim.sv > %t/bc/build.log 2>&1
+# RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s --check-prefix=H0
+# RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=60 | FileCheck %s --check-prefix=H60
+# CMD: foldsim-replicate-controls{loads=96 fanout=4 fanout-logic}
+# SIM: _rep1 = seq.firreg {{.*}}DONT_TOUCH
+# H0: {{^}}MATCH 196 cycles in 1200 host cycles
+# H60: {{^}}MATCH 196 cycles in 1389 host cycles

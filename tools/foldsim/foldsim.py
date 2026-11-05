@@ -1206,6 +1206,13 @@ def main():
                     help='with --static: the most loads (LUT pins per bit) a copy of the slot '
                          'controls drives; one over it is replicated, the replicas loaded in '
                          'lockstep (foldsim-replicate-controls); 0: none replicated')
+    ap.add_argument('--fanout', type=int, default=0,
+                    help='with --static: every other register (copies\' state, read selects) of more loads '
+                         'than this is replicated the same way, each replica at most this many '
+                         '(foldsim-replicate-controls fanout); 0: none')
+    ap.add_argument('--fanout-logic', action='store_true',
+                    help='with --fanout: one-LUT logic between such a register and its loads (a reset or '
+                         'enable decoded from a few flops) copied with each replica')
     ap.add_argument('classes', nargs='*',
                     help='none: the whole target one model of one thread, unthreaded')
     a = ap.parse_args()
@@ -1445,7 +1452,10 @@ def main():
                 run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
                      '-o', out('models.mlir')])
             fold += slr_options(a, foldsim_opt, out('models.mlir'), fold, out)
-        replicate = f'hw.module(foldsim-replicate-controls{{loads={a.control_fanout}}})'
+        rc = f'loads={a.control_fanout}'
+        if a.fanout:
+            rc += f' fanout={a.fanout}' + (' fanout-logic' if a.fanout_logic else '')
+        replicate = f'hw.module(foldsim-replicate-controls{{{rc}}})'
         pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}', SPLIT, replicate,
                                         'canonicalize', 'foldsim-sort', 'cse']
         if a.copies == 'auto' or a.slr_groups:
