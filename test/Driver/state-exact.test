@@ -8,3 +8,4 @@
 # CHECK: none None
 # CHECK: assign ['distributed', 'block', 'block']
 # CHECK: opc: frame 4096 H 4096 fits True routes True moved {{[0-9]+}}
+# CHECK: frames: frame 4096 fits True routes True

@@ -134,6 +134,10 @@ module tb;
   initial if (!$value$plusargs("maxreads=%d", maxreads)) maxreads = -1;
   initial if (!$value$plusargs("stall=%d", stall)) stall = 0;
   initial if (!$value$plusargs("bubble=%d", bubble)) bubble = 0;
+  // +burst=<n>: a bubble starts a run of up to n of them, as a host's long
+  // stalls do.
+  int burst = 1, brun = 0;
+  initial if (!$value$plusargs("burst=%d", burst)) burst = 1;
   initial if (!$value$plusargs("full=%d", full)) full = 0;
   initial if (!$value$plusargs("lo=%d", lo)) lo = 1;
   initial if (!$value$plusargs("hi=%d", hi)) hi = lo;
@@ -147,7 +151,12 @@ module tb;
   always @(negedge clk) begin
     vx = ix < T && ($urandom % 100 >= stall);
     yr = $urandom % 100 >= stall;
-    adv = $urandom % 100 >= bubble;
+    if (brun > 0) begin
+      adv = 0; brun--;
+    end else begin
+      adv = $urandom % 100 >= bubble;
+      if (!adv && burst > 1) brun = $urandom % burst;
+    end
   end
   always @(posedge clk) begin
     cyc <= cyc + 1; rst <= 0;
@@ -158,7 +167,7 @@ module tb;
   end
   initial begin
     automatic bit ok = 1;
-    do @(posedge clk); while (iy < T && cyc < 400000);
+    do @(posedge clk); while (iy < T && cyc < 4000000);
     wait (ref_done);
     if (iy < T) begin $display("TIMEOUT at %0d tokens", iy); $finish; end
     for (int t = W; t < T; t++)

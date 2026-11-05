@@ -822,6 +822,37 @@ void LogicAbsorber::run() {
       };
       DenseSet<Value> differing;
       bool same = matchAll(exclusive ? &differing : nullptr);
+      // A differing constant that only indexes arrays in the logic (each
+      // instance's element of a bus, wiring): the element is the leaf, not
+      // the constant and the whole array, so the model takes the element's
+      // bits rather than every instance's bus.
+      if (same && !differing.empty()) {
+        DenseSet<Operation *> inCone(ops.begin(), ops.end());
+        SmallVector<Value> elements, constants;
+        for (Value value : differing) {
+          if (!value.getDefiningOp<hw::ConstantOp>())
+            continue;
+          SmallVector<Value> gets;
+          bool onlyIndex = true;
+          for (auto &use : value.getUses()) {
+            if (!inCone.contains(use.getOwner()))
+              continue;
+            auto get = dyn_cast<hw::ArrayGetOp>(use.getOwner());
+            if (!get || use.getOperandNumber() != 1) {
+              onlyIndex = false;
+              break;
+            }
+            gets.push_back(get.getResult());
+          }
+          if (!onlyIndex || gets.empty())
+            continue;
+          constants.push_back(value);
+          elements.append(gets);
+        }
+        for (Value value : constants)
+          differing.erase(value);
+        differing.insert(elements.begin(), elements.end());
+      }
       if (same && !differing.empty()) {
         ops.clear();
         leaves.clear();
@@ -848,6 +879,21 @@ void LogicAbsorber::run() {
         }
         if (own)
           ownOutput[k] = result.getResultNumber();
+      }
+      // One value broadcast to every instance (a sequencer's control): the
+      // parent computes it once, so the model takes it as it is unless its
+      // logic reads no more bits than it has. Absorbed, every instance would
+      // read all of the logic's operands and compute it again.
+      if (instances.size() > 1 &&
+          llvm::all_of(instances, [&](hw::InstanceOp instance) {
+            return instance.getOperand(index) == instances[0].getOperand(index);
+          })) {
+        int64_t leafBits = 0;
+        for (auto [k, leaf] : llvm::enumerate(leaves))
+          if (!ownOutput[k])
+            leafBits += hw::getBitWidth(leaf.getType());
+        if (leafBits > hw::getBitWidth(arg.getType()))
+          continue;
       }
       IRMapping mapping;
       auto baseName = model.getInputName(index);

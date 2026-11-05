@@ -1,0 +1,21 @@
+# REQUIRES: verilator
+# An output that is a constant of each instance (a cluster's `base + i`
+# from its static input `base`, a leaf's identity) is taken by its readers
+# as that constant, not through a link: an early link's storage is written a
+# frame ahead, so the first frame would read it unwritten, while the target
+# has the value from its first cycle. The leaves fold their identity into a
+# word kept without reset from the first cycle, so a first frame without it
+# differs for good (before the fix: MISMATCH cycle 6). Nested, overlapped by
+# modulo, with stalls and bubbles; the report counts the outputs.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/nestconst
+# RUN: foldsim --srcs top.f --top Top --out %t/a --static --nest --modulo Leaf Cluster > %t/a.log 2>&1
+# RUN: FileCheck %s --check-prefix=REPORT < %t/a/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/a/obj %S/Inputs/tb_reset.sv top.sv %t/a/foldsim_sim.sv > %t/a/build.log 2>&1
+# RUN: %t/a/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/a/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/b --static --nest --modulo --bubbles --short-lead Leaf Cluster > %t/b.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -Mdir %t/b/obj %S/Inputs/tb_reset.sv top.sv %t/b/foldsim_sim.sv > %t/b/build.log 2>&1
+# RUN: %t/b/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +stall=20 +bubble=30 | FileCheck %s
+# REPORT: constant outputs: 3 (taken by their readers as constants)
+# REPORT-NOT: link use Cluster_model Leaf
+# CHECK: {{^}}MATCH 196 cycles

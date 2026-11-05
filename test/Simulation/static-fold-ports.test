@@ -1,0 +1,73 @@
+# REQUIRES: verilator
+# Folded port bundles (--fold-ports REGEX, --fold-ports-reset INPUT): the
+# netlist ports mp_<k>_<field> of four bundles leave and come as two record
+# streams. A bundle's outputs of a target cycle are one request record
+# (req_valid / req_ready / req_chan / req_treset / req_bits, the fields low
+# first in netlist order), its inputs one response record (rsp_valid /
+# rsp_ready / rsp_chan / rsp_bits). The outputs' token queues are memories
+# indexed by bundle and entry, written at each field's pushes one bundle a
+# host cycle (the pushes of a field spread: @4, 5, 6, 7), a record offered a
+# host cycle after the bundle's last push, an early field's token from reset
+# zero, the frame's reset token stored beside the record. The kernel's
+# header gives the layouts (FOLDSIM_PORTS_*). Against the target with a
+# memory-like endpoint on each bundle (Inputs/tb_ports.sv: every bundle
+# busy every cycle, answers 1 to 400 host cycles late, in random bundle
+# order, channels stalled, bubbles), plain and with spec groups (each
+# response field two copies, for the cycle before's fire or not).
+# Mutants that fail it: a field's pushes not spread (two bundles' tokens in
+# one host cycle: MISMATCH), a record sent once any field is pushed (ORDER /
+# MISMATCH), the reset token not carried (MISMATCH).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/ports
+# RUN: foldsim --srcs top.f --top Top --out %t/off --static --nest --modulo Unit > %t/off.log 2>&1
+# RUN: FileCheck %s --check-prefix=OFF --implicit-check-not=FOLDSIM_PORTS < %t/off/foldsim_sim.vh
+# RUN: foldsim --srcs top.f --top Top --out %t/on --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst Unit > %t/on.log 2>&1
+# RUN: FileCheck %s --check-prefix=VH < %t/on/foldsim_sim.vh
+# RUN: FileCheck %s --check-prefix=SLOT < %t/on/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/on -Mdir %t/on/obj %S/Inputs/tb_ports.sv top.sv %t/on/foldsim_sim.sv > %t/on/build.log 2>&1
+# RUN: %t/on/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s
+# RUN: %t/on/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s
+# RUN: %t/on/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/sp --static --nest --modulo --spec-groups mp_0_ack=mp_0_rvalid:mp_0_rdata,mp_1_ack=mp_1_rvalid:mp_1_rdata,mp_2_ack=mp_2_rvalid:mp_2_rdata,mp_3_ack=mp_3_rvalid:mp_3_rdata --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst Unit > %t/sp.log 2>&1
+# RUN: FileCheck %s --check-prefix=SP < %t/sp/foldsim_sim.vh
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/sp -DSPEC -Mdir %t/sp/obj %S/Inputs/tb_ports.sv top.sv %t/sp/foldsim_sim.sv > %t/sp/build.log 2>&1
+# RUN: %t/sp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 +stall=30 | FileCheck %s
+# RUN: %t/sp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=100 +hi=400 | FileCheck %s
+# (A prefix, the same bundles: mp_<k>_<field>.)
+# RUN: foldsim --srcs top.f --top Top --out %t/bu --static --nest --modulo --bubbles --fold-ports mp_ --fold-ports-reset rst Unit > %t/bu.log 2>&1
+# RUN: FileCheck %s --check-prefix=VH < %t/bu/foldsim_sim.vh
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/bu -DBUBBLES -Mdir %t/bu/obj %S/Inputs/tb_ports.sv top.sv %t/bu/foldsim_sim.sv > %t/bu/build.log 2>&1
+# RUN: %t/bu/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +lo=1 +hi=30 +bubble=30 +stall=30 | FileCheck %s
+# Errors: bundles not numbered from 0; no such reset input.
+# RUN: not foldsim --srcs top.f --top Top --out %t/e1 --static --nest --modulo --fold-ports 'mp_([13])_(.*)' --fold-ports-reset rst Unit 2>&1 | FileCheck %s --check-prefix=NUM
+# RUN: not foldsim --srcs top.f --top Top --out %t/e2 --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset nosuch Unit 2>&1 | FileCheck %s --check-prefix=RST
+# OFF: `define FOLDSIM_NUM_CLASSES
+# VH: `define FOLDSIM_PORTS 4
+# VH-NEXT: `define FOLDSIM_PORTS_CW 2
+# VH-NEXT: `define FOLDSIM_PORTS_REQ_W 30
+# VH-NEXT: `define FOLDSIM_PORTS_REQ_AVALID_LO 0
+# VH-NEXT: `define FOLDSIM_PORTS_REQ_AVALID_W 1
+# VH-NEXT: `define FOLDSIM_PORTS_REQ_ADDR_LO 1
+# VH-NEXT: `define FOLDSIM_PORTS_REQ_ADDR_W 8
+# VH-NEXT: `define FOLDSIM_PORTS_REQ_DATA_LO 9
+# VH-NEXT: `define FOLDSIM_PORTS_REQ_DATA_W 16
+# VH-NEXT: `define FOLDSIM_PORTS_REQ_ACK_LO 25
+# VH-NEXT: `define FOLDSIM_PORTS_REQ_ACK_W 1
+# VH-NEXT: `define FOLDSIM_PORTS_REQ_TAG_LO 26
+# VH-NEXT: `define FOLDSIM_PORTS_REQ_TAG_W 4
+# VH-NEXT: `define FOLDSIM_PORTS_RSP_W 17
+# VH-NEXT: `define FOLDSIM_PORTS_RSP_RVALID_LO 0
+# VH-NEXT: `define FOLDSIM_PORTS_RSP_RVALID_W 1
+# VH-NEXT: `define FOLDSIM_PORTS_RSP_RDATA_LO 1
+# VH-NEXT: `define FOLDSIM_PORTS_RSP_RDATA_W 16
+# SP: `define FOLDSIM_PORTS_RSP_W 34
+# SP: `define FOLDSIM_PORTS_RSP_RDATA_LO 2
+# SP-NEXT: `define FOLDSIM_PORTS_RSP_RDATA_W 32
+# SLOT-DAG: output mp_0_data @4
+# SLOT-DAG: output mp_1_data @5
+# SLOT-DAG: output mp_2_data @6
+# SLOT-DAG: output mp_3_data @7
+# SLOT-DAG: output mp_3_tag @7 (next)
+# NUM: error: fold-ports: the bundles are not numbered 0 to 1
+# RST: error: fold-ports-reset: no one-bit netlist input 'nosuch'
+# CHECK-NOT: ORDER
+# CHECK: {{^}}MATCH 196 cycles

@@ -28,17 +28,104 @@
 # RUN: FileCheck %s --check-prefix=LEAD < %t/lead/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/lead -DVM1 -Mdir %t/lead/obj %S/Inputs/tb_linkhbm.sv top.sv %t/lead/foldsim_sim.sv > %t/lead/build.log 2>&1
 # RUN: %t/lead/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=8 +hi=40 | FileCheck %s
+# --link-hbm-min-lead: a member with less room from its row's write to its
+# landing than that is an on-chip link (its landing would wait for the
+# memory's round trip every frame): of Unit -> Reader's two members, the one
+# with room 10 stays on chip at 11, and the stream's lead is the other's.
+# RUN: foldsim --srcs top.f --top Top --out %t/minl --static --nest --modulo --link-hbm-min-lead 11 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/minl.log 2>&1
+# RUN: FileCheck %s --check-prefix=MINL < %t/minl/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/minl -DVM1 -Mdir %t/minl/obj %S/Inputs/tb_linkhbm.sv top.sv %t/minl/foldsim_sim.sv > %t/minl/build.log 2>&1
+# RUN: %t/minl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=1 +hi=60 | FileCheck %s
+# A stream none of whose members is kept builds nothing, so its ports space
+# no pass: it is excluded and the frame scheduled again without it. At 100
+# no member has the room: both streams excluded, the frame the stream-free
+# fold's (no hbm rule; before, II 64 against 16: the dropped streams' ports
+# still spaced the passes), every link on chip, exact. At 20 Reader -> Unit
+# keeps none: excluded, and Unit -> Reader's members planned anew on the
+# frame without its spacing (both kept, lead 40), exact.
+# RUN: foldsim --srcs top.f --top Top --out %t/free --static --nest --modulo Unit Reader > %t/free.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/drop --static --nest --modulo --link-hbm-min-lead 100 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/drop.log 2>&1
+# RUN: cat %t/free.log %t/drop.log | FileCheck %s --check-prefix=DROP
+# RUN: FileCheck %s --check-prefix=DROPX < %t/drop.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/drop/obj %S/Inputs/tb_reset.sv top.sv %t/drop/foldsim_sim.sv > %t/drop/build.log 2>&1
+# RUN: %t/drop/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/drop/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/drop1 --static --nest --modulo --link-hbm-min-lead 20 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=DROP1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/drop1 -Mdir %t/drop1/obj %S/Inputs/tb_linkhbm.sv top.sv %t/drop1/foldsim_sim.sv > %t/drop1/build.log 2>&1
+# RUN: %t/drop1/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/drop1/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
+# DROP: II = [[II:[0-9]+]]{{$}}
+# DROP: II = [[II]]{{$}}
+# DROP: link streams: 0 streams, 0 links, 0 bits
+# DROPX: link stream Reader -> Unit keeps no member
+# DROPX: link stream Unit -> Reader keeps no member
+# DROP1: link stream Reader -> Unit keeps no member
+# DROP1-NOT: Unit -> Reader keeps no member
+# DROP1: link streams: 1 streams, 2 links
+# DROP1: link stream Unit Reader 2 0 32 32 1 16 32 2 40{{$}}
+# --link-hbm-row-bits: a stream's row (its controller's data width) at most
+# that many bits; a wider word is cut into rows, written one a host cycle
+# after the producer's pass and landing one a host cycle before the
+# reader's (16: two rows a 32-bit word, the passes spaced, a longer frame).
+# RUN: foldsim --srcs top.f --top Top --out %t/rowb --static --nest --modulo --link-hbm-row-bits 16 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/rowb.log 2>&1
+# RUN: FileCheck %s --check-prefix=ROWB < %t/rowb/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/rowb -DVM1 -Mdir %t/rowb/obj %S/Inputs/tb_linkhbm.sv top.sv %t/rowb/foldsim_sim.sv > %t/rowb/build.log 2>&1
+# RUN: %t/rowb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/rowb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
+# RUN: not foldsim --srcs top.f --top Top --out %t/rowbad --static --link-hbm-row-bits 5000 --link-kinds Unit:Reader:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=ROWBAD
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/one -Mdir %t/one/obj %S/Inputs/tb_linkhbm.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
+# A staged reader (--stage-levels: Reader evaluates over its stages, its links
+# read its stages before its state pass): its landings precede that read.
+# RUN: foldsim --srcs top.f --top Top --out %t/stg --static --nest --modulo --bubbles --stage-levels 1 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=STG
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/stg -DBUBBLES -Mdir %t/stg/obj %S/Inputs/tb_linkhbm.sv top.sv %t/stg/foldsim_sim.sv > %t/stg/build.log 2>&1
+# RUN: %t/stg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/stg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +bubble=30 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
+# STG: Reader staged: 2 stages
+# Two reader copies: a stream with a member dropped (its row written after the
+# reads the stream would request of it) requests only its kept members' rows
+# (before, the dropped row's read went out ahead of its write: PROTOCOL).
+# RUN: foldsim --srcs top.f --top Top --out %t/rc2 --static --nest --modulo --copies Reader:2 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/rc2.log 2>&1
+# RUN: FileCheck %s --check-prefix=RC2 < %t/rc2/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/rc2 -DVM1 -DVM2 -DVM3 -Mdir %t/rc2/obj %S/Inputs/tb_linkhbm.sv top.sv %t/rc2/foldsim_sim.sv > %t/rc2/build.log 2>&1
+# RUN: %t/rc2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/rc2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=20 +stall=30 +full=20 | FileCheck %s
+# RC2: link stream {{.+}} 1 1 32
+# A late producer (Driver/Inputs/linklate: each unit's output passes its input
+# through) is no stream's: its readers take it in the frame it is written, and
+# a stream lands a frame on. The streams are laid out after the analysis that
+# marks it late (before, it was a member and the fold mismatched).
+# RUN: cd %S/../Driver/Inputs/linklate && foldsim --srcs top.f --top Top --out %t/late --static --nest --modulo --link-kinds Unit:Reader:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=LATE
+# LATE: II =
+# LATE-NOT: link stream
+# A stream of 26 pages (Driver/Inputs/linkwide: a 13,000-bit word) behind a
+# controller of 32 entries' room: its page writes are at positions, one a
+# position, so it asks no more room than the decisions in flight take (before,
+# pages + 1 more: never there, no position ran).
+# RUN: cd %S/../Driver/Inputs/linkwide && foldsim --srcs top.f --top Top --out %t/wide --static --nest --modulo --link-kinds Unit:Reader:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=WIDE
+# RUN: cd %S/../Driver/Inputs/linkwide && %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/wide -Mdir %t/wide/obj %S/Inputs/tb_linkhbm.sv top.sv %t/wide/foldsim_sim.sv > %t/wide/build.log 2>&1
+# RUN: %t/wide/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=20 +room=32 | FileCheck %s
+# RUN: %t/wide/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +room=32 +full=20 | FileCheck %s
+# WIDE: link stream Unit Reader 1 0 13000 512 26
 # TWO: II = 64
 # TWO: link streams: 2 streams, 3 links, 2304 bits
 # TWO: link stream Reader Unit 1 0 32 32 1 16 16 1 {{[0-9]+}}
 # TWO: link stream Unit Reader 2 0 32 32 1 16 32 2
 # VH: `define FOLDSIM_VMEM_COUNT 2
+# VH: `define FOLDSIM_VMEM_TAGS
+# VH: `define FOLDSIM_VMEM_0_IW 7
 # VH: `define FOLDSIM_VMEM_0_INSTANCES 1
+# VH: `define FOLDSIM_VMEM_0_TAGW 6
 # VH: `define FOLDSIM_VMEM_1_INSTANCES 1
+# VH: `define FOLDSIM_VMEM_1_TAGW 6
 # ONE: link use Reader Unit 32 32 16 hbm 1
 # ONE: link stream Reader Unit 1 0 32 32 1 16 16 1
 # LEAD: link stream Reader Unit 1 0 32 32 1 16 16 1 10{{$}}
+# MINL: link stream Reader Unit 1 0 32 32 1 16 16 1 11{{$}}
+# ROWB: II = 80
+# ROWB: link stream Reader Unit 1 0 32 16 2 32 32 2
+# ROWB: link stream Unit Reader 1 1 32 16 2 32 32 2
+# ROWBAD: link-hbm-row-bits: 5000 is not 8 to 4096
+# MINL: link stream Unit Reader 1 1 32 32 1 16 16 1 48{{$}}
 # CHECK: {{^}}MATCH 196 cycles
 # CHECK-NOT: PROTOCOL

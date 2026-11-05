@@ -1,0 +1,60 @@
+# REQUIRES: verilator
+# HBM link streams sharing page engines (--link-hbm-shift N): a stream's
+# requests may move up to N positions earlier than `lead` before their
+# landings, and its page writes up to N later than their own after the
+# producer's pass, so that streams whose requests or writes fall at the same
+# positions share an engine. Requests stay in their landings' order (the
+# landing slots are taken in turn), each at least 8 positions after the
+# landing of its slot's last use (the landing slots are not grown); writes
+# stay in order and before the producer's next pass (the held word); a
+# request d earlier and a write e later only within the room from the row's
+# write to its request (d + e <= room - lead).
+# Inputs/linkshare: Reader reads a Unit's and a Vnit's register (two streams
+# into one reader: their requests at the same positions), Sink another
+# Unit's (a second stream from Unit: its writes at Unit -> Reader's).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/linkshare
+# Without the shift each stream takes an engine of its own.
+# RUN: foldsim --srcs top.f --top Top --out %t/own --static --nest --modulo --min-ii 160 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm Unit Vnit Reader Sink 2>&1 | FileCheck %s --check-prefix=OWN
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/own -DVM1 -DVM2 -Mdir %t/own/obj %S/Inputs/tb_linkhbm.sv top.sv %t/own/foldsim_sim.sv > %t/own/build.log 2>&1
+# RUN: %t/own/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=60 | FileCheck %s
+# With it the three share one engine: requests and writes moved, exact
+# (answers 1 to 60 host cycles on, channels stalled, `free` low, bubbles).
+# RUN: foldsim --srcs top.f --top Top --out %t/sh --static --nest --modulo --min-ii 160 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-shift 8 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm Unit Vnit Reader Sink 2>&1 | FileCheck %s --check-prefix=SH
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/sh -Mdir %t/sh/obj %S/Inputs/tb_linkhbm.sv top.sv %t/sh/foldsim_sim.sv > %t/sh/build.log 2>&1
+# RUN: %t/sh/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/sh/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=1 +hi=20 +stall=30 +full=20 | FileCheck %s
+# RUN: %t/sh/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=40 +hi=60 +full=40 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bub --static --nest --modulo --bubbles --min-ii 160 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-shift 8 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm Unit Vnit Reader Sink 2>&1 | FileCheck %s --check-prefix=SH
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/bub -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_linkhbm.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +lo=1 +hi=30 +bubble=30 +stall=30 +full=20 | FileCheck %s
+# The room binds (a lead of 160 is cut to each stream's room): nothing may
+# move, each stream on its own engine again, exact. (Ignoring the room, the
+# three share one engine, their requests before the rows' writes.)
+# RUN: foldsim --srcs top.f --top Top --out %t/room --static --nest --modulo --min-ii 160 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-shift 40 --link-hbm-lead 160 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm Unit Vnit Reader Sink 2>&1 | FileCheck %s --check-prefix=ROOM
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/room -DVM1 -DVM2 -Mdir %t/room/obj %S/Inputs/tb_linkhbm.sv top.sv %t/room/foldsim_sim.sv > %t/room/build.log 2>&1
+# RUN: %t/room/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 | FileCheck %s
+# --link-hbm-fit-slots: each stream takes the fewest landing slots its
+# requests need (16 here, not lead + 8 = 64), shared or not, exact with
+# answers as late as the lead (40 to 60 host cycles: a slot reused too soon
+# would answer a landing with another's row).
+# RUN: foldsim --srcs top.f --top Top --out %t/fit --static --nest --modulo --min-ii 160 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-fit-slots --link-hbm-shift 8 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm Unit Vnit Reader Sink 2>&1 | FileCheck %s --check-prefix=FIT
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/fit -Mdir %t/fit/obj %S/Inputs/tb_linkhbm.sv top.sv %t/fit/foldsim_sim.sv > %t/fit/build.log 2>&1
+# RUN: %t/fit/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/fit/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=40 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/fitm --static --nest --modulo --min-ii 64 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-fit-slots --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm Unit Vnit Reader Sink 2>&1 | FileCheck %s --check-prefix=FITM
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/fitm -DVM1 -DVM2 -Mdir %t/fitm/obj %S/Inputs/tb_linkhbm.sv top.sv %t/fitm/foldsim_sim.sv > %t/fitm/build.log 2>&1
+# RUN: %t/fitm/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +lo=40 +hi=60 +full=30 | FileCheck %s
+# FIT: page engines: 1 engines, 0 page columns
+# FIT: link stream slots: 16 16 16
+# FITM: page engines: 3 engines, 0 page columns
+# FITM: link stream slots: 16 16 16
+# OWN: page engines: 3 engines, 0 page columns
+# OWN-NOT: page engine shifts
+# SH: page engines: 1 engines, 0 page columns
+# SH-NEXT: page engine 0 32 bits, tag 9, row 7: link:Unit>Sink link:Unit>Reader link:Vnit>Reader
+# SH-NEXT: page engine shifts: 2 streams moved, requests up to 1, writes up to 2 positions
+# ROOM: page engines: 3 engines, 0 page columns
+# ROOM: page engine shifts: 0 streams moved, requests up to 0, writes up to 0 positions
+# CHECK-NOT: PROTOCOL
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL

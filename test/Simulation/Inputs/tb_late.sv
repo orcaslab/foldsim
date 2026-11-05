@@ -3,7 +3,8 @@
 // tokens, the simulator's channels stalled on +stall=<percent> of the host
 // cycles, and compares the output tokens from cycle W on (the leaves'
 // registers have no reset). Prints MATCH or the first difference. With
-// BUBBLES defined, `advance` is low on +bubble=<percent> of the host cycles.
+// BUBBLES defined, `advance` is low on +bubble=<percent> of the host cycles
+// (+burst=<n>: in runs of up to n).
 module tb;
   localparam T = 200, W = 4;
   function automatic logic [7:0] stim_x(int t);
@@ -42,10 +43,19 @@ module tb;
   logic adv;
   initial if (!$value$plusargs("stall=%d", stall)) stall = 0;
   initial if (!$value$plusargs("bubble=%d", bubble)) bubble = 0;
+  // +burst=<n>: a bubble starts a run of up to n of them, as a host's long
+  // stalls do.
+  int burst = 1, brun = 0;
+  initial if (!$value$plusargs("burst=%d", burst)) burst = 1;
   always @(negedge clk) begin
     vx = ix < T && ($urandom % 100 >= stall);
     yr = $urandom % 100 >= stall;
-    adv = $urandom % 100 >= bubble;
+    if (brun > 0) begin
+      adv = 0; brun--;
+    end else begin
+      adv = $urandom % 100 >= bubble;
+      if (!adv && burst > 1) brun = $urandom % burst;
+    end
   end
   always @(posedge clk) begin
     cyc <= cyc + 1; rst <= 0;
@@ -56,7 +66,7 @@ module tb;
   end
   initial begin
     automatic bit ok = 1;
-    do @(posedge clk); while (iy < T && cyc < 200000);
+    do @(posedge clk); while (iy < T && cyc < 2000000);
     wait (ref_done);
     if (iy < T) begin $display("TIMEOUT at %0d tokens", iy); $finish; end
     for (int t = W; t < T; t++)

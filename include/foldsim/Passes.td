@@ -395,7 +395,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "when the row was not written since the instance's last read; the "
            "instance keeps its read data, which is that row's. Exact by "
            "construction; a bit per instance records whether its read data "
-           "is current">,
+           "is current. Such a memory's requests leave a host cycle after the "
+           "state pass, from registers (the skip decided there): its room is "
+           "12 (10 with short-lead) and it needs a state gap of the lead + 2">,
     Option<"stagedEnv", "staged-env", "bool", "true",
            "The environment's endpoints take a token a host cycle after it "
            "is offered (registered token ends), not in that host cycle">,
@@ -480,6 +482,17 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "most bits of a page word in one virtual memory's row (a multiple "
            "of 8); each such column is a virtual memory of its own, served by "
            "a controller of its own">,
+    Option<"pageEngines", "page-engines", "unsigned", "0",
+           "With a model's pages off chip: its page columns carried by "
+           "shared engines (HBM page streams), at most this many, instead of "
+           "a controller per column. An engine is one virtual memory of one "
+           "image (INSTANCES 1) whose rows are {member, instance, page}; its "
+           "requests are tagged by member and instance (foldsim_vmem TAGW), "
+           "and the columns it carries never request at the same position "
+           "(the frame's static order, checked): no member FIFO, no "
+           "arbitration. Columns of one copy move together, so a copy's "
+           "columns need engines of their own; copies whose page traffic "
+           "falls in other positions share them. 0: a controller per column">,
     Option<"pageHbmWindow", "page-hbm-window", "unsigned", "0",
            "With a model's pages off chip: an on-chip window of at most this "
            "many instances' pages per copy, filled from the virtual memories "
@@ -543,6 +556,52 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "row's request precedes its landing (the memory's round trip in "
            "host cycles and a margin; less where a stream's writes come "
            "later)">,
+    Option<"linkHbmRowBits", "link-hbm-row-bits", "unsigned", "512",
+           "HBM link streams: the most bits of a stream's row (its "
+           "controller's data width, 8 to 4096): a wider word is cut into "
+           "that many rows, written one a host cycle after the producer's "
+           "pass and landing one a host cycle before the reader's, which "
+           "spaces their passes">,
+    Option<"linkHbmMinLead", "link-hbm-min-lead", "unsigned", "0",
+           "HBM link streams: the least positions from a row's write to its "
+           "landing for a link to be streamed; one with less stays an on-chip "
+           "link (0: the decision lead + 6). Set to the memory's round trip "
+           "in host cycles, no landing waits for it">,
+    Option<"linkHbmShift", "link-hbm-shift", "unsigned", "0",
+           "HBM link streams on page engines (page-engines): the most "
+           "positions a stream's request may move earlier than `lead` before "
+           "its landing, and a page write later than its own after the "
+           "producer's pass, so that streams whose requests or writes fall "
+           "at the same positions share an engine. Within the room from the "
+           "row's write to its request (both moves together), requests in "
+           "their landings' order, writes in order and before the producer's "
+           "next pass; a landing slot for each position more (0: none)">,
+    Option<"foldPorts", "fold-ports", "std::string", "\"\"",
+           "Netlist ports as bundles folded into two record streams: a "
+           "regex whose first capture is the bundle (an index 0..N-1) and "
+           "whose second the field (POSIX extended, e.g. m_axi_mem_([0-9]+)_(.*)), "
+           "or, without a group, a prefix: <prefix><bundle>_<field>. Each "
+           "bundle's outputs of a target cycle leave as one request record "
+           "(req_valid / req_ready / req_chan / req_treset / req_bits, the "
+           "fields low first in netlist order), its inputs come as one "
+           "response record (rsp_valid / rsp_ready / rsp_chan / rsp_bits); "
+           "the outputs' token queues are memories indexed by bundle, "
+           "written one bundle a host cycle (the pushes spread over the "
+           "frame). Empty: none">,
+    Option<"foldPortsReset", "fold-ports-reset", "std::string", "\"reset\"",
+           "With fold-ports: the netlist input whose frame token rides on "
+           "each request record (req_treset)">,
+    Option<"linkHbmFitSlots", "link-hbm-fit-slots", "bool", "false",
+           "HBM link streams on page engines: each takes the fewest landing "
+           "slots (a power of two, at least 8) its requests need, each request "
+           "at least 8 positions after the landing of its slot's last use (as "
+           "lead + 8 slots give at the lead); a stream that shares an engine "
+           "only with more takes lead + 8. The report lists them (link stream "
+           "slots)">,
+    Option<"minII", "min-ii", "unsigned", "0",
+           "With modulo: the shortest frame (host cycles) the search starts "
+           "from; positions past the schedule's own stay idle (a longer "
+           "prefetch distance for every request a pass issues)">,
     Option<"moduloLinear", "modulo-linear", "unsigned", "16",
            "With modulo: the periods tried one at a time from the frame's "
            "lower bound before the search skips ahead (a doubling step until "
@@ -564,6 +623,35 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "Outputs of a model driven by the same value (a bus broadcast to "
            "several children) are one producer: their readers share its "
            "links instead of one link per output">,
+    Option<"stageLevels", "stage-levels", "unsigned", "0",
+           "Staged evaluation: a class whose state cone (from its state and "
+           "inputs to its next state, memory ports and early outputs) is "
+           "deeper than this many estimated logic levels evaluates over "
+           "several host cycles: its logic cut into segments of at most this "
+           "many levels by registers that step with the frame's positions "
+           "(none moves in a bubble or between frames), its state and inputs "
+           "read the stages' positions before its state pass, which writes "
+           "as before. Only for a class with no late output, virtual memory "
+           "or black box. The schedule places such a state pass at least the "
+           "stages into the frame, its inputs' links the stages earlier, and "
+           "its state gap from the read. 0: none">,
+    ListOption<"multicycle", "multicycle", "std::string",
+               "With stage-levels: classes (globs; a copy goes by its class's "
+               "name) staged without stage registers. A copy evaluates one "
+               "instance at a time over M host cycles, M the cone's estimated "
+               "levels over stage-levels, or M given as <glob>:<M> (the logic "
+               "screen's count of the cone over the levels a host cycle may "
+               "take): the state and inputs it reads are "
+               "taken into capture registers at the read position (the state "
+               "pass's M + 1 before), the logic computes from them over M "
+               "host cycles into end registers taken a position before the "
+               "state pass, which writes from them; nothing else reads a "
+               "capture register or writes an end register. The schedule "
+               "spaces the copy's state passes at least M positions apart, so "
+               "a capture holds until its end registers are taken. The "
+               "multicycle paths (capture to end, M host cycles) are listed "
+               "for the flow (`foldsim.multicycle`). Only for a class that "
+               "could be staged and reads no memory combinationally">,
     ListOption<"registeredLinks", "registered-links", "std::string",
                "Classes (globs; a copy goes by its class's name) whose links "
                "are never taken in their producer's host cycle: with "

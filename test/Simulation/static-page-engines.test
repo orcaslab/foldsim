@@ -1,0 +1,118 @@
+# REQUIRES: verilator
+# HBM page streams (--page-engines): off-chip page columns (--storage
+# <model>:pages=hbm) carried by shared engines instead of a controller per
+# column. An engine is one virtual memory of one image (INSTANCES 1) whose
+# rows are {column, instance, page}; each request is tagged {column,
+# instance-and-page} (the instance port's top TAGW bits), the answer routed
+# back by it. Columns of a copy move together, so each takes an engine of its
+# own (a bank); a copy's page reads and writes are placed at positions of its
+# windows free on its bank (reads after the frame before's write of the page,
+# in page order, before the state pass; writes after it, before the copy's
+# next state pass), so copies whose page traffic falls in other positions
+# share a bank: the frame's static order multiplexes them, without FIFOs or
+# arbiters. Against the target from zero state (tb_pages.sv: a model per
+# virtual memory, answered 1 to 60 host cycles on, `free` low at times,
+# PROTOCOL for a read of a tag outstanding or a write of one), at page 1 to
+# 4, with copies, overlapped frames, nested sequencers, bubbles and stalls,
+# and the leaves' RAM virtual too; two models sharing one engine
+# (tb_linkhbm.sv, one image: rows of the shared memory, random power-up
+# state), with HBM link streams beside them; the report; and a cap too small.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/paged
+# RUN: foldsim --srcs top.f --top Top --out %t/c2 --static --page 4 --storage Leaf:pages=hbm --copies Leaf:2 --zero-latency-links --zero-latency-chains --page-hbm-column-bits 64 --page-engines auto Leaf 2>&1 | FileCheck %s --check-prefix=C2
+# RUN: FileCheck %s --check-prefix=VH < %t/c2/foldsim_sim.vh
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/c2 -DVM1 -Mdir %t/c2/obj %S/Inputs/tb_pages.sv top.sv %t/c2/foldsim_sim.sv > %t/c2/build.log 2>&1
+# RUN: %t/c2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=30 +stall=30 | FileCheck %s
+# RUN: %t/c2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=60 +full=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/cols --static --page 1 --storage Leaf:pages=hbm --page-hbm-column-bits 64 --page-engines auto Leaf > %t/cols.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/cols -DVM1 -DVM2 -Mdir %t/cols/obj %S/Inputs/tb_pages.sv top.sv %t/cols/foldsim_sim.sv > %t/cols/build.log 2>&1
+# RUN: %t/cols/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bub --static --page 3 --storage Leaf:pages=hbm --bubbles --modulo --page-hbm-column-bits 32 --page-engines auto Leaf > %t/bub.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/bub -DBUBBLES -DVM1 -Mdir %t/bub/obj %S/Inputs/tb_pages.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --page 4 --storage Leaf:pages=hbm --nest --short-lead --bubbles --page-engines auto Leaf > %t/nest.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/nest -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_pages.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=20 +bubble=20 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/ram --static --page 2 --storage Leaf:pages=hbm --virtual-memories ram --bubbles --page-engines auto Leaf > %t/ram.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/ram -DBUBBLES -DVM1 -Mdir %t/ram/obj %S/Inputs/tb_pages.sv top.sv %t/ram/foldsim_sim.sv > %t/ram/build.log 2>&1
+# RUN: %t/ram/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=40 +bubble=20 +full=20 | FileCheck %s
+# Two interleaved copies sharing one engine.
+# RUN: foldsim --srcs top.f --top Top --out %t/il --static --modulo --bubbles --page 1 --copies Leaf:2 --interleave-copies --storage Leaf:pages=hbm --page-engines auto Leaf 2>&1 | FileCheck %s --check-prefix=IL
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/il -DBUBBLES -Mdir %t/il/obj %S/Inputs/tb_pages.sv top.sv %t/il/foldsim_sim.sv > %t/il/build.log 2>&1
+# RUN: %t/il/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s
+# RUN: %t/il/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=60 +bubble=30 +stall=20 +full=20 | FileCheck %s
+# Two copies whose fetches leave a free position only at s - 1: page 0 must
+# still be read two positions before the state pass (else it shares, and the
+# state pass runs without its page): two engines.
+# RUN: foldsim --srcs top.f --top Top --out %t/late --static --modulo --bubbles --page 1 --copies Leaf:2 --storage Leaf:pages=hbm --page-engines auto Leaf > %t/late.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/late -DBUBBLES -DVM1 -Mdir %t/late/obj %S/Inputs/tb_pages.sv top.sv %t/late/foldsim_sim.sv > %t/late/build.log 2>&1
+# RUN: %t/late/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s
+# RUN: %t/late/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=3 +bubble=20 | FileCheck %s
+# An on-chip window (--page-hbm-window: each instance prefetched a window of
+# state passes ahead into its slot) carried by engines: the prefetches at
+# their own positions, a bank where they fall free.
+# RUN: foldsim --srcs top.f --top Top --out %t/win --static --bubbles --page 2 --page-hbm-window 2 --copies Leaf:2 --interleave-copies --storage Leaf:pages=hbm --page-engines auto Leaf > %t/win.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/win -DBUBBLES -DVM1 -Mdir %t/win/obj %S/Inputs/tb_pages.sv top.sv %t/win/foldsim_sim.sv > %t/win/build.log 2>&1
+# RUN: %t/win/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s
+# RUN: %t/win/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=60 +stall=20 +full=20 +bubble=30 | FileCheck %s
+# A cap below a copy's columns.
+# RUN: not foldsim --srcs top.f --top Top --out %t/cap --static --page 1 --storage Leaf:pages=hbm --page-hbm-column-bits 64 --page-engines 2 Leaf 2>&1 | FileCheck %s --check-prefix=CAP
+# Two models sharing one engine, alone and beside link streams.
+# RUN: cd %S/../Driver/Inputs/linkhbm
+# The link streams on engines too (their requests and writes at positions,
+# a member tag their landing slot or write tag), placed first, the pages
+# around them: one stream shares the two models' page engine.
+# RUN: foldsim --srcs top.f --top Top --out %t/two --static --nest --modulo --page 1 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=TWO
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/two -DVM1 -Mdir %t/two/obj %S/Inputs/tb_linkhbm.sv top.sv %t/two/foldsim_sim.sv > %t/two/build.log 2>&1
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=1 +hi=20 +stall=30 +full=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/mix --static --nest --modulo --bubbles --page 2 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=MIX
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/mix -DVM1 -DBUBBLES -Mdir %t/mix/obj %S/Inputs/tb_linkhbm.sv top.sv %t/mix/foldsim_sim.sv > %t/mix/build.log 2>&1
+# RUN: %t/mix/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 +bubble=30 | FileCheck %s
+# RUN: %t/mix/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=1 +hi=30 +stall=30 +full=20 | FileCheck %s
+# --vmem-forward 0: the kernel's controllers answer no read from their write
+# buffers (foldsim_vmem FORWARD 0), a define in the simulator's header.
+# RUN: cd %S/../Driver/Inputs/paged
+# RUN: foldsim --srcs top.f --top Top --out %t/nf --static --page 4 --storage Leaf:pages=hbm --page-hbm-column-bits 64 --page-engines auto --vmem-forward 0 Leaf > %t/nf.log 2>&1
+# RUN: FileCheck %s --check-prefix=NF < %t/nf/foldsim_sim.vh
+# RUN: FileCheck %s --check-prefix=VH --implicit-check-not=FOLDSIM_VMEM_FORWARD < %t/c2/foldsim_sim.vh
+# NF: `define FOLDSIM_VMEM_COUNT
+# NF-NEXT: `define FOLDSIM_VMEM_FORWARD 0
+# Schedule only: the engines the build would take for its link streams in the
+# report too (a cost model prices the schedule as built); the page columns are
+# laid out with the copies, so only streams are listed.
+# RUN: cd %S/../Driver/Inputs/linkhbm
+# RUN: foldsim --srcs top.f --top Top --out %t/so --static --nest --modulo --page 1 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm --schedule-only Unit Reader > %t/so.log 2>&1
+# RUN: FileCheck %s --check-prefix=SO < %t/so/schedule.txt
+# SO: page engines: 2 engines, 0 page columns
+# SO-NEXT: page engine 0 32 bits, tag 7, row 6: link:Reader>Unit
+# SO-NEXT: page engine 1 32 bits, tag 7, row 6: link:Unit>Reader
+# Streams of words not whole bytes (29 bits): an engine's row is whole bytes,
+# its byte mask covering the stream's row (the stream alone on an engine was
+# 29 bits under a 3-bit mask, its top bits never written; the compiler
+# stopped building the mask).
+# RUN: cd %S/../Driver/Inputs/linkodd
+# RUN: foldsim --srcs top.f --top Top --out %t/odd --static --nest --modulo --page 1 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=ODD
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/odd -DVM1 -Mdir %t/odd/obj %S/Inputs/tb_linkhbm.sv top.sv %t/odd/foldsim_sim.sv > %t/odd/build.log 2>&1
+# RUN: %t/odd/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/odd/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=1 +hi=20 +stall=30 +full=20 | FileCheck %s
+# ODD: page engine 1 32 bits, tag 7, row 6: link:Unit>Reader
+# C2: page engines: 2 engines, 2 page columns
+# C2: page engine 0 64 bits, tag 4, row 5: Leaf:region1_pages
+# C2: page engine 1 64 bits, tag 4, row 5: Leaf_copy1:region1_pages
+# VH: `define FOLDSIM_VMEM_COUNT 2
+# VH: `define FOLDSIM_VMEM_TAGS
+# VH: `define FOLDSIM_VMEM_0_IW 5
+# VH: `define FOLDSIM_VMEM_0_DW 64
+# VH: `define FOLDSIM_VMEM_0_MW 8
+# VH: `define FOLDSIM_VMEM_0_INSTANCES 1
+# VH: `define FOLDSIM_VMEM_0_TAGW 4
+# VH: `define FOLDSIM_VMEM_0_KNOWN_ZERO 0
+# CAP: error: page engines: 2 engines cannot carry the page columns of Leaf (3 columns)
+# TWO: page engines: 2 engines, 2 page columns
+# TWO: page engine 0 32 bits, tag 8, row 7: Unit:region1_pages Reader:region1_pages link:Reader>Unit
+# TWO: page engine 1 32 bits, tag 7, row 6: link:Unit>Reader
+# IL: page engines: 1 engines, 2 page columns
+# MIX: page engines: 2 engines, 2 page columns
+# CHECK-NOT: PROTOCOL
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL

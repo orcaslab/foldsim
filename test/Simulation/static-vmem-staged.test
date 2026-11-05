@@ -1,0 +1,30 @@
+# REQUIRES: verilator
+# Staged and multicycle evaluation (`stage-levels`, `multicycle`) of a class
+# with virtual memories: the request leaves at the state pass with the last
+# stage's row and data (as a store's write), and the read data is waited for
+# by the next evaluation's read position, the stages before its state pass
+# (the frame's advance checks the instance pending there). Against the target
+# (tb_vmem.sv: answers 1 to 60 host cycles on, `free` low at times, stalls,
+# bubbles), staged, with copies under nested sequencers and bubbles, and
+# multicycle. Waiting at the state pass instead (the read position's data not
+# yet landed) mismatches at seeds 2 and 3.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_staged
+# RUN: foldsim --srcs top.f --top Top --out %t/st --static --virtual-memories ram --stage-levels 1 Leaf > %t/st.log 2>&1
+# RUN: FileCheck %s --check-prefix=ST < %t/st/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/st/obj %S/Inputs/tb_vmem.sv top.sv %t/st/foldsim_sim.sv > %t/st/build.log 2>&1
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=40 +stall=20 +full=20 | FileCheck %s
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/cp --static --virtual-memories ram --copies Leaf:2 --nest --bubbles --stage-levels 1 Leaf > %t/cp.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DCOPIES2 -DIW=1 -Mdir %t/cp/obj %S/Inputs/tb_vmem.sv top.sv %t/cp/foldsim_sim.sv > %t/cp/build.log 2>&1
+# RUN: %t/cp/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=40 +stall=20 +full=20 +bubble=20 | FileCheck %s
+# RUN: %t/cp/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 +bubble=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/mc --static --virtual-memories ram --multicycle Leaf:3 --stage-levels 1 Leaf > %t/mc.log 2>&1
+# RUN: FileCheck %s --check-prefix=MC < %t/mc/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/mc/obj %S/Inputs/tb_vmem.sv top.sv %t/mc/foldsim_sim.sv > %t/mc/build.log 2>&1
+# RUN: %t/mc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=40 +stall=20 +full=20 | FileCheck %s
+# RUN: %t/mc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 | FileCheck %s
+# ST: Leaf x4 state gap {{[0-9]+}} stages 2
+# MC: Leaf x4 state gap {{[0-9]+}} stages 4 multicycle 3
+# CHECK-NOT: PROTOCOL
+# CHECK: {{^}}MATCH 196 cycles

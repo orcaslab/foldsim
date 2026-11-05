@@ -1,0 +1,27 @@
+# REQUIRES: verilator
+# --retime-memory-reads N (circt-opt seq-retime-firmem-reads mode=auto): a
+# memory of at least N bits read asynchronously at an address that is a
+# function of registers alone (Driver/Inputs/vmem_retime: a queue's data at the
+# complement of its head register, written at its tail's) is read through a
+# register, a target cycle early at the address's next value, reading new data,
+# so it may be virtual. Against the controller model of Inputs/tb_vmem.sv (write first:
+# the retimed read sees its cycle's write), at any latency, stalls, controller
+# room, copies: every run matches the target. Without the option the memory
+# cannot be virtual.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_retime
+# RUN: not foldsim --srcs top.f --top Top --out %t/no --static --virtual-memories ram Leaf > %t/no.log 2>&1
+# RUN: FileCheck %s --check-prefix=NO < %t/no.log
+# RUN: foldsim --srcs top.f --top Top --out %t/rt --static --virtual-memories ram --retime-memory-reads 64 Leaf > %t/rt.log 2>&1
+# RUN: FileCheck %s --check-prefix=RT < %t/rt.log
+# RUN: FileCheck %s --check-prefix=RPT < %t/rt/memories.rpt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DWRITE_FIRST -Mdir %t/rt/obj %S/Inputs/tb_vmem.sv top.sv %t/rt/foldsim_sim.sv > %t/rt/build.log 2>&1
+# RUN: %t/rt/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/rt/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: %t/rt/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/cp --static --virtual-memories ram --retime-memory-reads 64 --vmem-skip-held-reads --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DWRITE_FIRST -DCOPIES2 -DIW=1 -Mdir %t/cp/obj %S/Inputs/tb_vmem.sv top.sv %t/cp/foldsim_sim.sv > %t/cp/build.log 2>&1
+# RUN: %t/cp/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | FileCheck %s
+# NO: a virtual memory needs a registered read
+# RT: {{^}}+ circt-opt {{.*}}seq-retime-firmem-reads={{.*}} mode=auto min-bits=64
+# RPT: ram{{.*}} 16x8 {{.*}}converted
+# CHECK: {{^}}MATCH

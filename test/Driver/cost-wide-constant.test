@@ -1,0 +1,5 @@
+# The cost model's parser takes a constant wider than Python's default limit
+# on int() of decimal text (4,300 digits): a 16,861-bit word (5,076 digits),
+# as the A100-class models at 64 SMs have.
+# RUN: python3 -c "import sys; sys.path.insert(0, '%S/../../tools/foldsim'); import foldsim_cost as c; m, _ = c.parse('%S/Inputs/cost/wide.mlir'); print('modules', sorted(m))" | FileCheck %s
+# CHECK: modules ['Wide']

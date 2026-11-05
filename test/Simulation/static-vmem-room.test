@@ -26,7 +26,21 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/bub --static --virtual-memories ram --bubbles Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_vmem_queue.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
 # RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=20 +full=60 +bubble=30 | FileCheck %s
+# With --vmem-skip-held-reads, a held read's requests leave a host cycle after
+# the pass (decided from registers): one decision more in flight, a room of 12
+# (Driver/Inputs/vmem_room_held: a registered read address, read first, its row
+# written every cycle, so every pass issues a read and a write). The queue
+# still fills to its last entry and never past it.
+# RUN: cd %S/../Driver/Inputs/vmem_room_held
+# RUN: foldsim --srcs top.f --top Top --out %t/held --static --virtual-memories ram --vmem-skip-held-reads Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=ROOM12 < %t/held/foldsim_sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/held/obj %S/Inputs/tb_vmem_queue.sv top.sv %t/held/foldsim_sim.sv > %t/held/build.log 2>&1
+# RUN: %t/held/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +full=50 | FileCheck %s --check-prefix=FULL
+# RUN: %t/held/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +lo=1 +full=90 | FileCheck %s --check-prefix=FULL
+# RUN: %t/held/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=5 +hi=60 +full=80 | FileCheck %s
+# RUN: %t/held/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=30 +full=30 | FileCheck %s
 # ROOM10: vm0_free > 16'h9
+# ROOM12: vm0_free > 16'hB
 # ROOM8: |(vm0_free[15:3])
 # FULL: {{^}}MATCH {{.*}} queue peak 16
 # CHECK: {{^}}MATCH

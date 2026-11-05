@@ -404,7 +404,17 @@ KERNEL = dict(on=False, mem_ports=0, endpoint_logic=24565.0, endpoint_lutram=471
               port_channel_logic=3500.0, top_logic_per_link_bit=0.27, threaded_copy_logic=1500.0,
               uram_memories=False, fold_ports=False, folded_logic=40000.0, folded_lutram=5000.0,
               folded_uram_bits_per_port=330000.0, folded_measured=None, copy_logic=None,
-              calibration=None)
+              calibration=None,
+              sim_ports_folded=False, sim_port_folded_logic=1100.0,
+              sim_ports_shared_logic=8200.0, sim_ports_shared_lutram=1700.0)
+# sim_ports_folded (foldsim --fold-ports, built): the simulator's side of the
+# memory ports as request / response record streams. Per port what stays:
+# the inputs' tokens and frame registers (rdata's 4 copies and its frame:
+# ~1.0k LUTs at 4 SMs, census_cells.txt) and the outputs' counters and
+# pointers (~0.1k); shared: the record memories' write selects (a 32-way
+# AND-OR a request bit, ~11 LUTs a bit of 744) and their LUTRAM (744 bits x
+# 2 blocks of 64 rows). Estimates from the 4-SM census and the generated
+# netlist (foldsim_cost: -42.7k raw at 4 SMs), not yet a Vivado point.
 # fold_ports (a what-if, not built): the memory ports as one replicated unit
 # folded like a class: one bank-model engine, one endpoint shell and one
 # token-queue engine (`folded_logic`, `folded_lutram`) serving the channels in
@@ -518,8 +528,13 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             kernel_uram = math.ceil(KERNEL['mem_ports'] * KERNEL['folded_uram_bits_per_port'] /
                                     (storage.URAM[0] * storage.URAM[1]))
         else:
-            logic += KERNEL['mem_ports'] * (KERNEL['endpoint_logic'] + KERNEL['port_channel_logic'])
+            channel = KERNEL['sim_port_folded_logic'] if KERNEL['sim_ports_folded'] \
+                else KERNEL['port_channel_logic']
+            logic += KERNEL['mem_ports'] * (KERNEL['endpoint_logic'] + channel)
             base_lutram += KERNEL['mem_ports'] * KERNEL['endpoint_lutram']
+            if KERNEL['sim_ports_folded']:
+                logic += KERNEL['sim_ports_shared_logic']
+                base_lutram += KERNEL['sim_ports_shared_lutram']
         tlb = KERNEL['calibration']['top_logic_per_link_bit'] if KERNEL['calibration'] \
             else KERNEL['top_logic_per_link_bit']
         logic += tlb * ((sched or {}).get('__links__') or {}).get('ff', 0)
@@ -532,6 +547,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             logic += KERNEL['threaded_copy_logic'] * sum(1 for c, n in classes.items() if n > 1)
     page_of = {}
     paged = dict(bits=0, ff=0, ports=0, hbm=0)
+    # With page engines: each off-chip paged copy's (columns, engine share).
+    engine_cols = []
     for c, n in classes.items():
         k = degree.get(c, 1)
         kappa, lam = factors(cal, c, est[c]['lut'])
@@ -556,8 +573,14 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             if form == 'paged' and info.get('offchip'):
                 bits, mux, _ = paged_state(est[c])
                 pc = storage.page_cost(bits, t, info['page'], 'hbm')
-                # Its controllers (a column each) too.
-                cl, cr = storage.page_ctl(bits, info['page'], pc['controllers'])
+                # Its controllers (a column each) too; with page engines, its
+                # share of them (counted again for the fold below).
+                if tiers is not None and tiers.get('page_engines'):
+                    eng = storage.page_hbm_cost(bits, t, info['page'], tiers['frame'])
+                    cl, cr = eng['lut'] - pc['lut'], eng['lutram'] - pc['lutram']
+                    engine_cols.append((eng['engine_columns'], eng['ctl']))
+                else:
+                    cl, cr = storage.page_ctl(bits, info['page'], pc['controllers'])
                 logic += pc['lut'] + mux + cl
                 base_lutram += cr
                 copy_logic[(c, j)] += pc['lut'] + mux + cl
@@ -575,8 +598,15 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                 pcost = {k: dict(v, lutram=0.0, ii_floor=0) for k, v in pcost.items()}
                 if tiers is not None and (tiers.get('pages_hbm') or
                                           c in tiers.get('force_pages', ())):
-                    pcost['hbm'] = dict(storage.page_hbm_cost(bits, t, info['page']),
-                                        ii_floor=0, bubbles=t * max(
+                    # On engines, off chip at its own depth (page_hbm_depth:
+                    # few columns, so few engines).
+                    ph = storage.page_hbm_depth(bits, t, info['page'], tiers['frame'],
+                                                PAGE_PORT_SHARE) \
+                        if tiers.get('page_engines') else info['page']
+                    pcost['hbm'] = dict(storage.page_hbm_cost(
+                                            bits, t, ph,
+                                            tiers['frame'] if tiers.get('page_engines') else None),
+                                        ii_floor=0, page=ph, bubbles=t * max(
                                             0, storage.HBM_ROUND_TRIP + 7 - tiers['frame'] // t))
                 units.append(dict(costs=pcost,
                                   per={k: [(j, v)] for k, v in pcost.items()}, count=1,
@@ -704,7 +734,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     # ultra RAM may hold is a unit of its own (the link tier); the rest stays
     # in the base.
     lu = link_units(cal, (sched or {}).get('__links__'), ii, tiers.get('link_pages', True),
-                    tiers.get('link_hbm', False), tiers['frame']) if tiers is not None else None
+                    tiers.get('link_hbm', False), tiers['frame'],
+                    tiers.get('page_engines', False)) if tiers is not None else None
     if lu:
         units.extend(lu[0])
         lk = dict(lu[1], lutram=lu[1]['lutram'] + lk['lutram'] -
@@ -749,6 +780,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                 off['hbm_bytes'] += c['hbm']
                 off['controllers'] += c['ctl']
                 off.setdefault('links_hbm', []).append(u['store'])
+                if 'engine_columns' in c:
+                    engine_cols.append((1, c['ctl']))
                 off['link_hbm_bytes'] = off.get('link_hbm_bytes', 0.0) + c['hbm']
             lk['ff'] += c['ff']
             lk['lutram'] += c['lutram']
@@ -783,6 +816,15 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         u['kind'] = kind
         if kind == 'hbm' and u['store'] == 'pages':
             off['pages_offchip'].append(u['class'])
+            # The model's page off chip (a model's copies take one page: the
+            # shallowest of theirs).
+            model = re.sub(r'_copy\d+$', '', u['class'])
+            ph = u['costs']['hbm'].get('page')
+            if ph:
+                off.setdefault('page_hbm', {})
+                off['page_hbm'][model] = min(off['page_hbm'].get(model, ph), ph)
+            if 'engine_columns' in u['costs']['hbm']:
+                engine_cols.append((u['costs']['hbm']['engine_columns'], u['costs']['hbm']['ctl']))
             paged['ports'] -= u['costs']['block']['ports']
             paged['hbm'] += u['costs']['hbm']['hbm']
         elif kind == 'hbm':
@@ -800,6 +842,23 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             if key not in taken:
                 taken.add(key)
                 rules.append(rule)
+    # Page engines: the fold's, at least its widest copy's columns and the
+    # shares' sum, whole (the shares are priced already; the rest added).
+    page_engines = 0
+    # A schedule built with page engines: at least as many as it has. A
+    # schedule-only report lists the engines of its link streams alone (the
+    # page columns are laid out with the copies): the pages' engines on top.
+    built = (sched or {}).get('__links__') or {}
+    built_engines = built.get('engines', 0)
+    if engine_cols or built_engines:
+        share = sum(s for _, s in engine_cols)
+        own = max([c for c, _ in engine_cols] + [math.ceil(share - 1e-9)])
+        page_engines = max(own, built_engines) if built.get('engine_columns') else \
+            own + built_engines
+        el, er = storage.page_engine_ctl()
+        logic += (page_engines - share) * el
+        lutram += (page_engines - share) * er
+        bram += (page_engines - share) * storage.PAGE_ENGINE_BRAM
     sites = logic + storage.LUTRAM_SITES * lutram
     res = dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
                sites=round(sites), fits=fits, bram=round(bram, 1), uram=uram,
@@ -815,7 +874,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                                 else KERNEL['top_logic_per_link_bit']) * lk['ff']) if KERNEL['on'] else 0,
                storage=','.join(rules),
                **({'link_kinds': ','.join(link_rules)} if lu else {}),
-               **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged))
+               **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged),
+               **({'page_engines': page_engines} if page_engines else {}))
     if tiers is not None:
         res.update(off, hbm_bytes=round(off['hbm_bytes']), hbm_cap=round(caps['hbm']))
     return res
@@ -1049,9 +1109,21 @@ def parse_links(text):
                     max_need=int(x[9]))
                for x in re.findall(r'^    link stream (\S+) (\S+) (\d+) (\d+) (\d+) (\d+) (\d+) '
                                    r'(\d+) (\d+) (\d+)(?: \d+)?$', text, re.M)]
+    # Their landing slots where the schedule fitted them (link-hbm-fit-slots:
+    # a line of each built stream's, in their order), else LINK_STREAM_SLOTS.
+    m = re.search(r'^  link stream slots:((?: \d+)*)$', text, re.M)
+    if m and len(m.group(1).split()) == len(streams):
+        for st, k in zip(streams, m.group(1).split()):
+            st['slots'] = int(k)
+    # HBM page streams built (page-engines): the engines, and the link
+    # streams they carry (no controller of their own).
+    m = re.search(r'^  page engines: (\d+) engines, (\d+) page columns', text, re.M)
+    on_engines = set(re.findall(r' link:(\S+)>(\S+)', '\n'.join(
+        re.findall(r'^    page engine \d+ .*$', text, re.M))))
     return dict(lutram=float(g[2]), lutram_bits=int(g[1]), bram=float(g[5]), bram_bits=int(g[4]),
                 uram=float(g[8]), uram_bits=int(g[7]), ff=int(g[10]), uses=uses, pairs=pairs,
-                streams=streams)
+                streams=streams, engines=int(m.group(1)) if m else 0,
+                engine_columns=int(m.group(2)) if m else 0, engine_streams=on_engines)
 
 
 def link_lutram(depth, width):
@@ -1165,10 +1237,12 @@ def link_stream_ctl(dw):
             LINK_STREAM_CTL_LUTRAM[0] + LINK_STREAM_CTL_LUTRAM[1] * dw)
 
 
-def link_stream_cost(pair, uses, frame, f=1.0):
+def link_stream_cost(pair, uses, frame, f=1.0, engines=False):
     """A pair's links as an HBM stream (`pair`: its report line), the links it
     cannot carry distributed; None where its ports do not fit `frame` or it
-    carries none."""
+    carries none. With `engines` (foldsim --page-engines: streams ride the
+    shared page engines), its controller is its share of an engine, the
+    positions its requests take of the frame (`ctl`, `engine_columns` 1)."""
     ports = max(pair['producer_passes'] * pair['pages'],
                 pair['reader_passes'] * (pair['max_need'] + 2))
     if ports > LINK_PORT_SHARE * frame:
@@ -1179,32 +1253,41 @@ def link_stream_cost(pair, uses, frame, f=1.0):
         return None
     rest = sum(f * link_lutram(u['depth'], u['width']) for u in uses if u not in carried)
     cl, cr = link_stream_ctl(pair['dw'])
+    share = 1.0
+    if engines:
+        share = min(1.0, ports / max(frame, 1))
+        el, er = storage.page_engine_ctl()
+        cl, cr = share * el, share * er
     row = max(storage.HBM_BEAT_BYTES, storage.vmem_row_bytes(pair['dw']))
     slices = sum(math.ceil(u['width'] / pair['dw']) for u in carried)
     return dict(lut=cl + pair['dw'] * storage.page_select_luts(pair['pages']) +
                 LINK_STREAM_ENABLE_LUTS * slices,
                 lutram=cr + link_lutram(LINK_STREAM_SLOTS, pair['dw']) + rest,
                 ff=pair['word'] + 32, bram=0.0, uram=0.0, ii_floor=0,
-                hbm=float((pair['read_rows'] + pair['write_rows']) * row), ctl=1)
+                hbm=float((pair['read_rows'] + pair['write_rows']) * row), ctl=share,
+                **({'engine_columns': 1} if engines else {}))
 
 
 def link_streams_built(links):
     """The streams a report's schedule built (`link stream` lines): their
     on-chip cost and HBM bytes a frame, as link_stream_cost prices them."""
     out = dict(lut=0.0, lutram=0.0, ff=0, hbm=0.0, ctl=0)
+    on_engines = (links or {}).get('engine_streams', set())
     for s in (links or {}).get('streams', []):
-        cl, cr = link_stream_ctl(s['dw'])
+        # A stream carried by the page engines: its controller is theirs
+        # (counted with the engines, area).
+        cl, cr = (0.0, 0.0) if (s['p'], s['r']) in on_engines else link_stream_ctl(s['dw'])
         row = max(storage.HBM_BEAT_BYTES, storage.vmem_row_bytes(s['dw']))
         out['lut'] += cl + s['dw'] * storage.page_select_luts(s['pages']) + \
             LINK_STREAM_ENABLE_LUTS * s['kept']
-        out['lutram'] += cr + link_lutram(LINK_STREAM_SLOTS, s['dw'])
+        out['lutram'] += cr + link_lutram(s.get('slots', LINK_STREAM_SLOTS), s['dw'])
         out['ff'] += s['word'] + 32
         out['hbm'] += (s['read_rows'] + s['write_rows']) * row
-        out['ctl'] += 1
+        out['ctl'] += 0 if (s['p'], s['r']) in on_engines else 1
     return out
 
 
-def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0):
+def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0, engines=False):
     """The links as storage_area units, a unit per pair of models with a
     link that block or ultra RAM may hold (foldsim-fold-static `link-kinds`):
     its cost in each of LINK_KINDS, paged (`<kind>:<p>`, at the schedule's
@@ -1245,7 +1328,7 @@ def link_units(cal, links, ii=0, pages=True, hbm=False, frame=0):
             # The compiler's HBM stream (all the pair's links, not only those
             # block or ultra RAM may hold).
             every = [u for u in links['uses'] if u['p'] == p and u['r'] == r]
-            c = link_stream_cost(pair, every, frame, f)
+            c = link_stream_cost(pair, every, frame, f, engines)
             if c is not None:
                 c['lutram'] -= sum(f * link_lutram(u['depth'], u['width'])
                                    for u in every if not u['sync'])
@@ -1557,9 +1640,10 @@ def with_pages(sched, pages, offchip=()):
     the models in `offchip` with their pages off chip."""
     def model(c):
         return re.sub(r'_copy\d+$', '', c)
-    return {c: (info if c == '__links__' else
-                dict(info, page=pages.get(model(c), 0) if info['n'] > 1 else 0,
-                     offchip=model(c) in offchip and info['n'] > 1))
+    # '__links__' (parse_links) is the links' storage, not a class.
+    return {c: info if c == '__links__' else
+            dict(info, page=pages.get(model(c), 0) if info['n'] > 1 else 0,
+                 offchip=model(c) in offchip and info['n'] > 1)
             for c, info in sched.items()}
 
 
@@ -1740,7 +1824,7 @@ FRAME_STEPS = (1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8)
 def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True, vmem=None,
                  pattern='', weights=None, pages_hbm=True, row_bytes_min=1, max_ii=1 << 16,
                  page=True, link_pages=True, link_hbm=False, frame_growth=None,
-                 vmem_group=None):
+                 vmem_group=None, page_engines=False, only_frames=None):
     """--state auto: where each class's state lives, three tiers, priced.
 
       on chip    register stores and memories in flops, distributed, block or
@@ -1794,6 +1878,9 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
         # Pages off chip: those moved, and those the schedule has already.
         # (A model paged anew at this point keeps its pages where the area put
         # them, not where the schedule had them.)
+        # Pages off chip at their own depth (page_hbm_depth), where deeper.
+        pages = dict(pages or {}, **{m: p for m, p in res.get('page_hbm', {}).items()
+                                     if pages and m in pages and p > pages[m]})
         off = sorted({re.sub(r'_copy\d+$', '', c) for c in res.get('pages_offchip', [])} |
                      {re.sub(r'_copy\d+$', '', c) for c, info in (sched or {}).items()
                       if c != '__links__' and info.get('offchip') and
@@ -1816,7 +1903,10 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
                     link_kinds=res.get('link_kinds', ''), links_hbm=res.get('links_hbm', []))
 
     lk = link_cost(cal, (sched or {}).get('__links__'))
-    lu = link_units(cal, (sched or {}).get('__links__'))
+    top = min(max_ii, (frame_growth or FRAME_GROWTH) * ii)
+    # With HBM link streams, at the longest frame tried (their ports fit the
+    # longest best): a pair a stream may carry is at its least there too.
+    lu = link_units(cal, (sched or {}).get('__links__'), 0, True, link_hbm, top, page_engines)
     if lu:
         # The links that may move are the tier's: the rest alone, each group
         # at its least in every pool.
@@ -1831,17 +1921,24 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
              storage.route_luts())):
         return None
     deep = sorted({n for n in classes.values() if n > 1})
-    top = min(max_ii, (frame_growth or FRAME_GROWTH) * ii)
     steps = {round(ii * x) for x in FRAME_STEPS if ii * x <= top}
     frames = sorted({f for n in deep for f in range(n * ((ii + n - 1) // n), top + 1, n)} |
                     {ii} | steps)
+    if only_frames:
+        # Given frames only, each paging every number of models (the
+        # least load that fits and routes): a large fold's frame is set by
+        # its HBM bytes far past the schedule's, where the first-fit search
+        # over every frame takes hours, and the load is not monotonic in
+        # the models paged (selects against freed RAM).
+        frames = sorted(set(only_frames))
+        steps = set(frames)
     last = None
     for f in frames:
         if f < ii:
             continue
         tiers = dict(frame=f, base_hbm=base_hbm, base_bubbles=base_bubbles, weights=weights,
                      pages_hbm=pages_hbm, row_bytes_min=row_bytes_min, link_pages=link_pages,
-                     link_hbm=link_hbm, vmem_group=vmem_group)
+                     link_hbm=link_hbm, vmem_group=vmem_group, page_engines=page_engines)
         if f == ii:
             res = area(cal, est, classes, {}, rest, sched, f, entries, 'auto', route, uram,
                        vmem=vmem, tiers=tiers)
@@ -1869,6 +1966,12 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
                 tried[k] = (some, area(cal, est, classes, {}, rest, with_pages(sched, some), f,
                                        entries, 'auto', route, uram, vmem=vmem, tiers=tiers))
             return tried[k]
+        if only_frames:
+            fit = [k for k in range(0, len(order) + 1) if ok(at(k)[1])]
+            if not fit:
+                continue
+            k = min(fit, key=lambda k: (at(k)[1].get('congestion', at(k)[1]['luts']), at(k)[1]['luts'], k))
+            return outcome(at(k)[1], at(k)[0], f)
         if not ok(at(len(order))[1]):
             # Paging costs logic (the write-back's selects): where the
             # routing binds, paging every model may not route while paging
@@ -2105,6 +2208,14 @@ def main():
                          'routing headroom for a build')
     st.add_argument('--frame-growth', type=int, default=FRAME_GROWTH,
                     help='frames up to this many times the schedule\'s')
+    st.add_argument('--max-frame', type=int, default=1 << 16,
+                    help='frames up to this many host cycles')
+    st.add_argument('--vmem-forward', type=int, choices=(0, 1), default=1,
+                    help='0: controllers priced without forwarding from their write buffers '
+                         '(foldsim --vmem-forward 0, the kernel\'s FORWARD 0)')
+    st.add_argument('--frames', default='', metavar='F,...',
+                    help='only these frames, each with every number of models paged '
+                         '(the least load that fits)')
     st.add_argument('--kernel-terms', action='store_true',
                     help='price the kernel memory endpoints (x the netlist memory ports), the simulator '
                          "top level's logic per link register bit, a threaded copy's controls, and "
@@ -2118,6 +2229,10 @@ def main():
     st.add_argument('--calibrate', default='', metavar='JSON',
                     help='with --kernel-terms: a whole-design calibration (calibrations/*.json): per class '
                          'family factors, the top level per link bit, the links\' LUTRAM, fixed kernel terms')
+    st.add_argument('--sim-ports-folded', action='store_true',
+                    help='with --kernel-terms and the endpoints as built: the simulator\'s side of the memory '
+                         'ports folded into record streams (foldsim --fold-ports): its per-port channel queues '
+                         'priced as what stays a port plus the shared record memories')
     st.add_argument('--uram-memories', action='store_true',
                     help='with --kernel-terms: memories may take ultra RAM (as the storage rules ask)')
     st.add_argument('--copy-logic', default='', metavar='JSON',
@@ -2128,6 +2243,9 @@ def main():
     st.add_argument('--exact', action='store_true',
                     help='choose the kinds exactly (a 0-1 program, HiGHS through scipy) instead of '
                          'the repair and polish: the least routing load with every pool in cap')
+    st.add_argument('--page-engines', action='store_true',
+                    help='price off-chip pages carried by shared page engines (foldsim '
+                         '--page-engines: HBM page streams) instead of a controller per column')
     st.add_argument('--link-hbm', action='store_true',
                     help='price links in HBM too (a what-if: the compiler builds none)')
     st.add_argument('--links-from', default='', metavar='SCHEDULE',
@@ -2177,8 +2295,16 @@ def main():
 
 
 def state_main(a):
+    global LINK_STREAM_CTL_LOGIC, LINK_STREAM_CTL_LUTRAM
     if a.exact:
         storage.ASSIGN_EXACT = True
+    if a.vmem_forward == 0:
+        # Controllers without forwarding from their write buffers (the
+        # kernel's FORWARD 0; the json carries it to the build).
+        storage.no_forward()
+        fl, fr = storage.NO_FORWARD_VMEM
+        LINK_STREAM_CTL_LOGIC = (LINK_STREAM_CTL_LOGIC[0] * fl, LINK_STREAM_CTL_LOGIC[1] * fl)
+        LINK_STREAM_CTL_LUTRAM = (LINK_STREAM_CTL_LUTRAM[0] * fr, LINK_STREAM_CTL_LUTRAM[1] * fr)
     if a.route_limit is not None:
         storage.ROUTE_LIMIT = a.route_limit
     cal = json.load(open(a.calibration)) if a.calibration else None
@@ -2192,6 +2318,7 @@ def state_main(a):
                                                map(float, a.fold_ports_measured.split(','))))
                       if getattr(a, 'fold_ports_measured', '') else None,
                       calibration=json.load(open(a.calibrate)) if getattr(a, 'calibrate', '') else None,
+                      sim_ports_folded=getattr(a, 'sim_ports_folded', False),
                       uram_memories=getattr(a, 'uram_memories', False),
                       copy_logic=json.load(open(a.copy_logic)) if getattr(a, 'copy_logic', '') else None)
     m = re.search(r'virtual-memories=(\S+)', a.fold_options)
@@ -2213,7 +2340,9 @@ def state_main(a):
                        weights=weights, pages_hbm=not a.no_pages_hbm,
                        row_bytes_min=a.vmem_row_bytes_min, page=not a.no_page,
                        link_pages=not a.no_link_pages, link_hbm=a.link_hbm,
-                       frame_growth=a.frame_growth, vmem_group=a.vmem_group)
+                       frame_growth=a.frame_growth, vmem_group=a.vmem_group, max_ii=a.max_frame,
+                       page_engines=a.page_engines,
+                       only_frames=[int(x) for x in a.frames.split(',') if x])
     if links:
         lk = link_cost(cal, links)
         print(f"links: {(links['lutram_bits'] + links['bram_bits'] + links['uram_bits']) / 1e6:.1f} "
@@ -2229,6 +2358,7 @@ def state_main(a):
     print(f'II {ii} (schedule)')
     print(state_table(out, classes, est))
     if a.out:
+        out['vmem_forward'] = a.vmem_forward
         json.dump(out, open(a.out, 'w'), indent=1, default=str)
     return 0
 

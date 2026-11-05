@@ -115,7 +115,7 @@
 // HBM: %region1_fetching = seq.firreg
 // HBM: %region1_pages_pending = seq.firreg
 // HBM: %region1_writeback_valid = seq.firreg
-// HBM: foldsim.vmems = ["region1_pages:Leaf:3:1:32:4:1:8", "region2_pages:Leaf:3:1:32:4:1:8"]
+// HBM: foldsim.vmems = ["region1_pages:Leaf:3:1:32:4:1:8:0:pages", "region2_pages:Leaf:3:1:32:4:1:8:0:pages"]
 // HBMREGS: storage: 'hbm' is for a model's pages, not 'regs'
 // MODEL: page: no model 'Nope'
 // SPEC: page: 'Leaf:0' is not <model>:<p>, p at least 1

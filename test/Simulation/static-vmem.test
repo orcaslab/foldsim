@@ -35,6 +35,18 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/bub --static --virtual-memories ram --bubbles Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_vmem.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
 # RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=30 +bubble=30 +stall=10 | FileCheck %s
+# Bubbles at high rates and in long runs, with one copy and with two copies
+# under nested sequencers.
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=1 +hi=30 +bubble=95 +burst=16 +stall=10 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bubc --static --virtual-memories ram --copies Leaf:2 --nest --bubbles Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DCOPIES2 -DIW=1 -Mdir %t/bubc/obj %S/Inputs/tb_vmem.sv top.sv %t/bubc/foldsim_sim.sv > %t/bubc/build.log 2>&1
+# RUN: %t/bubc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=40 +bubble=90 +burst=8 +stall=20 +full=20 | FileCheck %s
+# --min-ii: the frame padded to 40 host cycles (its positions past the
+# schedule's idle), a longer distance from each read's request to its use.
+# RUN: foldsim --srcs top.f --top Top --out %t/minii --static --modulo --virtual-memories ram --min-ii 40 Leaf > %t/minii.log 2>&1
+# RUN: FileCheck %s --check-prefix=MINII < %t/minii/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/minii/obj %S/Inputs/tb_vmem.sv top.sv %t/minii/foldsim_sim.sv > %t/minii/build.log 2>&1
+# RUN: %t/minii/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +lo=1 +hi=30 +stall=20 | FileCheck %s
 # The regex is also searched in <class model>:<name> (a copy's by its class):
 # Leaf's RAM by its class, in both copies; a class without it keeps it inside.
 # RUN: foldsim --srcs top.f --top Top --out %t/cls --static --virtual-memories 'Leaf:ram' --copies Leaf:2 Leaf > /dev/null 2>&1
@@ -44,6 +56,7 @@
 # Without --virtual-memories the RAM stays inside.
 # RUN: foldsim --srcs top.f --top Top --out %t/plain --static Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=PLAIN < %t/plain/foldsim_sim.json
+# MINII: foldsim-fold-static: II = 40
 # VH: `define FOLDSIM_VMEM_COUNT 1
 # VH: `define FOLDSIM_VMEM_0_IW 2
 # VH: `define FOLDSIM_VMEM_0_AW 4

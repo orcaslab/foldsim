@@ -46,6 +46,12 @@
 # WIN: Leaf off-chip page window 2
 # RUN: FileCheck %s --check-prefix=ONE < %t/one.log
 # RUN: FileCheck %s --check-prefix=COLS < %t/cols/foldsim_sim.vh
+# Controller groups (--vmem-group) never take a page column: a group's FIFO
+# entry keeps one instance for a member's read and write of a host cycle, and a
+# column reads one instance's page while it writes another's (the kernel's
+# foldsim_vmem_group answered a read with the write's instance: virt_1101).
+# RUN: foldsim --srcs top.f --top Top --out %t/grp --static --page 1 --storage Leaf:pages=hbm --page-hbm-column-bits 64 --virtual-memories ram --vmem-group copy Leaf 2>&1 | FileCheck %s --check-prefix=GRP
+# GRP: foldsim: vmem controllers: g0 vm0, g1 vm1, g2 vm2, g3 vm3
 # ONE: pages Leaf: p 2, 3 registers, 181 bits (184 in 8-bit bytes, 1 enables); off chip: 1 virtual memories of 8 rows x 96 bits (vm0), lead 2
 # COLS: `define FOLDSIM_VMEM_COUNT 3
 # COLS: `define FOLDSIM_VMEM_0_IW 2

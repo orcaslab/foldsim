@@ -1,0 +1,63 @@
+# REQUIRES: verilator
+# Staged evaluation (--stage-levels N): a class whose state cone is deeper
+# than N estimated levels evaluates over several host cycles, its logic cut
+# by stage registers that step with the frame's positions; its state and
+# inputs are read the stages before its state pass. The leaves
+# (Driver/Inputs/deep) scan eight entries for the oldest, and the result
+# picks a row of a RAM read combinationally (at the instance of its stage),
+# the address of a RAM read through a register, an element write's entry and
+# two enables; the second leaf reads a late link of Top's logic. Against the
+# target (tb_late.sv), from zero state, with bubbles and stalled channels:
+# one copy at N = 6 and 4, two copies with overlapped frames, a copy per
+# instance, paged state (byte masks, and a dense page word whose old value
+# crosses the stages), nested sequencers with a short lead, and the link
+# kinds (zero-latency chains, shared, staged and compact links).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/deep
+# RUN: foldsim --srcs top.f --top Top --out %t/plain --static --bubbles Leaf > %t/plain.log 2>&1
+# RUN: FileCheck %s --check-prefix=PLAIN < %t/plain.log
+# RUN: foldsim-opt %t/plain/foldsim_sim.mlir --pass-pipeline='builtin.module(foldsim-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=DEEP
+# RUN: foldsim --srcs top.f --top Top --out %t/s6 --static --bubbles --stage-levels 6 Leaf > %t/s6.log 2>&1
+# RUN: FileCheck %s --check-prefix=S6 < %t/s6.log
+# RUN: foldsim-opt %t/s6/foldsim_sim.mlir --pass-pipeline='builtin.module(foldsim-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CUT6
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/s6/obj %S/Inputs/tb_late.sv top.sv %t/s6/foldsim_sim.sv > %t/s6/build.log 2>&1
+# RUN: %t/s6/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/s4 --static --bubbles --stage-levels 4 Leaf > %t/s4.log 2>&1
+# RUN: FileCheck %s --check-prefix=S4 < %t/s4.log
+# RUN: foldsim-opt %t/s4/foldsim_sim.mlir --pass-pipeline='builtin.module(foldsim-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CUT4
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/s4/obj %S/Inputs/tb_late.sv top.sv %t/s4/foldsim_sim.sv > %t/s4/build.log 2>&1
+# RUN: %t/s4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/c2 --static --bubbles --modulo --copies Leaf:2 --stage-levels 6 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/c2/obj %S/Inputs/tb_late.sv top.sv %t/c2/foldsim_sim.sv > %t/c2/build.log 2>&1
+# RUN: %t/c2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/c4 --static --modulo --copies Leaf:4 --stage-levels 5 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/c4/obj %S/Inputs/tb_late.sv top.sv %t/c4/foldsim_sim.sv > %t/c4/build.log 2>&1
+# RUN: %t/c4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/pg2 --static --bubbles --page 2 --stage-levels 6 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/pg2/obj %S/Inputs/tb_late.sv top.sv %t/pg2/foldsim_sim.sv > %t/pg2/build.log 2>&1
+# RUN: %t/pg2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/pg3 --static --bubbles --modulo --page 3 --no-page-masks --stage-levels 6 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/pg3/obj %S/Inputs/tb_late.sv top.sv %t/pg3/foldsim_sim.sv > %t/pg3/build.log 2>&1
+# RUN: %t/pg3/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --bubbles --nest --modulo --short-lead --copies Leaf:2 --page 2 --stage-levels 8 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_late.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +bubble=30 +stall=20 | FileCheck %s
+# The cut soonest first, forced: the same against the target.
+# RUN: env FOLDSIM_STAGE_CUT=soonest foldsim --srcs top.f --top Top --out %t/early --static --bubbles --modulo --page 2 --stage-levels 6 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/early/obj %S/Inputs/tb_late.sv top.sv %t/early/foldsim_sim.sv > %t/early/build.log 2>&1
+# RUN: %t/early/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/zl --static --bubbles --modulo --zero-latency-links --zero-latency-chains --share-links --staged-links --compact-links --stage-levels 6 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/zl/obj %S/Inputs/tb_late.sv top.sv %t/zl/foldsim_sim.sv > %t/zl/build.log 2>&1
+# RUN: %t/zl/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +bubble=30 +stall=20 | FileCheck %s
+# Unstaged, the leaf's cone is one host cycle of 49 estimated levels; at 6 and
+# 4 levels a stage (counted as the logic screen does: a 12-bit compare or adder
+# a LUT and a carry block, two chained choices a LUT), it spans 9 and 14 stage
+# registers and no end point is much deeper than a stage. Of the cut soonest
+# and the cut latest, the one of fewer stage register bits (STAGEBITS).
+# PLAIN: Leaf x4 state gap {{[0-9]+}}{{$}}
+# DEEP: #1 levels 49:
+# S6: Leaf x4 state gap 4 stages 9
+# S6: Leaf staged: 9 stages, soonest {{[0-9]+}} stage register bits, latest {{[0-9]+}} (latest)
+# CUT6: #1 levels {{[4-7]}}:
+# S4: Leaf x4 state gap 4 stages 14
+# CUT4: #1 levels {{[3-6]}}:
+# CHECK: {{^}}MATCH 196 cycles

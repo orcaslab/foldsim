@@ -1,0 +1,79 @@
+# REQUIRES: verilator
+# Staged and multicycle evaluation (`stage-levels`, `multicycle`) of a class
+# whose paged register state is kept off chip (--storage <model>:pages=hbm).
+# The copy reads its fetch buffer at an evaluation's read position, the
+# stages before its state pass, so each instance's pages are fetched by that
+# position (the fetch a lead before it, as early as the copy's read position
+# before: the buffer is free once that one has read it; but after the frame
+# before's write-back of each page), and waited for there (the frame's
+# advance checks the instance's pending pages at the read position); the
+# write-back is loaded at the state pass with the last stage's values, its
+# pages written after it as before. With a window, each prefetch is at the
+# copy's read position a window before, and the fetch from the window a lead
+# before the read. With page engines, the reads are placed by the read
+# positions. Against the target (tb_pages.sv: a controller model per virtual
+# memory, answers 1 to 60 host cycles on, `free` low at times, stalls,
+# bubbles, PROTOCOL for a read or write of an instance whose read is
+# outstanding), from zero state (Driver/Inputs/paged_staged: registered
+# outputs, a RAM read through a register): staged; multicycle; bubbles with
+# overlapped frames; copies under nested sequencers, and multicycle; the
+# dense page word
+# (its old value crosses the stages); a window, also multicycle with nested
+# sequencers and a short lead; page engines; the leaves' RAM virtual too.
+# Waiting for the pages at the state pass instead mismatches MC (seed 1,
+# PROTOCOL at seed 3); fetching a lead before the state pass instead of the
+# read mismatches ST and MC at every seed; fetching a page before the frame
+# before's write-back of it (no s - ii + 2 bound: it binds in CP and CPMC, two
+# instances a copy) reads the old page (PROTOCOL and MISMATCH in CP).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/paged_staged
+# RUN: foldsim --srcs top.f --top Top --out %t/st --static --page 2 --storage Leaf:pages=hbm --stage-levels 1 Leaf > %t/st.log 2>&1
+# RUN: FileCheck %s --check-prefix=ST < %t/st/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/st -Mdir %t/st/obj %S/Inputs/tb_pages.sv top.sv %t/st/foldsim_sim.sv > %t/st/build.log 2>&1
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=40 +stall=20 +full=20 | FileCheck %s
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/mc --static --page 3 --storage Leaf:pages=hbm --multicycle Leaf:3 --stage-levels 1 Leaf > %t/mc.log 2>&1
+# RUN: FileCheck %s --check-prefix=MC < %t/mc/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/mc -Mdir %t/mc/obj %S/Inputs/tb_pages.sv top.sv %t/mc/foldsim_sim.sv > %t/mc/build.log 2>&1
+# RUN: %t/mc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/mc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=40 +stall=20 +full=20 | FileCheck %s
+# RUN: %t/mc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bub --static --page 3 --storage Leaf:pages=hbm --bubbles --modulo --page-hbm-column-bits 32 --stage-levels 1 Leaf > %t/bub.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/bub -DBUBBLES -DVM1 -Mdir %t/bub/obj %S/Inputs/tb_pages.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=60 +bubble=50 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/cp --static --page 2 --storage Leaf:pages=hbm --copies Leaf:2 --nest --bubbles --stage-levels 1 Leaf > %t/cp.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/cp -DBUBBLES -DVM1 -Mdir %t/cp/obj %S/Inputs/tb_pages.sv top.sv %t/cp/foldsim_sim.sv > %t/cp/build.log 2>&1
+# RUN: %t/cp/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=40 +stall=20 +full=20 +bubble=20 | FileCheck %s
+# RUN: %t/cp/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 +bubble=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/cpmc --static --page 3 --storage Leaf:pages=hbm --copies Leaf:2 --multicycle Leaf:3 --stage-levels 1 Leaf > %t/cpmc.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/cpmc -DVM1 -Mdir %t/cpmc/obj %S/Inputs/tb_pages.sv top.sv %t/cpmc/foldsim_sim.sv > %t/cpmc/build.log 2>&1
+# RUN: %t/cpmc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/cpmc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/dense --static --page 3 --storage Leaf:pages=hbm --no-page-masks --modulo --stage-levels 1 Leaf > %t/dense.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/dense -Mdir %t/dense/obj %S/Inputs/tb_pages.sv top.sv %t/dense/foldsim_sim.sv > %t/dense/build.log 2>&1
+# RUN: %t/dense/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=3 +hi=10 +stall=10 | FileCheck %s
+# RUN: %t/dense/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/win --static --page 2 --storage Leaf:pages=hbm --page-hbm-window 2 --stage-levels 1 Leaf > %t/win.log 2>&1
+# RUN: FileCheck %s --check-prefix=WIN < %t/win.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/win -Mdir %t/win/obj %S/Inputs/tb_pages.sv top.sv %t/win/foldsim_sim.sv > %t/win/build.log 2>&1
+# RUN: %t/win/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 +full=20 | FileCheck %s
+# RUN: %t/win/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/winmc --static --page 3 --storage Leaf:pages=hbm --page-hbm-window 4 --multicycle Leaf:3 --stage-levels 1 --nest --short-lead --bubbles --page-hbm-column-bits 64 Leaf > %t/winmc.log 2>&1
+# RUN: FileCheck %s --check-prefix=WIN < %t/winmc.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/winmc -DBUBBLES -Mdir %t/winmc/obj %S/Inputs/tb_pages.sv top.sv %t/winmc/foldsim_sim.sv > %t/winmc/build.log 2>&1
+# RUN: %t/winmc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=40 +bubble=20 | FileCheck %s
+# RUN: %t/winmc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/eng --static --page 4 --storage Leaf:pages=hbm --page-hbm-column-bits 64 --page-engines auto --stage-levels 1 Leaf > %t/eng.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/eng -Mdir %t/eng/obj %S/Inputs/tb_pages.sv top.sv %t/eng/foldsim_sim.sv > %t/eng/build.log 2>&1
+# RUN: %t/eng/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=30 +stall=30 | FileCheck %s
+# RUN: %t/eng/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=60 +full=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/ram --static --page 2 --storage Leaf:pages=hbm --virtual-memories ram --bubbles --stage-levels 1 Leaf > %t/ram.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/ram -DBUBBLES -DVM1 -Mdir %t/ram/obj %S/Inputs/tb_pages.sv top.sv %t/ram/foldsim_sim.sv > %t/ram/build.log 2>&1
+# RUN: %t/ram/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=40 +bubble=20 +full=20 | FileCheck %s
+# RUN: %t/ram/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=60 | FileCheck %s
+# ST: Leaf x4 state gap {{[0-9]+}} stages 2 page 2 off chip
+# MC: Leaf x4 state gap {{[0-9]+}} stages 4 multicycle 3 page 3 off chip
+# WIN: Leaf off-chip page window 2
+# CHECK-NOT: PROTOCOL
+# CHECK: {{^}}MATCH 196 cycles
