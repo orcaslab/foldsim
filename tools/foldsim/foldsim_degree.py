@@ -186,6 +186,11 @@ def vmem_bram(est, classes, degree, vmem, vmem_group=None, row_bytes_min=1):
 # shares and the SLASH sc_mem tree (storage.platform_cost). Set by state_main;
 # when set, storage_area prices no controller from the estimates.
 BUILT = None
+# The page engines' count (storage_area): 'max' every off-chip copy's columns
+# and every stream on engines of their own (an upper bound); 'first-fit' as
+# foldsim-fold-static assigns them (storage.engines_first_fit), `shift` the
+# fold's link-hbm-shift (state --engine-rule, --link-hbm-shift).
+ENGINES = dict(rule='max', shift=0)
 
 
 def read_built(path):
@@ -996,7 +1001,15 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         share = sum(e[1] for e in engine_cols)
         cols = sum(e[0] for e in engine_cols if len(e) < 3)
         streams = sum(1 for e in engine_cols if len(e) == 3)
-        own = max([e[0] for e in engine_cols] + [math.ceil(share - 1e-9), cols + streams])
+        if ENGINES['rule'] == 'first-fit':
+            # As the compiler assigns them (storage.engines_first_fit): the
+            # page columns on the streams' engines where their traffic finds
+            # room, the streams sharing under link-hbm-shift.
+            own = max([e[0] for e in engine_cols] + [math.ceil(share - 1e-9), storage.engines_first_fit(
+                [(e[0], e[1] / max(e[0], 1)) for e in engine_cols if len(e) < 3],
+                [e[1] for e in engine_cols if len(e) == 3], ENGINES['shift'])])
+        else:
+            own = max([e[0] for e in engine_cols] + [math.ceil(share - 1e-9), cols + streams])
         page_engines = max(own, built_engines) if built.get('engine_columns') else \
             own + built_engines
         el, er = storage.page_engine_ctl()
@@ -2098,7 +2111,11 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
         return dict(page=spec, pattern=pat, storage=res.get('storage', ''), frame=frame,
                     res=res, h=h, moved=moved, pages_offchip=off,
                     rows=tiers_pattern(res.get('rows_new', [])), rows_new=res.get('rows_new', []),
-                    link_kinds=res.get('link_kinds', ''), links_hbm=res.get('links_hbm', []))
+                    link_kinds=res.get('link_kinds', ''), links_hbm=res.get('links_hbm', []),
+                    # The engines' rule and the shift a flow builds the choice with (foldsim
+                    # --link-hbm-shift), where priced first-fit.
+                    **({'engine_rule': ENGINES['rule'], 'link_hbm_shift': ENGINES['shift']}
+                       if ENGINES['rule'] != 'max' else {}))
 
     if BUILT is not None:
         # As built (--built-json): the schedule's frame, its pages, virtual
@@ -2453,6 +2470,14 @@ def main():
     st.add_argument('--page-engines', action='store_true',
                     help='price off-chip pages carried by shared page engines (foldsim '
                          '--page-engines: HBM page streams) instead of a controller per column')
+    st.add_argument('--engine-rule', choices=('max', 'first-fit'), default='max',
+                    help="with --page-engines: the engines priced: 'max' (every off-chip copy's columns "
+                         "and every stream on its own engines, an upper bound) or 'first-fit' (as "
+                         'foldsim-fold-static assigns them: columns on the engines where their traffic '
+                         'finds room, streams sharing under --link-hbm-shift)')
+    st.add_argument('--link-hbm-shift', type=int, default=0, metavar='N',
+                    help="the fold's foldsim --link-hbm-shift (streams on the page engines move their "
+                         "requests up to N positions to share an engine), for --engine-rule first-fit")
     st.add_argument('--link-hbm', action='store_true',
                     help='price links in HBM too (a what-if: the compiler builds none)')
     st.add_argument('--built-json', default='', metavar='JSON',
@@ -2508,6 +2533,7 @@ def main():
 
 def state_main(a):
     global BUILT
+    ENGINES.update(rule=getattr(a, 'engine_rule', 'max'), shift=getattr(a, 'link_hbm_shift', 0))
     if a.exact:
         storage.ASSIGN_EXACT = True
     if a.vmem_forward == 0:

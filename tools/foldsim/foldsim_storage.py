@@ -607,6 +607,56 @@ def no_forward():
     CTL_FORWARD = 0
 
 
+# The engines a fold takes, as foldsim-fold-static assigns them
+# (assignPageEngines), from occupancies (`engines_first_fit`): the link
+# streams first, then each off-chip copy's columns on the first run of
+# `columns` consecutive engines (new ones past the last) whose positions
+# leave its page traffic room. Positions are not known before a schedule,
+# so a position's use is an occupancy: an engine's share of the frame taken
+# (reads; writes alike), in the model's shares (page_engine_share, a copy's
+# max(p, 2) x instances; link_stream_cost's ports, a stream's). A copy's page
+# reads go in the window between its state passes, in page order after the
+# frame before's writes, page 0 two positions before the pass, so it shares
+# a run only where the run's occupancy plus its own stays within
+# ENGINE_PAGE_OCC: the 16-SM g16c put a 9-column copy of share 0.5 beside a
+# stream on 9 engines of its own (10), the 64-SM m_p64 49 columns and 8
+# streams on 20. A stream's requests sit a lead before its landings: at its
+# own positions an engine each (streams landing at the same passes collide:
+# the 32-SM schedule g32cs put 17 on 15); with link-hbm-shift (requests up
+# to N positions earlier, writes later) on the first engine within
+# ENGINE_STREAM_OCC (Driver/engines-first-fit.test: three streams of share
+# 0.3 on one; a64 S2_m64, shift 256 at II 81,922: 20 streams 16 -> 7
+# engines; a128 fake_S1_s4: 32 streams and a page column on 4).
+ENGINE_PAGE_OCC = 0.5
+ENGINE_STREAM_OCC = 1.0
+
+
+def engines_first_fit(copies, streams, shift=0):
+    """The page engines of a fold: `copies` [(columns, share of the frame a
+    column's page traffic takes)] in the compiler's class order, `streams`
+    [share of the frame its requests take]; `shift` the compiler's
+    link-hbm-shift. Returns the engine count."""
+    occ = []
+    for u in streams:
+        for e in range(len(occ) if shift > 0 else 0):
+            if occ[e] + u <= ENGINE_STREAM_OCC:
+                occ[e] += u
+                break
+        else:
+            occ.append(u)
+    for cols, u in copies:
+        cols = max(int(cols), 1)
+        first = 0
+        while any(occ[e] + u > ENGINE_PAGE_OCC for e in range(first, min(first + cols, len(occ)))):
+            first += 1
+        for e in range(first, first + cols):
+            if e < len(occ):
+                occ[e] += u
+            else:
+                occ.append(u)
+    return len(occ)
+
+
 def page_engine_ctl(row_bits=PAGE_ENGINE_BITS):
     """A page engine's (logic LUTs, LUTRAM LUTs)."""
     c = ctl_cost('engine', row_bits)
