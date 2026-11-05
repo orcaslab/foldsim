@@ -454,9 +454,11 @@ class LogicAbsorber {
 public:
   LogicAbsorber(ModuleOp top, hw::HWModuleOp parent,
                 const llvm::StringSet<> &modelNames, unsigned limit,
-                ArrayRef<std::string> exclusiveModels, bool absorbRegisters)
+                ArrayRef<std::string> exclusiveModels, bool absorbRegisters,
+                unsigned registerLimit)
       : top(top), parent(parent), modelNames(modelNames), limit(limit),
-        absorbRegisters(absorbRegisters) {
+        absorbRegisters(absorbRegisters),
+        registerLimit(registerLimit ? registerLimit : limit) {
     for (auto &glob : exclusiveModels) {
       auto pattern = llvm::GlobPattern::create(glob);
       if (!pattern) {
@@ -495,6 +497,7 @@ private:
   /// `absorb-registers`, and whether the collection under way may take
   /// registers (an exclusive one: `regsInside`).
   bool absorbRegisters;
+  unsigned registerLimit;
   bool regsInside = false;
   DenseMap<Value, bool> portDeps;
   /// The instances of the model being absorbed into, by their index, and the
@@ -715,7 +718,7 @@ bool LogicAbsorber::collect(Value root, SmallVectorImpl<Operation *> &ops,
       }
       ops.push_back(op);
       frames.pop_back();
-      if (ops.size() > limit)
+      if (ops.size() > (regsInside ? registerLimit : limit))
         return false;
     }
     return true;
@@ -1124,7 +1127,7 @@ void ExtractModelsPass::runOnOperation() {
 
   if (absorbLogic)
     LogicAbsorber(top, parent, modelNames, absorbLogic, absorbExclusive,
-                  absorbRegisters)
+                  absorbRegisters, absorbRegisterLogic)
         .run();
 
   auto *body = parent.getBodyBlock();

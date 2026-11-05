@@ -85,6 +85,9 @@ def ExtractModels : Pass<"foldsim-extract-models", "::mlir::ModuleOp"> {
     Option<"absorbRegisters", "absorb-registers", "bool", "false",
            "With absorb-exclusive: the logic a model input alone reads may "
            "pass through registers, which move into the model">,
+    Option<"absorbRegisterLogic", "absorb-register-logic", "unsigned", "0",
+           "With absorb-registers: the most ops a model input's logic through "
+           "registers may take (0: absorb-logic's)">,
     ListOption<"models", "models", "std::string",
                "The modules simulated as separate models">,
     Option<"netlist", "netlist", "bool", "false",
