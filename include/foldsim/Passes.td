@@ -64,6 +64,14 @@ def ExtractModels : Pass<"foldsim-extract-models", "::mlir::ModuleOp"> {
     differs among the instances' logic (a constant index into a bus, an input
     one instance has padded with zeros) is then an input too, each instance's
     own.
+
+    With `absorb-registers` too, that logic may pass through registers: a
+    register whose value reaches only that input (its own next value aside) is
+    moved into the model with the part of its next-value, reset and reset-value
+    logic that reaches it alone, at most N ops in all, its clock the model's.
+    A per-port pipeline register and the select in front of it are then one
+    copy in the model, the register a state of it: the same register, updated
+    from the same values every cycle.
   }];
   let options = [
     Option<"moduleName", "module", "std::string", "",
@@ -74,6 +82,9 @@ def ExtractModels : Pass<"foldsim-extract-models", "::mlir::ModuleOp"> {
     ListOption<"absorbExclusive", "absorb-exclusive", "std::string",
                "The models (globs) whose inputs, over the limit, take the "
                "part of the logic that reaches the input alone">,
+    Option<"absorbRegisters", "absorb-registers", "bool", "false",
+           "With absorb-exclusive: the logic a model input alone reads may "
+           "pass through registers, which move into the model">,
     ListOption<"models", "models", "std::string",
                "The modules simulated as separate models">,
     Option<"netlist", "netlist", "bool", "false",

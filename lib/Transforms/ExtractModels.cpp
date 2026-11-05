@@ -454,8 +454,9 @@ class LogicAbsorber {
 public:
   LogicAbsorber(ModuleOp top, hw::HWModuleOp parent,
                 const llvm::StringSet<> &modelNames, unsigned limit,
-                ArrayRef<std::string> exclusiveModels)
-      : top(top), parent(parent), modelNames(modelNames), limit(limit) {
+                ArrayRef<std::string> exclusiveModels, bool absorbRegisters)
+      : top(top), parent(parent), modelNames(modelNames), limit(limit),
+        absorbRegisters(absorbRegisters) {
     for (auto &glob : exclusiveModels) {
       auto pattern = llvm::GlobPattern::create(glob);
       if (!pattern) {
@@ -491,11 +492,18 @@ private:
   /// The models whose inputs take the logic that reaches them alone.
   SmallVector<llvm::GlobPattern> exclusiveGlobs;
   bool exclusive = false;
+  /// `absorb-registers`, and whether the collection under way may take
+  /// registers (an exclusive one: `regsInside`).
+  bool absorbRegisters;
+  bool regsInside = false;
   DenseMap<Value, bool> portDeps;
   /// The instances of the model being absorbed into, by their index, and the
   /// sinks of the parent's values for it.
   DenseMap<Operation *, unsigned> instanceIndex;
   DenseMap<Value, int64_t> sinks;
+  /// Registers moved into a model, by each instance's register.
+  DenseMap<Operation *, SmallVector<std::pair<SmallVector<Value>, Value>>>
+      absorbedRegs;
   /// Inputs added to a model, by the value each instance gives them.
   DenseMap<Operation *, SmallVector<std::pair<SmallVector<Value>, Value>>>
       absorbedInputs;
@@ -514,6 +522,9 @@ bool LogicAbsorber::dependsOnPorts(Value root) {
   auto leaf = [&](Value value) -> std::optional<bool> {
     auto *op = value.getDefiningOp();
     if (!op || isa<hw::InstanceOp>(op))
+      return true;
+    // A register the collection may take: logic over it can move with it.
+    if (regsInside && isa<seq::FirRegOp>(op))
       return true;
     if (!isConeOp(op))
       return false;
@@ -611,12 +622,19 @@ int64_t LogicAbsorber::sinkOf(Value root) {
       OpOperand *use = frame.uses[frame.next];
       Operation *user = use->getOwner();
       if (auto it = instanceIndex.find(user); it != instanceIndex.end()) {
+        // Through registers, sinks are instances: a register may reach
+        // several inputs of its instance (the fields of a pipeline
+        // register), and is moved once (absorbedRegs).
         frame.sink = meet(frame.sink, sinkCode(it->second,
-                                               use->getOperandNumber()));
+                                               regsInside ? 0
+                                                          : use->getOperandNumber()));
         ++frame.next;
         continue;
       }
-      if (!isConeOp(user)) {
+      // A register on the way (`regsInside`): its value's sinks are this
+      // use's; its own next value reading it meets the search under way,
+      // which adds none.
+      if (!isConeOp(user) && !(regsInside && isa<seq::FirRegOp>(user))) {
         frame.sink = kManySinks;
         break;
       }
@@ -665,10 +683,21 @@ bool LogicAbsorber::collect(Value root, SmallVectorImpl<Operation *> &ops,
     // is done with.
     auto enter = [&](Value value) {
       auto *op = value.getDefiningOp();
-      bool inside = op && isConeOp(op) && !(forced && forced->contains(value)) &&
-                    (op->getNumOperands() == 0 ||
-                     (dependsOnPorts(value) &&
-                      (only == kNoSink || sinkOf(value) == only)));
+      // Through registers, a search of the sinks stops at a register it is
+      // already in (its next value reading it): a value found that way to
+      // reach no sink reaches only that register, and is taken with it.
+      auto alone = [&](Value v) {
+        int64_t s = sinkOf(v);
+        return s == only || (regsInside && s == kNoSink);
+      };
+      bool reg = regsInside && op && isa<seq::FirRegOp>(op) &&
+                 only != kNoSink && !(forced && forced->contains(value)) &&
+                 alone(value);
+      bool inside = reg ||
+                    (op && isConeOp(op) && !(forced && forced->contains(value)) &&
+                     (op->getNumOperands() == 0 ||
+                      (dependsOnPorts(value) &&
+                       (only == kNoSink || alone(value)))));
       if (!inside) {
         if (leafSet.insert(value).second)
           leaves.push_back(value);
@@ -692,7 +721,8 @@ bool LogicAbsorber::collect(Value root, SmallVectorImpl<Operation *> &ops,
     return true;
   };
   auto *rootOp = root.getDefiningOp();
-  if (!rootOp || !isConeOp(rootOp) || !dependsOnPorts(root) ||
+  bool rootReg = regsInside && rootOp && isa<seq::FirRegOp>(rootOp);
+  if (!rootOp || (!rootReg && (!isConeOp(rootOp) || !dependsOnPorts(root))) ||
       (only != kNoSink && sinkOf(root) != only))
     return false;
   if (!visit(root))
@@ -708,6 +738,11 @@ static bool sameAttributes(Operation *a, Operation *b) {
   auto filtered = [](Operation *op) {
     NamedAttrList attrs(op->getAttrDictionary());
     attrs.erase("sv.namehint");
+    // A register's name and symbol are its instance's own.
+    if (isa<seq::FirRegOp>(op)) {
+      attrs.erase("name");
+      attrs.erase("inner_sym");
+    }
     return attrs.getDictionary(op->getContext());
   };
   return filtered(a) == filtered(b);
@@ -791,12 +826,38 @@ void LogicAbsorber::run() {
       // Over the limit, with `exclusive`, the logic that reaches this input
       // alone: what other inputs or state also read stays in the parent.
       int64_t only = kNoSink;
+      regsInside = false;
       if (!collect(instances[0].getOperand(index), ops, leaves)) {
         ops.clear();
         leaves.clear();
         only = sinkCode(0, index);
-        if (!exclusive ||
-            !collect(instances[0].getOperand(index), ops, leaves, only))
+        if (!exclusive)
+          continue;
+        bool taken = collect(instances[0].getOperand(index), ops, leaves, only);
+        // With `absorb-registers`, the logic that reaches the input alone
+        // may pass through registers: searched again with them inside.
+        if (absorbRegisters) {
+          SmallVector<Operation *> regOps;
+          SmallVector<Value> regLeaves;
+          regsInside = true;
+          portDeps.clear();
+          sinks.clear();
+          if (collect(instances[0].getOperand(index), regOps, regLeaves,
+                      sinkCode(0, 0)) &&
+              llvm::any_of(regOps, [](Operation *op) {
+                return isa<seq::FirRegOp>(op);
+              })) {
+            ops = std::move(regOps);
+            leaves = std::move(regLeaves);
+            only = sinkCode(0, 0);
+            taken = true;
+          } else {
+            regsInside = false;
+            portDeps.clear();
+            sinks.clear();
+          }
+        }
+        if (!taken)
           continue;
       }
       // Every instance's leaves for the logic, if it is the same logic. With
@@ -804,13 +865,15 @@ void LogicAbsorber::run() {
       // index into a bus, an input padded with zeros) is a leaf too: each
       // instance's value becomes the model's input.
       SmallVector<SmallVector<Value>> leavesOf;
+      SmallVector<DenseMap<Value, Value>> matchedOf;
       auto matchAll = [&](DenseSet<Value> *differing) {
         leavesOf.clear();
+        matchedOf.clear();
         for (auto instance : instances) {
           DenseMap<Value, Value> leafMap;
           for (auto leaf : leaves)
             leafMap[leaf] = Value();
-          DenseMap<Value, Value> matched;
+          auto &matched = matchedOf.emplace_back();
           if (!match(instances[0].getOperand(index),
                      instance.getOperand(index), leafMap, matched, differing))
             return false;
@@ -895,12 +958,81 @@ void LogicAbsorber::run() {
         if (leafBits > hw::getBitWidth(arg.getType()))
           continue;
       }
+      // A register moved in takes the model's clock: every instance's leaf
+      // must be the clock that instance is given.
+      std::optional<unsigned> clockArg;
+      for (unsigned a = 0; a < model.getNumInputPorts(); ++a)
+        if (isa<seq::ClockType>(model.getBodyBlock()->getArgument(a).getType())) {
+          clockArg = a;
+          break;
+        }
+      bool clocksOk = true;
+      for (auto [k, leaf] : llvm::enumerate(leaves)) {
+        if (!isa<seq::ClockType>(leaf.getType()))
+          continue;
+        clocksOk &= clockArg.has_value();
+        for (auto [i, instance] : llvm::enumerate(instances))
+          clocksOk &= clockArg && leavesOf[i][k] == instance.getOperand(*clockArg);
+      }
+      if (!clocksOk)
+        continue;
       IRMapping mapping;
+      // A register already moved in for another input of the instances (each
+      // instance's own register the same): that one, not a second copy; the
+      // logic and leaves only its next value read are then left out.
+      auto &movedRegs = absorbedRegs[model.getOperation()];
+      SmallVector<std::pair<SmallVector<Value>, Operation *>> newRegs;
+      DenseSet<Operation *> reused;
+      for (auto *op : ops) {
+        if (!isa<seq::FirRegOp>(op))
+          continue;
+        SmallVector<Value> regs;
+        for (auto &matched : matchedOf)
+          regs.push_back(matched.lookup(op->getResult(0)));
+        auto it = llvm::find_if(movedRegs,
+                                [&](auto &entry) { return entry.first == regs; });
+        if (it != movedRegs.end()) {
+          mapping.map(op->getResult(0), it->second);
+          reused.insert(op);
+        } else {
+          newRegs.push_back({regs, op});
+        }
+      }
+      DenseSet<Value> neededLeaves;
+      if (!reused.empty()) {
+        DenseSet<Operation *> inOps(ops.begin(), ops.end()), needed;
+        DenseSet<Value> leafSet(leaves.begin(), leaves.end());
+        SmallVector<Value> work{instances[0].getOperand(index)};
+        while (!work.empty()) {
+          Value v = work.pop_back_val();
+          if (leafSet.contains(v)) {
+            neededLeaves.insert(v);
+            continue;
+          }
+          auto *op = v.getDefiningOp();
+          if (!op || !inOps.contains(op) || reused.contains(op) ||
+              !needed.insert(op).second)
+            continue;
+          for (Value operand : op->getOperands())
+            work.push_back(operand);
+        }
+        SmallVector<Operation *> kept;
+        for (auto *op : ops)
+          if (needed.contains(op))
+            kept.push_back(op);
+        ops = std::move(kept);
+      }
       auto baseName = model.getInputName(index);
       SmallVector<bool> newPort(leaves.size(), false);
       for (auto [k, leaf] : llvm::enumerate(leaves)) {
+        if (!reused.empty() && !neededLeaves.contains(leaf))
+          continue;
         if (ownOutput[k]) {
           mapping.map(leaf, output->getOperand(*ownOutput[k]));
+          continue;
+        }
+        if (isa<seq::ClockType>(leaf.getType())) {
+          mapping.map(leaf, model.getBodyBlock()->getArgument(*clockArg));
           continue;
         }
         // A value every instance already gives an earlier moved input.
@@ -921,8 +1053,17 @@ void LogicAbsorber::run() {
         newPort[k] = true;
       }
       OpBuilder b = OpBuilder::atBlockBegin(model.getBodyBlock());
+      SmallVector<Operation *> clones;
       for (auto *op : ops)
-        b.clone(*op, mapping);
+        clones.push_back(b.clone(*op, mapping));
+      for (auto &[regs, op] : newRegs)
+        movedRegs.push_back({regs, mapping.lookup(op->getResult(0))});
+      // A register's own value in its next-value logic is cloned before the
+      // register: those operands are mapped now (a graph region).
+      for (auto *clone : clones)
+        for (auto &operand : clone->getOpOperands())
+          if (Value mapped = mapping.lookupOrNull(operand.get()))
+            operand.set(mapped);
       arg.replaceAllUsesWith(mapping.lookup(instances[0].getOperand(index)));
 
       // Each instance takes the leaves of its own logic. A leaf may be
@@ -979,7 +1120,8 @@ void ExtractModelsPass::runOnOperation() {
   }
 
   if (absorbLogic)
-    LogicAbsorber(top, parent, modelNames, absorbLogic, absorbExclusive)
+    LogicAbsorber(top, parent, modelNames, absorbLogic, absorbExclusive,
+                  absorbRegisters)
         .run();
 
   auto *body = parent.getBodyBlock();

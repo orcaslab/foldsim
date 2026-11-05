@@ -889,6 +889,11 @@ def main():
                          "alone, the rest as inputs: a per-port select in front of a per-port "
                          "class is then one copy in the class (foldsim-extract-models "
                          "absorb-exclusive)")
+    ap.add_argument('--absorb-registers', action='store_true',
+                    help="with --absorb-exclusive: the logic a model input alone reads may pass "
+                         "through registers (a per-port pipeline register and the select in front "
+                         "of it), which move into the model as its state (foldsim-extract-models "
+                         "absorb-registers)")
     ap.add_argument('--nest', action='store_true',
                     help="fold nested classes recursively: each class's threads numbered so "
                          "that a thread and its parent's are current together (foldsim-compose); with "
@@ -1304,6 +1309,8 @@ def main():
     for m in order:
         models = f' models={",".join(sorted(children[m]))}' if children[m] else ''
         exclusive = f' absorb-exclusive={a.absorb_exclusive}' if a.absorb_exclusive else ''
+        if a.absorb_exclusive and a.absorb_registers:
+            exclusive += ' absorb-registers'
         passes.append(f'foldsim-extract-models{{module={m}{models} netlist absorb-logic={ABSORB_LOGIC}{exclusive}}}')
         fused = [g for g in groups if set(g) <= children[m]]
         if fused:
