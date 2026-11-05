@@ -11,6 +11,7 @@ add_mlir_library(FoldsimTransforms
   RemoveDeadState.cpp
   ReplicateControls.cpp
   Sort.cpp
+  PassSplit.cpp
   StaticFold.cpp
 
   DEPENDS

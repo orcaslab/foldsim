@@ -659,6 +659,22 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "multicycle paths (capture to end, M host cycles) are listed "
                "for the flow (`foldsim.multicycle`). Only for a class that "
                "could be staged and reads no memory combinationally">,
+    ListOption<"passSplit", "pass-split", "std::string",
+               "Pass splitting: classes (globs; a copy goes by its class's "
+               "name), as <glob>:<P>, evaluated over P passes of their "
+               "multicycle span each (the class is multicycle, as with "
+               "`multicycle`, which may give the span): the isomorphic "
+               "fanout-free cones of the copy's logic (lanes: the same "
+               "operations, attributes and types, their leaves by position) "
+               "run on ceil(R/P) shared lanes, one replica a pass, a leaf "
+               "position the lane's replicas do not share chosen by the pass; "
+               "each replica's result is held in a register from the end of "
+               "its pass to the end registers. A lane is folded where its "
+               "estimated LUTs exceed its choices' and nothing it reads "
+               "depends on a held result. The copy's span is (P + 1) times "
+               "the multicycle span: the state passes that far apart. A "
+               "static FPGA's LUTs keep every stage's logic, so only the logic "
+               "the passes share is saved">,
     ListOption<"registeredLinks", "registered-links", "std::string",
                "Classes (globs; a copy goes by its class's name) whose links "
                "are never taken in their producer's host cycle: with "

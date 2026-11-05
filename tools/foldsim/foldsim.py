@@ -398,6 +398,8 @@ def frame_options(a):
         fold += f' stage-levels={a.stage_levels}'
     if getattr(a, 'multicycle', ''):
         fold += f' multicycle={a.multicycle}'
+    if getattr(a, 'pass_split', ''):
+        fold += f' pass-split={a.pass_split}'
     return fold
 
 
@@ -696,7 +698,7 @@ def write_slr_groups(sv, path):
                     f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT fs_{g[len("foldsim_"):]} $c }}\n')
 
 
-def write_multicycle_xdc(entries, path):
+def write_multicycle_xdc(entries, path, splits=()):
     """Each multicycle copy's paths from its capture registers to its end
     registers, M host cycles (setup M, hold M - 1). The compiler checks that
     these are all the paths out of the one and into the other; the flow
@@ -714,6 +716,21 @@ def write_multicycle_xdc(entries, path):
                     f'set_multicycle_path {m - 1} -hold '
                     f'-from [get_cells -hierarchical -filter {{IS_SEQUENTIAL && NAME =~ "*{p}cap*"}}] '
                     f'-to [get_cells -hierarchical -filter {{IS_SEQUENTIAL && NAME =~ "*{p}end*"}}]\n')
+        # Pass splitting: a pass of `span` host cycles from the captures and the pass counters to
+        # the holds, and the span again from the holds to the end registers.
+        for e in splits:
+            m, p = e['span'], e['prefix']
+            if m < 2:
+                continue
+            mc = 'fsmc_' + p[len('fsps_'):]
+            pairs = [(f'*{mc}cap*', f'*{p}hold*'), (f'*{p}pass*', f'*{p}hold*'), (f'*{p}sub*', f'*{p}hold*'),
+                     (f'*{p}hold*', f'*{mc}end*')]
+            f.write(f'# {p}: {e["passes"]} passes of {m} host cycles, {e["hold_bits"]} hold bits\n')
+            for a_, b_ in pairs:
+                for kind, n in (('setup', m), ('hold', m - 1)):
+                    f.write(f'set_multicycle_path {n} -{kind} '
+                            f'-from [get_cells -hierarchical -filter {{IS_SEQUENTIAL && NAME =~ "{a_}"}}] '
+                            f'-to [get_cells -hierarchical -filter {{IS_SEQUENTIAL && NAME =~ "{b_}"}}]\n')
 
 
 def vmem_partition(vmems, sets, choice, weights):
@@ -1063,6 +1080,12 @@ def main():
                          'taken before the state pass; the schedule spaces their state passes M '
                          'apart. <out>/foldsim_multicycle.xdc gives the flow the M-cycle paths, '
                          'foldsim_sim.json lists them (foldsim-fold-static)')
+    ap.add_argument('--pass-split', default='', metavar='CLASS:P,...',
+                    help='with --stage-levels: these classes (globs) multicycle, over P passes of their '
+                         'span: the copy\'s isomorphic fanout-free cones (lanes) run on ceil(R/P) shared '
+                         'lanes, one replica a pass, each result held from its pass to the end registers; '
+                         'the span is (P + 1) x the multicycle span. foldsim_multicycle.xdc gives the flow '
+                         'the passes\' paths (foldsim-fold-static)')
     ap.add_argument('--staged-links', action='store_true',
                     help="with --static: an early link of one producer instance in two registers, "
                          'copied at a fixed position of the frame, where the schedule allows '
@@ -1551,7 +1574,13 @@ def main():
         prefix, cycles, caps, ends = entry.split(':')
         info['multicycle'].append({'prefix': prefix, 'cycles': int(cycles),
                                    'capture_bits': int(caps), 'end_bits': int(ends)})
-    write_multicycle_xdc(info['multicycle'], out('foldsim_multicycle.xdc'))
+    ps = re.search(r'foldsim\.pass_split = \[(.*?)\]', sim_text)
+    info['pass_split'] = []
+    for e in re.findall(r'"([^"]*)"', ps.group(1)) if ps else []:
+        prefix, span, passes, hold = e.rsplit(':', 3)
+        info['pass_split'].append({'prefix': prefix, 'span': int(span), 'passes': int(passes),
+                                   'hold_bits': int(hold)})
+    write_multicycle_xdc(info['multicycle'], out('foldsim_multicycle.xdc'), info['pass_split'])
     if info.get('vmem'):
         info['vmem_forward'] = a.vmem_forward
     # Folded port bundles: the records' layouts (foldsim.ports).

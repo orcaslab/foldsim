@@ -14,6 +14,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "FAME5.h"
+#include "PassSplit.h"
 #include "Pipelines.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -135,6 +136,10 @@ struct Class {
   unsigned multicycle = 0;
   /// Multicycle: the bits of its capture and end registers.
   uint64_t multicycleCaps = 0, multicycleEnds = 0;
+  /// Pass splitting (`pass-split`): the passes of an evaluation (0: none)
+  /// and the host cycles of each (the multicycle span without splitting).
+  unsigned passSplit = 0, passSpan = 0;
+  uint64_t passHoldBits = 0;
   /// With --vmem-skip-held-reads: a virtual memory of it reads at a held
   /// address (heldReadRow), so its requests leave from registers a host
   /// cycle after the state pass, given a state gap of the lead + 2.
@@ -314,6 +319,8 @@ public:
   /// The modulo search's periods tried one at a time before it skips ahead
   /// (pass option modulo-linear).
   unsigned moduloLinear = 16;
+  /// `pass-split`: <glob>:<passes>.
+  SmallVector<std::string> passSplitSpecs;
   /// `link-hbm-lead`: the most positions a stream's request precedes its
   /// landing.
   unsigned linkHbmLead = kLinkHbmLead;
@@ -2108,7 +2115,7 @@ LogicalResult StaticFolder::chooseStages() {
     StringRef baseName = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
                                             : StringRef(cls.name);
     bool listed = false;
-    unsigned given = 0;
+    unsigned given = 0, split = 0;
     for (auto &spec : multicycleSpecs) {
       auto [pattern, cycles] = StringRef(spec).split(':');
       if (auto glob = llvm::GlobPattern::create(pattern);
@@ -2117,6 +2124,13 @@ LogicalResult StaticFolder::chooseStages() {
         if (!cycles.empty())
           cycles.getAsInteger(10, given);
       }
+    }
+    for (auto &spec : passSplitSpecs) {
+      auto [pattern, count] = StringRef(spec).split(':');
+      if (auto glob = llvm::GlobPattern::create(pattern);
+          glob && glob->match(baseName) && !count.getAsInteger(10, split) &&
+          split > 1)
+        listed = true;
     }
     if (!listed || !cls.stages)
       continue;
@@ -2127,7 +2141,8 @@ LogicalResult StaticFolder::chooseStages() {
     }
     if (combReads) {
       llvm::errs() << "foldsim-fold-static: " << cls.name
-                   << " reads a memory combinationally: staged, not multicycle\n";
+                   << " reads a memory combinationally: staged, not multicycle"
+                   << (split ? ", not split" : "") << "\n";
       continue;
     }
     DenseMap<Value, Staging> depths;
@@ -2161,6 +2176,16 @@ LogicalResult StaticFolder::chooseStages() {
     // span, whatever the estimate.
     if (given)
       cls.multicycle = given;
+    // Pass splitting: P passes of the span, and the span again for the logic
+    // after the held results.
+    if (split > 1) {
+      cls.passSplit = split;
+      cls.passSpan = cls.multicycle;
+      cls.multicycle *= split + 1;
+      llvm::errs() << "foldsim-fold-static: " << cls.name << " pass-split: "
+                   << split << " passes of " << cls.passSpan
+                   << " host cycles, span " << cls.multicycle << "\n";
+    }
     cls.stages = cls.multicycle + 1;
     llvm::errs() << "foldsim-fold-static: " << cls.name << " multicycle: "
                  << deepest << " half levels estimated, over "
@@ -2169,6 +2194,13 @@ LogicalResult StaticFolder::chooseStages() {
                                            " half levels a host cycle")
                  << "), state passes " << cls.multicycle
                  << " positions apart\n";
+  }
+  for (auto &spec : passSplitSpecs) {
+    auto [pattern, count] = StringRef(spec).split(':');
+    unsigned n = 0;
+    if (!llvm::GlobPattern::create(pattern) || count.getAsInteger(10, n) || n < 2)
+      return netlist.emitError("pass-split: '")
+             << spec << "' is not <glob>:<passes>, passes at least 2";
   }
   for (auto &spec : multicycleSpecs) {
     auto [pattern, cycles] = StringRef(spec).split(':');
@@ -6088,6 +6120,8 @@ LogicalResult StaticFolder::schedule() {
       os << " stages " << cls.stages;
     if (cls.multicycle)
       os << " multicycle " << cls.multicycle;
+    if (cls.passSplit)
+      os << " pass-split " << cls.passSplit;
     if (cls.page)
       os << " page " << cls.page << (cls.pagesOffChip ? " off chip" : "");
     if (nest)
@@ -7120,6 +7154,31 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
         if (statePort(operand.get()))
           if (Value at = ending(operand.get()); at != operand.get())
             operand.set(at);
+    }
+    // Pass splitting: the logic's lanes over the passes, counted from the
+    // captures' host cycle (a register of live1, as their enables).
+    if (cls.passSplit) {
+      SmallVector<Operation *> live;
+      for (auto *op : ops)
+        live.push_back(op);
+      std::string psPrefix = "fsps_" + cls.name + "__";
+      Value capNow = seq::CompRegClockEnabledOp::create(
+          b, b.getI1Type(), live1, hostClock, one,
+          b.getStringAttr(psPrefix + "cap"), Value(), Value(), Value(),
+          hw::InnerSymAttr{});
+      auto st = foldsim::foldLanes(b, live, hostClock, capNow, cls.passSplit,
+                                   cls.passSpan, psPrefix);
+      cls.passHoldBits = st.holdBits;
+      llvm::errs() << "foldsim-fold-static: " << cls.name << " pass-split "
+                   << cls.passSplit << ": " << st.groups << " lane groups, "
+                   << st.replicas << " replicas on " << st.lanes << " lanes, "
+                   << llvm::format("%.0f", st.before) << " -> "
+                   << llvm::format("%.0f", st.after) << " LUTs estimated, "
+                   << st.holdBits << " hold bits, " << st.selectBits
+                   << " chosen leaf bits (groups";
+      for (unsigned n : st.sizes)
+        llvm::errs() << " x" << n;
+      llvm::errs() << ")\n";
     }
     // The schedule's side: the copy's state passes, modulo the frame, at
     // least the span apart (no capture before the end registers are taken),
@@ -9210,9 +9269,17 @@ static bool isPathLogic(Operation *op) {
 LogicalResult StaticFolder::checkMulticycle(Class &cls) {
   std::string prefix = "fsmc_" + cls.name + "__";
   auto *body = cls.copy.getBodyBlock();
-  DenseSet<Operation *> caps, ends;
+  // Pass splitting's registers (fsps_<class>__): the holds a lane loads at
+  // the end of a replica's pass, and the pass counters (their controls).
+  std::string psPrefix = "fsps_" + cls.name + "__";
+  DenseSet<Operation *> caps, ends, holds, controls;
   for (auto reg : body->getOps<seq::CompRegClockEnabledOp>()) {
     StringRef name = reg.getName().value_or("");
+    if (name.starts_with(psPrefix)) {
+      (name.substr(psPrefix.size()).starts_with("hold") ? holds : controls)
+          .insert(reg.getOperation());
+      continue;
+    }
     if (!name.starts_with(prefix))
       continue;
     (name.substr(prefix.size()).starts_with("cap") ? caps : ends)
@@ -9229,7 +9296,8 @@ LogicalResult StaticFolder::checkMulticycle(Class &cls) {
     for (auto &use : value.getUses()) {
       auto *user = use.getOwner();
       if (auto reg = dyn_cast<seq::CompRegClockEnabledOp>(user);
-          reg && ends.contains(user) && use.get() == reg.getInput())
+          reg && (ends.contains(user) || holds.contains(user)) &&
+          use.get() == reg.getInput())
         continue;
       if (!isPathLogic(user))
         return user->emitError("multicycle: a path from ")
@@ -9241,14 +9309,18 @@ LogicalResult StaticFolder::checkMulticycle(Class &cls) {
     }
   }
   // Backward: every path into an end register starts at a capture register
-  // or a constant.
+  // or a constant (or a hold, whose own input starts there or at the pass
+  // counters).
   seen.clear();
   for (auto *end : ends)
     work.push_back(cast<seq::CompRegClockEnabledOp>(end).getInput());
+  for (auto *hold : holds)
+    work.push_back(cast<seq::CompRegClockEnabledOp>(hold).getInput());
   while (!work.empty()) {
     Value value = work.pop_back_val();
     auto *def = value.getDefiningOp();
-    if (def && caps.contains(def))
+    if (def && (caps.contains(def) || holds.contains(def) ||
+                controls.contains(def)))
       continue;
     if (!def || !isPathLogic(def))
       return cls.copy.emitError("multicycle: a path into ")
@@ -12194,6 +12266,16 @@ LogicalResult StaticFolder::buildSim() {
           Twine(cls.multicycleCaps) + ":" + Twine(cls.multicycleEnds)));
   if (!multicycles.empty())
     sim->setAttr("foldsim.multicycle", b.getArrayAttr(multicycles));
+  // Pass-split copies: each pass's paths (captures and pass counters to the
+  // holds, holds to the end registers), its span of host cycles.
+  SmallVector<Attribute> splits;
+  for (auto &cls : classes)
+    if (cls.passSplit && cls.passHoldBits)
+      splits.push_back(b.getStringAttr(
+          "fsps_" + cls.name + "__:" + Twine(cls.passSpan) + ":" +
+          Twine(cls.passSplit) + ":" + Twine(cls.passHoldBits)));
+  if (!splits.empty())
+    sim->setAttr("foldsim.pass_split", b.getArrayAttr(splits));
   simModule = sim;
   return success();
 }
@@ -12595,6 +12677,7 @@ void FoldStaticPass::runOnOperation() {
                       registeredLinks, shareLinks, stagedLinks, linkBlockDepth,
                       linkUltraDepth, linkKinds, stageLevels, multicycle);
   folder.moduloLinear = moduloLinear;
+  folder.passSplitSpecs.assign(passSplit.begin(), passSplit.end());
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
   folder.linkHbmShift = linkHbmShift;
