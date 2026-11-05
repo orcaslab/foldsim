@@ -41,6 +41,17 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/nest --static --bubbles --nest --modulo --short-lead --copies Leaf:2 --page 2 --pass-split Leaf:4 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_late.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
 # RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +bubble=30 +stall=20 | FileCheck %s
+# Pages off chip (tb_pages.sv: the page words in a virtual memory model,
+# answered 1 to 60 host cycles late): a controller per column, and two copies
+# on page engines; the page writes start deferSpan after the state pass.
+# RUN: foldsim --srcs top.f --top Top --out %t/hbm --static --bubbles --page 2 --storage Leaf:pages=hbm --pass-split Leaf:4 Leaf > %t/hbm.log 2>&1
+# RUN: FileCheck %s --check-prefix=HBM < %t/hbm/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/hbm -DBUBBLES -Mdir %t/hbm/obj %S/Inputs/tb_pages.sv top.sv %t/hbm/foldsim_sim.sv > %t/hbm/build.log 2>&1
+# RUN: %t/hbm/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=60 +stall=20 +full=20 +bubble=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/eng --static --modulo --page 4 --storage Leaf:pages=hbm --copies Leaf:2 --page-hbm-column-bits 64 --page-engines auto --pass-split Leaf:4 Leaf > %t/eng.log 2>&1
+# RUN: FileCheck %s --check-prefix=ENG < %t/eng/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/eng -DVM1 -DVM2 -Mdir %t/eng/obj %S/Inputs/tb_pages.sv top.sv %t/eng/foldsim_sim.sv > %t/eng/build.log 2>&1
+# RUN: %t/eng/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
 # The mutant: folded, lane 5 leaves the group; the unmutated P = 4 simulator
 # against the mutant target mismatches.
 # RUN: foldsim --srcs top_mut.f --top Top --out %t/mut --static --bubbles --pass-split Leaf:4 Leaf > %t/mut.log 2>&1
@@ -67,6 +78,8 @@
 # The deferred registers page with the rest (their write-back parts loaded
 # deferSpan on, the page writes from there).
 # PG: pages Leaf: p 2, 18 registers, {{.*}}; kept 1 registers, 8 bits;
+# HBM: pages Leaf: p 2, 18 registers, {{.*}} off chip
+# ENG: page engines: 3 engines
 # ONE: Leaf_copy3 pass-split 4: 3 deferred registers
 # MUT: Leaf pass-split 4: 3 deferred registers ({{[0-9]+}} bits), {{.*}} (groups x7 x2)
 # EARLY: Leaf pass-split 4: {{[1-9][0-9]*}} deferred registers ({{[0-9]+}} bits), {{[1-9]}} lane groups

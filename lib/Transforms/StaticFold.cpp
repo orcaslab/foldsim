@@ -2823,7 +2823,8 @@ void StaticFolder::offChipRows(const Class &cls,
       readRow[pos] = 1;
       instRow[pos] = i;
       pageRow[pos] = j;
-      unsigned wpos = wrap(s + 1 + int(j));
+      // Pass splitting: the write-back is complete deferSpan on.
+      unsigned wpos = wrap(s + 1 + int(cls.deferSpan) + int(j));
       writeRow[wpos] = 1;
       wpageRow[wpos] = j;
     }
@@ -2964,7 +2965,8 @@ LogicalResult StaticFolder::assignPageEngines() {
       for (unsigned x = 0; x < n && fits; ++x) {
         auto [st, i] = states[x];
         int next = x + 1 < n ? states[x + 1].first : states[0].first + frame;
-        int q = std::max(st + 1, lastWrite + 1);
+        // Pass splitting: the write-back is complete deferSpan on.
+        int q = std::max(st + 1 + int(cls.deferSpan), lastWrite + 1);
         for (unsigned j = 0; j < p && fits; ++j, ++q) {
           while (q <= next && writes[wrap(q)])
             ++q;
@@ -8466,8 +8468,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       // copy's page writes start then (below).
       bool deferLoad = false;
       auto deferred = deferredNext.find(reg);
-      if (deferred != deferredNext.end() && cls.page && !cls.pagesOffChip &&
-          threads > 1 && width && !readyRegs.contains(reg)) {
+      if (deferred != deferredNext.end() && cls.page &&
+          !(cls.pagesOffChip && cls.pageWindow) && threads > 1 && width &&
+          !readyRegs.contains(reg)) {
         deferLoad = true;
         next = deferred->second;
       } else if (deferred != deferredNext.end()) {
