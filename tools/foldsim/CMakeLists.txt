@@ -7,6 +7,12 @@ configure_file(foldsim_storage.py ${CMAKE_BINARY_DIR}/bin/foldsim_storage.py COP
 # Target manifests: a design's whole recipe in one file (--manifest).
 configure_file(foldsim_manifest.py ${CMAKE_BINARY_DIR}/bin/foldsim_manifest.py COPYONLY)
 install(PROGRAMS foldsim_manifest.py DESTINATION bin)
+# The design-independent steps of an image flow from a manifest (boundary
+# lifting, the kernel shell's header).
+configure_file(foldsim_flow.py ${CMAKE_BINARY_DIR}/bin/foldsim_flow.py COPYONLY)
+configure_file(flow/lift_boundaries.py ${CMAKE_BINARY_DIR}/bin/flow/lift_boundaries.py COPYONLY)
+install(PROGRAMS foldsim_flow.py DESTINATION bin)
+install(PROGRAMS flow/lift_boundaries.py DESTINATION bin/flow)
 # A design's simulator gated against its own RTL in Verilator, by its ports.
 configure_file(foldsim_gate.py ${CMAKE_BINARY_DIR}/bin/foldsim_gate.py COPYONLY)
 install(PROGRAMS foldsim_gate.py DESTINATION bin)

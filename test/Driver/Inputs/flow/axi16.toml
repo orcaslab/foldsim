@@ -1,0 +1,7 @@
+[design]
+top = "Top"
+[platform]
+mem_ports = 16
+mem_id_width = 8
+mem_channel_shift = 0
+axi_spec = 2
