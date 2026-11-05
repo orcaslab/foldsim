@@ -1562,10 +1562,11 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
                 return dict(copies=copies or '-', error=r.stderr.strip().splitlines()[-1:])
         text = open(report).read()
         ii, _, _ = parse_schedule(text)
-        res = dict(copies=copies or '-', ii=ii,
-                   **area(cal, est, classes, dict(zip(names, ks)), rest,
-                          parse_classes(text), ii, entries, store, route, uram, slr_groups,
-                          vmem))
+        ar = area(cal, est, classes, dict(zip(names, ks)), rest, parse_classes(text), ii,
+                  entries, store, route, uram, slr_groups, vmem)
+        # `copies` here is the copies spec tried; the area's per-copy table
+        # (its own `copies`, as the state outcome names it) is `per_copy`.
+        res = dict(ar, copies=copies or '-', ii=ii, per_copy=ar.get('copies'))
         if fit:
             period = fit_period(fit, features(res['largest_copy'], depth, sum(ks),
                                               res['luts']))
