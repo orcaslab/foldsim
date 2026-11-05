@@ -687,7 +687,8 @@ private:
   std::map<std::tuple<unsigned, unsigned, unsigned, unsigned, unsigned>,
            StagedMember>
       stagedMembers;
-  bool stagedPlanned = false;
+  /// The II the groups were planned at (-1: not yet): replanned if it moves.
+  int stagedPlannedII = -1;
   void planStagedMemories();
   const StagedMember *stagedMemberOf(unsigned reader, unsigned port,
                                      unsigned at, unsigned p,
@@ -3275,9 +3276,11 @@ StaticFolder::stagedWindow(unsigned p, unsigned inst, unsigned reader,
 }
 
 void StaticFolder::planStagedMemories() {
-  if (stagedPlanned)
+  if (stagedPlannedII == int(ii))
     return;
-  stagedPlanned = true;
+  stagedPlannedII = int(ii);
+  stagedGroups.clear();
+  stagedMembers.clear();
   if (!stagedLinkMemories || !stagedLinks || ii == 0 || !slrOf.empty())
     return;
   // The staged links, as the report and buildSim find them: an early link
