@@ -1,0 +1,395 @@
+{
+ "name": "calm4b4s4-20261104",
+ "source": "three points pooled: calm4 (a100_lite_m4 9dcc73c2a, gen/m4, Vivado synthesis only, image mode), B4 (a100_lite_m4 A3 bfd8b6ea4, gen/m4p, routed V80 image at 50 MHz, WNS +1.253) and s4x (the small GPU, m1tel/gen/s4x, foldsim 054231b, routed V80 image at 50 MHz, WNS +1.239); each priced as built uncalibrated (foldsim_degree state --kernel-terms --links-as-built --no-page); controller factors over the points whose price has controllers (calm4)",
+ "synth_per_routed": 1.038,
+ "families": [
+  {
+   "family": "l1req",
+   "match": "^l1req_",
+   "logic": 3.106,
+   "copies": 3,
+   "points": [
+    {
+     "logic": 5.073,
+     "lutram": 1.0
+    },
+    {
+     "logic": 1.39,
+     "lutram": 1.14
+    },
+    {
+     "logic": 1.242,
+     "lutram": 1.303
+    }
+   ],
+   "lutram": 1.039
+  },
+  {
+   "family": "lmq",
+   "match": "^lmq_",
+   "logic": 2.249,
+   "copies": 3,
+   "points": [
+    {
+     "logic": 2.509,
+     "lutram": 1.927
+    },
+    {
+     "logic": 1.875,
+     "lutram": 1.2
+    },
+    {
+     "logic": 1.383,
+     "lutram": 1.37
+    }
+   ],
+   "lutram": 1.275
+  },
+  {
+   "family": "l1rsp",
+   "match": "^l1rsp$",
+   "logic": 2.87,
+   "copies": 3,
+   "points": [
+    {
+     "logic": 3.098,
+     "lutram": 1.112
+    },
+    {
+     "logic": 2.749,
+     "lutram": 1.162
+    },
+    {
+     "logic": 1.306,
+     "lutram": 1.194
+    }
+   ],
+   "lutram": 1.114
+  },
+  {
+   "family": "switches",
+   "match": "^(l1sw|l2sw|l2fs|axix|l2mo|l2rs|l2nb|kmub|lms)(_\\d+)?(_copy\\d+)?$",
+   "logic": 2.452,
+   "copies": 45,
+   "points": [
+    {
+     "logic": 2.756,
+     "lutram": 0.362
+    },
+    {
+     "logic": 2.238,
+     "lutram": 1.133
+    },
+    {
+     "logic": 2.272,
+     "lutram": 1.159
+    }
+   ],
+   "lutram": 0.896
+  },
+  {
+   "family": "fdiv_fsqrt",
+   "match": "^VX_(fdiv|fsqrt)_unit$",
+   "logic": 4.459,
+   "copies": 4,
+   "points": [
+    {
+     "logic": 6.124,
+     "lutram": null
+    },
+    {
+     "logic": 2.731,
+     "lutram": null
+    },
+    {
+     "logic": null,
+     "lutram": null
+    }
+   ],
+   "lutram": 1.0,
+   "lutram_add": 2422
+  },
+  {
+   "family": "mufu_pe",
+   "match": "^VX_mufu_pe$",
+   "logic": 0.098,
+   "copies": 2,
+   "points": [
+    {
+     "logic": 0.1,
+     "lutram": 0.542
+    },
+    {
+     "logic": 0.096,
+     "lutram": 0.444
+    },
+    {
+     "logic": null,
+     "lutram": null
+    }
+   ],
+   "lutram": 0.489
+  },
+  {
+   "family": "tcu_fedp",
+   "match": "^VX_tcu_fedp",
+   "logic": 0.585,
+   "copies": 3,
+   "points": [
+    {
+     "logic": 0.616,
+     "lutram": 8.089
+    },
+    {
+     "logic": 0.557,
+     "lutram": 2.168
+    },
+    {
+     "logic": 0.57,
+     "lutram": 0.283
+    }
+   ],
+   "lutram": 2.811
+  },
+  {
+   "family": "compute_slice",
+   "match": "^VX_compute_slice__lift_model$",
+   "logic": 0.896,
+   "copies": 3,
+   "points": [
+    {
+     "logic": 0.904,
+     "lutram": 1.44
+    },
+    {
+     "logic": 0.996,
+     "lutram": 1.177
+    },
+    {
+     "logic": 0.743,
+     "lutram": 0.645
+    }
+   ],
+   "lutram": 1.227
+  },
+  {
+   "family": "socket",
+   "match": "^VX_socket__lift_model$",
+   "logic": 0.988,
+   "copies": 3,
+   "points": [
+    {
+     "logic": 1.139,
+     "lutram": 2.104
+    },
+    {
+     "logic": 0.976,
+     "lutram": 2.091
+    },
+    {
+     "logic": 0.811,
+     "lutram": 0.662
+    }
+   ],
+   "lutram": 2.024
+  },
+  {
+   "family": "core",
+   "match": "^VX_core__lift_model$",
+   "logic": 0.919,
+   "copies": 3,
+   "points": [
+    {
+     "logic": 1.077,
+     "lutram": 1.801
+    },
+    {
+     "logic": 0.783,
+     "lutram": 86.013
+    },
+    {
+     "logic": 0.838,
+     "lutram": 0.929
+    }
+   ],
+   "lutram": 3.346
+  },
+  {
+   "family": "l2req",
+   "match": "^l2req_",
+   "logic": 1.18,
+   "copies": 3,
+   "points": [
+    {
+     "logic": 0.934,
+     "lutram": 1.284
+    },
+    {
+     "logic": 1.49,
+     "lutram": 0.254
+    },
+    {
+     "logic": 1.037,
+     "lutram": 0.98
+    }
+   ],
+   "lutram": 0.834
+  },
+  {
+   "family": "opc",
+   "match": "^VX_opc_unit$",
+   "logic": 0.99,
+   "copies": 3,
+   "points": [
+    {
+     "logic": 0.947,
+     "lutram": 0.497
+    },
+    {
+     "logic": 0.978,
+     "lutram": 1.646
+    },
+    {
+     "logic": 1.459,
+     "lutram": 1.575
+    }
+   ],
+   "lutram": 1.079
+  },
+  {
+   "family": "icache",
+   "match": "^VX_cache_bank__lift_icache$",
+   "logic": 0.973,
+   "copies": 2,
+   "points": [
+    {
+     "logic": 0.993,
+     "lutram": 1.183
+    },
+    {
+     "logic": 0.953,
+     "lutram": 1.077
+    },
+    {
+     "logic": null,
+     "lutram": null
+    }
+   ],
+   "lutram": 1.131
+  },
+  {
+   "family": "target",
+   "match": "^foldsim_target_model$",
+   "logic": 1.227,
+   "copies": 3,
+   "points": [
+    {
+     "logic": 1.272,
+     "lutram": 0.619
+    },
+    {
+     "logic": 1.191,
+     "lutram": 1.328
+    },
+    {
+     "logic": 1.217,
+     "lutram": 1.331
+    }
+   ],
+   "lutram": 1.086
+  },
+  {
+   "family": "fcvt",
+   "match": "^VX_fcvt_unit$",
+   "logic": 0.707,
+   "copies": 2,
+   "points": [
+    {
+     "logic": 0.82,
+     "lutram": 53.757
+    },
+    {
+     "logic": 0.589,
+     "lutram": 0.845
+    },
+    {
+     "logic": null,
+     "lutram": null
+    }
+   ],
+   "lutram": 3.41
+  },
+  {
+   "family": "fncp",
+   "match": "^VX_fncp_unit$",
+   "logic": 0.603,
+   "copies": 2,
+   "points": [
+    {
+     "logic": 0.694,
+     "lutram": 0.771
+    },
+    {
+     "logic": 0.509,
+     "lutram": 0.8
+    },
+    {
+     "logic": null,
+     "lutram": null
+    }
+   ],
+   "lutram": 0.785
+  }
+ ],
+ "rest": 0.0,
+ "top_logic_per_link_bit": 0.232,
+ "link_lutram": 0.98,
+ "vmem_ctl": {
+  "logic": 0.418,
+  "lutram": 0.148
+ },
+ "fixed": {
+  "logic": 3943,
+  "lutram": 32,
+  "ramb36": 0,
+  "what": "the control endpoint (foldsim_ctrl)"
+ },
+ "points": [
+  {
+   "name": "calm4 (synthesis)",
+   "measured_total": {
+    "logic": 827462,
+    "lutram": 530427,
+    "ff": 1613806,
+    "ramb36": 1147,
+    "ramb18": 716,
+    "uram": 228
+   },
+   "measure_scale": 1.038
+  },
+  {
+   "name": "B4 (routed image)",
+   "measured_total": {
+    "logic": 597863,
+    "lutram": 382809,
+    "ff": 1164070,
+    "ramb36": 398,
+    "ramb18": 25,
+    "uram": 144
+   },
+   "measure_scale": 1.0
+  },
+  {
+   "name": "s4x (routed image)",
+   "measured_total": {
+    "logic": 379374,
+    "lutram": 95539,
+    "ff": 543443,
+    "ramb36": 99,
+    "ramb18": 66,
+    "uram": 0
+   },
+   "measure_scale": 1.0
+  }
+ ]
+}
