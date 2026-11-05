@@ -19,9 +19,9 @@
 # CHECK: eligible q gap 100: read latency 0
 # CHECK: eligible w gap 100: row of 8192 bits
 # CHECK: eligible m gap 100: yes
-# CHECK: vmem 512 x 64 x 2048: hbm 262144 lutram 4200.6 bram 29 lut 3081
+# CHECK: vmem 512 x 64 x 2048: hbm 262144 lutram 4431.412 bram 29.0 lut 2843
 # CHECK: select [0, 1, 1, 1, 3, 5, 10]
-# CHECK: controller [(898, 0), (1391, 821), (1954, 1948), (5334, 8706)]
+# CHECK: controller [(1098, 408), (1313, 1167), (1823, 2255), (4882, 8784)]
 # CHECK: pattern ^(Opc:a\.b\[0\]|Opc:gpr/ram)$
 # Two of the six banks go to HBM (the least that fits and routes), H the frame.
 # CHECK: opc: page '' frame 4096 H 4096 hbm 524288 fits True routes True

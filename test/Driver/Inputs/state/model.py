@@ -16,7 +16,7 @@ for m, gap in ((gpr, 100), (gpr, 4), (('q', 16, 64, 1, 1, 0, None, 1, True), 100
 c = s.vmem_cost(64, 2048, 512)
 print(f'vmem 512 x 64 x 2048: hbm {c["hbm"]:.0f} lutram {c["lutram"]} bram {c["bram"]} '
       f'lut {c["lut"]:.0f}')
-# The calibrated prices (st32_1031 §10.2): a page bit's write-back select and
+# The calibrated prices (st32_1031 §10.2; the controllers routed since virtA_1105: ctl_cost): a page bit's write-back select and
 # a virtual memory's controller (logic, LUTRAM) by row width.
 print('select', [s.page_select_luts(p) for p in (1, 2, 3, 4, 8, 16, 31)])
 print('controller', [tuple(round(x) for x in s.vmem_ctl(w)) for w in (64, 512, 1024, 4096)])

@@ -1,0 +1,21 @@
+# The kernel's controllers priced as routed (foldsim_storage.ctl_cost: a
+# virtual memory or group with its host cache and known-zero bits, a stream's
+# own, a page engine), the platform's way into device memory the controllers
+# add to (platform_cost: shares beyond the kernel's 32 masters, SLASH's sc_mem
+# SmartConnects past 8 masters), and a generation's controllers as built
+# (state --built-json: foldsim_degree.read_built). The routed images' numbers
+# are in the input's comments.
+# RUN: python3 %S/Inputs/state/ctl_price.py foldsim %t | FileCheck %s
+# CHECK: B4 vmem: logic 2870 lutram 1567 bram 16
+# CHECK: vt group: logic 2559 lutram 676 bram 19
+# CHECK: engine: logic 1313 lutram 1167 bram 0
+# CHECK: stream: logic 1098 lutram 408 bram 0
+# CHECK: wide: logic 4882 lutram 8784 bram 0
+# CHECK: kz 37888: 0.0 kz 65536: 16.0
+# CHECK: platform 1 11 None: logic 20096 lutram 9532 masters 12 shares 0 sc_nodes 4
+# CHECK: platform 1 40 31: logic 84964 lutram 40819 masters 32 shares 31 sc_nodes 8
+# CHECK: platform 16 0 None: logic 40192 lutram 19064 masters 16 shares 0 sc_nodes 8
+# CHECK: platform 8 0 None: logic 0 lutram 0 masters 8 shares 0 sc_nodes 0
+# CHECK: platform 32 60 None: logic 135320 lutram 41868 masters 32 shares 32 sc_nodes 8
+# CHECK: built: 3 [('engine', 1), ('link', 1), ('vmem', 1)] forward 0 ports 1 logic 3983 lutram 1677 bram 19
+# CHECK: controllers: 3 2 [(64, 13, 2), (512, 9, 1)]

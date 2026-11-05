@@ -3,13 +3,13 @@
 # bits), each copy's share of engines its columns times the positions its
 # page reads take of the frame (p x instances), the fold's engines at least
 # its widest copy's columns and the shares' sum; against a controller per
-# column of up to 4,096 bits; and a link stream riding the engines priced as
+# column of up to 4,096 bits (engines and controllers priced routed, ctl_cost); and a link stream riding the engines priced as
 # its share of one (the positions its requests take of the frame).
 # RUN: python3 %S/Inputs/paged/engines_price.py foldsim | FileCheck %s
 # CHECK: p 4 frame 64: columns 2 share 2.000 engines lut {{[0-9]+}} lutram {{[0-9]+}}; per column 1 lut {{[0-9]+}} lutram {{[0-9]+}}
 # CHECK: p 4 frame 256: columns 2 share 0.500
 # CHECK: p 8 frame 128: columns 1 share 1.000
-# CHECK: fold at 256: 5 engines, engine lut 1657 lutram 866
+# CHECK: fold at 256: 5 engines, engine lut 1313 lutram 1167
 # CHECK: stream at 128: own ctl 1.0 lut {{[0-9]+}}; engines ctl 0.375 lut {{[0-9]+}}
 # CHECK: built: engines 3 carried [('A', 'B')] controllers 1 lut {{[0-9]+}}
-# CHECK: no forward: engine lut 1220 lutram 570; vmem 512 {{[0-9]+}}+{{[0-9]+}} -> {{[0-9]+}}+{{[0-9]+}}
+# CHECK: no forward: engine lut 967 lutram 768; vmem 512 {{[0-9]+}}+{{[0-9]+}} -> {{[0-9]+}}+{{[0-9]+}}

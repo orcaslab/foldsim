@@ -143,11 +143,30 @@ def split_virtual(est, pattern):
             for c, e in est.items()}
 
 
-def vmem_bram(est, classes, degree, vmem):
+def vmem_controllers(mems, threads, vmem_group=None, row_bytes_min=1):
+    """The kernel's controllers of a copy's virtual memories (`mems`:
+    class_estimates' memories, `threads` instances): one a memory, or with
+    foldsim --vmem-group copy one a row size (members placed largest first,
+    rows in a power of two of the group's image). Each: dict(data_width,
+    row_width, instances, members)."""
+    if vmem_group != 'copy':
+        return [dict(data_width=m[2], row_width=max(1, (m[1] - 1).bit_length()), instances=threads,
+                     members=1) for m in mems]
+    groups = {}
+    for m in mems:
+        groups.setdefault(storage.vmem_row_bytes(m[2], row_bytes_min), []).append(m)
+    return [dict(data_width=max(m[2] for m in g),
+                 row_width=max(1, (sum(1 << max(0, (m[1] - 1).bit_length()) for m in g) - 1).bit_length()),
+                 instances=threads, members=len(g)) for g in groups.values()]
+
+
+def vmem_bram(est, classes, degree, vmem, vmem_group=None, row_bytes_min=1):
     """RAMB36 of the host caches of a fold degree's virtual memories: a
-    controller per memory of each copy, of the copy's instances times the
-    memory's rows; `vmem`: (foldsim --vmem-cache-rows, its budget), or None
-    for none (the kernel's default)."""
+    controller per memory of each copy (vmem_controllers: a row size of a
+    copy with --vmem-group copy), of the copy's instances times its rows,
+    each cache's lines and tags as the kernel builds them (storage.ctl_cost);
+    `vmem`: (foldsim --vmem-cache-rows, its budget), or None for none (the
+    kernel's default)."""
     if not vmem:
         return 0.0
     vms = []
@@ -155,10 +174,53 @@ def vmem_bram(est, classes, degree, vmem):
         k = degree.get(c, 1)
         for j in range(k):
             t = copy_threads(n, k, j)
-            for (_, d, w, *_) in est[c].get('vmems', []):
-                vms.append(dict(instances=t, row_width=max(1, (d - 1).bit_length()),
-                                data_width=w))
+            vms += vmem_controllers(est[c].get('vmems', []), t, vmem_group, row_bytes_min)
     return storage.vmem_cache_bram(vms, *vmem)
+
+
+# A generated simulator's controllers (state --built-json: its foldsim_sim.json
+# and the foldsim_kernel.vh beside it), priced as built: every foldsim_vmem
+# the kernel instantiates (a virtual memory or group, an HBM link stream's
+# own, a page engine) by storage.ctl_cost with its row bits, host-cache rows,
+# members and known-zero bits; FORWARD from foldsim_sim.vh; the masters, the
+# shares and the SLASH sc_mem tree (storage.platform_cost). Set by state_main;
+# when set, storage_area prices no controller from the estimates.
+BUILT = None
+
+
+def read_built(path):
+    """BUILT from a foldsim_sim.json (and its foldsim_sim.vh /
+    foldsim_kernel.vh): dict(controllers=[...], logic, lutram, bram, forward,
+    platform, counts)."""
+    j = json.load(open(path))
+    d = os.path.dirname(os.path.abspath(path))
+    vh = ''.join(open(os.path.join(d, f)).read() for f in ('foldsim_sim.vh', 'foldsim_kernel.vh')
+                 if os.path.exists(os.path.join(d, f)))
+    m = re.search(r'FOLDSIM_VMEM_FORWARD (\d)', vh)
+    forward = int(m.group(1)) if m else int(j.get('vmem_forward', 1))
+    m = re.search(r'FOLDSIM_VMEM_MASTERS (\d+)', vh)
+    vmasters = int(m.group(1)) if m else None
+    m = re.search(r'FOLDSIM_MEM_PORTS (\d+)', vh)
+    ports = int(m.group(1)) if m else None
+    ctls = j.get('vmem_groups') or j.get('vmem') or []
+    save = storage.CTL_FORWARD
+    storage.CTL_FORWARD = forward
+    out = dict(controllers=[], logic=0.0, lutram=0.0, bram=0.0, forward=forward, mem_ports=ports,
+               vmem_masters=vmasters, counts={})
+    for c in ctls:
+        cls = str(c.get('class', ''))
+        kind = 'link' if cls.startswith('__link') else 'engine' if cls.startswith('__pages') else 'vmem'
+        kz = 0
+        if c.get('known_zero'):
+            kz = -(-((1 << c['row_width']) * c['instances']) // (1 << c.get('kz_shift', 0)))
+        x = storage.ctl_cost(kind, c['data_width'], c.get('cache_rows', 0) or 0, c.get('size', 1) or 1,
+                             kz=kz)
+        out['controllers'].append(dict(kind=kind, dw=c['data_width'], cache_rows=c.get('cache_rows', 0), **x))
+        out['counts'][kind] = out['counts'].get(kind, 0) + 1
+        for key in ('logic', 'lutram', 'bram'):
+            out[key] += x[key]
+    storage.CTL_FORWARD = save
+    return out
 
 
 def read_util(path):
@@ -284,7 +346,9 @@ def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fi
     are off chip; their host caches (`vmem`, vmem_bram) take block RAM.
     The kernel's controllers' logic is not priced. `tiers` (store 'auto'
     only): the off-chip tier (storage_area), as choose_state gives it."""
-    cache = vmem_bram(est, classes, degree, vmem)
+    vg = (tiers or {}).get('vmem_group')
+    rbm = (tiers or {}).get('row_bytes_min', 1)
+    cache = vmem_bram(est, classes, degree, vmem, vg, rbm) if BUILT is None else 0.0
     slrs = storage.route_slrs(sum(degree.get(c, 1) for c in classes) if slr_groups else 0)
     if store == 'auto':
         res = storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram,
@@ -293,7 +357,7 @@ def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fi
             # The host caches of the memories it moved off chip: priced again
             # with them in the base (their lines are block RAM).
             more = vmem_bram(split_virtual(est, tiers_pattern(res['vmem_new'])), classes,
-                             degree, vmem)
+                             degree, vmem, vg, rbm)
             if more > cache:
                 cache = more
                 res = storage_area(cal, est, classes, degree, rest, sched, ii, entries, route,
@@ -472,9 +536,10 @@ def calibrate_units(units):
         def scale(c, k):
             if c is None:
                 return c
-            # A store in HBM costs its virtual-memory controller: the
-            # calibration's controller factors, whatever the class.
-            gl, gr = (cal['vmem_ctl']['logic'], cal['vmem_ctl']['lutram']) if k == 'hbm' else (fl, fr)
+            # A store in HBM costs its virtual-memory controller, priced
+            # routed (storage.ctl_cost): the calibration's controller factors
+            # (fitted against the cache-less OOC line) no longer apply.
+            gl, gr = (1.0, 1.0) if k == 'hbm' else (fl, fr)
             c = dict(c)
             c['lut'] = c.get('lut', 0.0) * gl
             c['lutram'] = c.get('lutram', 0.0) * gr
@@ -546,6 +611,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         if not KERNEL['copy_logic'] and not KERNEL['calibration']:
             logic += KERNEL['threaded_copy_logic'] * sum(1 for c, n in classes.items() if n > 1)
     page_of = {}
+    n_ctl = 0
     paged = dict(bits=0, ff=0, ports=0, hbm=0)
     # With page engines: each off-chip paged copy's (columns, engine share).
     engine_cols = []
@@ -581,6 +647,9 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                     engine_cols.append((eng['engine_columns'], eng['ctl']))
                 else:
                     cl, cr = storage.page_ctl(bits, info['page'], pc['controllers'])
+                    n_ctl += pc['controllers']
+                if BUILT is not None:
+                    cl = cr = 0.0
                 logic += pc['lut'] + mux + cl
                 base_lutram += cr
                 copy_logic[(c, j)] += pc['lut'] + mux + cl
@@ -610,17 +679,27 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                                             0, storage.HBM_ROUND_TRIP + 7 - tiers['frame'] // t))
                 units.append(dict(costs=pcost,
                                   per={k: [(j, v)] for k, v in pcost.items()}, count=1,
-                                  fixed=None, store='pages', default='block',
+                                  fixed=info.get('page_kind') if BUILT is not None else None,
+                                  store='pages', default='block',
                                   **{'class': c}))
                 paged['ff'] += pcost['block']['ff']
                 paged['ports'] += pcost['block']['ports']
                 paged['bits'] += bits * t
         # The controllers of its memories already virtual (the pattern's), one
-        # a memory of each copy, in the kernel.
-        for m in est[c].get('vmems', []):
-            cl, cr = storage.vmem_ctl(m[2])
-            logic += k * cl
-            base_lutram += k * cr
+        # a memory of each copy (a row size of a copy with --vmem-group
+        # copy), in the kernel; built (BUILT) the generation's own instead.
+        if BUILT is None:
+            for j in range(k):
+                t = copy_threads(n, k, j)
+                for v in vmem_controllers(est[c].get('vmems', []), t,
+                                          (tiers or {}).get('vmem_group'),
+                                          (tiers or {}).get('row_bytes_min', 1)):
+                    x = storage.ctl_cost('vmem', v['data_width'], 0, v['members'],
+                                         (1 << v['row_width']) * v['instances'])
+                    logic += x['logic']
+                    base_lutram += x['lutram']
+                    kernel_bram += x['bram']
+                    n_ctl += 1
         deep = [f for f in forms if f[2] == 'lutram']
         regs_free = all(f[2] in ('lutram', 'one') for f in forms)
         for w, cnt in sorted(est[c]['regw'].items()):
@@ -662,16 +741,20 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                 parts = []
                 for j, t, _, fgap in forms:
                     v = storage.vmem_cost(d, w, t, wt, tiers.get('row_bytes_min', 1))
-                    v = dict(v, lutram=lam * v['lutram'])
+                    cr = v['lutram'] - v.get('ctl_lutram', 0.0)
+                    v = dict(v, lutram=lam * cr + v.get('ctl_lutram', 0.0))
                     if tiers.get('vmem_group') == 'copy':
                         # foldsim --vmem-group copy: one controller for a
-                        # copy's memories of a row size, its LUTs shared by
-                        # those the class may move.
+                        # copy's memories of a row size, its LUTs and block
+                        # RAM shared by those the class may move.
                         rb = storage.vmem_row_bytes(w, tiers.get('row_bytes_min', 1))
-                        share = sum(1 for m in est[c]['mems']
-                                    if storage.vmem_row_bytes(m[2], tiers.get('row_bytes_min', 1))
-                                    == rb and not storage.vmem_eligible(m, fgap))
-                        v['lut'] = v['lut'] / max(1, share)
+                        share = max(1, sum(1 for m in est[c]['mems']
+                                           if storage.vmem_row_bytes(m[2], tiers.get('row_bytes_min', 1))
+                                           == rb and not storage.vmem_eligible(m, fgap)))
+                        v['lut'] = v['lut'] / share
+                        v['lutram'] -= v.get('ctl_lutram', 0.0) * (1 - 1 / share)
+                        v['bram'] -= v.get('ctl_bram', 0.0) * (1 - 1 / share)
+                        v['ctl'] = 1 / share
                     v = {k: (x if k == 'ii_floor' else x * cnt) for k, x in v.items()}
                     parts.append((j, v))
                     for key in hc:
@@ -850,7 +933,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     # page columns are laid out with the copies): the pages' engines on top.
     built = (sched or {}).get('__links__') or {}
     built_engines = built.get('engines', 0)
-    if engine_cols or built_engines:
+    if (engine_cols or built_engines) and BUILT is None:
         share = sum(s for _, s in engine_cols)
         own = max([c for c, _ in engine_cols] + [math.ceil(share - 1e-9)])
         page_engines = max(own, built_engines) if built.get('engine_columns') else \
@@ -859,6 +942,34 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         logic += (page_engines - share) * el
         lutram += (page_engines - share) * er
         bram += (page_engines - share) * storage.PAGE_ENGINE_BRAM
+    # The kernel's controllers and what they add to the platform's way into
+    # device memory (storage.platform_cost: the masters' shares, SLASH's
+    # sc_mem tree), with --kernel-terms: built, the generation's own (BUILT);
+    # else those this point has (memories virtual already and moved, streams
+    # with a controller of their own, page engines, off-chip page columns).
+    platform = None
+    if BUILT is not None:
+        logic += BUILT['logic']
+        lutram += BUILT['lutram']
+        bram += BUILT['bram']
+        n_ctl = len(BUILT['controllers'])
+        page_engines = BUILT['counts'].get('engine', 0)
+    else:
+        chosen = [(u, next(iter(ch))) for u, ch in zip(units, choice)]
+        n_ctl += sum(u['costs']['hbm'].get('ctl', 0) for u, kind in chosen
+                     if kind == 'hbm' and not u.get('link') and
+                     'engine_columns' not in u['costs']['hbm']) + \
+            sum(1 for u, kind in chosen
+                if kind == 'hbm' and u.get('link') and 'engine_columns' not in u['costs']['hbm']) + \
+            link_cost(cal, (sched or {}).get('__links__'))['ctl'] + page_engines
+    if KERNEL['on'] and (KERNEL['mem_ports'] or n_ctl):
+        ports = KERNEL['mem_ports']
+        if BUILT is not None and BUILT.get('mem_ports') is not None:
+            ports = BUILT['mem_ports']
+        platform = storage.platform_cost(ports, math.ceil(n_ctl - 1e-9),
+                                         BUILT.get('vmem_masters') if BUILT else None)
+        logic += platform['logic']
+        lutram += platform['lutram']
     sites = logic + storage.LUTRAM_SITES * lutram
     res = dict(luts=round(logic + lutram), logic=round(logic), lutram=round(lutram),
                sites=round(sites), fits=fits, bram=round(bram, 1), uram=uram,
@@ -875,7 +986,14 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                storage=','.join(rules),
                **({'link_kinds': ','.join(link_rules)} if lu else {}),
                **({'ii_floor': floor} if floor > ii else {}), **paged_fields(paged),
-               **({'page_engines': page_engines} if page_engines else {}))
+               **({'page_engines': page_engines} if page_engines else {}),
+               controllers=round(n_ctl, 1),
+               **({'platform': {k: round(v) for k, v in platform.items()}} if platform else {}))
+    if platform or BUILT is not None:
+        # The controllers and the platform terms are priced after the kinds:
+        # whether the point still fits its pools.
+        res['fits'] = fits and res['sites'] <= caps['sites'] + 1e-9 and \
+            res['bram'] <= caps['bram'] + 1e-9 and res['uram'] <= caps['uram'] + 1e-9
     if tiers is not None:
         res.update(off, hbm_bytes=round(off['hbm_bytes']), hbm_cap=round(caps['hbm']))
     return res
@@ -1224,17 +1342,19 @@ LINK_STREAM_ENABLE_LUTS = 2
 
 # A stream's controller: the V7B foldsim_vmem as the kernel instantiates it
 # for a stream (INSTANCES 1, a 6-bit tag, AW 16, a whole-row enable, no host
-# cache, no known-zero bits, QUEUE 32, OUTSTANDING 64), Vivado 2025.2
-# synthesis + opt_design out of context on the V80 (st32_1031/lk2/cal): DW
-# 512: 1,435 logic + 753 LUTRAM; 256: 1,302 + 457; no block RAM.
+# cache, no known-zero bits, QUEUE 32, OUTSTANDING 64), priced routed
+# (storage.ctl_cost 'link': vtB-vtD, vtG streams of 64 and 256 bits routed
+# 1,172-1,270 logic + 363-774 LUTRAM). The OOC line of before (st32_1031/lk2/
+# cal, synthesis + opt_design: DW 512 1,435 + 753; 256 1,302 + 457) is kept for
+# comparison only.
 LINK_STREAM_CTL_LOGIC = (1169.0, 0.52)
 LINK_STREAM_CTL_LUTRAM = (161.0, 1.156)
 
 
 def link_stream_ctl(dw):
     """A stream's controller (logic, LUTRAM LUTs) for rows of `dw` bits."""
-    return (LINK_STREAM_CTL_LOGIC[0] + LINK_STREAM_CTL_LOGIC[1] * dw,
-            LINK_STREAM_CTL_LUTRAM[0] + LINK_STREAM_CTL_LUTRAM[1] * dw)
+    c = storage.ctl_cost('link', dw)
+    return c['logic'], c['lutram']
 
 
 def link_stream_cost(pair, uses, frame, f=1.0, engines=False):
@@ -1276,7 +1396,8 @@ def link_streams_built(links):
     for s in (links or {}).get('streams', []):
         # A stream carried by the page engines: its controller is theirs
         # (counted with the engines, area).
-        cl, cr = (0.0, 0.0) if (s['p'], s['r']) in on_engines else link_stream_ctl(s['dw'])
+        cl, cr = (0.0, 0.0) if (s['p'], s['r']) in on_engines or BUILT is not None \
+            else link_stream_ctl(s['dw'])
         row = max(storage.HBM_BEAT_BYTES, storage.vmem_row_bytes(s['dw']))
         out['lut'] += cl + s['dw'] * storage.page_select_luts(s['pages']) + \
             LINK_STREAM_ENABLE_LUTS * s['kept']
@@ -1382,6 +1503,10 @@ def parse_classes(text):
                                          gap=int(m.group(4)) if m.group(4) else None,
                                          page=int(page.group(1)) if page else 0,
                                          offchip=bool(page and page.group(2)))
+            continue
+        m = re.match(r'^  pages (\S+): p \d+, .* page RAMs .*, (block|ultra);', line)
+        if m and m.group(1) in out:
+            out[m.group(1)]['page_kind'] = m.group(2)
             continue
         m = re.match(r'^    (ready|state): ([\d .]+)$', line)
         if m and cur is not None:
@@ -1903,6 +2028,12 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
                     rows=tiers_pattern(res.get('rows_new', [])), rows_new=res.get('rows_new', []),
                     link_kinds=res.get('link_kinds', ''), links_hbm=res.get('links_hbm', []))
 
+    if BUILT is not None:
+        # As built (--built-json): the schedule's frame, its pages, virtual
+        # memories and link kinds as generated; nothing moves.
+        res = area(cal, est, classes, {}, rest, sched, ii, entries, 'auto', route, uram,
+                   vmem=None, tiers=None)
+        return outcome(res, {}, ii)
     lk = link_cost(cal, (sched or {}).get('__links__'))
     top = min(max_ii, (frame_growth or FRAME_GROWTH) * ii)
     # With HBM link streams, at the longest frame tried (their ports fit the
@@ -2249,6 +2380,11 @@ def main():
                          '--page-engines: HBM page streams) instead of a controller per column')
     st.add_argument('--link-hbm', action='store_true',
                     help='price links in HBM too (a what-if: the compiler builds none)')
+    st.add_argument('--built-json', default='', metavar='JSON',
+                    help="price as built: the generation's foldsim_sim.json (and the foldsim_sim.vh / "
+                         'foldsim_kernel.vh beside it) gives the kernel\'s controllers (virtual memories '
+                         'and groups, streams\' own, page engines; their host caches, known-zero bits, '
+                         'FORWARD and masters); the schedule\'s frame, pages and link kinds, nothing moved')
     st.add_argument('--links-from', default='', metavar='SCHEDULE',
                     help='another schedule report of the same fold to read the link storage from '
                          '(one made by a compiler that reports it)')
@@ -2296,16 +2432,15 @@ def main():
 
 
 def state_main(a):
-    global LINK_STREAM_CTL_LOGIC, LINK_STREAM_CTL_LUTRAM
+    global BUILT
     if a.exact:
         storage.ASSIGN_EXACT = True
     if a.vmem_forward == 0:
         # Controllers without forwarding from their write buffers (the
-        # kernel's FORWARD 0; the json carries it to the build).
+        # kernel's FORWARD 0, every controller; the json carries it to the
+        # build).
         storage.no_forward()
-        fl, fr = storage.NO_FORWARD_VMEM
-        LINK_STREAM_CTL_LOGIC = (LINK_STREAM_CTL_LOGIC[0] * fl, LINK_STREAM_CTL_LOGIC[1] * fl)
-        LINK_STREAM_CTL_LUTRAM = (LINK_STREAM_CTL_LUTRAM[0] * fr, LINK_STREAM_CTL_LUTRAM[1] * fr)
+    BUILT = read_built(a.built_json) if getattr(a, 'built_json', '') else None
     if a.route_limit is not None:
         storage.ROUTE_LIMIT = a.route_limit
     cal = json.load(open(a.calibration)) if a.calibration else None
@@ -2358,6 +2493,11 @@ def state_main(a):
         return 1
     print(f'II {ii} (schedule)')
     print(state_table(out, classes, est))
+    if BUILT is not None:
+        print(f"as built: {len(BUILT['controllers'])} controllers "
+              f"({', '.join(f'{v} {k}' for k, v in sorted(BUILT['counts'].items()))}), FORWARD "
+              f"{BUILT['forward']}: {BUILT['logic']:,.0f} logic + {BUILT['lutram']:,.0f} LUTRAM LUTs, "
+              f"{BUILT['bram']:.1f} RAMB36; platform {out['res'].get('platform')}")
     if a.out:
         out['vmem_forward'] = a.vmem_forward
         json.dump(out, open(a.out, 'w'), indent=1, default=str)

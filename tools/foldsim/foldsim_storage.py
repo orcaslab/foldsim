@@ -363,25 +363,149 @@ HBM_ROUND_TRIP = 64
 VMEM_ROW_BITS = 4096
 HBM_BEAT_BYTES = 64
 RELIEF_KINDS = ('hbm',)
-# A virtual memory's controller in the kernel (foldsim_vmem: request queue,
-# tags, write buffer, AXI master; its host cache is block RAM, priced apart):
-# logic LUTs and distributed-RAM LUTs, linear in its row's bits (the write
-# buffer holds QUEUE = 32 rows in distributed RAM). Calibrated (st32_1031
-# §10.2): the v7 kernel's foldsim_vmem as the 16-SM image instantiates it
-# (IW 9, AW 1, byte masks, known-zero rows, QUEUE 32), Vivado 2025.2
-# synthesis + opt_design out of context on the V80: DW 512: 1,391 logic +
-# 821 LUTRAM; 1024: 2,039 + 1,950; 4096: 5,333 + 8,707. It makes moving a
-# small store off chip cost more than it frees, and a wide row costly.
+# The kernel's controllers (foldsim_vmem: request queue, tags, write buffer,
+# AXI master; a host cache and the known-zero bits in block RAM where it has
+# them), as foldsim_afu instantiates them for a virtual memory or a group of
+# them (foldsim --vmem-group), an HBM link stream's own controller and a page
+# engine: logic and distributed-RAM LUTs over the features [1, min(dw, 512),
+# max(dw - 512, 0), a host cache, a group of more than one member] (`dw` the
+# controller's row bits), fitted on every routed V80 image whose kernel had
+# them (virtA_1105/cal ctl_fit.py: vtA-vtG, fsd64h, B4; 81 controllers,
+# Vivado 2025.2, routed): per controller mean |error| 8.5 % logic, 26 %
+# LUTRAM; per image (its controllers summed) within -2.5..+11 %. Before (the
+# OOC lines below, cache-less) every image's controllers priced 3-70 % low:
+# a host cache adds ~1,560 logic and 400 LUTRAM LUTs, a row past one AXI beat
+# about a LUT and two LUTRAM LUTs a bit (the 4096-bit point is fsd64h's alone;
+# a group's term is small and negative: its wrapper is ~115 LUTs, the rest is
+# the fit).
+CTL_LOGIC = (1067.56, 0.4803, 0.9958, 1556.37, -95.68)
+CTL_LUTRAM = (299.06, 1.6951, 2.1253, 399.66, -130.94)
+# The OOC lines of before (st32_1031 §10.2: the v7 controller IW 9, AW 1,
+# known-zero rows, synthesis + opt_design; DW 512: 1,391 + 821; 4096:
+# 5,333 + 8,707), kept for comparison (ctl_fit.py 'old').
 VMEM_CTL_LOGIC = (828.0, 1.10)
 VMEM_CTL_LUTRAM = (-305.0, 2.2)
+# The controllers' block RAM (routed): the host cache's lines in true dual
+# port with byte lanes (a RAMB36 column of 36 bits, 1,024 rows; port A reads,
+# port B writes, reading first), one more for its two tag copies; and the
+# known-zero bits (KZ_BITS at most, foldsim --vmem-known-zero-bits) in 16
+# one-bit banks, block RAM where a bank is deeper than KZ_BRAM_DEPTH rows
+# (Vivado kept 2,368-deep banks in distributed RAM, put 4,096-deep ones in
+# block RAM). A page engine or a stream (no cache, no known-zero bits): none
+# (the OOC engine's one RAMB36 became distributed RAM routed). Over the 81
+# controllers: measured 754.0 RAMB36, priced 736.0 (-2.4 %; before: 166, -78 %).
+KZ_BITS = 1 << 16
+KZ_BANKS = 16
+KZ_BRAM_DEPTH = 3072
+# FORWARD 0 (foldsim --vmem-forward 0): every controller priced without
+# forwarding from its write buffer (no_forward()).
+CTL_FORWARD = 1
+
+
+def kz_bits(image_rows, budget=KZ_BITS):
+    """A controller's known-zero bits (foldsim.py vmem_known_zero): a bit per
+    block of 2^shift image rows, the fewest blocks within `budget`."""
+    if budget <= 0 or image_rows <= 0:
+        return 0
+    shift = 0
+    while -(-image_rows // (1 << shift)) > budget:
+        shift += 1
+    return -(-image_rows // (1 << shift))
+
+
+def ctl_cost(kind, dw, cache_rows=0, members=1, image_rows=0, kz=None):
+    """A controller of the kernel (`kind` 'vmem': a virtual memory or a group
+    of `members`; 'link': an HBM link stream's own; 'engine': a page engine)
+    with rows of `dw` bits: dict(logic, lutram, bram). A virtual memory's
+    `cache_rows` host-cache lines and its known-zero bits (`kz`, else those of
+    its `image_rows` rows: 2^AW x instances) add block RAM; a stream or an
+    engine has neither."""
+    dw = max(int(dw), 1)
+    cache = 1.0 if kind == 'vmem' and cache_rows else 0.0
+    f = (1.0, float(min(dw, 512)), float(max(dw - 512, 0)), cache,
+         1.0 if kind == 'vmem' and members > 1 else 0.0)
+    logic = sum(a * x for a, x in zip(CTL_LOGIC, f))
+    lutram = max(0.0, sum(a * x for a, x in zip(CTL_LUTRAM, f)))
+    if CTL_FORWARD == 0:
+        fl, fr = NO_FORWARD_ENGINE if kind == 'engine' else NO_FORWARD_VMEM
+        logic, lutram = logic * fl, lutram * fr
+    bram = 0.0
+    if cache:
+        bram += math.ceil(((dw + 7) // 8 * 8) / 36) * math.ceil(cache_rows / 1024) + 1
+    if kind == 'vmem':
+        bits = kz_bits(image_rows) if kz is None else kz
+        depth = -(-bits // KZ_BANKS)
+        if depth > KZ_BRAM_DEPTH:
+            bram += KZ_BANKS * math.ceil(depth / 32768)
+    return dict(logic=logic, lutram=lutram, bram=bram)
+
+
+# The kernel's device-memory masters and the platform's way into device
+# memory, which every controller adds to (hw/syn/foldsim/vmem_ports.py,
+# SLASH linker/slashkit mem_ctx.py). The kernel has at most MAX_MASTERS
+# masters: one per memory port of the target (bound even where the port fold
+# leaves all but the first idle), then one per controller as far as they go;
+# beyond, controller k shares master k mod M (foldsim_vmem_share), or with no
+# master left (memory ports = MAX_MASTERS) memory port k mod P's with its
+# endpoint. SLASH binds the masters round robin to SC_MEM_PORTS HBM vNoC
+# ports and puts a SmartConnect (sc_mem, at most SC_MAX_SI inputs) on every
+# port with more than one. Routed (virtA_1105/cal ctl_fit.py): a share
+# 70 logic + 284 LUTRAM LUTs with one input, 986 + 15 more an input
+# (fsd64h, 31 shares); an sc_mem node 808 + 2,108 logic and 781 + 801
+# LUTRAM a slave input (2 inputs: vtC/vtE 5,024 + 2,383; 4: fsd64h 9,240 +
+# 3,985). 32 masters (16 memory ports and 16 controllers, or 32 ports) take
+# 8 nodes of 4: 106k LUTs.
+MAX_MASTERS = 32
+SC_MEM_PORTS = 8
+SC_MAX_SI = 16
+SHARE_ONE = (70.0, 284.0)
+SHARE_EXTRA = (986.0, 15.0)
+SC_NODE_LOGIC = (808.0, 2108.0)
+SC_NODE_LUTRAM = (781.0, 801.0)
+
+
+def platform_cost(mem_ports, controllers, vmem_masters=None):
+    """The masters' shares and SLASH's sc_mem tree for a kernel of
+    `mem_ports` memory ports and `controllers` foldsim_vmem controllers
+    (`vmem_masters`: the kernel's FOLDSIM_VMEM_MASTERS, default as many as
+    fit): dict(logic, lutram, masters, shares, sc_nodes)."""
+    p, n = max(int(mem_ports), 0), max(int(controllers), 0)
+    room = max(0, MAX_MASTERS - p)
+    m = min(n, room if vmem_masters is None else vmem_masters)
+    logic = lutram = 0.0
+    shares = 0
+    if n and m == 0 and p:
+        # On the memory ports' masters, each with its endpoint.
+        for k in range(min(n, p)):
+            on = len(range(k, n, p))
+            logic += SHARE_ONE[0] + on * SHARE_EXTRA[0]
+            lutram += SHARE_ONE[1] + on * SHARE_EXTRA[1]
+            shares += 1
+    elif 0 < m < n:
+        for k in range(m):
+            on = len(range(k, n, m))
+            logic += SHARE_ONE[0] + (on - 1) * SHARE_EXTRA[0]
+            lutram += SHARE_ONE[1] + (on - 1) * SHARE_EXTRA[1]
+            shares += 1
+    masters = p + m
+    nodes = 0
+    for b in range(SC_MEM_PORTS):
+        q = len(range(b, masters, SC_MEM_PORTS))
+        while q > 1:
+            for g in range(0, q, SC_MAX_SI):
+                si = min(SC_MAX_SI, q - g)
+                logic += SC_NODE_LOGIC[0] + SC_NODE_LOGIC[1] * si
+                lutram += SC_NODE_LUTRAM[0] + SC_NODE_LUTRAM[1] * si
+                nodes += 1
+            q = -(-q // SC_MAX_SI)
+    return dict(logic=logic, lutram=lutram, masters=masters, shares=shares, sc_nodes=nodes)
 
 
 def vmem_ctl(row_bits):
     """A virtual memory controller's (logic LUTs, LUTRAM LUTs) for rows of
-    `row_bits` (VMEM_CTL_LOGIC, VMEM_CTL_LUTRAM)."""
-    rb = max(int(row_bits), 64)
-    return (VMEM_CTL_LOGIC[0] + VMEM_CTL_LOGIC[1] * rb,
-            max(0.0, VMEM_CTL_LUTRAM[0] + VMEM_CTL_LUTRAM[1] * rb))
+    `row_bits`, without a host cache (ctl_cost)."""
+    c = ctl_cost('vmem', max(int(row_bits), 64))
+    return c['logic'], c['lutram']
 
 
 def vmem_row_bytes(width, row_bytes_min=1):
@@ -425,9 +549,10 @@ def vmem_cost(depth, width, threads, weight=1.0, row_bytes_min=1):
     row = max(vmem_row_bytes(width, row_bytes_min), HBM_BEAT_BYTES)
     th = 1 << (threads - 1).bit_length() if threads > 1 else 1
     lr, br = cost.mem_cost(th, width, 1, 1) if threads > 1 else (0.0, 0.0)
-    cl, cr = vmem_ctl(width)
-    return dict(lut=cl, lutram=lr + cr, ff=width, bram=br, uram=0,
-                ii_floor=0, hbm=2 * weight * threads * row, ctl=1)
+    c = ctl_cost('vmem', max(width, 64), image_rows=depth * th)
+    return dict(lut=c['logic'], lutram=lr + c['lutram'], ff=width, bram=br + c['bram'], uram=0,
+                ii_floor=0, hbm=2 * weight * threads * row, ctl=1, ctl_bram=c['bram'],
+                ctl_lutram=c['lutram'])
 
 
 # HBM page streams (foldsim --page-engines): an off-chip page word in columns
@@ -440,16 +565,14 @@ def vmem_cost(depth, width, threads, weight=1.0, row_bytes_min=1):
 # many as the schedule's positions let the assignment share (foldsim-fold-
 # static assignPageEngines; more where copies' traffic collides).
 PAGE_ENGINE_BITS = 512
-# An engine's (logic, LUTRAM) LUTs, linear in its row's bits, and its block
-# RAM: calibrated (virt_1101 cal/, Vivado 2025.2 synthesis + opt_design out of
-# context on the V80, the image kernel's V8B foldsim_vmem as foldsim_afu
-# instantiates a page engine: INSTANCES 1, IW 1, TAGW 10, AW 12, byte masks,
-# read-first, QUEUE 32, OUTSTANDING 128, WRITES_OUT 128, no host cache, no
-# known-zero rows): DW 512: 1,657 logic + 866 LUTRAM + 1 RAMB36; DW 256:
-# 1,509 + 550 + 1 (the write-out sequence table).
+# An engine's (logic, LUTRAM) LUTs and block RAM: ctl_cost('engine', 512)
+# (routed: 1,313 logic + 1,167 LUTRAM, no block RAM; measured on vtC/vtE/vtF
+# 1,259-1,391 + 1,356-1,381). The OOC calibration of before (virt_1101 cal/,
+# synthesis + opt_design: DW 512 1,657 + 866 + 1 RAMB36; DW 256 1,509 + 550
+# + 1) is kept for comparison only.
 PAGE_ENGINE_LOGIC = (1361.0, 0.578)
 PAGE_ENGINE_LUTRAM = (234.0, 1.234)
-PAGE_ENGINE_BRAM = 1.0
+PAGE_ENGINE_BRAM = 0.0
 
 
 # Controllers that answer no read from their write buffer (the kernel's
@@ -465,20 +588,15 @@ NO_FORWARD_VMEM = (1324.0 / 1646.0, 537.0 / 833.0)
 
 def no_forward():
     """Price every controller (virtual memories', page engines', link
-    streams' own) as FORWARD 0."""
-    global VMEM_CTL_LOGIC, VMEM_CTL_LUTRAM, PAGE_ENGINE_LOGIC, PAGE_ENGINE_LUTRAM
-    fl, fr = NO_FORWARD_VMEM
-    VMEM_CTL_LOGIC = (VMEM_CTL_LOGIC[0] * fl, VMEM_CTL_LOGIC[1] * fl)
-    VMEM_CTL_LUTRAM = (VMEM_CTL_LUTRAM[0] * fr, VMEM_CTL_LUTRAM[1] * fr)
-    fl, fr = NO_FORWARD_ENGINE
-    PAGE_ENGINE_LOGIC = (PAGE_ENGINE_LOGIC[0] * fl, PAGE_ENGINE_LOGIC[1] * fl)
-    PAGE_ENGINE_LUTRAM = (PAGE_ENGINE_LUTRAM[0] * fr, PAGE_ENGINE_LUTRAM[1] * fr)
+    streams' own) as FORWARD 0: the factors above on ctl_cost."""
+    global CTL_FORWARD
+    CTL_FORWARD = 0
 
 
 def page_engine_ctl(row_bits=PAGE_ENGINE_BITS):
     """A page engine's (logic LUTs, LUTRAM LUTs)."""
-    return (PAGE_ENGINE_LOGIC[0] + PAGE_ENGINE_LOGIC[1] * row_bits,
-            PAGE_ENGINE_LUTRAM[0] + PAGE_ENGINE_LUTRAM[1] * row_bits)
+    c = ctl_cost('engine', row_bits)
+    return c['logic'], c['lutram']
 
 
 def page_engine_share(bits, threads, p, frame):
