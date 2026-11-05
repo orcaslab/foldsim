@@ -1,0 +1,2 @@
+`define FOLDSIM_NUM_CLASSES 2
+`define FOLDSIM_PORTS 16

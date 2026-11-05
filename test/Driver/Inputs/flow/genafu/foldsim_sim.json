@@ -1,0 +1,123 @@
+{
+ "top": "T",
+ "threads": {
+  "T_model": 1
+ },
+ "ports": [
+  {
+   "dir": "in",
+   "name": "hostClock",
+   "width": 0
+  },
+  {
+   "dir": "in",
+   "name": "hostReset",
+   "width": 1
+  },
+  {
+   "dir": "out",
+   "name": "rst_n_ready",
+   "width": 1
+  },
+  {
+   "dir": "in",
+   "name": "rst_n_valid",
+   "width": 1
+  },
+  {
+   "dir": "in",
+   "name": "rst_n_bits",
+   "width": 1
+  },
+  {
+   "dir": "out",
+   "name": "go_ready",
+   "width": 1
+  },
+  {
+   "dir": "in",
+   "name": "go_valid",
+   "width": 1
+  },
+  {
+   "dir": "in",
+   "name": "go_bits",
+   "width": 1
+  },
+  {
+   "dir": "out",
+   "name": "cmd_valid_ready",
+   "width": 1
+  },
+  {
+   "dir": "in",
+   "name": "cmd_valid_valid",
+   "width": 1
+  },
+  {
+   "dir": "in",
+   "name": "cmd_valid_bits",
+   "width": 1
+  },
+  {
+   "dir": "out",
+   "name": "cmd_write_ready",
+   "width": 1
+  },
+  {
+   "dir": "in",
+   "name": "cmd_write_valid",
+   "width": 1
+  },
+  {
+   "dir": "in",
+   "name": "cmd_write_bits",
+   "width": 1
+  },
+  {
+   "dir": "out",
+   "name": "cmd_addr_ready",
+   "width": 1
+  },
+  {
+   "dir": "in",
+   "name": "cmd_addr_valid",
+   "width": 1
+  },
+  {
+   "dir": "in",
+   "name": "cmd_addr_bits",
+   "width": 12
+  },
+  {
+   "dir": "out",
+   "name": "cmd_data_ready",
+   "width": 1
+  },
+  {
+   "dir": "in",
+   "name": "cmd_data_valid",
+   "width": 1
+  },
+  {
+   "dir": "in",
+   "name": "cmd_data_bits",
+   "width": 32
+  },
+  {
+   "dir": "in",
+   "name": "idle_ready",
+   "width": 1
+  },
+  {
+   "dir": "out",
+   "name": "idle_valid",
+   "width": 1
+  },
+  {
+   "dir": "out",
+   "name": "idle_bits",
+   "width": 1
+  }
+ ]
+}
