@@ -1,0 +1,52 @@
+# foldsim_flow.py afu: the kernel's top with the manifest's control binding.
+# Bound roles name the target's ports (the simulator's channels, checked
+# against foldsim_sim.json, widths included); "!" binds an active-low one
+# through an inverting channel; a role left out is tied off: a sink for what
+# the control endpoint drives, a constant 0 token for what it reads. A port the
+# endpoint names itself connects by name (`FOLDSIM_IN), as Vortex's do.
+# RUN: python3 %foldsim_tools/foldsim_flow.py afu --manifest %S/Inputs/flow/afu.toml --gen %S/Inputs/flow/genafu | FileCheck %s
+# RUN: not python3 %foldsim_tools/foldsim_flow.py afu --manifest %S/Inputs/flow/afu-bad.toml --gen %S/Inputs/flow/genafu 2>&1 | FileCheck %s --check-prefix=BAD
+# RUN: not python3 %foldsim_tools/foldsim_flow.py afu --manifest %S/Inputs/flow/afu-width.toml --gen %S/Inputs/flow/genafu 2>&1 | FileCheck %s --check-prefix=WIDTH
+# CHECK: parameter DCR_ADDR_W                 = 12,
+# CHECK-NEXT: parameter DCR_DATA_W                 = 32
+# CHECK: `FOLDSIM_CH(rst_n, 1)
+# CHECK-NEXT: `FOLDSIM_CH(foldsim_ctl_reset, 1)
+# CHECK-NEXT: `FOLDSIM_CH(cmd_valid, 1)
+# CHECK-NEXT: `FOLDSIM_CH(cmd_write, 1)
+# CHECK-NEXT: `FOLDSIM_CH(cmd_addr, DCR_ADDR_W)
+# CHECK-NEXT: `FOLDSIM_CH(cmd_data, DCR_DATA_W)
+# CHECK-NEXT: `FOLDSIM_CH(go, 1)
+# CHECK-NEXT: `FOLDSIM_CH(foldsim_nc_dcr_rsp_valid, 1)
+# CHECK-NEXT: `FOLDSIM_CH(foldsim_nc_dcr_rsp_data, DCR_DATA_W)
+# CHECK-NEXT: `FOLDSIM_CH(idle, 1)
+# CHECK-NEXT: `FOLDSIM_CH(foldsim_ctl_busy, 1)
+# CHECK-NEXT: assign rst_n_valid = foldsim_ctl_reset_valid;
+# CHECK-NEXT: assign foldsim_ctl_reset_ready = rst_n_ready;
+# CHECK-NEXT: assign rst_n_bits = ~foldsim_ctl_reset_bits;
+# CHECK-NEXT: assign foldsim_nc_dcr_rsp_valid_valid = 1'b1;
+# CHECK-NEXT: assign foldsim_nc_dcr_rsp_valid_bits = '0;
+# CHECK-NEXT: assign foldsim_nc_dcr_rsp_data_valid = 1'b1;
+# CHECK-NEXT: assign foldsim_nc_dcr_rsp_data_bits = '0;
+# CHECK-NEXT: assign foldsim_ctl_busy_valid = idle_valid;
+# CHECK-NEXT: assign idle_ready = foldsim_ctl_busy_ready;
+# CHECK-NEXT: assign foldsim_ctl_busy_bits = ~idle_bits;
+# CHECK: foldsim_sim sim (
+# CHECK: `FOLDSIM_IN(rst_n),
+# CHECK-NEXT: `FOLDSIM_IN(cmd_valid),
+# CHECK-NEXT: `FOLDSIM_IN(cmd_write),
+# CHECK-NEXT: `FOLDSIM_IN(cmd_addr),
+# CHECK-NEXT: `FOLDSIM_IN(cmd_data),
+# CHECK-NEXT: `FOLDSIM_IN(go),
+# CHECK-NEXT: `FOLDSIM_IN(idle)
+# CHECK-NEXT: );
+# CHECK: foldsim_ctrl #(
+# CHECK: .reset_valid (foldsim_ctl_reset_valid), .reset_ready (foldsim_ctl_reset_ready), .reset_bits (foldsim_ctl_reset_bits),
+# CHECK-NEXT: .dcr_req_valid_valid (cmd_valid_valid), .dcr_req_valid_ready (cmd_valid_ready), .dcr_req_valid_bits (cmd_valid_bits),
+# CHECK: .start_valid (go_valid), .start_ready (go_ready), .start_bits (go_bits),
+# CHECK-NEXT: .dcr_rsp_valid_valid (foldsim_nc_dcr_rsp_valid_valid), {{.*}}
+# CHECK-NEXT: .dcr_rsp_data_valid (foldsim_nc_dcr_rsp_data_valid), {{.*}}
+# CHECK-NEXT: .busy_valid (foldsim_ctl_busy_valid), .busy_ready (foldsim_ctl_busy_ready), .busy_bits (foldsim_ctl_busy_bits)
+# CHECK-NEXT: );
+# CHECK-NOT: @{{[A-Z_]+}}@
+# BAD: afu: [platform.control] binds nosuch, which is no port of the simulator
+# WIDTH: afu: cmd_addr is 12 bits, the endpoint's dcr_req_addr 16

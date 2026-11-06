@@ -1,0 +1,22 @@
+# REQUIRES: verilator
+# foldsim_gate.py: a design's simulator against its own RTL, known only by its
+# ports (foldsim_sim.json). The tree-arb target folded from its manifest, the
+# unfolded Top and the simulator each on the same random stimulus, the
+# simulator's channels stalled and its frames bubbled: the same output tokens
+# every cycle. Another stimulus gives other tokens (the gate sees a difference).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/tree-arb
+# RUN: foldsim --manifest %S/../Driver/Inputs/manifest/tree-arb.toml --out %t --bubbles > /dev/null 2>&1
+# RUN: python3 %foldsim_tools/foldsim_gate.py tb --sim-json %t/foldsim_sim.json --clock clk --out %t --max-cycles 1024
+# RUN: python3 %foldsim_tools/foldsim_gate.py stim %t/stim.hex --sim-json %t/foldsim_sim.json --cycles 400 --reset rst:2 --seed 1
+# RUN: python3 %foldsim_tools/foldsim_gate.py stim %t/stim2.hex --sim-json %t/foldsim_sim.json --cycles 400 --reset rst:2 --seed 2
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module gate_ref -Mdir %t/ref %t/gate_ref.sv top.sv > %t/ref.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module gate_sim -Mdir %t/sim %t/gate_sim.sv %t/foldsim_sim.sv > %t/sim.log 2>&1
+# RUN: %t/ref/Vgate_ref +cycles=400 +stim=%t/stim.hex +trace=%t/ref.trace | FileCheck %s --check-prefix=REF
+# RUN: %t/sim/Vgate_sim +cycles=400 +stim=%t/stim.hex +trace=%t/sim.trace +stall=30 +bubble=20 +verilator+seed+3 | FileCheck %s --check-prefix=SIM
+# RUN: python3 %foldsim_tools/foldsim_gate.py compare %t/ref.trace %t/sim.trace --sim-json %t/foldsim_sim.json --skip 4 | FileCheck %s
+# RUN: %t/sim/Vgate_sim +cycles=400 +stim=%t/stim2.hex +trace=%t/sim2.trace > /dev/null
+# RUN: not python3 %foldsim_tools/foldsim_gate.py compare %t/ref.trace %t/sim2.trace --sim-json %t/foldsim_sim.json --skip 4 | FileCheck %s --check-prefix=DIFF
+# REF: REF 400 cycles
+# SIM: SIM 400 cycles in {{[0-9]+}} host cycles, H {{[0-9.]+}}
+# CHECK: MATCH 396 cycles
+# DIFF: MISMATCH cycle {{[0-9]+}}: y

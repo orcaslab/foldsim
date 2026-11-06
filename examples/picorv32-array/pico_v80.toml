@@ -1,0 +1,43 @@
+# Target manifest: pico_array on the V80 (pico_v80: the array behind the kernel's control endpoint and one idle AXI4
+# memory port). The first non-Vortex image; its routed utilization is the generic calibration's out-of-sample point.
+[design]
+format = 1
+name = "picorv32-array4-v80"
+top = "pico_v80"
+
+[rtl]
+files = ["upstream/picorv32.v", "pico_array.sv", "pico_v80.sv"]
+
+[classes]
+modules = ["pico_tile"]
+
+[env]
+sinks = ["host_rsp_valid", "host_rsp_data", "running"]
+
+[options]
+static = true
+zero_latency_links = true
+zero_latency_chains = true
+bubbles = true
+
+[platform]
+kernel = "foldsim_afu"
+adapter = "axi4"
+mem_ports = 1                    # m_axi_mem_0, idle
+mem_id_width = 4
+mem_channel_shift = 0
+clock_mhz = 250
+device = "xcv80-lsva4737-2MHP-e-S"
+
+[platform.control]
+# pico_v80's own port names bound to the control endpoint's roles.
+reset = "rst"
+start = "go"
+busy = "running"
+csr_addr_width = 12
+csr_data_width = 32
+csr_req = { valid = "host_req_valid", rw = "host_req_write", addr = "host_req_addr", data = "host_req_data" }
+csr_rsp = { valid = "host_rsp_valid", data = "host_rsp_data" }
+
+[flow]
+clock = "clk"

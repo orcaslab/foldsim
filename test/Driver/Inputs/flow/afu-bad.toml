@@ -1,0 +1,5 @@
+[design]
+top = "T"
+[platform.control]
+start = "go"
+csr_req = { valid = "cmd_valid", addr = "nosuch" }

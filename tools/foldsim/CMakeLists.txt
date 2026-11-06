@@ -4,6 +4,31 @@ install(PROGRAMS foldsim.py DESTINATION bin RENAME foldsim)
 configure_file(foldsim_degree.py ${CMAKE_BINARY_DIR}/bin/foldsim_degree.py COPYONLY)
 configure_file(foldsim_cost.py ${CMAKE_BINARY_DIR}/bin/foldsim_cost.py COPYONLY)
 configure_file(foldsim_storage.py ${CMAKE_BINARY_DIR}/bin/foldsim_storage.py COPYONLY)
+# Target manifests: a design's whole recipe in one file (--manifest).
+configure_file(foldsim_manifest.py ${CMAKE_BINARY_DIR}/bin/foldsim_manifest.py COPYONLY)
+install(PROGRAMS foldsim_manifest.py DESTINATION bin)
+# The design-independent steps of an image flow from a manifest (boundary
+# lifting, the kernel shell's header).
+configure_file(foldsim_flow.py ${CMAKE_BINARY_DIR}/bin/foldsim_flow.py COPYONLY)
+install(PROGRAMS foldsim_flow.py DESTINATION bin)
+# The flow's scripts (flow/: lift_boundaries.py; v80/: vmem_ports.py, package_ip.tcl, the implementation
+# hooks, portfold_gen.sh; platform/: gen_platform.py and the card descriptors) and the kernel shell
+# (rtl/kernel: the memory and control endpoints, the virtual-memory controllers, foldsim_afu.sv.in),
+# beside the tools in the build and the install.
+file(GLOB_RECURSE FOLDSIM_FLOW_FILES RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/flow/*)
+foreach(f ${FOLDSIM_FLOW_FILES})
+  configure_file(${f} ${CMAKE_BINARY_DIR}/bin/${f} COPYONLY)
+endforeach()
+install(DIRECTORY flow DESTINATION bin USE_SOURCE_PERMISSIONS)
+file(GLOB FOLDSIM_KERNEL_RTL RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/rtl/kernel/*)
+foreach(f ${FOLDSIM_KERNEL_RTL})
+  configure_file(${PROJECT_SOURCE_DIR}/${f} ${CMAKE_BINARY_DIR}/bin/${f} COPYONLY)
+endforeach()
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/rtl/kernel DESTINATION bin/rtl)
+# A design's simulator gated against its own RTL in Verilator, by its ports.
+configure_file(foldsim_gate.py ${CMAKE_BINARY_DIR}/bin/foldsim_gate.py COPYONLY)
+install(PROGRAMS foldsim_gate.py DESTINATION bin)
 install(PROGRAMS foldsim_degree.py DESTINATION bin)
 install(FILES foldsim_cost.py DESTINATION bin)
 install(PROGRAMS foldsim_storage.py DESTINATION bin)

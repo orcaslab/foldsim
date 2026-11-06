@@ -19,7 +19,7 @@ none): fit2 pooled every point's measured controllers over calm4's price alone.
 B4's price is calm4a3/price_m4p_unc.json (m4p_unc.argv.json, current code, 1,029,124 LUTs): price_m4p.json was
 overwritten at 18:39 by a calibrated pass (check.py writes to its argv's --out) and no longer reproduces fit2's input.
 calm4's price_ab3.json reproduces exactly (calm4/price_unc.json)."""
-import json, re
+import json, re, os
 
 S_SYN = 1.038
 L = '/home/blaise/dev/fame5_work/static/st32_1031/lk2'
@@ -31,14 +31,8 @@ POINTS = [
     dict(name='s4x (routed image)', rpt=L + '/m1tel/img_s4x/bin/foldsim.vbin.prj/report_utilization_foldsim.txt',
          price=L + '/m1tel/price_s4x_unc.json', s=1.0, afu='foldsim_afu_0'),
 ]
-FAM = [
-    ('l1req', r'^l1req_'), ('lmq', r'^lmq_'), ('l1rsp', r'^l1rsp$'),
-    ('switches', r'^(l1sw|l2sw|l2fs|axix|l2mo|l2rs|l2nb|kmub|lms)(_\d+)?(_copy\d+)?$'),
-    ('fdiv_fsqrt', r'^VX_(fdiv|fsqrt)_unit$'), ('mufu_pe', r'^VX_mufu_pe$'), ('tcu_fedp', r'^VX_tcu_fedp'),
-    ('compute_slice', r'^VX_compute_slice__lift_model$'), ('socket', r'^VX_socket__lift_model$'),
-    ('core', r'^VX_core__lift_model$'), ('l2req', r'^l2req_'), ('opc', r'^VX_opc_unit$'),
-    ('icache', r'^VX_cache_bank__lift_icache$'), ('target', r'^foldsim_target_model$'),
-    ('fcvt', r'^VX_fcvt_unit$'), ('fncp', r'^VX_fncp_unit$')]
+FAM = [tuple(x) for x in json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           'vortex_families.json')))['families']]  # Vortex's, as data
 
 
 def parse(path):

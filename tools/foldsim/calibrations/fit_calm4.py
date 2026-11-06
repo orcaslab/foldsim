@@ -6,7 +6,7 @@ measured LUTRAM + SRL / (store LUTRAM x SYNTH_PER_ROUTED), or, where the model p
 copy. Top level: (measured logic of the simulator's own level / S - the ports' queues) / link register bits. Links:
 measured link-memory LUTRAM / priced. Virtual-memory controllers: measured vmem_<k> / the HBM kind's priced costs.
 Fixed: the control endpoint (no estimate)."""
-import json, re
+import json, re, os
 S = 1.038
 C = '/home/blaise/dev/fame5_work/static/st32_1031/lk2/calm4'
 rows, order = {}, []
@@ -20,14 +20,8 @@ for line in open(C + '/syn/hier2.rpt'):
     rows.setdefault(n, v)
 d = json.load(open(C + '/price_ab3.json'))['res']
 copies = {k.split('#')[0]: v for k, v in d['copies'].items()}
-FAM = [  # (family, regex on the class model, the coordinator's list first)
-    ('l1req', r'^l1req_'), ('lmq', r'^lmq_'), ('l1rsp', r'^l1rsp$'),
-    ('switches', r'^(l1sw|l2sw|l2fs|axix|l2mo|l2rs|l2nb|kmub|lms)(_\d+)?(_copy\d+)?$'),
-    ('fdiv_fsqrt', r'^VX_(fdiv|fsqrt)_unit$'), ('mufu_pe', r'^VX_mufu_pe$'), ('tcu_fedp', r'^VX_tcu_fedp'),
-    ('compute_slice', r'^VX_compute_slice__lift_model$'), ('socket', r'^VX_socket__lift_model$'),
-    ('core', r'^VX_core__lift_model$'), ('l2req', r'^l2req_'), ('opc', r'^VX_opc_unit$'),
-    ('icache', r'^VX_cache_bank__lift_icache$'), ('target', r'^foldsim_target_model$'),
-    ('fcvt', r'^VX_fcvt_unit$'), ('fncp', r'^VX_fncp_unit$')]
+FAM = [tuple(x) for x in json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                           'vortex_families.json')))['families']]  # Vortex's, as data
 fams = []
 for name, rx in FAM:
     ml = mr = gl = gr = 0.0; n = 0

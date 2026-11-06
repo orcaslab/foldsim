@@ -1,0 +1,10 @@
+[design]
+top = "T"
+[platform]
+mem_ports = 1
+mem_id_width = 4
+[platform.control]
+reset = "!rst_n"
+start = "go"
+busy = "!idle"
+csr_req = { valid = "cmd_valid", rw = "cmd_write", addr = "cmd_addr", data = "cmd_data" }

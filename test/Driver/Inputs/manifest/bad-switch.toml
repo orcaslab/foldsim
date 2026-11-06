@@ -1,0 +1,4 @@
+[design]
+top = "Top"
+[options]
+static = 1

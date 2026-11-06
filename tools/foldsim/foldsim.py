@@ -3,6 +3,11 @@
 
 usage: foldsim --srcs <srcs.f> --top <top> --out <dir> [--circt-bin <dir>]
                [--foldsim-bin <dir>] <class> [<class> ...]
+       foldsim --manifest <design.toml> --out <dir> [<option> ...]
+
+A target manifest (foldsim_manifest.py) holds a design's whole recipe: its
+RTL, classes, environment sinks, memory policy and platform binding; the
+command line overrides any of it.
 
 CIRCT (circt-verilog, circt-opt, firtool) comes from --circt-bin or PATH, and
 foldsim-opt from --foldsim-bin, the directory of this driver, or PATH.
@@ -64,6 +69,7 @@ NO_OP_DUMP = '--mlir-print-op-on-diagnostic=false'
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from foldsim_storage import VMEM_CACHE_BUDGET, bram36, vmem_cache_rows  # noqa: E402
 import foldsim_storage  # noqa: E402
+import foldsim_manifest  # noqa: E402
 
 
 def run(cmd, check=True, **kw):
@@ -292,6 +298,37 @@ def read_srcs(path, defines, incdirs, files, base=None, seen=()):
             sys.exit(f'{path}: unsupported option {token} in a source list')
         else:
             files.append(resolve(token))
+
+
+def rewrite_sources(files, rewrites, outdir):
+    """The source list with each file a --rewrite names read from a rewritten
+    copy in `outdir`."""
+    if not rewrites:
+        return files
+    by = {}
+    for r in rewrites:
+        if not isinstance(r, dict) or set(r) != {'file', 'from', 'to'}:
+            sys.exit(f'--rewrite {r}: not {{"file": F, "from": A, "to": B}}')
+        by.setdefault(os.path.realpath(r['file']), []).append(r)
+    known = {os.path.realpath(f) for f in files}
+    for f in by:
+        if f not in known:
+            sys.exit(f'--rewrite: {f} is not a source of the design')
+    os.makedirs(outdir, exist_ok=True)
+    out = []
+    for f in files:
+        rs = by.get(os.path.realpath(f))
+        if rs:
+            text = open(f).read()
+            for r in rs:
+                if r['from'] not in text:
+                    sys.exit(f'--rewrite {f}: no {r["from"]!r} in it')
+                text = text.replace(r['from'], r['to'])
+            f = os.path.join(outdir, os.path.basename(f))
+            with open(f, 'w') as g:
+                g.write(text)
+        out.append(f)
+    return out
 
 
 def frame_options(a):
@@ -834,12 +871,30 @@ def vmem_groups(vmems, choice, weights=None, kz_bits=0):
     return groups
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
-    ap.add_argument('--srcs', required=True,
+    ap.add_argument('--manifest', default='', metavar='FILE',
+                    help="the design's target manifest (foldsim_manifest.py): its options are "
+                         "the defaults, each overridden by the command line's")
+    ap.add_argument('--manifest-var', action='append', default=[], metavar='VAR=VALUE',
+                    help="a ${VAR} of the manifest's strings (else the environment's)")
+    ap.add_argument('--manifest-dump', action='store_true',
+                    help='print the options, the manifest applied, as JSON and exit')
+    ap.add_argument('--srcs', default='',
                     help='source list: +define+, +incdir+, -f/-F lists and files')
-    ap.add_argument('--top', required=True)
-    ap.add_argument('--out', required=True)
+    ap.add_argument('--src', action='append', default=[], metavar='FILE',
+                    help='a source file after the list\'s')
+    ap.add_argument('--incdir', action='append', default=[], metavar='DIR',
+                    help='an include directory after the list\'s')
+    ap.add_argument('--define', action='append', default=[], metavar='MACRO[=VALUE]',
+                    help='a define after the list\'s')
+    ap.add_argument('--rewrite', action='append', default=[], type=json.loads,
+                    metavar='{"file": F, "from": A, "to": B}',
+                    help='before the import, the source F read from a copy (<out>/rewritten) with '
+                         'every A replaced by B (A must occur): a construct the importer does not '
+                         'lower, written as one it does, the design itself unchanged')
+    ap.add_argument('--top', default='')
+    ap.add_argument('--out', default='')
     ap.add_argument('--circt-bin', default='')
     ap.add_argument('--foldsim-bin', default='')
     ap.add_argument('--max-unroll-trip-count', type=int, default=0, metavar='N',
@@ -1252,7 +1307,15 @@ def main():
                          'enable decoded from a few flops) copied with each replica')
     ap.add_argument('classes', nargs='*',
                     help='none: the whole target one model of one thread, unthreaded')
-    a = ap.parse_args()
+    return ap
+
+
+def main():
+    ap = build_parser()
+    a = foldsim_manifest.parse_args(ap)
+    for opt, v in (('--srcs or --src', a.srcs or a.src), ('--top', a.top), ('--out', a.out)):
+        if not v:
+            ap.error(f'{opt} is required (on the command line or in the manifest)')
     tool = lambda t: os.path.join(a.circt_bin, t) if a.circt_bin else t
     here = os.path.dirname(os.path.realpath(__file__))
     foldsim_bin = a.foldsim_bin or (here if os.path.exists(os.path.join(here, 'foldsim-opt')) else '')
@@ -1261,7 +1324,12 @@ def main():
     out = lambda f: os.path.join(a.out, f)
 
     defines, incdirs, files = [], [], []
-    read_srcs(a.srcs, defines, incdirs, files)
+    if a.srcs:
+        read_srcs(a.srcs, defines, incdirs, files)
+    defines += ['-D' + d for d in a.define]
+    incdirs += ['-I' + d for d in a.incdir]
+    files += a.src
+    files = rewrite_sources(files, a.rewrite, out('rewritten'))
     design = out('design.mlir')
     run([tool('circt-verilog'), '--ir-hw', f'--top={a.top}', '--allow-use-before-declare',
          '--allow-hierarchical-const', '--ignore-uninstantiated-modules', '--detect-memories',

@@ -1,0 +1,26 @@
+# Target manifest: pico_array, four PicoRV32 tiles in a mailbox ring (gen_1105, task D). Nothing of this
+# design is in the compiler: its RTL, its class and its options are all here.
+[design]
+format = 1
+name = "picorv32-array4"
+description = "4 x PicoRV32 (rv32im) with private 4 KiB RAMs and a mailbox ring"
+top = "pico_array"
+
+[rtl]
+files = ["upstream/picorv32.v", "pico_array.sv"]
+# PicoRV32's non-formal `assert` calls an empty task: CIRCT lowers it with the coroutine inlining of
+# CIRCT foldsim/inline-task-calls ec301d974 (before it, [rtl] rewrite = [{ file = "upstream/picorv32.v", from =
+# "`define assert(assert_expr) empty_statement", to = "`define assert(assert_expr)" }] worked around it).
+
+[classes]
+modules = ["pico_tile"]          # the repeating tile: one threaded copy, four threads
+
+[options]
+static = true
+zero_latency_links = true
+zero_latency_chains = true
+bubbles = true
+
+[flow]
+clock = "clk"                    # the target clock (foldsim_gate.py --clock)
+workload = "sw/work.c"           # sorted words, checksum, sieve, ring exchange (gate.sh, stim.py)

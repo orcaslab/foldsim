@@ -1,0 +1,1 @@
+`define FOLDSIM_NUM_CLASSES 2

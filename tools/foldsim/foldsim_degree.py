@@ -42,6 +42,7 @@ usage:
       [--degree-calibration F]
 """
 import argparse
+from collections import defaultdict
 import itertools
 import json
 import math
@@ -110,6 +111,48 @@ def class_estimates(models, names):
             visit(name)
         out[name] = acc
     return out
+
+
+# A class's generic cost features (class_features): what its logic is made
+# of, from the models' IR, for any design. A calibration's `generic` model
+# prices a class that none of its families names by these.
+GENERIC_FEATURES = ('log_lut', 'mux_share', 'arith_share', 'ff_per_lut', 'mem_bits_per_lut')
+
+
+def class_features(models, names):
+    """Per class: GENERIC_FEATURES of one instance (logic LUTs as the model
+    prices them, by op kind; register bits; memory bits)."""
+    mods, _ = cost.parse(models)
+    out = {}
+    for name in names:
+        acc = dict(lut=defaultdict(float), ff=0, mem_bits=0)
+
+        def visit(n):
+            m = mods[n]
+            for k, v in m.lut.items():
+                acc['lut'][k] += v
+            acc['ff'] += m.ff
+            acc['mem_bits'] += sum(r[1] * r[2] for r in m.mems)
+            for child, _ in m.insts:
+                if child in mods and child not in cost.BLACKBOX and child.split('__')[0] not in cost.BLACKBOX:
+                    visit(child)
+        if name in mods:
+            visit(name)
+        lut = sum(acc['lut'].values())
+        if lut <= 0:
+            continue
+        arith = sum(v for k, v in acc['lut'].items() if k in ('add', 'sub', 'mul', 'icmp', 'shl', 'shru', 'shrs'))
+        out[name] = dict(log_lut=math.log10(lut), mux_share=acc['lut'].get('mux', 0.0) / lut,
+                         arith_share=arith / lut, ff_per_lut=acc['ff'] / lut,
+                         mem_bits_per_lut=acc['mem_bits'] / lut / 64.0)
+    return out
+
+
+def generic_factor(model, feats):
+    """A generic model's factor ({features, coef, lo, hi}: exp of a linear
+    form of the features, clamped to the fitted families' range)."""
+    x = model['coef'][0] + sum(c * feats[f] for c, f in zip(model['coef'][1:], model['features']))
+    return min(max(math.exp(x), model['lo']), model['hi'])
 
 
 def state_lutram(est, threads, form='lutram'):
@@ -527,15 +570,27 @@ def top_link_logic(links):
 # logic per link register bit; a factor on the links' LUTRAM; and fixed kernel
 # terms (vmem controllers, the control endpoint) the model has no estimate of.
 # Factors are synthesized / priced x SYNTH_PER_ROUTED, fitted on one whole-design
-# synthesis (the file says which); classes no family names keep 1.
+# synthesis (the file says which). The families are a design's own fit, data
+# of its calibration file (calibrations/vortex_families.json names Vortex's);
+# a class no family names takes the calibration's `generic` model of its cost
+# features (class_features; calibrations/fit_generic.py), if it has one, else 1.
 def cal_factors(c):
     cal = KERNEL['calibration']
     if not cal:
         return 1.0, 1.0
     model = re.sub(r'_copy\d+$', '', c)
-    for fam in cal['families']:
+    for fam in cal.get('families', []):
         if re.search(fam['match'], model):
             return fam['logic'], fam['lutram']
+    gen = cal.get('generic')
+    if gen and KERNEL.get('models'):
+        if KERNEL.get('features') is None:
+            KERNEL['features'] = {}
+        if model not in KERNEL['features']:
+            KERNEL['features'].update(class_features(KERNEL['models'], [model]))
+        f = KERNEL['features'].get(model)
+        if f:
+            return generic_factor(gen['logic'], f), generic_factor(gen['lutram'], f)
     return 1.0, 1.0
 
 
@@ -545,7 +600,7 @@ def cal_lutram_add(c):
     if not cal:
         return 0.0
     model = re.sub(r'_copy\d+$', '', c)
-    for fam in cal['families']:
+    for fam in cal.get('families', []):
         if re.search(fam['match'], model):
             return fam.get('lutram_add', 0.0)
     return 0.0
@@ -2668,6 +2723,7 @@ def state_main(a):
                                                map(float, a.fold_ports_measured.split(','))))
                       if getattr(a, 'fold_ports_measured', '') else None,
                       calibration=json.load(open(a.calibrate)) if getattr(a, 'calibrate', '') else None,
+                      models=a.models, features=None,
                       sim_ports_folded=getattr(a, 'sim_ports_folded', False),
                       uram_memories=getattr(a, 'uram_memories', False),
                       copy_logic=json.load(open(a.copy_logic)) if getattr(a, 'copy_logic', '') else None)

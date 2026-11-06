@@ -1,0 +1,16 @@
+# A calibration prices any design's classes: its families (a design's own fit,
+# regexes on the class names) first, then its `generic` model of the class's
+# cost features (log LUTs, select and arithmetic shares, flops and memory bits
+# per LUT; calibrations/fit_generic.py), else 1.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/tree-arb
+# RUN: foldsim --manifest %S/Inputs/manifest/tree-arb.toml --out %t --schedule-only > /dev/null 2>&1
+# RUN: python3 %S/Inputs/state/generic_cal.py %foldsim_tools/foldsim %t/models.mlir | FileCheck %s
+# CHECK: Top_model log_lut {{[0-9.]+}} mux_share {{[0-9.]+}} arith_share {{[0-9.]+}} ff_per_lut {{[0-9.]+}} mem_bits_per_lut {{[0-9.]+}}
+# CHECK: root_Bank log_lut
+# CHECK: sl log_lut
+# CHECK: sl: logic 2.000 lutram 0.500
+# CHECK: sl_copy1: logic 2.000 lutram 0.500
+# CHECK: root_Bank: logic [[RB:[0-9.]+]] lutram 1.200
+# CHECK: nosuch: logic 1.000 lutram 1.000
+# CHECK: root_Bank expected logic [[RB]]
+# CHECK: no generic: (1.0, 1.0)

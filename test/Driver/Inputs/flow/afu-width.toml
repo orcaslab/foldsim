@@ -1,0 +1,5 @@
+[design]
+top = "T"
+[platform.control]
+csr_addr_width = 16
+csr_req = { addr = "cmd_addr" }

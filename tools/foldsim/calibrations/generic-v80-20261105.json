@@ -1,0 +1,259 @@
+{
+ "name": "generic-v80-20261105",
+ "source": "design-independent: calm4b4s4-20261104.json's terms, its families replaced by a generic model of the class cost features (fit_generic.py, ridge 0.3) fitted on 15 families' classes in /home/blaise/dev/fame5_work/static/a100cfg_1102/work/gen/b4/gen/models.mlir",
+ "synth_per_routed": 1.038,
+ "rest": 0.0,
+ "top_logic_per_link_bit": 0.232,
+ "link_lutram": 0.98,
+ "vmem_ctl": {
+  "logic": 0.418,
+  "lutram": 0.148
+ },
+ "fixed": {
+  "logic": 3943,
+  "lutram": 32,
+  "ramb36": 0,
+  "what": "the control endpoint (foldsim_ctrl)"
+ },
+ "points": [
+  {
+   "name": "calm4 (synthesis)",
+   "measured_total": {
+    "logic": 827462,
+    "lutram": 530427,
+    "ff": 1613806,
+    "ramb36": 1147,
+    "ramb18": 716,
+    "uram": 228
+   },
+   "measure_scale": 1.038
+  },
+  {
+   "name": "B4 (routed image)",
+   "measured_total": {
+    "logic": 597863,
+    "lutram": 382809,
+    "ff": 1164070,
+    "ramb36": 398,
+    "ramb18": 25,
+    "uram": 144
+   },
+   "measure_scale": 1.0
+  },
+  {
+   "name": "s4x (routed image)",
+   "measured_total": {
+    "logic": 379374,
+    "lutram": 95539,
+    "ff": 543443,
+    "ramb36": 99,
+    "ramb18": 66,
+    "uram": 0
+   },
+   "measure_scale": 1.0
+  }
+ ],
+ "families": [],
+ "generic": {
+  "logic": {
+   "features": [
+    "log_lut",
+    "mux_share",
+    "arith_share",
+    "ff_per_lut",
+    "mem_bits_per_lut"
+   ],
+   "coef": [
+    -1.328831,
+    0.012017,
+    1.095092,
+    1.331628,
+    0.823392,
+    0.522471
+   ],
+   "lo": 0.098,
+   "hi": 3.106,
+   "fit": {
+    "families": {
+     "l1req": {
+      "fitted": 1.387,
+      "loo": 1.223,
+      "family": 3.106
+     },
+     "lmq": {
+      "fitted": 1.064,
+      "loo": 0.984,
+      "family": 2.249
+     },
+     "l1rsp": {
+      "fitted": 0.646,
+      "loo": 0.545,
+      "family": 2.87
+     },
+     "switches": {
+      "fitted": 2.17,
+      "loo": 2.54,
+      "family": 2.452
+     },
+     "mufu_pe": {
+      "fitted": 0.329,
+      "loo": 1.263,
+      "family": 0.098
+     },
+     "tcu_fedp": {
+      "fitted": 0.705,
+      "loo": 0.732,
+      "family": 0.585
+     },
+     "compute_slice": {
+      "fitted": 0.891,
+      "loo": 0.881,
+      "family": 0.896
+     },
+     "socket": {
+      "fitted": 1.03,
+      "loo": 1.041,
+      "family": 0.988
+     },
+     "core": {
+      "fitted": 0.785,
+      "loo": 0.729,
+      "family": 0.919
+     },
+     "l2req": {
+      "fitted": 0.986,
+      "loo": 0.77,
+      "family": 1.18
+     },
+     "opc": {
+      "fitted": 1.228,
+      "loo": 1.871,
+      "family": 0.99
+     },
+     "icache": {
+      "fitted": 2.182,
+      "loo": 2.971,
+      "family": 0.973
+     },
+     "target": {
+      "fitted": 0.922,
+      "loo": 0.884,
+      "family": 1.227
+     },
+     "fcvt": {
+      "fitted": 0.952,
+      "loo": 1.141,
+      "family": 0.707
+     },
+     "fncp": {
+      "fitted": 0.998,
+      "loo": 1.059,
+      "family": 0.603
+     }
+    },
+    "weighted_error": -0.0509,
+    "weighted_loo_error": -0.0173
+   }
+  },
+  "lutram": {
+   "features": [
+    "log_lut",
+    "mux_share",
+    "arith_share",
+    "ff_per_lut",
+    "mem_bits_per_lut"
+   ],
+   "coef": [
+    -0.463431,
+    0.034297,
+    0.977112,
+    1.967835,
+    -0.092679,
+    -0.825849
+   ],
+   "lo": 0.489,
+   "hi": 3.41,
+   "fit": {
+    "families": {
+     "l1req": {
+      "fitted": 1.029,
+      "loo": 1.022,
+      "family": 1.039
+     },
+     "lmq": {
+      "fitted": 1.046,
+      "loo": 1.023,
+      "family": 1.275
+     },
+     "l1rsp": {
+      "fitted": 0.81,
+      "loo": 0.777,
+      "family": 1.114
+     },
+     "switches": {
+      "fitted": 1.017,
+      "loo": 1.181,
+      "family": 0.896
+     },
+     "mufu_pe": {
+      "fitted": 0.839,
+      "loo": 1.487,
+      "family": 0.489
+     },
+     "tcu_fedp": {
+      "fitted": 1.753,
+      "loo": 1.599,
+      "family": 2.811
+     },
+     "compute_slice": {
+      "fitted": 1.421,
+      "loo": 1.893,
+      "family": 1.227
+     },
+     "socket": {
+      "fitted": 1.426,
+      "loo": 1.314,
+      "family": 2.024
+     },
+     "core": {
+      "fitted": 1.888,
+      "loo": 1.516,
+      "family": 3.346
+     },
+     "l2req": {
+      "fitted": 1.01,
+      "loo": 1.219,
+      "family": 0.834
+     },
+     "opc": {
+      "fitted": 1.211,
+      "loo": 1.53,
+      "family": 1.079
+     },
+     "icache": {
+      "fitted": 1.055,
+      "loo": 1.012,
+      "family": 1.131
+     },
+     "target": {
+      "fitted": 1.783,
+      "loo": 1.921,
+      "family": 1.086
+     },
+     "fcvt": {
+      "fitted": 2.883,
+      "loo": 2.873,
+      "family": 3.41
+     },
+     "fncp": {
+      "fitted": 2.045,
+      "loo": 2.285,
+      "family": 0.785
+     }
+    },
+    "weighted_error": -0.0531,
+    "weighted_loo_error": 0.111
+   }
+  }
+ }
+}

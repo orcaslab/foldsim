@@ -1,0 +1,20 @@
+# The tree-arb target (static-tree-classes.test's INNER fold) as a manifest.
+[design]
+format = 1
+name = "tree-arb"
+top = "Top"
+
+[rtl]
+srcs = "../tree-arb/top.f"
+
+[classes]
+modules = ["root+Bank"]
+at = ["sl@*.slice", "root@inner:arb", "root@inner:*.join_arb"]
+
+[options]
+static = true
+zero_latency_links = true
+zero_latency_chains = true
+
+[flow]
+clock = "clk"
