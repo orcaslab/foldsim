@@ -1715,7 +1715,7 @@ static bool findHeldRead(seq::FirMemReadOp read, comb::MuxOp &found,
 static int stageOpFullLevels(Operation *op);
 
 /// The logic levels a link taken in its producer's host cycle may span: the
-/// logic screen's gate.
+/// Beacon's gate.
 static constexpr int kZeroLinkLevels = 12;
 
 /// An operation's logic levels, estimated: none for wiring, two for an adder

@@ -8,7 +8,7 @@
 # RAM_HINTS (below): memories to map to block / ultra RAM. FAME5_OPTS: more foldsim-fame5 options (" registered-state=true").
 set -eo pipefail
 O=$1; N=$2; IDW=${3:-9}; DW=${4:-512}; CHS=${5:-5}; SPEC=${6:-2}
-# foldsim: the kernel shell is rtl/kernel of this repository (Vortex: hw/rtl/afu/foldsim).
+# foldsim: the kernel shell is shell/rtl (rtl/kernel links to it) of this repository (Vortex: hw/rtl/afu/foldsim).
 R=${FOLDSIM_KERNEL_RTL:-$(cd "$(dirname "$0")/../../../../rtl/kernel" && pwd)}; T=$(cd "$R/../.." && pwd)
 : "${CIRCT_BIN:?}" "${FOLDSIM_OPT:?}"
 mkdir -p $O/src; cd $O
@@ -61,7 +61,7 @@ open(p, 'w').write(s)
 print('portfold_gen: %d helper modules prefixed' % len(mods))
 PY
 { echo "foldsim_mem threaded $N ways (ID_W $IDW DATA_W $DW CH_SHIFT $CHS SPEC $SPEC), $(date '+%F %T')"
-  echo "foldsim $(git -C $T rev-parse --short HEAD)$(git -C $T diff --quiet -- rtl/kernel || echo +dirty)${RAM_HINTS:+ RAM_HINTS: $RAM_HINTS}${FAME5_OPTS:+ FAME5_OPTS:$FAME5_OPTS}"
+  echo "foldsim $(git -C $T rev-parse --short HEAD)$(git -C $T diff --quiet -- shell/rtl || echo +dirty)${RAM_HINTS:+ RAM_HINTS: $RAM_HINTS}${FAME5_OPTS:+ FAME5_OPTS:$FAME5_OPTS}"
   echo "circt-verilog: $($CIRCT_BIN/circt-verilog --version 2>&1 | head -1)"
   echo "foldsim-opt: $FOLDSIM_OPT ($(cat $(dirname $FOLDSIM_OPT)/REV 2>/dev/null | cut -c1-80))"
   echo "firtool: $($CIRCT_BIN/firtool --version 2>&1 | head -1)"

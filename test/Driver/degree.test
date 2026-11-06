@@ -15,3 +15,17 @@
 # SEARCH: <- pick
 # SEARCH: searched 1 of 2 choices: one per frame depth, then the neighbours of the front
 # NONE: foldsim: copies {{.*}}: II {{[0-9]+}}, about {{[0-9]+}} LUTs (uncalibrated)
+# With --degree-estimator beacon-area (upstream's Beacon area, foldsim-estimate-area) the shipped V80 builds' area
+# factors, fitted on the IR cost model (foldsim_cost.py), are not used and LUTs take the device scale; the period
+# fit still is.
+# RUN: foldsim --srcs top.f --top Top --out %t/beacon --static --copies auto --degree-estimator beacon-area Leaf 2>&1 | FileCheck %s --check-prefix=BCAL
+# RUN: FileCheck %s --check-prefix=BTABLE < %t/beacon/degree.txt
+# RUN: FileCheck %s --check-prefix=AREA < %t/beacon/degree/area.json
+# BCAL: foldsim_degree: the area factors of full_lkg, {{.*}} were fitted on another estimator than the one in use (beacon-area) and are not used: LUTs at the estimator scale
+# BCAL: foldsim: copies {{.*}}: II {{[0-9]+}}, about {{[0-9]+}} LUTs, {{[0-9.]+}} MHz, {{[0-9.]+}} ns per cycle (foldsim_v80.json: LUTs at the estimator scale)
+# BTABLE: copies ii luts {{.*}} mhz ns
+# BTABLE: <- pick
+# BTABLE: area factors not used (fitted on another estimator than beacon-area): full_lkg, {{.*}}; LUTs at the Beacon device scale
+# AREA: "Leaf": {
+# AREA: "state": {
+# AREA: "target": "versal"

@@ -6,13 +6,16 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// A timing screen: the logic levels of the longest path to every end point
-// of an elaborated, LUT-mapped design, counted as Vivado counts them on the
-// V80. It finds the depth outliers before a Vivado run; it predicts neither
-// slack nor wire delay.
+// Beacon: the logic levels of the longest path to every end point of an
+// elaborated design mapped to a target's cells (foldsim/Beacon.h), counted as
+// Vivado counts them on the target's FPGA, or in cell stages on an ASIC. It
+// finds the depth outliers before a Vivado run; it predicts neither slack nor
+// wire delay.
 //
 //===----------------------------------------------------------------------===//
 
+#include "BeaconOps.h"
+#include "foldsim/Beacon.h"
 #include "foldsim/Passes.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -24,7 +27,6 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringMap.h"
-#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MathExtras.h"
@@ -48,6 +50,12 @@ namespace foldsim {
 
 using namespace mlir;
 using namespace circt;
+using foldsim::BeaconTarget;
+using foldsim::lookupBeaconTarget;
+using foldsim::beacon::kMaxTableBits;
+using foldsim::beacon::significantBits;
+using foldsim::beacon::variableBits;
+using foldsim::beacon::widthOf;
 
 namespace {
 
@@ -166,11 +174,6 @@ struct Edge {
 
 constexpr unsigned kNone = ~0u;
 
-unsigned widthOf(Value value) {
-  int64_t width = hw::getBitWidth(value.getType());
-  return width < 0 ? 0 : width;
-}
-
 /// ceil(log6(n)): the levels of a LUT6 tree over n signals.
 /// Whether module `name` is `wanted` or one of its specializations
 /// (`<wanted>_<n>`).
@@ -196,51 +199,6 @@ unsigned lut6Depth(unsigned n) {
 /// (CARRY8 or LOOKAHEAD8) between the input's block and the output's.
 int carryLevels(unsigned in, unsigned out) { return 2 + out / 8 - in / 8; }
 
-/// A device's family. On an FPGA, levels are as Vivado counts them, and the
-/// two families differ only in their DSPs: both have LUT6s, 8-bit carry
-/// blocks and 64-word distributed RAMs. On an ASIC library, levels are gate
-/// stages of the and-inverter graph.
-struct Device {
-  /// The operand widths of a DSP's multiplier.
-  unsigned dspA, dspB;
-  /// Levels from the fabric to a product the DSP registers, from there out
-  /// to the fabric, and through each further DSP of a cascade.
-  int dspIn, dspOut, dspCascade;
-  /// An ASIC library, and its delays in ps: a stage, a flip-flop's clock to
-  /// output and setup (hw/syn/yosys/liberty_stage.py), and what a path adds
-  /// beyond its stages, fitted on OpenSTA (buffering, the inverter after a
-  /// flip-flop's QN, slew).
-  bool asic = false;
-  int stagePs = 0, clk2qPs = 0, setupPs = 0, pathPs = 0;
-};
-
-/// The V80 (Versal, DSP58): from a registered product, Vivado counts M_DATA,
-/// ALUMUX, ALUADD, OUTPUT and the cells before the multiplier it does not
-/// absorb; a cascaded DSP adds ALUMUX, ALUADD and OUTPUT. The U55C
-/// (Virtex UltraScale+ HBM, DSP48E2) has one ALU cell and an 18-bit B port.
-const Device kVersal = {27, 24, 1, 6, 3};
-const Device kVirtexUltraScalePlusHBM = {27, 18, 1, 5, 2};
-/// ASAP7 7.5-track RVT at the TT corner, as hw/syn/yosys builds with it: a
-/// cell at fanout 3 and its own slew, a DFFHQNx1's clock to output and setup,
-/// and 167 ps per path, the median over five asic_gate DUTs. Products are
-/// multipliers of cells, not DSPs.
-const Device kAsap7 = {0, 0, 0, 0, 0, true, 24, 58, 6, 167};
-
-/// The device of a family, by the names of hw/syn/xilinx/platforms (the V80's
-/// and the U55C's) and of hw/syn/yosys's PDK (asap7).
-const Device *lookupDevice(StringRef family) {
-  return llvm::StringSwitch<const Device *>(family)
-      .Case("versal", &kVersal)
-      .Case("virtexuplusHBM", &kVirtexUltraScalePlusHBM)
-      .Case("asap7", &kAsap7)
-      .Default(nullptr);
-}
-
-/// The most bits a divider can depend on for synthesis to write it out as a
-/// table over them; also the dividend widths whose quotient and remainder by
-/// a constant foldsim-lower-constant-division writes out.
-constexpr unsigned kMaxTableBits = 10;
-
 /// The most nodes searched for the bits a divider depends on.
 constexpr unsigned kMaxSupportCone = 4096;
 
@@ -248,26 +206,11 @@ constexpr unsigned kMaxSupportCone = 4096;
 /// multiplexers per two more.
 int tableLevels(unsigned bits) { return bits <= 6 ? 1 : 1 + (bits - 5) / 2; }
 
-/// The low bits of `value` that are not known zero: a zero-extension is a
-/// concatenation under a zero constant.
-unsigned significantBits(Value value) {
-  unsigned width = widthOf(value);
-  if (auto concat = value.getDefiningOp<comb::ConcatOp>())
-    if (auto top = concat.getInputs().front().getDefiningOp<hw::ConstantOp>())
-      if (top.getValue().isZero())
-        return width - widthOf(top);
-  return width;
-}
-
-/// The bits of `value` a product depends on: none for a constant.
-unsigned variableBits(Value value) {
-  return value.getDefiningOp<hw::ConstantOp>() ? 0 : significantBits(value);
-}
-
 class Timing {
 public:
   /// Instances of `blackBoxes` are external modules, as a harness's stubs.
-  Timing(ModuleOp top, ArrayRef<std::string> blackBoxes, const Device &device)
+  Timing(ModuleOp top, ArrayRef<std::string> blackBoxes,
+         const BeaconTarget &device)
       : device(device) {
     for (auto module : top.getOps<hw::HWModuleLike>()) {
       if (llvm::is_contained(blackBoxes, module.getModuleName()))
@@ -299,6 +242,7 @@ private:
   ArrayRef<unsigned> support(unsigned ctx, Operation *op, bool &small);
   void evaluate(unsigned root);
   void collect(unsigned ctx);
+  void sweepUnobservable();
   void addEndPoints(unsigned ctx, Operation *op, StringRef port, Value value,
                     bool boundary = false);
   void addRegister(unsigned ctx, Operation *op, Value reg, Value next,
@@ -306,18 +250,25 @@ private:
   void retime(unsigned levels);
   unsigned startOf(unsigned ctx, unsigned id, uint32_t &fanout,
                    unsigned &crossings);
+  uint32_t inputFanout(unsigned id);
+  void collapse(unsigned id, ArrayRef<Edge> edges, int &best, unsigned &pred);
   void printName(raw_ostream &os, unsigned id);
   void printOp(raw_ostream &os, Operation *op, StringRef port, uint32_t bit);
   void printPath(raw_ostream &os, const EndPoint &end, unsigned rank);
   const std::string &path(unsigned ctx);
 
-  const Device &device;
+  const BeaconTarget &device;
   DenseMap<StringAttr, Operation *> modules;
   DenseSet<StringAttr> stubs;
   std::vector<Context> contexts;
   DenseMap<std::pair<unsigned, Operation *>, unsigned> children;
   std::vector<std::string> paths;
   std::vector<Node> nodes;
+  /// Per node: the register and port bits its cone reaches if
+  /// there are at most kMaxTableBits of them, else kNone alone; and whether
+  /// the cone has a word-level operation the mapper left unmapped.
+  std::vector<SmallVector<unsigned, 4>> cones;
+  std::vector<bool> coneWords;
   DenseMap<std::tuple<unsigned, void *, unsigned>, unsigned> ids;
   std::vector<EndPoint> endPoints;
   /// Evaluated nodes, each after its inputs.
@@ -334,6 +285,7 @@ private:
   unsigned retimeLevels = 0;
   llvm::StringMap<uint64_t> otherOps;
   uint64_t loops = 0;
+  uint64_t unobservable = 0;
   SmallVector<std::pair<unsigned, unsigned>> loopSamples;
 };
 
@@ -780,6 +732,7 @@ void Timing::evaluate(unsigned root) {
         pred = in;
       }
     }
+    collapse(id, edges, best, pred);
     nodes[id].levels = best;
     nodes[id].pred = pred;
     nodes[id].state = 2;
@@ -787,6 +740,67 @@ void Timing::evaluate(unsigned root) {
       order.push_back(id);
     stack.pop_back();
   }
+}
+
+/// A node whose cone reaches at most kMaxTableBits register or port bits and
+/// goes through a word-level operation is a table over those bits (LUTs on an
+/// FPGA, a multiplexer tree on an ASIC): synthesis maps a cut of six inputs to
+/// one LUT6, where the word-level operations the
+/// mapper leaves for carry chains and DSPs count their own levels. A shift by
+/// an amount computed from a 2-bit field is one LUT per bit, not a product,
+/// compares and a shifter. Cones of LUTs alone keep the mapper's depth.
+void Timing::collapse(unsigned id, ArrayRef<Edge> edges, int &best,
+                      unsigned &pred) {
+  if (cones.size() < nodes.size()) {
+    cones.resize(nodes.size());
+    coneWords.resize(nodes.size());
+  }
+  Kind kind = nodes[id].kind;
+  // A distributed-RAM read depends on the memory's contents, not on its
+  // address alone.
+  if (kind == Kind::AsyncRead) {
+    cones[id] = {kNone};
+    return;
+  }
+  bool word = kind == Kind::Arith || kind == Kind::Order ||
+              kind == Kind::Equal || kind == Kind::Mul || kind == Kind::Div ||
+              kind == Kind::Table;
+  SmallVector<unsigned, 4> cone;
+  bool wide = false;
+  for (auto &edge : edges) {
+    unsigned in = edge.in;
+    if (nodes[in].state != 2 || nodes[in].kind == Kind::AsyncRead) {
+      wide = true;
+      break;
+    }
+    if (isStart(nodes[in].kind)) {
+      cone.push_back(in);
+    } else {
+      auto &c = cones[in];
+      if (!c.empty() && c.front() == kNone) {
+        wide = true;
+        break;
+      }
+      cone.append(c.begin(), c.end());
+      word |= coneWords[in];
+    }
+    llvm::sort(cone);
+    cone.erase(std::unique(cone.begin(), cone.end()), cone.end());
+    if (cone.size() > kMaxTableBits) {
+      wide = true;
+      break;
+    }
+  }
+  if (wide) {
+    cones[id] = {kNone};
+    return;
+  }
+  if (word && !cone.empty() && table(cone.size()) < best) {
+    best = table(cone.size());
+    pred = cone.front();
+  }
+  cones[id] = std::move(cone);
+  coneWords[id] = word;
 }
 
 void Timing::addEndPoints(unsigned ctx, Operation *op, StringRef port,
@@ -914,10 +928,98 @@ void Timing::collect(unsigned ctx) {
   }
 }
 
+/// The memory a read or write port belongs to; null for anything else.
+static Operation *memoryOf(Operation *op) {
+  Value memory;
+  if (auto read = dyn_cast<seq::FirMemReadOp>(op))
+    memory = read.getMemory();
+  else if (auto write = dyn_cast<seq::FirMemWriteOp>(op))
+    memory = write.getMemory();
+  else if (auto rw = dyn_cast<seq::FirMemReadWriteOp>(op))
+    memory = rw.getMemory();
+  return memory ? memory.getDefiningOp() : nullptr;
+}
+
+/// Drops the end points no top output, stub input or vendor IP input
+/// depends on, as Vivado removes unobservable logic: a counter only an
+/// assertion read, a flag nothing reads, state that feeds only itself.
+/// A register is observable bit by bit, a memory as a whole.
+void Timing::sweepUnobservable() {
+  DenseMap<std::tuple<unsigned, Operation *, unsigned>, SmallVector<unsigned, 1>>
+      regBits;
+  DenseMap<std::pair<unsigned, Operation *>, SmallVector<unsigned>> states;
+  SmallVector<unsigned> work;
+  std::vector<bool> liveEnd(endPoints.size());
+  for (unsigned i = 0, e = endPoints.size(); i < e; ++i) {
+    auto &end = endPoints[i];
+    if (isa<hw::OutputOp, hw::InstanceOp>(end.op)) {
+      liveEnd[i] = true;
+      work.push_back(end.node);
+    } else if (Operation *memory = memoryOf(end.op)) {
+      states[{end.ctx, memory}].push_back(i);
+    } else if (end.port == "d") {
+      regBits[{end.ctx, end.op, end.bit}].push_back(i);
+    } else {
+      states[{end.ctx, end.op}].push_back(i);
+    }
+  }
+
+  auto mark = [&](ArrayRef<unsigned> ends) {
+    for (unsigned i : ends)
+      if (!liveEnd[i]) {
+        liveEnd[i] = true;
+        work.push_back(endPoints[i].node);
+      }
+  };
+  DenseSet<std::pair<unsigned, Operation *>> liveStates;
+  auto markState = [&](unsigned ctx, Operation *op) {
+    if (!liveStates.insert({ctx, op}).second)
+      return;
+    if (auto it = states.find({ctx, op}); it != states.end())
+      mark(it->second);
+  };
+
+  std::vector<bool> seen(nodes.size());
+  SmallVector<Edge> edges;
+  while (!work.empty()) {
+    unsigned id = work.pop_back_val();
+    if (id >= seen.size())
+      seen.resize(nodes.size());
+    if (seen[id])
+      continue;
+    seen[id] = true;
+    Node n = nodes[id];
+    Operation *op = n.value.getDefiningOp();
+    if (n.kind == Kind::Reg) {
+      if (auto it = regBits.find({n.ctx, op, n.bit}); it != regBits.end())
+        mark(it->second);
+      markState(n.ctx, op);
+      continue;
+    }
+    if (n.kind == Kind::SyncRead || n.kind == Kind::AsyncRead)
+      markState(n.ctx, memoryOf(op));
+    if (isStart(n.kind))
+      continue;
+    edges.clear();
+    operands(id, edges);
+    for (auto &edge : edges)
+      work.push_back(edge.in);
+  }
+
+  std::vector<EndPoint> live;
+  live.reserve(endPoints.size());
+  for (unsigned i = 0, e = endPoints.size(); i < e; ++i)
+    if (liveEnd[i])
+      live.push_back(endPoints[i]);
+  unobservable = endPoints.size() - live.size();
+  endPoints = std::move(live);
+}
+
 LogicalResult Timing::run(hw::HWModuleOp top, unsigned retimeLevels) {
   this->retimeLevels = retimeLevels;
   contexts.push_back({0, {}, top, 0});
   collect(0);
+  sweepUnobservable();
   for (auto &end : endPoints)
     evaluate(end.node);
   for (auto &end : endPoints) {
@@ -1033,6 +1135,22 @@ unsigned Timing::startOf(unsigned ctx, unsigned id, uint32_t &fanout,
   }
 }
 
+/// The largest fanout of a bit into the last cell before end point bit `id`:
+/// a clock enable or a select that drives the cells of every bit of a wide
+/// register has the register's width as its load, which routing, not logic
+/// depth, makes slow.
+uint32_t Timing::inputFanout(unsigned id) {
+  if (isStart(nodes[id].kind))
+    return 0;
+  SmallVector<Edge> edges;
+  inputs(id, edges);
+  uint32_t fanout = 0;
+  for (auto &edge : edges)
+    if (!isStart(nodes[edge.in].kind))
+      fanout = std::max(fanout, nodes[edge.in].fanout);
+  return fanout;
+}
+
 void Timing::printOp(raw_ostream &os, Operation *op, StringRef port,
                      uint32_t bit) {
   if (auto name = op->getAttrOfType<StringAttr>("name"))
@@ -1070,7 +1188,7 @@ void Timing::printName(raw_ostream &os, unsigned id) {
 
 void Timing::writeEndPoints(raw_ostream &os, unsigned minLevels) {
   os << "levels,retimed,kind,start_kind,fanout,crossings,start_inst,start,"
-        "end_inst,end\n";
+        "end_inst,end,in_fanout\n";
   for (auto &end : endPoints) {
     if ((unsigned)end.levels < minLevels)
       continue;
@@ -1083,7 +1201,7 @@ void Timing::writeEndPoints(raw_ostream &os, unsigned minLevels) {
     printName(os, start);
     os << ',' << end.ctx << ',';
     printOp(os, end.op, end.port, end.bit);
-    os << '\n';
+    os << ',' << inputFanout(end.node) << '\n';
   }
 }
 
@@ -1100,7 +1218,7 @@ void Timing::writeInstances(raw_ostream &os) {
 /// For every instance of `modules`, the deepest bit of each port: the
 /// levels at which an input arrives, and the levels behind an output.
 void Timing::writePorts(raw_ostream &os, ArrayRef<std::string> modules) {
-  os << "instance,module,direction,port,width,levels\n";
+  os << "instance,module,direction,port,width,levels,through\n";
   auto deepest = [&](unsigned ctx, Value value) {
     int levels = -1;
     for (unsigned bit = 0, e = widthOf(value); bit < e; ++bit) {
@@ -1112,21 +1230,63 @@ void Timing::writePorts(raw_ostream &os, ArrayRef<std::string> modules) {
     }
     return levels;
   };
+  auto within = [&](unsigned ctx, unsigned root) {
+    while (contexts[ctx].depth > contexts[root].depth)
+      ctx = contexts[ctx].parent;
+    return ctx == root;
+  };
+  // The bits of an output that logic outside the instance reaches without a
+  // register: a path from an input port through to an output, which leaves
+  // the instance's neighbours one combinational path.
+  auto through = [&](unsigned ctx, Value value) {
+    unsigned count = 0;
+    SmallVector<unsigned> stack;
+    DenseSet<unsigned> seen;
+    SmallVector<Edge> edges;
+    for (unsigned bit = 0, e = widthOf(value); bit < e; ++bit) {
+      unsigned id = resolve(ctx, value, bit);
+      if (id == kNone)
+        continue;
+      stack.assign({id});
+      seen.clear();
+      seen.insert(id);
+      bool found = false;
+      while (!found && !stack.empty()) {
+        unsigned n = stack.pop_back_val();
+        if (!within(nodes[n].ctx, ctx)) {
+          found = true;
+          break;
+        }
+        if (isStart(nodes[n].kind))
+          continue;
+        edges.clear();
+        operands(n, edges);
+        for (auto &edge : edges)
+          if (seen.insert(edge.in).second)
+            stack.push_back(edge.in);
+      }
+      count += found;
+    }
+    return count;
+  };
   for (unsigned ctx = 1, e = contexts.size(); ctx < e; ++ctx) {
     auto c = contexts[ctx];
     if (!matchesModule(c.module.getModuleName(), modules))
       continue;
-    auto write = [&](StringRef dir, StringRef name, Value value, int levels) {
+    auto write = [&](StringRef dir, StringRef name, Value value, int levels,
+                     unsigned bits) {
       os << path(ctx) << ',' << c.module.getModuleName() << ',' << dir << ','
-         << name << ',' << widthOf(value) << ',' << levels << '\n';
+         << name << ',' << widthOf(value) << ',' << levels << ',' << bits
+         << '\n';
     };
     for (auto [i, operand] : llvm::enumerate(c.inst.getOperands()))
       if (!isa<seq::ClockType>(operand.getType()))
         write("in", c.module.getInputName(i), operand,
-              deepest(c.parent, operand));
+              deepest(c.parent, operand), 0);
     auto *output = c.module.getBodyBlock()->getTerminator();
     for (auto [i, operand] : llvm::enumerate(output->getOperands()))
-      write("out", c.module.getOutputName(i), operand, deepest(ctx, operand));
+      write("out", c.module.getOutputName(i), operand, deepest(ctx, operand),
+            through(ctx, operand));
   }
 }
 
@@ -1312,6 +1472,7 @@ void Timing::writeReport(raw_ostream &os, unsigned topPaths,
     ++histogram[end.levels];
   os << "instances " << contexts.size() << ", bits " << nodes.size()
      << " (evaluated " << computed << "), end points " << endPoints.size()
+     << " (" << unobservable << " unobservable left out)"
      << ", combinational loops " << loops << "\n";
   for (auto [id, in] : loopSamples) {
     os << "  loop: " << path(nodes[id].ctx) << '/';
@@ -1710,9 +1871,9 @@ void EstimateTimingPass::runOnOperation() {
     }
   }
 
-  const Device *device = lookupDevice(family);
+  const BeaconTarget *device = lookupBeaconTarget(target);
   if (!device) {
-    design.emitError("unknown FPGA family '") << family << "'";
+    foldsim::emitUnknownBeaconTarget(design, target);
     return signalPassFailure();
   }
   Timing timing(design, blackBoxes, *device);

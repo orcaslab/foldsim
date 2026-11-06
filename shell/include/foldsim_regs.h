@@ -11,7 +11,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// The foldsim simulator's register map (hw/rtl/afu/foldsim/foldsim_regs.vh).
+// The foldsim simulator's register map (shell/rtl/foldsim_regs.vh).
 // Byte offsets on the kernel's AXI4-Lite control port. 0x040-0x0BF is left
 // empty: on the V80 the PCIe block's MSI-X table sits at that offset of the BAR
 // the first kernel is mapped at, and answers those accesses itself.
@@ -74,7 +74,7 @@ enum {
 #define FOLDSIM_REG_FINISH(c)   (0x100u + 8u * (c))  // threads of class c finished, lo/hi (c < 96)
 
 // The memory model: each memory port's timing as a DRAM channel's banks
-// (hw/rtl/afu/foldsim/foldsim_mem_bank.sv). Its settings take effect at the
+// (shell/rtl/foldsim_mem_bank.sv). Its settings take effect at the
 // next target reset; a reset command's CMD_ADDR is the FOLDSIM_MEM_REFRESH_*
 // the target has from that reset on. Times are DRAM clocks.
 #define FOLDSIM_REG_MEM_REFRESH 0x0D8u  // read only: the FOLDSIM_MEM_REFRESH_* in effect

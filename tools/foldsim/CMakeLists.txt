@@ -1,6 +1,8 @@
 # The driver: elaborates a design with CIRCT and builds its simulator.
 configure_file(foldsim.py ${CMAKE_BINARY_DIR}/bin/foldsim COPYONLY)
 install(PROGRAMS foldsim.py DESTINATION bin RENAME foldsim)
+# The fold-degree search (--copies auto): prices each class with foldsim-opt's
+# foldsim-estimate-area, the one area model.
 configure_file(foldsim_degree.py ${CMAKE_BINARY_DIR}/bin/foldsim_degree.py COPYONLY)
 configure_file(foldsim_cost.py ${CMAKE_BINARY_DIR}/bin/foldsim_cost.py COPYONLY)
 configure_file(foldsim_storage.py ${CMAKE_BINARY_DIR}/bin/foldsim_storage.py COPYONLY)
@@ -13,7 +15,8 @@ configure_file(foldsim_flow.py ${CMAKE_BINARY_DIR}/bin/foldsim_flow.py COPYONLY)
 install(PROGRAMS foldsim_flow.py DESTINATION bin)
 # The flow's scripts (flow/: lift_boundaries.py; v80/: vmem_ports.py, package_ip.tcl, the implementation
 # hooks, portfold_gen.sh; platform/: gen_platform.py and the card descriptors) and the kernel shell
-# (rtl/kernel: the memory and control endpoints, the virtual-memory controllers, foldsim_afu.sv.in),
+# (shell/rtl, also reached as rtl/kernel: the memory and control endpoints, the virtual-memory controllers,
+# foldsim_afu.sv.in),
 # beside the tools in the build and the install.
 file(GLOB_RECURSE FOLDSIM_FLOW_FILES RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} CONFIGURE_DEPENDS
      ${CMAKE_CURRENT_SOURCE_DIR}/flow/*)
@@ -25,7 +28,7 @@ file(GLOB FOLDSIM_KERNEL_RTL RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS ${
 foreach(f ${FOLDSIM_KERNEL_RTL})
   configure_file(${PROJECT_SOURCE_DIR}/${f} ${CMAKE_BINARY_DIR}/bin/${f} COPYONLY)
 endforeach()
-install(DIRECTORY ${PROJECT_SOURCE_DIR}/rtl/kernel DESTINATION bin/rtl)
+install(DIRECTORY ${PROJECT_SOURCE_DIR}/shell/rtl/ DESTINATION bin/rtl/kernel)
 # A design's simulator gated against its own RTL in Verilator, by its ports.
 configure_file(foldsim_gate.py ${CMAKE_BINARY_DIR}/bin/foldsim_gate.py COPYONLY)
 install(PROGRAMS foldsim_gate.py DESTINATION bin)
@@ -42,3 +45,7 @@ install(FILES foldsim_v80.json DESTINATION bin)
 # The V80 builds that calibrate the routability term (foldsim_storage.py fit-route).
 configure_file(foldsim_v80_route.csv ${CMAKE_BINARY_DIR}/bin/foldsim_v80_route.csv COPYONLY)
 install(FILES foldsim_v80_route.csv DESTINATION bin)
+# Interface boundary lifting: plain-port wrappers that let interface-port units
+# be classes, on a rewritten copy of the sources (needs pyslang).
+configure_file(foldsim_lift.py ${CMAKE_BINARY_DIR}/bin/foldsim-lift COPYONLY)
+install(PROGRAMS foldsim_lift.py DESTINATION bin RENAME foldsim-lift)

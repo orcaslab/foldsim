@@ -14,7 +14,7 @@
 // The target's AXI4 memory port, as a foldsim endpoint.
 //
 // Timing is a DRAM channel's banks (foldsim_mem_bank, cycle for cycle
-// sim/common/dram_bank_model.h's DramBankAxi): each read holds a slot, and
+// shell/model/dram_bank_model.h's DramBankAxi): each read holds a slot, and
 // responses leave in the order their data departs. Every output is a function
 // of the model's state, so all of them are offered at the start of a target
 // cycle.

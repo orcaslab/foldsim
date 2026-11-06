@@ -484,7 +484,9 @@ def axi_spec_groups(top, design_text, depth):
 
 
 # The V80 builds that calibrate --copies auto by default (foldsim_degree.py
-# calibrate): area, placement capacity and the period fit.
+# calibrate): area, placement capacity and the period fit. Area factors fitted
+# on another estimator than the one in use (foldsim_degree.ESTIMATOR: the IR cost model by default,
+# Beacon's area with --degree-estimator beacon-area) are not used.
 DEGREE_CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                   'foldsim_v80.json')
 
@@ -572,10 +574,13 @@ def choose_copies(a, foldsim_opt, flat, passes, out):
         sys.exit(f'--copies auto: no choice that places{routes} within {a.lut_budget or "any"} '
                  f'LUTs; see {out("degree.txt")}')
     pick = result['pick']
+    calibration = os.path.basename(path) if cal else 'uncalibrated'
+    if cal and not result.get('area_calibrated', True):
+        calibration += ': LUTs at the estimator scale'
     timing = (f", {pick['mhz']} MHz, {pick['ns']} ns per cycle" if 'ns' in pick else '')
     rules = pick.get('storage', '')
     print(f"foldsim: copies {pick['copies']}: II {pick['ii']}, about {pick['luts']} LUTs"
-          f"{timing} ({os.path.basename(path) if cal else 'uncalibrated'})"
+          f"{timing} ({calibration})"
           + (f"; storage: {len(rules.split(','))} rules" if rules else ''), file=sys.stderr)
     return ('' if pick['copies'] == '-' else pick['copies']), rules
 
@@ -1242,6 +1247,9 @@ def build_parser():
                     help='with --copies auto: builds that calibrate the estimate '
                          '(foldsim_degree.py calibrate); the V80\'s, foldsim_v80.json, '
                          'by default, `none` for none')
+    ap.add_argument('--degree-estimator', default='foldsim_cost.py', choices=('foldsim_cost.py', 'beacon-area'),
+                    help='the area model of --copies / --page / --state auto: the IR cost model (default: '
+                         'the calibrations fitted on it) or Beacon\'s area (foldsim-estimate-area)')
     ap.add_argument('--degree-max-points', type=int, default=256,
                     help='with --copies auto: schedule every choice up to this many, '
                          'else search them (foldsim_degree.py evaluate)')
@@ -1313,6 +1321,10 @@ def build_parser():
 def main():
     ap = build_parser()
     a = foldsim_manifest.parse_args(ap)
+    if a.degree_estimator != 'foldsim_cost.py':
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        import foldsim_degree
+        foldsim_degree.set_estimator(a.degree_estimator)
     for opt, v in (('--srcs or --src', a.srcs or a.src), ('--top', a.top), ('--out', a.out)):
         if not v:
             ap.error(f'{opt} is required (on the command line or in the manifest)')

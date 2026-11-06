@@ -8,7 +8,7 @@
 //
 // Runs foldsim's passes, with the CIRCT HW, Comb, Seq and SV dialects and
 // passes a simulator's pipeline uses between them, and the Synth passes that
-// map a design to LUTs for `foldsim-estimate-timing`.
+// `foldsim-beacon-map` runs to map a design to a Beacon target's cells.
 //
 //===----------------------------------------------------------------------===//
 

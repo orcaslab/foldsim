@@ -6,7 +6,8 @@ k stores of its state, each about n/k instances deep (the first n mod k one
 deeper), and the frame it allows: the deepest copy's. For every choice of k per class:
 
   II      exact: the scheduler's (foldsim-fold-static schedule-only);
-  LUTs    the IR's estimate per class (foldsim_cost.py), calibrated per class
+  LUTs    Beacon's area of each class (foldsim-opt: foldsim-beacon-map area,
+          foldsim-estimate-area, on the V80's target), calibrated per class
           against Vivado's hierarchical utilization of a build of the design;
   sites   the LUT sites the placer needs, distributed RAM weighted, against
           the V80 dynamic region (fits);
@@ -50,6 +51,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -86,7 +88,7 @@ def parse_schedule(text):
     return ii, classes, max(slots) if slots else 0
 
 
-def class_estimates(models, names):
+def _ir_estimates(models, names):
     """Per class, one instance: logic LUTs (black boxes included), register
     bits and the memories, from the models' IR."""
     mods, _ = cost.parse(models)
@@ -110,7 +112,94 @@ def class_estimates(models, names):
         if name in mods:
             visit(name)
         out[name] = acc
+    for e in out.values():
+        e.update(lut_ip=0.0, scale=1.0)
     return out
+
+
+# The Beacon target whose area prices a class: the calibration is the V80's.
+AREA_TARGET = 'versal'
+# The area model a build's estimates (est_logic, est_lutram, and the kappa and
+# lam fitted on them) come from. The area factors of a build fitted on another
+# model, or with none recorded, are not used; its measured period, LUTs and
+# largest copy still serve the period fit.
+BEACON = 'beacon-area'
+# The IR cost model (foldsim_cost.py: our calibrations, our pricer's storage / paging / link terms) or Beacon's
+# area (upstream 11-01). A build without a recorded estimator was fitted on the IR cost model. Default: the IR
+# cost model (the fold-a100 pricer's behaviour); --estimator beacon-area selects Beacon's (set_estimator).
+IR_COST = 'foldsim_cost.py'
+ESTIMATORS = (IR_COST, BEACON)
+ESTIMATOR = IR_COST
+
+
+def set_estimator(name):
+    global ESTIMATOR
+    if name not in ESTIMATORS:
+        sys.exit(f'unknown estimator {name} (one of {", ".join(ESTIMATORS)})')
+    ESTIMATOR = name
+
+
+def build_estimator(b):
+    """The estimator a calibration build was fitted on (none recorded: the IR cost model)."""
+    return b.get('estimator', IR_COST)
+
+
+def default_foldsim_opt():
+    """foldsim-opt beside this script (the build or install tree), else PATH."""
+    here = os.path.join(os.path.dirname(os.path.realpath(__file__)), 'foldsim-opt')
+    return here if os.path.exists(here) else 'foldsim-opt'
+
+
+def pow2(threads):
+    """The instance index's range: a power of two."""
+    return 1 << (threads - 1).bit_length() if threads > 1 else 1
+
+
+def _beacon_estimates(models, classes, foldsim_opt, out=None):
+    """Per class, one instance, from Beacon's area of the models' IR
+    (foldsim-estimate-area): the area mapping's logic LUTs before Beacon's
+    device scale (`lut`, what kappa calibrates, so a new scale leaves the
+    fitted factors valid), the Vivado cores' LUTs (`lut_ip`), the device
+    scale (`scale`, the factor without a calibration), flip-flops, and its
+    state at each power-of-two instance count up to the largest class
+    (state_lutram). `out` keeps the pass's module table."""
+    threads = [1 << i for i in range(pow2(max(classes.values(), default=1)).bit_length())]
+    with tempfile.TemporaryDirectory() as tmp:
+        table = out or os.path.join(tmp, 'area.json')
+        pipeline = (f'builtin.module(foldsim-beacon-map{{target={AREA_TARGET} area}},'
+                    f'foldsim-estimate-area{{target={AREA_TARGET} modules={table} report= '
+                    f'state-threads={",".join(map(str, threads))}}})')
+        r = subprocess.run([foldsim_opt, models, f'--pass-pipeline={pipeline}', '-o', os.devnull],
+                           capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(f'foldsim-estimate-area failed on {models}:\n{r.stderr}')
+        doc = json.load(open(table))
+        mods, scale = doc['modules'], doc.get('lut_scale', 1.0)
+    est = {}
+    for name in classes:
+        m = mods.get(name)
+        if not m:
+            est[name] = dict(lut=0.0, lut_ip=0.0, scale=scale, ff=0,
+                             state={t: (0.0, 0.0, 0.0) for t in threads})
+            continue
+        state = {int(t): (s['reg_lutram'], s['mem_lutram'], s['mem_bram'])
+                 for t, s in m['state'].items()}
+        # The memories' read multiplexers are priced with the memories, at the
+        # depth a copy gives them (state_lutram), not as the class's logic.
+        mux = state[1][1] - m['lutram']
+        # A Vivado core's flip-flops are its pipeline, not the class's state.
+        est[name] = dict(lut=m['lut_mapped'], lut_ip=max(m['lut_fixed'] - mux, 0.0),
+                         scale=scale, ff=m['ff'] - m.get('ip_ff', 0), state=state)
+    return est
+
+
+def class_estimates(models, classes, foldsim_opt=None, out=None):
+    """Per class, one instance: the estimator's (ESTIMATOR) area -- the IR cost model's logic LUTs, register
+    bits, register widths and memories (lut_ip 0, scale 1), or Beacon's (_beacon_estimates)."""
+    if ESTIMATOR == BEACON:
+        return _beacon_estimates(models, classes if isinstance(classes, dict) else {c: 1 for c in classes},
+                                 foldsim_opt or default_foldsim_opt(), out)
+    return _ir_estimates(models, classes)
 
 
 # A class's generic cost features (class_features): what its logic is made
@@ -160,6 +249,9 @@ def state_lutram(est, threads, form='lutram'):
     registers as memories of one entry per instance (flip-flops for one, a
     ring or a store in flops), and its memories `threads` times deeper, an
     entry for each instance index (a power of two)."""
+    if 'state' in est:   # Beacon's area: the state at each power-of-two instance count
+        reg, mem_lutram, mem_bram = est['state'][pow2(threads)]
+        return (reg if form == 'lutram' else 0.0) + mem_lutram, mem_bram
     threads = 1 << (threads - 1).bit_length() if threads > 1 else 1
     luts = 0.0 if form != 'lutram' else cost.mem_cost(threads, est['ff'], 1, 0)[0]
     bram = 0.0
@@ -318,11 +410,12 @@ def calibrate(a):
     ii, classes, _ = parse_schedule(text)
     sched = parse_classes(text)
     entries = a.register_state_entries
-    est = class_estimates(a.models, classes)
+    est = class_estimates(a.models, classes, a.foldsim_opt)
     copies, rest, total, totals = read_util(a.util)
     period = a.period - read_wns(a.timing)
     cal = json.load(open(a.out)) if os.path.exists(a.out) else {}
-    build = dict(name=a.name, luts=total, rest=rest, period=period, classes={}, **totals)
+    build = dict(name=a.name, estimator=ESTIMATOR, luts=total, rest=rest, period=period,
+                 classes={}, **totals)
     if a.screen:
         build['depth'] = screen_depth(a.screen)
     for name, n in classes.items():
@@ -339,7 +432,8 @@ def calibrate(a):
         build['classes'][name] = dict(
             copies=k, threads=t, logic=m['logic'] / k, lutram=m['lutram'] / k,
             est_logic=e['lut'], est_lutram=lr, form=form, state_logic=sl,
-            kappa=max(m['logic'] / k - sl, 0) / e['lut'] if e['lut'] else 1.0,
+            kappa=(max(m['logic'] / k - sl - e.get('lut_ip', 0.0), 0) / e['lut']
+                   if e['lut'] else e.get('scale', 1.0)),
             lam=(m['lutram'] / k) / lr if lr else 1.0)
     build['max_copy'] = max(m['lut'] / m['copies'] for m in copies.values())
     cal.setdefault('builds', [b for b in cal.get('builds', []) if b['name'] != a.name])
@@ -353,12 +447,23 @@ def calibrate(a):
           f"largest copy {build['max_copy']:.0f}")
 
 
-def factors(cal, name, est_lut):
+def area_builds(cal):
+    """The builds whose area factors were fitted on the estimator in use (ESTIMATOR)."""
+    return [b for b in (cal or {}).get('builds', []) if build_estimator(b) == ESTIMATOR]
+
+
+def retired_builds(cal):
+    """The builds whose area factors were fitted on another estimator."""
+    return [b['name'] for b in (cal or {}).get('builds', []) if build_estimator(b) != ESTIMATOR]
+
+
+def factors(cal, name, est_lut, scale=1.0):
     """A class's calibration: from the build whose estimate of it is nearest
     (the same design at another degree, else the nearest size), the latest
     such build of a design built more than once (the compiler it reflects),
-    else the median over every class and build, else none."""
-    builds = (cal or {}).get('builds', [])
+    else the median over every class and build, else Beacon's device scale
+    for the LUTs. Only builds fitted on Beacon's area count (area_builds)."""
+    builds = area_builds(cal)
     near = [(round(abs(math.log(c['est_logic'] / est_lut)), 6), -i, c)
             for i, b in enumerate(builds) for n, c in b['classes'].items()
             if n == name and c['est_logic'] and est_lut]
@@ -369,15 +474,17 @@ def factors(cal, name, est_lut):
     ls = sorted(c['lam'] for b in builds for c in b['classes'].values())
     if ks:
         return ks[len(ks) // 2], ls[len(ls) // 2]
-    return 1.0, 1.0
+    return scale, 1.0
 
 
 def rest_of(cal, est_total):
     """The LUTs outside the copies (memory endpoint, links, control) of the
-    build nearest in estimated size."""
-    builds = (cal or {}).get('builds', [])
+    build nearest in estimated size (of those fitted on Beacon's area), else
+    the median over every build (measured, whatever the estimator)."""
+    builds = area_builds(cal)
     if not builds:
-        return 0.0
+        rests = sorted(b['rest'] for b in (cal or {}).get('builds', []))
+        return rests[len(rests) // 2] if rests else 0.0
     def size(b):
         return sum(c['est_logic'] * c['copies'] for c in b['classes'].values())
     return min(builds, key=lambda b: abs(math.log(max(size(b), 1) / max(est_total, 1))))['rest']
@@ -472,14 +579,15 @@ def fixed_area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, cac
     paged = dict(bits=0, ff=0, ports=0, hbm=0)
     for c, n in classes.items():
         k = degree.get(c, 1)
-        kappa, lam = factors(cal, c, est[c]['lut'])
+        kappa, lam = factors(cal, c, est[c]['lut'], est[c].get('scale', 1.0))
         for j in range(k):
             t = copy_threads(n, k, j)
             info = (sched or {}).get(c if j == 0 else f'{c}_copy{j}')
             form, bypass = state_form(t, info, ii, entries) if sched is not None else \
                 ('one' if t == 1 else 'lutram', False)
             lr, br = state_lutram(est[c], t, form)
-            copy_logic = kappa * est[c]['lut'] + state_logic(cal, form, bypass, est[c]['ff'])
+            copy_logic = (kappa * est[c]['lut'] + est[c].get('lut_ip', 0.0)
+                          + state_logic(cal, form, bypass, est[c]['ff']))
             if form == 'paged':
                 bits, mux, others = paged_state(est[c])
                 lr, br = state_lutram(others, t, form)
@@ -1237,8 +1345,9 @@ def lstsq(rows, ys):
 def firesim_factors(cal):
     """FireSim's LUTs against our estimate of the unfolded target, logic and
     distributed RAM apart: the least over the FireSim builds calibrated, so a
-    projection is what FireSim needs at the least."""
-    fs = (cal or {}).get('firesim', [])
+    projection is what FireSim needs at the least. Their estimate is the
+    calibrated area, so only builds against Beacon's count."""
+    fs = [b for b in (cal or {}).get('firesim', []) if build_estimator(b) == ESTIMATOR]
     if not fs:
         return None
     return dict(logic=min(b['logic'] / b['est_logic'] for b in fs),
@@ -1274,9 +1383,10 @@ def calibrate_firesim(a):
         sys.exit(f'no row {a.instance} in {a.util}')
     cal = json.load(open(a.out)) if os.path.exists(a.out) else {}
     _, classes, _ = parse_schedule(open(a.schedule).read())
-    est = class_estimates(a.models, classes)
+    est = class_estimates(a.models, classes, a.foldsim_opt)
     unf = area(cal, est, classes, dict(classes), rest_of(cal, sum(e['lut'] for e in est.values())))
-    b = dict(name=a.name, luts=row[0], logic=row[1], lutram=row[2], period=a.period,
+    b = dict(name=a.name, estimator=ESTIMATOR, luts=row[0], logic=row[1], lutram=row[2],
+             period=a.period,
              est_logic=unf['logic'], est_lutram=unf['lutram'])
     cal['firesim'] = [x for x in cal.get('firesim', []) if x['name'] != a.name] + [b]
     json.dump(cal, open(a.out, 'w'), indent=1)
@@ -1875,14 +1985,20 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
     _, classes, _ = parse_schedule(base_schedule)
     m = re.search(r'register-state-entries=(\d+)', fold_options)
     entries = int(m.group(1)) if m else 2
-    target = class_estimates(models, classes)
+    os.makedirs(workdir, exist_ok=True)
+    target = class_estimates(models, classes, foldsim_opt, os.path.join(workdir, 'area.json'))
     m = re.search(r'virtual-memories=(\S+)', fold_options)
     est = split_virtual(target, m.group(1) if m else '')
     rest = rest_of(cal, sum(est[c]['lut'] for c in classes))
     names = [c for c, n in classes.items() if n > 1]
     choices = [degrees(classes[c]) for c in names]
-    os.makedirs(workdir, exist_ok=True)
     fit = period_fit(cal, use_depth=depth is not None)
+    retired = retired_builds(cal)
+    if retired:
+        print(f"foldsim_degree: the area factors of {', '.join(retired)} were fitted on "
+              f"another estimator than the one in use ({ESTIMATOR}) and are not used"
+              f"{'' if area_builds(cal) else ': LUTs at the estimator scale'}; re-fit them with "
+              "`foldsim_degree.py calibrate` on their models", file=sys.stderr)
 
     def one(ks):
         copies = ','.join(f'{c}:{k}' for c, k in zip(names, ks) if k > 1)
@@ -1951,7 +2067,8 @@ def evaluate(models, base_schedule, fold_options, foldsim_opt, workdir, cal,
     return dict(classes=classes, points=points, front=front, pick=pick, budget=budget,
                 unfolded=unfolded, firesim=firesim_area(cal, unfolded), depth=depth, fit=fit,
                 space=space, store=store, route=route, uram=uram, slr_groups=slr_groups,
-                vmems=sum(len(e.get('vmems', [])) for e in est.values()))
+                vmems=sum(len(e.get('vmems', [])) for e in est.values()),
+                area_calibrated=bool(area_builds(cal)), retired=retired)
 
 
 def copy_estimates(est, classes):
@@ -2479,6 +2596,10 @@ def table(result):
                      f"{per['uram']} URAM288, in millions; S = the region's {slrs:g} SLRs"
                      f'{groups}; foldsim_storage.py fit-route) <= {storage.ROUTE_LIMIT} %: a load '
                      f'of at most {storage.route_luts():.0f} LUTs')
+    if result.get('retired'):
+        lines.append(f"area factors not used (fitted on another estimator than {ESTIMATOR}): "
+                     f"{', '.join(result['retired'])}"
+                     f"{'' if result.get('area_calibrated') else '; LUTs at the Beacon device scale'}")
     if fit:
         c = fit['coef']
         label = dict(size='log2(largest copy LUTs)',
@@ -2490,7 +2611,7 @@ def table(result):
             for x, t in zip(c[1:], fit['terms'])])
         lines.append(f'period = {terms} ns; leave-one-out RMS {fit["rms"]} ns {fit["loo"] or ""}')
     else:
-        lines.append('no calibration: LUTs uncalibrated, no period term (ranked by II)')
+        lines.append('no calibration: LUTs at the Beacon device scale, no period term (ranked by II)')
     return '\n'.join(lines)
 
 
@@ -2524,7 +2645,6 @@ def main():
     e = sub.add_parser('explore', help='the front of a models IR')
     e.add_argument('--models', required=True)
     e.add_argument('--module', required=True)
-    e.add_argument('--foldsim-opt', default='foldsim-opt')
     e.add_argument('--workdir', required=True)
     e.add_argument('--calibration', default='')
     e.add_argument('--lut-budget', type=int, default=0)
@@ -2650,7 +2770,17 @@ def main():
                          '(one made by a compiler that reports it)')
     f = sub.add_parser('fit', help='the period fit of a calibration and its leave-one-out error')
     f.add_argument('--calibration', required=True)
+    for p in (g, c, e):
+        p.add_argument('--foldsim-opt', default=default_foldsim_opt(),
+                       help='the foldsim-opt that prices the models (default: beside this '
+                            'script, else PATH)')
+    for p in sub.choices.values():
+        if not any('--estimator' in x.option_strings for x in p._actions):
+            p.add_argument('--estimator', choices=ESTIMATORS, default=IR_COST,
+                           help='the area model: the IR cost model (foldsim_cost.py, default: the calibrations '
+                                'fitted on it) or Beacon\'s area (beacon-area: foldsim-estimate-area)')
     a = ap.parse_args()
+    set_estimator(getattr(a, 'estimator', IR_COST))
     if a.cmd == 'fit':
         cal = json.load(open(a.calibration))
         builds = [b for b in cal['builds'] if b.get('period_fit', True)]
