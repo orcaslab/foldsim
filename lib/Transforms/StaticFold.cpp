@@ -4049,20 +4049,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
   // port reads an instance's pages in the slots before its state pass. A
   // multicycle copy's, its multicycle span apart: one evaluation at a time.
   std::vector<std::set<int>> pageSlots(classes.size());
-  auto pageClash = [&](unsigned c, int t) {
-    int p = passSpacing(c);
-    auto &slots = pageSlots[c];
-    auto it = slots.lower_bound(t - p + 1);
-    return it != slots.end() && *it < t + p;
-  };
   // A copy with paged links: every pass at least its link page apart.
   std::vector<std::set<int>> linkSlots(classes.size());
-  auto linkClash = [&](unsigned c, int t) {
-    int p = classes[c].linkPage;
-    auto &slots = linkSlots[c];
-    auto it = slots.lower_bound(t - p + 1);
-    return it != slots.end() && *it < t + p;
-  };
   while (!heap.empty()) {
     std::pop_heap(heap.begin(), heap.end(), cmp);
     unsigned n = heap.back();
@@ -4076,9 +4064,25 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     auto &taken = busy[c];
     bool spaced = classes[c].linkPage > 1;
     earliest = firstFree(taken, earliest, 0);
-    while ((pages && pageClash(c, earliest)) ||
-           (spaced && linkClash(c, earliest)))
-      earliest = firstFree(taken, earliest + 1, 0);
+    // A slot clashing with a state pass x of the copy (|t - x| < p) clashes
+    // for every t up to x + p - 1: the search resumes at x + p, past the
+    // window, instead of one slot at a time (the same slot is found; a copy
+    // of thousands of paged instances otherwise rescanned its whole span).
+    for (;;) {
+      int next = earliest;
+      auto past = [&](std::set<int> &placed, int p) {
+        auto it = placed.lower_bound(earliest - p + 1);
+        if (it != placed.end() && *it < earliest + p)
+          next = std::max(next, *it + p);
+      };
+      if (pages)
+        past(pageSlots[c], passSpacing(c));
+      if (spaced)
+        past(linkSlots[c], int(classes[c].linkPage));
+      if (next == earliest)
+        break;
+      earliest = firstFree(taken, next, 0);
+    }
     takeSlot(taken, earliest, 0);
     if (pages)
       pageSlots[c].insert(earliest);
