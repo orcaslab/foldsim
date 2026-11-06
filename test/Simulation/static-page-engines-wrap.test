@@ -1,0 +1,38 @@
+# REQUIRES: verilator
+# Page engines (--page-engines) with a modulo schedule whose slots run past
+# the frame: a slot past the frame runs in the next frame's (--modulo), so a
+# copy's state passes may lie more than a frame of absolute positions apart
+# (Driver/Inputs/pagewrap: a 40-stage chain of Mid, copies of interleaved
+# instances, the chain's late stages in the next frame's slots; copy 0 holds
+# instances 0, 13, 26 and 39, the last past the frame). The scheduler's page
+# port spaces the state passes in the frame's circular order; the engines
+# place each instance's page reads and writes between its circular
+# neighbours too (in absolute order the last instance's next state pass came
+# before its own, and no engine could carry the column: "4096 engines cannot
+# carry the page columns of Mid"). Against the target from zero state
+# (tb_pages.sv: each virtual memory answered 1 to 60 host cycles on, `free`
+# low at times), with bubbles and stalls; the mutant target (Mid's output
+# also takes its state's top bit) MISMATCHes the same simulator.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/pagewrap
+# RUN: foldsim --srcs top.f --top Top --out %t/w1 --static --modulo --page Mid:1 --copies Mid:13 --interleave-copies --storage Mid:pages=hbm --page-engines auto Mid Leaf 2>&1 | FileCheck %s --check-prefix=W1
+# RUN: FileCheck %s --check-prefix=SLOTS < %t/w1/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/w1 -DVM1 -Mdir %t/w1/obj %S/Inputs/tb_pages.sv top.sv %t/w1/foldsim_sim.sv > %t/w1/build.log 2>&1
+# RUN: %t/w1/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s
+# RUN: %t/w1/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=60 +stall=30 +full=20 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/w1 -DVM1 -Mdir %t/w1/objm %S/Inputs/tb_pages.sv top_mut.sv %t/w1/foldsim_sim.sv > %t/w1/buildm.log 2>&1
+# RUN: %t/w1/objm/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s --check-prefix=MUT
+# RUN: foldsim --srcs top.f --top Top --out %t/w2 --static --modulo --bubbles --page Mid:2 --copies Mid:13 --interleave-copies --storage Mid:pages=hbm --page-engines auto Mid Leaf 2>&1 | FileCheck %s --check-prefix=W2
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/w2 -DVM1 -DVM2 -DBUBBLES -Mdir %t/w2/obj %S/Inputs/tb_pages.sv top.sv %t/w2/foldsim_sim.sv > %t/w2/build.log 2>&1
+# RUN: %t/w2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# RUN: %t/w2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=5 +hi=60 +stall=20 +bubble=20 | FileCheck %s
+# A cap below what the wrapped columns need is still refused.
+# RUN: not foldsim --srcs top.f --top Top --out %t/cap --static --modulo --page Mid:2 --copies Mid:13 --interleave-copies --storage Mid:pages=hbm --page-engines 2 Mid Leaf 2>&1 | FileCheck %s --check-prefix=CAP
+# W1: II = 37
+# W1: page engines: 2 engines, 13 page columns
+# W2: page engines: 3 engines, 13 page columns
+# SLOTS: Mid x4 state gap {{[0-9]+}} page 1 off chip
+# SLOTS-NEXT: state: 0 13 26 39
+# CHECK-NOT: PROTOCOL
+# CHECK: MATCH
+# MUT: MISMATCH
+# CAP: page engines: 2 engines cannot carry the page columns of Mid

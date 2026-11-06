@@ -2934,9 +2934,13 @@ LogicalResult StaticFolder::assignPageEngines() {
     if (!columns)
       continue;
     unsigned p = cls.page, n = cls.threads();
+    // The state passes in the frame's circular order: a modulo schedule may
+    // put a slot past the frame (it runs in the next frame's), so a copy's
+    // state passes can span more than a frame of absolute positions; each
+    // instance's page traffic lies between its circular neighbours.
     SmallVector<std::pair<int, unsigned>> states;
     for (unsigned i = 0; i < n; ++i)
-      states.push_back({cls.slot[kState][i], i});
+      states.push_back({int(wrap(cls.slot[kState][i])), i});
     llvm::sort(states);
     PageRows fixed;
     if (cls.pageWindow)
