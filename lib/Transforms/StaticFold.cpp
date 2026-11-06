@@ -13,6 +13,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include <chrono>
 #include "FAME5.h"
 #include "PassSplit.h"
 #include "Pipelines.h"
@@ -473,6 +474,8 @@ private:
     SmallVector<int> outputSlot;
     /// The late outputs moved to their state pass (`stateOnly`).
     DenseSet<unsigned> moved;
+    /// The modulo search of this choice: its lower bound, periods tried.
+    unsigned lower = 0, tried = 0;
   };
   Choice searchReady();
   /// Assigns the classes to SLR groups (`slrOf`): within the capacity, the
@@ -550,7 +553,7 @@ private:
       ArrayRef<int> height, const ReadyWrites &writes,
       SmallVectorImpl<SmallVector<int>> &slots, unsigned below);
   /// The last modulo search: its lower bound and the periods it tried.
-  unsigned moduloLower = 0, moduloTried = 0;
+  unsigned moduloLower = 0, moduloTried = 0, moduloTotal = 0;
   LogicalResult buildCopy(Class &cls);
   LogicalResult stageLogic(Class &cls, Block *body, Operation *held,
                            Value hostClock, Value live1, Value pre1,
@@ -4317,13 +4320,48 @@ unsigned StaticFolder::placeModulo(
       return scheduled;
     return failed + (scheduled - failed) / 2;
   };
+  // With a frame to beat (`below`), the longest period of use is tried
+  // first: a choice it does not place is dropped without the search below it,
+  // on the premise the doubling and halving steps above already rest on
+  // (feasibility monotone in the period). The ready-pass search places most
+  // choices against a frame found before (searchReady); where paged copies'
+  // spacing sets the lower bound a few percent under that frame, each such
+  // choice otherwise ran the whole search (16 linear periods, then doubling up
+  // to the frame) to fail. A choice the probe places is then searched from
+  // the lower bound as before (the same period found).
+  bool probing = below && top > lower;
+  auto next = [&](unsigned period, bool fits) -> unsigned {
+    if (!probing)
+      return advance(period, fits);
+    probing = false;
+    if (!fits)
+      return 0;
+    failed = lower - 1;
+    scheduled = 0;
+    step = 1;
+    return lower;
+  };
   bool fitsNow = false;
   moduloLower = lower;
   moduloTried = 0;
-  for (unsigned period = lower; period && period <= top;
-       period = advance(period, fitsNow)) {
+  static const char *searchLog = getenv("FOLDSIM_SEARCH_LOG");
+  auto started = std::chrono::steady_clock::now();
+  auto logged = [&](unsigned result) {
+    if (searchLog)
+      llvm::errs() << "foldsim-fold-static: modulo search lower " << lower
+                   << " top " << top << " tried " << moduloTried << " -> "
+                   << result << " in "
+                   << std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - started)
+                          .count()
+                   << " ms\n";
+    return result;
+  };
+  for (unsigned period = probing ? top : lower; period && period <= top;
+       period = next(period, fitsNow)) {
     fitsNow = false;
     ++moduloTried;
+    ++moduloTotal;
     // List scheduling, a copy's slots taken modulo the frame; an evaluation
     // runs at most one frame late.
     SmallVector<int> slotOf(nodes.size(), -1);
@@ -4582,11 +4620,11 @@ unsigned StaticFolder::placeModulo(
                   envSlack(k, period) > int(period))
         ok = false;
     // The least period not ruled out: done; otherwise search below it.
-    if (ok && period <= failed + 1)
-      return period;
+    if (ok && period <= failed + 1 && !probing)
+      return logged(period);
     fitsNow = ok;
   }
-  return 0;
+  return logged(0);
 }
 
 /// The bits of a model's output `o` that depend combinationally on its input
@@ -5110,6 +5148,8 @@ StaticFolder::Choice StaticFolder::searchReady() {
     best.outputSlot = outputSlot;
     best.outputEarly = outputEarly;
     best.moved = stateOnly;
+    best.lower = moduloLower;
+    best.tried = moduloTried;
     return true;
   };
   // The choice of a ready pass for candidate k: bit k of `mask`, flipped for
@@ -6067,6 +6107,12 @@ LogicalResult StaticFolder::schedule() {
   if (slrGroups && failed(chooseGroups()))
     return failure();
   Choice best = searchReady();
+  if (best.tried) {
+    // The report gives the chosen schedule's search (the last one placed may
+    // be another choice's).
+    moduloLower = best.lower;
+    moduloTried = best.tried;
+  }
   if (!best.length) {
     // Named for the choice that writes the most outputs at ready passes:
     // every model with late outputs given one.
@@ -6150,7 +6196,7 @@ LogicalResult StaticFolder::schedule() {
   os << "foldsim-fold-static: II = " << ii << "\n";
   if (moduloTried)
     os << "modulo search: lower bound " << moduloLower << ", " << moduloTried
-       << " periods tried\n";
+       << " periods tried (" << moduloTotal << " over the ready-pass search)\n";
   if (zeroLatencyLinks) {
     // Each class input fed by a late link, and those taken in its producer's
     // host cycle.

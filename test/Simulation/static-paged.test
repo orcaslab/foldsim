@@ -33,16 +33,19 @@
 # RUN: %t/rank/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +stall=30 | FileCheck %s
 # The modulo search skipping ahead (--modulo-linear 1: one period at a time
 # only from the lower bound, then a doubling step and halving): another
-# order of periods tried, the same frame here, exact.
+# order of periods tried, the same frame here, exact. The report gives the
+# chosen schedule's search and the periods tried over the whole ready-pass
+# search (a choice placed against a frame found before is tried at the
+# longest period of use first, and dropped if it does not place there).
 # RUN: FileCheck %s --check-prefix=RANK < %t/rank/schedule.txt
 # RUN: foldsim --srcs top.f --top Top --out %t/rank1 --static --modulo --modulo-linear 1 --ready-levels rank --interleave-copies --copies Leaf:2 --page 2 Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=RANK1 < %t/rank1/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/rank1/obj %S/Inputs/tb_late.sv top.sv %t/rank1/foldsim_sim.sv > %t/rank1/build.log 2>&1
 # RUN: %t/rank1/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +stall=30 | FileCheck %s
 # RANK: foldsim-fold-static: II = 10
-# RANK-NEXT: modulo search: lower bound 6, 4 periods tried
+# RANK-NEXT: modulo search: lower bound 6, 1 periods tried (8 over the ready-pass search)
 # RANK1: foldsim-fold-static: II = 10
-# RANK1-NEXT: modulo search: lower bound 6, 3 periods tried
+# RANK1-NEXT: modulo search: lower bound 6, 1 periods tried (8 over the ready-pass search)
 # RUN: foldsim --srcs top.f --top Top --out %t/vm --static --virtual-memories ram --page 2 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/vm/obj %S/Inputs/tb_vmem.sv top.sv %t/vm/foldsim_sim.sv > %t/vm/build.log 2>&1
 # RUN: %t/vm/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=1 +hi=30 +stall=20 | FileCheck %s
