@@ -627,6 +627,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "With modulo: the shortest frame (host cycles) the search starts "
            "from; positions past the schedule's own stay idle (a longer "
            "prefetch distance for every request a pass issues)">,
+    Option<"readyChoice", "ready-choice", "std::string", "\"\"",
+           "The choice of ready passes, given instead of searched: the "
+           "classes (as the report names them) that get a ready pass, comma "
+           "separated, after `split:` when the classes' ready outputs are "
+           "split by level (the report's `(N ready passes)`, N > 1). The "
+           "choice is placed once (with modulo, the period search from the "
+           "lower bound as for any choice); it must place. For a schedule a "
+           "search found before (the report's `(ready pass)` / `(N ready "
+           "passes)` lines): the same frame without the search. Empty: search">,
     Option<"moduloLinear", "modulo-linear", "unsigned", "16",
            "With modulo: the periods tried one at a time from the frame's "
            "lower bound before the search skips ahead (a doubling step until "

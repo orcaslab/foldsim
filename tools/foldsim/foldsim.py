@@ -345,6 +345,8 @@ def frame_options(a):
         fold += f' min-ii={a.min_ii}'
     if getattr(a, 'modulo_linear', None) is not None:
         fold += f' modulo-linear={a.modulo_linear}'
+    if getattr(a, 'ready_choice', ''):
+        fold += f' ready-choice={a.ready_choice}'
     if a.interleave_copies:
         fold += ' interleave-copies'
     if getattr(a, 'spec_groups', ''):
@@ -1007,6 +1009,11 @@ def build_parser():
     ap.add_argument('--min-ii', type=int, default=0, metavar='N',
                     help='with --static --modulo: the shortest frame in host cycles (foldsim-fold-static '
                          'min-ii); positions past the schedule\'s own stay idle, a longer prefetch distance')
+    ap.add_argument('--ready-choice', default='', metavar='[split:]CLASS,...',
+                    help='with --static: the classes that get a ready pass, given instead of searched '
+                         '(foldsim-fold-static ready-choice; "split:" first when ready outputs are split by '
+                         'level): a schedule found before, rebuilt without the search. '
+                         'ready_choice.py <schedule.txt> prints it from a report')
     ap.add_argument('--modulo', action='store_true',
                     help='with --static: overlap consecutive frames, a slot past the frame running in '
                          'the next frame\'s, when that frame is shorter')

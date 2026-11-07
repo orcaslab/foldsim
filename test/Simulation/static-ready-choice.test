@@ -1,0 +1,23 @@
+# --ready-choice (foldsim-fold-static ready-choice): the classes with a ready
+# pass given instead of searched, as ready_choice.py reads them from a report.
+# Driver/Inputs/lanes_late (a chain of four leaves within a cycle: a ready
+# pass; modulo, bubbles): the searched schedule's choice given back rebuilds the same
+# schedule (every line but the search's report) and the same netlist, which
+# matches its target (tb_late.sv, stalls and bubbles); an unknown class is an error.
+# REQUIRES: verilator
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/lanes_late
+# RUN: foldsim --srcs top.f --top Top --out %t/s --static --modulo --bubbles Leaf > %t/s.log 2>&1
+# RUN: python3 %foldsim_tools/ready_choice.py %t/s/schedule.txt > %t/choice
+# RUN: FileCheck %s --check-prefix=CHOICE < %t/choice
+# RUN: foldsim --srcs top.f --top Top --out %t/g --static --modulo --bubbles --ready-choice split:Leaf,Top_model Leaf > %t/g.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/g.log
+# RUN: tail -n +3 %t/s/schedule.txt > %t/s.tail && tail -n +3 %t/g/schedule.txt > %t/g.tail && diff %t/s.tail %t/g.tail
+# RUN: sed 's#%t/[sg]##g' %t/s/foldsim_sim.sv > %t/s.sv && sed 's#%t/[sg]##g' %t/g/foldsim_sim.sv > %t/g.sv && diff %t/s.sv %t/g.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/g/obj %S/Inputs/tb_late.sv top.sv %t/g/foldsim_sim.sv > %t/g/build.log 2>&1
+# RUN: %t/g/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +stall=20 +bubble=20 | FileCheck %s
+# RUN: not foldsim --srcs top.f --top Top --out %t/x --static --modulo --ready-choice NoSuchClass Leaf > %t/x.log 2>&1
+# RUN: FileCheck %s --check-prefix=BAD < %t/x.log
+# CHOICE: {{^}}split:Leaf,Top_model{{$}}
+# LOG: ready-choice=
+# BAD: ready-choice: no class 'NoSuchClass'
+# CHECK: {{^}}MATCH

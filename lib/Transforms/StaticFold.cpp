@@ -357,6 +357,9 @@ public:
   /// longer prefetch distance for every request a pass issues (for studies
   /// of latency hiding, or a host rate matched to another simulator's).
   unsigned minII = 0;
+  /// `ready-choice`: the classes with a ready pass, given instead of
+  /// searched ("split:" first: ready outputs split by level); empty: search.
+  std::string readyChoice;
   /// `staged-link-memories` (with `staged-links`): see stagedMemories.
   bool stagedLinkMemories = false;
   StaticFolder(ModuleOp top, hw::HWModuleOp netlist, StringRef simName,
@@ -5263,6 +5266,37 @@ StaticFolder::Choice StaticFolder::searchReady() {
     if (attempt())
       shorten(/*greedy=*/true);
   };
+  // A choice given (ready-choice): placed once, as the search would place it
+  // with no frame to beat; the classes' ready outputs split by level for that
+  // placement only when asked, as the `auto` search leaves them.
+  if (!readyChoice.empty()) {
+    StringRef spec = readyChoice;
+    bool split = spec.consume_front("split:");
+    SmallVector<StringRef> names;
+    spec.split(names, ',', -1, /*KeepEmpty=*/false);
+    SmallVector<bool> ready(classes.size(), false);
+    for (StringRef name : names) {
+      auto it = llvm::find_if(classes, [&](const Class &cls) {
+        return cls.name == name;
+      });
+      if (it == classes.end()) {
+        netlist.emitError("ready-choice: no class '") << name << "'";
+        return best;
+      }
+      if (!late(*it)) {
+        netlist.emitError("ready-choice: class '")
+            << name << "' has no late output for a ready pass";
+        return best;
+      }
+      ready[it - classes.begin()] = true;
+    }
+    bool before = splitReady;
+    splitReady = split || splitReady;
+    tryReady(ready);
+    splitReady = before;
+    stateOnly = best.moved;
+    return best;
+  }
   // Where no choice of one ready pass per class places: outputs moved out of
   // the cycles, and (with `auto`) a class's ready outputs split by level; the
   // shorter frame is kept, the split passes on a tie (no output written
@@ -12971,6 +13005,7 @@ void FoldStaticPass::runOnOperation() {
   folder.pageWriteGate = pageWriteGate;
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.minII = minII;
+  folder.readyChoice = readyChoice;
   folder.stagedLinkMemories = stagedLinks && stagedLinkMemories;
   if (failed(folder.run()))
     return signalPassFailure();
