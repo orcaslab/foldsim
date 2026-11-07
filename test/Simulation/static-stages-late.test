@@ -79,6 +79,21 @@
 # RUN: FileCheck %s --check-prefix=ROWS < %t/rows/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/rows/obj %S/Inputs/tb_late.sv top.sv %t/rows/foldsim_sim.sv > %t/rows/build.log 2>&1
 # RUN: %t/rows/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +bubble=30 | FileCheck %s
+# A staged class's wide arithmetic is split so that a stage may end inside
+# it (Driver/Inputs/staged_wide: a 53 x 53 product, 106-bit sums and a
+# difference, 64-bit unsigned and signed ordering compares, 127-bit shifts by
+# 127-bit amounts): unstaged one cone of 23 levels; at 8 levels a stage the
+# split ops leave no end point deeper than about a stage (WIDE8), against the
+# target at 6 and 8 levels a stage.
+# RUN: cd %S/../Driver/Inputs/staged_wide
+# RUN: foldsim --srcs top.f --top Top --out %t/w8 --static --stage-levels 8 Leaf > %t/w8.log 2>&1
+# RUN: FileCheck %s --check-prefix=SPLIT8 < %t/w8.log
+# RUN: foldsim-opt %t/w8/foldsim_sim.mlir --pass-pipeline='builtin.module(foldsim-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=WIDE8
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/w8/obj %S/Inputs/tb_late.sv top.sv %t/w8/foldsim_sim.sv > %t/w8/build.log 2>&1
+# RUN: %t/w8/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/w6 --static --bubbles --stage-levels 6 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/w6/obj %S/Inputs/tb_late.sv top.sv %t/w6/foldsim_sim.sv > %t/w6/build.log 2>&1
+# RUN: %t/w6/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +stall=20 +bubble=30 | FileCheck %s
 # A --multicycle request is never ignored: on a class it cannot apply to (late
 # outputs, held reads) or without --stage-levels it is an error naming why; a
 # glob that matches no class is a warning.
@@ -96,6 +111,8 @@
 # SH: Leaf x4 state gap {{[0-9]+}} stages 2{{$}}
 # ROWS: Leaf x4 state gap {{[0-9]+}} stages 2 page 3{{$}}
 # ROWS: pages Leaf: p 3, {{[0-9]+}} registers, {{[0-9]+}} bits (with 1 memories' rows
+# SPLIT8: Leaf: {{[0-9]+}} wide ops split for stages (24-bit carry chains, 24 x 24 products)
+# WIDE8: #1 levels {{[5-9]}}:
 # VH5: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 2{{$}}
 # VH2: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 4{{$}}
 # MC1: error: multicycle: Leaf cannot be multicycle: 1 of 1 outputs late, virtual memories read at held addresses

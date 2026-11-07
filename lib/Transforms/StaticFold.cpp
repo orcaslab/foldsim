@@ -1722,6 +1722,7 @@ LogicalResult StaticFolder::nestInstances() {
 static bool findHeldRead(seq::FirMemReadOp read, comb::MuxOp &found,
                          bool &qOnTrue);
 static int stageOpFullLevels(Operation *op);
+static int64_t significantBits(Value value);
 
 /// The logic levels a link taken in its producer's host cycle may span: the
 /// Beacon's gate.
@@ -1956,7 +1957,251 @@ static int stageOpFullLevels(Operation *op) {
     return 2 + int(hw::getBitWidth(op->getResult(0).getType()) / 8);
   if (isa<comb::AndOp, comb::OrOp, comb::XorOp>(op))
     return lut6(op->getNumOperands());
+  // A variable shift: a 4:1 choice a LUT6 per two amount bits; where the
+  // amount may reach the width, the logic screen's ordering compare of the
+  // amount against it, and the choice after it.
+  if (isa<comb::ShlOp, comb::ShrUOp, comb::ShrSOp>(op)) {
+    Value amount = op->getOperand(1);
+    if (isa_and_nonnull<hw::ConstantOp>(amount.getDefiningOp()))
+      return 0;
+    int64_t w = hw::getBitWidth(op->getResult(0).getType());
+    int sel = int(llvm::Log2_64_Ceil(std::max<int64_t>(w, 2)));
+    int64_t bits = significantBits(amount);
+    int choice = (sel + 1) / 2;
+    return bits > sel ? 1 + int((bits + 7) / 8) + 2 : choice;
+  }
+  // A product: a LUT table of at most ten variable operand bits, else the
+  // DSP cascade over the significant bits, about 2.5 levels a 27 x 24 cell.
+  if (auto mul = dyn_cast<comb::MulOp>(op); mul && op->getNumOperands() == 2) {
+    int64_t a = significantBits(op->getOperand(0)),
+            b = significantBits(op->getOperand(1));
+    if (a + b <= 10)
+      return lut6(a + b);
+    int64_t cells = std::min(((a + 26) / 27) * ((b + 23) / 24),
+                             ((b + 26) / 27) * ((a + 23) / 24));
+    return 1 + int((5 * cells + 1) / 2);
+  }
   return logicLevels(op);
+}
+
+/// The bits of `value` that may be nonzero: its width less the constant
+/// zeros a concatenation puts on top (a zero extension), or a constant's
+/// active bits.
+static int64_t significantBits(Value value) {
+  int64_t width = hw::getBitWidth(value.getType());
+  if (auto constant = value.getDefiningOp<hw::ConstantOp>())
+    return constant.getValue().getActiveBits();
+  if (auto concat = value.getDefiningOp<comb::ConcatOp>()) {
+    if (concat.getNumOperands() < 2)
+      return width;
+    if (auto top = concat.getOperand(0).getDefiningOp<hw::ConstantOp>();
+        top && top.getValue().isZero())
+      return width - hw::getBitWidth(top.getType());
+  }
+  return width;
+}
+
+/// Staged evaluation cuts the logic between ops, never inside one, so a stage
+/// is at least as deep as its deepest op. For a staged class's logic: an
+/// adder, subtracter or ordering compare wider than `chunk` bits becomes a
+/// ripple of adders of at most `chunk` bits (each one's carry out the next
+/// one's carry in, through a constant low bit: one carry chain each); a
+/// variable shift whose amount may reach its width becomes a choice on the
+/// amount's high bits around a shift by its low bits; a product of more
+/// than one 24 x 24 cell (the significant bits) a sum of 24 x 24 partial
+/// products, each a DSP cell, the sum split again. Equivalent for every
+/// value; a stage may then end between the pieces. Only an op estimated
+/// deeper than `levels` (stageOpFullLevels) is split. Returns the ops split.
+static unsigned splitForStages(Block *body, unsigned chunk, int levels) {
+  unsigned split = 0;
+  auto bitsOf = [](Value v) { return unsigned(hw::getBitWidth(v.getType())); };
+  // Products first: their sums are split with the adders.
+  SmallVector<comb::MulOp> muls;
+  for (auto mul : body->getOps<comb::MulOp>())
+    if (mul.getNumOperands() == 2)
+      muls.push_back(mul);
+  for (auto mul : muls) {
+    Value x = mul.getOperand(0), y = mul.getOperand(1);
+    if (isa_and_nonnull<hw::ConstantOp>(x.getDefiningOp()) ||
+        isa_and_nonnull<hw::ConstantOp>(y.getDefiningOp()))
+      continue;
+    unsigned w = bitsOf(mul.getResult());
+    unsigned sx = unsigned(significantBits(x)), sy = unsigned(significantBits(y));
+    if ((sx <= 24 && sy <= 24) || sx + sy <= 10 || stageOpFullLevels(mul) <= levels)
+      continue;
+    ImplicitLocOpBuilder b(mul.getLoc(), mul);
+    auto piece = [&](Value v, unsigned lo, unsigned n) -> Value {
+      Value part = b.createOrFold<comb::ExtractOp>(b.getIntegerType(n), v, lo);
+      if (n == w)
+        return part;
+      return b.createOrFold<comb::ConcatOp>(
+          hw::ConstantOp::create(b, b.getIntegerType(w - n), 0), part);
+    };
+    SmallVector<Value> terms;
+    unsigned ex = std::min(sx, w), ey = std::min(sy, w);
+    for (unsigned i = 0; i < ex; i += 24)
+      for (unsigned j = 0; j < ey; j += 24) {
+        unsigned off = i + j;
+        if (off >= w)
+          continue;
+        Value p = comb::MulOp::create(b, piece(x, i, std::min(24u, ex - i)),
+                                      piece(y, j, std::min(24u, ey - j)));
+        if (off)
+          p = b.createOrFold<comb::ConcatOp>(
+              b.createOrFold<comb::ExtractOp>(b.getIntegerType(w - off), p, 0),
+              hw::ConstantOp::create(b, b.getIntegerType(off), 0));
+        terms.push_back(p);
+      }
+    // A balanced sum.
+    while (terms.size() > 1) {
+      SmallVector<Value> next;
+      for (unsigned k = 0; k + 1 < terms.size(); k += 2)
+        next.push_back(comb::AddOp::create(b, terms[k], terms[k + 1]));
+      if (terms.size() % 2)
+        next.push_back(terms.back());
+      terms = std::move(next);
+    }
+    mul.getResult().replaceAllUsesWith(terms.front());
+    mul.erase();
+    ++split;
+  }
+  // Shifts whose amount may reach the width.
+  SmallVector<Operation *> shifts;
+  for (auto &op : *body)
+    if (isa<comb::ShlOp, comb::ShrUOp, comb::ShrSOp>(op))
+      shifts.push_back(&op);
+  for (auto *op : shifts) {
+    Value x = op->getOperand(0), amount = op->getOperand(1);
+    unsigned w = bitsOf(x);
+    unsigned sel = llvm::Log2_32_Ceil(std::max(w, 2u));
+    if (isa_and_nonnull<hw::ConstantOp>(amount.getDefiningOp()) || w <= 8 ||
+        significantBits(amount) <= int64_t(sel) || sel >= w ||
+        stageOpFullLevels(op) <= levels)
+      continue;
+    ImplicitLocOpBuilder b(op->getLoc(), op);
+    Value hi = b.createOrFold<comb::ExtractOp>(b.getIntegerType(w - sel), amount, sel);
+    Value lo = b.createOrFold<comb::ExtractOp>(b.getIntegerType(sel), amount, 0);
+    Value loWide = b.createOrFold<comb::ConcatOp>(
+        hw::ConstantOp::create(b, b.getIntegerType(w - sel), 0), lo);
+    Value big = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, hi,
+                                     hw::ConstantOp::create(b, b.getIntegerType(w - sel), 0));
+    Value inner, fill;
+    if (isa<comb::ShlOp>(op)) {
+      inner = comb::ShlOp::create(b, x, loWide);
+      fill = hw::ConstantOp::create(b, b.getIntegerType(w), 0);
+    } else if (isa<comb::ShrUOp>(op)) {
+      inner = comb::ShrUOp::create(b, x, loWide);
+      fill = hw::ConstantOp::create(b, b.getIntegerType(w), 0);
+    } else {
+      inner = comb::ShrSOp::create(b, x, loWide);
+      fill = b.createOrFold<comb::ReplicateOp>(
+          b.getIntegerType(w), b.createOrFold<comb::ExtractOp>(b.getI1Type(), x, w - 1));
+    }
+    Value result = comb::MuxOp::create(b, big, fill, inner);
+    op->getResult(0).replaceAllUsesWith(result);
+    op->erase();
+    ++split;
+  }
+  // Adders (a chain of two-operand ones first), subtracters, ordering
+  // compares. The ripple: chunk k adds {0, a_k, 1} + {0, b_k, c} (c the
+  // carry in; the constant low bit turns it into the chain's own carry), its
+  // sum bits [n:1] and its carry out bit n + 1; the first chunk without a
+  // carry in adds {0, a_0} + {0, b_0}.
+  auto ripple = [&](ImplicitLocOpBuilder &b, Value x, Value y, Value carry,
+                    Value *carryOut) -> Value {
+    unsigned w = bitsOf(x);
+    SmallVector<Value> sums;
+    for (unsigned lo = 0; lo < w; lo += chunk) {
+      unsigned n = std::min(chunk, w - lo);
+      Value xk = b.createOrFold<comb::ExtractOp>(b.getIntegerType(n), x, lo);
+      Value yk = b.createOrFold<comb::ExtractOp>(b.getIntegerType(n), y, lo);
+      Value zero1 = hw::ConstantOp::create(b, b.getI1Type(), 0);
+      Value sum;
+      if (!carry) {
+        Value s = comb::AddOp::create(b, b.createOrFold<comb::ConcatOp>(zero1, xk),
+                                      b.createOrFold<comb::ConcatOp>(zero1, yk));
+        sum = b.createOrFold<comb::ExtractOp>(b.getIntegerType(n), s, 0);
+        carry = b.createOrFold<comb::ExtractOp>(b.getI1Type(), s, n);
+      } else {
+        Value one1 = hw::ConstantOp::create(b, b.getI1Type(), 1);
+        Value s = comb::AddOp::create(
+            b, b.createOrFold<comb::ConcatOp>(ValueRange{zero1, xk, one1}),
+            b.createOrFold<comb::ConcatOp>(ValueRange{zero1, yk, carry}));
+        sum = b.createOrFold<comb::ExtractOp>(b.getIntegerType(n), s, 1);
+        carry = b.createOrFold<comb::ExtractOp>(b.getI1Type(), s, n + 1);
+      }
+      sums.push_back(sum);
+    }
+    if (carryOut)
+      *carryOut = carry;
+    std::reverse(sums.begin(), sums.end());
+    return sums.size() == 1 ? sums.front() : b.createOrFold<comb::ConcatOp>(sums);
+  };
+  SmallVector<Operation *> arith;
+  for (auto &op : *body)
+    if (isa<comb::AddOp, comb::SubOp, comb::ICmpOp>(op))
+      arith.push_back(&op);
+  for (auto *op : arith) {
+    if (stageOpFullLevels(op) <= levels)
+      continue;
+    ImplicitLocOpBuilder b(op->getLoc(), op);
+    if (auto add = dyn_cast<comb::AddOp>(op)) {
+      unsigned w = bitsOf(add.getResult());
+      if (w <= chunk)
+        continue;
+      Value acc = add.getOperand(0);
+      for (unsigned k = 1; k < add.getNumOperands(); ++k)
+        acc = ripple(b, acc, add.getOperand(k), Value(), nullptr);
+      add.getResult().replaceAllUsesWith(acc);
+      add.erase();
+      ++split;
+    } else if (auto sub = dyn_cast<comb::SubOp>(op)) {
+      unsigned w = bitsOf(sub.getResult());
+      if (w <= chunk)
+        continue;
+      Value notY = comb::XorOp::create(
+          b, sub.getRhs(), hw::ConstantOp::create(b, APInt::getAllOnes(w)));
+      Value r = ripple(b, sub.getLhs(), notY, hw::ConstantOp::create(b, b.getI1Type(), 1),
+                       nullptr);
+      sub.getResult().replaceAllUsesWith(r);
+      sub.erase();
+      ++split;
+    } else if (auto cmp = dyn_cast<comb::ICmpOp>(op)) {
+      unsigned w = bitsOf(cmp.getLhs());
+      auto pred = cmp.getPredicate();
+      bool isSigned = pred == comb::ICmpPredicate::slt || pred == comb::ICmpPredicate::sle ||
+                      pred == comb::ICmpPredicate::sgt || pred == comb::ICmpPredicate::sge;
+      bool order = isSigned || pred == comb::ICmpPredicate::ult ||
+                   pred == comb::ICmpPredicate::ule || pred == comb::ICmpPredicate::ugt ||
+                   pred == comb::ICmpPredicate::uge;
+      if (!order || w <= chunk)
+        continue;
+      Value x = cmp.getLhs(), y = cmp.getRhs();
+      if (isSigned) {
+        Value msb = hw::ConstantOp::create(b, APInt::getOneBitSet(w, w - 1));
+        x = comb::XorOp::create(b, x, msb);
+        y = comb::XorOp::create(b, y, msb);
+      }
+      // x >= y: the carry out of x + ~y + 1; x > y = !(y >= x).
+      bool swap = pred == comb::ICmpPredicate::ugt || pred == comb::ICmpPredicate::sgt ||
+                  pred == comb::ICmpPredicate::ule || pred == comb::ICmpPredicate::sle;
+      if (swap)
+        std::swap(x, y);
+      Value notY = comb::XorOp::create(b, y, hw::ConstantOp::create(b, APInt::getAllOnes(w)));
+      Value geq;
+      (void)ripple(b, x, notY, hw::ConstantOp::create(b, b.getI1Type(), 1), &geq);
+      // uge/sge: x >= y; ult/slt: !(x >= y); ugt/sgt (swapped): !(y >= x);
+      // ule/sle (swapped): y >= x.
+      bool negate = pred == comb::ICmpPredicate::ult || pred == comb::ICmpPredicate::slt ||
+                    pred == comb::ICmpPredicate::ugt || pred == comb::ICmpPredicate::sgt;
+      Value r = negate ? comb::XorOp::create(b, geq, hw::ConstantOp::create(b, b.getI1Type(), 1))
+                       : geq;
+      cmp.getResult().replaceAllUsesWith(r);
+      cmp.erase();
+      ++split;
+    }
+  }
+  return split;
 }
 
 /// The half levels of a combinational read of `read`'s memory kept as a
@@ -2117,6 +2362,7 @@ LogicalResult StaticFolder::chooseStages() {
   }
   // Which specs matched a class (by its class's name for a copy).
   SmallVector<bool> specMatched(multicycleSpecs.size(), false);
+  DenseSet<Operation *> splitModels;
   for (auto &cls : classes) {
     // Not for a class with folded pipelines or black boxes. A class with
     // late outputs stages as any other: each pass (its ready passes too)
@@ -2174,6 +2420,16 @@ LogicalResult StaticFolder::chooseStages() {
         return cls.model.emitError("multicycle: ")
                << cls.name << " cannot be multicycle: " << why;
       continue;
+    }
+    // Its wide arithmetic in pieces a stage may end between (once a model:
+    // a copy's model is its class's).
+    if (!splitModels.contains(cls.model.getOperation())) {
+      splitModels.insert(cls.model.getOperation());
+      unsigned chunk = 8 * std::max(1u, (stageLevels - 2) / 2);
+      if (unsigned n = splitForStages(body, chunk, int(stageLevels)))
+        llvm::errs() << "foldsim-fold-static: " << cls.name << ": " << n
+                     << " wide ops split for stages (" << chunk
+                     << "-bit carry chains, 24 x 24 products)\n";
     }
     // The last stage of a register's next value (its reset a choice more),
     // a memory's write or registered read, an early output's next value
