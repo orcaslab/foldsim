@@ -935,6 +935,33 @@ def LowerWideNegation : Pass<"foldsim-lower-wide-negation",
   let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
 }
 
+def CompressAddTrees : Pass<"foldsim-compress-add-trees",
+                            "::circt::hw::HWModuleOp"> {
+  let summary = "Wide sums of many addends as compressor trees";
+  let description = [{
+    Gathers a tree of additions into the addends it sums: an addition's
+    operand that is another addition of the same width, used there alone, or
+    the zero extension of a narrower addition that cannot wrap (the largest
+    values its operands' known bits allow fit in its width), used there
+    alone. A sum of at least `min-operands` addends is rebuilt as a
+    compressor tree of full and half adders (circt::datapath::CompressorTree,
+    Dadda's reduction, as `convert-datapath-to-comb` lowers
+    `datapath.compress`) reducing the addends' bits to two rows, then one
+    addition of the two. A population count over many inputs written as a
+    tree of two-input additions (a pairwise adder tree) is the case that
+    matters: a synthesis tool lays each addition on a carry chain, so its
+    depth grows with a carry chain per level of the tree; the compressor's
+    depth grows with log1.5 of the addends, in logic that packs into LUTs.
+    Exact: two's-complement sums modulo the width, every addend kept. The
+    other additions of the design (fewer addends) are left as they are.
+  }];
+  let options = [
+    Option<"minOperands", "min-operands", "unsigned", "64",
+           "Sums of at least this many addends are rewritten">,
+  ];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
+}
+
 def KeepModules : Pass<"foldsim-keep-modules", "::mlir::ModuleOp"> {
   let summary = "Keep the instances of named modules through inlining";
   let description = [{

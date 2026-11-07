@@ -10,6 +10,7 @@ add_mlir_library(FoldsimTransforms
   MemoriesToRegisters.cpp
   FuseModels.cpp
   LowerWideNegation.cpp
+  CompressAddTrees.cpp
   Pipelines.cpp
   RemoveDeadState.cpp
   ReplicateControls.cpp
@@ -22,6 +23,7 @@ add_mlir_library(FoldsimTransforms
 
   LINK_LIBS PUBLIC
   CIRCTComb
+  CIRCTDatapath
   CIRCTHW
   CIRCTHWTransforms
   CIRCTSeq

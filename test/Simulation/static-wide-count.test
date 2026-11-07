@@ -1,0 +1,27 @@
+# REQUIRES: verilator
+# --compress-adds N (foldsim-compress-add-trees): a sum of at least N addends
+# (a tree of additions, zero-extended ones that cannot wrap included) becomes
+# a compressor tree of full adders and one addition, an exact rewrite of every
+# model before folding. Driver/Inputs/wide_count: two population counts of 72
+# bits written as pairwise adder trees and a running total, in a class of four
+# leaves with late outputs. Against the target (tb_late.sv), from zero state,
+# with stalled channels: at the recipe's threshold (64: the counts only), and
+# at 3 (every sum of three addends or more, the total among them), with
+# copies; without the option the pairwise trees stay.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/wide_count
+# RUN: foldsim --srcs top.f --top Top --out %t/no --static Leaf > %t/no.log 2>&1
+# RUN: FileCheck %s --check-prefix=NO < %t/no/foldsim_sim.mlir
+# RUN: foldsim --srcs top.f --top Top --out %t/r --static --compress-adds 64 Leaf > %t/r.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/r.log
+# RUN: FileCheck %s --check-prefix=SIM < %t/r/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/r/obj %S/Inputs/tb_late.sv top.sv %t/r/foldsim_sim.sv > %t/r/build.log 2>&1
+# RUN: %t/r/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 | FileCheck %s
+# RUN: %t/r/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/all --static --compress-adds 3 --copies Leaf:2 Leaf > %t/all.log 2>&1
+# RUN: FileCheck %s --check-prefix=SIM < %t/all/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/all/obj %S/Inputs/tb_late.sv top.sv %t/all/foldsim_sim.sv > %t/all/build.log 2>&1
+# RUN: %t/all/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +stall=20 | FileCheck %s
+# NO: comb.add {{.*}} : i2
+# LOG: foldsim-compress-add-trees{min-operands=64}
+# SIM-NOT: comb.add {{.*}} : i2
+# CHECK: {{^}}MATCH

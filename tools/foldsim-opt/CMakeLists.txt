@@ -6,6 +6,7 @@ target_link_libraries(foldsim-opt PRIVATE
   CIRCTComb
   CIRCTCombToSynth
   CIRCTCombTransforms
+  CIRCTDatapath
   CIRCTHW
   CIRCTHWTransforms
   CIRCTSeq

@@ -1059,6 +1059,11 @@ def build_parser():
                          'own default) rebalanced into trees of logarithmic depth before folding (circt '
                          'comb-balance-mux). Exact; for a module whose ladders grow with the design (a '
                          'select over every port of a shared cache). 0: none')
+    ap.add_argument('--compress-adds', metavar='MIN_ADDENDS', type=int, default=0,
+                    help='every model\'s sums of at least MIN_ADDENDS addends (a tree of additions, '
+                         'zero-extended ones that cannot wrap included: a population count over many '
+                         'inputs) as a compressor tree of full adders and one final addition, before '
+                         'folding (foldsim-compress-add-trees, CIRCT\'s datapath compressor). Exact; 0: none')
     ap.add_argument('--prefix-negate', metavar='MIN_BITS', type=int, default=0,
                     help='negations of at least MIN_BITS bits (x & -x, the lowest set bit of a '
                          'priority select) as a logarithmic prefix OR instead of a carry chain, before '
@@ -1448,6 +1453,8 @@ def main():
         passes.append(f'hw.module(foldsim-lower-wide-negation{{min-width={a.prefix_negate}}})')
     if a.balance_mux:
         passes.append(f'hw.module(comb-balance-mux{{mux-chain-threshold={a.balance_mux}}})')
+    if a.compress_adds:
+        passes.append(f'hw.module(foldsim-compress-add-trees{{min-operands={a.compress_adds}}})')
     compose = f'module={a.top} sim=foldsim_sim'
     # With registered state the next thread is picked a host cycle earlier, from
     # inputs a cycle older: on classes of 16 threads that costs 37.5 % more host
