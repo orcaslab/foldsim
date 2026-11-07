@@ -40,6 +40,12 @@ configure_file(foldsim_mc_judge.py ${CMAKE_BINARY_DIR}/bin/foldsim_mc_judge.py C
 install(PROGRAMS foldsim_mc_judge.py DESTINATION bin)
 configure_file(ready_choice.py ${CMAKE_BINARY_DIR}/bin/ready_choice.py COPYONLY)
 install(PROGRAMS ready_choice.py DESTINATION bin)
+# The SLLs an existing netlist needs against the region's budget (from its logged fold pipeline).
+configure_file(foldsim_sll_check.py ${CMAKE_BINARY_DIR}/bin/foldsim_sll_check.py COPYONLY)
+install(PROGRAMS foldsim_sll_check.py DESTINATION bin)
+# Beacon's routing terms (fanout, SLR crossings): fit on a placed build, score a screen.
+configure_file(foldsim_beacon_terms.py ${CMAKE_BINARY_DIR}/bin/foldsim_beacon_terms.py COPYONLY)
+install(PROGRAMS foldsim_beacon_terms.py DESTINATION bin)
 # The V80 builds that calibrate the fold degree's area and period
 # (foldsim_degree.py calibrate), the default of --copies auto.
 configure_file(foldsim_v80.json ${CMAKE_BINARY_DIR}/bin/foldsim_v80.json COPYONLY)

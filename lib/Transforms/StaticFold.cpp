@@ -5428,46 +5428,112 @@ LogicalResult StaticFolder::estimateSlls() {
     if (slrSites[c] > largestCap)
       tooLarge += " " + classes[c].name + " (" + std::to_string(slrSites[c]) +
                   " sites)";
+  // Branch over the classes that matter (the 10 largest by sites or by link
+  // bits); the rest, small and lightly linked, are placed greedily at each
+  // leaf, each where it adds least to the worst boundary.
+  SmallVector<uint64_t> linkTotal(n, 0);
+  for (unsigned c = 0; c < n; ++c)
+    for (unsigned d = 0; d < n; ++d)
+      linkTotal[c] += bits[c][d] + bits[d][c];
+  llvm::SmallDenseSet<unsigned> branch;
+  {
+    SmallVector<unsigned> byLinks(order.begin(), order.end());
+    llvm::stable_sort(byLinks, [&](unsigned x, unsigned y) {
+      return linkTotal[x] > linkTotal[y];
+    });
+    for (unsigned k = 0; k < std::min<unsigned>(n, 10); ++k) {
+      branch.insert(order[k]);
+      branch.insert(byLinks[k]);
+    }
+  }
+  SmallVector<unsigned> big, small;
+  for (unsigned c : order)
+    (branch.contains(c) ? big : small).push_back(c);
+  llvm::stable_sort(small, [&](unsigned x, unsigned y) {
+    return linkTotal[x] > linkTotal[y];
+  });
   SmallVector<int> group(n, -1), best;
   SmallVector<uint64_t> used(groups, 0), cut(groups ? groups - 1 : 0, 0),
       bestCut;
   uint64_t bestWorst = ~0ull, bestTotal = ~0ull, visited = 0;
+  // The boundaries a class adds to in group g, given the classes placed.
+  auto adds = [&](unsigned c, unsigned g, SmallVectorImpl<uint64_t> &added) {
+    added.assign(cut.size(), 0);
+    for (unsigned d = 0; d < n; ++d) {
+      if (d == c || group[d] < 0 || unsigned(group[d]) == g)
+        continue;
+      unsigned h = group[d];
+      uint64_t w = bits[c][d] + bits[d][c];
+      for (unsigned b = std::min(g, h); b < std::max(g, h); ++b)
+        added[b] += w;
+    }
+  };
+  auto fitsIn = [&](unsigned c, unsigned g) {
+    return slrSites[c] > largestCap ? slrCaps[g] == largestCap
+                                    : used[g] + slrSites[c] <= slrCaps[g];
+  };
   std::function<void(unsigned)> visit = [&](unsigned k) {
     if (++visited > 20'000'000)
       return;
     uint64_t worst = cut.empty() ? 0 : *llvm::max_element(cut);
     if (worst > bestWorst)
       return;
-    if (k == n) {
-      uint64_t total = 0;
-      for (auto x : cut)
-        total += x;
-      if (worst < bestWorst || (worst == bestWorst && total < bestTotal)) {
-        bestWorst = worst;
-        bestTotal = total;
-        best = group;
-        bestCut.assign(cut.begin(), cut.end());
+    if (k == big.size()) {
+      // The small classes, greedily; undone after.
+      SmallVector<std::pair<unsigned, SmallVector<uint64_t>>> placed;
+      bool ok = true;
+      for (unsigned c : small) {
+        int bestG = -1;
+        uint64_t bestW = ~0ull;
+        SmallVector<uint64_t> bestAdd, added;
+        for (unsigned g = 0; g < groups; ++g) {
+          if (!fitsIn(c, g))
+            continue;
+          adds(c, g, added);
+          uint64_t w = 0;
+          for (unsigned b = 0; b < cut.size(); ++b)
+            w = std::max(w, cut[b] + added[b]);
+          if (w < bestW) {
+            bestW = w;
+            bestG = g;
+            bestAdd = added;
+          }
+        }
+        if (bestG < 0) {
+          ok = false;
+          break;
+        }
+        for (unsigned b = 0; b < cut.size(); ++b)
+          cut[b] += bestAdd[b];
+        group[c] = bestG;
+        used[bestG] += slrSites[c];
+        placed.push_back({c, bestAdd});
+      }
+      if (ok) {
+        uint64_t w = cut.empty() ? 0 : *llvm::max_element(cut), total = 0;
+        for (auto x : cut)
+          total += x;
+        if (w < bestWorst || (w == bestWorst && total < bestTotal)) {
+          bestWorst = w;
+          bestTotal = total;
+          best = group;
+          bestCut.assign(cut.begin(), cut.end());
+        }
+      }
+      for (auto &[c, added] : llvm::reverse(placed)) {
+        for (unsigned b = 0; b < cut.size(); ++b)
+          cut[b] -= added[b];
+        used[group[c]] -= slrSites[c];
+        group[c] = -1;
       }
       return;
     }
-    unsigned c = order[k];
+    unsigned c = big[k];
+    SmallVector<uint64_t> added;
     for (unsigned g = 0; g < groups; ++g) {
-      // A class larger than every SLR goes to the largest (its own cut is
-      // unknown); any other within its SLR's capacity.
-      bool fits = slrSites[c] > largestCap ? slrCaps[g] == largestCap
-                                            : used[g] + slrSites[c] <= slrCaps[g];
-      if (!fits)
+      if (!fitsIn(c, g))
         continue;
-      SmallVector<uint64_t> added(cut.size(), 0);
-      for (unsigned j = 0; j < k; ++j) {
-        unsigned d = order[j];
-        unsigned h = group[d];
-        if (h == g)
-          continue;
-        uint64_t w = bits[c][d] + bits[d][c];
-        for (unsigned b = std::min(g, h); b < std::max(g, h); ++b)
-          added[b] += w;
-      }
+      adds(c, g, added);
       for (unsigned b = 0; b < cut.size(); ++b)
         cut[b] += added[b];
       group[c] = g;
