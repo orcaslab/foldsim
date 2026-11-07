@@ -749,6 +749,8 @@ def slr_options(a, foldsim_opt, models, fold, out):
                 + ','.join(f'{c}:{s}' for c, s in sites.items()))
     if a.slr_assign:
         opts += f' slr-assign={a.slr_assign}'
+    if a.slr_serialize:
+        opts += f' slr-serialize={a.slr_serialize}'
     return opts
 
 
@@ -1364,6 +1366,11 @@ def build_parser():
                          'each SLR boundary) the design needs at the least over every assignment of its classes '
                          'to the region\'s SLRs (fold-static sll-estimate), against the boundary budget '
                          '(sll_per_boundary x sll_margin); with --slr-groups the groups also keep within it')
+    ap.add_argument('--slr-serialize', default='', metavar='[GLOB:]K,...',
+                    help='with --slr-groups: the links between groups of the given classes (globs) carried '
+                         'over K host cycles on a K-th of the wires (SLLs), K alone for every class; the '
+                         "reader takes them K host cycles later and the producer's passes of a kind are kept "
+                         'K apart (foldsim-fold-static slr-serialize)')
     ap.add_argument('--slr-assign', default='',
                     help='with --slr-groups: <class>:<group>,...: classes pinned to a group '
                          '(copy j > 0 of a class is <class>_copy<j>)')

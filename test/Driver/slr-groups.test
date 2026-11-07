@@ -102,3 +102,9 @@
 # SLL-BIG: larger than every SLR (its own cut unknown): Leaf (5 sites)
 # RUN: not foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-sites=Leaf:5/1 slr-capacities=10/1,10 sll-estimate schedule-only})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=SLL-N
 # SLL-N: slr-capacities: every group needs 1 further resources
+
+# slr-serialize: <glob>:<k> or <k>, k from 1 to 64, a glob that names a class.
+# RUN: not foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-groups=2 slr-serialize=Leaf:0 schedule-only})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=SER-K
+# RUN: not foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-groups=2 slr-serialize=Nope:2 schedule-only})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=SER-NONE
+# SER-K: slr-serialize: 'Leaf:0' is not <glob>:<k> or <k>, k from 1 to 64
+# SER-NONE: slr-serialize: no class matches 'Nope:2'
