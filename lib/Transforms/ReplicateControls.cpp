@@ -16,6 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "foldsim/MemoryLoads.h"
 #include "foldsim/Passes.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -39,10 +40,10 @@ using namespace circt;
 
 namespace {
 
-/// A memory this shallow is LUTs or flops, whose address and enable pins
-/// grow with its width; a deeper one is block RAM unless read asynchronously
-/// (isLutMemory).
-constexpr uint64_t kLutDepth = 64;
+using foldsim::isLutMemory;
+using foldsim::kLutMemoryDepth;
+using foldsim::maskGrain;
+using foldsim::memoryLoads;
 
 /// Ops that only route a register's bits: copied along with a replica.
 bool isWiring(Operation *op) {
@@ -84,44 +85,6 @@ uint64_t widthOf(Value value) {
   return std::max<int64_t>(1, hw::getBitWidth(value.getType()));
 }
 
-/// The RAM style a memory states to synthesis, if any (`ram_style`).
-StringRef ramStyleOf(Operation *op) {
-  if (auto attrs = sv::getSVAttributes(op))
-    for (auto a : attrs)
-      if (auto sva = dyn_cast<sv::SVAttributeAttr>(a);
-          sva && sva.getName().getValue() == "ram_style" && sva.getExpression())
-        return sva.getExpression().getValue().trim('"');
-  return {};
-}
-
-/// A memory synthesis builds of LUTs (distributed RAM) or flops: one stated
-/// so, or of at most 64 entries, or of any depth read asynchronously (read
-/// latency 0: a block RAM's read is registered, so such a memory is LUTs
-/// however deep; firtool states it `ram_style = "distributed"`). Its address
-/// and enable pins grow with its width times its depth. Any other is block
-/// RAM.
-bool isLutMemory(seq::FirMemOp op) {
-  StringRef style = ramStyleOf(op);
-  if (style == "block" || style == "ultra")
-    return false;
-  return style == "distributed" || style == "registers" ||
-         op.getType().getDepth() <= kLutDepth || op.getReadLatency() == 0;
-}
-
-/// The pins one bit of a port's address, enable or mask drives.
-uint64_t memoryLoads(seq::FirMemType type, bool lut, uint64_t width) {
-  uint64_t depth = type.getDepth();
-  if (lut)
-    return width * llvm::divideCeil(depth, 32);
-  return llvm::divideCeil(width, 36) * llvm::divideCeil(depth, 1024);
-}
-
-/// The bits of a memory one mask bit writes.
-uint64_t maskGrain(seq::FirMemType type) {
-  auto maskWidth = type.getMaskWidth();
-  return maskWidth && *maskWidth ? type.getWidth() / *maskWidth : 1;
-}
-
 /// The pins a use of a register's bit drives (see the pass description).
 uint64_t loadsOf(OpOperand &use) {
   auto *op = use.getOwner();
@@ -131,7 +94,7 @@ uint64_t loadsOf(OpOperand &use) {
     if (use.get() == data)
       return 1;
     auto mem = memory.getDefiningOp<seq::FirMemOp>();
-    bool lut = mem ? isLutMemory(mem) : type.getDepth() <= kLutDepth;
+    bool lut = mem ? isLutMemory(mem) : type.getDepth() <= kLutMemoryDepth;
     if (auto write = dyn_cast<seq::FirMemWriteOp>(op);
         write && write.getMask() == use.get())
       return memoryLoads(type, lut, maskGrain(type));

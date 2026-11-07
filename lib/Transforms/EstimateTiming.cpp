@@ -16,6 +16,7 @@
 
 #include "BeaconOps.h"
 #include "foldsim/Beacon.h"
+#include "foldsim/MemoryLoads.h"
 #include "foldsim/Passes.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -163,13 +164,15 @@ struct EndPoint {
   int16_t retimed = 0;
 };
 
-/// An input of a node: the levels from it to the node, and whether the node
-/// loads it (an adder bit reaches the lower bits' inputs over the carry
-/// chain, not as their load).
+/// An input of a node: the levels from it to the node, and the pins with
+/// which the node loads it: 0 for an adder bit reaching the lower bits'
+/// inputs over the carry chain, not as their load; a distributed-RAM read's
+/// address bit, a pin in every LUT of the memory (foldsim/MemoryLoads.h);
+/// else 1.
 struct Edge {
   unsigned in;
   int levels;
-  bool load;
+  uint32_t load;
 };
 
 constexpr unsigned kNone = ~0u;
@@ -475,7 +478,7 @@ void Timing::inputs(unsigned id, SmallVectorImpl<Edge> &edges) {
 void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
   Node n = nodes[id];
   Operation *op = n.value.getDefiningOp();
-  auto add = [&](Value operand, unsigned bit, int levels, bool load = true) {
+  auto add = [&](Value operand, unsigned bit, int levels, uint32_t load = 1) {
     unsigned in = resolve(n.ctx, operand, bit);
     if (in != kNone)
       edges.push_back({in, levels, load});
@@ -493,7 +496,7 @@ void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
     size_t first = edges.size();
     for (auto operand : op->getOperands())
       for (unsigned bit = 0; bit <= n.bit; ++bit)
-        add(operand, bit, arith(bit, n.bit), bit == n.bit);
+        add(operand, bit, arith(bit, n.bit), bit == n.bit ? 1 : 0);
     if (!device.asic)
       fitLut(edges, first);
     return;
@@ -618,12 +621,17 @@ void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
     // RAM64X1D is one level; deeper memories add a MUXF7/MUXF8 or LUT level
     // per doubling.
     auto read = cast<seq::FirMemReadOp>(op);
-    uint64_t depth = read.getMemory().getType().getDepth();
+    auto type = read.getMemory().getType();
+    uint64_t depth = type.getDepth();
     int levels = device.asic
                      ? 1 + (int)llvm::Log2_64_Ceil(depth)
                      : 1 + std::max(0, (int)llvm::Log2_64_Ceil(depth) - 6);
+    // Every LUT of the memory takes the address bit: one node per data bit
+    // here, so each loads its share of the memory's pins.
+    uint32_t pins = std::max<uint64_t>(
+        1, foldsim::memoryLoads(type, true, type.getWidth()) / type.getWidth());
     for (unsigned bit = 0, e = widthOf(read.getAddress()); bit < e; ++bit)
-      add(read.getAddress(), bit, levels);
+      add(read.getAddress(), bit, levels, pins);
     if (auto enable = read.getEnable())
       add(enable, 0, 1);
     return;
@@ -807,10 +815,32 @@ void Timing::addEndPoints(unsigned ctx, Operation *op, StringRef port,
                           Value value, bool boundary) {
   if (!value)
     return;
+  // A memory port's address, enable or mask bit is an end point that drives
+  // a pin of every LUT (or block RAM) of the memory: its fanout, which the
+  // route, not logic, makes slow (foldsim/MemoryLoads.h).
+  uint32_t pins = 0;
+  if (port != "wd") {
+    Value memory;
+    if (auto write = dyn_cast<seq::FirMemWriteOp>(op))
+      memory = write.getMemory();
+    else if (auto read = dyn_cast<seq::FirMemReadOp>(op))
+      memory = read.getMemory();
+    else if (auto rw = dyn_cast<seq::FirMemReadWriteOp>(op))
+      memory = rw.getMemory();
+    if (auto mem = memory ? memory.getDefiningOp<seq::FirMemOp>() : nullptr) {
+      auto type = mem.getType();
+      bool mask = port == "wm";
+      pins = foldsim::memoryLoads(type, foldsim::isLutMemory(mem),
+                                  mask ? foldsim::maskGrain(type)
+                                       : type.getWidth());
+    }
+  }
   for (unsigned bit = 0, e = widthOf(value); bit < e; ++bit) {
     unsigned id = resolve(ctx, value, bit);
-    if (id != kNone)
-      endPoints.push_back({id, ctx, op, port, bit, kNone, boundary});
+    if (id == kNone)
+      continue;
+    endPoints.push_back({id, ctx, op, port, bit, kNone, boundary});
+    nodes[id].fanout += pins;
   }
 }
 
