@@ -404,6 +404,9 @@ struct ReplicateControlsPass
           OpBuilder wb(op);
           wb.setInsertionPointAfter(op);
           auto *clone = wb.clone(*op);
+          // A copy of the wiring sorts first, as an op the module order
+          // did not number; entered so that a lookup of it never misses.
+          position[clone] = 0;
           for (auto &operand : clone->getOpOperands())
             operand.set(mapped(operand.get()));
           for (auto [old, copied] :
@@ -422,8 +425,12 @@ struct ReplicateControlsPass
             unused.push_back(op);
         erased = !unused.empty();
         for (auto *op : unused) {
+          // Its position stays: erasing it would leave a tombstone, and a
+          // module of many replicated controls fills the map with them, so
+          // that every lookup that misses walks most of the table. An op
+          // created later at its address is entered anew (a replica or a
+          // copy of the wiring, the only ops this creates).
           fanout.wiring.erase(op);
-          position.erase(op);
           op->erase();
         }
       }
