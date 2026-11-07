@@ -246,7 +246,38 @@ def lanes(width, mask):
     return (1, width) if grain in (8, 9) else (mask, grain)
 
 
+# A threaded memory read through a register (read latency 1) keeps each
+# instance's read register in a buffer of an entry per instance, read
+# combinationally at the next slot's instance (foldsim-fold-static): LUTRAM
+# of the read data's width, whatever kind holds the memory (rows page the
+# register with the instance's instead). Off by default (the planner's
+# choices before 11-07); foldsim_degree state --read-buffers.
+READ_BUFFERS = False
+
+
+def read_buffer_cost(store):
+    """The LUTRAM LUTs and flops of a memory's per-instance read registers
+    (READ_BUFFERS), or zeros."""
+    t = store.get('threads', 1)
+    if not READ_BUFFERS or store.get('reg') or store.get('rlat', 0) < 1 or t <= 1:
+        return 0.0, 0
+    r = max(store['rports'], 1)
+    entries = 1 << (t - 1).bit_length()
+    return r * cost.mem_cost(entries, store['width'], 1, 0, 'distributed')[0], r * store['width']
+
+
 def kind_cost(store, kind):
+    """_kind_cost, with the memory's per-instance read registers
+    (read_buffer_cost) in every kind that keeps it on chip."""
+    c = _kind_cost(store, kind)
+    if c is not None and kind in ('distributed', 'block', 'ultra'):
+        lr, ff = read_buffer_cost(store)
+        if lr:
+            c = dict(c, lutram=c['lutram'] + lr, ff=c['ff'] + ff)
+    return c
+
+
+def _kind_cost(store, kind):
     """What a store costs in a kind: logic LUTs, distributed-RAM LUTs, flops,
     RAMB36, URAM; and the II floor its write ports imply (0: none). None if
     the kind cannot hold it. `store`: depth, width, rports, wports, rlat (0 or

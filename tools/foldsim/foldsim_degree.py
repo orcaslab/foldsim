@@ -340,10 +340,11 @@ PLATFORM = dict(by_traffic=False)
 COPY_CAP = None
 
 
-def slr_copy_cap(region, slr='smallest'):
+def slr_copy_cap(region, slr='smallest', luts=False):
     """COPY_CAP of a dynamic region's SLR (foldsim_v80_slr.json: per SLR its
     ramb36 and uram, and the margin a copy may fill): `slr` its name, or
-    smallest / largest (by LUTs)."""
+    smallest / largest (by LUTs); with `luts` (state --copy-cap-luts) its
+    LUTs and LUTRAM LUTs too."""
     slrs = region['slrs']
     if slr in ('smallest', 'largest'):
         pick = (min if slr == 'smallest' else max)(slrs, key=lambda s: s['luts'])
@@ -352,14 +353,24 @@ def slr_copy_cap(region, slr='smallest'):
         if pick is None:
             raise ValueError(f'no SLR {slr} in the region (' + ', '.join(s['name'] for s in slrs) + ')')
     m = region.get('margin', 1.0)
-    return dict(name=pick['name'], uram=m * pick['uram'], bram=m * pick['ramb36'])
+    cap = dict(name=pick['name'], uram=m * pick['uram'], bram=m * pick['ramb36'])
+    if luts:
+        # LUTs: the copy's own logic plus its stores' LUTs and LUTRAM (g32cdj,
+        # 11-07: a slice copy of 604.9k LUTs refused against SLR2's 601.6k);
+        # LUTRAM within the SLR's SLICEMs.
+        cap.update(lut=m * pick['luts'], lutram=m * pick.get('lutram_luts', pick['luts']))
+    return cap
 
 
-def copy_cap_pools(units, caps, base):
+def copy_cap_pools(units, caps, base, copy_logic=None):
     """COPY_CAP as pools of storage.assign: for each copy j of a class c, its
     stores' URAM (`uram@c#j`) and RAMB36 (`bram@c#j`) at each kind, from the
-    units' per-copy costs, each pool capped. Links (placed at the producer,
-    the simulator's level) are not a copy's."""
+    units' per-copy costs, each pool capped. With the cap's `lut` (and
+    `lutram`), the copy's LUTs too (`lut@c#j`: its stores' LUTs and LUTRAM at
+    each kind, on a base of the copy's own logic, `copy_logic`; `lutram@c#j`:
+    the LUTRAM alone, within the SLR's SLICEMs), so that a copy whose LUTRAM
+    stores outgrow an SLR moves them to block or ultra RAM or off chip. Links
+    (placed at the producer, the simulator's level) are not a copy's."""
     if not COPY_CAP:
         return
     for u in units:
@@ -369,10 +380,19 @@ def copy_cap_pools(units, caps, base):
             if kind not in u['costs']:
                 continue
             for j, pc in parts:
-                for res in ('uram', 'bram'):
-                    if pc.get(res):
-                        key = f"{res}@{u['class']}#{j}"
-                        u['costs'][kind][key] = u['costs'][kind].get(key, 0.0) + pc[res]
+                amounts = {res: pc.get(res, 0.0) for res in ('uram', 'bram')}
+                if COPY_CAP.get('lut') is not None:
+                    amounts['lut'] = pc.get('lut', 0.0) + pc.get('lutram', 0.0)
+                    amounts['lutram'] = pc.get('lutram', 0.0)
+                for res, x in amounts.items():
+                    key = f"{res}@{u['class']}#{j}"
+                    if res == 'lut':
+                        # Every copy with a store gets its LUT pool, its own
+                        # logic the base: a copy over on logic alone is named.
+                        caps[key] = COPY_CAP[res]
+                        base.setdefault(key, (copy_logic or {}).get((u['class'], j), 0.0))
+                    if x:
+                        u['costs'][kind][key] = u['costs'][kind].get(key, 0.0) + x
                         caps[key] = COPY_CAP[res]
                         base.setdefault(key, 0.0)
 
@@ -1108,7 +1128,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         lk = dict(lk, lutram=lk['lutram'] * KERNEL['calibration']['link_lutram'])
         base = dict(base, sites=logic + storage.LUTRAM_SITES * (lk['lutram'] + base_lutram),
                     luts=storage.fold_load(logic + lk['lutram'] + base_lutram, cache + lk['bram'], lk['uram']))
-    copy_cap_pools(units, caps, base)
+    copy_cap_pools(units, caps, base, copy_logic)
     choice, used = storage.assign(units, base, caps,
                                   dict(luts=storage.route_luts(slrs)) if route else None,
                                   price_extra=tiers is not None)
@@ -2834,6 +2854,14 @@ def main():
                          "(foldsim_v80_slr.json, or `v80`), with its margin: SLR the name of the "
                          'one every copy must fit, or smallest (default) / largest; the stores\' '
                          'kinds are chosen under it')
+    st.add_argument('--read-buffers', action='store_true',
+                    help="price a threaded memory's per-instance read registers (a buffer of an entry per "
+                         'instance, LUTRAM of the read width) in every on-chip kind of the memory, as the fold '
+                         "builds them (rows page them with the instance's registers)")
+    st.add_argument('--copy-cap-luts', action='store_true',
+                    help="with --copy-cap: each copy's LUTs (its logic plus its stores' LUTs and LUTRAM) "
+                         "and LUTRAM within the SLR's too (times the margin); a copy whose LUTRAM stores "
+                         'outgrow it moves them to block or ultra RAM or off chip')
     st.add_argument('--links-from', default='', metavar='SCHEDULE',
                     help='another schedule report of the same fold to read the link storage from '
                          '(one made by a compiler that reports it)')
@@ -2903,11 +2931,14 @@ def state_main(a):
         # build).
         storage.no_forward()
     global COPY_CAP
+    if getattr(a, 'read_buffers', False):
+        storage.READ_BUFFERS = True
     if getattr(a, 'copy_cap', ''):
         path, _, slr = a.copy_cap.partition(':')
         if path == 'v80':
             path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
-        COPY_CAP = slr_copy_cap(json.load(open(path)), slr or 'smallest')
+        COPY_CAP = slr_copy_cap(json.load(open(path)), slr or 'smallest',
+                                getattr(a, 'copy_cap_luts', False))
     BUILT = read_built(a.built_json) if getattr(a, 'built_json', '') else None
     if BUILT is not None:
         m = re.search(r'(?:^| )storage=(\S+)', a.fold_options)
