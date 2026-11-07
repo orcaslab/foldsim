@@ -40,7 +40,8 @@ using namespace circt;
 namespace {
 
 /// A memory this shallow is LUTs or flops, whose address and enable pins
-/// grow with its width; a deeper one is block RAM.
+/// grow with its width; a deeper one is block RAM unless read asynchronously
+/// (isLutMemory).
 constexpr uint64_t kLutDepth = 64;
 
 /// Ops that only route a register's bits: copied along with a replica.
@@ -83,10 +84,34 @@ uint64_t widthOf(Value value) {
   return std::max<int64_t>(1, hw::getBitWidth(value.getType()));
 }
 
+/// The RAM style a memory states to synthesis, if any (`ram_style`).
+StringRef ramStyleOf(Operation *op) {
+  if (auto attrs = sv::getSVAttributes(op))
+    for (auto a : attrs)
+      if (auto sva = dyn_cast<sv::SVAttributeAttr>(a);
+          sva && sva.getName().getValue() == "ram_style" && sva.getExpression())
+        return sva.getExpression().getValue().trim('"');
+  return {};
+}
+
+/// A memory synthesis builds of LUTs (distributed RAM) or flops: one stated
+/// so, or of at most 64 entries, or of any depth read asynchronously (read
+/// latency 0: a block RAM's read is registered, so such a memory is LUTs
+/// however deep; firtool states it `ram_style = "distributed"`). Its address
+/// and enable pins grow with its width times its depth. Any other is block
+/// RAM.
+bool isLutMemory(seq::FirMemOp op) {
+  StringRef style = ramStyleOf(op);
+  if (style == "block" || style == "ultra")
+    return false;
+  return style == "distributed" || style == "registers" ||
+         op.getType().getDepth() <= kLutDepth || op.getReadLatency() == 0;
+}
+
 /// The pins one bit of a port's address, enable or mask drives.
-uint64_t memoryLoads(seq::FirMemType type, uint64_t width) {
+uint64_t memoryLoads(seq::FirMemType type, bool lut, uint64_t width) {
   uint64_t depth = type.getDepth();
-  if (depth <= kLutDepth)
+  if (lut)
     return width * llvm::divideCeil(depth, 32);
   return llvm::divideCeil(width, 36) * llvm::divideCeil(depth, 1024);
 }
@@ -105,10 +130,12 @@ uint64_t loadsOf(OpOperand &use) {
     auto type = cast<seq::FirMemType>(memory.getType());
     if (use.get() == data)
       return 1;
+    auto mem = memory.getDefiningOp<seq::FirMemOp>();
+    bool lut = mem ? isLutMemory(mem) : type.getDepth() <= kLutDepth;
     if (auto write = dyn_cast<seq::FirMemWriteOp>(op);
         write && write.getMask() == use.get())
-      return memoryLoads(type, maskGrain(type));
-    return memoryLoads(type, type.getWidth());
+      return memoryLoads(type, lut, maskGrain(type));
+    return memoryLoads(type, lut, type.getWidth());
   };
   if (auto read = dyn_cast<seq::FirMemReadOp>(op))
     return port(read.getMemory(), Value{});
@@ -316,7 +343,7 @@ struct ReplicateControlsPass
         else if (auto write = dyn_cast<seq::FirMemWriteOp>(owner))
           memory = write.getMemory();
         auto op = memory ? memory.getDefiningOp<seq::FirMemOp>() : nullptr;
-        if (op && op.getType().getDepth() <= kLutDepth && !op.getInit() &&
+        if (op && isLutMemory(op) && !op.getInit() &&
             !op.getInnerSymAttr() &&
             llvm::all_of(op->getUsers(), [](Operation *user) {
               return isa<seq::FirMemReadOp, seq::FirMemWriteOp>(user);

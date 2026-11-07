@@ -1087,14 +1087,17 @@ def ReplicateControls
     with the same next value, clock, reset and preset, so they all hold the
     register's value on every host cycle, each driving a group of at most
     `loads` loads, the loads in module order so that a group is a submodule's
-    stores. A load is a pin per bit of the register: a memory port's address,
-    enable or mask is its width times its depth in 32-entry LUTs (a block
-    RAM, deeper than 64 entries: a pin per 36 bits and 1024 entries), a
-    select's condition is its width, anything else one. Concatenations,
-    extractions, bit casts, replications and inversions of the register are
-    wiring, copied with it. A memory of at most 64 entries or a select whose
-    one port is over `loads` is first split by bits into parts of at most
-    `loads` (a memory in whole mask bits). The replicas and the register get
+    stores. A load is a pin per bit of the register: a LUT memory's address,
+    enable or mask is its width times its depth in 32-entry LUTs, a block
+    RAM's a pin per 36 bits and 1024 entries; a select's condition is its
+    width, anything else one. A LUT memory is one of at most 64 entries, one
+    read asynchronously (read latency 0, which no block RAM has: synthesis
+    builds it of LUTs however deep), or one whose `ram_style` says
+    distributed or registers; `ram_style` block or ultra makes any memory a
+    block RAM. Concatenations, extractions, bit casts, replications and
+    inversions of the register are wiring, copied with it. A LUT memory or a
+    select whose one port is over `loads` is first split by bits into parts of
+    at most `loads` (a memory in whole mask bits). The replicas and the register get
     `DONT_TOUCH`. The simulator's behavior is the same on every host cycle.
 
     The marks are removed in any case; `loads` 0 replicates nothing.
