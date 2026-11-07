@@ -5580,6 +5580,10 @@ LogicalResult StaticFolder::estimateSlls() {
   SmallVector<SmallVector<uint64_t>> bits;
   SmallVector<SmallVector<unsigned>> links;
   linkBits(bits, links);
+  // A serialized class's links take a k-th of their bits in wires.
+  for (unsigned p = 0; p < bits.size(); ++p)
+    for (auto &b : bits[p])
+      b = serialWires(p, b);
   SmallVector<unsigned> order;
   for (unsigned c = 0; c < n; ++c)
     order.push_back(c);
