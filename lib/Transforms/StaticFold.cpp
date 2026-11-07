@@ -608,6 +608,11 @@ private:
   std::string sllReport;
   SmallVector<int> slrOf;
   SmallVector<uint64_t> slrSites;
+  /// Further resources of each class and SLR beyond the LUT sites (slr-sites
+  /// <class>:<sites>/<r1>/..., slr-capacities <sites>/<r1>/...: a copy's
+  /// flops, URAM, block RAM...), each kept within its SLR's like the sites,
+  /// in sll-estimate.
+  SmallVector<SmallVector<uint64_t>> slrMore, slrCapsMore;
   hw::HWModuleOp simModule;
   /// A select of offered pairs: the netlist output, and the input whose
   /// value in the frame before it is ANDed with.
@@ -5374,28 +5379,60 @@ void StaticFolder::linkBits(SmallVectorImpl<SmallVector<uint64_t>> &bits,
 LogicalResult StaticFolder::parseSlrSpecs(unsigned groups) {
   unsigned n = classes.size();
   slrSites.assign(n, 0);
+  slrMore.assign(n, {});
   for (auto &spec : slrSiteSpecs) {
     auto [name, count] = StringRef(spec).rsplit(':');
     int c = -1;
     for (auto [i, cls] : llvm::enumerate(classes))
       if (cls.name == name)
         c = i;
-    uint64_t sites = 0;
-    if (c < 0 || count.getAsInteger(10, sites))
+    SmallVector<StringRef> parts;
+    count.split(parts, '/');
+    SmallVector<uint64_t> values(parts.size(), 0);
+    bool bad = c < 0;
+    for (auto [k, part] : llvm::enumerate(parts))
+      bad |= part.getAsInteger(10, values[k]);
+    if (bad)
       return netlist.emitError("slr-sites: '") << spec
-             << "' is not <class>:<sites> of a class";
-    slrSites[c] = sites;
+             << "' is not <class>:<sites>[/<resource>...] of a class";
+    slrSites[c] = values[0];
+    slrMore[c].assign(values.begin() + 1, values.end());
   }
   slrCaps.assign(groups, slrCapacity);
+  slrCapsMore.assign(groups, {});
   if (!slrCapacitySpecs.empty()) {
     if (slrCapacitySpecs.size() != groups)
       return netlist.emitError("slr-capacities: ")
              << slrCapacitySpecs.size() << " capacities for " << groups
              << " groups";
-    for (auto [g, spec] : llvm::enumerate(slrCapacitySpecs))
-      if (StringRef(spec).getAsInteger(10, slrCaps[g]))
+    for (auto [g, spec] : llvm::enumerate(slrCapacitySpecs)) {
+      SmallVector<StringRef> parts;
+      StringRef(spec).split(parts, '/');
+      bool bad = parts[0].getAsInteger(10, slrCaps[g]);
+      for (StringRef part : ArrayRef(parts).drop_front()) {
+        uint64_t v = 0;
+        bad |= part.getAsInteger(10, v);
+        slrCapsMore[g].push_back(v);
+      }
+      if (bad)
         return netlist.emitError("slr-capacities: '") << spec
-               << "' is not a number of sites";
+               << "' is not a number of sites[/<resource>...]";
+    }
+  }
+  // The further resources: as many for every class as the capacities give
+  // (a class that names fewer takes none of the rest).
+  size_t more = 0;
+  for (auto &caps : slrCapsMore)
+    more = std::max(more, caps.size());
+  for (auto &caps : slrCapsMore)
+    if (caps.size() != more)
+      return netlist.emitError("slr-capacities: every group needs ")
+             << more << " further resources";
+  for (auto [c, values] : llvm::enumerate(slrMore)) {
+    if (values.size() > more)
+      return netlist.emitError("slr-sites: ")
+             << classes[c].name << " names more resources than the capacities";
+    values.resize(more, 0);
   }
   return success();
 }
@@ -5423,9 +5460,23 @@ LogicalResult StaticFolder::estimateSlls() {
     return slrSites[x] > slrSites[y];
   });
   uint64_t largestCap = *llvm::max_element(slrCaps);
+  size_t more = slrCapsMore.empty() ? 0 : slrCapsMore[0].size();
+  SmallVector<uint64_t> largestMore(more, 0);
+  for (auto &caps : slrCapsMore)
+    for (size_t r = 0; r < more; ++r)
+      largestMore[r] = std::max(largestMore[r], caps[r]);
+  // Larger than every SLR in some resource: it cannot be placed whole.
+  auto tooBig = [&](unsigned c) {
+    if (slrSites[c] > largestCap)
+      return true;
+    for (size_t r = 0; r < more; ++r)
+      if (slrMore[c][r] > largestMore[r])
+        return true;
+    return false;
+  };
   std::string tooLarge;
   for (unsigned c = 0; c < n; ++c)
-    if (slrSites[c] > largestCap)
+    if (tooBig(c))
       tooLarge += " " + classes[c].name + " (" + std::to_string(slrSites[c]) +
                   " sites)";
   // Branch over the classes that matter (the 10 largest by sites or by link
@@ -5455,6 +5506,13 @@ LogicalResult StaticFolder::estimateSlls() {
   SmallVector<int> group(n, -1), best;
   SmallVector<uint64_t> used(groups, 0), cut(groups ? groups - 1 : 0, 0),
       bestCut;
+  SmallVector<SmallVector<uint64_t>> usedMore(groups,
+                                              SmallVector<uint64_t>(more, 0));
+  auto place = [&](unsigned c, unsigned g, int sign) {
+    used[g] += sign * int64_t(slrSites[c]);
+    for (size_t r = 0; r < more; ++r)
+      usedMore[g][r] += sign * int64_t(slrMore[c][r]);
+  };
   uint64_t bestWorst = ~0ull, bestTotal = ~0ull, visited = 0;
   // The boundaries a class adds to in group g, given the classes placed.
   auto adds = [&](unsigned c, unsigned g, SmallVectorImpl<uint64_t> &added) {
@@ -5469,8 +5527,14 @@ LogicalResult StaticFolder::estimateSlls() {
     }
   };
   auto fitsIn = [&](unsigned c, unsigned g) {
-    return slrSites[c] > largestCap ? slrCaps[g] == largestCap
-                                    : used[g] + slrSites[c] <= slrCaps[g];
+    if (tooBig(c))
+      return slrCaps[g] == largestCap;
+    if (used[g] + slrSites[c] > slrCaps[g])
+      return false;
+    for (size_t r = 0; r < more; ++r)
+      if (usedMore[g][r] + slrMore[c][r] > slrCapsMore[g][r])
+        return false;
+    return true;
   };
   std::function<void(unsigned)> visit = [&](unsigned k) {
     if (++visited > 20'000'000)
@@ -5506,7 +5570,7 @@ LogicalResult StaticFolder::estimateSlls() {
         for (unsigned b = 0; b < cut.size(); ++b)
           cut[b] += bestAdd[b];
         group[c] = bestG;
-        used[bestG] += slrSites[c];
+        place(c, bestG, 1);
         placed.push_back({c, bestAdd});
       }
       if (ok) {
@@ -5523,7 +5587,7 @@ LogicalResult StaticFolder::estimateSlls() {
       for (auto &[c, added] : llvm::reverse(placed)) {
         for (unsigned b = 0; b < cut.size(); ++b)
           cut[b] -= added[b];
-        used[group[c]] -= slrSites[c];
+        place(c, group[c], -1);
         group[c] = -1;
       }
       return;
@@ -5537,9 +5601,9 @@ LogicalResult StaticFolder::estimateSlls() {
       for (unsigned b = 0; b < cut.size(); ++b)
         cut[b] += added[b];
       group[c] = g;
-      used[g] += slrSites[c];
+      place(c, g, 1);
       visit(k + 1);
-      used[g] -= slrSites[c];
+      place(c, g, -1);
       group[c] = -1;
       for (unsigned b = 0; b < cut.size(); ++b)
         cut[b] -= added[b];

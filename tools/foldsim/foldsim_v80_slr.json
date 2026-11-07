@@ -1,5 +1,5 @@
 {
- "about": "The V80 compute shell's dynamic region (pblock_slash, SLASH linker/slashkit/resources/base/compute/constraints/impl.xdc) per SLR, its sites counted by Vivado 2025.2 on b4e's opt checkpoint (11-07). Unequal: the static region owns most of SLR0. sites_per_lut converts placed LUTs to foldsim_degree's LUT sites: b4e's largest SLR group, 978,886 estimated sites placed as 672,695 LUTs (post-synth hierarchical utilization), the group that spilled over SLR2/SLR1 at 95 % of SLR2's LUTs. margin: the share of an SLR's LUTs a group may fill and still route at 200 MHz. sll_per_boundary: the V80's super long lines between adjacent SLRs (report_utilization -slr, both boundaries 18,870; Vivado refuses a partition past it: r16c, 11-07, 23,987 needed between SLR1 and SLR2). sll_margin: the share of them the fold's link bits may take (the rest for the shell's crossings and the placer).",
+ "about": "The V80 compute shell's dynamic region (pblock_slash, SLASH linker/slashkit/resources/base/compute/constraints/impl.xdc) per SLR, its sites counted by Vivado 2025.2 on b4e's opt checkpoint (11-07). Unequal: the static region owns most of SLR0. sites_per_lut converts placed LUTs to foldsim_degree's LUT sites: b4e's largest SLR group, 978,886 estimated sites placed as 672,695 LUTs (post-synth hierarchical utilization), the group that spilled over SLR2/SLR1 at 95 % of SLR2's LUTs. margin: the share of an SLR's LUTs a group may fill and still route at 200 MHz. sll_per_boundary: the V80's super long lines between adjacent SLRs (report_utilization -slr, both boundaries 18,870; Vivado refuses a partition past it: r16c, 11-07, 23,987 needed between SLR1 and SLR2). sll_margin: the share of them the fold's link bits may take (the rest for the shell's crossings and the placer). netlist_lut_scale / netlist_ff_scale (foldsim_sll_check.py --resources netlist): synthesized LUTs and flip-flops per foldsim_cost LUT / flop of a class copy's module in the generated netlist, r16c's Vivado 2025.2 synthesis (11-07, hier_utilization.rpt): all copies 998,386 LUTs for 1,476,513 counted (0.676; the five largest 0.64-0.78), 1,477,464 flops for 1,801,740 (0.82; the slice copy 0.90). URAM by ram_style as built: the slice copy 522 counted, 517 synthesized. sll_per_link_bit (foldsim_sll_check.py): the SLLs a placed build used over its worst boundary per whole-copy link bit of the check's worst boundary: b4e (placed and routed 11-07, 10,134 SLLs over its worst boundary, 3,818 over the other) against 43,376 link bits estimated (--resources netlist, this region): 0.234. One build: to refit with each placed or failed image.",
  "sites_per_lut": 1.455,
  "margin": 0.85,
  "slrs": [
@@ -26,5 +26,8 @@
   }
  ],
  "sll_per_boundary": 18870,
- "sll_margin": 0.85
+ "sll_margin": 0.85,
+ "netlist_lut_scale": 0.68,
+ "netlist_ff_scale": 0.9,
+ "sll_per_link_bit": 0.234
 }

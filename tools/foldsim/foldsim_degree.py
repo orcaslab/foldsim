@@ -329,6 +329,52 @@ ENGINES = dict(rule='max', shift=0)
 # The platform's masters (storage.platform_cost 'best'): by the whole HBM share
 # (default) or by the point's own HBM traffic (state --masters-by-traffic).
 PLATFORM = dict(by_traffic=False)
+# A class copy's own block and ultra RAM, each within one SLR's (state
+# --copy-cap): {'uram': most URAM288, 'bram': most RAMB36} a copy may hold, or
+# None (no cap). A copy is placed whole in an SLR (Vivado keeps a module's
+# cells together where it can; a copy past an SLR's memory must be cut, its
+# wide page and store ports then crossing SLLs: r16c 11-07, a 16-SM slice copy
+# of 517 URAM against SLRs of 496 / 511 / 204, failed partitioning at 23,987
+# SLLs). The stores' kinds are chosen under these caps (pools per copy in
+# storage.assign).
+COPY_CAP = None
+
+
+def slr_copy_cap(region, slr='smallest'):
+    """COPY_CAP of a dynamic region's SLR (foldsim_v80_slr.json: per SLR its
+    ramb36 and uram, and the margin a copy may fill): `slr` its name, or
+    smallest / largest (by LUTs)."""
+    slrs = region['slrs']
+    if slr in ('smallest', 'largest'):
+        pick = (min if slr == 'smallest' else max)(slrs, key=lambda s: s['luts'])
+    else:
+        pick = next((s for s in slrs if s['name'] == slr), None)
+        if pick is None:
+            raise ValueError(f'no SLR {slr} in the region (' + ', '.join(s['name'] for s in slrs) + ')')
+    m = region.get('margin', 1.0)
+    return dict(name=pick['name'], uram=m * pick['uram'], bram=m * pick['ramb36'])
+
+
+def copy_cap_pools(units, caps, base):
+    """COPY_CAP as pools of storage.assign: for each copy j of a class c, its
+    stores' URAM (`uram@c#j`) and RAMB36 (`bram@c#j`) at each kind, from the
+    units' per-copy costs, each pool capped. Links (placed at the producer,
+    the simulator's level) are not a copy's."""
+    if not COPY_CAP:
+        return
+    for u in units:
+        if u.get('link'):
+            continue
+        for kind, parts in u.get('per', {}).items():
+            if kind not in u['costs']:
+                continue
+            for j, pc in parts:
+                for res in ('uram', 'bram'):
+                    if pc.get(res):
+                        key = f"{res}@{u['class']}#{j}"
+                        u['costs'][kind][key] = u['costs'][kind].get(key, 0.0) + pc[res]
+                        caps[key] = COPY_CAP[res]
+                        base.setdefault(key, 0.0)
 
 
 def read_built(path):
@@ -1062,6 +1108,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         lk = dict(lk, lutram=lk['lutram'] * KERNEL['calibration']['link_lutram'])
         base = dict(base, sites=logic + storage.LUTRAM_SITES * (lk['lutram'] + base_lutram),
                     luts=storage.fold_load(logic + lk['lutram'] + base_lutram, cache + lk['bram'], lk['uram']))
+    copy_cap_pools(units, caps, base)
     choice, used = storage.assign(units, base, caps,
                                   dict(luts=storage.route_luts(slrs)) if route else None,
                                   price_extra=tiers is not None)
@@ -1236,8 +1283,12 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                largest_copy=round(max(per_copy.values())),
                copies={f'{c}#{j}': dict(logic=round(copy_logic[(c, j)]), total=round(per_copy[(c, j)]),
                                         store_lut=round(store_lut.get((c, j), 0.0)),
-                                        store_lutram=round(store_lutram.get((c, j), 0.0)))
+                                        store_lutram=round(store_lutram.get((c, j), 0.0)),
+                                        uram=round(used.get(f'uram@{c}#{j}', 0.0), 1),
+                                        bram=round(used.get(f'bram@{c}#{j}', 0.0), 1))
                        for (c, j) in per_copy},
+               **({'copy_cap': dict(COPY_CAP, over=sorted(
+                   p for p in caps if '@' in p and used[p] > caps[p] + 1e-9))} if COPY_CAP else {}),
                vmem_ctl={x: round(v, 1) for x, v in vmem_ctl.items()},
                top_logic=round(top_link_logic((sched or {}).get('__links__'))) if KERNEL['on'] else 0,
                storage=','.join(rules),
@@ -1904,14 +1955,27 @@ def state_logic(cal, form, bypass, bits):
     return table[form][1 if bypass else 0] * bits
 
 
-def copy_sites(cal, est, name, threads, entries=2):
+def copy_sites(cal, est, name, threads, entries=2, info=None, ii=0):
     """LUT sites the placer needs for one copy of class `name` (`est`, its
     class_estimates entry) at `threads` instances, calibrated: its state as
-    the compiler keeps it before a schedule is known (state_form)."""
+    the compiler keeps it, given the copy's line of a schedule report
+    (`info`, parse_classes; `ii` its II) or, without one, as before a schedule
+    is known (state_form). A paged copy keeps its registers and small
+    memories in page RAMs, not a distributed RAM of an entry per instance:
+    its page selects and its other memories' stores, as fixed_area prices it
+    (r16c, 11-07: the 64-instance slice copy, paged, was counted 1,470,914
+    sites without its schedule, 168 % of the largest SLR; as built 559,939
+    LUTs)."""
     kappa, lam = factors(cal, name, est['lut'])
-    form, _ = state_form(threads, None, 0, entries)
+    form, bypass = state_form(threads, info, ii, entries)
     lr, _ = state_lutram(est, threads, form)
-    logic = kappa * est['lut'] + state_logic(cal, form, False, est['ff'])
+    logic = kappa * est['lut'] + state_logic(cal, form, bypass, est['ff'])
+    if form == 'paged':
+        bits, mux, others = paged_state(est)
+        lr, _ = state_lutram(others, threads, form)
+        pc = storage.page_cost(bits, threads, info['page'],
+                               'hbm' if info.get('offchip') else 'block')
+        logic += pc['lut'] + mux
     return placement(logic, lam * lr)[0]
 
 
@@ -2765,6 +2829,11 @@ def main():
                          'foldsim_kernel.vh beside it) gives the kernel\'s controllers (virtual memories '
                          'and groups, streams\' own, page engines; their host caches, known-zero bits, '
                          'FORWARD and masters); the schedule\'s frame, pages and link kinds, nothing moved')
+    st.add_argument('--copy-cap', default='', metavar='REGION[:SLR]',
+                    help="each class copy's own block and ultra RAM within one SLR of the region "
+                         "(foldsim_v80_slr.json, or `v80`), with its margin: SLR the name of the "
+                         'one every copy must fit, or smallest (default) / largest; the stores\' '
+                         'kinds are chosen under it')
     st.add_argument('--links-from', default='', metavar='SCHEDULE',
                     help='another schedule report of the same fold to read the link storage from '
                          '(one made by a compiler that reports it)')
@@ -2833,6 +2902,12 @@ def state_main(a):
         # kernel's FORWARD 0, every controller; the json carries it to the
         # build).
         storage.no_forward()
+    global COPY_CAP
+    if getattr(a, 'copy_cap', ''):
+        path, _, slr = a.copy_cap.partition(':')
+        if path == 'v80':
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
+        COPY_CAP = slr_copy_cap(json.load(open(path)), slr or 'smallest')
     BUILT = read_built(a.built_json) if getattr(a, 'built_json', '') else None
     if BUILT is not None:
         m = re.search(r'(?:^| )storage=(\S+)', a.fold_options)

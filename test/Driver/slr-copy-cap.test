@@ -1,0 +1,36 @@
+# Per-copy SLR caps. A class copy is placed whole in an SLR where it can; one
+# past every SLR's memory or logic is cut by the placer, its wide state and
+# store ports then crossing SLLs (r16c, 11-07: a slice copy of 517 URAM
+# against SLRs of 496 / 511 / 204 failed partitioning at 23,987 SLLs).
+#
+# The planner (foldsim_degree state --copy-cap): each copy's URAM and RAMB36
+# are pools of the storage choice, capped at one SLR's with the margin: two
+# wide, shallow memories both in URAM without the cap, one moved under it;
+# the SLR by name or the smallest. copy_sites with the schedule: a paged copy
+# keeps its registers in page RAMs, not a distributed RAM an instance deep.
+# RUN: python3 %S/Inputs/slr-copy-cap/model.py %foldsim_tools/foldsim.py | FileCheck %s --check-prefix=MODEL
+# MODEL: no cap: {{\[\['ultra'\], \['ultra'\]\]}} uram 176.0 bram 0.0
+# MODEL: cap: {{\['distributed', 'ultra'\]}} copy uram 88.0 copy bram 0.0 cap 100.0
+# MODEL: smallest {'name': 'B', 'uram': 1.0, 'bram': 4.0} A {'name': 'A', 'uram': 10.0, 'bram': 20.0}
+# MODEL: copy sites: unscheduled {{[0-9]+}}, paged {{[0-9]+}}, paged smaller True
+
+# The check of a generated netlist (foldsim_sll_check.py, resources counted on
+# the netlist; logic within each SLR's capacity times the margin, memories
+# within its whole count): the leaf's memory in URAM (64 x 8: a whole
+# URAM288) fits only the SLR that has URAM: OK where a copy may take any SLR
+# (the copy there), REFUSE (exit 1) where it must fit the other; within SLRs
+# of 100 URAM it fits either, and no link crosses.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/storage
+# RUN: foldsim --srcs top.f --top Top --out %t/x --static --copies Leaf:1 --storage 'Leaf:mem=ultra' Leaf 2> %t/x.log
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-small.json --foldsim-opt foldsim-opt --out %t/any | FileCheck %s --check-prefix=ANY
+# RUN: not python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-small.json --foldsim-opt foldsim-opt --copy-cap SLR1 --out %t/small | FileCheck %s --check-prefix=SMALL
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-big.json --foldsim-opt foldsim-opt --copy-cap smallest --out %t/big | FileCheck %s --check-prefix=BIG
+# ANY: SLR1 capacity: lut 50,000, ff 100,000, uram 0.0, bram 100.0
+# ANY: copy cap: any (SLR1, SLR0)
+# ANY: Leaf: lut {{[0-9,]+}}, ff {{[0-9,]+}}, uram 1.0, bram 0.0; of each SLR's capacity (binding resource): SLR1 inf %, SLR0 50 %
+# ANY: slr1 = SLR0: lut {{[0-9,]+}} / {{[0-9,]+}}, ff {{[0-9,]+}} / {{[0-9,]+}}, uram 1.0 / 2.0
+# ANY: x: OK: 0 SLLs projected within the 1000 budget
+# SMALL: copy cap: SLR1 (SLR1)
+# SMALL: x: REFUSE: Leaf fits no SLR whole (the nearest, SLR1: over its uram)
+# BIG: copy cap: smallest (SLR1)
+# BIG: x: OK

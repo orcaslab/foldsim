@@ -710,13 +710,16 @@ def slr_options(a, foldsim_opt, models, fold, out):
                         '-o', os.devnull], capture_output=True, text=True)
     if r.returncode:
         sys.exit(r.stderr)
-    _, classes, _ = foldsim_degree.parse_schedule(open(base).read())
+    text = open(base).read()
+    ii, classes, _ = foldsim_degree.parse_schedule(text)
+    info = foldsim_degree.parse_classes(text)
     path = a.degree_calibration or DEGREE_CALIBRATION
     cal = json.load(open(path)) if path != 'none' and os.path.exists(path) else None
     entries = a.register_state_entries if a.register_state_entries is not None else 2
     of = {c: re.sub(r'_copy\d+$', '', c) for c in classes}
     est = foldsim_degree.class_estimates(models, sorted(set(of.values())))
-    sites = {c: round(foldsim_degree.copy_sites(cal, est[of[c]], of[c], n, entries))
+    # Each copy's state as that schedule keeps it (paged copies in page RAMs).
+    sites = {c: round(foldsim_degree.copy_sites(cal, est[of[c]], of[c], n, entries, info.get(c), ii))
              for c, n in classes.items()}
     if a.slr_region and not a.slr_groups:
         # --sll-check alone: the SLLs any assignment to the region's SLRs needs
