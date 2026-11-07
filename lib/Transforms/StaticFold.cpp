@@ -10058,11 +10058,22 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
   if (rows.empty() || uniform)
     return hw::ConstantOp::create(b, type, rows.empty() ? 0 : rows[0]);
   unsigned indexWidth = hw::getBitWidth(index.getType());
-  SmallVector<Value> elements;
+  // One constant of the whole array (what canonicalization makes of an
+  // array of constants), not an op per row: a frame of 2^17 positions times
+  // thousands of tables (128 SMs) is otherwise hundreds of millions of ops.
+  // The rows' IntegerAttrs are uniqued, so a sparse table costs a pointer a
+  // row.
+  SmallVector<Attribute> elements;
+  elements.reserve(size_t(1) << indexWidth);
   for (uint64_t k = (uint64_t(1) << indexWidth); k-- > 0;)
-    elements.push_back(
-        hw::ConstantOp::create(b, type, k < rows.size() ? rows[k] : 0));
-  Value array = hw::ArrayCreateOp::create(b, elements);
+    elements.push_back(b.getIntegerAttr(type, k < rows.size() ? rows[k] : 0));
+  // Rows equal once cut to `width` bits (and the padding): one constant, as
+  // canonicalization makes of a uniform array.
+  if (llvm::all_equal(elements))
+    return hw::ConstantOp::create(b, cast<IntegerAttr>(elements[0]));
+  auto arrayType = hw::ArrayType::get(type, elements.size());
+  Value array = hw::AggregateConstantOp::create(b, arrayType,
+                                                b.getArrayAttr(elements));
   return hw::ArrayGetOp::create(b, array, index);
 }
 
