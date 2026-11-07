@@ -1959,11 +1959,23 @@ static int stageOpFullLevels(Operation *op) {
   return logicLevels(op);
 }
 
+/// The half levels of a combinational read of `read`'s memory kept as a
+/// store of 2^`entryBits` instances' rows (distributed RAM), as the logic
+/// screen counts it: a level, and one per doubling of the depth past 64.
+static int readHalfLevels(seq::FirMemReadOp read, unsigned entryBits) {
+  auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+  int bits = int(entryBits) +
+             (memory ? int(llvm::Log2_64_Ceil(memory.getType().getDepth())) : 0);
+  return 2 * (1 + std::max(0, bits - 6));
+}
+
 /// The levels a value adds on the paths into it: through the logic and
-/// combinational reads (a level each), stopping at registers (stage
-/// registers too), registered reads, black boxes and the model's inputs.
+/// combinational reads (readHalfLevels, a store of 2^`entryBits` instances'
+/// rows), stopping at registers (stage registers too), registered reads,
+/// black boxes and the model's inputs.
 static void depthEdges(Value value,
-                       SmallVectorImpl<std::pair<Value, int>> &edges) {
+                       SmallVectorImpl<std::pair<Value, int>> &edges,
+                       unsigned entryBits) {
   auto *op = value.getDefiningOp();
   if (!op)
     return;
@@ -1973,9 +1985,10 @@ static void depthEdges(Value value,
   if (read) {
     if (memory && memory.getReadLatency() > 0)
       return;
-    edges.push_back({read.getAddress(), 2});
+    int levels = readHalfLevels(read, entryBits);
+    edges.push_back({read.getAddress(), levels});
     if (read.getEnable())
-      edges.push_back({read.getEnable(), 2});
+      edges.push_back({read.getEnable(), levels});
     return;
   }
   if (isa<seq::FirRegOp, seq::CompRegClockEnabledOp, seq::FirMemOp,
@@ -2004,7 +2017,8 @@ struct Staging {
 /// there would pass `limit`, and then starts the next stage, its operands
 /// taken through the stage registers; so no stage spans more than `limit`
 /// levels (or one op's). Depth first without recursion.
-static Staging stageOf(Value root, int limit, DenseMap<Value, Staging> &memo) {
+static Staging stageOf(Value root, int limit, DenseMap<Value, Staging> &memo,
+                       unsigned entryBits) {
   SmallVector<std::pair<Value, bool>> stack{{root, false}};
   SmallVector<std::pair<Value, int>> next;
   while (!stack.empty()) {
@@ -2017,7 +2031,7 @@ static Staging stageOf(Value root, int limit, DenseMap<Value, Staging> &memo) {
       continue;
     }
     next.clear();
-    depthEdges(value, next);
+    depthEdges(value, next, entryBits);
     if (!expanded) {
       // A placeholder against cycles, then the operands first.
       memo[value] = {0, 0};
@@ -2048,10 +2062,10 @@ static Staging stageOf(Value root, int limit, DenseMap<Value, Staging> &memo) {
 
 /// The stage a write of `value` through `extra` more levels ends in.
 static int sinkStage(Value value, int extra, int limit,
-                     DenseMap<Value, Staging> &memo) {
+                     DenseMap<Value, Staging> &memo, unsigned entryBits) {
   if (!value)
     return 0;
-  auto s = stageOf(value, limit, memo);
+  auto s = stageOf(value, limit, memo, entryBits);
   if (s.stage < 0)
     return 0;
   return s.stage + (s.levels > 0 && s.levels + extra > limit ? 1 : 0);
@@ -2167,27 +2181,29 @@ LogicalResult StaticFolder::chooseStages() {
     // late output's value (over the state and inputs, as read).
     DenseMap<Value, Staging> memo;
     int limit = 2 * int(stageLevels), next = 0, last = 0;
+    // (Its memories' stores keep a row per instance: 2^eb instances.)
+    unsigned eb = cls.threads() > 1 ? llvm::Log2_32_Ceil(cls.threads()) : 0;
     for (auto &op : *body) {
       if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
         int add = reg.getReset() ? 1 : 0;
-        next = std::max({next, sinkStage(reg.getNext(), 2 * add, limit, memo),
-                         sinkStage(reg.getReset(), 2 * add, limit, memo)});
+        next = std::max({next, sinkStage(reg.getNext(), 2 * add, limit, memo, eb),
+                         sinkStage(reg.getReset(), 2 * add, limit, memo, eb)});
       } else if (isa<seq::FirMemWriteOp>(op)) {
         for (auto operand : op.getOperands())
           if (statePort(operand))
-            last = std::max(last, sinkStage(operand, 0, limit, memo));
+            last = std::max(last, sinkStage(operand, 0, limit, memo, eb));
       } else if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
         auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
         if (memory && memory.getReadLatency() > 0)
-          last = std::max({last, sinkStage(read.getAddress(), 0, limit, memo),
-                           sinkStage(read.getEnable(), 0, limit, memo)});
+          last = std::max({last, sinkStage(read.getAddress(), 0, limit, memo, eb),
+                           sinkStage(read.getEnable(), 0, limit, memo, eb)});
       }
     }
     last = std::max(last, next);
     auto *output = body->getTerminator();
     for (auto [o, out] : llvm::enumerate(cls.outputDepth))
       last = std::max(last, cls.late[o]
-                                ? sinkStage(output->getOperand(o), 0, limit, memo)
+                                ? sinkStage(output->getOperand(o), 0, limit, memo, eb)
                                 : next + (out + limit - 1) / limit);
     cls.stages = unsigned(last);
 
@@ -2218,7 +2234,7 @@ LogicalResult StaticFolder::chooseStages() {
     auto depthOf = [&](Value value, int extra) {
       if (!value)
         return 0;
-      auto s = stageOf(value, kUnbounded, depths);
+      auto s = stageOf(value, kUnbounded, depths, eb);
       return s.stage < 0 ? 0 : s.levels + extra;
     };
     int deepest = 0, nextDepth = 0;
@@ -7508,18 +7524,20 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
   }
   DenseMap<Value, Staging> memo;
   int limit = std::max<int>(2, 2 * stageLevels);
+  // (Its memories' stores keep a row per instance: 2^eb instances.)
+  unsigned eb = cls.threads() > 1 ? llvm::Log2_32_Ceil(cls.threads()) : 0;
   for (;; ++limit) {
     memo.clear();
     int last = 0;
     for (auto sink : sinks)
-      last = std::max(last, sinkStage(sink, 0, limit, memo));
+      last = std::max(last, sinkStage(sink, 0, limit, memo, eb));
     if (last <= int(stages))
       break;
   }
   for (auto &op : *body)
     for (auto result : op.getResults())
       if (!memo.count(result))
-        stageOf(result, limit, memo);
+        stageOf(result, limit, memo, eb);
 
   // The logic's ops, and the same cut latest first (each op in the latest
   // stage its readers allow, the writes at the last): of the two, the one
@@ -7564,7 +7582,7 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
   for (auto *op : llvm::reverse(post)) {
     int levels = 0;
     if (auto read = dyn_cast<seq::FirMemReadOp>(op))
-      levels = 2;
+      levels = readHalfLevels(read, eb);
     else
       levels = stageOpLevels(op);
     int stage = 0, at = 0;
@@ -7964,7 +7982,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   std::pair<unsigned, uint64_t> rowMemories{0, 0};
   if (cls.page) {
     readyRegisters(cls, readyRegs);
-    if ((pageMemoryBits || !pageRows.empty()) && threads > 1 && !cls.stages)
+    // (Staged, with on-chip pages only: a staged class's rows with pages off
+    // chip mismatched its target under bubbles; it keeps its memories.)
+    if ((pageMemoryBits || !pageRows.empty()) && threads > 1 &&
+        (!cls.stages || !cls.pagesOffChip))
       rowMemories = memoriesAsRows(cls, readyRegs, virtualOf);
   }
 

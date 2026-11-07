@@ -70,6 +70,15 @@
 # RUN: FileCheck %s --check-prefix=SH < %t/sh/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/sh/obj %S/Inputs/tb_late.sv top.sv %t/sh/foldsim_sim.sv > %t/sh/build.log 2>&1
 # RUN: %t/sh/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +stall=20 | FileCheck %s
+# A staged class's small memories page as rows (--page-memory-bits, pages
+# on chip; Driver/Inputs/paged_staged: a RAM read through a register), with
+# bubbles and overlapped frames; the reads' half levels count a store of a
+# row per instance (a level per doubling past 64 rows, as the logic screen).
+# RUN: cd %S/../Driver/Inputs/paged_staged
+# RUN: foldsim --srcs top.f --top Top --out %t/rows --static --page 3 --bubbles --modulo --stage-levels 1 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=ROWS < %t/rows/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/rows/obj %S/Inputs/tb_late.sv top.sv %t/rows/foldsim_sim.sv > %t/rows/build.log 2>&1
+# RUN: %t/rows/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +bubble=30 | FileCheck %s
 # A --multicycle request is never ignored: on a class it cannot apply to (late
 # outputs, held reads) or without --stage-levels it is an error naming why; a
 # glob that matches no class is a warning.
@@ -85,6 +94,8 @@
 # RD8: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 2{{$}}
 # RD4: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 5{{$}}
 # SH: Leaf x4 state gap {{[0-9]+}} stages 2{{$}}
+# ROWS: Leaf x4 state gap {{[0-9]+}} stages 2 page 3{{$}}
+# ROWS: pages Leaf: p 3, {{[0-9]+}} registers, {{[0-9]+}} bits (with 1 memories' rows
 # VH5: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 2{{$}}
 # VH2: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 4{{$}}
 # MC1: error: multicycle: Leaf cannot be multicycle: 1 of 1 outputs late, virtual memories read at held addresses
