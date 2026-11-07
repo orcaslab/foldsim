@@ -336,6 +336,7 @@ struct ReplicateControlsPass
     auto dontTouch = sv::SVAttributeAttr::get(context, "DONT_TOUCH", R"("true")",
                                               /*emitAsComment=*/false);
     DenseMap<Operation *, unsigned> position;
+    position.reserve(body->getOperations().size());
     for (auto [i, op] : llvm::enumerate(*body))
       position[&op] = i;
     auto positionOf = [&](Operation *op) {
@@ -352,10 +353,20 @@ struct ReplicateControlsPass
         total += loadsOf(*use);
       if (total <= loads)
         continue;
-      auto sinks = fanout.sinks;
-      llvm::stable_sort(sinks, [&](OpOperand *x, OpOperand *y) {
-        return positionOf(x->getOwner()) < positionOf(y->getOwner());
-      });
+      // Each load's position looked up once, then sorted by it: a lookup in
+      // the map of a whole module (128 SMs: hundreds of millions of ops) is
+      // a cache miss, and a comparison sort made two per comparison, hours
+      // over every control's fanout.
+      SmallVector<std::pair<unsigned, OpOperand *>> keyed;
+      keyed.reserve(fanout.sinks.size());
+      for (auto *use : fanout.sinks)
+        keyed.emplace_back(positionOf(use->getOwner()), use);
+      llvm::stable_sort(keyed, llvm::less_first());
+      SmallVector<OpOperand *> sinks;
+      sinks.reserve(keyed.size());
+      for (auto &[at, use] : keyed)
+        sinks.push_back(use);
+      keyed = {};
       // Groups in module order, each of at most `loads` loads but a single
       // use of more.
       SmallVector<SmallVector<OpOperand *>> groups;
@@ -394,9 +405,9 @@ struct ReplicateControlsPass
           OpBuilder wb(op);
           wb.setInsertionPointAfter(op);
           auto *clone = wb.clone(*op);
-          // A copy of the wiring sorts first, as an op the module order
-          // did not number; entered so that a lookup of it never misses.
-          position[clone] = 0;
+          // A copy of the wiring is never a load of this call (it is wiring,
+          // followed past), so it needs no position (a lookup of an op the
+          // map lacks gives 0 anyway).
           for (auto &operand : clone->getOpOperands())
             operand.set(mapped(operand.get()));
           for (auto [old, copied] :
