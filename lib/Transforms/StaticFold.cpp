@@ -7927,6 +7927,14 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
   Value one = hw::ConstantOp::create(b, b.getI1Type(), 1);
   Value live;
   unsigned onLive = 0, made = 0;
+  DenseMap<Value, SmallVector<Value>> concatParts;
+  for (auto &op : *body)
+    if (auto concat = dyn_cast<comb::ConcatOp>(op);
+        concat && llvm::any_of(concat.getOperands(), [](Value v) {
+          return isa_and_nonnull<hw::ConstantOp>(v.getDefiningOp());
+        }))
+      concatParts[concat.getResult()].assign(concat.getOperands().begin(),
+                                             concat.getOperands().end());
   std::function<Value(Value, unsigned)> delayed = [&](Value value,
                                                       unsigned k) -> Value {
     int from = stageOf(value);
@@ -7934,6 +7942,20 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
       return value;
     if (Value known = delays.lookup({value, k}))
       return known;
+    // A concatenation with constant parts (a zero extension) crosses the
+    // stages as its variable parts alone: no stage register holds a
+    // constant bit, and the logic after it still sees the constant (a
+    // shift by a zero-extended amount compares no high bits).
+    // (Its operands as built: the loop below sets an op's operands to their
+    // values at its own stage.)
+    if (auto it = concatParts.find(value); it != concatParts.end()) {
+      SmallVector<Value> parts;
+      for (auto part : it->second)
+        parts.push_back(delayed(part, k));
+      Value staged = comb::ConcatOp::create(b, parts);
+      delays[{value, k}] = staged;
+      return staged;
+    }
     Value before = delayed(value, k - 1);
     if (!live || onLive == 512) {
       live = seq::CompRegClockEnabledOp::create(
