@@ -73,3 +73,18 @@
 # CAPS-FULL: slr-groups: no assignment of the classes to 2 groups of at most 4,9 sites (the largest class copy: 5 sites)
 # RUN: not foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-groups=2 slr-capacities=4 schedule-only})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CAPS-N
 # CAPS-N: slr-capacities: 1 capacities for 2 groups
+
+# SLLs (super long lines between adjacent SLRs) are a capacity: sll-estimate
+# reports the least link bits any assignment of the classes to the region's SLRs
+# must carry over its worst boundary (three classes of 5 sites, SLRs of 10: one
+# link of 8 bits crosses), against the budget; with slr-groups the budget is a
+# hard limit, and no assignment within it is an error.
+# RUN: foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-sites=Leaf:5,Leaf_copy1:5,Leaf_copy2:5 slr-capacities=10,10,10 sll-estimate slr-sll-budget=6 schedule-only report=%t/sll.txt})' -o /dev/null
+# RUN: FileCheck %s --check-prefix=SLL < %t/sll.txt
+# SLL: sll estimate: 3 SLRs of 10,10,10 sites, budget 6 a boundary
+# SLL-NEXT: boundaries: 0-1 8 1-2 0 link bits (worst 8, total 8): OVER BUDGET
+# RUN: not foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-groups=2 slr-sites=Leaf:5,Leaf_copy1:5,Leaf_copy2:5 slr-capacities=10,10 slr-sll-budget=6 schedule-only})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=SLL-FULL
+# SLL-FULL: with at most 6 link bits over each SLR boundary
+# RUN: foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-groups=2 slr-sites=Leaf:5,Leaf_copy1:5,Leaf_copy2:5 slr-capacities=10,10 slr-sll-budget=8 schedule-only report=%t/sll2.txt})' -o /dev/null
+# RUN: FileCheck %s --check-prefix=SLL-OK < %t/sll2.txt
+# SLL-OK: slr boundaries: 0-1 8 link bits (budget 8)

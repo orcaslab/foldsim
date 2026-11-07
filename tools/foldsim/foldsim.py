@@ -718,15 +718,25 @@ def slr_options(a, foldsim_opt, models, fold, out):
     est = foldsim_degree.class_estimates(models, sorted(set(of.values())))
     sites = {c: round(foldsim_degree.copy_sites(cal, est[of[c]], of[c], n, entries))
              for c, n in classes.items()}
+    if a.slr_region and not a.slr_groups:
+        # --sll-check alone: the SLLs any assignment to the region's SLRs needs
+        # (fold-static sll-estimate), the netlist unchanged.
+        caps = slr_region_capacities(a.slr_region)
+        return (f' sll-estimate slr-sll-budget={slr_region_sll_budget(a.slr_region)} slr-capacities='
+                + ','.join(str(c) for _, c in caps) + ' slr-sites='
+                + ','.join(f'{c}:{s}' for c, s in sites.items()))
     if a.slr_region:
         # Unequal SLRs: group g is the region's g-th SLR, each with its own
         # capacity (its LUTs, with margin, in LUT sites); the floorplan names it.
+        # No boundary may carry more link bits than its SLLs, with margin.
         caps = slr_region_capacities(a.slr_region)
         print(f'foldsim: {len(caps)} SLR groups of at most '
               + ', '.join(f'{n} {c}' for n, c in caps) + ' LUT sites; copies: '
               + ', '.join(f'{c} {s}' for c, s in sites.items()), file=sys.stderr)
         opts = (f' slr-groups={len(caps)} slr-capacities={",".join(str(c) for _, c in caps)} slr-sites='
-                + ','.join(f'{c}:{s}' for c, s in sites.items()))
+                + ','.join(f'{c}:{s}' for c, s in sites.items())
+                + f' slr-sll-budget={slr_region_sll_budget(a.slr_region)}'
+                + (' sll-estimate' if a.sll_check else ''))
     else:
         capacity = a.slr_capacity or round(foldsim_degree.PLACE_MARGIN *
                                            foldsim_degree.PLACE_SITES / a.slr_count)
@@ -748,6 +758,17 @@ def slr_region_capacities(path):
     region = json.load(open(path))
     return [(slr['name'], round(region['margin'] * slr['luts'] * region['sites_per_lut']))
             for slr in region['slrs']]
+
+
+def slr_region_sll_budget(path):
+    """The most link bits an SLR boundary of the region may carry: its SLLs
+    (super long lines; the V80: 18,870 a boundary) times the region's
+    sll_margin (Vivado refuses a partition past the SLLs; leave room for the
+    shell's own crossings and the placer)."""
+    if path == 'v80':
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
+    region = json.load(open(path))
+    return int(region.get('sll_margin', 1.0) * region.get('sll_per_boundary', 0))
 
 
 def write_slr_groups(sv, path, names=None):
@@ -1335,6 +1356,11 @@ def build_parser():
                          'compute shell\'s: foldsim_v80_slr.json, or `v80`): one group per SLR, each '
                          'within its own SLR\'s capacity and assigned to that SLR by name in '
                          '<out>/foldsim_floorplan.tcl; replaces --slr-count and --slr-capacity')
+    ap.add_argument('--sll-check', action='store_true',
+                    help='with --static and --slr-region: report in schedule.txt the SLLs (link bits over '
+                         'each SLR boundary) the design needs at the least over every assignment of its classes '
+                         'to the region\'s SLRs (fold-static sll-estimate), against the boundary budget '
+                         '(sll_per_boundary x sll_margin); with --slr-groups the groups also keep within it')
     ap.add_argument('--slr-assign', default='',
                     help='with --slr-groups: <class>:<group>,...: classes pinned to a group '
                          '(copy j > 0 of a class is <class>_copy<j>)')
@@ -1628,7 +1654,7 @@ def main():
                         else fold + f' storage={",".join(hbm)}')
         if a.state == 'auto':
             fold = choose_state(a, foldsim_opt, flat, passes, out, fold)
-        if a.slr_groups:
+        if a.slr_groups or a.sll_check:
             if a.copies != 'auto':
                 run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
                      '-o', out('models.mlir')])
@@ -1639,7 +1665,7 @@ def main():
         replicate = f'hw.module(foldsim-replicate-controls{{{rc}}})'
         pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}', SPLIT, replicate,
                                         'canonicalize', 'foldsim-sort', 'cse']
-        if a.copies == 'auto' or a.slr_groups:
+        if a.copies == 'auto' or a.slr_groups or a.sll_check:
             sim_input = out('models.mlir')
             pipeline = pipeline[len(passes) + len(OPTIMIZE):]
     else:
@@ -1654,6 +1680,8 @@ def main():
     run([tool('firtool'), '--format=mlir', sim,
          '--add-vivado-ram-address-conflict-synthesis-bug-workaround', '-o', out('foldsim_sim.sv')])
 
+    if a.sll_check and not a.slr_region:
+        sys.exit('--sll-check needs --slr-region')
     if a.slr_groups:
         if not a.static:
             sys.exit('--slr-groups needs --static')

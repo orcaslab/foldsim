@@ -373,7 +373,8 @@ public:
                ArrayRef<std::string> envSinks, unsigned registerStateEntries,
                unsigned slrGroups, ArrayRef<std::string> slrSites,
                uint64_t slrCapacity, ArrayRef<std::string> slrCapacities,
-               ArrayRef<std::string> slrAssign,
+               ArrayRef<std::string> slrAssign, bool sllEstimate,
+               uint64_t sllBudget,
                ArrayRef<std::string> storage, StringRef readyLevels,
                unsigned forwardAfterLevels, bool shareLinkWrites,
                unsigned zeroChainHops, ArrayRef<std::string> page,
@@ -389,7 +390,8 @@ public:
         specGroupSpecs(specGroups), envSinkNames(envSinks),
         specDepth(specDepth), slrGroups(slrGroups), slrSiteSpecs(slrSites),
         slrCapacity(slrCapacity), slrCapacitySpecs(slrCapacities),
-        slrAssignSpecs(slrAssign),
+        slrAssignSpecs(slrAssign), sllEstimate(sllEstimate),
+        sllBudget(sllBudget),
         scheduleOnly(scheduleOnly), oneCycleLinks(oneCycleLinks),
         overlapFrames(overlapFrames), modulo(modulo),
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
@@ -486,6 +488,8 @@ private:
   /// Assigns the classes to SLR groups (`slrOf`): within the capacity, the
   /// shortest frame, then the fewest link bits between groups.
   LogicalResult chooseGroups();
+  LogicalResult parseSlrSpecs(unsigned groups);
+  LogicalResult estimateSlls();
   /// Bits each class's outputs send to each other class's inputs: per
   /// consumer input, the producer bits it reads (a link of its own).
   void linkBits(SmallVectorImpl<SmallVector<uint64_t>> &bits,
@@ -594,6 +598,14 @@ private:
   ArrayRef<std::string> slrCapacitySpecs;
   SmallVector<uint64_t> slrCaps;
   ArrayRef<std::string> slrAssignSpecs;
+  /// SLLs (super long lines between adjacent SLRs): with `sll-estimate`, the
+  /// fewest link bits any assignment of the classes to the region's SLRs
+  /// (slr-capacities, in order: adjacent SLRs adjacent) must carry over its
+  /// worst boundary, reported; with `slr-sll-budget`, the most link bits an SLR
+  /// group assignment may put over any one boundary.
+  bool sllEstimate;
+  uint64_t sllBudget;
+  std::string sllReport;
   SmallVector<int> slrOf;
   SmallVector<uint64_t> slrSites;
   hw::HWModuleOp simModule;
@@ -5357,6 +5369,153 @@ void StaticFolder::linkBits(SmallVectorImpl<SmallVector<uint64_t>> &bits,
   }
 }
 
+/// Each class's LUT sites (slr-sites) and each of `groups` SLRs' capacity
+/// (slr-capacities, else slr-capacity for each).
+LogicalResult StaticFolder::parseSlrSpecs(unsigned groups) {
+  unsigned n = classes.size();
+  slrSites.assign(n, 0);
+  for (auto &spec : slrSiteSpecs) {
+    auto [name, count] = StringRef(spec).rsplit(':');
+    int c = -1;
+    for (auto [i, cls] : llvm::enumerate(classes))
+      if (cls.name == name)
+        c = i;
+    uint64_t sites = 0;
+    if (c < 0 || count.getAsInteger(10, sites))
+      return netlist.emitError("slr-sites: '") << spec
+             << "' is not <class>:<sites> of a class";
+    slrSites[c] = sites;
+  }
+  slrCaps.assign(groups, slrCapacity);
+  if (!slrCapacitySpecs.empty()) {
+    if (slrCapacitySpecs.size() != groups)
+      return netlist.emitError("slr-capacities: ")
+             << slrCapacitySpecs.size() << " capacities for " << groups
+             << " groups";
+    for (auto [g, spec] : llvm::enumerate(slrCapacitySpecs))
+      if (StringRef(spec).getAsInteger(10, slrCaps[g]))
+        return netlist.emitError("slr-capacities: '") << spec
+               << "' is not a number of sites";
+  }
+  return success();
+}
+
+/// The SLLs the design needs at the least: over the assignments of the
+/// classes (each copy whole) to the region's SLRs in order, within each SLR's
+/// capacity, the smallest worst boundary of link bits (a link between SLRs i
+/// and j crosses every boundary between them), by branch and bound over the
+/// classes, the largest first. A class larger than every SLR cannot be placed
+/// whole: its own cut is not known here, and it is named.
+LogicalResult StaticFolder::estimateSlls() {
+  unsigned n = classes.size();
+  unsigned groups = slrCapacitySpecs.size();
+  if (!groups)
+    return netlist.emitError("sll-estimate needs slr-capacities");
+  if (failed(parseSlrSpecs(groups)))
+    return failure();
+  SmallVector<SmallVector<uint64_t>> bits;
+  SmallVector<SmallVector<unsigned>> links;
+  linkBits(bits, links);
+  SmallVector<unsigned> order;
+  for (unsigned c = 0; c < n; ++c)
+    order.push_back(c);
+  llvm::stable_sort(order, [&](unsigned x, unsigned y) {
+    return slrSites[x] > slrSites[y];
+  });
+  uint64_t largestCap = *llvm::max_element(slrCaps);
+  std::string tooLarge;
+  for (unsigned c = 0; c < n; ++c)
+    if (slrSites[c] > largestCap)
+      tooLarge += " " + classes[c].name + " (" + std::to_string(slrSites[c]) +
+                  " sites)";
+  SmallVector<int> group(n, -1), best;
+  SmallVector<uint64_t> used(groups, 0), cut(groups ? groups - 1 : 0, 0),
+      bestCut;
+  uint64_t bestWorst = ~0ull, bestTotal = ~0ull, visited = 0;
+  std::function<void(unsigned)> visit = [&](unsigned k) {
+    if (++visited > 20'000'000)
+      return;
+    uint64_t worst = cut.empty() ? 0 : *llvm::max_element(cut);
+    if (worst > bestWorst)
+      return;
+    if (k == n) {
+      uint64_t total = 0;
+      for (auto x : cut)
+        total += x;
+      if (worst < bestWorst || (worst == bestWorst && total < bestTotal)) {
+        bestWorst = worst;
+        bestTotal = total;
+        best = group;
+        bestCut.assign(cut.begin(), cut.end());
+      }
+      return;
+    }
+    unsigned c = order[k];
+    for (unsigned g = 0; g < groups; ++g) {
+      // A class larger than every SLR goes to the largest (its own cut is
+      // unknown); any other within its SLR's capacity.
+      bool fits = slrSites[c] > largestCap ? slrCaps[g] == largestCap
+                                            : used[g] + slrSites[c] <= slrCaps[g];
+      if (!fits)
+        continue;
+      SmallVector<uint64_t> added(cut.size(), 0);
+      for (unsigned j = 0; j < k; ++j) {
+        unsigned d = order[j];
+        unsigned h = group[d];
+        if (h == g)
+          continue;
+        uint64_t w = bits[c][d] + bits[d][c];
+        for (unsigned b = std::min(g, h); b < std::max(g, h); ++b)
+          added[b] += w;
+      }
+      for (unsigned b = 0; b < cut.size(); ++b)
+        cut[b] += added[b];
+      group[c] = g;
+      used[g] += slrSites[c];
+      visit(k + 1);
+      used[g] -= slrSites[c];
+      group[c] = -1;
+      for (unsigned b = 0; b < cut.size(); ++b)
+        cut[b] -= added[b];
+    }
+  };
+  visit(0);
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  os << "  sll estimate: " << groups << " SLRs of ";
+  for (auto [g, cap] : llvm::enumerate(slrCaps))
+    os << (g ? "," : "") << cap;
+  os << " sites";
+  if (sllBudget)
+    os << ", budget " << sllBudget << " a boundary";
+  os << "\n";
+  if (best.empty()) {
+    os << "    no assignment within the SLRs' capacities"
+       << (visited > 20'000'000 ? " found (search capped)" : "") << "\n";
+  } else {
+    os << "    boundaries:";
+    for (auto [b, x] : llvm::enumerate(bestCut))
+      os << " " << b << "-" << b + 1 << " " << x;
+    os << " link bits (worst " << bestWorst << ", total " << bestTotal << ")"
+       << (visited > 20'000'000 ? " (search capped: an upper bound)" : "")
+       << (sllBudget && bestWorst > sllBudget ? ": OVER BUDGET" : "") << "\n";
+    for (unsigned g = 0; g < groups; ++g) {
+      uint64_t sites = 0;
+      std::string members;
+      for (unsigned c = 0; c < n; ++c)
+        if (best[c] == int(g)) {
+          sites += slrSites[c];
+          members += " " + classes[c].name;
+        }
+      os << "    slr" << g << " (" << sites << " sites):" << members << "\n";
+    }
+  }
+  if (!tooLarge.empty())
+    os << "    larger than every SLR (its own cut unknown):" << tooLarge << "\n";
+  sllReport = text;
+  return success();
+}
+
 LogicalResult StaticFolder::chooseGroups() {
   unsigned n = classes.size();
   auto classNamed = [&](StringRef name) -> int {
@@ -5365,16 +5524,8 @@ LogicalResult StaticFolder::chooseGroups() {
         return c;
     return -1;
   };
-  slrSites.assign(n, 0);
-  for (auto &spec : slrSiteSpecs) {
-    auto [name, count] = StringRef(spec).rsplit(':');
-    int c = classNamed(name);
-    uint64_t sites = 0;
-    if (c < 0 || count.getAsInteger(10, sites))
-      return netlist.emitError("slr-sites: '") << spec
-             << "' is not <class>:<sites> of a class";
-    slrSites[c] = sites;
-  }
+  if (failed(parseSlrSpecs(slrGroups)))
+    return failure();
   SmallVector<int> pinned(n, -1);
   for (auto &spec : slrAssignSpecs) {
     auto [name, group] = StringRef(spec).rsplit(':');
@@ -5385,17 +5536,6 @@ LogicalResult StaticFolder::chooseGroups() {
              << "' is not <class>:<group> of a class and a group below "
              << slrGroups;
     pinned[c] = g;
-  }
-  slrCaps.assign(slrGroups, slrCapacity);
-  if (!slrCapacitySpecs.empty()) {
-    if (slrCapacitySpecs.size() != slrGroups)
-      return netlist.emitError("slr-capacities: ")
-             << slrCapacitySpecs.size() << " capacities for " << slrGroups
-             << " groups";
-    for (auto [g, spec] : llvm::enumerate(slrCapacitySpecs))
-      if (StringRef(spec).getAsInteger(10, slrCaps[g]))
-        return netlist.emitError("slr-capacities: '") << spec
-               << "' is not a number of sites";
   }
   SmallVector<SmallVector<uint64_t>> bits;
   SmallVector<SmallVector<unsigned>> links;
@@ -5417,6 +5557,11 @@ LogicalResult StaticFolder::chooseGroups() {
   std::vector<std::pair<uint64_t, SmallVector<int>>> kept;
   SmallVector<int> group(n, -1);
   SmallVector<uint64_t> used(slrGroups, 0);
+  // With slr-capacities the groups are the region's SLRs in order: a link
+  // between groups i and j crosses every boundary between them, and with
+  // slr-sll-budget no boundary may carry more link bits than the budget.
+  bool budgeted = sllBudget && !slrCapacitySpecs.empty();
+  SmallVector<uint64_t> boundary(slrGroups ? slrGroups - 1 : 0, 0);
   uint64_t visited = 0;
   std::function<void(unsigned, unsigned, uint64_t)> visit =
       [&](unsigned k, unsigned opened, uint64_t cut) {
@@ -5445,11 +5590,31 @@ LogicalResult StaticFolder::chooseGroups() {
             if (group[d] != int(g))
               more += bits[c][d] + bits[d][c];
           }
+          SmallVector<uint64_t> added(boundary.size(), 0);
+          if (budgeted) {
+            bool over = false;
+            for (unsigned j = 0; j < k; ++j) {
+              unsigned d = order[j];
+              unsigned h = group[d];
+              if (h == g)
+                continue;
+              for (unsigned b = std::min(g, h); b < std::max(g, h); ++b)
+                added[b] += bits[c][d] + bits[d][c];
+            }
+            for (unsigned b = 0; b < boundary.size(); ++b)
+              over |= boundary[b] + added[b] > sllBudget;
+            if (over)
+              continue;
+            for (unsigned b = 0; b < boundary.size(); ++b)
+              boundary[b] += added[b];
+          }
           group[c] = g;
           used[g] += slrSites[c];
           visit(k + 1, std::max(opened, g + 1), cut + more);
           used[g] -= slrSites[c];
           group[c] = -1;
+          for (unsigned b = 0; b < boundary.size(); ++b)
+            boundary[b] -= added[b];
         }
       };
   visit(0, 0, 0);
@@ -5465,7 +5630,10 @@ LogicalResult StaticFolder::chooseGroups() {
       largest = std::max(largest, sites);
     return netlist.emitError("slr-groups: no assignment of the classes to ")
            << slrGroups << " groups of at most " << caps
-           << " sites (the largest class copy: " << largest << " sites)";
+           << " sites (the largest class copy: " << largest << " sites)"
+           << (budgeted ? " with at most " + std::to_string(sllBudget) +
+                              " link bits over each SLR boundary"
+                        : std::string());
   }
 
   // Of those, the shortest frame, then the fewest bits between groups.
@@ -6179,6 +6347,8 @@ LogicalResult StaticFolder::schedule() {
     return netlist.emitError("ready-levels '")
            << readyLevelsMode << "' is none of off, auto, always and rank";
   splitReady = readyLevelsMode == "always" || readyLevelsMode == "rank";
+  if (sllEstimate && failed(estimateSlls()))
+    return failure();
   if (slrGroups && failed(chooseGroups()))
     return failure();
   Choice best = searchReady();
@@ -6298,6 +6468,7 @@ LogicalResult StaticFolder::schedule() {
       os << "  chains cut past " << zeroChainHops << " hops: "
          << cutLinks.size() << " links\n";
   }
+  os << sllReport;
   if (!slrOf.empty()) {
     SmallVector<SmallVector<uint64_t>> bits;
     SmallVector<SmallVector<unsigned>> links;
@@ -6333,6 +6504,21 @@ LogicalResult StaticFolder::schedule() {
     }
     os << "  slr links registered: " << crossLinks << " of " << allLinks
        << " links, " << crossBits << " of " << allBits << " bits\n";
+    // Groups that are the region's SLRs in order: the link bits over each
+    // boundary, the SLLs they take.
+    if (!slrCapacitySpecs.empty() && slrGroups > 1) {
+      SmallVector<uint64_t> over(slrGroups - 1, 0);
+      for (unsigned p = 0; p < classes.size(); ++p)
+        for (unsigned c = 0; c < classes.size(); ++c)
+          if (slrOf[p] >= 0 && slrOf[c] >= 0 && slrOf[p] != slrOf[c])
+            for (int b = std::min(slrOf[p], slrOf[c]);
+                 b < std::max(slrOf[p], slrOf[c]); ++b)
+              over[b] += bits[p][c];
+      os << "  slr boundaries:";
+      for (auto [b, x] : llvm::enumerate(over))
+        os << " " << b << "-" << b + 1 << " " << x;
+      os << " link bits" << (sllBudget ? " (budget " + std::to_string(sllBudget) + ")" : std::string()) << "\n";
+    }
     for (unsigned p = 0; p < classes.size(); ++p)
       for (unsigned c = 0; c < classes.size(); ++c)
         if (crosses(p, c) && links[p][c])
@@ -13023,8 +13209,8 @@ void FoldStaticPass::runOnOperation() {
                       vmemSkipHeldReads, stagedEnv,
                       specGroups, specDepth,
                       envSinks, registerStateEntries, slrGroups, slrSites,
-                      slrCapacity, slrCapacities, slrAssign, storage,
-                      readyLevels,
+                      slrCapacity, slrCapacities, slrAssign, sllEstimate,
+                      slrSllBudget, storage, readyLevels,
                       forwardAfterLevels, shareLinkWrites, zeroChainHops,
                       page, pageMasks, pageHbmColumnBits, pageHbmWindow,
                       pageEngines, pageMemoryBits, pageMemories, pageRows, compactLinks,

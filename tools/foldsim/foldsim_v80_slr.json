@@ -1,10 +1,30 @@
 {
-  "about": "The V80 compute shell's dynamic region (pblock_slash, SLASH linker/slashkit/resources/base/compute/constraints/impl.xdc) per SLR, its sites counted by Vivado 2025.2 on b4e's opt checkpoint (11-07). Unequal: the static region owns most of SLR0. sites_per_lut converts placed LUTs to foldsim_degree's LUT sites: b4e's largest SLR group, 978,886 estimated sites placed as 672,695 LUTs (post-synth hierarchical utilization), the group that spilled over SLR2/SLR1 at 95 % of SLR2's LUTs. margin: the share of an SLR's LUTs a group may fill and still route at 200 MHz.",
-  "sites_per_lut": 1.455,
-  "margin": 0.85,
-  "slrs": [
-    {"name": "SLR2", "luts": 707808, "lutram_luts": 353904, "ramb36": 975, "uram": 496},
-    {"name": "SLR1", "luts": 665952, "lutram_luts": 332976, "ramb36": 1044, "uram": 511},
-    {"name": "SLR0", "luts": 261120, "lutram_luts": 130560, "ramb36": 396, "uram": 204}
-  ]
+ "about": "The V80 compute shell's dynamic region (pblock_slash, SLASH linker/slashkit/resources/base/compute/constraints/impl.xdc) per SLR, its sites counted by Vivado 2025.2 on b4e's opt checkpoint (11-07). Unequal: the static region owns most of SLR0. sites_per_lut converts placed LUTs to foldsim_degree's LUT sites: b4e's largest SLR group, 978,886 estimated sites placed as 672,695 LUTs (post-synth hierarchical utilization), the group that spilled over SLR2/SLR1 at 95 % of SLR2's LUTs. margin: the share of an SLR's LUTs a group may fill and still route at 200 MHz. sll_per_boundary: the V80's super long lines between adjacent SLRs (report_utilization -slr, both boundaries 18,870; Vivado refuses a partition past it: r16c, 11-07, 23,987 needed between SLR1 and SLR2). sll_margin: the share of them the fold's link bits may take (the rest for the shell's crossings and the placer).",
+ "sites_per_lut": 1.455,
+ "margin": 0.85,
+ "slrs": [
+  {
+   "name": "SLR2",
+   "luts": 707808,
+   "lutram_luts": 353904,
+   "ramb36": 975,
+   "uram": 496
+  },
+  {
+   "name": "SLR1",
+   "luts": 665952,
+   "lutram_luts": 332976,
+   "ramb36": 1044,
+   "uram": 511
+  },
+  {
+   "name": "SLR0",
+   "luts": 261120,
+   "lutram_luts": 130560,
+   "ramb36": 396,
+   "uram": 204
+  }
+ ],
+ "sll_per_boundary": 18870,
+ "sll_margin": 0.85
 }

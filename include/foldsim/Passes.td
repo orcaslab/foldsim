@@ -449,6 +449,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "With slr-groups, each group's most LUT sites, one per group: "
                "group g is the region's g-th SLR (the floorplan names it), so "
                "unequal SLRs each take what fits them; replaces slr-capacity">,
+    Option<"sllEstimate", "sll-estimate", "bool", "false",
+           "Report the SLLs the design needs at the least: of the assignments "
+           "of the classes to the region's SLRs (slr-capacities, in order, "
+           "and slr-sites), the smallest worst boundary of link bits; a class "
+           "larger than every SLR is named (its own cut is not known)">,
+    Option<"slrSllBudget", "slr-sll-budget", "uint64_t", "0",
+           "With slr-groups and slr-capacities, the most link bits an "
+           "assignment may put over any one SLR boundary (its SLLs; 0: any)">,
     ListOption<"slrAssign", "slr-assign", "std::string",
                "With slr-groups, classes pinned to a group, as "
                "<class>:<group>">,
