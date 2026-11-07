@@ -126,7 +126,7 @@ def main():
     f.add_argument('--period-ns', type=float, default=5.0)
     s = sub.add_parser('score')
     s.add_argument('screen')
-    s.add_argument('--calibration', required=True)
+    s.add_argument('--calibration', default=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_timing.json'))
     s.add_argument('--schedule')
     s.add_argument('--slr-region')
     s.add_argument('--named', action='store_true', help='the floorplan assigns group g to the g-th SLR')
