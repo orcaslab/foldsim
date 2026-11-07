@@ -1,0 +1,10 @@
+{
+ "about": "Beacon's routing terms on the V80 (foldsim_beacon_terms.py fit): 6,432 user-clock paths of b4e's post-place phys_opt checkpoint (11-07, 4-SM A100-class fold at 5.000 ns), up to 500 per slack band from -3 to +5 ns; path delay = 5.0 ns - slack against logic levels, log2 of the path's largest net fanout and whether it changes SLR. At 200 MHz: 13.9 levels with no fanout or crossing, a crossing ~5.2 levels, a fanout of 8,192 ~6.7 levels.",
+ "intercept_ns": 0.46833069805914107,
+ "ns_per_level": 0.32594784645615704,
+ "ns_per_log2_fanout": 0.16700389660345913,
+ "ns_slr_crossing": 1.69266755552616,
+ "r2": 0.8311303284092785,
+ "rmse_ns": 0.7279787615206388,
+ "paths": 6432
+}
