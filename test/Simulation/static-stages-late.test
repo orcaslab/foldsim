@@ -60,9 +60,20 @@
 # RUN: foldsim --srcs top_ready.f --top Top --out %t/v8 --static --virtual-memories ram --vmem-skip-held-reads --page 2 --stage-levels 1 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=2 -DWRITE_FIRST -DIW=3 -Mdir %t/v8/obj %S/Inputs/tb_vmem.sv top_ready.sv %t/v8/foldsim_sim.sv > %t/v8/build.log 2>&1
 # RUN: %t/v8/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=30 +stall=20 +maxreads=1600 | FileCheck %s --check-prefix=FEW
+# Registers whose write data is another register's value (Driver/Inputs/
+# staged_shift: a shift register with enables, in both orders): the staged
+# copy keeps every write's value before replacing any register (one taken
+# after its source register was replaced named a freed value: fsd_node_model
+# of the FireSim datacenter crashed so, an i1 value as a 13-bit address).
+# RUN: cd %S/../Driver/Inputs/staged_shift
+# RUN: foldsim --srcs top.f --top Top --out %t/sh --static --stage-levels 2 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=SH < %t/sh/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/sh/obj %S/Inputs/tb_late.sv top.sv %t/sh/foldsim_sim.sv > %t/sh/build.log 2>&1
+# RUN: %t/sh/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +stall=20 | FileCheck %s
 # A --multicycle request is never ignored: on a class it cannot apply to (late
 # outputs, held reads) or without --stage-levels it is an error naming why; a
 # glob that matches no class is a warning.
+# RUN: cd %S/../Driver/Inputs/vmem_held
 # RUN: not foldsim --srcs top.f --top Top --out %t/mc1 --static --virtual-memories ram --vmem-skip-held-reads --multicycle Leaf:3 --stage-levels 1 Leaf > %t/mc1.log 2>&1
 # RUN: FileCheck %s --check-prefix=MC1 < %t/mc1.log
 # RUN: not foldsim --srcs top.f --top Top --out %t/mc2 --static --multicycle Leaf:3 Leaf > %t/mc2.log 2>&1
@@ -73,6 +84,7 @@
 # ST6: Leaf x4 state gap {{[0-9]+}} stages 3{{$}}
 # RD8: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 2{{$}}
 # RD4: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 5{{$}}
+# SH: Leaf x4 state gap {{[0-9]+}} stages 2{{$}}
 # VH5: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 2{{$}}
 # VH2: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 4{{$}}
 # MC1: error: multicycle: Leaf cannot be multicycle: 1 of 1 outputs late, virtual memories read at held addresses

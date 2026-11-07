@@ -7221,16 +7221,12 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
     write.next = edges.get(reg.getType());
     write.reg = seq::FirRegOp::create(b, write.next, reg.getClk(),
                                       reg.getNameAttr());
-    reg.getResult().replaceAllUsesWith(write.reg.getResult());
-    // (A register a ready pass reads keeps its store as its replacement.)
-    if (readyRegs.erase(reg))
-      readyRegs.insert(write.reg);
-    reg.erase();
     writes.push_back(write);
   }
-  // The registers' old next values, now dead; the writes' values held as
-  // uses meanwhile (a value of the old next value may have had the register
-  // as its only user).
+  // The writes' values held as uses (a value of the old next value may have
+  // had the register as its only user), before any register is replaced: a
+  // write's data may be another register's value (a shift register's), which
+  // its replacement then takes in the keeper too.
   SmallVector<Value> kept;
   for (auto &write : writes) {
     if (write.enable)
@@ -7240,6 +7236,14 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
   }
   auto *keeper = UnrealizedConversionCastOp::create(b, TypeRange{}, kept)
                      .getOperation();
+  for (auto [reg, write] : llvm::zip(regs, writes)) {
+    reg.getResult().replaceAllUsesWith(write.reg.getResult());
+    // (A register a ready pass reads keeps its store as its replacement.)
+    if (readyRegs.erase(reg))
+      readyRegs.insert(write.reg);
+    reg.erase();
+  }
+  // The registers' old next values, now dead.
   for (bool erased = true; erased;) {
     erased = false;
     for (auto &op : llvm::make_early_inc_range(llvm::reverse(*body)))
