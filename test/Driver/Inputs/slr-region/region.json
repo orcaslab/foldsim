@@ -1,0 +1,2 @@
+{"about": "test region: a large SLR, a small one", "sites_per_lut": 1.0, "margin": 1.0,
+ "slrs": [{"name": "SLR2", "luts": 1000000}, {"name": "SLR0", "luts": 10}]}

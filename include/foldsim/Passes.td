@@ -445,6 +445,10 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "(a class not listed takes none)">,
     Option<"slrCapacity", "slr-capacity", "uint64_t", "0",
            "With slr-groups, the most LUT sites of a group (0: any)">,
+    ListOption<"slrCapacities", "slr-capacities", "std::string",
+               "With slr-groups, each group's most LUT sites, one per group: "
+               "group g is the region's g-th SLR (the floorplan names it), so "
+               "unequal SLRs each take what fits them; replaces slr-capacity">,
     ListOption<"slrAssign", "slr-assign", "std::string",
                "With slr-groups, classes pinned to a group, as "
                "<class>:<group>">,

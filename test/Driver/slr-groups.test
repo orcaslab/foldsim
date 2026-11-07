@@ -50,3 +50,26 @@
 # No assignment within the capacity is an error.
 # RUN: not foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-groups=2 slr-sites=Leaf:5,Leaf_copy1:5,Leaf_copy2:5 slr-capacity=6 schedule-only})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=FULL
 # FULL: slr-groups: no assignment of the classes to 2 groups of at most 6 sites
+
+# Unequal SLRs (--slr-region): one group per SLR of the region, each within its
+# own capacity, assigned to that SLR by name in the floorplan. The small SLR
+# takes nothing that does not fit it.
+# RUN: cd %S/Inputs/source-list
+# RUN: foldsim --srcs top.f --top Top --out %t/region --static --copies Leaf:2 --slr-groups --slr-region %S/Inputs/slr-region/region.json Leaf 2>&1 | FileCheck %s --check-prefix=REGION
+# RUN: FileCheck %s --check-prefix=PLAN3 < %t/region/foldsim_floorplan.tcl
+# REGION: foldsim: 2 SLR groups of at most SLR2 1000000, SLR0 10 LUT sites
+# REGION: slr groups: 2 of at most 1000000,10 sites
+# REGION-NEXT: slr0 ({{[0-9]+}} sites): Leaf Top_model Leaf_copy1
+# PLAN3: set_property USER_SLR_ASSIGNMENT SLR2 $c
+# PLAN3-NOT: fs_slr
+
+# Per-group capacities: a group too small for any class stays empty; one
+# capacity per group, else an error.
+# RUN: foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-groups=2 slr-sites=Leaf:5,Leaf_copy1:5,Leaf_copy2:5 slr-capacities=4,20 schedule-only report=%t/caps.txt})' -o /dev/null
+# RUN: FileCheck %s --check-prefix=CAPS < %t/caps.txt
+# CAPS: slr groups: 2 of at most 4,20 sites
+# CAPS-NEXT: slr1 (15 sites):
+# RUN: not foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-groups=2 slr-sites=Leaf:5,Leaf_copy1:5,Leaf_copy2:5 slr-capacities=4,9 schedule-only})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CAPS-FULL
+# CAPS-FULL: slr-groups: no assignment of the classes to 2 groups of at most 4,9 sites (the largest class copy: 5 sites)
+# RUN: not foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-groups=2 slr-capacities=4 schedule-only})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CAPS-N
+# CAPS-N: slr-capacities: 1 capacities for 2 groups

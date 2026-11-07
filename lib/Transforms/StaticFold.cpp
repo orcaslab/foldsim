@@ -372,7 +372,8 @@ public:
                bool stagedEnv, ArrayRef<std::string> specGroups, unsigned specDepth,
                ArrayRef<std::string> envSinks, unsigned registerStateEntries,
                unsigned slrGroups, ArrayRef<std::string> slrSites,
-               uint64_t slrCapacity, ArrayRef<std::string> slrAssign,
+               uint64_t slrCapacity, ArrayRef<std::string> slrCapacities,
+               ArrayRef<std::string> slrAssign,
                ArrayRef<std::string> storage, StringRef readyLevels,
                unsigned forwardAfterLevels, bool shareLinkWrites,
                unsigned zeroChainHops, ArrayRef<std::string> page,
@@ -387,7 +388,8 @@ public:
         reportPath(report), copies(copies), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
         specDepth(specDepth), slrGroups(slrGroups), slrSiteSpecs(slrSites),
-        slrCapacity(slrCapacity), slrAssignSpecs(slrAssign),
+        slrCapacity(slrCapacity), slrCapacitySpecs(slrCapacities),
+        slrAssignSpecs(slrAssign),
         scheduleOnly(scheduleOnly), oneCycleLinks(oneCycleLinks),
         overlapFrames(overlapFrames), modulo(modulo),
         interleaveCopies(interleaveCopies), zeroLatencyLinks(zeroLatencyLinks),
@@ -586,6 +588,11 @@ private:
   unsigned slrGroups;
   ArrayRef<std::string> slrSiteSpecs;
   uint64_t slrCapacity;
+  /// Each group's most sites, if the groups differ (`slr-capacities`: group g
+  /// is the g-th SLR of the region, which the floorplan names); else every
+  /// group's is slrCapacity and the groups are alike.
+  ArrayRef<std::string> slrCapacitySpecs;
+  SmallVector<uint64_t> slrCaps;
   ArrayRef<std::string> slrAssignSpecs;
   SmallVector<int> slrOf;
   SmallVector<uint64_t> slrSites;
@@ -5379,13 +5386,25 @@ LogicalResult StaticFolder::chooseGroups() {
              << slrGroups;
     pinned[c] = g;
   }
+  slrCaps.assign(slrGroups, slrCapacity);
+  if (!slrCapacitySpecs.empty()) {
+    if (slrCapacitySpecs.size() != slrGroups)
+      return netlist.emitError("slr-capacities: ")
+             << slrCapacitySpecs.size() << " capacities for " << slrGroups
+             << " groups";
+    for (auto [g, spec] : llvm::enumerate(slrCapacitySpecs))
+      if (StringRef(spec).getAsInteger(10, slrCaps[g]))
+        return netlist.emitError("slr-capacities: '") << spec
+               << "' is not a number of sites";
+  }
   SmallVector<SmallVector<uint64_t>> bits;
   SmallVector<SmallVector<unsigned>> links;
   linkBits(bits, links);
 
   // The assignments within the capacity with the fewest bits between groups,
   // by branch and bound over the classes, the largest first; a group is
-  // opened in order (the groups are alike) unless some class is pinned.
+  // opened in order (the groups are alike) unless some class is pinned or
+  // the groups' capacities differ.
   constexpr unsigned kKept = 64;
   SmallVector<unsigned> order;
   for (unsigned c = 0; c < n; ++c)
@@ -5393,7 +5412,8 @@ LogicalResult StaticFolder::chooseGroups() {
   llvm::stable_sort(order, [&](unsigned x, unsigned y) {
     return slrSites[x] > slrSites[y];
   });
-  bool anyPinned = llvm::any_of(pinned, [](int g) { return g >= 0; });
+  bool anyPinned = llvm::any_of(pinned, [](int g) { return g >= 0; }) ||
+                   !slrCapacitySpecs.empty();
   std::vector<std::pair<uint64_t, SmallVector<int>>> kept;
   SmallVector<int> group(n, -1);
   SmallVector<uint64_t> used(slrGroups, 0);
@@ -5417,7 +5437,7 @@ LogicalResult StaticFolder::chooseGroups() {
         for (unsigned g = 0; g < limit; ++g) {
           if (pinned[c] >= 0 && int(g) != pinned[c])
             continue;
-          if (slrCapacity && used[g] + slrSites[c] > slrCapacity)
+          if (slrCaps[g] && used[g] + slrSites[c] > slrCaps[g])
             continue;
           uint64_t more = 0;
           for (unsigned j = 0; j < k; ++j) {
@@ -5433,9 +5453,20 @@ LogicalResult StaticFolder::chooseGroups() {
         }
       };
   visit(0, 0, 0);
-  if (kept.empty())
+  if (kept.empty()) {
+    std::string caps = std::to_string(slrCapacity);
+    if (!slrCapacitySpecs.empty()) {
+      caps.clear();
+      for (auto [g, cap] : llvm::enumerate(slrCaps))
+        caps += (g ? "," : "") + std::to_string(cap);
+    }
+    uint64_t largest = 0;
+    for (auto sites : slrSites)
+      largest = std::max(largest, sites);
     return netlist.emitError("slr-groups: no assignment of the classes to ")
-           << slrGroups << " groups of at most " << slrCapacity << " sites";
+           << slrGroups << " groups of at most " << caps
+           << " sites (the largest class copy: " << largest << " sites)";
+  }
 
   // Of those, the shortest frame, then the fewest bits between groups.
   unsigned bestLength = 0;
@@ -6282,9 +6313,13 @@ LogicalResult StaticFolder::schedule() {
           crossLinks += links[p][c];
         }
       }
-    os << "  slr groups: " << slrGroups << " of at most "
-       << (slrCapacity ? std::to_string(slrCapacity) : std::string("any"))
-       << " sites\n";
+    os << "  slr groups: " << slrGroups << " of at most ";
+    if (slrCapacitySpecs.empty())
+      os << (slrCapacity ? std::to_string(slrCapacity) : std::string("any"));
+    else
+      for (auto [g, cap] : llvm::enumerate(slrCaps))
+        os << (g ? "," : "") << cap;
+    os << " sites\n";
     for (unsigned g = 0; g < slrGroups; ++g) {
       uint64_t sites = 0;
       std::string members;
@@ -12988,7 +13023,8 @@ void FoldStaticPass::runOnOperation() {
                       vmemSkipHeldReads, stagedEnv,
                       specGroups, specDepth,
                       envSinks, registerStateEntries, slrGroups, slrSites,
-                      slrCapacity, slrAssign, storage, readyLevels,
+                      slrCapacity, slrCapacities, slrAssign, storage,
+                      readyLevels,
                       forwardAfterLevels, shareLinkWrites, zeroChainHops,
                       page, pageMasks, pageHbmColumnBits, pageHbmWindow,
                       pageEngines, pageMemoryBits, pageMemories, pageRows, compactLinks,
