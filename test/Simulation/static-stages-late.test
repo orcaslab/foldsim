@@ -1,0 +1,85 @@
+# REQUIRES: verilator
+# Staged evaluation (--stage-levels) of classes with late outputs and held
+# virtual-memory reads. Every pass of a staged class (its ready passes too)
+# reads its state and inputs its stages before its slot and writes its outputs
+# at its slot from the last stage: a late output takes the stages as latency
+# (its readers wait for the slot), and a ready pass reads the stages before
+# it. A held read's request leaves a host cycle after the state pass from
+# registers of the last stage's row, held row and enables (the skip decided
+# there, for the state pass's instance). Against the targets, with bubbles and
+# stalled channels:
+# - Driver/Inputs/late_staged (tb_late.sv): a leaf whose output is late and
+#   deep (a combinational RAM read through two multiplies, mixed with its
+#   input); top_state.sv: four leaves' outputs written at their state passes;
+#   top_ready.sv: the last leaf's output back into the first leaf's state in
+#   the same cycle (ready passes), at 2 and 5 stages, and paged, two copies
+#   under nested sequencers with zero-latency, shared, staged and compact
+#   links; top.sv: a chain, the cut soonest first.
+# - Driver/Inputs/vmem_held_deep (tb_vmem.sv): the same with the RAM virtual
+#   and read at a held address (--vmem-skip-held-reads): fewer reads than
+#   cycles x instances, staged 2 and 4 stages, the cut soonest first (a held
+#   row of the read side's stage 0 instead mismatches at cycle 5), and paged
+#   copies with ready passes (paged registers the ready passes read keep their
+#   stores through the stages); Driver/Inputs/vmem_held: eight leaves, paged.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/late_staged
+# RUN: foldsim --srcs top_state.f --top Top --out %t/st0 --static --bubbles Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/st0/obj %S/Inputs/tb_late.sv leaf.sv top_state.sv %t/st0/foldsim_sim.sv > %t/st0/build.log 2>&1
+# RUN: %t/st0/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top_state.f --top Top --out %t/st6 --static --bubbles --stage-levels 6 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=ST6 < %t/st6/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/st6/obj %S/Inputs/tb_late.sv leaf.sv top_state.sv %t/st6/foldsim_sim.sv > %t/st6/build.log 2>&1
+# RUN: %t/st6/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top_ready.f --top Top --out %t/rd8 --static --bubbles --stage-levels 8 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=RD8 < %t/rd8/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/rd8/obj %S/Inputs/tb_late.sv leaf.sv top_ready.sv %t/rd8/foldsim_sim.sv > %t/rd8/build.log 2>&1
+# RUN: %t/rd8/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top_ready.f --top Top --out %t/rd4 --static --bubbles --stage-levels 4 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=RD4 < %t/rd4/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/rd4/obj %S/Inputs/tb_late.sv leaf.sv top_ready.sv %t/rd4/foldsim_sim.sv > %t/rd4/build.log 2>&1
+# RUN: %t/rd4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top_ready.f --top Top --out %t/rdk --static --bubbles --nest --modulo --zero-latency-links --zero-latency-chains --compact-links --share-links --staged-links --copies Leaf:2 --page 2 --stage-levels 4 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/rdk/obj %S/Inputs/tb_late.sv leaf.sv top_ready.sv %t/rdk/foldsim_sim.sv > %t/rdk/build.log 2>&1
+# RUN: %t/rdk/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +bubble=30 +stall=20 | FileCheck %s
+# RUN: env FOLDSIM_STAGE_CUT=soonest foldsim --srcs top.f --top Top --out %t/ch --static --bubbles --short-lead --nest --copies Leaf:2 --stage-levels 8 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/ch/obj %S/Inputs/tb_late.sv leaf.sv top.sv %t/ch/foldsim_sim.sv > %t/ch/build.log 2>&1
+# RUN: %t/ch/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +bubble=30 +stall=20 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/vmem_held_deep
+# RUN: foldsim --srcs top.f --top Top --out %t/vh5 --static --virtual-memories ram --vmem-skip-held-reads --stage-levels 5 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=VH5 < %t/vh5/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=2 -DWRITE_FIRST -Mdir %t/vh5/obj %S/Inputs/tb_vmem.sv leaf.sv top.sv %t/vh5/foldsim_sim.sv > %t/vh5/build.log 2>&1
+# RUN: %t/vh5/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 +maxreads=600 | FileCheck %s --check-prefix=FEW
+# RUN: %t/vh5/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 +maxreads=600 | FileCheck %s --check-prefix=FEW
+# RUN: env FOLDSIM_STAGE_CUT=soonest foldsim --srcs top.f --top Top --out %t/vh2 --static --virtual-memories ram --vmem-skip-held-reads --stage-levels 2 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=VH2 < %t/vh2/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=2 -DWRITE_FIRST -Mdir %t/vh2/obj %S/Inputs/tb_vmem.sv leaf.sv top.sv %t/vh2/foldsim_sim.sv > %t/vh2/build.log 2>&1
+# RUN: %t/vh2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 +maxreads=600 | FileCheck %s --check-prefix=FEW
+# RUN: foldsim --srcs top_ready.f --top Top --out %t/vhk --static --virtual-memories ram --vmem-skip-held-reads --modulo --nest --bubbles --copies Leaf:2 --page 2 --stage-levels 2 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=2 -DWRITE_FIRST -DCOPIES2 -DIW=1 -DBUBBLES -Mdir %t/vhk/obj %S/Inputs/tb_vmem.sv leaf.sv top_ready.sv %t/vhk/foldsim_sim.sv > %t/vhk/build.log 2>&1
+# RUN: %t/vhk/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=30 +stall=20 +bubble=20 +maxreads=600 | FileCheck %s --check-prefix=FEW
+# RUN: cd %S/../Driver/Inputs/vmem_held
+# RUN: foldsim --srcs top_ready.f --top Top --out %t/v8 --static --virtual-memories ram --vmem-skip-held-reads --page 2 --stage-levels 1 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=2 -DWRITE_FIRST -DIW=3 -Mdir %t/v8/obj %S/Inputs/tb_vmem.sv top_ready.sv %t/v8/foldsim_sim.sv > %t/v8/build.log 2>&1
+# RUN: %t/v8/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=30 +stall=20 +maxreads=1600 | FileCheck %s --check-prefix=FEW
+# A --multicycle request is never ignored: on a class it cannot apply to (late
+# outputs, held reads) or without --stage-levels it is an error naming why; a
+# glob that matches no class is a warning.
+# RUN: not foldsim --srcs top.f --top Top --out %t/mc1 --static --virtual-memories ram --vmem-skip-held-reads --multicycle Leaf:3 --stage-levels 1 Leaf > %t/mc1.log 2>&1
+# RUN: FileCheck %s --check-prefix=MC1 < %t/mc1.log
+# RUN: not foldsim --srcs top.f --top Top --out %t/mc2 --static --multicycle Leaf:3 Leaf > %t/mc2.log 2>&1
+# RUN: FileCheck %s --check-prefix=MC2 < %t/mc2.log
+# RUN: cd %S/../Driver/Inputs/vmem_staged
+# RUN: foldsim --srcs top.f --top Top --out %t/mc3 --static --virtual-memories ram --multicycle 'Nope:3,Leaf:3' --stage-levels 1 Leaf > %t/mc3.log 2>&1
+# RUN: FileCheck %s --check-prefix=MC3 < %t/mc3.log
+# ST6: Leaf x4 state gap {{[0-9]+}} stages 3{{$}}
+# RD8: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 2{{$}}
+# RD4: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 5{{$}}
+# VH5: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 2{{$}}
+# VH2: Leaf x4 (ready pass) state gap {{[0-9]+}} stages 4{{$}}
+# MC1: error: multicycle: Leaf cannot be multicycle: 1 of 1 outputs late, virtual memories read at held addresses
+# MC2: error: multicycle: needs stage-levels
+# MC3: Leaf multicycle: {{[0-9]+}} half levels estimated, over 3 host cycles (given)
+# MC3: warning: multicycle 'Nope:3' matches no class
+# CHECK: {{^}}MATCH 196 cycles
+# FEW: {{^}}MATCH 196 cycles
+# FEW-NEXT: {{^}}READS
+# FEW-NEXT: {{^}}FEWER
