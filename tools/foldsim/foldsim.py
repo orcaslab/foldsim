@@ -1053,6 +1053,16 @@ def build_parser():
                          'read address with its enable low) is not issued unless its row was written '
                          'since the instance last read it; the instance keeps its read data (exact). '
                          "Its requests leave a host cycle after the pass, from registers (room 12)")
+    ap.add_argument('--balance-mux', metavar='MIN_CHAIN', type=int, default=0,
+                    help='every model\'s linear priority mux chains of at least MIN_CHAIN conditions '
+                         '(an if/else-if ladder, a loop that keeps the last match; 16 is comb-balance-mux\'s '
+                         'own default) rebalanced into trees of logarithmic depth before folding (circt '
+                         'comb-balance-mux). Exact; for a module whose ladders grow with the design (a '
+                         'select over every port of a shared cache). 0: none')
+    ap.add_argument('--prefix-negate', metavar='MIN_BITS', type=int, default=0,
+                    help='negations of at least MIN_BITS bits (x & -x, the lowest set bit of a '
+                         'priority select) as a logarithmic prefix OR instead of a carry chain, before '
+                         'folding (foldsim-lower-wide-negation). Exact; 0: none')
     ap.add_argument('--retime-memory-reads', metavar='MIN_BITS', type=int,
                     help="memories of at least MIN_BITS bits without a ram_style hint, read "
                          'asynchronously at an address that is a function of registers alone (a '
@@ -1432,6 +1442,12 @@ def main():
     for g in groups:
         if not any(set(g) <= children[m] for m in order):
             sys.exit(f'{"+".join(g)}: not instantiated by the same module')
+    # Depth the design's own structure gives a select over many inputs, in every
+    # model before it is folded (exact rewrites; the RTL is unchanged).
+    if a.prefix_negate:
+        passes.append(f'hw.module(foldsim-lower-wide-negation{{min-width={a.prefix_negate}}})')
+    if a.balance_mux:
+        passes.append(f'hw.module(comb-balance-mux{{mux-chain-threshold={a.balance_mux}}})')
     compose = f'module={a.top} sim=foldsim_sim'
     # With registered state the next thread is picked a host cycle earlier, from
     # inputs a cycle older: on classes of 16 threads that costs 37.5 % more host

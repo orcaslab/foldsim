@@ -9,6 +9,7 @@ add_mlir_library(FoldsimTransforms
   FindPipelines.cpp
   MemoriesToRegisters.cpp
   FuseModels.cpp
+  LowerWideNegation.cpp
   Pipelines.cpp
   RemoveDeadState.cpp
   ReplicateControls.cpp

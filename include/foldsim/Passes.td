@@ -914,6 +914,27 @@ def LowerEquality : Pass<"foldsim-lower-equality", "::circt::hw::HWModuleOp"> {
   let dependentDialects = ["circt::comb::CombDialect"];
 }
 
+def LowerWideNegation : Pass<"foldsim-lower-wide-negation",
+                             "::circt::hw::HWModuleOp"> {
+  let summary = "Wide negations as logarithmic prefix logic";
+  let description = [{
+    Rewrites a negation `comb.sub 0, x` of at least `min-width` bits as
+    `x ^ (P << 1)`, P the inclusive prefix OR of x's bits in log2(width)
+    stages of `p | (p << d)` (bit i of -x is x[i] XOR the OR of the bits
+    below it). A synthesis tool lays the subtraction on a carry chain, one
+    carry block per 8 bits on an FPGA, so the depth of `x & -x`, the lowest
+    set bit of a priority select, grows with the number of inputs; the
+    prefix grows with their log. Exact: the value is the same for every x.
+    For the few wide one-hot selects of a design: narrower negations (the
+    datapath's) stay on the carry chain, which is as fast up to a few blocks.
+  }];
+  let options = [
+    Option<"minWidth", "min-width", "unsigned", "65",
+           "Negations of at least this many bits are rewritten">,
+  ];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
+}
+
 def KeepModules : Pass<"foldsim-keep-modules", "::mlir::ModuleOp"> {
   let summary = "Keep the instances of named modules through inlining";
   let description = [{

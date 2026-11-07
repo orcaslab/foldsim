@@ -1,0 +1,29 @@
+# REQUIRES: verilator
+# --prefix-negate N (foldsim-lower-wide-negation): a negation of at least N
+# bits becomes a logarithmic prefix OR; --balance-mux N (circt
+# comb-balance-mux): priority mux chains of at least N conditions become
+# trees, a chain under an enclosing condition too. Both exact rewrites of every
+# model before folding. Driver/Inputs/wide_select: the lowest of 72 pending
+# bits (`pend & -pend`) and the last match of a 20-entry loop under an enclosing
+# condition, in a class of four leaves with late outputs. Against the target
+# (tb_late.sv), from zero state, with stalled channels: the rewrites at the
+# recipe's thresholds, and at thresholds that rewrite every negation and
+# chain of the design (2 / 2); without the options the negation stays.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/wide_select
+# RUN: foldsim --srcs top.f --top Top --out %t/no --static Leaf > %t/no.log 2>&1
+# RUN: FileCheck %s --check-prefix=NO < %t/no/foldsim_sim.mlir
+# RUN: foldsim --srcs top.f --top Top --out %t/r --static --prefix-negate 65 --balance-mux 16 Leaf > %t/r.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/r.log
+# RUN: FileCheck %s --check-prefix=SIM < %t/r/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/r/obj %S/Inputs/tb_late.sv top.sv %t/r/foldsim_sim.sv > %t/r/build.log 2>&1
+# RUN: %t/r/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 | FileCheck %s
+# RUN: %t/r/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/all --static --prefix-negate 2 --balance-mux 2 --copies Leaf:2 Leaf > %t/all.log 2>&1
+# RUN: FileCheck %s --check-prefix=SIM < %t/all/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/all/obj %S/Inputs/tb_late.sv top.sv %t/all/foldsim_sim.sv > %t/all/build.log 2>&1
+# RUN: %t/all/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +stall=20 | FileCheck %s
+# NO: comb.sub %c0_i72
+# LOG: foldsim-lower-wide-negation{min-width=65}
+# LOG-SAME: comb-balance-mux{mux-chain-threshold=16}
+# SIM-NOT: comb.sub %c0_i72
+# CHECK: {{^}}MATCH
