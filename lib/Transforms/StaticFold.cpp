@@ -3753,15 +3753,21 @@ void StaticFolder::readyLevels(ArrayRef<bool> ready, ReadyWrites &writes) {
         passLinks.push_back({from, to});
       }
     }
-    llvm::sort(passLinks);
-    passLinks.erase(std::unique(passLinks.begin(), passLinks.end()),
-                    passLinks.end());
+    // The links by source, bucketed in linear time (this test runs for every
+    // output and level tried, every placement: sorting all the links each
+    // time was most of the ready-pass search at 128 SMs). Duplicates stay:
+    // each counts once in its target's wait and is released once, so the
+    // topological count, and the answer, are those of the deduplicated set.
     for (auto [from, to] : passLinks) {
       ++edges[from + 1];
       ++waits[to];
     }
     for (unsigned n = 0; n < numPasses; ++n)
       edges[n + 1] += edges[n];
+    SmallVector<unsigned> fill(edges.begin(), edges.end() - 1),
+        targets(passLinks.size());
+    for (auto [from, to] : passLinks)
+      targets[fill[from]++] = to;
     SmallVector<unsigned> sources;
     for (unsigned n = 0; n < numPasses; ++n)
       if (!waits[n])
@@ -3771,8 +3777,8 @@ void StaticFolder::readyLevels(ArrayRef<bool> ready, ReadyWrites &writes) {
       unsigned n = sources.pop_back_val();
       ++placed;
       for (unsigned e = edges[n]; e < edges[n + 1]; ++e)
-        if (!--waits[passLinks[e].second])
-          sources.push_back(passLinks[e].second);
+        if (!--waits[targets[e]])
+          sources.push_back(targets[e]);
     }
     return placed == numPasses;
   };
