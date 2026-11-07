@@ -621,6 +621,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"foldPortsReset", "fold-ports-reset", "std::string", "\"reset\"",
            "With fold-ports: the netlist input whose frame token rides on "
            "each request record (req_treset)">,
+    Option<"readBufferBits", "read-buffer-bits", "unsigned", "0",
+           "A threaded memory read through a register keeps each instance's "
+           "read register in a buffer of an entry per instance, read at the "
+           "next slot's instance and registered. With N > 0, such a buffer of "
+           "at least N bits is a RAM read synchronously instead (read first, "
+           "address the next slot's instance, its output the registered "
+           "value: block RAM rather than LUTs), the read register's bypass of "
+           "data just out of the memory registered beside it. The same value "
+           "every host cycle. 0: every buffer read combinationally">,
     Option<"pageWriteGate", "page-write-gate", "bool", "false",
            "Off-chip pages on page engines (page-engines): each page's "
            "write-back bits through a register of its own, loaded the host "

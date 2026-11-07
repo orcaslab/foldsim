@@ -425,6 +425,8 @@ def frame_options(a):
         fold += f' link-hbm-shift={a.link_hbm_shift}'
     if getattr(a, 'page_write_gate', False):
         fold += ' page-write-gate'
+    if getattr(a, 'read_buffer_bits', 0):
+        fold += f' read-buffer-bits={a.read_buffer_bits}'
     if getattr(a, 'link_hbm_fit_slots', False):
         fold += ' link-hbm-fit-slots'
     if getattr(a, 'fold_ports', ''):
@@ -1191,6 +1193,10 @@ def build_parser():
                          'request moves earlier, or its write later, so that streams whose requests or writes '
                          'fall at the same positions share an engine (within the room from the row\'s write to '
                          'its request; foldsim-fold-static; 0: none)')
+    ap.add_argument('--read-buffer-bits', type=int, default=0, metavar='N',
+                    help="with --static: a threaded memory's per-instance read-register buffer of at least N bits "
+                         'read synchronously (a block RAM, read first) instead of combinationally (LUTs); 0: none '
+                         '(foldsim-fold-static read-buffer-bits)')
     ap.add_argument('--page-write-gate', action='store_true',
                     help='with --static and --page-engines: off-chip pages written back through a gated '
                          'register a page (loaded the host cycle before its write, else held at zero) and an OR '

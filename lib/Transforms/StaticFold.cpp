@@ -344,6 +344,9 @@ public:
   /// `page-write-gate`: off-chip pages on engines written back through
   /// per-page gated registers and an OR (choosePageGates, Class::pageGate).
   bool pageWriteGate = false;
+  /// `read-buffer-bits`: a per-instance read-register buffer of at least this
+  /// many bits read synchronously (a block RAM); 0: none.
+  unsigned readBufferBits = 0;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
   /// landing) a member is streamed with (0: the decision lead + 6). A
   /// member with less room is built as an on-chip link: its landing would
@@ -9229,9 +9232,14 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         } else {
           auto width = hw::getBitWidth(dout.getType());
           auto bufferType = seq::FirMemType::get(context, entries, width, 1);
+          // `read-buffer-bits`: a buffer that large read synchronously at
+          // the next slot's instance, read first (see below).
+          bool syncRead = readBufferBits &&
+                          uint64_t(entries) * width >= readBufferBits;
           auto buffer = seq::FirMemOp::create(
-              b, bufferType, /*readLatency=*/0, /*writeLatency=*/1,
-              seq::RUW::Undefined, seq::WUW::Undefined,
+              b, bufferType, /*readLatency=*/syncRead ? 1 : 0,
+              /*writeLatency=*/1,
+              syncRead ? seq::RUW::Old : seq::RUW::Undefined, seq::WUW::Undefined,
               b.getStringAttr(readName), hw::InnerSymAttr{},
               seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
           keepShallowInFlops(buffer);
@@ -9239,20 +9247,38 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
               b, region.inst, hostClock, b.getStringAttr(readName + "_inst"));
           seq::FirMemWriteOp::create(b, buffer, readInst, hostClock, capture,
                                      asBits(b, dout), Value{});
+          // `read-buffer-bits`: a buffer that large read synchronously at
+          // the next slot's instance, read first: its output a host cycle on
+          // is what the combinational read registered held (a write in the
+          // same host cycle lands after either read), so the buffer can be a
+          // block RAM; the bypass below is registered beside it.
           Value bufferData = seq::FirMemReadOp::create(b, buffer, region.inst1,
                                                        hostClock, one());
           // The next slot's instance's data, out of the memory now, is not
           // yet in the buffer.
-          if (cls.stateGap < 4) {
-            Value fresh = comb::AndOp::create(
+          Value fresh;
+          if (cls.stateGap < 4)
+            fresh = comb::AndOp::create(
                 b, capture,
                 comb::ICmpOp::create(b, comb::ICmpPredicate::eq, readInst,
                                      region.inst1));
-            bufferData =
-                comb::MuxOp::create(b, fresh, asBits(b, dout), bufferData);
+          if (syncRead) {
+            data = bufferData;
+            if (fresh) {
+              Value freshR = seq::FirRegOp::create(
+                  b, fresh, hostClock, b.getStringAttr(readName + "_fresh"));
+              Value doutR = seq::FirRegOp::create(
+                  b, asBits(b, dout), hostClock,
+                  b.getStringAttr(readName + "_bypass"));
+              data = comb::MuxOp::create(b, freshR, doutR, data);
+            }
+          } else {
+            if (fresh)
+              bufferData =
+                  comb::MuxOp::create(b, fresh, asBits(b, dout), bufferData);
+            data = seq::FirRegOp::create(b, bufferData, hostClock,
+                                         b.getStringAttr(readName + "_read"));
           }
-          data = seq::FirRegOp::create(b, bufferData, hostClock,
-                                       b.getStringAttr(readName + "_read"));
           // This slot's instance's data, out of the memory now, read at its
           // state pass just before.
           if (cls.stateGap < 2) {
@@ -13355,6 +13381,7 @@ void FoldStaticPass::runOnOperation() {
   folder.foldPortsReset = foldPortsReset;
   folder.linkHbmFitSlots = linkHbmFitSlots;
   folder.pageWriteGate = pageWriteGate;
+  folder.readBufferBits = readBufferBits;
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.minII = minII;
   folder.readyChoice = readyChoice;

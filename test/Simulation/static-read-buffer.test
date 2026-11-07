@@ -1,0 +1,31 @@
+# REQUIRES: verilator
+# --read-buffer-bits: a threaded memory read through a register keeps each
+# instance's read register in a buffer of an entry per instance; at N bits or
+# more that buffer is a RAM read synchronously at the next slot's instance,
+# read first, with the bypass of data just out of the memory registered beside
+# it (block RAM instead of LUTs). The leaves (Driver/Inputs/paged) read their
+# 16 x 8 RAM through a register, four instances. Against the target
+# (tb_late.sv), from zero state: registers in LUTs, one copy (state gap below
+# 4: the bypass); two copies chained in a host cycle with paged registers; the
+# nested sequencer with a short lead at p = 4; each exact, and the buffer read
+# synchronously (registered read port, its bypass register present).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/paged
+# RUN: foldsim --srcs top.f --top Top --out %t/flat --static --bubbles --read-buffer-bits 1 Leaf > %t/flat.log 2>&1
+# RUN: FileCheck %s --check-prefix=SV < %t/flat/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/flat/obj %S/Inputs/tb_late.sv top.sv %t/flat/foldsim_sim.sv > %t/flat/build.log 2>&1
+# RUN: %t/flat/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/chain --static --bubbles --page 2 --region-bits 72 --copies Leaf:2 --zero-latency-links --zero-latency-chains --read-buffer-bits 1 Leaf > %t/chain.log 2>&1
+# RUN: FileCheck %s --check-prefix=SV < %t/chain/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/chain/obj %S/Inputs/tb_late.sv top.sv %t/chain/foldsim_sim.sv > %t/chain/build.log 2>&1
+# RUN: %t/chain/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +bubble=40 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --bubbles --nest --short-lead --region-bits 100 --page 4 --read-buffer-bits 1 Leaf > %t/nest.log 2>&1
+# RUN: FileCheck %s --check-prefix=SV < %t/nest/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_late.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +bubble=30 +stall=20 | FileCheck %s
+# Off (the default) the buffer stays combinational.
+# RUN: foldsim --srcs top.f --top Top --out %t/off --static --bubbles Leaf > %t/off.log 2>&1
+# RUN: FileCheck %s --check-prefix=OFF < %t/off/foldsim_sim.mlir
+# SV: _rdata = seq.firmem 1, 1, old, undefined
+# OFF: _rdata = seq.firmem 0, 1, undefined, undefined
+# OFF-NOT: _rdata_bypass
+# CHECK: {{^}}MATCH {{[0-9]+}} cycles
