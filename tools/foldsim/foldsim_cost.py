@@ -104,6 +104,9 @@ class Mod:
         self.Z, self.O, self.W = {}, {}, {}   # known-zero / known-one bits, widths of int values
         self.P = {}                           # bit provenance of wide values: [(length, src, src_lo)]
         self.regs, self.muxes = {}, {}        # register -> next value; mux -> (cost, a, b)
+        self.uses = defaultdict(int)          # value -> its uses
+        self.ands, self.ors = {}, []          # and -> (cost, operands); or ops (result, operands, cost, width)
+        self.shifts, self.extracts = {}, defaultdict(list)   # shift -> (cost, width, op); value -> [(low, width)]
         self.ids = {}
 
     def sid(self, v):
@@ -430,9 +433,16 @@ def parse(path):
         if cur is None:
             continue
         if s.startswith('hw.output'):
+            for v in re.findall(SSA, s):
+                cur.uses[v] += 1
             refund_enables(cur)
+            pack_and_or(cur)
+            trim_shifts(cur)
             cur = None
             continue
+        if ' = ' not in s:
+            for v in re.findall(SSA, s.split(' : ')[0]):
+                cur.uses[v] += 1
         if s.startswith('seq.firmem.write_port') or s.startswith('seq.firmem.read_write_port'):
             mm = re.search(r'(' + SSA + r')\[', s)
             if mm and mm.group(1) in mems:
@@ -444,12 +454,19 @@ def parse(path):
         op = rhs.split()[0]
         res = re.findall(SSA, lhs)
         operands = re.findall(SSA, rhs.split(' : ')[0])
+        for v in operands:
+            cur.uses[v] += 1
         if op in CONSTS:
             cur.consts.update(res)
             if op == 'hw.constant':
                 track(cur, op, rhs, res, operands)
             continue
         if op in FREE:
+            if op == 'comb.extract' and operands:
+                lo = re.search(r'from (\d+)', rhs)
+                ew = int_width(result_type(rhs).split('->')[-1])
+                if lo and ew:
+                    cur.extracts[operands[0]].append((int(lo.group(1)), ew))
             track(cur, op, rhs, res, operands)
             continue
         if op in REGS:
@@ -484,9 +501,52 @@ def parse(path):
             unknown[op] += 1
             continue
         cur.lut[op.split('.')[1]] += c
+        if op in ('comb.shl', 'comb.shru', 'comb.shrs') and c and len(res) == 1:
+            cur.shifts[res[0]] = (c, int_width(result_type(rhs)) or 0, op.split('.')[1])
+        if op == 'comb.and' and c and len(res) == 1:
+            cur.ands[res[0]] = (c, [o for o in operands if o not in cur.consts])
+        elif op == 'comb.or' and c and len(res) == 1:
+            cur.ors.append((res[0], [o for o in operands if o not in cur.consts], c, int_width(result_type(rhs)) or 0))
         if op == 'comb.mux' and len(operands) == 3 and c:
             cur.muxes[res[0]] = (c, operands[1], operands[2])
     return mods, unknown
+
+
+def pack_and_or(mod):
+    """An AND whose only use is an OR (a sum of products: a one-hot select's
+    `data & sel` terms ORed) is not a LUT of its own: synthesis packs the OR's
+    terms and their AND inputs into one LUT6 tree per bit, ceil((n - 1) / 5)
+    LUTs for n inputs, where foldsim_cost counted a LUT a bit per AND and the
+    OR's tree apart (FSD's ToR, 51 % `and` and 15 % `or`, synthesized at about
+    half its count)."""
+    for r, ops, c_or, w in mod.ors:
+        absorbed = [o for o in ops if o in mod.ands and mod.uses[o] == 1]
+        if not absorbed or not w:
+            continue
+        n = sum(len(mod.ands[o][1]) for o in absorbed) + len(ops) - len(absorbed)
+        old = c_or + sum(mod.ands[o][0] for o in absorbed)
+        new = w * math.ceil((n - 1) / 5)
+        if new < old:
+            mod.lut['and'] -= sum(mod.ands[o][0] for o in absorbed)
+            mod.lut['or'] += new - c_or
+    mod.ands, mod.ors = {}, []
+
+
+def trim_shifts(mod):
+    """A shift whose only uses are extracts builds only the bits they take
+    (a paged row shifted down and its low word taken: synthesis keeps that
+    word's muxes, not the whole row's): its cost in the share of its result
+    bits the extracts cover."""
+    for r, (c, w, cls) in mod.shifts.items():
+        ex = mod.extracts.get(r)
+        if not w or not ex or mod.uses[r] != len(ex):
+            continue
+        bits = set()
+        for lo, ew in ex:
+            bits.update(range(lo, min(w, lo + ew)))
+        if len(bits) < w:
+            mod.lut[cls] -= c * (1 - len(bits) / w)
+    mod.shifts, mod.extracts, mod.uses = {}, defaultdict(list), defaultdict(int)
 
 
 def refund_enables(mod):

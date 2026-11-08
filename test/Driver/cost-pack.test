@@ -1,0 +1,9 @@
+# foldsim_cost's LUT count as synthesis packs it. A one-hot select's terms
+# (data AND select, ORed): each AND whose only use is the OR goes into the
+# OR's LUT6 tree, ceil((n - 1) / 5) LUTs a bit for n inputs (a & s | b & t:
+# 8 LUTs, not 8 + 8 for the ANDs and 8 for the OR); an AND used elsewhere too
+# (%5, also XORed) keeps its LUTs. A shift whose only use is an extract
+# builds the bits taken: a 64-bit shift right by 6 bits (64 x 3 LUTs) with
+# bit 0 taken is 3 LUTs.
+# RUN: python3 -c "import sys; sys.path.insert(0, '%foldsim_tools'); import foldsim_cost as c; m = c.parse('%S/Inputs/cost-pack/m.mlir')[0]['M']; print('and', m.lut['and'], 'or', m.lut['or'], 'xor', m.lut['xor'], 'shru', m.lut['shru'])" | FileCheck %s
+# CHECK: and 8.0 or 16.0 xor 8.0 shru 3.0
