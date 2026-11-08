@@ -27,18 +27,52 @@
 # within its whole count): the leaf's memory in URAM (64 x 8: a whole
 # URAM288) fits only the SLR that has URAM: OK where a copy may take any SLR
 # (the copy there), REFUSE (exit 1) where it must fit the other; within SLRs
-# of 100 URAM it fits either, and no link crosses.
+# of 100 URAM it fits either. Without a placement model in the region the
+# SLLs are not projected.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/storage
 # RUN: foldsim --srcs top.f --top Top --out %t/x --static --copies Leaf:1 --storage 'Leaf:mem=ultra' Leaf 2> %t/x.log
 # RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-small.json --foldsim-opt foldsim-opt --out %t/any | FileCheck %s --check-prefix=ANY
 # RUN: not python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-small.json --foldsim-opt foldsim-opt --copy-cap SLR1 --out %t/small | FileCheck %s --check-prefix=SMALL
 # RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-big.json --foldsim-opt foldsim-opt --copy-cap smallest --out %t/big | FileCheck %s --check-prefix=BIG
-# ANY: SLR1 capacity: lut 50,000, ff 100,000, uram 0.0, bram 100.0
+# ANY: SLR1 capacity: lut 50,000, lutram 50,000, ff 100,000, uram 0.0, bram 100.0
 # ANY: copy cap: any (SLR1, SLR0)
-# ANY: Leaf: lut {{[0-9,]+}}, ff {{[0-9,]+}}, uram 1.0, bram 0.0; of each SLR's capacity (binding resource): SLR1 inf %, SLR0 50 %
-# ANY: slr1 = SLR0: lut {{[0-9,]+}} / {{[0-9,]+}}, ff {{[0-9,]+}} / {{[0-9,]+}}, uram 1.0 / 2.0
-# ANY: x: OK: 0 SLLs projected within the 1000 budget
+# ANY: Leaf: lut {{[0-9,]+}}, lutram {{[0-9,]+}}, ff {{[0-9,]+}}, uram 1.0, bram 0.0; of each SLR's capacity (binding resource): SLR1 inf %, SLR0 50 %
+# ANY: slr1 ({{[0-9]+}} sites): Leaf
+# ANY: SLR0 as placed: {{.*}} uram 1.0 (50 %)
+# ANY: x: OK: an assignment within the SLRs (no placement model in the region: SLLs not projected)
 # SMALL: copy cap: SLR1 (SLR1)
 # SMALL: x: REFUSE: Leaf fits no SLR whole (the nearest, SLR1: over its uram)
 # BIG: copy cap: smallest (SLR1)
 # BIG: x: OK
+
+# The placement model (region-place.json: SLRs of 150 LUTs filled to 75 %):
+# the leaf copy (no whole-copy cap) is larger than an SLR's room, so it is
+# cut, filling its SLR's room and the rest in the other; its own cut by Rent's
+# rule, the links between the sides and the simulator level's constant are
+# the boundary's SLLs, a warning over the budget's 30.
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-place.json --foldsim-opt foldsim-opt --copy-cap none --out %t/place | FileCheck %s --check-prefix=PLACE
+# PLACE: (no whole assignment: Leaf left out, spread over the room the others leave)
+# PLACE: the design over the region: lut 69 %, lutram 24 %, ff 61 % (placement fill lut 75 %, lutram 75 %, ff 75 %)
+# PLACE: SLR1 as placed: lut 112 (75 %)
+# PLACE: Leaf cut over the SLRs: SLR1 58 %, SLR0 42 % of its logic
+# PLACE: boundary SLR1-SLR0: 22 SLLs projected (links 2, cut copies 19, simulator level and kernel 1)
+# PLACE: x: WARN: 22 SLLs projected over SLR1-SLR0 (budget 30); Leaf cut over SLRs
+
+# Netlist resources are mandatory: without the generation's foldsim_sim.mlir
+# the check refuses (the schedule's estimates miss stage registers, read
+# buffers and the simulator level); --resources schedule is an estimate,
+# never a verdict.
+# RUN: mkdir -p %t/nonet && cp %t/x/schedule.txt %t/nonet/
+# RUN: not python3 %foldsim_tools/foldsim_sll_check.py %t/nonet --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-place.json --foldsim-opt foldsim-opt --out %t/nn | FileCheck %s --check-prefix=NONET
+# NONET: nonet: REFUSE: no netlist ({{.*}}foldsim_sim.mlir missing)
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-place.json --resources schedule --foldsim-opt foldsim-opt --out %t/sched | FileCheck %s --check-prefix=SCHED
+# SCHED: resources from the schedule (AN ESTIMATE ONLY
+# SCHED: x: ESTIMATE (schedule resources, not a verdict)
+
+# The driver's --sll-check runs the check on the netlist it generated
+# (<out>/sll/sll.txt) and fails on a refusal.
+# RUN: not foldsim --srcs top.f --top Top --out %t/d --static --copies Leaf:1 --storage 'Leaf:mem=ultra' --slr-region %S/Inputs/slr-copy-cap/region-place.json --sll-check Leaf 2>&1 | FileCheck %s --check-prefix=DRV
+# DRV: foldsim: SLL check: d: REFUSE: Leaf fits no SLR whole
+# DRV: --sll-check refuses this netlist
+# RUN: FileCheck %s --check-prefix=DRVR < %t/d/sll/sll.txt
+# DRVR: d: REFUSE: Leaf fits no SLR whole

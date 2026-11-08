@@ -1,37 +1,43 @@
 #!/usr/bin/env python3
 """foldsim_sll_check.py <gen dir> [--log <driver log>] [--slr-region v80|<json>] [--copy-cap SLR]
-                       [--resources netlist|schedule] [--foldsim-opt <bin>] [--out <dir>]
+                       [--resources netlist|schedule] [--models <models.mlir> [--fold-options <options>]]
+                       [--foldsim-opt <bin>] [--out <dir>] [--json <file>]
 
-Whether an existing netlist places over the region's SLRs, without regenerating it.
+Whether an existing netlist places over the region's SLRs, and the SLLs each SLR boundary takes, without
+regenerating it.
 
-Each class copy's resources: with `--resources netlist` (the default where the generation's foldsim_sim.mlir is
-there) its LUTs, flip-flops, URAM288 and RAMB36 counted on the generated netlist itself (foldsim_cost over the
-copy's module `<copy>_static` and the stores and page RAMs below it; a memory's RAM by its ram_style, as Vivado
-builds it: URAM288 by 72-bit columns of 4,096 rows, RAMB36 by foldsim_cost.mem_cost), LUTs and flops scaled to
-synthesized ones by the region's netlist_lut_scale / netlist_ff_scale, and the simulator level's link memories
-counted with the copy whose output they hold (a link memory is its producer's output register, placed at the
-producer); with `--resources schedule` its LUT sites only, from the class estimates of the generation's models
-and its schedule (foldsim_degree.copy_sites: paged copies in page RAMs).
+Each class copy's resources are counted on the generated netlist itself (`--resources netlist`, the default; the
+check REFUSES without the generation's foldsim_sim.mlir, since the schedule's estimates miss stage registers, read
+buffers and the simulator level and said "fits" where placement failed): its LUTs, LUTRAM LUTs, flip-flops,
+URAM288 and RAMB36 (foldsim_cost over the copy's module `<copy>_static` and the stores and page RAMs below it; a
+memory's RAM by its ram_style, as Vivado builds it: URAM288 by 72-bit columns of 4,096 rows, RAMB36 by
+foldsim_cost.mem_cost), LUTs and flops scaled to synthesized ones (the region's netlist_lut_scale /
+netlist_ff_scale) and then to placed ones (placed_per_synthesized: the kernel beside the simulator and the placer's
+replication), and the simulator level's link memories and registers counted with the copy whose output they hold
+(placed at the producer). `--resources schedule` gives an estimate from the class estimates of the generation's
+models and its schedule (foldsim_degree.copy_sites), never a verdict.
 
-The checks, in order:
+The generation's fold is run again schedule-only (the `+ ... foldsim-opt <flat.mlir> ... --pass-pipeline=...` line
+of the generation log, <gen dir>.gen.log by default; or `--models` and `--fold-options`): its II must be the
+netlist's (an older or newer compiler checks another netlist: REFUSE). Then, in order:
   1. every copy fits whole, in each resource, the `--copy-cap` SLR's capacity times the region's margin (SLR a
-     name, `smallest` or `largest`; default largest: a copy past every SLR must be cut by the placer, its wide
-     state and store ports then crossing SLLs at a cost not known here: r16c, 11-07, a slice copy of 517 URAM
-     against SLRs of 496 / 511 / 204, failed partitioning at 23,987 SLLs);
-  2. some assignment of the copies to the SLRs keeps every SLR within its capacity in each resource (the
-     generation's logged fold pipeline -- the `+ ... foldsim-opt <flat.mlir> ... --pass-pipeline=...` line of the
-     generation log, <gen dir>.gen.log by default -- run again schedule-only with sll-estimate over the copies'
-     LUT sites and, as further resources, their flops, URAM and RAMB36);
-  3. the link bits over the worst boundary of that assignment, whole copies, as SLLs (times the region's
-     sll_per_link_bit, calibrated on a placed build: the placer splits a large copy where its own cut is small, a
-     wide link memory is read a word at a time) against the budget (sll_per_boundary x sll_margin; past it a
-     warning) and the boundary's SLLs (past them a refusal).
+     name, `smallest`, `largest`, `any` (the default: some SLR) or `none`; r16c, 11-07, a slice copy of 517 URAM
+     against SLRs of 496 / 511 / 204 and 713k placed LUTs, failed partitioning at 23,987 SLLs);
+  2. the design within the region at the placer's fill (the region's placement model: `fill` of each logic
+     resource, LUTs, LUTRAM and flops; memories at their whole counts, their primitives placed apart);
+  3. an assignment of whole copies to the SLRs, each within its fill (fold-static sll-estimate over the copies'
+     LUT sites and, as further resources, their LUTRAM, flops, URAM and RAMB36); where there is none, the largest
+     copies by logic (at most cut_copies) are left out, the others assigned within the SLRs' balanced share (the
+     placer balances the SLRs' fill), and each left-out copy fills its SLR's room and levels the next SLRs' fill:
+     the placer cuts it;
+  4. each boundary's SLLs as placed (the placement model, fit on placed builds): the link wires between the two
+     sides (sll_per_link_bit), each cut copy's own cut by Rent's rule over its smaller side (rent_t x placed
+     LUTs^rent_p), and the simulator level and kernel (other_slls, sll_per_vmem_bit x the netlist's virtual memory
+     port bits); past the boundary's SLLs a refusal, past the budget (sll_per_boundary x sll_margin) or with a copy
+     cut a warning.
 
-Logic (LUTs, flops) is checked against each SLR's capacity times the region's margin, memories (URAM288, RAMB36)
-against its whole count (a copy's RAM primitives, each on narrow ports, can be placed apart).
-
-Exits 0 (OK, or WARN), 1 if a check refuses, 2 on error. Report in <out>/sll.txt (the estimate)
-and on stdout.
+Exits 0 (OK, or WARN), 1 if a check refuses, 2 on error. Report in <out>/sll.txt (the estimate) and on stdout;
+`--json` writes the copies' resources, the wires between them, the assignment and each copy's shares of the SLRs.
 """
 import argparse, json, math, os, re, shlex, subprocess, sys
 from itertools import takewhile
@@ -41,7 +47,9 @@ sys.path.insert(0, HERE)
 import foldsim_cost  # noqa: E402
 import foldsim_degree  # noqa: E402
 
-RESOURCES = ('lut', 'ff', 'uram', 'bram')
+RESOURCES = ('lut', 'lutram', 'ff', 'uram', 'bram')
+# The logic: what a copy placed whole keeps in one SLR (its memory primitives, on narrow ports, go apart).
+LOGIC = ('lut', 'lutram', 'ff')
 # A Versal CLB: 8 LUT6 and 16 flip-flops.
 FFS_PER_LUT = 2
 URAM_DEPTH, URAM_WIDTH = 4096, 72
@@ -77,6 +85,24 @@ def mem_ram(rec):
     return 0.0, foldsim_cost.mem_cost(d, w, r, rl, st)[1]
 
 
+def add_memory(acc, rec):
+    """A memory's URAM288, RAMB36 and distributed RAM LUTs (in `lut` and in
+    `lutram`: a LUTRAM LUT takes a SLICEM's, of which an SLR has a share)."""
+    u, b = mem_ram(rec)
+    _, d, w, r, wr, rl, st, *_ = rec
+    lr = foldsim_cost.mem_cost(d, w, r, rl, st)[0] if st != 'ultra' else 0.0
+    acc['uram'] += u
+    acc['bram'] += b
+    acc['lut'] += lr
+    acc['lutram'] += lr
+    # The bits its ports carry (a feature of the copy's own wiring).
+    acc['port_bits'] = acc.get('port_bits', 0) + w * (r + wr)
+
+
+def new_acc():
+    return dict(lut=0.0, lutram=0.0, ff=0.0, uram=0.0, bram=0.0)
+
+
 def subtree(mods, name, stop, acc):
     """A module's LUTs (logic, black boxes, distributed RAM), flops and RAM with
     its children, but not the `stop` modules (other copies)."""
@@ -84,11 +110,7 @@ def subtree(mods, name, stop, acc):
     acc['lut'] += sum(m.lut.values())
     acc['ff'] += m.ff
     for rec in m.mems:
-        u, b = mem_ram(rec)
-        acc['uram'] += u
-        acc['bram'] += b
-        _, d, w, r, _, rl, st, *_ = rec
-        acc['lut'] += foldsim_cost.mem_cost(d, w, r, rl, st)[0] if st != 'ultra' else 0.0
+        add_memory(acc, rec)
     for child, _ in m.insts:
         if child in stop:
             continue
@@ -126,12 +148,13 @@ def netlist_resources(sim, copies, region):
     statics = {f'{c}_static' for c in copies if f'{c}_static' in mods}
     out = {}
     for c in copies:
-        acc = dict(lut=0.0, ff=0.0, uram=0.0, bram=0.0)
+        acc = new_acc()
         if f'{c}_static' in mods:
             subtree(mods, f'{c}_static', statics - {f'{c}_static'}, acc)
+            acc['io_bits'] = mods[f'{c}_static'].ins + mods[f'{c}_static'].outs
         out[c] = acc
     top = mods.get('foldsim_sim')
-    rest = dict(lut=0.0, ff=0.0, uram=0.0, bram=0.0)
+    rest = new_acc()
     if top is not None:
         # The simulator level's array reads are its link registers' reads by
         # instance, which synthesis builds in the registers' read selects (r16c:
@@ -145,21 +168,17 @@ def netlist_resources(sim, copies, region):
             owner = next((c for c in names if reg.startswith(c + '_')), None)
             (out[owner] if owner else rest)['ff'] += w
         for rec in top.mems:
-            u, b = mem_ram(rec)
-            _, d, w, r, _, rl, st, *_ = rec
-            lr = foldsim_cost.mem_cost(d, w, r, rl, st)[0] if st != 'ultra' else 0.0
             owner = next((c for c in names if rec[0].startswith(c + '_')), None)
-            dst = out[owner] if owner else rest
-            dst['uram'] += u
-            dst['bram'] += b
-            dst['lut'] += lr
+            add_memory(out[owner] if owner else rest, rec)
         for child, _ in top.insts:
             if child not in statics and child in mods:
                 subtree(mods, child, statics, rest)
     ls, fs = region.get('netlist_lut_scale', 1.0), region.get('netlist_ff_scale', 1.0)
+    pl = region.get('placed_per_synthesized', {})
     for v in list(out.values()) + [rest]:
-        v['lut'] *= ls
-        v['ff'] *= fs
+        v['lut'] *= ls * pl.get('lut', 1.0)
+        v['lutram'] *= ls * pl.get('lutram', 1.0)
+        v['ff'] *= fs * pl.get('ff', 1.0)
     out['__top__'] = rest
     return out
 
@@ -171,8 +190,9 @@ def slr_caps(region):
     b4e's opc copy of 1,024 RAMB36, 98 % of SLR1's and past its margin,
     placed and routed, 11-07)."""
     m = region.get('margin', 1.0)
-    return [dict(name=s['name'], lut=m * s['luts'], ff=m * FFS_PER_LUT * s['luts'],
-                 uram=s.get('uram', 0), bram=s.get('ramb36', 0)) for s in region['slrs']]
+    return [dict(name=s['name'], lut=m * s['luts'], lutram=m * s.get('lutram_luts', s['luts']),
+                 ff=m * FFS_PER_LUT * s['luts'], uram=s.get('uram', 0), bram=s.get('ramb36', 0))
+            for s in region['slrs']]
 
 
 def fmt(r, x):
@@ -186,6 +206,101 @@ def lut_equivalent(res, caps):
     return max(res[r] / tot[r] * tot['lut'] for r in RESOURCES if tot[r])
 
 
+def schedule_ii(text):
+    m = re.search(r'II = (\d+)', text)
+    return int(m.group(1)) if m else None
+
+
+def full_capacities(region):
+    """Per SLR (in order, the chain of the region), each resource whole."""
+    return [dict(name=s['name'], lut=s['luts'], lutram=s.get('lutram_luts', s['luts']), ff=FFS_PER_LUT * s['luts'],
+                 uram=s.get('uram', 0), bram=s.get('ramb36', 0)) for s in region['slrs']]
+
+
+def spread(top, full):
+    """The simulator level's share of each SLR (spread over the region in
+    proportion to each resource's capacity)."""
+    tot = {r: sum(c[r] for c in full) for r in RESOURCES}
+    return [{r: (top or {}).get(r, 0.0) * c[r] / tot[r] if tot[r] else 0.0 for r in RESOURCES} for c in full]
+
+
+def distribute(res_l, room, home, use, full):
+    """A copy's (`res_l`) share of each SLR, per resource: its `home` SLR
+    up to its `room`, the rest over the SLRs next out (the nearer first),
+    levelling their fill (`use` of `full`: the placer balances the SLRs) up to
+    each one's room. {resource: [share per SLR]}, or None if some resource's
+    room is short. A copy's memory primitives go apart where there is room,
+    its logic as a whole (the `lut` shares, which cut it)."""
+    n = len(room)
+    out = {}
+    for r in RESOURCES:
+        need = res_l[r]
+        if need <= 0:
+            out[r] = [float(s == home) for s in range(n)]
+            continue
+        amt = [0.0] * n
+        amt[home] = min(need, max(0.0, room[home][r]))
+        left = need - amt[home]
+        for d in range(1, n):
+            ring = [s for s in range(n) if abs(s - home) == d and full[s][r] > 0]
+            if left <= 1e-9 or not ring:
+                continue
+            # The fill level at which the ring takes `left` (or all its room).
+            def take(level):
+                return sum(min(max(0.0, room[s][r]), max(0.0, level * full[s][r] - use[s][r])) for s in ring)
+            lo, hi = 0.0, 1.0 + max(use[s][r] / full[s][r] for s in ring) + max(
+                max(0.0, room[s][r]) / full[s][r] for s in ring)
+            if take(hi) <= left:
+                level = hi
+            else:
+                for _ in range(60):
+                    mid = (lo + hi) / 2
+                    lo, hi = (mid, hi) if take(mid) < left else (lo, mid)
+                level = hi
+            for s in ring:
+                amt[s] = min(max(0.0, room[s][r]), max(0.0, level * full[s][r] - use[s][r]))
+            left = need - sum(amt)
+        if left > 1e-6 * need:
+            return None
+        out[r] = [x / need for x in amt]
+    return out
+
+
+def vmem_bits(gdir):
+    """The bits of the netlist's virtual memory ports (foldsim_sim.json: each
+    port's read and write data, row and instance): its wiring to the kernel's
+    memory controllers, which the placer puts apart from the copies."""
+    path = os.path.join(gdir, 'foldsim_sim.json')
+    if not os.path.exists(path):
+        return 0
+    return sum(2 * v['data_width'] + v['row_width'] + v['inst_width'] for v in json.load(open(path)).get('vmem', []))
+
+
+def boundary_slls(shares, res, wires, top_share, model, vbits=0):
+    """Each boundary's SLLs: SLLs per link wire bit times the link wires
+    between the copies' shares on either side; Rent's rule (t x LUTs^p) over
+    each cut copy's smaller side (and over the simulator level's, with
+    top_rent_t); and the simulator level and the kernel beside it (a
+    constant, other_slls, and SLLs per virtual memory port bit).
+    Returns [(link SLLs, cut SLLs, simulator-level and kernel SLLs)] per
+    boundary."""
+    n = len(top_share)
+    t, p = model['rent_t'], model['rent_p']
+    out = []
+    for b in range(n - 1):
+        low = {c: sum(x['lut'][:b + 1]) for c, x in shares.items()}
+        link = sum(w * (low[c] * (1 - low[d]) + low[d] * (1 - low[c]))
+                   for (c, d), w in wires.items() if c in low and d in low)
+        cut = sum(t * (min(f, 1 - f) * res[c]['lut']) ** p for c, f in low.items() if 1e-9 < f < 1 - 1e-9)
+        tl = sum(x['lut'] for x in top_share[:b + 1])
+        th = sum(x['lut'] for x in top_share[b + 1:])
+        # The simulator level and the kernel beside it, spread over the SLRs.
+        sim = model.get('top_rent_t', 0.0) * min(tl, th) ** p + model.get('other_slls', 0.0) + \
+            model.get('sll_per_vmem_bit', 0.0) * vbits
+        out.append((model['sll_per_link_bit'] * link, cut, sim))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('gen')
@@ -194,10 +309,17 @@ def main():
     ap.add_argument('--copy-cap', default='any', metavar='SLR',
                     help='where every class copy must fit whole: any (default: some SLR of the region), or the '
                          'SLR named, smallest or largest (by LUTs)')
-    ap.add_argument('--resources', choices=('netlist', 'schedule'), default=None,
-                    help='netlist (default where foldsim_sim.mlir is there) or schedule')
+    ap.add_argument('--resources', choices=('netlist', 'schedule'), default='netlist',
+                    help='netlist (default; the check refuses without the generated foldsim_sim.mlir) or '
+                         'schedule (an estimate only, never a verdict: stage registers, read buffers and the '
+                         'netlist\'s own logic are not in it)')
     ap.add_argument('--foldsim-opt', default=os.path.join(HERE, 'foldsim-opt'))
     ap.add_argument('--out')
+    ap.add_argument('--models', help='the pre-fold models (models.mlir) instead of running the logged pipeline\'s '
+                                     'passes before the fold on its input again')
+    ap.add_argument('--fold-options', help='the fold\'s options (foldsim-fold-static{...}) instead of the log\'s; '
+                                           'needs --models')
+    ap.add_argument('--json', help='write the copies\' resources, wires and assignment here (calibration)')
     ap.add_argument('--register-state-entries', type=int, default=None)
     a = ap.parse_args()
     gen = os.path.abspath(a.gen.rstrip('/'))
@@ -213,30 +335,58 @@ def main():
     budget = int(region.get('sll_margin', 1.0) * region.get('sll_per_boundary', 0))
     name = os.path.basename(gen)
     sim = os.path.join(gdir, 'foldsim_sim.mlir')
-    mode = a.resources or ('netlist' if os.path.exists(sim) else 'schedule')
+    mode = a.resources
+    report = os.path.join(out, 'sll.txt')
 
-    line = next((l for l in open(log) if 'foldsim-fold-static{' in l and '--pass-pipeline=' in l), None)
-    if not line:
-        sys.exit(f'no fold pipeline line in {log}')
-    # The trace line is unquoted (the pipeline's options hold spaces): the input is the token after foldsim-opt,
-    # the pipeline everything from --pass-pipeline= to the final -o.
-    flat = line.lstrip('+ ').split()[1]
-    m = re.search(r'--pass-pipeline=[\'"]?(builtin\.module\(.*\))[\'"]? -o \S+\s*$', line)
-    if not m:
-        sys.exit(f'no --pass-pipeline=builtin.module(...) -o in the fold line of {log}')
-    passes = split_top(m.group(1))
-    fi = next(i for i, p in enumerate(passes) if p.startswith('foldsim-fold-static{'))
-    fold = passes[fi][len('foldsim-fold-static{'):-1]
+    def finish(lines, verdict):
+        lines.append(f'{name}: {verdict}')
+        print('\n'.join(lines))
+        with open(report, 'a' if os.path.exists(report) else 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        sys.exit(1 if verdict.startswith('REFUSE') else 0)
+
+    if mode == 'netlist' and not os.path.exists(sim):
+        if os.path.exists(report):
+            os.remove(report)
+        finish([], f'REFUSE: no netlist ({sim} missing): the check counts the generated netlist (stage registers, '
+                    'read buffers and the simulator level are not in the schedule\'s estimates); keep '
+                    'foldsim_sim.mlir in the generation, or run with --resources schedule for an estimate')
+
+    run = lambda cmd: subprocess.run(cmd, check=True, capture_output=True, text=True)
+    if a.fold_options is not None:
+        # The generation's fold options and pre-fold models given (the driver's --sll-check).
+        fold, models = a.fold_options, a.models
+        if not models:
+            sys.exit('--fold-options needs --models')
+    else:
+        line = next((l for l in open(log) if 'foldsim-fold-static{' in l and '--pass-pipeline=' in l), None)
+        if not line:
+            sys.exit(f'no fold pipeline line in {log}')
+        # The trace line is unquoted (the pipeline's options hold spaces): the input is the token after
+        # foldsim-opt, the pipeline everything from --pass-pipeline= to the final -o.
+        flat = line.lstrip('+ ').split()[1]
+        m = re.search(r'--pass-pipeline=[\'"]?(builtin\.module\(.*\))[\'"]? -o \S+\s*$', line)
+        if not m:
+            sys.exit(f'no --pass-pipeline=builtin.module(...) -o in the fold line of {log}')
+        passes = split_top(m.group(1))
+        fi = next(i for i, p in enumerate(passes) if p.startswith('foldsim-fold-static{'))
+        fold = passes[fi][len('foldsim-fold-static{'):-1]
+        models = a.models or os.path.join(out, 'models.mlir')
+        if not a.models:
+            if not os.path.exists(flat):
+                for alt in (os.path.join(gdir, 'flat.mlir'), os.path.join(gdir, 'models.mlir')):
+                    if os.path.exists(alt):
+                        flat = alt
+                        break
+            if os.path.basename(flat) == 'models.mlir':
+                models = flat
+            else:
+                run([a.foldsim_opt, flat, '--mlir-print-op-on-diagnostic=false',
+                     f'--pass-pipeline=builtin.module({",".join(passes[:fi])})', '-o', models])
     # Options this check sets itself, or that would write the generation's outputs.
     fold = ' '.join(o for o in shlex.split(fold) if not re.match(
-        r'(report|slr-groups|slr-capacity|slr-capacities|slr-sites|slr-assign|slr-sll-budget|sll-estimate|schedule-only)\b', o))
-    models = os.path.join(out, 'models.mlir')
-    run = lambda cmd: subprocess.run(cmd, check=True, capture_output=True, text=True)
-    if not os.path.exists(flat) and os.path.exists(os.path.join(gdir, 'models.mlir')):
-        models = os.path.join(gdir, 'models.mlir')
-    else:
-        run([a.foldsim_opt, flat, '--mlir-print-op-on-diagnostic=false',
-             f'--pass-pipeline=builtin.module({",".join(passes[:fi])})', '-o', models])
+        r'(report|slr-groups|slr-capacity|slr-capacities|slr-sites|slr-assign|slr-sll-budget|sll-estimate|schedule-only)\b',
+        o))
     # The class copies and their instances: the generation's own schedule (same fold options).
     stext = open(os.path.join(gdir, 'schedule.txt')).read()
     ii, classes, _ = foldsim_degree.parse_schedule(stext)
@@ -254,27 +404,31 @@ def main():
             entries = int(m.group(1)) if m else 2
         of = {c: re.sub(r'_copy\d+$', '', c) for c in classes}
         est = foldsim_degree.class_estimates(models, sorted(set(of.values())))
-        res = {c: dict(lut=foldsim_degree.copy_sites(cal, est[of[c]], of[c], n, entries, info.get(c), ii) / spl,
-                       ff=0.0, uram=0.0, bram=0.0) for c, n in classes.items()}
-    # The simulator level's own logic and unowned memories spread over the region: each SLR keeps its share free.
-    free = [dict(c) for c in caps]
-    if top_share:
-        tot = {r: sum(c[r] for c in caps) for r in RESOURCES}
-        for c in free:
-            for r in RESOURCES:
-                if tot[r]:
-                    c[r] -= top_share[r] * c[r] / tot[r]
+        res = {c: dict(new_acc(), lut=foldsim_degree.copy_sites(cal, est[of[c]], of[c], n, entries, info.get(c), ii)
+                       / spl) for c, n in classes.items()}
+    model = region.get('placement', {})
+    full = full_capacities(region)
+    fills = model.get('fill', {})
+    # The simulator level's own logic and unowned memories spread over the region (each SLR keeps its share free);
+    # the placer fills an SLR up to its `fill` of each resource (the region's placement model).
+    top_spread = spread(top_share, full)
+    fill_of = {r: fills.get(r, region.get('margin', 1.0) if r in LOGIC else 1.0) for r in RESOURCES}
+    room0 = [{r: fill_of[r] * c[r] - t[r] for r in RESOURCES} for c, t in zip(full, top_spread)]
 
     lines = [f'{name}: SLRs {",".join(names)}, resources from the {mode}'
-             + (f' (LUT x{region.get("netlist_lut_scale", 1.0)}, FF x{region.get("netlist_ff_scale", 1.0)})'
-                if mode == 'netlist' else '') + f'; margin {region.get("margin", 1.0)}; SLL budget {budget} a '
+             + (f' (LUT x{region.get("netlist_lut_scale", 1.0)}, FF x{region.get("netlist_ff_scale", 1.0)}, '
+                f'placed per synthesized {region.get("placed_per_synthesized", {})})'
+                if mode == 'netlist' else ' (AN ESTIMATE ONLY: no stage registers, read buffers or simulator level)')
+             + f'; margin {region.get("margin", 1.0)}; SLL budget {budget} a '
              f'boundary ({region.get("sll_per_boundary")} x {region.get("sll_margin")})']
     for c in caps:
         lines.append(f'  {c["name"]} capacity: ' + ', '.join(f'{r} {fmt(r, c[r])}' for r in RESOURCES))
     if top_share:
         lines.append('  simulator level (spread): ' + ', '.join(f'{r} {fmt(r, top_share[r])}' for r in RESOURCES))
     # 1. Each copy whole within an SLR: any of them, or the one named.
-    if a.copy_cap == 'any':
+    if a.copy_cap == 'none':
+        allowed = [dict(c, **{r: math.inf for r in RESOURCES}) for c in caps]
+    elif a.copy_cap == 'any':
         allowed = caps
     elif a.copy_cap in ('smallest', 'largest'):
         allowed = [(min if a.copy_cap == 'smallest' else max)(caps, key=lambda c: c['lut'])]
@@ -294,67 +448,146 @@ def main():
         if all(fill(c, s) > 1 + 1e-9 for s in allowed):
             s = min(allowed, key=lambda s: fill(c, s))
             over.append((c, s['name'], [r for r in RESOURCES if res[c][r] > s[r] + 1e-9]))
-    # 2. and 3. An assignment within every SLR's capacity in each resource (fold-static sll-estimate: LUT sites,
-    # then flops, URAM and RAMB36 in tenths as further resources); its SLRs then shown resource by resource.
-    def vec(x, sites):
-        return '/'.join([str(max(0, round(sites)))] + [str(max(0, round(10 * x[r] if r != 'ff' else x[r])))
-                                                      for r in RESOURCES[1:]])
-    report = os.path.join(out, 'sll.txt')
-    opts = (f'{fold} schedule-only report={report} sll-estimate slr-sll-budget={budget} slr-capacities='
-            + ','.join(vec(c, spl * c['lut']) for c in free) + ' slr-sites='
-            + ','.join(f'{c}:{vec(res[c], max(1, spl * res[c]["lut"]))}' for c in classes))
-    run([a.foldsim_opt, models, f'--pass-pipeline=builtin.module(foldsim-fold-static{{{opts}}})', '-o', os.devnull])
-    text = open(report).read()
-    est_lines = text[text.index('  sll estimate:'):].split('\n')
-    sec = [est_lines[0]] + list(takewhile(lambda l: l.startswith('    '), est_lines[1:]))
-    m = re.search(r'\(worst (\d+), total (\d+)\)', '\n'.join(sec))
-    worst = int(m.group(1)) if m else None
+
+    # 2. An assignment of whole copies within each SLR's fill in every resource (fold-static sll-estimate: LUT
+    # sites, then LUTRAM LUTs, flops, and URAM and RAMB36 in tenths as further resources); where there is none,
+    # the largest copy is left out of the assignment and spread over the room the others leave, from the SLR the
+    # search gave it outwards (the placer cuts it).
+    # A copy's memories count up to the largest SLR's room: past it their primitives go apart.
+    def vec(x, sites, clamp=None):
+        return '/'.join([str(max(0, round(sites)))] + [str(max(0, round(x[r]))) for r in LOGIC[1:]] +
+                        [str(max(0, round(10 * (min(x[r], clamp[r]) if clamp else x[r])))) for r in ('uram', 'bram')])
+
+    def estimate(sizes, caps_g, memories=True):
+        if os.path.exists(report):
+            os.remove(report)
+        # Without `memories` the copies' memories are left to go apart (the placer balances the logic).
+        mem_room = {r: max(0.0, max(x[r] for x in caps_g)) if memories else 0.0 for r in ('uram', 'bram')}
+        opts = (f'{fold} schedule-only report={report} sll-estimate slr-sll-budget={budget} slr-capacities='
+                + ','.join(vec(c, spl * c['lut']) for c in caps_g) + ' slr-sites='
+                + ','.join(f'{c}:{vec(sizes[c], spl * sizes[c]["lut"], mem_room)}' for c in classes))
+        run([a.foldsim_opt, models, f'--pass-pipeline=builtin.module(foldsim-fold-static{{{opts}}})', '-o',
+             os.devnull])
+        text = open(report).read()
+        est_lines = text[text.index('  sll estimate:'):].split('\n')
+        sec = [est_lines[0]] + list(takewhile(lambda l: l.startswith('    '), est_lines[1:]))
+        wires = {}
+        for l in sec:
+            mw = re.match(r'    wires (\S+) (\S+) (\d+)$', l)
+            if mw:
+                wires[(mw.group(1), mw.group(2))] = int(mw.group(3))
+        sec = [l for l in sec if not l.startswith('    wires ')]
+        groups = None
+        # A copy larger than every SLR's room is put whole in the largest: not an assignment within the room.
+        if re.search(r'\(worst \d+, total \d+\)', '\n'.join(sec)) and \
+                not any(l.startswith('    larger than every SLR') for l in sec):
+            groups = []
+            for g in range(len(room0)):
+                mm = re.search(rf'^    slr{g} \(\d+ sites\):(.*)$', '\n'.join(sec), re.M)
+                groups.append(mm.group(1).split() if mm else [])
+        return text, sec, wires, groups
+
+    text, sec, wires, groups = estimate(res, room0)
+    # The refold must be the generation's schedule: a compiler that does not take the generation's options the same
+    # way (an older one without staging: e8, 11-07, refolded to II 2,748 for 2,931) checks another netlist.
+    rii = schedule_ii(text)
+    if rii != ii:
+        finish(lines, f'REFUSE: the check\'s refold has II {rii}, the netlist\'s schedule II {ii}: this compiler '
+                      f'({a.foldsim_opt}) does not reproduce the generation; run the check with the generation\'s')
+    # No assignment of whole copies: the largest copies by logic (at most model['cut_copies']) left out one by one
+    # and spread over the room the others leave.
+    cuts = []
+    by_logic = sorted(res, key=lambda c: -max(res[c][r] / room0[0][r] for r in LOGIC if room0[0][r] > 0))
+    # The other copies within the SLRs' balanced share (the placer balances the SLRs' fill: each SLR at most the
+    # region's fill of the whole design plus model['balance_slack']), the cut copies filling the room left.
+    tot_full = {r: sum(c[r] for c in full) for r in RESOURCES}
+    u = {r: (sum(x[r] for x in res.values()) + (top_share or {}).get(r, 0.0)) / tot_full[r] if tot_full[r] else 0.0
+         for r in RESOURCES}
+    balanced = [{r: min(room0[g][r], (u[r] + model.get('balance_slack', 0.05)) * full[g][r] - top_spread[g][r])
+                 for r in RESOURCES} for g in range(len(full))]
+    while groups is None and mode == 'netlist' and not over and len(cuts) < model.get('cut_copies', 2):
+        cuts.append(by_logic[len(cuts)])
+        _, sec2, _, groups = estimate(dict(res, **{c: new_acc() for c in cuts}), balanced, memories=False)
+        sec += ['    (no whole assignment: ' + ', '.join(cuts) + ' left out, spread over the room the others leave)'] \
+            + sec2[1:]
+    cut_copy = cuts[-1] if cuts else None
     lines += sec
-    assign_bad = []
-    if worst is not None:
-        for g, s in enumerate(free):
-            mm = re.search(rf'^    slr{g} \(\d+ sites\):(.*)$', '\n'.join(sec), re.M)
-            members = mm.group(1).split() if mm else []
-            use = {r: sum(res[c][r] for c in members) for r in RESOURCES}
-            lines.append(f'    slr{g} = {s["name"]}: ' + ', '.join(
-                f'{r} {fmt(r, use[r])} / {fmt(r, s[r])}' for r in RESOURCES))
-            bad = [r for r in RESOURCES if use[r] > s[r] + 1e-9]
-            if bad:
-                assign_bad.append((s['name'], bad))
     largest = big[0]
     lines.append(f'{name}: largest class copy {largest}: ' + ', '.join(
         f'{s["name"]} {100 * max(res[largest][r] / s[r] if s[r] else 0 for r in RESOURCES):.0f} %' for s in caps)
         + ' of the SLR\'s capacity (its binding resource)')
+    shares = slls = failed = None
+    # Memories go apart (a copy's primitives where there is room): within the region's, at the fill.
+    mem_over = [r for r in ('uram', 'bram') if sum(x[r] for x in res.values()) > sum(x[r] for x in room0) + 1e-9]
+    # The whole design against the region at the placer's fill (the placed builds: 66-74 % of its LUTs).
+    region_fill = {r: (sum(x[r] for x in res.values()) + (top_share or {}).get(r, 0.0)) / sum(c[r] for c in full)
+                   for r in LOGIC if sum(c[r] for c in full)}
+    lines.append('  the design over the region: ' + ', '.join(f'{r} {100 * f:.0f} %' for r, f in region_fill.items())
+                 + ' (placement fill ' + ', '.join(f'{r} {100 * fill_of[r]:.0f} %' for r in LOGIC) + ')')
+    fill_over = [r for r, f in region_fill.items() if f > fill_of[r] + 1e-9]
+    if groups is not None:
+        shares = {c: {r: [float(c in g) for g in groups] for r in RESOURCES} for c in classes}
+        room = [{r: room0[g][r] - sum(res[c][r] for c in groups[g] if c not in cuts) for r in RESOURCES}
+                for g in range(len(groups))]
+        failed = None
+        for c in cuts:
+            home = next(g for g, cs in enumerate(groups) if c in cs)
+            use = [{r: room0[g][r] - room[g][r] + top_spread[g][r] for r in RESOURCES} for g in range(len(groups))]
+            shares[c] = distribute(res[c], room, home, use, full)
+            if shares[c] is None:
+                failed = c
+                break
+            room = [{r: room[g][r] - res[c][r] * shares[c][r][g] for r in RESOURCES} for g in range(len(groups))]
+        if failed is None:
+            for g, s in enumerate(full):
+                use = {r: sum(res[c][r] * shares[c][r][g] for c in classes) + top_spread[g][r] for r in RESOURCES}
+                lines.append(f'    {s["name"]} as placed: ' + ', '.join(
+                    f'{r} {fmt(r, use[r])} ({100 * use[r] / s[r]:.0f} %)' if s[r] else f'{r} 0' for r in RESOURCES))
+            for c in cuts:
+                lines.append(f'    {c} cut over the SLRs: ' + ', '.join(
+                    f'{s["name"]} {100 * x:.0f} %' for s, x in zip(full, shares[c]['lut'])) + ' of its logic')
+            if model:
+                slls = boundary_slls(shares, res, wires, top_spread, model, vmem_bits(gdir))
+                for b, (lk, ct, sm) in enumerate(slls):
+                    lines.append(f'    boundary {names[b]}-{names[b + 1]}: {lk + ct + sm:,.0f} SLLs projected '
+                                 f'(links {lk:,.0f}, cut copies {ct:,.0f}, simulator level and kernel {sm:,.0f})')
+    if a.json:
+        json.dump(dict(name=name, ii=ii, mode=mode, copies=res, top=top_share, wires=[[x, y, w] for (x, y), w in
+                                                                                     wires.items()],
+                       assignment=groups, cuts=cuts, shares=shares,
+                       slls=slls), open(a.json, 'w'), indent=1)
+    if mode != 'netlist':
+        finish(lines, 'ESTIMATE (schedule resources, not a verdict): '
+                      + ('an assignment within the SLRs' if groups is not None else 'no assignment'))
     if over:
         verdict = 'REFUSE: ' + '; '.join(f'{c} fits no SLR whole (the nearest, {s}: over its {"/".join(r)})'
                                          for c, s, r in over) + \
             ' (a copy past its SLR is cut by the placer, its SLLs unknown: r16c failed so)'
-    elif worst is None:
-        verdict = 'REFUSE: no assignment of the copies within the SLRs\' capacities'
-    elif assign_bad:
-        verdict = 'REFUSE: the assignment found is over ' + '; '.join(
-            f'{s}\'s {"/".join(r)}' for s, r in assign_bad)
+    elif fill_over:
+        verdict = 'REFUSE: the design\'s ' + ', '.join(f'{r} {100 * region_fill[r]:.0f} %' for r in fill_over) + \
+            ' of the region, past the placement fill (' + ', '.join(f'{100 * fill_of[r]:.0f} %' for r in fill_over) + \
+            '; r16c failed placement at 84 % of its LUTs)'
+    elif mem_over:
+        verdict = f'REFUSE: the copies\' {"/".join(mem_over)} past the region\'s at the placement fill'
+    elif groups is None:
+        verdict = 'REFUSE: no assignment of the copies within the SLRs\' fill, even with the largest cut'
+    elif failed is not None:
+        verdict = f'REFUSE: {failed} does not fit the room the other copies leave in the SLRs'
+    elif slls is None:
+        verdict = 'OK: an assignment within the SLRs (no placement model in the region: SLLs not projected)'
     else:
-        # The SLLs the worst boundary takes as placed: its whole-copy link bits
-        # times the region's sll_per_link_bit (a placed build's SLLs over its
-        # estimate: the placer splits the copies where their own cut is small
-        # and a wide link reads a word at a time); without it, the link bits.
-        per = region.get('sll_per_link_bit')
-        sll = worst * per if per else worst
-        lines.append(f'{name}: worst boundary {worst} whole-copy link bits' + (
-            f' -> {sll:,.0f} SLLs projected (x{per})' if per else '') +
-            f'; budget {budget}, the boundary\'s {region.get("sll_per_boundary")}')
-        if sll > region.get('sll_per_boundary', budget):
-            verdict = f'REFUSE: {sll:,.0f} SLLs projected past the boundary\'s {region.get("sll_per_boundary")}'
-        elif sll > budget:
-            verdict = f'WARN: {sll:,.0f} SLLs projected over the {budget} budget'
+        worst = max(sum(x) for x in slls)
+        wb = max(range(len(slls)), key=lambda b: sum(slls[b]))
+        where = f'{names[wb]}-{names[wb + 1]}'
+        cutn = f'; {", ".join(cuts)} cut over SLRs' if cuts else ''
+        if worst > region.get('sll_per_boundary', budget):
+            verdict = f'REFUSE: {worst:,.0f} SLLs projected over {where}, past its {region.get("sll_per_boundary")}' \
+                      + cutn
+        elif worst > budget or cuts:
+            verdict = f'WARN: {worst:,.0f} SLLs projected over {where} (budget {budget}){cutn}'
         else:
-            verdict = f'OK: {sll:,.0f} SLLs projected within the {budget} budget'
-    lines.append(f'{name}: {verdict}')
-    print('\n'.join(lines))
-    with open(report, 'a') as f:
-        f.write('\n'.join(lines) + '\n')
-    sys.exit(1 if verdict.startswith('REFUSE') else 0)
+            verdict = f'OK: {worst:,.0f} SLLs projected over {where}, within the {budget} budget'
+    finish(lines, verdict)
 
 
 if __name__ == '__main__':

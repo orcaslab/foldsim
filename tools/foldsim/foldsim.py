@@ -736,13 +736,6 @@ def slr_options(a, foldsim_opt, models, fold, out):
                 sites[c] = round(measured[c]['lut'] * spl)
         print(f'foldsim: copy sites measured from {a.slr_sites} ({sum(c in measured for c in sites)} of {len(sites)})',
               file=sys.stderr)
-    if a.slr_region and not a.slr_groups:
-        # --sll-check alone: the SLLs any assignment to the region's SLRs needs
-        # (fold-static sll-estimate), the netlist unchanged.
-        caps = slr_region_capacities(a.slr_region)
-        return (f' sll-estimate slr-sll-budget={slr_region_sll_budget(a.slr_region)} slr-capacities='
-                + ','.join(str(c) for _, c in caps) + ' slr-sites='
-                + ','.join(f'{c}:{s}' for c, s in sites.items()))
     if a.slr_region:
         # Unequal SLRs: group g is the region's g-th SLR, each with its own
         # capacity (its LUTs, with margin, in LUT sites); the floorplan names it.
@@ -753,8 +746,7 @@ def slr_options(a, foldsim_opt, models, fold, out):
               + ', '.join(f'{c} {s}' for c, s in sites.items()), file=sys.stderr)
         opts = (f' slr-groups={len(caps)} slr-capacities={",".join(str(c) for _, c in caps)} slr-sites='
                 + ','.join(f'{c}:{s}' for c, s in sites.items())
-                + f' slr-sll-budget={slr_region_sll_budget(a.slr_region)}'
-                + (' sll-estimate' if a.sll_check else ''))
+                + f' slr-sll-budget={slr_region_sll_budget(a.slr_region)}')
     else:
         capacity = a.slr_capacity or round(foldsim_degree.PLACE_MARGIN *
                                            foldsim_degree.PLACE_SITES / a.slr_count)
@@ -1382,10 +1374,11 @@ def build_parser():
                          'within its own SLR\'s capacity and assigned to that SLR by name in '
                          '<out>/foldsim_floorplan.tcl; replaces --slr-count and --slr-capacity')
     ap.add_argument('--sll-check', action='store_true',
-                    help='with --static and --slr-region: report in schedule.txt the SLLs (link bits over '
-                         'each SLR boundary) the design needs at the least over every assignment of its classes '
-                         'to the region\'s SLRs (fold-static sll-estimate), against the boundary budget '
-                         '(sll_per_boundary x sll_margin); with --slr-groups the groups also keep within it')
+                    help='with --static and --slr-region: check the generated netlist against the region\'s SLRs '
+                         '(foldsim_sll_check.py: each copy\'s LUT, LUTRAM, FF, URAM and RAMB36 counted on the '
+                         'netlist, an assignment within the SLRs, the SLLs each boundary takes as placed), report '
+                         'in <out>/sll/sll.txt, and fail on a refusal; with --slr-groups the groups also keep the '
+                         'boundary budget (sll_per_boundary x sll_margin) in link bits')
     ap.add_argument('--slr-sites', default='', metavar='JSON',
                     help="with --slr-groups: each copy's LUTs measured on a generated netlist of the same recipe "
                          '(JSON {copy: {"lut": n}}, foldsim_sll_check.py netlist resources) instead of the '
@@ -1692,7 +1685,9 @@ def main():
             if a.copies != 'auto':
                 run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
                      '-o', out('models.mlir')])
-            fold += slr_options(a, foldsim_opt, out('models.mlir'), fold, out)
+            if a.slr_groups:
+                fold += slr_options(a, foldsim_opt, out('models.mlir'), fold, out)
+        sll_fold = fold
         rc = f'loads={a.control_fanout}'
         if a.fanout:
             rc += f' fanout={a.fanout}' + (' fanout-logic' if a.fanout_logic else '')
@@ -1714,8 +1709,8 @@ def main():
     run([tool('firtool'), '--format=mlir', sim,
          '--add-vivado-ram-address-conflict-synthesis-bug-workaround', '-o', out('foldsim_sim.sv')])
 
-    if a.sll_check and not a.slr_region:
-        sys.exit('--sll-check needs --slr-region')
+    if a.sll_check and not (a.slr_region and a.static):
+        sys.exit('--sll-check needs --static and --slr-region')
     if a.slr_groups:
         if not a.static:
             sys.exit('--slr-groups needs --static')
@@ -1878,6 +1873,18 @@ def main():
                         f.write(f'`define FOLDSIM_VMEM_G{g}_CACHE_ROWS {v["cache_rows"]}\n')
             f.write(f'`define FOLDSIM_VMEM_BYTES 64\'h{info["vmem_bytes"]:x}\n')
     print(f'foldsim: {", ".join(f"{k} x{v}" for k, v in info["threads"].items())}', file=sys.stderr)
+    if a.sll_check:
+        # The per-copy SLR / SLL check on the netlist just generated (its
+        # stage registers, read buffers and simulator level counted; schedule
+        # estimates said "fits" where placement failed): <out>/sll/sll.txt;
+        # a refusal fails the generation, its outputs kept.
+        r = run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_sll_check.py'),
+                 a.out, '--models', out('models.mlir'), '--fold-options', sll_fold, '--foldsim-opt', foldsim_opt,
+                 '--slr-region', a.slr_region, '--out', out('sll')], check=False, capture_output=True)
+        verdict = next((l for l in reversed(r.stdout.splitlines()) if re.search(r': (OK|WARN|REFUSE):', l)), None)
+        print(f'foldsim: SLL check: {verdict or "failed: " + (r.stderr or r.stdout)[-2000:]}', file=sys.stderr)
+        if r.returncode:
+            sys.exit(f'foldsim: --sll-check refuses this netlist (report {out("sll")}/sll.txt)')
 
 
 if __name__ == '__main__':
