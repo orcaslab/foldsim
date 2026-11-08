@@ -41,6 +41,20 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/nest --static --bubbles --nest --modulo --short-lead --copies Leaf:2 --page 2 --stage-levels 8 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_late.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
 # RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +bubble=30 +stall=20 | FileCheck %s
+# Per class (--stage-levels-class): Leaf at 4 over a global 6 (14 stages, as
+# at 4; against the target), Leaf off (unstaged), Leaf at 6 alone (as at 6),
+# and a spec that matches no class.
+# RUN: foldsim --srcs top.f --top Top --out %t/k4 --static --bubbles --stage-levels 6 --stage-levels-class Leaf:4 Leaf > %t/k4.log 2>&1
+# RUN: FileCheck %s --check-prefix=S4 < %t/k4.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/k4/obj %S/Inputs/tb_late.sv top.sv %t/k4/foldsim_sim.sv > %t/k4/build.log 2>&1
+# RUN: %t/k4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/koff --static --bubbles --stage-levels 6 --stage-levels-class 'Le*:off' Leaf > %t/koff.log 2>&1
+# RUN: FileCheck %s --check-prefix=PLAIN < %t/koff.log
+# RUN: foldsim --srcs top.f --top Top --out %t/k6 --static --bubbles --stage-levels-class Leaf:6 Leaf > %t/k6.log 2>&1
+# RUN: FileCheck %s --check-prefix=S6 < %t/k6.log
+# RUN: not foldsim --srcs top.f --top Top --out %t/knone --static --stage-levels 6 --stage-levels-class Nope:3 Leaf > %t/knone.log 2>&1
+# RUN: FileCheck %s --check-prefix=KNONE < %t/knone.log
+# KNONE: stage-levels-class: 'Nope:3' matches no class
 # The cut soonest first, forced: the same against the target.
 # RUN: env FOLDSIM_STAGE_CUT=soonest foldsim --srcs top.f --top Top --out %t/early --static --bubbles --modulo --page 2 --stage-levels 6 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/early/obj %S/Inputs/tb_late.sv top.sv %t/early/foldsim_sim.sv > %t/early/build.log 2>&1

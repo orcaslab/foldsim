@@ -143,6 +143,9 @@ struct Class {
   /// state pass, whose writes are as without stages; its state gap counts
   /// from the state pass to the next evaluation's read. 0: none.
   unsigned stages = 0;
+  /// Its staged evaluation's levels (stage-levels, or its class's
+  /// stage-levels-class), 0: not staged.
+  unsigned stageLevels = 0;
   /// Multicycle (`multicycle`): host cycles from the capture registers to
   /// the end registers, the stages less one (0: none, or stage registers).
   unsigned multicycle = 0;
@@ -357,6 +360,8 @@ public:
   SmallVector<std::string> passSplitSpecs;
   /// `state-in-ram` / `state-in-ram-read-bits` (planStateInRam).
   SmallVector<std::string> stateInRamSpecs;
+  /// `stage-levels-class`: <glob>:<N|off> per class over `stage-levels`.
+  SmallVector<std::string> stageLevelClassSpecs;
   unsigned stateInRamReadBits = 0;
   /// `state-in-ram-h`: the most host cycles a copy's P passes take,
   /// instances x P (0: no bound), for `auto` P.
@@ -2613,7 +2618,40 @@ LogicalResult StaticFolder::chooseStages() {
       return netlist.emitError("multicycle: '")
              << spec << "' is not <glob> or <glob>:<host cycles>";
   }
-  if (!stageLevels) {
+  // Each class's levels: stage-levels, or the last stage-levels-class spec
+  // its class's name matches (N, or off: 0).
+  for (auto &spec : stageLevelClassSpecs) {
+    auto [pattern, levels] = StringRef(spec).rsplit(':');
+    unsigned n = 0;
+    if (pattern.empty() || !llvm::GlobPattern::create(pattern) ||
+        (levels != "off" && (levels.getAsInteger(10, n) || !n)))
+      return netlist.emitError("stage-levels-class: '")
+             << spec << "' is not <glob>:<levels> or <glob>:off";
+  }
+  SmallVector<bool> levelMatched(stageLevelClassSpecs.size(), false);
+  bool anyStaged = false;
+  for (auto &cls : classes) {
+    StringRef baseName = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
+                                            : StringRef(cls.name);
+    cls.stageLevels = stageLevels;
+    for (auto [k, spec] : llvm::enumerate(stageLevelClassSpecs)) {
+      auto [pattern, levels] = StringRef(spec).rsplit(':');
+      if (auto glob = llvm::GlobPattern::create(pattern);
+          glob && glob->match(baseName)) {
+        levelMatched[k] = true;
+        unsigned n = 0;
+        if (levels != "off")
+          levels.getAsInteger(10, n);
+        cls.stageLevels = n;
+      }
+    }
+    anyStaged |= cls.stageLevels > 0;
+  }
+  for (auto [k, spec] : llvm::enumerate(stageLevelClassSpecs))
+    if (!levelMatched[k])
+      return netlist.emitError("stage-levels-class: '")
+             << spec << "' matches no class";
+  if (!anyStaged) {
     if (!multicycleSpecs.empty())
       return netlist.emitError("multicycle: needs stage-levels (the levels a "
                                "host cycle takes); '")
@@ -2641,6 +2679,7 @@ LogicalResult StaticFolder::chooseStages() {
     // state pass, and written back after the state pass (offChipRows).
     StringRef baseName = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
                                             : StringRef(cls.name);
+    unsigned stageLevels = cls.stageLevels;
     bool listed = false;
     unsigned given = 0;
     for (auto [k, spec] : llvm::enumerate(multicycleSpecs)) {
@@ -2652,6 +2691,12 @@ LogicalResult StaticFolder::chooseStages() {
         if (!cycles.empty())
           cycles.getAsInteger(10, given);
       }
+    }
+    if (!stageLevels) {
+      if (listed)
+        return cls.model.emitError("multicycle: ")
+               << cls.name << " needs stage-levels (stage-levels-class off)";
+      continue;
     }
     bool late = llvm::any_of(cls.late, [](bool late) { return late; });
     std::string why;
@@ -8904,7 +8949,7 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
           sinks.push_back(operand);
   }
   DenseMap<Value, Staging> memo;
-  int limit = std::max<int>(2, 2 * stageLevels);
+  int limit = std::max<int>(2, 2 * cls.stageLevels);
   // (Its memories' stores keep a row per instance: 2^eb instances.)
   unsigned eb = cls.threads() > 1 ? llvm::Log2_32_Ceil(cls.threads()) : 0;
   for (;; ++limit) {
@@ -15076,6 +15121,8 @@ void FoldStaticPass::runOnOperation() {
   folder.moduloLinear = moduloLinear;
   folder.passSplitSpecs.assign(passSplit.begin(), passSplit.end());
   folder.stateInRamSpecs.assign(stateInRam.begin(), stateInRam.end());
+  folder.stageLevelClassSpecs.assign(stageLevelsClass.begin(),
+                                     stageLevelsClass.end());
   folder.stateInRamReadBits = stateInRamReadBits;
   folder.stateInRamH = stateInRamH;
   folder.stateInRamZeroLinks = stateInRamZeroLinks;

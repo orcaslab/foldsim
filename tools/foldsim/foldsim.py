@@ -448,6 +448,8 @@ def frame_options(a):
         fold += f' registered-links={a.registered_links}'
     if getattr(a, 'stage_levels', 0):
         fold += f' stage-levels={a.stage_levels}'
+    if getattr(a, 'stage_levels_class', ''):
+        fold += f' stage-levels-class={a.stage_levels_class}'
     if getattr(a, 'multicycle', ''):
         fold += f' multicycle={a.multicycle}'
     if getattr(a, 'pass_split', ''):
@@ -1332,6 +1334,10 @@ def build_parser():
                     help='with --static: the RAM (distributed, block or ultra) of the links from model P '
                          'to model R that --link-block-depth\'s rules let block or ultra RAM hold, '
                          'whatever their depth (--state auto chooses them; foldsim-fold-static)')
+    ap.add_argument('--stage-levels-class', default='', metavar='CLASS:N|CLASS:off,...',
+                    help='with --static: per class over --stage-levels (globs on the model name; the last '
+                         'matching spec wins): stage that class at N levels, or not at all (off); a spec that '
+                         'matches no class is an error (foldsim-fold-static stage-levels-class)')
     ap.add_argument('--stage-levels', type=int, default=0, metavar='N',
                     help='with --static: a class whose state cone is deeper than N estimated logic '
                          'levels (no black box or folded pipeline) evaluates over several host '

@@ -773,6 +773,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "The schedule places such a pass at least the stages into the "
            "frame, its inputs' links the stages earlier, and its state gap "
            "from the read. 0: none">,
+    ListOption<"stageLevelsClass", "stage-levels-class", "std::string",
+               "Per class over stage-levels: <glob>:<N> stages a class (globs "
+               "on the model's name; a copy goes by its class's) at N levels, "
+               "<glob>:off not at all; the last matching spec wins. A spec "
+               "that matches no class is an error">,
     ListOption<"multicycle", "multicycle", "std::string",
                "With stage-levels: classes (globs; a copy goes by its class's "
                "name) staged without stage registers. A copy evaluates one "
