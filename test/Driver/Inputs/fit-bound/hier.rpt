@@ -1,0 +1,8 @@
+| Design State : Synthesized
++----------+-----------+--------------+------------+------------+---------+------+-----+--------+--------+------+------------+
+| Instance |   Module  | PR Attribute | Total PPLOCs | Total LUTs | Logic LUTs | LUTRAMs | SRLs | FFs | RAMB36 | RAMB18 | URAM | DSP Blocks |
++----------+-----------+--------------+------------+------------+---------+------+-----+--------+--------+------+------------+
+| foldsim_afu_0 | x_afu | Reconfigurable | - | 1300(1.00%) | 1000(1.00%) | 300(1.00%) | 0(0.00%) | 1100(1.00%) | 4(1.00%) | 2(1.00%) | 2(0.00%) | 0(0.00%) |
+| sim | x_sim | Reconfigurable | - | 300 | 100 | 200 | 0 | 30 | 0 | 0 | 2 | 0 |
+| A_copy | x_A_static | Reconfigurable | - | 280 | 80 | 200 | 0 | 8 | 0 | 0 | 2 | 0 |
+| B_copy | x_B_static | Reconfigurable | - | 0 | 0 | 0 | 0 | 16 | 0 | 0 | 0 | 0 |

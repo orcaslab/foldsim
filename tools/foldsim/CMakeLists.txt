@@ -43,6 +43,12 @@ install(PROGRAMS ready_choice.py DESTINATION bin)
 # The SLLs an existing netlist needs against the region's budget (from its logged fold pipeline).
 configure_file(foldsim_sll_check.py ${CMAKE_BINARY_DIR}/bin/foldsim_sll_check.py COPYONLY)
 install(PROGRAMS foldsim_sll_check.py DESTINATION bin)
+# The fit calibration database (every synthesis of a netlist against its count) and the bound check of a fold
+# against its region (floor, median, upper bound; per copy against the SLRs; the image's post-synthesis gate).
+configure_file(foldsim_fitdb.py ${CMAKE_BINARY_DIR}/bin/foldsim_fitdb.py COPYONLY)
+install(PROGRAMS foldsim_fitdb.py DESTINATION bin)
+configure_file(foldsim_fit_bound.py ${CMAKE_BINARY_DIR}/bin/foldsim_fit_bound.py COPYONLY)
+install(PROGRAMS foldsim_fit_bound.py DESTINATION bin)
 # Beacon's routing terms (fanout, SLR crossings): fit on a placed build, score a screen.
 configure_file(foldsim_beacon_terms.py ${CMAKE_BINARY_DIR}/bin/foldsim_beacon_terms.py COPYONLY)
 install(PROGRAMS foldsim_beacon_terms.py DESTINATION bin)

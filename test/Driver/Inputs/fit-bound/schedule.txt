@@ -1,0 +1,3 @@
+foldsim-fold-static: II = 64
+  link kinds: distributed 2 4096 130; block 1 36864 1.0; ultra 1 294912 1; registers 5 4500
+  link storage: 3 memories, 1 bits, 130 LUTRAM LUTs; 4500 register bits; staged: 2 links, 4000 register bits; 
