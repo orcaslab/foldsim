@@ -1041,7 +1041,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             # page-memories): a kind priced as paged_state prices the small
             # ones, its page RAM a share of the class's (URAM).
             as_row = BUILT is not None and BUILT.get('rows') and \
-                re.search(BUILT['rows'], f"{re.sub(r'_copy\\d+$', '', c)}:{name}")
+                re.search(BUILT['rows'], re.sub(r'_copy\d+$', '', c) + ':' + name)
             if tiers is not None and (not tiers.get('as_built') or as_row) and nameable and \
                     len(per) == len(forms) and rl <= 1 and \
                     all(f == 'paged' for _, _, f, _ in forms) and \
@@ -2264,7 +2264,7 @@ def tiers_pattern(pairs):
     """The virtual-memories regex that names exactly these (class, memory)
     pairs as foldsim-fold-static matches them: `<class model>:<name>`, the
     model of a copy its class's."""
-    names = sorted({f"{re.sub(r'_copy\d+$', '', c)}:{m}" for c, m in pairs})
+    names = sorted({re.sub(r'_copy\d+$', '', c) + ':' + m for c, m in pairs})
     return '^(' + '|'.join(ere_escape(n) for n in names) + ')$' if names else ''
 
 
