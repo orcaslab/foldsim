@@ -429,6 +429,8 @@ def frame_options(a):
         fold += f' link-hbm-shift={a.link_hbm_shift}'
     if getattr(a, 'page_write_gate', False):
         fold += ' page-write-gate'
+        if getattr(a, 'page_write_gate_pages', ''):
+            fold += f' page-write-gate-pages={a.page_write_gate_pages}'
     if getattr(a, 'read_buffer_bits', 0):
         fold += f' read-buffer-bits={a.read_buffer_bits}'
     if getattr(a, 'fold_store_ram', 0):
@@ -1218,8 +1220,11 @@ def build_parser():
                          'the copy\'s own; a write landing in between forwarded unless the schedule shows '
                          'none can). Exact; 0: read combinationally, LUTs (foldsim-fold-static fold-store-ram)')
     ap.add_argument('--fold-store-style', choices=('auto', 'ultra', 'block'), default='auto',
-                    help='with --fold-store-ram: the stores\' RAM style (auto: ultra from 2048 entries deep, '
-                         'block below); a --storage rule <model>:fold<k>_store=<kind> takes precedence')
+                    help='with --fold-store-ram: the stores\' RAM style (auto: ultra where it takes fewer than half as '
+                         'many primitives as block RAM, else block); a --storage rule <model>:fold<k>_store=<kind> takes precedence')
+    ap.add_argument('--page-write-gate-pages', metavar='MODEL:N,...', default='',
+                    help='with --page-write-gate: per model, gate only the first N pages of each column; the rest '
+                         'through the page select (foldsim-fold-static page-write-gate-pages)')
     ap.add_argument('--page-write-gate', action='store_true',
                     help='with --static and --page-engines: off-chip pages written back through a gated '
                          'register a page (loaded the host cycle before its write, else held at zero) and an OR '

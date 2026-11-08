@@ -658,7 +658,8 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "leaves less room, down to a combinational read">,
     Option<"foldStoreStyle", "fold-store-style", "std::string", "\"auto\"",
            "With fold-store-ram: the stores' RAM style, ultra, block, or auto "
-           "(ultra from 2048 entries deep, block below); a storage rule for "
+           "(ultra where it takes fewer than half as many primitives as "
+           "block RAM at its best aspect, else block); a storage rule for "
            "the store by name (<model>:fold<k>_store=<kind>) takes "
            "precedence">,
     Option<"pageWriteGate", "page-write-gate", "bool", "false",
@@ -672,6 +673,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "write-back register loads at the state pass (a 2:1 select a bit "
            "of one page). A class with a page window keeps the select (the "
            "report's `page write gate` line names the classes gated)">,
+    Option<"pageWriteGatePages", "page-write-gate-pages", "std::string", "\"\"",
+           "With page-write-gate: per class, how many pages are gated "
+           "(<model>:<n>, comma separated; the first n pages of each column, "
+           "the others chosen by a select of n fewer inputs, ORed in): a "
+           "balance between the gated registers (a flop a paged bit of a "
+           "gated page) and the select's LUTs. Unlisted: every page">,
     Option<"linkHbmFitSlots", "link-hbm-fit-slots", "bool", "false",
            "HBM link streams on page engines: each takes the fewest landing "
            "slots (a power of two, at least 8) its requests need, each request "

@@ -20,6 +20,18 @@
 # RUN: %t/c2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=30 +stall=30 | FileCheck %s
 # RUN: %t/c2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=60 +full=20 | FileCheck %s
 # RUN: %t/c2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=1 | FileCheck %s
+# Two of the four pages gated (`--page-write-gate-pages Leaf:2`): pages 0 and 1 through their gated registers, pages 2
+# and 3 through the page select (zero at pages 0 and 1), ORed in: the same tokens.
+# RUN: foldsim --srcs top.f --top Top --out %t/half --static --page 4 --storage Leaf:pages=hbm --copies Leaf:2 --zero-latency-links --zero-latency-chains --page-hbm-column-bits 64 --page-engines auto --page-write-gate --page-write-gate-pages Leaf:2 Leaf > %t/half.log 2>&1
+# RUN: FileCheck %s --check-prefix=HALF < %t/half/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/half -DVM1 -Mdir %t/half/obj %S/Inputs/tb_pages.sv top.sv %t/half/foldsim_sim.sv > %t/half/build.log 2>&1
+# RUN: %t/half/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=30 +stall=30 | FileCheck %s
+# RUN: %t/half/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=60 +full=20 | FileCheck %s
+# RUN: not foldsim --srcs top.f --top Top --out %t/badg --static --page 4 --storage Leaf:pages=hbm --page-engines auto --page-write-gate --page-write-gate-pages Leaf Leaf 2>&1 | FileCheck %s --check-prefix=BADG
+# HALF: _gate1 = seq.firreg
+# HALF-NOT: _gate2 = seq.firreg
+# HALF-NOT: _gate3 = seq.firreg
+# BADG: page-write-gate-pages: 'Leaf' is not <model>:<pages>
 # RUN: foldsim --srcs top.f --top Top --out %t/bub --static --page 3 --storage Leaf:pages=hbm --bubbles --modulo --page-hbm-column-bits 32 --page-engines auto --page-write-gate Leaf > %t/bub.log 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/bub -DBUBBLES -DVM1 -Mdir %t/bub/obj %S/Inputs/tb_pages.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
 # RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s

@@ -360,6 +360,8 @@ public:
   /// `page-write-gate`: off-chip pages on engines written back through
   /// per-page gated registers and an OR (choosePageGates, Class::pageGate).
   bool pageWriteGate = false;
+  /// `page-write-gate-pages`: per model, the pages gated (absent: all).
+  std::map<std::string, unsigned> pageGatePages;
   /// `read-buffer-bits`: a per-instance read-register buffer of at least this
   /// many bits read synchronously (a block RAM); 0: none.
   unsigned readBufferBits = 0;
@@ -9658,11 +9660,23 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     if (!read)
       return memory.emitError("folded pipeline store without its read");
     auto *rule = storageFor(cls, name, /*reg=*/false, width);
+    // `auto`: ultra RAM where it takes fewer than half as many primitives
+    // as block RAM (an URAM288 holds eight RAMB36's bits; the device has
+    // about half as many), so that a narrow or shallow store takes block RAM
+    // rather than a mostly empty URAM column.
+    auto autoStyle = [&]() -> StringRef {
+      uint64_t d = threadedType.getDepth(), w = width;
+      uint64_t urams = llvm::divideCeil(w, 72) * llvm::divideCeil(d, 4096);
+      uint64_t brams = std::numeric_limits<uint64_t>::max();
+      for (auto [dd, ww] : {std::pair<uint64_t, uint64_t>{512, 72}, {1024, 36},
+                            {2048, 18}, {4096, 9}, {8192, 4}, {16384, 2},
+                            {32768, 1}})
+        brams = std::min(brams, llvm::divideCeil(d, dd) * llvm::divideCeil(w, ww));
+      return 2 * urams < brams ? "ultra" : "block";
+    };
     StringRef style = rule ? StringRef(rule->kind)
-                      : foldStoreStyle != "auto"
-                          ? StringRef(foldStoreStyle)
-                          : StringRef(threadedType.getDepth() >= 2048 ? "ultra"
-                                                                      : "block");
+                      : foldStoreStyle != "auto" ? StringRef(foldStoreStyle)
+                                                 : autoStyle();
     bool ram = style == "block" || style == "ultra";
     // `fold-store-lead` host cycles ahead (2: into the RAM's register and an
     // output register; 1: into the RAM's register alone), at most the state
@@ -10213,6 +10227,14 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // a page before it, so neither buffer is overwritten before it is used.
   if (!pagedRegs.empty()) {
     unsigned p = cls.page;
+    // `page-write-gate-pages`: the first n pages of a gated class gated.
+    unsigned gatedPages = p;
+    {
+      std::string model = cls.splitFrom >= 0 ? classes[cls.splitFrom].name
+                                              : cls.name;
+      if (auto it = pageGatePages.find(model); it != pageGatePages.end())
+        gatedPages = std::min(it->second, p);
+    }
     BackedgeBuilder edges(b, model.getLoc());
     auto bits = [&](unsigned width) { return b.getIntegerType(width); };
     auto *rule = storageFor(cls, "pages", /*reg=*/false, 0);
@@ -10627,7 +10649,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             b.createOrFold<comb::ExtractOp>(bits(n), col.out, offset), fetched));
         parts.push_back(fetched);
         Value back = b.createOrFold<comb::ExtractOp>(bits(n), reg.writeBack, lo);
-        if (!col.gateReset.empty()) {
+        if (!col.gateReset.empty() && j < gatedPages) {
           // Gated: zero but the host cycle of page j's write (its
           // synchronous reset, a FF's SR pin), so the column ORs its pages.
           // Pages are written in order from the state pass + 1, so only page
@@ -10710,10 +10732,21 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         return hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elems),
                                       col.writeIndex);
       };
-      // Gated: every page's word zero but the one being written: their OR.
-      writeData = !col.gateReset.empty()
-                      ? Value(comb::OrOp::create(b, words, false))
-                      : select(words, col.width);
+      // Gated: every page's word zero but the one being written: their OR;
+      // the pages past the gated ones (`page-write-gate-pages`) chosen by
+      // the index as without gates (zero at a gated page's), ORed in.
+      if (col.gateReset.empty() || gatedPages == 0) {
+        writeData = select(words, col.width);
+      } else if (gatedPages >= p) {
+        writeData = comb::OrOp::create(b, words, false);
+      } else {
+        SmallVector<Value> ors(words.begin(), words.begin() + gatedPages);
+        SmallVector<Value> rest(words);
+        for (unsigned j = 0; j < gatedPages; ++j)
+          rest[j] = hw::ConstantOp::create(b, bits(col.width), 0);
+        ors.push_back(select(rest, col.width));
+        writeData = comb::OrOp::create(b, ors, false);
+      }
       if (bytesMasked)
         writeMask = select(masks, bytes);
       if (offChip) {
@@ -14395,6 +14428,18 @@ void FoldStaticPass::runOnOperation() {
   folder.foldPortsReset = foldPortsReset;
   folder.linkHbmFitSlots = linkHbmFitSlots;
   folder.pageWriteGate = pageWriteGate;
+  for (StringRef spec : llvm::split(StringRef(pageWriteGatePages), ',')) {
+    if (spec.empty())
+      continue;
+    auto [model, count] = spec.rsplit(':');
+    unsigned n;
+    if (model.empty() || count.getAsInteger(10, n)) {
+      getOperation().emitError("page-write-gate-pages: '")
+          << spec << "' is not <model>:<pages>";
+      return signalPassFailure();
+    }
+    folder.pageGatePages[model.str()] = n;
+  }
   folder.readBufferBits = readBufferBits;
   folder.foldStoreRam = foldStoreRam;
   folder.foldStoreStyle = foldStoreStyle;
