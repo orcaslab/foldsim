@@ -1,0 +1,50 @@
+# The fit calibration database and the bound check (foldsim_fitdb.py, foldsim_fit_bound.py).
+#
+# count: a copy's storage as counted on the netlist, a link register charged to the copy that reads it.
+# Copy A: a 4,096 x 80 ram_style ultra memory = 2 URAM288 (two 72-bit columns), a 1,024 x 7 store read
+# combinationally = 7 x 16 x 1.14 + the column select (162.68 LUTs priced, 128 as RAM64M8 primitives, all
+# of them forced: no block RAM reads combinationally), an 8-bit register; copy B two 8-bit registers; the
+# level's register A_o_to_B_i (8 bits) is B's link.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: python3 %foldsim_tools/foldsim_fitdb.py count %S/Inputs/fit-bound --json %t/count.json | FileCheck %s --check-prefix=COUNT
+# COUNT: fit-bound: 2 copies; simulator counted: lut 163, logic 0, lutram 163, lutram_lb 128, lutram_forced 128, ff 32, uram 2, bram 0, dsp 0
+# RUN: python3 -c "import json; c = json.load(open('%t/count.json')); print('A', c['copies']['A']['uram'], c['copies']['A']['ff'], 'B', c['copies']['B']['ff'], 'Blink', c['links']['B']['ff'])" | FileCheck %s --check-prefix=OWN
+# OWN: A 2.0 8.0 B 16.0 Blink 8.0
+#
+# ingest + fit: measured per counted over the whole simulator (sim row: 300 LUTs, 30 FFs, 2 URAM) and the
+# kernel (the AFU less the simulator: 1,000 LUTs, 1,070 FFs, 5 RAMB36 with the RAMB18s at half).
+# RUN: python3 %foldsim_tools/foldsim_fitdb.py ingest --db %t/db.jsonl --name d1 %S/Inputs/fit-bound %S/Inputs/fit-bound/hier.rpt | FileCheck %s --check-prefix=INGEST
+# INGEST: d1 (synth, Synthesized): 2 of 2 copies measured; lut 1.844, lutram 1.229, lutram_forced 1.562, ff 0.938, uram 1.000, bram - (simulator measured/counted)
+# RUN: python3 %foldsim_tools/foldsim_fitdb.py ingest --db %t/db.jsonl --name d2 %S/Inputs/fit-bound %S/Inputs/fit-bound/hier.rpt > /dev/null
+# RUN: python3 %foldsim_tools/foldsim_fitdb.py ingest --db %t/db.jsonl --name d2 %S/Inputs/fit-bound %S/Inputs/fit-bound/hier.rpt > /dev/null
+# RUN: wc -l < %t/db.jsonl | FileCheck %s --check-prefix=LINES
+# LINES: 2
+# RUN: python3 %foldsim_tools/foldsim_fitdb.py fit --db %t/db.jsonl --min-design-luts 0 --min-luts 0 --out %t/fit.json | FileCheck %s --check-prefix=FIT
+# FIT: fit synth over 2 designs (d1, d2)
+# FIT: design lut n   2  min 1.844 (d1)  median 1.844  max 1.844 (d1)  bounds [1.844, 1.844]
+# FIT: kernel lut n   2  min 1,000 (d1)  median 1,000  max 1,000 (d1)
+# FIT: kernel bram n   2  min 5 (d1)
+#
+# The bound check. Uncalibrated (no --fit): the storage floor; the region's 2 x 1,000 LUTs, 3 + 1 URAM.
+# RUN: python3 %foldsim_tools/foldsim_fit_bound.py %S/Inputs/fit-bound --slr-region %S/Inputs/fit-bound/region.json | FileCheck %s --check-prefix=FLOOR
+# FLOOR: design floor (uncalibrated storage): lut 128 (6 %), lutram 128 (13 %), ff 0 (0 %), uram 2 (50 %), bram 0 (0 %)
+# FLOOR: fit-bound: PASS
+# A copy whose URAM no SLR holds (SLRs of 1 and 1 URAM; the design past 94 % of the region's too): impossible, exit 1.
+# RUN: not python3 %foldsim_tools/foldsim_fit_bound.py --count %t/count.json --slr-region %S/Inputs/fit-bound/region-uram1.json | FileCheck %s --check-prefix=URAM
+# URAM: REFUSE: IMPOSSIBLE: design floor uram 99 % of the region, past 94 %; IMPOSSIBLE: copy A uram 2 > the largest SLR's 1
+# With the fit: median 163 x 1.844 + the kernel's 1,000 = 1,300 LUTs: within 80 % of 2,000; past 80 % of
+# 1,400 (SLRs of 700 LUTs): likely not to fit, exit 1.
+# RUN: python3 %foldsim_tools/foldsim_fit_bound.py --count %t/count.json --fit %t/fit.json --slr-region %S/Inputs/fit-bound/region.json | FileCheck %s --check-prefix=CAL
+# CAL: design median: lut 1,300 (65 %)
+# CAL: count.json: PASS
+# RUN: not python3 %foldsim_tools/foldsim_fit_bound.py --count %t/count.json --fit %t/fit.json --slr-region %S/Inputs/fit-bound/region-small.json | FileCheck %s --check-prefix=SMALL
+# SMALL: REFUSE: LIKELY: design median lut 93 % of the region, past the fill 80 %
+# The post-synthesis gate: the measured AFU (1,300 LUTs) and copies instead of bounds.
+# RUN: not python3 %foldsim_tools/foldsim_fit_bound.py --count %t/count.json --synthesis %S/Inputs/fit-bound/hier.rpt --slr-region %S/Inputs/fit-bound/region-small.json | FileCheck %s --check-prefix=SYN
+# SYN: measured (Synthesized
+# SYN: REFUSE: LIKELY: design median lut 93 % of the region
+# A schedule report: the link storage the compiler decided (link registers 4,500 bits, staged 4,000: the
+# larger, never the sum) against 4,000 flops (2 per LUT).
+# RUN: not python3 %foldsim_tools/foldsim_fit_bound.py --schedule %S/Inputs/fit-bound/schedule.txt --slr-region %S/Inputs/fit-bound/region.json | FileCheck %s --check-prefix=SCHED
+# SCHED: schedule floor (II 64), link storage only: lut 130 (6 %), lutram 130 (13 %), ff 4,500 (112 %), uram 1 (25 %), bram 1 (5 %)
+# SCHED: REFUSE: schedule floor ff 112 % of the region

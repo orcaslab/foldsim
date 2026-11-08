@@ -1,0 +1,1 @@
+{"slrs": [{"name": "S0", "luts": 1000, "lutram_luts": 500, "ramb36": 10, "uram": 1}, {"name": "S1", "luts": 1000, "lutram_luts": 500, "ramb36": 10, "uram": 1}], "margin": 0.85, "placement": {"region_fill": {"lut": 0.8, "lutram": 0.8, "ff": 0.8}}}
