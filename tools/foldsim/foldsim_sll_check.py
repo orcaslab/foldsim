@@ -37,7 +37,9 @@ netlist's (an older or newer compiler checks another netlist: REFUSE). Then, in 
      cut a warning.
 
 Exits 0 (OK, or WARN), 1 if a check refuses, 2 on error. Report in <out>/sll.txt (the estimate) and on stdout;
-`--json` writes the copies' resources, the wires between them, the assignment and each copy's shares of the SLRs.
+`--json` writes the copies' resources, the wires between them, the assignment, each copy's shares of the SLRs, the
+copies that fit no SLR whole (`over`), the cut ones (`cuts`) and each SLR's capacity (`caps`, logic times `margin`).
+A WARN with a copy cut is still a straddle: the driver's SLR rule (foldsim --region) and fit_gate.sh fail on it.
 """
 import argparse, json, math, os, re, shlex, subprocess, sys
 from itertools import takewhile
@@ -616,7 +618,8 @@ def main():
         json.dump(dict(name=name, ii=ii, mode=mode, copies=res, top=top_share, wires=[[x, y, w] for (x, y), w in
                                                                                      wires.items()],
                        assignment=groups, cuts=cuts, shares=shares,
-                       slls=slls), open(a.json, 'w'), indent=1)
+                       slls=slls, over=[c for c, _, _ in over], caps=caps, margin=region.get('margin', 1.0)),
+                  open(a.json, 'w'), indent=1)
     if mode != 'netlist':
         finish(lines, 'ESTIMATE (schedule resources, not a verdict): '
                       + ('an assignment within the SLRs' if groups is not None else 'no assignment'))
