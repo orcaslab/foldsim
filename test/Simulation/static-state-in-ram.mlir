@@ -1,5 +1,4 @@
 // REQUIRES: verilator
-// XFAIL: *
 // State in RAM (SiR, foldsim-fold-static `state-in-ram`; DESIGN.md of fold-sir-1108): a class's
 // register state kept in RAM (URAM / BRAM), a row an instance times P plus the pass, read in place
 // two host cycles ahead and written back from the next-state outputs, no fetch buffer, no per-bit
@@ -55,8 +54,8 @@
 // instance two host cycles ahead into the RAM's output register and a read flop, the write staged
 // a host cycle after the state pass at the staged instance, with byte masks by enable.
 // P1: seq.firmem 1, 1, old, undefined {sv.attributes = [#sv.attribute<"ram_style" = "{{.*}}">]} : <4 x {{[0-9]+}}, mask {{[0-9]+}}>
-// P1: seq.firmem.read_port %region0_sir0[%ahead0_inst2]
-// P1: seq.firmem.write_port %region0_sir0[%region0_inst_staged]
+// P1: seq.firmem.read_port %{{region[0-9]+}}_sir[%ahead0_inst2]
+// P1: seq.firmem.write_port %[[R:region[0-9]+]]_sir[%[[R]]_inst_staged]
 // P1LOG: state-in-ram: Model: {{[0-9]+}} bits/instance, 4 instances, {{[0-9]+}} x 72 columns, P 1, {{ultra|block}}
 // UL: ram_style" = "\22ultra\22
 // P2LOG: state-in-ram: Model: {{[0-9]+}} bits/instance, 4 instances, {{[0-9]+}} x 72 columns, P 2

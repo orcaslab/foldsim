@@ -152,6 +152,11 @@ struct Class {
   /// registers' writes, (passSplit + 1) x passSpan (0: none).
   unsigned deferSpan = 0;
   uint64_t passHoldBits = 0;
+  /// State in RAM (`state-in-ram`): P, the rows an instance (0: off; P > 1
+  /// is built as pages, `page` = P, with masks), and its RAM style.
+  unsigned sir = 0;
+  std::string sirStyle;
+  bool sirLogged = false;
   /// With --vmem-skip-held-reads: a virtual memory of it reads at a held
   /// address (heldReadRow), so its requests leave from registers a host
   /// cycle after the state pass, given a state gap of the lead + 2.
@@ -345,6 +350,9 @@ public:
   unsigned moduloLinear = 16;
   /// `pass-split`: <glob>:<passes>.
   SmallVector<std::string> passSplitSpecs;
+  /// `state-in-ram` / `state-in-ram-read-bits` (planStateInRam).
+  SmallVector<std::string> stateInRamSpecs;
+  unsigned stateInRamReadBits = 0;
   /// `link-hbm-lead`: the most positions a stream's request precedes its
   /// landing.
   unsigned linkHbmLead = kLinkHbmLead;
@@ -1109,6 +1117,9 @@ private:
   }
   /// `pass-split`: each named class's deferred lanes, planned on its model.
   LogicalResult planPassSplits();
+  /// `state-in-ram`: sets each matching class's Class::sir (and with P > 1
+  /// its `page`), before the pages are placed and the schedule made.
+  LogicalResult planStateInRam();
   StringRef syncLinkStyle(uint64_t depth, unsigned width) const {
     if (linkUltraDepth && depth >= linkUltraDepth)
       return "ultra";
@@ -6623,6 +6634,113 @@ bool StaticFolder::pagesAny(const Class &cls) const {
   return false;
 }
 
+LogicalResult StaticFolder::planStateInRam() {
+  struct Spec {
+    std::string glob;
+    uint64_t minBits = 1;
+    unsigned passes = 0;
+    bool used = false;
+  };
+  SmallVector<Spec> specs;
+  for (auto &text : stateInRamSpecs) {
+    SmallVector<StringRef> parts;
+    StringRef(text).split(parts, ':');
+    Spec spec;
+    spec.glob = parts[0].str();
+    if (parts.size() > 3 || parts[0].empty() ||
+        !llvm::GlobPattern::create(parts[0]) ||
+        (parts.size() > 1 && parts[1].getAsInteger(10, spec.minBits)) ||
+        (parts.size() > 2 && (parts[2].getAsInteger(10, spec.passes) ||
+                              !spec.passes)))
+      return netlist.emitError("state-in-ram: '")
+             << text << "' is not <glob>[:<min-bits>[:<P>]], P at least 1";
+    specs.push_back(spec);
+  }
+  for (auto &cls : classes) {
+    StringRef base = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
+                                        : StringRef(cls.name);
+    Spec *match = nullptr;
+    for (auto &spec : specs)
+      if (auto glob = llvm::GlobPattern::create(spec.glob);
+          glob && glob->match(base))
+        match = &spec;
+    if (!match)
+      continue;
+    match->used = true;
+    auto log = [&]() -> raw_ostream & {
+      return llvm::errs() << "foldsim-fold-static: state-in-ram: " << cls.name
+                          << ": ";
+    };
+    unsigned threads = cls.threads();
+    if (threads < 2) {
+      log() << "one instance, skipped\n";
+      continue;
+    }
+    if (cls.page) {
+      log() << "paged, skipped\n";
+      continue;
+    }
+    // The register bits an instance writes, as pages count them (buildCopy
+    // decides each register: a held one keeps its store).
+    DenseSet<Operation *> ready;
+    readyRegisters(cls, ready);
+    auto *folding = cls.folding.get();
+    uint64_t bits = 0;
+    unsigned regs = 0;
+    for (auto reg : cls.model.getBodyBlock()->getOps<seq::FirRegOp>())
+      if (!(folding && folding->physical.contains(reg)) &&
+          reg.getNext() != reg.getResult() &&
+          hw::getBitWidth(reg.getType()) > 0 && !ready.contains(reg)) {
+        bits += hw::getBitWidth(reg.getType());
+        ++regs;
+      }
+    if (!bits || bits < match->minBits) {
+      log() << bits << " bits/instance, below " << match->minBits
+            << ", skipped\n";
+      continue;
+    }
+    unsigned p = match->passes;
+    if (!p)
+      p = stateInRamReadBits
+              ? unsigned(std::max<uint64_t>(
+                    1, llvm::divideCeil(bits, stateInRamReadBits)))
+              : 1;
+    unsigned entries = 1u << llvm::Log2_32_Ceil(threads);
+    std::string style;
+    if (auto *rule = storageFor(cls, "sir", /*reg=*/false, 0)) {
+      if (rule->kind != "block" && rule->kind != "ultra")
+        return netlist.emitError("storage: '")
+               << rule->kind << "' is not block or ultra for state-in-ram";
+      style = rule->kind;
+    } else {
+      // RAMB36 at 512 x 72 while the rows fit, else URAM288 (4096 x 72).
+      style = uint64_t(entries) * p <= 512 ? "block" : "ultra";
+    }
+    cls.sir = p;
+    cls.sirStyle = style;
+    uint64_t rowBits = llvm::divideCeil(bits, p);
+    uint64_t columns = llvm::divideCeil(rowBits, 72);
+    log() << bits << " bits/instance, " << threads << " instances, " << columns
+          << " x 72 columns, P " << p << ", " << style << " (" << regs
+          << " registers, " << entries * p << " rows)\n";
+    if (p > 1) {
+      // Built as pages of the row's bits, on chip, with masks: every row read
+      // into the capture registers (the fetch buffer) and the evaluation on
+      // the last, so no register's row is written before it is read; the
+      // write-back registers' rows written one a host cycle through a P:1
+      // select, about ceil(P / 4) LUTs a row bit.
+      cls.page = p;
+      uint64_t select = rowBits * llvm::divideCeil(p, 4);
+      log() << "0 hazard registers, " << bits << " capture bits, " << bits
+            << " write-back bits, write select ~" << select << " LUTs\n";
+    }
+  }
+  for (auto &spec : specs)
+    if (!spec.used)
+      return netlist.emitError("state-in-ram: no model '") << spec.glob << "'";
+  return success();
+}
+
 int StaticFolder::minStateGap(const Class &cls) const {
   // Computed once a class: the scheduler asks for every instance of every
   // choice it places.
@@ -6637,6 +6755,10 @@ int StaticFolder::minStateGap(const Class &cls) const {
   // A staged class's writes reach its next evaluation's reads through its
   // stores alone, no bypass.
   if (cls.stages)
+    gap = std::max(gap, 4);
+  // State in RAM, P = 1: the staged write lands a host cycle after the state
+  // pass, the next evaluation's read two host cycles before it, no bypass.
+  if (cls.sir == 1)
     gap = std::max(gap, 4);
   // Pass splitting: the deferred writes land before the next evaluation's
   // reads (a block RAM store's a host cycle early), no bypass.
@@ -8797,9 +8919,11 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // The entries a per-instance store keeps: every instance index, so a copy
   // of instances not a power of two leaves the last entries unused.
   unsigned entries = 1u << idxWidth;
+  // State in RAM with P > 1 is pages with masks.
+  bool pageMasks = this->pageMasks || cls.sir > 1;
   // Registers of so few instances, passed in a ring order, are a ring of
   // flops: no store, no read select and no bypass.
-  bool ring = !cls.stages && !cls.page && !cls.deferSpan && threads > 1 &&
+  bool ring = !cls.stages && !cls.page && !cls.deferSpan && !cls.sir && threads > 1 &&
               threads <= registerStateEntries &&
               ringOrder(cls, ii);
   // A per-instance store this shallow is flops: Vivado would otherwise spend
@@ -9829,6 +9953,19 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     Value enable;
   };
   SmallVector<PagedReg> pagedRegs;
+  // State in RAM, P = 1 (`state-in-ram`): each written register's value (a
+  // placeholder until the rows are built), its next value's bits and the
+  // enable it is written under (null: every state pass).
+  struct SirReg {
+    Backedge value;
+    unsigned width;
+    Value data, enable;
+    std::string name;
+    /// Until the rows are built, the next value and enable, held (a later
+    /// store's read may replace them).
+    Operation *held = nullptr;
+  };
+  SmallVector<SirReg> sirRegs;
   // Off chip, each page column's virtual memory and its outputs (requests
   // and pending reads), appended to the copy's ports once its body is built.
   SmallVector<std::pair<unsigned, Operation *>> pageRequests;
@@ -9900,6 +10037,19 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                    foldsim::peelHolds(b, next, reg.getResult());
       if (!write.holds && !write.enable)
         write.data = next;
+      // State in RAM, P = 1: packed with the copy's other written registers
+      // into the rows built below.
+      if (cls.sir == 1 && !write.holds && width && !readyRegs.contains(reg)) {
+        auto placeholder = pageEdges.get(reg.getType());
+        SmallVector<Value> held{asBits(b, write.data)};
+        if (write.enable)
+          held.push_back(write.enable);
+        sirRegs.push_back({placeholder, unsigned(width), Value(), Value(),
+                           reg.getName().str(), hold(held)});
+        reg.getResult().replaceAllUsesWith(Value(placeholder));
+        reg.erase();
+        continue;
+      }
       auto &region = regionFor(width);
       if (ring && !write.holds) {
         // The ring: the head is the evaluated instance's state; its state
@@ -10222,6 +10372,177 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     memory.erase();
   }
 
+  // State in RAM, P = 1: the written registers packed into a word an
+  // instance, the registers written every state pass first, then those of
+  // each enable together, each run from a mask lane boundary (8 bits in
+  // ultra RAM, 9 in block RAM) and padded to whole lanes, so a lane is one
+  // enable's. The word is cut into columns of whole 72-bit ports, a RAM and
+  // a region of controls each: read at the instance two host cycles ahead
+  // into the RAM's register, then an output register (the registers'
+  // values), and written a host cycle after the state pass from stage
+  // registers, the next values and, a lane, its enable. The state gap of 4
+  // keeps every read clear of a write to its row: no bypass.
+  for (auto &reg : sirRegs) {
+    SmallVector<Value> held;
+    release(reg.held, held);
+    reg.data = held[0];
+    reg.enable = held.size() > 1 ? held[1] : Value();
+  }
+  if (!sirRegs.empty()) {
+    if (cls.stateGap < 4)
+      return model.emitError("state-in-ram: '")
+             << cls.name << "' needs a state gap of 4, not " << cls.stateGap;
+    auto bits = [&](unsigned width) { return b.getIntegerType(width); };
+    StringRef kind = cls.sirStyle;
+    bool masked = llvm::any_of(sirRegs, [](auto &r) { return bool(r.enable); });
+    unsigned grain = masked ? (kind == "ultra" ? 8 : 9) : 1;
+    llvm::MapVector<Value, SmallVector<unsigned>> groups;
+    for (auto [i, reg] : llvm::enumerate(sirRegs))
+      groups[reg.enable].push_back(i);
+    SmallVector<std::pair<Value, SmallVector<unsigned>>> runs;
+    if (auto it = groups.find(Value()); it != groups.end())
+      runs.push_back(*it);
+    for (auto &[enable, members] : groups)
+      if (enable)
+        runs.push_back({enable, members});
+    SmallVector<uint64_t> bitAt(sirRegs.size(), 0);
+    SmallVector<Value> laneEnable;
+    uint64_t layoutBits = 0, sirBits = 0;
+    for (auto &[enable, members] : runs) {
+      layoutBits = llvm::divideCeil(layoutBits, grain) * grain;
+      for (unsigned i : members) {
+        bitAt[i] = layoutBits;
+        layoutBits += sirRegs[i].width;
+        sirBits += sirRegs[i].width;
+      }
+      layoutBits = llvm::divideCeil(layoutBits, grain) * grain;
+      while (laneEnable.size() * grain < layoutBits)
+        laneEnable.push_back(enable);
+    }
+    unsigned colBits = 72 * std::max(1u, regionBits / 72);
+    unsigned columns = unsigned(llvm::divideCeil(layoutBits, colBits));
+    struct Column {
+      unsigned width;
+      Region *region;
+      seq::FirMemOp memory;
+      Value out;
+      SmallVector<std::pair<unsigned, Value>> parts;
+    };
+    std::vector<Column> cols(columns);
+    for (unsigned c = 0; c < columns; ++c) {
+      regionFor(regionBits);
+      cols[c].width =
+          unsigned(std::min<uint64_t>(colBits, layoutBits - uint64_t(c) * colBits));
+    }
+    for (unsigned c = 0; c < columns; ++c)
+      cols[c].region = &regions[regions.size() - columns + c];
+    for (auto &col : cols) {
+      auto &region = *col.region;
+      auto memType = seq::FirMemType::get(
+          context, entries, col.width,
+          masked ? std::optional<size_t>(col.width / grain)
+                 : std::optional<size_t>(1));
+      col.memory = seq::FirMemOp::create(
+          b, memType, /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old,
+          seq::WUW::Undefined, b.getStringAttr(region.prefix + "_sir"),
+          hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+      setRamStyle(col.memory, kind);
+      Value data = seq::FirMemReadOp::create(b, col.memory, region.inst2,
+                                             hostClock, one());
+      col.out = seq::FirRegOp::create(
+          b, data, hostClock, b.getStringAttr(region.prefix + "_sir_out"));
+    }
+    // Each register's bits, cut where columns meet: its value from the
+    // output registers, its next value into the columns' words. The values
+    // replace the placeholders last: a next value or enable may be one.
+    SmallVector<Value> values;
+    for (auto [r, reg] : llvm::enumerate(sirRegs)) {
+      SmallVector<Value> parts;
+      for (unsigned lo = 0; lo < reg.width;) {
+        uint64_t g = bitAt[r] + lo;
+        unsigned c = unsigned(g / colBits), offset = unsigned(g % colBits);
+        unsigned n = std::min(reg.width - lo, colBits - offset);
+        parts.push_back(
+            b.createOrFold<comb::ExtractOp>(bits(n), cols[c].out, offset));
+        cols[c].parts.push_back(
+            {offset, b.createOrFold<comb::ExtractOp>(bits(n), reg.data, lo)});
+        lo += n;
+      }
+      Value value = parts.size() == 1
+                        ? parts[0]
+                        : b.createOrFold<comb::ConcatOp>(
+                              SmallVector<Value>(parts.rbegin(), parts.rend()));
+      values.push_back(
+          b.createOrFold<hw::BitcastOp>(Value(reg.value).getType(), value));
+    }
+    for (auto [c, col] : llvm::enumerate(cols)) {
+      auto &region = *col.region;
+      std::string prefix = region.prefix;
+      if (!region.instStaged)
+        region.instStaged = keep(seq::FirRegOp::create(
+            b, region.inst, hostClock,
+            b.getStringAttr(region.prefix + "_inst_staged")));
+      llvm::sort(col.parts, [](auto &x, auto &y) { return x.first < y.first; });
+      SmallVector<Value> low;
+      unsigned have = 0;
+      for (auto &[off, value] : col.parts) {
+        if (off > have)
+          low.push_back(hw::ConstantOp::create(b, bits(off - have), 0));
+        low.push_back(value);
+        have = off + hw::getBitWidth(value.getType());
+      }
+      if (have < col.width)
+        low.push_back(hw::ConstantOp::create(b, bits(col.width - have), 0));
+      Value word = low.size() == 1
+                       ? low[0]
+                       : b.createOrFold<comb::ConcatOp>(
+                             SmallVector<Value>(low.rbegin(), low.rend()));
+      Value data = seq::FirRegOp::create(b, word, hostClock,
+                                         b.getStringAttr(prefix + "_sir_wdata"));
+      Value enable = seq::FirRegOp::create(b, region.state, hostClock,
+                                           b.getStringAttr(prefix + "_sir_wen"));
+      Value mask;
+      if (masked) {
+        // A lane's enable, staged once a column.
+        DenseMap<Value, Value> staged;
+        unsigned lanes = col.width / grain;
+        uint64_t first = uint64_t(c) * colBits / grain;
+        SmallVector<Value> high;
+        for (unsigned k = lanes; k-- > 0;) {
+          Value laneEn = laneEnable[first + k];
+          if (!laneEn) {
+            high.push_back(one());
+            continue;
+          }
+          Value &kept = staged[laneEn];
+          if (!kept)
+            kept = seq::FirRegOp::create(
+                b, laneEn, hostClock,
+                b.getStringAttr(prefix + "_sir_lane" + Twine(staged.size() - 1)));
+          high.push_back(kept);
+        }
+        mask = high.size() == 1 ? high[0] : b.createOrFold<comb::ConcatOp>(high);
+        // A column of one lane: no mask (lowering ignores a mask of one).
+        if (lanes == 1) {
+          enable = comb::AndOp::create(b, enable, mask);
+          mask = Value();
+        }
+      }
+      seq::FirMemWriteOp::create(b, col.memory, region.instStaged, hostClock,
+                                 enable, data, mask);
+    }
+    for (auto [reg, value] : llvm::zip(sirRegs, values))
+      reg.value.setValue(value);
+    if (!cls.sirLogged) {
+      cls.sirLogged = true;
+      llvm::errs() << "foldsim-fold-static: state-in-ram: " << cls.name
+                   << ": built " << sirRegs.size() << " registers, " << sirBits
+                   << " bits in " << layoutBits << " (" << grain
+                   << "-bit lanes, " << runs.size() << " runs), " << columns
+                   << " columns of " << colBits << " bits, " << kind << "\n";
+    }
+  }
+
   // The paged registers, one vector of W bits a row of `pages` pages of
   // pw = ceil(W / p) bits, the page word cut into columns of whole 72-bit
   // ports (one RAM and one copy of the controls each, at most about
@@ -10248,7 +10569,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     BackedgeBuilder edges(b, model.getLoc());
     auto bits = [&](unsigned width) { return b.getIntegerType(width); };
     auto *rule = storageFor(cls, "pages", /*reg=*/false, 0);
-    std::string kind = rule ? rule->kind : "block";
+    std::string kind = rule ? rule->kind
+                       : !cls.sirStyle.empty() ? cls.sirStyle
+                                               : std::string("block");
     if (kind != "block" && kind != "ultra" && kind != "distributed" &&
         kind != "registers" && kind != "hbm")
       return model.emitError("storage: '") << kind << "' for pages";
@@ -14411,7 +14734,8 @@ LogicalResult StaticFolder::run() {
       if (cls.folding && cls.folding->edges)
         cls.folding->edges->abandon();
   };
-  if (failed(parsePages()) || failed(parseStorage()) || failed(pagesOffChip()) ||
+  if (failed(parsePages()) || failed(parseStorage()) ||
+      failed(planStateInRam()) || failed(pagesOffChip()) ||
       failed(chooseStages()) || failed(planPassSplits()) ||
       failed(schedule())) {
     abandonFolds();
@@ -14484,6 +14808,8 @@ void FoldStaticPass::runOnOperation() {
                       linkUltraDepth, linkKinds, stageLevels, multicycle);
   folder.moduloLinear = moduloLinear;
   folder.passSplitSpecs.assign(passSplit.begin(), passSplit.end());
+  folder.stateInRamSpecs.assign(stateInRam.begin(), stateInRam.end());
+  folder.stateInRamReadBits = stateInRamReadBits;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
   folder.linkHbmShift = linkHbmShift;

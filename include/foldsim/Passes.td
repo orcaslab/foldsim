@@ -797,6 +797,26 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "before scheduling: a class without lanes is left as it is. A "
                "static FPGA's LUTs keep every stage's logic, so only the logic "
                "the passes share is saved. Not for a staged class">,
+    ListOption<"stateInRam", "state-in-ram", "std::string",
+               "State in RAM (SiR): classes (globs on the model's name; a "
+               "copy goes by its class's) as <glob>[:<min-bits>[:<P>]]. A "
+               "matching class of more than one instance, whose written "
+               "register bits an instance (not the ready passes' registers) "
+               "are at least min-bits (default 1), keeps them in a RAM of a "
+               "row an instance times P plus a pass, in columns of whole "
+               "72-bit ports, a mask lane a write enable. P = 1 (default): the "
+               "row read in place two host cycles ahead, through the RAM's "
+               "register and an output register, written whole a host cycle "
+               "after the state pass, at a state gap of at least 4. P > 1: "
+               "the rows read one a host cycle into capture registers and "
+               "written back one a host cycle through a P:1 row select (the "
+               "paged form of `page`, with masks). Style by a storage rule "
+               "<model>:sir=<block|ultra>; else block where the rows fit "
+               "RAMB36 512 x 72, ultra otherwise. A class already paged keeps "
+               "its pages">,
+    Option<"stateInRamReadBits", "state-in-ram-read-bits", "unsigned", "0",
+           "With state-in-ram: the RAM bits an evaluation reads a host cycle "
+           "(N > 0): P = ceil(bits / N) for a class whose spec gives no P">,
     ListOption<"registeredLinks", "registered-links", "std::string",
                "Classes (globs; a copy goes by its class's name) whose links "
                "are never taken in their producer's host cycle: with "

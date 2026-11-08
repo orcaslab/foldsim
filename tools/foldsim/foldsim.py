@@ -450,6 +450,10 @@ def frame_options(a):
         fold += f' multicycle={a.multicycle}'
     if getattr(a, 'pass_split', ''):
         fold += f' pass-split={a.pass_split}'
+    if getattr(a, 'state_in_ram', ''):
+        fold += f' state-in-ram={a.state_in_ram}'
+        if getattr(a, 'state_in_ram_read_bits', 0):
+            fold += f' state-in-ram-read-bits={a.state_in_ram_read_bits}'
     return fold
 
 
@@ -1256,6 +1260,17 @@ def build_parser():
                          'taken before the state pass; the schedule spaces their state passes M '
                          'apart. <out>/foldsim_multicycle.xdc gives the flow the M-cycle paths, '
                          'foldsim_sim.json lists them (foldsim-fold-static)')
+    ap.add_argument('--state-in-ram', default='', metavar='CLASS[:MIN_BITS[:P]],...',
+                    help='with --static: state in RAM (SiR) for these classes (globs on the model name): the '
+                         'written register bits of an instance (at least MIN_BITS, default 1) kept in a RAM of a '
+                         'row an instance times P plus a pass, in 72-bit columns with a mask lane a write enable. '
+                         'P = 1 (default): read in place two host cycles ahead, written a host cycle after the '
+                         'state pass (state gap 4); P > 1: built as on-chip pages with masks (capture registers, '
+                         'a P:1 write select). Style by --storage MODEL:sir=block|ultra, else block while the '
+                         'rows fit 512 x 72, ultra otherwise (foldsim-fold-static state-in-ram)')
+    ap.add_argument('--state-in-ram-read-bits', type=int, default=0, metavar='N',
+                    help='with --state-in-ram: P = ceil(bits / N) for a class whose spec gives no P '
+                         '(foldsim-fold-static state-in-ram-read-bits; 0: P = 1)')
     ap.add_argument('--pass-split', default='', metavar='CLASS:P,...',
                     help='these classes (globs; CLASS:P[:S]): the isomorphic fanout-free cones (lanes) of '
                          'the logic only registers\' next values use run on ceil(R/P) shared lanes, one '
