@@ -360,6 +360,8 @@ public:
   /// longer prefetch distance for every request a pass issues (for studies
   /// of latency hiding, or a host rate matched to another simulator's).
   unsigned minII = 0;
+  /// `slr-serialize`: <glob>:<k> or <k> entries.
+  std::vector<std::string> slrSerializeSpecs;
   /// `ready-choice`: the classes with a ready pass, given instead of
   /// searched ("split:" first: ready outputs split by level); empty: search.
   std::string readyChoice;
@@ -505,7 +507,42 @@ private:
   bool crosses(int p, int c) const {
     return !slrOf.empty() && p >= 0 && c >= 0 && slrOf[p] != slrOf[c];
   }
-  int crossDelay(int p, int c) const { return crosses(p, c) ? 1 : 0; }
+  /// `slr-serialize`: the host cycles a link of class `c` between groups
+  /// takes, its bits sent a k-th at a time (1: unserialized).
+  SmallVector<unsigned> serialK;
+  bool slrSerialize = false;
+  LogicalResult parseSerialize();
+  unsigned serialOf(int c) const {
+    return c >= 0 && unsigned(c) < serialK.size() ? serialK[c] : 1;
+  }
+  /// The wires (SLLs) `bits` of class `p`'s links take between groups.
+  uint64_t serialWires(int p, uint64_t bits) const {
+    unsigned k = serialOf(p);
+    return (bits + k - 1) / k;
+  }
+  int crossDelay(int p, int c) const {
+    return crosses(p, c) ? int(serialOf(p)) : 0;
+  }
+  /// `slr-serialize`: the spacing of each class's passes of one kind (its
+  /// k, where a link of it crosses groups and k > 1; else 0).
+  SmallVector<unsigned> serialSpacing() const {
+    SmallVector<unsigned> space(classes.size(), 0);
+    if (!slrSerialize || slrOf.empty())
+      return space;
+    for (auto &consumer : consumers) {
+      if (consumer.cls < 0)
+        continue;
+      for (auto &pieces : consumer.pieces)
+        for (auto &piece : pieces) {
+          if (piece.producer < 0)
+            continue;
+          int p = producers[piece.producer].cls;
+          if (p >= 0 && crosses(p, consumer.cls) && serialOf(p) > 1)
+            space[p] = serialOf(p);
+        }
+    }
+    return space;
+  }
   /// The evaluations of the given choice of ready passes and what each waits
   /// for; which late outputs are written at ready passes in `writes`.
   void frameGraph(ArrayRef<bool> ready, ReadyWrites &writes,
@@ -2347,6 +2384,34 @@ LogicalResult StaticFolder::parseRegisteredLinks() {
   return success();
 }
 
+LogicalResult StaticFolder::parseSerialize() {
+  serialK.assign(classes.size(), 1);
+  for (auto &spec : slrSerializeSpecs) {
+    auto [pattern, count] = StringRef(spec).rsplit(':');
+    if (count.empty())
+      std::swap(pattern, count);
+    unsigned k = 0;
+    if (count.getAsInteger(10, k) || k < 1 || k > 64)
+      return netlist.emitError("slr-serialize: '")
+             << spec << "' is not <glob>:<k> or <k>, k from 1 to 64";
+    auto glob = llvm::GlobPattern::create(pattern.empty() ? "*" : pattern);
+    if (!glob)
+      return netlist.emitError("slr-serialize: '") << spec << "' is not a glob";
+    bool any = false;
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      int base = cls.splitFrom >= 0 ? cls.splitFrom : int(c);
+      if (glob->match(classes[base].name) || glob->match(cls.name)) {
+        serialK[c] = k;
+        any = true;
+      }
+    }
+    if (!any)
+      return netlist.emitError("slr-serialize: no class matches '") << spec << "'";
+  }
+  slrSerialize = llvm::any_of(serialK, [](unsigned k) { return k > 1; });
+  return success();
+}
+
 LogicalResult StaticFolder::parseLinkKinds() {
   if (linkHbmRowBits < 8 || linkHbmRowBits > 4096)
     return netlist.emitError("link-hbm-row-bits: ")
@@ -4087,6 +4152,16 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
   std::vector<std::set<int>> pageSlots(classes.size());
   // A copy with paged links: every pass at least its link page apart.
   std::vector<std::set<int>> linkSlots(classes.size());
+  // slr-serialize: a copy whose link crosses groups, each kind of pass (the
+  // state pass, a ready pass of each level) its k apart: a pass's bits are
+  // sent over the k host cycles after it.
+  auto serial = serialSpacing();
+  std::map<std::pair<unsigned, unsigned>, std::set<int>> serialSlots;
+  auto serialKey = [&](unsigned n) {
+    return std::make_pair(nodes[n].cls, nodes[n].pass == kState
+                                            ? 0u
+                                            : 1u + nodes[n].level);
+  };
   while (!heap.empty()) {
     std::pop_heap(heap.begin(), heap.end(), cmp);
     unsigned n = heap.back();
@@ -4115,6 +4190,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
         past(pageSlots[c], passSpacing(c));
       if (spaced)
         past(linkSlots[c], int(classes[c].linkPage));
+      if (serial[c] > 1)
+        past(serialSlots[serialKey(n)], int(serial[c]));
       if (next == earliest)
         break;
       earliest = firstFree(taken, next, 0);
@@ -4124,6 +4201,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
       pageSlots[c].insert(earliest);
     if (spaced)
       linkSlots[c].insert(earliest);
+    if (serial[c] > 1)
+      serialSlots[serialKey(n)].insert(earliest);
     slotOf[n] = earliest;
     for (auto [s, latency] : succs[n])
       if (!--waiting[s]) {
@@ -4156,6 +4235,11 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
           {length,
            *pageSlots[c].rbegin() - *pageSlots[c].begin() + int(passSpacing(c)),
            paged(c) ? int(cls.pageLead()) + 4 : 0});
+  // Serialized links: the next frame's first pass of a kind k after the last.
+  for (auto &[key, placed] : serialSlots)
+    if (!placed.empty())
+      length = std::max<int>(length, *placed.rbegin() - *placed.begin() +
+                                         int(serial[key.first]));
   // Paged links: the next frame's first pass a link page after the last.
   for (auto [c, cls] : llvm::enumerate(classes))
     if (cls.linkPage > 1 && !linkSlots[c].empty())
@@ -4307,6 +4391,11 @@ unsigned StaticFolder::placeModulo(
   for (auto [c, cls] : llvm::enumerate(classes))
     if (cls.linkPage > 1)
       lower = std::max(lower, cls.linkPage * evaluations[c]);
+  // Nor than a serialized copy's passes of a kind, each its k apart.
+  auto serial = serialSpacing();
+  for (auto [c, cls] : llvm::enumerate(classes))
+    if (serial[c] > 1)
+      lower = std::max(lower, serial[c] * cls.threads());
   // Nor than `min-ii`.
   lower = std::max(lower, minII);
   auto cmp = [&](unsigned a, unsigned b) {
@@ -4449,6 +4538,36 @@ unsigned StaticFolder::placeModulo(
       });
     };
     auto spaced = [&](unsigned n) { return classes[nodes[n].cls].linkPage > 1; };
+    // slr-serialize: each kind of pass of a copy whose link crosses groups
+    // holds the k slots up to it, (t - k, t], modulo the frame.
+    std::map<std::pair<unsigned, unsigned>, llvm::BitVector> serialPort;
+    auto serialKey = [&](unsigned n) {
+      return std::make_pair(nodes[n].cls, nodes[n].pass == kState
+                                              ? 0u
+                                              : 1u + nodes[n].level);
+    };
+    auto serialed = [&](unsigned n) { return serial[nodes[n].cls] > 1; };
+    auto serialFree = [&](unsigned n, int t) {
+      auto it = serialPort.find(serialKey(n));
+      if (it == serialPort.end())
+        return true;
+      bool free = true;
+      windowOf(serial[nodes[n].cls], t, [&](int lo, int hi) {
+        free &= it->second.find_first_in(lo, hi) < 0;
+      });
+      return free;
+    };
+    auto serialTake = [&](unsigned n, int t, bool take) {
+      auto &port = serialPort[serialKey(n)];
+      if (port.empty())
+        port.resize(period);
+      windowOf(serial[nodes[n].cls], t, [&](int lo, int hi) {
+        if (take)
+          port.set(lo, hi);
+        else
+          port.reset(lo, hi);
+      });
+    };
     auto pageFree = [&](unsigned c, int t) {
       auto &port = pagePort[c];
       if (port.empty())
@@ -4493,7 +4612,8 @@ unsigned StaticFolder::placeModulo(
       earliest = firstFree(taken, earliest, period);
       while (earliest < int(2 * period) &&
              ((pages(n) && !pageFree(c, earliest)) ||
-              (spaced(n) && !linkFree(c, earliest))))
+              (spaced(n) && !linkFree(c, earliest)) ||
+              (serialed(n) && !serialFree(n, earliest))))
         earliest = firstFree(taken, earliest + 1, period);
       if (earliest >= int(2 * period)) {
         fits = false;
@@ -4504,6 +4624,8 @@ unsigned StaticFolder::placeModulo(
         pageTake(c, earliest, true);
       if (spaced(n))
         linkTake(c, earliest, true);
+      if (serialed(n))
+        serialTake(n, earliest, true);
       slotOf[n] = earliest;
       for (auto [s, latency] : succs[n])
         if (!--waiting[s]) {
@@ -4556,8 +4678,10 @@ unsigned StaticFolder::placeModulo(
         pageTake(node.cls, slotOf[n], false);
       if (spaced(n))
         linkTake(node.cls, slotOf[n], false);
+      if (serialed(n))
+        serialTake(n, slotOf[n], false);
       int at = slotOf[n];
-      if (!pages(n) && !spaced(n)) {
+      if (!pages(n) && !spaced(n) && !serialed(n)) {
         for (int hi = latest; hi > slotOf[n];) {
           int r = hi % int(period);
           int lo = std::max(slotOf[n] + 1, hi - r);
@@ -4571,7 +4695,8 @@ unsigned StaticFolder::placeModulo(
       } else {
         for (int t = latest; t > slotOf[n]; --t)
           if (!taken.test(t % period) && (!pages(n) || pageFree(node.cls, t)) &&
-              (!spaced(n) || linkFree(node.cls, t))) {
+              (!spaced(n) || linkFree(node.cls, t)) &&
+              (!serialed(n) || serialFree(n, t))) {
             at = t;
             break;
           }
@@ -4581,6 +4706,8 @@ unsigned StaticFolder::placeModulo(
         pageTake(node.cls, at, true);
       if (spaced(n))
         linkTake(node.cls, at, true);
+      if (serialed(n))
+        serialTake(n, at, true);
       slotOf[n] = at;
     }
 
@@ -5456,6 +5583,10 @@ LogicalResult StaticFolder::estimateSlls() {
   SmallVector<SmallVector<uint64_t>> bits;
   SmallVector<SmallVector<unsigned>> links;
   linkBits(bits, links);
+  // A serialized class's links take a k-th of their bits in wires.
+  for (unsigned p = 0; p < bits.size(); ++p)
+    for (auto &b : bits[p])
+      b = serialWires(p, b);
   SmallVector<unsigned> order;
   for (unsigned c = 0; c < n; ++c)
     order.push_back(c);
@@ -5717,11 +5848,16 @@ LogicalResult StaticFolder::chooseGroups() {
             continue;
           if (slrCaps[g] && used[g] + slrSites[c] > slrCaps[g])
             continue;
+          // A link between groups takes a k-th of its bits in wires
+          // (slr-serialize).
+          auto wires = [&](unsigned x, unsigned y) {
+            return serialWires(x, bits[x][y]) + serialWires(y, bits[y][x]);
+          };
           uint64_t more = 0;
           for (unsigned j = 0; j < k; ++j) {
             unsigned d = order[j];
             if (group[d] != int(g))
-              more += bits[c][d] + bits[d][c];
+              more += wires(c, d);
           }
           SmallVector<uint64_t> added(boundary.size(), 0);
           if (budgeted) {
@@ -5732,7 +5868,7 @@ LogicalResult StaticFolder::chooseGroups() {
               if (h == g)
                 continue;
               for (unsigned b = std::min(g, h); b < std::max(g, h); ++b)
-                added[b] += bits[c][d] + bits[d][c];
+                added[b] += wires(c, d);
             }
             for (unsigned b = 0; b < boundary.size(); ++b)
               over |= boundary[b] + added[b] > sllBudget;
@@ -6606,7 +6742,7 @@ LogicalResult StaticFolder::schedule() {
     SmallVector<SmallVector<uint64_t>> bits;
     SmallVector<SmallVector<unsigned>> links;
     linkBits(bits, links);
-    uint64_t crossBits = 0, allBits = 0;
+    uint64_t crossBits = 0, allBits = 0, crossWires = 0;
     unsigned crossLinks = 0, allLinks = 0;
     for (unsigned p = 0; p < classes.size(); ++p)
       for (unsigned c = 0; c < classes.size(); ++c) {
@@ -6615,6 +6751,7 @@ LogicalResult StaticFolder::schedule() {
         if (crosses(p, c)) {
           crossBits += bits[p][c];
           crossLinks += links[p][c];
+          crossWires += serialWires(p, bits[p][c]);
         }
       }
     os << "  slr groups: " << slrGroups << " of at most ";
@@ -6637,6 +6774,9 @@ LogicalResult StaticFolder::schedule() {
     }
     os << "  slr links registered: " << crossLinks << " of " << allLinks
        << " links, " << crossBits << " of " << allBits << " bits\n";
+    if (slrSerialize)
+      os << "  slr links serialized: "
+         << crossWires << " wires for " << crossBits << " bits\n";
     // Groups that are the region's SLRs in order: the link bits over each
     // boundary, the SLLs they take.
     if (!slrCapacitySpecs.empty() && slrGroups > 1) {
@@ -6646,17 +6786,24 @@ LogicalResult StaticFolder::schedule() {
           if (slrOf[p] >= 0 && slrOf[c] >= 0 && slrOf[p] != slrOf[c])
             for (int b = std::min(slrOf[p], slrOf[c]);
                  b < std::max(slrOf[p], slrOf[c]); ++b)
-              over[b] += bits[p][c];
+              over[b] += serialWires(p, bits[p][c]);
       os << "  slr boundaries:";
       for (auto [b, x] : llvm::enumerate(over))
         os << " " << b << "-" << b + 1 << " " << x;
-      os << " link bits" << (sllBudget ? " (budget " + std::to_string(sllBudget) + ")" : std::string()) << "\n";
+      os << (slrSerialize ? " link wires" : " link bits")
+         << (sllBudget ? " (budget " + std::to_string(sllBudget) + ")" : std::string()) << "\n";
     }
     for (unsigned p = 0; p < classes.size(); ++p)
       for (unsigned c = 0; c < classes.size(); ++c)
         if (crosses(p, c) && links[p][c])
           os << "    " << classes[p].name << " -> " << classes[c].name << ": "
-             << links[p][c] << " links, " << bits[p][c] << " bits\n";
+             << links[p][c] << " links, " << bits[p][c] << " bits"
+             << (serialOf(p) > 1 ? ", " + std::to_string(serialOf(p)) +
+                                       " host cycles on " +
+                                       std::to_string(serialWires(p, bits[p][c])) +
+                                       " wires"
+                                 : std::string())
+             << "\n";
   }
   for (auto &cls : classes) {
     os << "  " << cls.name << " x" << cls.threads()
@@ -11008,6 +11155,9 @@ LogicalResult StaticFolder::buildSim() {
   // The producer's bits a reading group in another SLR group takes, registered
   // in the producer's group: one register for every link of that group.
   std::map<std::tuple<unsigned, unsigned, unsigned, int>, Value> crossData;
+  // slr-serialize: each class's pass enable, by pass kind (0 the state pass,
+  // 1 + l a ready pass of level l), at the pass's host cycle.
+  std::map<std::pair<unsigned, unsigned>, Value> serialEnable;
   // Without `forward`, a write is not forwarded to a read of its entry in
   // the same host cycle: the schedule never reads it there. With `after`,
   // it is forwarded past the read register instead of into it: each piece's
@@ -11123,6 +11273,16 @@ LogicalResult StaticFolder::buildSim() {
     bool banked = !producer.late;
     bool crossing = to >= 0 && !slrOf.empty() && slrOf[c] != to;
     assert(!(crossing && now) && "a link between SLR groups is never zero");
+    // slr-serialize: the host cycles the crossing takes; every register of
+    // the write (enable, entry, bank) is that many host cycles late.
+    unsigned serial = crossing ? serialOf(c) : 1;
+    auto lateBy = [&](Value v, const Twine &lateName) {
+      std::string n0 = lateName.str();
+      v = copyReg(v, n0);
+      for (unsigned j = 1; j < serial; ++j)
+        v = copyReg(v, n0 + std::to_string(j + 1));
+      return v;
+    };
     Value bits = asBits(b, copies[c].getResult(producer.port));
     std::string baseName = linkName.str();
     SmallVector<Value> pieces, nowPieces;
@@ -11137,9 +11297,65 @@ LogicalResult StaticFolder::buildSim() {
         if (!registered) {
           if (auto *op = data.getDefiningOp())
             tagGroup(op, slrOf[c]);
-          registered = copyReg(data, producer.name + "_slr" + Twine(to) + "_" +
-                                         Twine(low + at));
-          tagGroup(registered.getDefiningOp(), slrOf[c]);
+          std::string crossName = producer.name + "_slr" + std::to_string(to) +
+                                  "_" + std::to_string(low + at);
+          if (serial <= 1) {
+            registered = copyReg(data, crossName);
+            tagGroup(registered.getDefiningOp(), slrOf[c]);
+          } else {
+            // slr-serialize: the producer's group holds the bits of its
+            // pass (host cycle T) and sends chunk j of them in a register
+            // over T + 1 + j; the reader's group shifts them along, so at
+            // T + k the last chunk and the shifted ones are the bits.
+            Operation *mark = &body->back();
+            unsigned cw = (w + serial - 1) / serial;
+            Value &e0 = serialEnable[{c, producer.atReady ? 1 + producer.readyLevel : 0u}];
+            if (!e0) {
+              Value base = !producer.atReady ? ctl.state2
+                           : producer.readyLevel ? ctl.laterReady2[producer.readyLevel - 1]
+                                             : ctl.ready2;
+              std::string en = classes[c].name + "_serial" +
+                               (!producer.atReady ? std::string("_state")
+                                : producer.readyLevel ? "_ready_l" + std::to_string(producer.readyLevel)
+                                        : std::string("_ready"));
+              e0 = copyReg(copyReg(base, en + "1"), en + "0");
+            }
+            SmallVector<Value> step{e0};
+            for (unsigned j = 1; j < serial; ++j)
+              step.push_back(copyReg(step.back(), crossName + "_step" +
+                                                      std::to_string(j)));
+            Value hold = seq::CompRegClockEnabledOp::create(
+                b, data, hostClock, e0, b.getStringAttr(crossName + "_hold"),
+                Value(), Value(), Value(), hw::InnerSymAttr());
+            auto chunk = [&](Value from, unsigned j) -> Value {
+              unsigned lo = std::min(j * cw, w);
+              unsigned n = std::min(cw, w - lo);
+              if (!n)
+                return constant(cw, 0);
+              Value v = b.createOrFold<comb::ExtractOp>(b.getIntegerType(n),
+                                                        from, lo);
+              return n < cw ? b.createOrFold<comb::ConcatOp>(
+                                  constant(cw - n, 0), v)
+                            : v;
+            };
+            Value next = constant(cw, 0);
+            for (unsigned j = serial; j-- > 0;)
+              next = comb::MuxOp::create(b, step[j], chunk(j ? hold : data, j),
+                                         next);
+            Value sent = copyReg(next, crossName);
+            for (auto *op = mark->getNextNode(); op; op = op->getNextNode())
+              if (!isa<hw::ConstantOp>(op))
+                tagGroup(op, slrOf[c]);
+            // The reader's side (tagged with the reader's group by the
+            // input): chunk j shifted k - 1 - j times.
+            SmallVector<Value> parts{sent};
+            for (unsigned j = 1; j < serial; ++j)
+              parts.push_back(copyReg(parts.back(), crossName + "_shift" +
+                                                        std::to_string(j)));
+            Value all = b.createOrFold<comb::ConcatOp>(parts);
+            registered =
+                b.createOrFold<comb::ExtractOp>(b.getIntegerType(w), all, 0);
+          }
         }
         data = registered;
       }
@@ -11161,7 +11377,7 @@ LogicalResult StaticFolder::buildSim() {
                     group.prefix + pass + "1"),
             group.prefix + pass + "0");
         if (crossing)
-          enable = copyReg(enable, group.prefix + pass + "_late");
+          enable = lateBy(enable, group.prefix + pass + "_late");
       }
       // A compact link's entry and mask, registered as the group's.
       Value member, memberLate, compactInst, compactInstLate;
@@ -11183,14 +11399,14 @@ LogicalResult StaticFolder::buildSim() {
                                       prefix + "_member1"),
                               prefix + "_member0");
           if (crossing)
-            cw.member = copyReg(cw.member, prefix + "_member_late");
+            cw.member = lateBy(cw.member, prefix + "_member_late");
           if (threads > 1) {
             cw.inst = copyReg(
                 copyReg(table(b, ctl.inst2, index, llvm::Log2_32_Ceil(threads)),
                         prefix + "_inst1"),
                 prefix + "_inst0");
             if (crossing)
-              cw.inst = copyReg(cw.inst, prefix + "_inst_late");
+              cw.inst = lateBy(cw.inst, prefix + "_inst_late");
           }
         }
         member = cw.member;
@@ -11283,7 +11499,7 @@ LogicalResult StaticFolder::buildSim() {
                         group.prefix + "_tail0"));
           group.bank = notOf(parity);
           if (crossing)
-            group.bank = copyReg(group.bank, group.prefix + "_bank_late");
+            group.bank = lateBy(group.bank, group.prefix + "_bank_late");
         }
         writeAddress.push_back(group.bank);
         readAddress.push_back(bank());
@@ -11293,7 +11509,7 @@ LogicalResult StaticFolder::buildSim() {
           group.inst = copyReg(copyReg(ctl.inst2, group.prefix + "_inst1"),
                                group.prefix + "_inst0");
           if (crossing)
-            group.inst = copyReg(group.inst, group.prefix + "_inst_late");
+            group.inst = lateBy(group.inst, group.prefix + "_inst_late");
         }
         writeAddress.push_back(compact.empty() ? group.inst : compactInst);
         readAddress.push_back(address());
@@ -13283,7 +13499,8 @@ void StaticFolder::staggerPortPushes() {
 LogicalResult StaticFolder::run() {
   inlineNetlists();
   if (failed(collect()) || failed(resolveEnvironment()) || failed(resolvePortFold()) ||
-      failed(parseRegisteredLinks()) || failed(parseLinkKinds()))
+      failed(parseRegisteredLinks()) || failed(parseSerialize()) ||
+      failed(parseLinkKinds()))
     return failure();
   for (auto &cls : classes)
     if (cls.threads() > 1 &&
@@ -13395,6 +13612,7 @@ void FoldStaticPass::runOnOperation() {
   folder.readBufferBits = readBufferBits;
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.minII = minII;
+  folder.slrSerializeSpecs.assign(slrSerialize.begin(), slrSerialize.end());
   folder.readyChoice = readyChoice;
   folder.stagedLinkMemories = stagedLinks && stagedLinkMemories;
   if (failed(folder.run()))

@@ -723,6 +723,19 @@ def slr_options(a, foldsim_opt, models, fold, out):
     # Each copy's state as that schedule keeps it (paged copies in page RAMs).
     sites = {c: round(foldsim_degree.copy_sites(cal, est[of[c]], of[c], n, entries, info.get(c), ii))
              for c, n in classes.items()}
+    if a.slr_sites:
+        # Measured: each copy's LUTs in a generated netlist of the same recipe
+        # (foldsim_sll_check.py's netlist resources, JSON {copy: {lut: ..}}),
+        # in LUT sites (the region's sites_per_lut).
+        rj = a.slr_region if a.slr_region not in ('', 'v80') else os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
+        spl = json.load(open(rj))['sites_per_lut']
+        measured = json.load(open(a.slr_sites))
+        for c in sites:
+            if c in measured:
+                sites[c] = round(measured[c]['lut'] * spl)
+        print(f'foldsim: copy sites measured from {a.slr_sites} ({sum(c in measured for c in sites)} of {len(sites)})',
+              file=sys.stderr)
     if a.slr_region and not a.slr_groups:
         # --sll-check alone: the SLLs any assignment to the region's SLRs needs
         # (fold-static sll-estimate), the netlist unchanged.
@@ -751,6 +764,8 @@ def slr_options(a, foldsim_opt, models, fold, out):
                 + ','.join(f'{c}:{s}' for c, s in sites.items()))
     if a.slr_assign:
         opts += f' slr-assign={a.slr_assign}'
+    if a.slr_serialize:
+        opts += f' slr-serialize={a.slr_serialize}'
     return opts
 
 
@@ -1370,6 +1385,15 @@ def build_parser():
                          'each SLR boundary) the design needs at the least over every assignment of its classes '
                          'to the region\'s SLRs (fold-static sll-estimate), against the boundary budget '
                          '(sll_per_boundary x sll_margin); with --slr-groups the groups also keep within it')
+    ap.add_argument('--slr-sites', default='', metavar='JSON',
+                    help="with --slr-groups: each copy's LUTs measured on a generated netlist of the same recipe "
+                         '(JSON {copy: {"lut": n}}, foldsim_sll_check.py netlist resources) instead of the '
+                         "estimate, in LUT sites (the region's sites_per_lut)")
+    ap.add_argument('--slr-serialize', default='', metavar='[GLOB:]K,...',
+                    help='with --slr-groups: the links between groups of the given classes (globs) carried '
+                         'over K host cycles on a K-th of the wires (SLLs), K alone for every class; the '
+                         "reader takes them K host cycles later and the producer's passes of a kind are kept "
+                         'K apart (foldsim-fold-static slr-serialize)')
     ap.add_argument('--slr-assign', default='',
                     help='with --slr-groups: <class>:<group>,...: classes pinned to a group '
                          '(copy j > 0 of a class is <class>_copy<j>)')

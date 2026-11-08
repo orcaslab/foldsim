@@ -461,6 +461,18 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"slrSllBudget", "slr-sll-budget", "uint64_t", "0",
            "With slr-groups and slr-capacities, the most link bits an "
            "assignment may put over any one SLR boundary (its SLLs; 0: any)">,
+    ListOption<"slrSerialize", "slr-serialize", "std::string",
+               "With slr-groups, the links between groups of the given classes "
+               "(globs; a copy goes by its class's name) carried over k host "
+               "cycles on a k-th of the wires (super long lines), as "
+               "<glob>:<k>, or <k> for every class (a later entry wins): the "
+               "producer's group holds the bits its pass writes and sends a "
+               "k-th of them a host cycle, the reader's group shifts them back "
+               "together and writes the link k host cycles after the pass (1 "
+               "unserialized), so its reader takes it k host cycles later. The "
+               "class's passes of each kind (its state pass, its ready passes "
+               "of a level) are kept k apart; SLL budgets and cuts count a "
+               "k-th of its bits">,
     ListOption<"slrAssign", "slr-assign", "std::string",
                "With slr-groups, classes pinned to a group, as "
                "<class>:<group>">,
