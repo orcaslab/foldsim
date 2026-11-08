@@ -6688,9 +6688,12 @@ LogicalResult StaticFolder::planStateInRam() {
       log() << "one instance, skipped\n";
       continue;
     }
+    // State in RAM replaces the class's pages (on or off chip): its storage
+    // rule for them is met.
     if (cls.page) {
-      log() << "paged, skipped\n";
-      continue;
+      log() << "replaces page " << cls.page << "\n";
+      cls.page = 0;
+      storageFor(cls, "pages", /*reg=*/false, 0);
     }
     // The register bits an instance writes, as pages count them (buildCopy
     // decides each register: a held one keeps its store).
@@ -6923,7 +6926,7 @@ LogicalResult StaticFolder::pagesOffChip() {
     for (auto &rule : storageRules)
       if (rule.model == model && !rule.regs && rule.store == "pages" &&
           rule.kind == "hbm")
-        cls.pagesOffChip = cls.page > 0;
+        cls.pagesOffChip = cls.page > 0 && !cls.sir;
   }
   return success();
 }
@@ -10639,7 +10642,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     }
     BackedgeBuilder edges(b, model.getLoc());
     auto bits = [&](unsigned width) { return b.getIntegerType(width); };
-    auto *rule = storageFor(cls, "pages", /*reg=*/false, 0);
+    auto *rule = cls.sir ? nullptr : storageFor(cls, "pages", /*reg=*/false, 0);
     std::string kind = rule ? rule->kind
                        : !cls.sirStyle.empty() ? cls.sirStyle
                                                : std::string("block");

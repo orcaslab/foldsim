@@ -8,7 +8,7 @@
 // one row: auto style, ultra, block), two copies, P > 1 (`state-in-ram-read-bits=16`: the model's
 // four 8-bit pipeline registers s1..s4 in two passes of two; s3's next value (s2 + 7) is complete
 // in pass 0, before its row is read in pass 1: the hazard register, kept in a capture until its
-// write), and a paged class left paged (SiR skipped, logged).
+// write), and a paged class, whose pages SiR replaces (logged).
 // RUN: rm -rf %t && mkdir -p %t && cat %S/Inputs/fold_model.mlir %s > %t/in.mlir
 // RUN: firtool --format=mlir %t/in.mlir -o %t/target.sv
 // RUN: mkdir -p %t/off && foldsim-opt %t/in.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top})" -o %t/off/sim.mlir 2> %t/off/fold.log
@@ -60,7 +60,8 @@
 // UL: ram_style" = "\22ultra\22
 // P2LOG: state-in-ram: Model: {{[0-9]+}} bits/instance, 4 instances, {{[0-9]+}} x 72 columns, P 2
 // P2LOG: state-in-ram: Model: {{[0-9]+}} hazard registers, {{[0-9]+}} capture bits
-// PGLOG: state-in-ram: Model: paged, skipped
+// PGLOG: state-in-ram: Model: replaces page 2
+// PGLOG: state-in-ram: Model: {{[0-9]+}} bits/instance, 4 instances, {{[0-9]+}} x 72 columns, P 1
 // STYLE: storage: 'distributed' is not block or ultra for state-in-ram
 // CLASS: state-in-ram: no model 'Nope'
 

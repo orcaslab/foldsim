@@ -814,8 +814,8 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "written back one a host cycle through a P:1 row select (the "
                "paged form of `page`, with masks). Style by a storage rule "
                "<model>:sir=<block|ultra>; else block where the rows fit "
-               "RAMB36 512 x 72, ultra otherwise. A class already paged keeps "
-               "its pages">,
+               "RAMB36 512 x 72, ultra otherwise. It replaces a class's pages "
+               "(page, on or off chip)">,
     Option<"stateInRamReadBits", "state-in-ram-read-bits", "unsigned", "0",
            "With state-in-ram: the RAM bits an evaluation reads a host cycle "
            "(N > 0): P = ceil(bits / N) for a class whose spec gives no P">,
