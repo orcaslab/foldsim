@@ -796,6 +796,82 @@ def slr_region_sll_budget(path):
     return int(region.get('sll_margin', 1.0) * region.get('sll_per_boundary', 0))
 
 
+def v80_region():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
+
+
+def check_region(a):
+    """The region of the SLR rule (--region): a JSON path, or '' when none
+    applies (no --static, or a manifest device other than the V80's)."""
+    if not a.static:
+        return ''
+    r = a.region
+    if r in ('', 'auto'):
+        r = a.slr_region
+    if r in ('', 'auto'):
+        device = foldsim_manifest.get(a.manifest, 'platform.device', a.manifest_var) if a.manifest else None
+        if device and not fnmatch.fnmatch(str(device), 'xcv80-*'):
+            return ''
+        r = 'v80'
+    return v80_region() if r == 'v80' else r
+
+
+STRADDLE = re.compile(r'fits no SLR whole|no assignment of the copies|does not fit the room the other copies leave')
+
+
+def slr_rule(a, out, verdict, rc):
+    """The hard SLR rule on the check's verdict and JSON (<out>/sll/sll.json):
+    no class copy may cross an SLR boundary. Exits with an error naming each
+    straddling copy, its resources and each SLR's capacity, unless
+    --allow-slr-straddle gives the reason."""
+    if rc == 2 or verdict is None:
+        sys.exit('foldsim: error: SLR rule: the SLR check failed, so no copy is proven to fit an SLR whole '
+                 f'(report {out("sll")}); --allow-slr-straddle does not cover a failed check')
+    j = json.load(open(out('sll/sll.json'))) if os.path.exists(out('sll/sll.json')) else {}
+    copies, caps = j.get('copies', {}), j.get('caps', [])
+    over = list(j.get('over', []))
+    cuts = [c for c in j.get('cuts', []) if c not in over]
+    if not (over or cuts or STRADDLE.search(verdict)):
+        return
+    res = ('lut', 'lutram', 'ff', 'uram', 'bram')
+    fmt = lambda r, x: f'{x:,.1f}' if r in ('uram', 'bram') else f'{x:,.0f}'
+    lines = [f'SLR rule: no class copy may cross an SLR boundary; this netlist: {verdict}']
+    for c in over + cuts:
+        why = 'fits no SLR whole' if c in over else 'is left out of every assignment of whole copies to the SLRs'
+        sh = (j.get('shares') or {}).get(c)
+        if sh and c in cuts:
+            # The resource it is cut most in.
+            r = max((r for r in res if r in sh), key=lambda r: 1 - max(sh[r]))
+            why += (' (the check spreads it: ' + ', '.join(f'{s["name"]} {100 * x:.0f} %' for s, x in zip(caps, sh[r]))
+                    + f' of its {r})')
+        lines.append(f'  {c} {why}: ' + ', '.join(f'{r} {fmt(r, copies[c][r])}' for r in res if c in copies))
+    if caps:
+        lines.append(f'  SLR capacities (logic x margin {j.get("margin", 1.0)}, memories whole):')
+        lines += [f'    {s["name"]}: ' + ', '.join(f'{r} {fmt(r, s[r])}' for r in res) for s in caps]
+    lines.append(f'  report: {out("sll")}/sll.txt')
+    if a.allow_slr_straddle:
+        import getpass
+        import time
+        note = dict(reason=a.allow_slr_straddle, time=time.strftime('%F %T'), user=getpass.getuser(),
+                    straddle=over + cuts, verdict=verdict)
+        json.dump(note, open(out('SLR_STRADDLE_APPROVED'), 'w'), indent=1)
+        info = json.load(open(out('foldsim_sim.json')))
+        info['slr_straddle_approved'] = note
+        with open(out('foldsim_sim.json'), 'w') as f:
+            json.dump(info, f, indent=1)
+        bar = '!' * 78
+        print('\n'.join([bar, f'foldsim: WARNING: SLR STRADDLE APPROVED: {a.allow_slr_straddle}'] + lines
+                        + [f'  recorded in {out("SLR_STRADDLE_APPROVED")} and foldsim_sim.json', bar]),
+              file=sys.stderr)
+        return
+    if os.path.exists(out('foldsim_sim.sv')):
+        os.replace(out('foldsim_sim.sv'), out('foldsim_sim.sv.slr-refused'))
+    sys.exit('\n'.join(['foldsim: error: ' + lines[0]] + lines[1:]
+                       + ['  foldsim_sim.sv renamed foldsim_sim.sv.slr-refused; change the recipe (copies, paging, '
+                          'storage) so every copy fits an SLR whole, or override with '
+                          '--allow-slr-straddle=<who, when, why>']))
+
+
 def write_slr_groups(sv, path, names=None):
     # A group split over an SLR boundary pays a crossing on paths wholly inside
     # it, and Vivado otherwise places by area alone. A group name, not an SLR,
@@ -1419,11 +1495,25 @@ def build_parser():
                          'within its own SLR\'s capacity and assigned to that SLR by name in '
                          '<out>/foldsim_floorplan.tcl; replaces --slr-count and --slr-capacity')
     ap.add_argument('--sll-check', action='store_true',
-                    help='with --static and --slr-region: check the generated netlist against the region\'s SLRs '
-                         '(foldsim_sll_check.py: each copy\'s LUT, LUTRAM, FF, URAM and RAMB36 counted on the '
-                         'netlist, an assignment within the SLRs, the SLLs each boundary takes as placed), report '
-                         'in <out>/sll/sll.txt, and fail on a refusal; with --slr-groups the groups also keep the '
-                         'boundary budget (sll_per_boundary x sll_margin) in link bits')
+                    help='with --static and a region (--region or --slr-region): also fail on the SLR check\'s '
+                         'refusals other than a straddle (the design past the region\'s placement fill, the SLLs '
+                         'projected past a boundary), which are otherwise warnings; with --slr-groups the groups '
+                         'also keep the boundary budget (sll_per_boundary x sll_margin) in link bits')
+    ap.add_argument('--region', default='auto', metavar='JSON',
+                    help='with --static: the dynamic region the simulator is placed in (JSON, per SLR its LUTs, '
+                         'LUTRAM, URAM and RAMB36 and the margin: foldsim_v80_slr.json, or `v80`). HARD RULE: no '
+                         'class copy may cross an SLR boundary. After the fold the driver checks the netlist '
+                         '(foldsim_sll_check.py: each copy\'s LUT, LUTRAM, FF, URAM and RAMB36 counted on '
+                         'foldsim_sim.mlir, an assignment of whole copies to the SLRs; report in <out>/sll/sll.txt) '
+                         'and FAILS when a copy fits no SLR whole, when no assignment of whole copies exists, or '
+                         'when a copy is cut over SLRs (FireSim vD, 11-07: its ToR switch straddled SLR1/SLR2 and '
+                         'routing failed after 18 h); foldsim_sim.sv is then renamed foldsim_sim.sv.slr-refused. '
+                         'Default `auto`: --slr-region if given, else the V80 compute shell\'s region (the static '
+                         'fold\'s target) unless the manifest\'s [platform] device is not an xcv80 part')
+    ap.add_argument('--allow-slr-straddle', default='', metavar='REASON',
+                    help='the ONLY override of the SLR rule (--region): the compilation finishes with a straddling '
+                         'copy, the reason (who approved it, when, why) recorded in <out>/SLR_STRADDLE_APPROVED and '
+                         'in foldsim_sim.json (slr_straddle_approved)')
     ap.add_argument('--slr-sites', default='', metavar='JSON',
                     help="with --slr-groups: each copy's LUTs measured on a generated netlist of the same recipe "
                          '(JSON {copy: {"lut": n}}, foldsim_sll_check.py netlist resources) instead of the '
@@ -1679,6 +1769,8 @@ def main():
         sys.exit('--storage needs --static')
     if a.schedule_only and not a.static:
         sys.exit('--schedule-only needs --static')
+    # The hard SLR rule's region (--region): the check runs on every static fold's netlist.
+    region = check_region(a)
     if a.static:
         fold = f'module={a.top} sim=foldsim_sim report={out("schedule.txt")}'
         if a.region_bits:
@@ -1726,7 +1818,7 @@ def main():
                         else fold + f' storage={",".join(hbm)}')
         if a.state == 'auto':
             fold = choose_state(a, foldsim_opt, flat, passes, out, fold)
-        if a.slr_groups or a.sll_check:
+        if a.slr_groups or region:
             if a.copies != 'auto':
                 run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
                      '-o', out('models.mlir')])
@@ -1739,7 +1831,7 @@ def main():
         replicate = f'hw.module(foldsim-replicate-controls{{{rc}}})'
         pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}', SPLIT, replicate,
                                         'canonicalize', 'foldsim-sort', 'cse']
-        if a.copies == 'auto' or a.slr_groups or a.sll_check:
+        if a.copies == 'auto' or a.slr_groups or region:
             sim_input = out('models.mlir')
             pipeline = pipeline[len(passes) + len(OPTIMIZE):]
     else:
@@ -1754,8 +1846,8 @@ def main():
     run([tool('firtool'), '--format=mlir', sim,
          '--add-vivado-ram-address-conflict-synthesis-bug-workaround', '-o', out('foldsim_sim.sv')])
 
-    if a.sll_check and not (a.slr_region and a.static):
-        sys.exit('--sll-check needs --static and --slr-region')
+    if a.sll_check and not region:
+        sys.exit('--sll-check needs --static and a region (--region or --slr-region)')
     if a.slr_groups:
         if not a.static:
             sys.exit('--slr-groups needs --static')
@@ -1918,18 +2010,27 @@ def main():
                         f.write(f'`define FOLDSIM_VMEM_G{g}_CACHE_ROWS {v["cache_rows"]}\n')
             f.write(f'`define FOLDSIM_VMEM_BYTES 64\'h{info["vmem_bytes"]:x}\n')
     print(f'foldsim: {", ".join(f"{k} x{v}" for k, v in info["threads"].items())}', file=sys.stderr)
-    if a.sll_check:
+    if region:
         # The per-copy SLR / SLL check on the netlist just generated (its
         # stage registers, read buffers and simulator level counted; schedule
-        # estimates said "fits" where placement failed): <out>/sll/sll.txt;
-        # a refusal fails the generation, its outputs kept.
+        # estimates said "fits" where placement failed): <out>/sll/sll.txt.
+        # HARD RULE: a copy that cannot be placed whole in an SLR fails the
+        # compilation (slr_rule; only --allow-slr-straddle overrides it); the
+        # check's other refusals fail it with --sll-check, else warn.
+        os.makedirs(out('sll'), exist_ok=True)
         r = run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_sll_check.py'),
                  a.out, '--models', out('models.mlir'), '--fold-options', sll_fold, '--foldsim-opt', foldsim_opt,
-                 '--slr-region', a.slr_region, '--out', out('sll')], check=False, capture_output=True)
-        verdict = next((l for l in reversed(r.stdout.splitlines()) if re.search(r': (OK|WARN|REFUSE):', l)), None)
-        print(f'foldsim: SLL check: {verdict or "failed: " + (r.stderr or r.stdout)[-2000:]}', file=sys.stderr)
-        if r.returncode:
-            sys.exit(f'foldsim: --sll-check refuses this netlist (report {out("sll")}/sll.txt)')
+                 '--slr-region', region, '--out', out('sll'), '--json', out('sll/sll.json')],
+                check=False, capture_output=True)
+        line = next((l for l in reversed(r.stdout.splitlines()) if re.search(r': (OK|WARN|REFUSE):', l)), None)
+        print(f'foldsim: SLL check: {line or "failed: " + (r.stderr or r.stdout)[-2000:]}', file=sys.stderr)
+        verdict = line.split(': ', 1)[1] if line else None
+        slr_rule(a, out, verdict, r.returncode)
+        if r.returncode and not STRADDLE.search(verdict):
+            if a.sll_check:
+                sys.exit(f'foldsim: --sll-check refuses this netlist (report {out("sll")}/sll.txt)')
+            print(f'foldsim: WARNING: the SLL check refuses this netlist (report {out("sll")}/sll.txt; '
+                  '--sll-check fails on it)', file=sys.stderr)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,3 @@
+{"about": "slr-rule test region: two SLRs of 100 LUTs, smaller than the Leaf copy (about 120 LUTs): it fits no SLR whole",
+ "sites_per_lut": 1.0, "margin": 1.0, "netlist_lut_scale": 1.0, "netlist_ff_scale": 1.0, "sll_per_boundary": 1000, "sll_margin": 1.0,
+ "slrs": [{"name": "SLR1", "luts": 100, "ramb36": 100, "uram": 100}, {"name": "SLR0", "luts": 100, "ramb36": 100, "uram": 100}]}

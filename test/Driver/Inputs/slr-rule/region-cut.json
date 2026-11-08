@@ -1,0 +1,5 @@
+{"about": "slr-rule test region: two SLRs of 200 LUTs (400 flops). Each Leaf copy of two (about 255 flops) fits an SLR whole, but the placer fills an SLR to only half of it, so no assignment of whole copies exists and the copies are cut over the SLRs, the region at 95 %",
+ "sites_per_lut": 1.0, "margin": 1.0, "netlist_lut_scale": 1.0, "netlist_ff_scale": 1.0, "sll_per_boundary": 100000, "sll_margin": 1.0,
+ "slrs": [{"name": "SLR1", "luts": 200, "ramb36": 100, "uram": 100}, {"name": "SLR0", "luts": 200, "ramb36": 100, "uram": 100}],
+ "placement": {"fill": {"lut": 0.5, "lutram": 0.5, "ff": 0.5, "uram": 1.0, "bram": 1.0}, "region_fill": {"lut": 0.95, "lutram": 0.95, "ff": 0.95},
+               "balance_slack": 0.05, "cut_copies": 2, "rent_t": 1.0, "rent_p": 0.75, "sll_per_link_bit": 0.5, "other_slls": 1, "sll_per_vmem_bit": 0}}

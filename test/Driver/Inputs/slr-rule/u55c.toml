@@ -1,0 +1,12 @@
+# slr-rule test: a target whose platform is not the V80 (no default region).
+[design]
+top = "Top"
+
+[rtl]
+srcs = "../storage/top.f"
+
+[platform]
+device = "xcu55c-fsvh2892-2L-e"
+
+[options]
+static = true

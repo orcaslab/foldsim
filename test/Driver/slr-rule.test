@@ -1,0 +1,55 @@
+# The hard SLR rule (foldsim --region): no class copy may cross an SLR
+# boundary. After the fold the driver runs foldsim_sll_check.py on the netlist
+# (each copy's LUT, LUTRAM, FF, URAM and RAMB36 counted on foldsim_sim.mlir, an
+# assignment of whole copies to the region's SLRs) and fails when a copy fits
+# no SLR whole or when no assignment of whole copies exists (a copy cut over
+# SLRs), naming the copy, its resources and each SLR's capacity;
+# foldsim_sim.sv is renamed foldsim_sim.sv.slr-refused. FireSim vD, 11-07: the
+# check refused it, it was launched anyway, and routing failed after 18 h with
+# its ToR switch straddling SLR1/SLR2. Only --allow-slr-straddle=<reason>
+# overrides it, recorded in <out>/SLR_STRADDLE_APPROVED and foldsim_sim.json.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/storage
+
+# Default: a static fold is checked against the V80 compute shell's region.
+# RUN: foldsim --srcs top.f --top Top --out %t/v80 --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 Leaf 2>&1 | FileCheck %s --check-prefix=V80
+# RUN: FileCheck %s --check-prefix=V80R < %t/v80/sll/sll.txt
+# V80: foldsim: SLL check: v80: OK
+# V80R: SLR2 capacity: lut 601,637
+# V80R: v80: OK
+
+# Two SLRs of 100 LUTs: the Leaf copy (about 120 LUTs) fits no SLR whole.
+# RUN: not foldsim --srcs top.f --top Top --out %t/tiny --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --region %S/Inputs/slr-rule/region-tiny.json Leaf 2>&1 | FileCheck %s --check-prefix=TINY
+# RUN: test -f %t/tiny/foldsim_sim.sv.slr-refused && not test -e %t/tiny/foldsim_sim.sv
+# TINY: foldsim: error: SLR rule: no class copy may cross an SLR boundary; this netlist: REFUSE: Leaf fits no SLR whole
+# TINY-NEXT: Leaf fits no SLR whole: lut {{[0-9,]+}}, lutram {{[0-9,]+}}, ff {{[0-9,]+}}, uram 0.0, bram 0.0
+# TINY-NEXT: SLR capacities (logic x margin 1.0, memories whole):
+# TINY-NEXT: SLR1: lut 100, lutram 100, ff 200, uram 100.0, bram 100.0
+# TINY-NEXT: SLR0: lut 100, lutram 100, ff 200, uram 100.0, bram 100.0
+# TINY: foldsim_sim.sv renamed foldsim_sim.sv.slr-refused
+# TINY-SAME: --allow-slr-straddle=<who, when, why>
+
+# Each of two Leaf copies fits an SLR whole, but the placer fills an SLR to
+# half: no assignment of whole copies, the check cuts them over the SLRs. A
+# warning of the check, a failure of the rule.
+# RUN: not foldsim --srcs top.f --top Top --out %t/cut --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:2 --region %S/Inputs/slr-rule/region-cut.json Leaf 2>&1 | FileCheck %s --check-prefix=CUT
+# CUT: foldsim: SLL check: cut: WARN: {{.*}} cut over SLRs
+# CUT: foldsim: error: SLR rule: no class copy may cross an SLR boundary
+# CUT: Leaf{{(_copy1)?}} is left out of every assignment of whole copies to the SLRs
+# CUT: SLR1: lut 200, lutram 200, ff 400
+
+# The override: the compilation finishes, the reason recorded.
+# RUN: foldsim --srcs top.f --top Top --out %t/ovr --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --region %S/Inputs/slr-rule/region-tiny.json --allow-slr-straddle='lit test, 11-08, synthetic' Leaf 2>&1 | FileCheck %s --check-prefix=OVR
+# RUN: test -f %t/ovr/foldsim_sim.sv
+# RUN: FileCheck %s --check-prefix=OVRF < %t/ovr/SLR_STRADDLE_APPROVED
+# RUN: FileCheck %s --check-prefix=OVRJ < %t/ovr/foldsim_sim.json
+# OVR: foldsim: WARNING: SLR STRADDLE APPROVED: lit test, 11-08, synthetic
+# OVR-NEXT: SLR rule: no class copy may cross an SLR boundary
+# OVR-NOT: --sll-check fails on it
+# OVRF: "reason": "lit test, 11-08, synthetic"
+# OVRF: "Leaf"
+# OVRJ: "slr_straddle_approved"
+
+# A manifest whose platform is not the V80 has no default region: no check.
+# RUN: foldsim --manifest %S/Inputs/slr-rule/u55c.toml --out %t/u55c --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 Leaf 2>&1 | FileCheck %s --check-prefix=U55C
+# RUN: not test -e %t/u55c/sll
+# U55C-NOT: SLL check
