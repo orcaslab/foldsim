@@ -371,6 +371,10 @@ public:
   unsigned foldStoreLead = 2;
   /// `staged-link-direct`: see stagedDirect.
   bool stagedLinkDirect = false;
+  /// `drop-dead-inputs`: model inputs never read take no link.
+  bool dropDeadInputs = false;
+  unsigned deadInputs = 0;
+  uint64_t deadInputBits = 0;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
   /// landing) a member is streamed with (0: the decision lead + 6). A
   /// member with less room is built as an on-chip link: its landing would
@@ -1477,6 +1481,17 @@ LogicalResult StaticFolder::collect() {
       consumer.cls = c;
       consumer.port = i;
       consumer.width = hw::getBitWidth(cls.inputTypes[i]);
+      // `drop-dead-inputs`: an input the model never reads takes no link
+      // (a constant in every instance), whatever drives it.
+      if (dropDeadInputs && consumer.width &&
+          cls.model.getBodyBlock()->getArgument(i).use_empty()) {
+        for (unsigned k = 0; k < cls.instances.size(); ++k)
+          consumer.pieces.emplace_back().push_back(
+              Piece{-1, 0, 0, consumer.width, APInt::getZero(consumer.width)});
+        ++deadInputs;
+        deadInputBits += consumer.width;
+        continue;
+      }
       for (auto instance : cls.instances)
         if (failed(decompose(instance.getOperand(i), 0, consumer.width,
                              consumer.pieces.emplace_back())))
@@ -13227,6 +13242,9 @@ LogicalResult StaticFolder::buildSim() {
       os << "; staged " << stagedReads;
     if (stagedLinkDirect)
       os << " (read in place " << stagedDirectReads << ")";
+    if (dropDeadInputs)
+      os << "; dead inputs " << deadInputs << " (" << deadInputBits
+         << " bits, no link)";
     if (linkBlockDepth || linkUltraDepth)
       os << "; block/ultra " << syncReads << " (read ahead " << earlyReads
          << ")";
@@ -14276,6 +14294,7 @@ void FoldStaticPass::runOnOperation() {
   folder.readyChoice = readyChoice;
   folder.stagedLinkMemories = stagedLinks && stagedLinkMemories;
   folder.stagedLinkDirect = stagedLinks && stagedLinkDirect;
+  folder.dropDeadInputs = dropDeadInputs;
   if (failed(folder.run()))
     return signalPassFailure();
 }

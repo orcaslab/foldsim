@@ -8,7 +8,8 @@
 # - the broadcast's top reads its four lane accumulators in place (4 of 11
 #   staged reads; the lanes, of four instances, keep their read registers);
 # - the arbiter tree (zero-latency links and chains): 5 of 11;
-# - one producer port, a bit to each of four readers (staged-bits): 8 of 13;
+# - one producer port, a bit to each of four readers (staged-bits): 8 of 13,
+#   with drop-dead-inputs (two unread inputs, 9 bits, given constants);
 # - staged registers without memories: the broadcast's 4 again.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/broadcast
 # RUN: foldsim --srcs top.f --top Top --out %t/bc --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --staged-link-direct Lane 2>&1 | FileCheck %s --check-prefix=BC
@@ -27,7 +28,7 @@
 # RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s
 # RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=60 | FileCheck %s
 # RUN: cd %S/../Driver/Inputs/staged-bits
-# RUN: foldsim --srcs top.f --top Top --out %t/sb --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --staged-link-direct Sw Lnk 2>&1 | FileCheck %s --check-prefix=SB
+# RUN: foldsim --srcs top.f --top Top --out %t/sb --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --staged-link-direct --drop-dead-inputs Sw Lnk 2>&1 | FileCheck %s --check-prefix=SB
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/sb/obj %S/Inputs/tb_reset.sv top.sv %t/sb/foldsim_sim.sv > %t/sb/build.log 2>&1
 # RUN: %t/sb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +stall=0 | FileCheck %s
 # RUN: %t/sb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+10 +stall=30 | FileCheck %s
@@ -36,7 +37,7 @@
 # The top's accumulator inputs: the second registers, no read register.
 # BCSIM-NOT: %Top_model_g_lane_{{[0-9]}}_lane_acc_read =
 # TREE: staged 11 (read in place 5)
-# SB: staged 13 (read in place 8)
+# SB: staged 13 (read in place 8); dead inputs 2 (9 bits, no link)
 # H0: {{^}}MATCH 196 cycles in 1200 host cycles
 # H60: {{^}}MATCH 196 cycles in {{1383|1394}} host cycles
 # CHECK: {{^}}MATCH 196 cycles

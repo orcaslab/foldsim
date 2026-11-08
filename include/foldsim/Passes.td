@@ -723,6 +723,10 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "read of the frame before, by the first of this one), so the "
            "link's bits are held in two flops (or a memory row and a flop) "
            "instead of three">,
+    Option<"dropDeadInputs", "drop-dead-inputs", "bool", "false",
+           "A model input its body never reads (left over from a class cut: "
+           "its bits go to a sibling class directly) takes no link, no "
+           "storage and no read register: a constant to the copy">,
     Option<"shareLinks", "share-links", "bool", "false",
            "Outputs of a model driven by the same value (a bus broadcast to "
            "several children) are one producer: their readers share its "

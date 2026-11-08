@@ -407,6 +407,8 @@ def frame_options(a):
         fold += ' compact-links'
     if getattr(a, 'share_links', False):
         fold += ' share-links'
+    if getattr(a, 'drop_dead_inputs', False):
+        fold += ' drop-dead-inputs'
     if getattr(a, 'staged_links', False):
         fold += ' staged-links'
         if getattr(a, 'staged_link_memories', False):
@@ -1270,6 +1272,9 @@ def build_parser():
                     help="with --staged-links: a reader of one instance reads a staged link's second register "
                          'in place, with no read register of its own (the copy a host cycle later in the frame): '
                          'two flops a link bit instead of three (foldsim-fold-static staged-link-direct)')
+    ap.add_argument('--drop-dead-inputs', action='store_true',
+                    help='with --static: a model input its body never reads takes no link (no storage, no read '
+                         'register) (foldsim-fold-static drop-dead-inputs)')
     ap.add_argument('--share-links', action='store_true',
                     help='with --static: outputs of a model driven by the same value (a bus broadcast '
                          'to several children) share one link (foldsim-fold-static)')
