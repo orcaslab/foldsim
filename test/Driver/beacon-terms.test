@@ -1,0 +1,19 @@
+# Beacon's routing terms (foldsim_beacon_terms.py fit): path delay on logic
+# levels, log2 fanout and the path's SLR changes. Two builds' samples (one at
+# 5 ns given after `=`, one with a requirement column at 6 ns) whose delays
+# are 1 + 0.3 L + 0.1 log2 F + 1.0 per SLR change: the count fit recovers the
+# terms exactly, each sample also against the other's fit (leave one out);
+# the crossing flag does not.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: python3 %foldsim_tools/foldsim_beacon_terms.py fit %S/Inputs/beacon-terms/a.tsv=5.0 %S/Inputs/beacon-terms/b.tsv -o %t/count.json | FileCheck %s --check-prefix=COUNT
+# RUN: python3 %foldsim_tools/foldsim_beacon_terms.py fit %S/Inputs/beacon-terms/a.tsv=5.0 %S/Inputs/beacon-terms/b.tsv --crossings flag -o %t/flag.json | FileCheck %s --check-prefix=FLAG
+# COUNT: "intercept_ns": 1.0,
+# COUNT: "ns_per_level": 0.3,
+# COUNT: "ns_per_log2_fanout": 0.1,
+# COUNT: "ns_slr_crossing": 1.0,
+# COUNT: "crossings": "count"
+# COUNT: "rmse_ns": 0.0,
+# COUNT: "loo_rmse_ns": 0.0
+# FLAG: "crossings": "flag"
+# FLAG: "r2": 0.{{[0-9]+}},
+# FLAG-NOT: "rmse_ns": 0.0,
