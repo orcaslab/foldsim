@@ -1,0 +1,7 @@
+# Hard synthesis-tool limits on generated SystemVerilog (foldsim_sv_limits.py), before any tool runs: a declared
+# variable or constant past --max-bits (Vivado's 1,000,000: Synth 8-4556) is an ERROR; a memory is exempt.
+# RUN: not python3 %foldsim_tools/foldsim_sv_limits.py %S/Inputs/sv-limits/big.sv | FileCheck %s --check-prefix=BIG
+# RUN: python3 %foldsim_tools/foldsim_sv_limits.py %S/Inputs/sv-limits/big.sv --max-bits 2000000 | FileCheck %s --check-prefix=OK
+# BIG: ERROR: 1 declaration(s) over 1,000,000 bits (Synth 8-4556); largest t11 1,441,792 bits
+# BIG: ERROR Synth 8-4556: t11 1,441,792 bits at line 4
+# OK: OK: 0 declaration(s) over 2,000,000 bits
