@@ -1,3 +1,5 @@
+# (11-08: the runs pin --no-drop-dead-inputs --no-staged-link-direct, the defaults before then, so that the
+# link counts and registers checked below stay those of the feature under test.)
 # Per-copy SLR caps. A class copy is placed whole in an SLR where it can; one
 # past every SLR's memory or logic is cut by the placer, its wide state and
 # store ports then crossing SLLs (r16c, 11-07: a slice copy of 517 URAM
@@ -30,7 +32,7 @@
 # of 100 URAM it fits either. Without a placement model in the region the
 # SLLs are not projected.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/storage
-# RUN: foldsim --srcs top.f --top Top --out %t/x --static --copies Leaf:1 --storage 'Leaf:mem=ultra' Leaf 2> %t/x.log
+# RUN: foldsim --srcs top.f --top Top --out %t/x --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --storage 'Leaf:mem=ultra' Leaf 2> %t/x.log
 # RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-small.json --foldsim-opt foldsim-opt --out %t/any | FileCheck %s --check-prefix=ANY
 # RUN: not python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-small.json --foldsim-opt foldsim-opt --copy-cap SLR1 --out %t/small | FileCheck %s --check-prefix=SMALL
 # RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-big.json --foldsim-opt foldsim-opt --copy-cap smallest --out %t/big | FileCheck %s --check-prefix=BIG
@@ -71,7 +73,7 @@
 
 # The driver's --sll-check runs the check on the netlist it generated
 # (<out>/sll/sll.txt) and fails on a refusal.
-# RUN: not foldsim --srcs top.f --top Top --out %t/d --static --copies Leaf:1 --storage 'Leaf:mem=ultra' --slr-region %S/Inputs/slr-copy-cap/region-place.json --sll-check Leaf 2>&1 | FileCheck %s --check-prefix=DRV
+# RUN: not foldsim --srcs top.f --top Top --out %t/d --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --storage 'Leaf:mem=ultra' --slr-region %S/Inputs/slr-copy-cap/region-place.json --sll-check Leaf 2>&1 | FileCheck %s --check-prefix=DRV
 # DRV: foldsim: SLL check: d: REFUSE: Leaf fits no SLR whole
 # DRV: --sll-check refuses this netlist
 # RUN: FileCheck %s --check-prefix=DRVR < %t/d/sll/sll.txt

@@ -1,0 +1,22 @@
+# REQUIRES: verilator
+# The defaults of 11-08 (drop-dead-inputs, staged-link-direct, fold-store-ram=32768) on designs whose own tests pin the
+# defaults before them (static-link-hbm, static-slr-serialize, static-staged-memories, static-link-kinds): the same
+# designs and flags without the pins, exact against the target, stalled or not, at the host cycles of the pinned runs.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/linkhbm
+# RUN: foldsim --srcs top.f --top Top --out %t/hbm --static --nest --modulo --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/hbm.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/hbm -DVM1 -Mdir %t/hbm/obj %S/Inputs/tb_linkhbm.sv top.sv %t/hbm/foldsim_sim.sv > %t/hbm/build.log 2>&1
+# RUN: %t/hbm/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/hbm/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/linkpage
+# RUN: foldsim --srcs top.f --top Top --out %t/s2 --static --nest --modulo --slr-groups --slr-count 2 --slr-assign Unit:0,Reader:1,Top_model:1 --slr-serialize 2 Unit Reader > %t/s2.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/s2/obj %S/Inputs/tb_reset.sv top.sv %t/s2/foldsim_sim.sv > %t/s2/build.log 2>&1
+# RUN: %t/s2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/s2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/broadcast
+# RUN: foldsim --srcs top.f --top Top --out %t/bc --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories Lane 2>&1 | FileCheck %s --check-prefix=BC
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/bc/obj %S/Inputs/tb_reset.sv top.sv %t/bc/foldsim_sim.sv > %t/bc/build.log 2>&1
+# RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=60 | FileCheck %s
+# BC: staged {{[0-9]+}} (read in place {{[0-9]+}}); dead inputs {{[0-9]+}} + {{[0-9]+}} in part
+# CHECK: {{^}}MATCH
+# CHECK-NOT: PROTOCOL

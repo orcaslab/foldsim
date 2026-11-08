@@ -1,4 +1,4 @@
-// RUN: foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Prod,Cons netlist},foldsim-fold-static{module=Top})" 2>&1 | FileCheck %s --check-prefix=KEEP
+// RUN: foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Prod,Cons netlist},foldsim-fold-static{module=Top drop-dead-inputs=false})" 2>&1 | FileCheck %s --check-prefix=KEEP
 // RUN: foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Prod,Cons netlist},foldsim-fold-static{module=Top drop-dead-inputs})" 2>&1 | FileCheck %s --check-prefix=DROP
 
 // Model inputs never read (`drop-dead-inputs`): Cons takes three of Prod's

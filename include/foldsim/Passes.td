@@ -645,7 +645,7 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "value: block RAM rather than LUTs), the read register's bypass of "
            "data just out of the memory registered beside it. The same value "
            "every host cycle. 0: every buffer read combinationally">,
-    Option<"foldStoreRam", "fold-store-ram", "uint64_t", "0",
+    Option<"foldStoreRam", "fold-store-ram", "uint64_t", "32768",
            "Folded pipelines' result stores of at least N bits (an entry per "
            "slot and instance) read through a register, in block or ultra "
            "RAM: each read a host cycle or two ahead (fold-store-lead), at the "
@@ -725,14 +725,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "take (distributed RAM), written at the producer's passes; each "
            "link's second register is loaded from it at its own copy "
            "position (distinct positions in the frame: one read port)">,
-    Option<"stagedLinkDirect", "staged-link-direct", "bool", "false",
+    Option<"stagedLinkDirect", "staged-link-direct", "bool", "true",
            "With staged-links: a reader of one instance reads a staged link's "
            "second register in place, without a read register of its own "
            "(the copy then a host cycle later in the frame: after the last "
            "read of the frame before, by the first of this one), so the "
            "link's bits are held in two flops (or a memory row and a flop) "
            "instead of three">,
-    Option<"dropDeadInputs", "drop-dead-inputs", "bool", "false",
+    Option<"dropDeadInputs", "drop-dead-inputs", "bool", "true",
            "A model input its body never reads (left over from a class cut: "
            "its bits go to a sibling class directly) takes no link, no "
            "storage and no read register: a constant to the copy">,

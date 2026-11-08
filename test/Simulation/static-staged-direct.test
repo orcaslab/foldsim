@@ -12,18 +12,18 @@
 #   with drop-dead-inputs (two unread inputs, 9 bits, given constants);
 # - staged registers without memories: the broadcast's 4 again.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/broadcast
-# RUN: foldsim --srcs top.f --top Top --out %t/bc --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --staged-link-direct Lane 2>&1 | FileCheck %s --check-prefix=BC
+# RUN: foldsim --srcs top.f --top Top --out %t/bc --static --no-drop-dead-inputs --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --staged-link-direct Lane 2>&1 | FileCheck %s --check-prefix=BC
 # RUN: FileCheck %s --check-prefix=BCSIM < %t/bc/foldsim_sim.mlir
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/bc/obj %S/Inputs/tb_reset.sv top.sv %t/bc/foldsim_sim.sv > %t/bc/build.log 2>&1
 # RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s --check-prefix=H0
 # RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=60 | FileCheck %s --check-prefix=H60
-# RUN: foldsim --srcs top.f --top Top --out %t/bcr --static --nest --modulo --share-links --compact-links --staged-links --staged-link-direct Lane 2>&1 | FileCheck %s --check-prefix=BC
+# RUN: foldsim --srcs top.f --top Top --out %t/bcr --static --no-drop-dead-inputs --nest --modulo --share-links --compact-links --staged-links --staged-link-direct Lane 2>&1 | FileCheck %s --check-prefix=BC
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/bcr/obj %S/Inputs/tb_reset.sv top.sv %t/bcr/foldsim_sim.sv > %t/bcr/build.log 2>&1
 # RUN: %t/bcr/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=60 | FileCheck %s --check-prefix=H60
 # Without the option: every staged read through a read register.
-# RUN: foldsim --srcs top.f --top Top --out %t/bc0 --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories Lane 2>&1 | FileCheck %s --check-prefix=BC0
+# RUN: foldsim --srcs top.f --top Top --out %t/bc0 --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --share-links --compact-links --staged-links --staged-link-memories Lane 2>&1 | FileCheck %s --check-prefix=BC0
 # RUN: cd %S/../Driver/Inputs/tree-arb
-# RUN: foldsim --srcs top.f --top Top --out %t/tz --static --nest --modulo --compact-links --staged-links --staged-link-memories --staged-link-direct --share-links --zero-latency-links --zero-latency-chains --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=TREE
+# RUN: foldsim --srcs top.f --top Top --out %t/tz --static --no-drop-dead-inputs --nest --modulo --compact-links --staged-links --staged-link-memories --staged-link-direct --share-links --zero-latency-links --zero-latency-chains --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=TREE
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/tz/obj %S/Inputs/tb_reset.sv top.sv %t/tz/foldsim_sim.sv > %t/tz/build.log 2>&1
 # RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s
 # RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=60 | FileCheck %s

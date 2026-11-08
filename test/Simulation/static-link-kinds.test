@@ -1,4 +1,6 @@
 # REQUIRES: verilator
+# (11-08: the runs pin --no-drop-dead-inputs --no-staged-link-direct, the defaults before then, so that the
+# link counts and registers checked below stay those of the feature under test.)
 # The links' storage kinds, each exact against the target, channels stalled
 # or not, and the report's `link kinds` as built:
 # - shared links (`--share-links`): the top drives one registered bus to its
@@ -13,20 +15,20 @@
 #   (an address unit's operand from its lane's port) is read a host cycle
 #   ahead, then chosen into the read register.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/broadcast
-# RUN: foldsim --srcs top.f --top Top --out %t/bc --static --nest --modulo --share-links --compact-links --staged-links Lane 2>&1 | FileCheck %s --check-prefix=BC
+# RUN: foldsim --srcs top.f --top Top --out %t/bc --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --share-links --compact-links --staged-links Lane 2>&1 | FileCheck %s --check-prefix=BC
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/bc/obj %S/Inputs/tb_reset.sv top.sv %t/bc/foldsim_sim.sv > %t/bc/build.log 2>&1
 # RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
 # RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/bc0 --static --nest --modulo Lane 2>&1 | FileCheck %s --check-prefix=BC0
+# RUN: foldsim --srcs top.f --top Top --out %t/bc0 --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo Lane 2>&1 | FileCheck %s --check-prefix=BC0
 # BC: shared outputs 5; staged: 11 links, 232 register bits
 # BC: link kinds: distributed 0 0 0; block 0 0 0.0; ultra 0 0 0; registers 11 232
 # BC0: link storage: 16 memories, 840 bits
 # RUN: cd %S/../Driver/Inputs/tree-arb
-# RUN: foldsim --srcs top.f --top Top --out %t/tz --static --nest --modulo --compact-links --staged-links --share-links --zero-latency-links --zero-latency-chains --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=TREE
+# RUN: foldsim --srcs top.f --top Top --out %t/tz --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --compact-links --staged-links --share-links --zero-latency-links --zero-latency-chains --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=TREE
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/tz/obj %S/Inputs/tb_reset.sv top.sv %t/tz/foldsim_sim.sv > %t/tz/build.log 2>&1
 # RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s
 # RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=60 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/t --static --nest --modulo --compact-links --staged-links --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' > /dev/null 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/t --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --compact-links --staged-links --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/t/obj %S/Inputs/tb_reset.sv top.sv %t/t/foldsim_sim.sv > %t/t/build.log 2>&1
 # RUN: %t/t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +stall=30 | FileCheck %s
 # TREE: staged 11
@@ -34,28 +36,28 @@
 # into fsd_link's in_valid): every reader's staged registers take the same
 # name, which an inner symbol each made a redefinition before (firtool failed).
 # RUN: cd %S/../Driver/Inputs/staged-bits
-# RUN: foldsim --srcs top.f --top Top --out %t/sb --static --nest --modulo --share-links --compact-links --staged-links Sw Lnk 2>&1 | FileCheck %s --check-prefix=SB
+# RUN: foldsim --srcs top.f --top Top --out %t/sb --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --share-links --compact-links --staged-links Sw Lnk 2>&1 | FileCheck %s --check-prefix=SB
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/sb/obj %S/Inputs/tb_reset.sv top.sv %t/sb/foldsim_sim.sv > %t/sb/build.log 2>&1
 # RUN: %t/sb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +stall=0 | FileCheck %s
 # RUN: %t/sb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+10 +stall=30 | FileCheck %s
 # SB: staged: 13 links, 152 register bits
 # SB-NOT: redefinition of inner symbol
 # RUN: cd %S/../Driver/Inputs/stateless
-# RUN: foldsim --srcs top.f --top Top --out %t/blk --static --nest --modulo --compact-links --link-block-depth 2 Sm Agu 2>&1 | FileCheck %s --check-prefix=BLK
+# RUN: foldsim --srcs top.f --top Top --out %t/blk --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --compact-links --link-block-depth 2 Sm Agu 2>&1 | FileCheck %s --check-prefix=BLK
 # RUN: FileCheck %s --check-prefix=BLKSIM < %t/blk/foldsim_sim.mlir
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/blk/obj %S/Inputs/tb_reset.sv top.sv %t/blk/foldsim_sim.sv > %t/blk/build.log 2>&1
 # RUN: %t/blk/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +stall=0 | FileCheck %s
 # RUN: %t/blk/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +stall=30 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/ult --static --nest --modulo --compact-links --link-ultra-depth 2 Sm Agu 2>&1 | FileCheck %s --check-prefix=ULT
+# RUN: foldsim --srcs top.f --top Top --out %t/ult --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --compact-links --link-ultra-depth 2 Sm Agu 2>&1 | FileCheck %s --check-prefix=ULT
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/ult/obj %S/Inputs/tb_reset.sv top.sv %t/ult/foldsim_sim.sv > %t/ult/build.log 2>&1
 # RUN: %t/ult/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +stall=30 | FileCheck %s
 # Per pair of models (`--link-kinds`): the Sm -> Agu links in ultra RAM, the
 # Agu -> Sm ones distributed whatever their depth; the report lists each link.
-# RUN: foldsim --srcs top.f --top Top --out %t/lk --static --nest --modulo --compact-links --link-block-depth 2 --link-kinds Sm_model:Agu:ultra,Agu:Sm_model:distributed Sm Agu 2>&1 | FileCheck %s --check-prefix=LK
+# RUN: foldsim --srcs top.f --top Top --out %t/lk --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --compact-links --link-block-depth 2 --link-kinds Sm_model:Agu:ultra,Agu:Sm_model:distributed Sm Agu 2>&1 | FileCheck %s --check-prefix=LK
 # RUN: FileCheck %s --check-prefix=LKUSE < %t/lk/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/lk/obj %S/Inputs/tb_reset.sv top.sv %t/lk/foldsim_sim.sv > %t/lk/build.log 2>&1
 # RUN: %t/lk/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +stall=30 | FileCheck %s
-# RUN: not foldsim --srcs top.f --top Top --out %t/lkx --static --nest --modulo --link-kinds Sm_model:Nope:block Sm Agu 2>&1 | FileCheck %s --check-prefix=LKX
+# RUN: not foldsim --srcs top.f --top Top --out %t/lkx --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --link-kinds Sm_model:Nope:block Sm Agu 2>&1 | FileCheck %s --check-prefix=LKX
 # LK: link kinds: distributed {{[0-9]+}} {{[0-9]+}} {{[0-9]+}}; block 0 0 0.0; ultra [[U:[1-9][0-9]*]]
 # LK: block/ultra [[U]]
 # LKUSE-NOT: link use Agu Sm_model {{[0-9]+ [0-9]+ [0-9]+}} block

@@ -1,4 +1,6 @@
 # REQUIRES: verilator
+# (11-08: the runs pin --no-drop-dead-inputs --no-staged-link-direct, the defaults before then, so that the
+# link counts and registers checked below stay those of the feature under test.)
 # Serialized links between SLR groups (`--slr-serialize [<glob>:]<k>`): the
 # producer's group holds the bits of its pass and sends a k-th of them a host
 # cycle over the k after the next, every chunk from the held bits (no logic of
@@ -7,23 +9,23 @@
 # producer's passes of a kind stay k apart. A crossing takes a k-th of the wires. Exact against the
 # target, channels stalled or not, with bubbles, early and late links.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/linkpage
-# RUN: foldsim --srcs top.f --top Top --out %t/s2 --static --nest --modulo --slr-groups --slr-count 2 --slr-assign Unit:0,Reader:1,Top_model:1 --slr-serialize 2 Unit Reader 2>&1 | FileCheck %s --check-prefix=S2
+# RUN: foldsim --srcs top.f --top Top --out %t/s2 --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --slr-groups --slr-count 2 --slr-assign Unit:0,Reader:1,Top_model:1 --slr-serialize 2 Unit Reader 2>&1 | FileCheck %s --check-prefix=S2
 # RUN: FileCheck %s --check-prefix=S2SIM < %t/s2/foldsim_sim.mlir
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/s2/obj %S/Inputs/tb_reset.sv top.sv %t/s2/foldsim_sim.sv > %t/s2/build.log 2>&1
 # RUN: %t/s2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
 # RUN: %t/s2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/b --static --nest --modulo --bubbles --slr-groups --slr-count 2 --slr-assign Unit:0,Reader:1,Top_model:1 --slr-serialize Unit:4,Reader:2 Unit Reader 2>&1 | FileCheck %s --check-prefix=MIX
+# RUN: foldsim --srcs top.f --top Top --out %t/b --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --bubbles --slr-groups --slr-count 2 --slr-assign Unit:0,Reader:1,Top_model:1 --slr-serialize Unit:4,Reader:2 Unit Reader 2>&1 | FileCheck %s --check-prefix=MIX
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/b/obj %S/Inputs/tb_reset.sv top.sv %t/b/foldsim_sim.sv > %t/b/build.log 2>&1
 # RUN: %t/b/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +bubble=0 | FileCheck %s
 # RUN: %t/b/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +bubble=50 | FileCheck %s
 # RUN: %t/b/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +bubble=30 +stall=30 | FileCheck %s
 # Late links (zero latency within a group), a chain over three groups.
 # RUN: cd %S/../Driver/Inputs/late
-# RUN: foldsim --srcs top.f --top Top --out %t/l3 --static --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-count 3 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-serialize 3 Leaf > /dev/null 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/l3 --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-count 3 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-serialize 3 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/l3/obj %S/Inputs/tb_late.sv top.sv %t/l3/foldsim_sim.sv > %t/l3/build.log 2>&1
 # RUN: %t/l3/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
 # RUN: %t/l3/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=40 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/l2 --static --copies Leaf:3 --two-cycle-links --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:0,Top_model:1 --slr-serialize Leaf*:2 Leaf > /dev/null 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/l2 --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:3 --two-cycle-links --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:0,Top_model:1 --slr-serialize Leaf*:2 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/l2/obj %S/Inputs/tb_late.sv top.sv %t/l2/foldsim_sim.sv > %t/l2/build.log 2>&1
 # RUN: %t/l2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=20 | FileCheck %s
 # S2: II = 10

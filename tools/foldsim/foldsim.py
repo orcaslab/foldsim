@@ -407,14 +407,12 @@ def frame_options(a):
         fold += ' compact-links'
     if getattr(a, 'share_links', False):
         fold += ' share-links'
-    if getattr(a, 'drop_dead_inputs', False):
-        fold += ' drop-dead-inputs'
+    fold += f" drop-dead-inputs={'true' if getattr(a, 'drop_dead_inputs', True) else 'false'}"
     if getattr(a, 'staged_links', False):
         fold += ' staged-links'
         if getattr(a, 'staged_link_memories', False):
             fold += ' staged-link-memories'
-        if getattr(a, 'staged_link_direct', False):
-            fold += ' staged-link-direct'
+        fold += f" staged-link-direct={'true' if getattr(a, 'staged_link_direct', True) else 'false'}"
     if getattr(a, 'link_block_depth', 0):
         fold += f' link-block-depth={a.link_block_depth}'
     if getattr(a, 'link_ultra_depth', 0):
@@ -433,10 +431,9 @@ def frame_options(a):
             fold += f' page-write-gate-pages={a.page_write_gate_pages}'
     if getattr(a, 'read_buffer_bits', 0):
         fold += f' read-buffer-bits={a.read_buffer_bits}'
-    if getattr(a, 'fold_store_ram', 0):
-        fold += f' fold-store-ram={a.fold_store_ram}'
-        if getattr(a, 'fold_store_style', 'auto') != 'auto':
-            fold += f' fold-store-style={a.fold_store_style}'
+    fold += f' fold-store-ram={getattr(a, "fold_store_ram", 32768)}'
+    if getattr(a, 'fold_store_style', 'auto') != 'auto':
+        fold += f' fold-store-style={a.fold_store_style}'
     if getattr(a, 'link_hbm_fit_slots', False):
         fold += ' link-hbm-fit-slots'
     if getattr(a, 'fold_ports', ''):
@@ -1214,11 +1211,11 @@ def build_parser():
                     help="with --static: a threaded memory's per-instance read-register buffer of at least N bits "
                          'read synchronously (a block RAM, read first) instead of combinationally (LUTs); 0: none '
                          '(foldsim-fold-static read-buffer-bits)')
-    ap.add_argument('--fold-store-ram', type=int, default=0, metavar='N',
+    ap.add_argument('--fold-store-ram', type=int, default=32768, metavar='N',
                     help="with --static: folded pipelines' result stores of at least N bits read through a "
                          'register, a host cycle or two ahead, in block or ultra RAM (their slot counters '
                          'the copy\'s own; a write landing in between forwarded unless the schedule shows '
-                         'none can). Exact; 0: read combinationally, LUTs (foldsim-fold-static fold-store-ram)')
+                         'none can). Exact; default 32768; 0: read combinationally, LUTs (foldsim-fold-static fold-store-ram)')
     ap.add_argument('--fold-store-style', choices=('auto', 'ultra', 'block'), default='auto',
                     help='with --fold-store-ram: the stores\' RAM style (auto: ultra where it takes fewer than half as '
                          'many primitives as block RAM, else block); a --storage rule <model>:fold<k>_store=<kind> takes precedence')
@@ -1273,11 +1270,11 @@ def build_parser():
                     help="with --staged-links: the staged links of one producer port to one reader class "
                          "keep their first registers as one distributed-RAM memory, each link's second "
                          "register loaded from it at its own copy position (foldsim-fold-static)")
-    ap.add_argument('--staged-link-direct', action='store_true',
+    ap.add_argument('--staged-link-direct', action=argparse.BooleanOptionalAction, default=True,
                     help="with --staged-links: a reader of one instance reads a staged link's second register "
                          'in place, with no read register of its own (the copy a host cycle later in the frame): '
                          'two flops a link bit instead of three (foldsim-fold-static staged-link-direct)')
-    ap.add_argument('--drop-dead-inputs', action='store_true',
+    ap.add_argument('--drop-dead-inputs', action=argparse.BooleanOptionalAction, default=True,
                     help='with --static: a model input its body never reads takes no link (no storage, no read '
                          'register) (foldsim-fold-static drop-dead-inputs)')
     ap.add_argument('--share-links', action='store_true',

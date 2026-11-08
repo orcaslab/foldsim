@@ -1,4 +1,6 @@
 # REQUIRES: verilator
+# (11-08: the runs pin --no-drop-dead-inputs --no-staged-link-direct, the defaults before then, so that the
+# link counts and registers checked below stay those of the feature under test.)
 # Staged links as memories (`--staged-link-memories`): the staged links of one
 # producer port to one reader class keep their first registers as one
 # distributed-RAM memory, an entry per producer instance, written at the
@@ -11,7 +13,7 @@
 # - the arbiter tree with zero-latency links and chains: two memories;
 # - one producer port, a bit to each of four readers (staged-bits): two.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/broadcast
-# RUN: foldsim --srcs top.f --top Top --out %t/bc --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories Lane 2>&1 | FileCheck %s --check-prefix=BC
+# RUN: foldsim --srcs top.f --top Top --out %t/bc --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --share-links --compact-links --staged-links --staged-link-memories Lane 2>&1 | FileCheck %s --check-prefix=BC
 # RUN: FileCheck %s --check-prefix=BCUSE < %t/bc/schedule.txt
 # RUN: FileCheck %s --check-prefix=BCSIM < %t/bc/foldsim_sim.mlir
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/bc/obj %S/Inputs/tb_reset.sv top.sv %t/bc/foldsim_sim.sv > %t/bc/build.log 2>&1
@@ -24,17 +26,17 @@
 # H0: {{^}}MATCH 196 cycles in 1200 host cycles
 # H60: {{^}}MATCH 196 cycles in 1383 host cycles
 # Without the option, the same staged registers (static-link-kinds.test BC).
-# RUN: foldsim --srcs top.f --top Top --out %t/bc0 --static --nest --modulo --share-links --compact-links --staged-links Lane 2>&1 | FileCheck %s --check-prefix=BC0
+# RUN: foldsim --srcs top.f --top Top --out %t/bc0 --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --share-links --compact-links --staged-links Lane 2>&1 | FileCheck %s --check-prefix=BC0
 # BC0: staged: 11 links, 232 register bits; compact
 # BC0-NOT: staged memories
 # RUN: cd %S/../Driver/Inputs/tree-arb
-# RUN: foldsim --srcs top.f --top Top --out %t/tz --static --nest --modulo --compact-links --staged-links --staged-link-memories --share-links --zero-latency-links --zero-latency-chains --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=TREE
+# RUN: foldsim --srcs top.f --top Top --out %t/tz --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --compact-links --staged-links --staged-link-memories --share-links --zero-latency-links --zero-latency-chains --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=TREE
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/tz/obj %S/Inputs/tb_reset.sv top.sv %t/tz/foldsim_sim.sv > %t/tz/build.log 2>&1
 # RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s
 # RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=60 | FileCheck %s
 # TREE: staged: 11 links, 46 register bits; staged memories: 2 (4 links), 18 bits
 # RUN: cd %S/../Driver/Inputs/staged-bits
-# RUN: foldsim --srcs top.f --top Top --out %t/sb --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories Sw Lnk 2>&1 | FileCheck %s --check-prefix=SB
+# RUN: foldsim --srcs top.f --top Top --out %t/sb --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --share-links --compact-links --staged-links --staged-link-memories Sw Lnk 2>&1 | FileCheck %s --check-prefix=SB
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/sb/obj %S/Inputs/tb_reset.sv top.sv %t/sb/foldsim_sim.sv > %t/sb/build.log 2>&1
 # RUN: %t/sb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +stall=0 | FileCheck %s
 # RUN: %t/sb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+10 +stall=30 | FileCheck %s
@@ -43,10 +45,10 @@
 # With SLR groups (`--slr-groups`), a staged link (and its memory) within one group as without groups; one between
 # groups is registered at its producer's group instead (never staged). Both exact.
 # RUN: cd %S/../Driver/Inputs/broadcast
-# RUN: foldsim --srcs top.f --top Top --out %t/sgs --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --slr-groups --slr-count 2 --slr-assign Lane:0,Top_model:0 Lane 2>&1 | FileCheck %s --check-prefix=SGS
+# RUN: foldsim --srcs top.f --top Top --out %t/sgs --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --slr-groups --slr-count 2 --slr-assign Lane:0,Top_model:0 Lane 2>&1 | FileCheck %s --check-prefix=SGS
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/sgs/obj %S/Inputs/tb_reset.sv top.sv %t/sgs/foldsim_sim.sv > %t/sgs/build.log 2>&1
 # RUN: %t/sgs/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=60 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/sgx --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --slr-groups --slr-count 2 --slr-assign Lane:0,Top_model:1 Lane 2>&1 | FileCheck %s --check-prefix=SGX
+# RUN: foldsim --srcs top.f --top Top --out %t/sgx --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --slr-groups --slr-count 2 --slr-assign Lane:0,Top_model:1 Lane 2>&1 | FileCheck %s --check-prefix=SGX
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/sgx/obj %S/Inputs/tb_reset.sv top.sv %t/sgx/foldsim_sim.sv > %t/sgx/build.log 2>&1
 # RUN: %t/sgx/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=60 | FileCheck %s
 # SGS: staged: 11 links, 168 register bits; staged memories: 1 (4 links)

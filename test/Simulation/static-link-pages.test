@@ -1,4 +1,6 @@
 # REQUIRES: verilator
+# (11-08: the runs pin --no-drop-dead-inputs --no-staged-link-direct, the defaults before then, so that the
+# link counts and registers checked below stay those of the feature under test.)
 # Paged links (`--link-kinds <producer>:<reader>:<kind>:<p>`): an early link,
 # its reader input's only source, in block or ultra RAM as p rows an entry of
 # a p-th of its bits; the producer's and the reader's passes p apart (their
@@ -7,17 +9,17 @@
 # channels stalled or not, with bubbles. A link whose write lands too close
 # to its read (Reader -> Unit at p 3: 3 host cycles) stays unpaged.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/linkpage
-# RUN: foldsim --srcs top.f --top Top --out %t/p2 --static --nest --modulo --link-block-depth 2 --link-kinds Unit:Reader:block:2,Reader:Unit:ultra:3 Unit Reader 2>&1 | FileCheck %s --check-prefix=P2
+# RUN: foldsim --srcs top.f --top Top --out %t/p2 --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --link-block-depth 2 --link-kinds Unit:Reader:block:2,Reader:Unit:ultra:3 Unit Reader 2>&1 | FileCheck %s --check-prefix=P2
 # RUN: FileCheck %s --check-prefix=P2USE < %t/p2/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/p2/obj %S/Inputs/tb_reset.sv top.sv %t/p2/foldsim_sim.sv > %t/p2/build.log 2>&1
 # RUN: %t/p2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
 # RUN: %t/p2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/p4 --static --nest --modulo --bubbles --link-block-depth 2 --link-kinds Unit:Reader:block:4,Reader:Unit:block:2 Unit Reader 2>&1 | FileCheck %s --check-prefix=P4
+# RUN: foldsim --srcs top.f --top Top --out %t/p4 --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --bubbles --link-block-depth 2 --link-kinds Unit:Reader:block:4,Reader:Unit:block:2 Unit Reader 2>&1 | FileCheck %s --check-prefix=P4
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/p4/obj %S/Inputs/tb_reset.sv top.sv %t/p4/foldsim_sim.sv > %t/p4/build.log 2>&1
 # RUN: %t/p4/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +bubble=0 | FileCheck %s
 # RUN: %t/p4/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +bubble=50 | FileCheck %s
 # RUN: %t/p4/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +bubble=30 +stall=30 | FileCheck %s
-# RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --nest --modulo --link-kinds Unit:Reader:distributed:2 Unit Reader 2>&1 | FileCheck %s --check-prefix=BAD
+# RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --link-kinds Unit:Reader:distributed:2 Unit Reader 2>&1 | FileCheck %s --check-prefix=BAD
 # P2: II = 12
 # P2: paged: 1 links, 64 flops
 # P2: link kinds: distributed 0 0 0; block 6 1536 3.0; ultra 1 256 1
