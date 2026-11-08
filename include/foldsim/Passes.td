@@ -664,6 +664,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "result still lands before its first read (the store's depth of "
            "edges II apart and the state gap), else an error. Not for a "
            "pipeline with black boxes. 0: none">,
+    ListOption<"foldStageLevelsClass", "fold-stage-levels-class", "std::string",
+               "Per class over fold-stage-levels: <glob>:<N> stages that "
+               "class's folded pipelines at N levels, <glob>:off not at all "
+               "(globs on the model's name; a copy goes by its class's; the "
+               "last matching spec wins; a spec of no class is an error)">,
     Option<"foldStoreLead", "fold-store-lead", "unsigned", "2",
            "With fold-store-ram: host cycles a store is read ahead, 2 (the "
            "RAM's register and an output register) or 1 (the RAM's register "

@@ -434,6 +434,8 @@ def frame_options(a):
     fold += f' fold-store-ram={getattr(a, "fold_store_ram", 32768)}'
     if getattr(a, 'fold_stage_levels', 0):
         fold += f' fold-stage-levels={a.fold_stage_levels}'
+    if getattr(a, 'fold_stage_levels_class', ''):
+        fold += f' fold-stage-levels-class={a.fold_stage_levels_class}'
     if getattr(a, 'fold_store_style', 'auto') != 'auto':
         fold += f' fold-store-style={a.fold_store_style}'
     if getattr(a, 'link_hbm_fit_slots', False):
@@ -1304,6 +1306,10 @@ def build_parser():
                          'register, a host cycle or two ahead, in block or ultra RAM (their slot counters '
                          'the copy\'s own; a write landing in between forwarded unless the schedule shows '
                          'none can). Exact; default 32768; 0: read combinationally, LUTs (foldsim-fold-static fold-store-ram)')
+    ap.add_argument('--fold-stage-levels-class', default='', metavar='CLASS:N|CLASS:off,...',
+                    help='with --static: per class over --fold-stage-levels (globs on the model name; the last '
+                         'matching spec wins; a spec of no class is an error; foldsim-fold-static '
+                         'fold-stage-levels-class)')
     ap.add_argument('--fold-stage-levels', type=int, default=0, metavar='N',
                     help="with --static: folded pipelines' layer logic cut by host-clock stage registers at N "
                          'estimated levels (as --stage-levels counts them); results land later in the store, '

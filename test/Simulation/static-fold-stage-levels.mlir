@@ -38,6 +38,14 @@
 // RUN: %t/c2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 | FileCheck %s
 // RUN: %t/c2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 | FileCheck %s
 
+// Per class (fold-stage-levels-class): Model's at one level alone (as above), off over a global
+// one (none), and a spec of no class.
+// RUN: foldsim-opt %t/in.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top fold-stage-levels-class=Model:1})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=S1LOG
+// RUN: foldsim-opt %t/in.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top fold-stage-levels=1 fold-stage-levels-class=Mod*:off})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=KOFF
+// RUN: not foldsim-opt %t/in.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top fold-stage-levels-class=Nope:1})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=KNONE
+// KOFF-NOT: fold-stage-levels:
+// KNONE: fold-stage-levels-class: 'Nope:1' matches no class
+
 // CHECK: {{^}}MATCH 4 outputs x 88 cycles
 
 // Stage registers on the host clock in fold0's copy, the tags waiting 3 host

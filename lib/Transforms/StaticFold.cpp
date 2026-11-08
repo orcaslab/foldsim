@@ -397,6 +397,8 @@ public:
   /// `fold-stage-levels`: folded pipelines' layers cut at this many
   /// estimated levels by stage registers (0: none).
   unsigned foldStageLevels = 0;
+  /// `fold-stage-levels-class`: <glob>:<N|off> per class over it.
+  SmallVector<std::string> foldStageLevelClassSpecs;
   std::string foldStoreStyle = "auto";
   unsigned foldStoreLead = 2;
   /// `staged-link-direct`: see stagedDirect.
@@ -15017,11 +15019,40 @@ LogicalResult StaticFolder::run() {
       failed(parseRegisteredLinks()) || failed(parseSerialize()) ||
       failed(parseLinkKinds()))
     return failure();
-  for (auto &cls : classes)
+  // `fold-stage-levels-class`: per class (its class's name for a copy) over
+  // fold-stage-levels, the last matching spec winning.
+  SmallVector<bool> foldLevelMatched(foldStageLevelClassSpecs.size(), false);
+  for (auto &spec : foldStageLevelClassSpecs) {
+    auto [pattern, levels] = StringRef(spec).rsplit(':');
+    unsigned n = 0;
+    if (pattern.empty() || !llvm::GlobPattern::create(pattern) ||
+        (levels != "off" && (levels.getAsInteger(10, n) || !n)))
+      return netlist.emitError("fold-stage-levels-class: '")
+             << spec << "' is not <glob>:<levels> or <glob>:off";
+  }
+  for (auto &cls : classes) {
+    StringRef baseName = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
+                                            : StringRef(cls.name);
+    unsigned levels = foldStageLevels;
+    for (auto [k, spec] : llvm::enumerate(foldStageLevelClassSpecs)) {
+      auto [pattern, given] = StringRef(spec).rsplit(':');
+      if (auto glob = llvm::GlobPattern::create(pattern);
+          glob && glob->match(baseName)) {
+        foldLevelMatched[k] = true;
+        levels = 0;
+        if (given != "off")
+          given.getAsInteger(10, levels);
+      }
+    }
     if (cls.threads() > 1 &&
-        failed(foldPipelines(cls.model, cls.threads(), foldStoreRam,
-                             foldStageLevels, cls.folding)))
+        failed(foldPipelines(cls.model, cls.threads(), foldStoreRam, levels,
+                             cls.folding)))
       return failure();
+  }
+  for (auto [k, spec] : llvm::enumerate(foldStageLevelClassSpecs))
+    if (!foldLevelMatched[k])
+      return netlist.emitError("fold-stage-levels-class: '")
+             << spec << "' matches no class";
   for (auto &cls : classes)
     if (failed(analyze(cls)))
       return failure();
@@ -15150,6 +15181,8 @@ void FoldStaticPass::runOnOperation() {
   folder.foldStoreStyle = foldStoreStyle;
   folder.foldStoreLead = foldStoreLead;
   folder.foldStageLevels = foldStageLevels;
+  folder.foldStageLevelClassSpecs.assign(foldStageLevelsClass.begin(),
+                                         foldStageLevelsClass.end());
   if (foldStoreLead < 1 || foldStoreLead > 2) {
     getOperation().emitError("fold-store-lead: ")
         << unsigned(foldStoreLead) << " is not 1 or 2";
