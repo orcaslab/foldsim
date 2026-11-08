@@ -819,6 +819,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"stateInRamReadBits", "state-in-ram-read-bits", "unsigned", "0",
            "With state-in-ram: the RAM bits an evaluation reads a host cycle "
            "(N > 0): P = ceil(bits / N) for a class whose spec gives no P">,
+    Option<"stateInRamZeroLinks", "state-in-ram-zero-links", "bool", "false",
+           "With state-in-ram and zero-latency-links: links into a class of "
+           "P > 1 may be taken in their producer's host cycle (default: from "
+           "their read registers, as a staged reader's, so that no "
+           "producer's logic chains into the evaluation on the last pass)">,
     Option<"stateInRamH", "state-in-ram-h", "unsigned", "0",
            "With state-in-ram and P auto: the most host cycles a copy's "
            "passes may take, instances x P (0: no bound)">,

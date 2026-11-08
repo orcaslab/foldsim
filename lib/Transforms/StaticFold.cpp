@@ -358,6 +358,8 @@ public:
   /// `state-in-ram-h`: the most host cycles a copy's P passes take,
   /// instances x P (0: no bound), for `auto` P.
   unsigned stateInRamH = 0;
+  /// `state-in-ram-zero-links`: zero-latency links into a P > 1 class.
+  bool stateInRamZeroLinks = false;
   /// The state-in-ram classes' RAM primitives by SLR group, once scheduled.
   void reportStateInRam() const;
   /// `link-hbm-lead`: the most positions a stream's request precedes its
@@ -3729,6 +3731,12 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   // A staged reader reads its inputs from their read registers, its stages
   // before its state pass.
   if (classes[c].stages)
+    return false;
+  // A reader with its state in RAM over passes (state-in-ram, P > 1)
+  // evaluates on its last pass from its capture registers: its inputs from
+  // their read registers too, so that no producer's logic chains into it
+  // (`state-in-ram-zero-links` allows it).
+  if (classes[c].sir > 1 && !stateInRamZeroLinks)
     return false;
   if (zeroLatencyChains)
     return !cutLinks.count({p, c, input});
@@ -14886,6 +14894,7 @@ void FoldStaticPass::runOnOperation() {
   folder.stateInRamSpecs.assign(stateInRam.begin(), stateInRam.end());
   folder.stateInRamReadBits = stateInRamReadBits;
   folder.stateInRamH = stateInRamH;
+  folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
   folder.linkHbmShift = linkHbmShift;

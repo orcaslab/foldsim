@@ -456,6 +456,8 @@ def frame_options(a):
             fold += f' state-in-ram-read-bits={a.state_in_ram_read_bits}'
         if getattr(a, 'state_in_ram_h', 0):
             fold += f' state-in-ram-h={a.state_in_ram_h}'
+        if getattr(a, 'state_in_ram_zero_links', False):
+            fold += ' state-in-ram-zero-links'
     return fold
 
 
@@ -1349,6 +1351,10 @@ def build_parser():
     ap.add_argument('--state-in-ram-read-bits', type=int, default=0, metavar='N',
                     help='with --state-in-ram: P = ceil(bits / N) for a class whose spec gives no P '
                          '(foldsim-fold-static state-in-ram-read-bits; 0: P = 1)')
+    ap.add_argument('--state-in-ram-zero-links', action='store_true',
+                    help='with --state-in-ram and --zero-latency-links: links into a P > 1 class may be taken '
+                         'in their producer\'s host cycle (default: from read registers, so that no producer '
+                         'logic chains into its last-pass evaluation; foldsim-fold-static state-in-ram-zero-links)')
     ap.add_argument('--state-in-ram-h', type=int, default=0, metavar='N',
                     help='with --state-in-ram and P auto: the most host cycles a copy\'s passes take '
                          '(instances x P; foldsim-fold-static state-in-ram-h; 0: no bound)')
