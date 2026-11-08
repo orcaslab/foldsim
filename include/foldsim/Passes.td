@@ -653,6 +653,17 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "entry per instance, beside the store), into the RAM's output "
            "register, as far ahead as the schedule shows every write to the "
            "entry landed. Exact. 0: every store read combinationally (LUTs)">,
+    Option<"foldStageLevels", "fold-stage-levels", "unsigned", "0",
+           "Folded pipelines' logic in stages: each layer of a folded "
+           "pipeline's copy (the issue's logic to the first layer, a layer's "
+           "to the next, the last's to the store's write data) cut by "
+           "registers on the host clock so that no stage spans more than N "
+           "estimated levels (as stage-levels counts them); every layer then "
+           "takes the deepest layer's stages and the results land that much "
+           "later in the store. Checked once the schedule is known: each "
+           "result still lands before its first read (the store's depth of "
+           "edges II apart and the state gap), else an error. Not for a "
+           "pipeline with black boxes. 0: none">,
     Option<"foldStoreLead", "fold-store-lead", "unsigned", "2",
            "With fold-store-ram: host cycles a store is read ahead, 2 (the "
            "RAM's register and an output register) or 1 (the RAM's register "

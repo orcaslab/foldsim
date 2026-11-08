@@ -432,6 +432,8 @@ def frame_options(a):
     if getattr(a, 'read_buffer_bits', 0):
         fold += f' read-buffer-bits={a.read_buffer_bits}'
     fold += f' fold-store-ram={getattr(a, "fold_store_ram", 32768)}'
+    if getattr(a, 'fold_stage_levels', 0):
+        fold += f' fold-stage-levels={a.fold_stage_levels}'
     if getattr(a, 'fold_store_style', 'auto') != 'auto':
         fold += f' fold-store-style={a.fold_store_style}'
     if getattr(a, 'link_hbm_fit_slots', False):
@@ -1300,6 +1302,10 @@ def build_parser():
                          'register, a host cycle or two ahead, in block or ultra RAM (their slot counters '
                          'the copy\'s own; a write landing in between forwarded unless the schedule shows '
                          'none can). Exact; default 32768; 0: read combinationally, LUTs (foldsim-fold-static fold-store-ram)')
+    ap.add_argument('--fold-stage-levels', type=int, default=0, metavar='N',
+                    help="with --static: folded pipelines' layer logic cut by host-clock stage registers at N "
+                         'estimated levels (as --stage-levels counts them); results land later in the store, '
+                         'checked against the schedule (foldsim-fold-static fold-stage-levels; 0: none)')
     ap.add_argument('--fold-store-style', choices=('auto', 'ultra', 'block'), default='auto',
                     help='with --fold-store-ram: the stores\' RAM style (auto: ultra where it takes fewer than half as '
                          'many primitives as block RAM, else block); a --storage rule <model>:fold<k>_store=<kind> takes precedence')

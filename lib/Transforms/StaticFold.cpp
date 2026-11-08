@@ -86,6 +86,9 @@ struct Fold {
   /// from the issue's tags a host cycle on (`valid1`, `slot1`, `thread1`).
   bool ahead = false;
   unsigned depth = 0, outAt = 0;
+  /// `fold-stage-levels`: the host cycles its stage registers add to the
+  /// copy (in `outAt`), checked against the schedule when the copy is built.
+  unsigned staged = 0;
   Value valid1, slot1, thread1;
   std::optional<Backedge> slotNow;
 };
@@ -386,6 +389,9 @@ public:
   /// least this many bits read through a register (block or ultra RAM);
   /// 0: none.
   uint64_t foldStoreRam = 0;
+  /// `fold-stage-levels`: folded pipelines' layers cut at this many
+  /// estimated levels by stage registers (0: none).
+  unsigned foldStageLevels = 0;
   std::string foldStoreStyle = "auto";
   unsigned foldStoreLead = 2;
   /// `staged-link-direct`: see stagedDirect.
@@ -7670,7 +7676,7 @@ static bool inCone(Operation *op) {
 /// counter is then no target state but the copy's own (`Fold::ahead`), and
 /// the model's read of it a placeholder at slot 0.
 static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
-                                   uint64_t aheadBits,
+                                   uint64_t aheadBits, unsigned stageLevels,
                                    std::unique_ptr<Folding> &out) {
   auto *body = model.getBodyBlock();
   ImplicitLocOpBuilder b(model.getLoc(), body->getTerminator());
@@ -7822,7 +7828,12 @@ static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
         modelClock, hw::ConstantOp::create(b, i1, 1));
     f.foldOfStore[store] = f.folds.size();
 
-    // The unthreaded copy.
+    // The unthreaded copy (its registers `layerRegs`); the ops made for it
+    // come after `mark` in the body.
+    Operation *mark = &*std::prev(body->getTerminator()->getIterator());
+    SmallVector<seq::FirRegOp> layerRegs;
+    // Each copy register's layers (of this pipeline's bits it holds).
+    SmallVector<SmallVector<unsigned, 2>> regLayers;
     DenseMap<Value, Value> copies;
     SmallVector<std::pair<unsigned, Backedge>> copyNexts;
     for (auto ri : p.registers) {
@@ -7837,6 +7848,12 @@ static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
       auto type = b.getIntegerType(reg.layer.size());
       auto next = f.edges->get(type);
       auto copy = hostReg(next, reg.reg.getName() + "_fold");
+      layerRegs.push_back(copy.getDefiningOp<seq::FirRegOp>());
+      auto &held = regLayers.emplace_back();
+      for (unsigned bit = 0; bit < reg.layer.size(); ++bit)
+        if (reg.layer[bit] && reg.pipeline[bit] == pi &&
+            !llvm::is_contained(held, reg.layer[bit]))
+          held.push_back(reg.layer[bit]);
       copies[reg.reg.getResult()] =
           castBits(b, copy, reg.reg.getResult().getType());
       copyNexts.push_back({ri, next});
@@ -7968,6 +7985,149 @@ static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
     }
     Value word = fromRuns(b, runs);
 
+    // `fold-stage-levels`: each layer's logic in the copy (the issue's to the
+    // first layer, each layer's to the next, the last's to the store's write
+    // data) cut by stage registers so that no stage spans more than
+    // `stageLevels` estimated levels (half levels as staged evaluation counts
+    // them; an op deeper than that alone keeps a stage). A register of the
+    // copy holds bits of several layers, so every layer takes the same S
+    // host cycles, the deepest layer's stages; the write data its own. The
+    // tags wait as much more. Exact as long as each result still lands in
+    // the store before it is read, which the copy checks once the schedule
+    // is known (the store's depth of edges, II apart, and the state gap).
+    // Not for a pipeline with black boxes (their contracts fix the
+    // latency between their ports).
+    unsigned staged = 0;
+    int layerEnd1 = 0, wordEnd1 = 0;
+    if (stageLevels && p.boxes.empty()) {
+      int limit = 2 * int(stageLevels);
+      // A value's stage and levels in it: a register of the copy (on the
+      // host clock) starts a stage; an op made for the copy (after `mark`)
+      // is staged as staged evaluation stages; anything else (the model's,
+      // the same for every issue, or a constant) is in every stage (-1).
+      DenseMap<Value, Staging> memo;
+      auto made = [&](Operation *op) {
+        return op->getBlock() == body && mark->isBeforeInBlock(op) &&
+               inCone(op);
+      };
+      auto stageAt = [&](Value root) -> Staging {
+        SmallVector<std::pair<Value, bool>> stack{{root, false}};
+        SmallVector<std::pair<Value, int>> edges;
+        while (!stack.empty()) {
+          auto [value, expanded] = stack.pop_back_val();
+          if (!expanded && memo.count(value))
+            continue;
+          auto *op = value.getDefiningOp();
+          if (!op || !made(op)) {
+            auto reg = dyn_cast_or_null<seq::FirRegOp>(op);
+            memo[value] = reg && reg.getClk() == f.physClock ? Staging{0, 0}
+                                                              : Staging{-1, 0};
+            continue;
+          }
+          edges.clear();
+          depthEdges(value, edges, 0);
+          if (!expanded) {
+            memo[value] = {-1, 0};
+            stack.push_back({value, true});
+            for (auto [operand, levels] : edges)
+              if (!memo.count(operand))
+                stack.push_back({operand, false});
+            continue;
+          }
+          int stage = -1, at = 0;
+          int levels = edges.empty() ? 0 : edges.front().second;
+          for (auto [operand, add] : edges)
+            stage = std::max(stage, memo.lookup(operand).stage);
+          if (stage < 0) {
+            memo[value] = {-1, 0};
+            continue;
+          }
+          for (auto [operand, add] : edges)
+            if (auto st = memo.lookup(operand); st.stage == stage)
+              at = std::max(at, st.levels);
+          if (at > 0 && at + levels > limit) {
+            ++stage;
+            at = 0;
+          }
+          memo[value] = {stage, at + levels};
+        }
+        return memo.lookup(root);
+      };
+      // Each layer's stages: its registers' deepest; the layers a register
+      // holds bits of take the same (its bits are delayed alike).
+      SmallVector<int> layerStages(layers + 1, 0);
+      for (auto [r, reg] : llvm::enumerate(layerRegs))
+        for (auto l : regLayers[r])
+          layerStages[l] =
+              std::max(layerStages[l], stageAt(reg.getNext()).stage);
+      for (bool changed = true; changed;) {
+        changed = false;
+        for (auto &held : regLayers) {
+          int most = 0;
+          for (auto l : held)
+            most = std::max(most, layerStages[l]);
+          for (auto l : held)
+            if (layerStages[l] != most) {
+              layerStages[l] = most;
+              changed = true;
+            }
+        }
+      }
+      int layerEnd = 0, layerSum = 0;
+      for (unsigned l = 1; l <= depth && l < layerStages.size(); ++l) {
+        layerEnd = std::max(layerEnd, layerStages[l]);
+        layerSum += layerStages[l];
+      }
+      auto regEnd = [&](unsigned r) {
+        int most = 0;
+        for (auto l : regLayers[r])
+          most = std::max(most, layerStages[l]);
+        return most;
+      };
+      int wordEnd = std::max(0, stageAt(word).stage);
+      if (layerEnd > 0 || wordEnd > 0) {
+        // Each op made for the copy takes its operands through as many stage
+        // registers as their stages are before its own; each layer register
+        // its next value through the rest of the layer's S stages.
+        DenseMap<Value, SmallVector<Value>> delays;
+        auto delayed = [&](Value value, int n) -> Value {
+          auto &chain = delays[value];
+          while (int(chain.size()) < n)
+            chain.push_back(hostReg(chain.empty() ? value : chain.back(),
+                                    prefix + "_stage"));
+          return n ? chain[n - 1] : value;
+        };
+        SmallVector<Operation *> staging;
+        for (auto &[value, st] : memo)
+          if (auto *op = value.getDefiningOp(); op && st.stage > 0 && made(op))
+            staging.push_back(op);
+        llvm::sort(staging, [](Operation *x, Operation *y) {
+          return x->isBeforeInBlock(y);
+        });
+        staging.erase(std::unique(staging.begin(), staging.end()),
+                      staging.end());
+        for (auto *op : staging) {
+          int at = memo.lookup(op->getResult(0)).stage;
+          for (auto &operand : op->getOpOperands()) {
+            auto it = memo.find(operand.get());
+            if (it == memo.end() || it->second.stage < 0 ||
+                it->second.stage >= at)
+              continue;
+            operand.set(delayed(operand.get(), at - it->second.stage));
+          }
+        }
+        for (auto [r, reg] : llvm::enumerate(layerRegs)) {
+          int at = memo.lookup(reg.getNext()).stage, end = regEnd(r);
+          if (at >= 0 && at < end)
+            reg.getNextMutable().assign(delayed(reg.getNext(), end - at));
+        }
+        staged = unsigned(layerSum) + unsigned(wordEnd);
+        outAt += staged;
+        layerEnd1 = layerSum;
+        wordEnd1 = wordEnd;
+      }
+    }
+
     // The tags, along with the copy, and the registered write.
     Value valid = p.enable ? Value(comb::AndOp::create(b, f.edge, p.enable))
                            : Value(f.edge);
@@ -7992,6 +8152,13 @@ static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
     fold.ahead = ahead;
     fold.depth = depth;
     fold.outAt = outAt;
+    fold.staged = staged;
+    if (staged)
+      llvm::errs() << "foldsim-fold-static: fold-stage-levels: "
+                   << model.getModuleName() << " fold" << pi << ": " << layers
+                   << " layers, " << layerEnd1 << " stage registers on their way, write data "
+                   << wordEnd1 << " more: results " << staged
+                   << " host cycles later\n";
     fold.slotNow = slotNow;
     f.folds.push_back(fold);
   }
@@ -9021,6 +9188,23 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   auto physical = [&](Operation *op) {
     return folding && folding->physical.contains(op);
   };
+  // `fold-stage-levels`: a staged folded pipeline's results land `outAt + 1`
+  // host cycles after their issue; the first read of a store entry is the
+  // store's depth of edges after its write's issue, II apart, less a frame
+  // plus the state gap: (depth - 1) II + gap >= outAt + 2, as a read ahead's
+  // (buildAheadStore) with no lead.
+  if (folding)
+    for (auto [k, fold] : llvm::enumerate(folding->folds))
+      if (fold.staged &&
+          uint64_t(fold.depth - 1) * ii + uint64_t(std::max(cls.stateGap, 0)) <
+              uint64_t(fold.outAt) + 2)
+        return model.emitError("fold-stage-levels: ")
+               << cls.name << " fold" << k << ": its results land "
+               << fold.outAt + 1 << " host cycles after their issue ("
+               << fold.staged << " for its stages), after their first read ("
+               << fold.depth << " edges of II " << ii << ", state gap "
+               << cls.stateGap << "): fewer levels a stage would not help; "
+               << "a larger fold-stage-levels or none";
   // One instance: a black box with a pipeline contract stays, stepped through
   // its clock enable at the state pass; the clock reaches it, as a bit if its
   // port is one, and nothing else. The boxes are kept in body order, so that
@@ -14791,7 +14975,7 @@ LogicalResult StaticFolder::run() {
   for (auto &cls : classes)
     if (cls.threads() > 1 &&
         failed(foldPipelines(cls.model, cls.threads(), foldStoreRam,
-                             cls.folding)))
+                             foldStageLevels, cls.folding)))
       return failure();
   for (auto &cls : classes)
     if (failed(analyze(cls)))
@@ -14918,6 +15102,7 @@ void FoldStaticPass::runOnOperation() {
   folder.foldStoreRam = foldStoreRam;
   folder.foldStoreStyle = foldStoreStyle;
   folder.foldStoreLead = foldStoreLead;
+  folder.foldStageLevels = foldStageLevels;
   if (foldStoreLead < 1 || foldStoreLead > 2) {
     getOperation().emitError("fold-store-lead: ")
         << unsigned(foldStoreLead) << " is not 1 or 2";
