@@ -373,7 +373,7 @@ public:
   bool stagedLinkDirect = false;
   /// `drop-dead-inputs`: model inputs never read take no link.
   bool dropDeadInputs = false;
-  unsigned deadInputs = 0;
+  unsigned deadInputs = 0, partlyDeadInputs = 0;
   uint64_t deadInputBits = 0;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
   /// landing) a member is streamed with (0: the decision lead + 6). A
@@ -1309,6 +1309,82 @@ static APInt aggregateBits(Attribute attr, Type type) {
   return *bits;
 }
 
+/// The bits of `value` (its flat bit vector, bit 0 least significant) that
+/// any use reads, through the ops that only route bits: comb.extract,
+/// hw.bitcast, hw.array_get (index 0 the least significant element; a
+/// non-constant index reads every element) and hw.struct_extract (the first
+/// field the most significant). Any other use reads every bit.
+static llvm::BitVector liveBits(Value value,
+                                DenseMap<Value, llvm::BitVector> &memo) {
+  if (auto it = memo.find(value); it != memo.end())
+    return it->second;
+  int64_t width = hw::getBitWidth(value.getType());
+  llvm::BitVector live(width > 0 ? unsigned(width) : 0u);
+  auto all = [&]() { live.set(); };
+  for (auto &use : value.getUses()) {
+    if (live.all())
+      break;
+    auto *user = use.getOwner();
+    if (auto extract = dyn_cast<comb::ExtractOp>(user)) {
+      auto sub = liveBits(extract.getResult(), memo);
+      for (unsigned b : sub.set_bits())
+        live.set(extract.getLowBit() + b);
+    } else if (auto cast = dyn_cast<hw::BitcastOp>(user)) {
+      auto sub = liveBits(cast.getResult(), memo);
+      if (sub.size() == live.size())
+        live |= sub;
+      else
+        all();
+    } else if (auto get = dyn_cast<hw::ArrayGetOp>(user);
+               get && use.getOperandNumber() == 0) {
+      auto type = hw::type_cast<hw::ArrayType>(get.getInput().getType());
+      int64_t ew = hw::getBitWidth(type.getElementType());
+      auto sub = liveBits(get.getResult(), memo);
+      if (ew <= 0 || int64_t(sub.size()) != ew) {
+        all();
+        continue;
+      }
+      SmallVector<uint64_t> elements;
+      if (auto c = get.getIndex().getDefiningOp<hw::ConstantOp>()) {
+        if (c.getValue().getZExtValue() < type.getNumElements())
+          elements.push_back(c.getValue().getZExtValue());
+      } else {
+        for (uint64_t i = 0; i < type.getNumElements(); ++i)
+          elements.push_back(i);
+      }
+      for (auto i : elements)
+        for (unsigned b : sub.set_bits())
+          live.set(unsigned(i * ew + b));
+    } else if (auto field = dyn_cast<hw::StructExtractOp>(user)) {
+      auto type = hw::type_cast<hw::StructType>(field.getInput().getType());
+      auto sub = liveBits(field.getResult(), memo);
+      // The field's offset: the widths of the fields after it.
+      int64_t offset = 0;
+      bool after = false, ok = true;
+      for (auto &f : type.getElements()) {
+        if (after) {
+          int64_t w = hw::getBitWidth(f.type);
+          if (w < 0)
+            ok = false;
+          offset += w;
+        }
+        if (f.name == field.getFieldNameAttr())
+          after = true;
+      }
+      if (!ok || !after) {
+        all();
+        continue;
+      }
+      for (unsigned b : sub.set_bits())
+        live.set(unsigned(offset + b));
+    } else {
+      all();
+    }
+  }
+  memo[value] = live;
+  return live;
+}
+
 LogicalResult StaticFolder::decompose(Value value, unsigned low,
                                       unsigned width, Pieces &pieces) {
   if (width == 0)
@@ -1496,6 +1572,52 @@ LogicalResult StaticFolder::collect() {
         if (failed(decompose(instance.getOperand(i), 0, consumer.width,
                              consumer.pieces.emplace_back())))
           return failure();
+      // The bits of a read input that no use reads (a bus whose fields the
+      // model ignores): constants too, no link.
+      if (dropDeadInputs && consumer.width) {
+        DenseMap<Value, llvm::BitVector> memo;
+        auto live = liveBits(cls.model.getBodyBlock()->getArgument(i), memo);
+        unsigned dead = consumer.width - live.count();
+        if (dead && live.size() == consumer.width) {
+          deadInputBits += dead;
+          ++partlyDeadInputs;
+          for (auto &pieces : consumer.pieces) {
+            Pieces out;
+            unsigned at = 0;
+            auto append = [&](Piece piece) {
+              if (!out.empty()) {
+                auto &last = out.back();
+                if (piece.producer < 0 && last.producer < 0) {
+                  last.constant = piece.constant.concat(last.constant);
+                  last.width += piece.width;
+                  return;
+                }
+              }
+              out.push_back(piece);
+            };
+            for (auto &piece : pieces) {
+              // Runs of live and dead bits within the piece.
+              unsigned k = 0;
+              while (k < piece.width) {
+                bool on = live.test(at + k);
+                unsigned n = 1;
+                while (k + n < piece.width && live.test(at + k + n) == on)
+                  ++n;
+                if (!on)
+                  append(Piece{-1, 0, 0, n, APInt::getZero(n)});
+                else if (piece.producer < 0)
+                  append(Piece{-1, 0, 0, n, piece.constant.extractBits(n, k)});
+                else
+                  append(Piece{piece.producer, piece.inst, piece.low + k, n,
+                               APInt()});
+                k += n;
+              }
+              at += piece.width;
+            }
+            pieces = std::move(out);
+          }
+        }
+      }
     }
   }
   auto *output = body->getTerminator();
@@ -13243,8 +13365,8 @@ LogicalResult StaticFolder::buildSim() {
     if (stagedLinkDirect)
       os << " (read in place " << stagedDirectReads << ")";
     if (dropDeadInputs)
-      os << "; dead inputs " << deadInputs << " (" << deadInputBits
-         << " bits, no link)";
+      os << "; dead inputs " << deadInputs << " + " << partlyDeadInputs
+         << " in part (" << deadInputBits << " bits, no link)";
     if (linkBlockDepth || linkUltraDepth)
       os << "; block/ultra " << syncReads << " (read ahead " << earlyReads
          << ")";

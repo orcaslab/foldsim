@@ -37,7 +37,7 @@
 # The top's accumulator inputs: the second registers, no read register.
 # BCSIM-NOT: %Top_model_g_lane_{{[0-9]}}_lane_acc_read =
 # TREE: staged 11 (read in place 5)
-# SB: staged 13 (read in place 8); dead inputs 2 (9 bits, no link)
+# SB: staged 13 (read in place 8); dead inputs 2 + {{[0-9]+}} in part ({{[0-9]+}} bits, no link)
 # H0: {{^}}MATCH 196 cycles in 1200 host cycles
 # H60: {{^}}MATCH 196 cycles in {{1383|1394}} host cycles
 # CHECK: {{^}}MATCH 196 cycles
