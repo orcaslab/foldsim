@@ -7,7 +7,8 @@
 # are pools of the storage choice, capped at one SLR's with the margin: two
 # wide, shallow memories both in URAM without the cap, one moved under it;
 # the SLR by name or the smallest. With --copy-cap-luts the copy's LUTs
-# (its logic plus its stores' LUTs and LUTRAM) too: LUTRAM stores move to
+# (its logic plus its stores' LUTs and LUTRAM, over the placed / priced LUTs,
+# 1.15) and its stores' flops too: LUTRAM stores move to
 # block RAM when the copy would outgrow the SLR. copy_sites with the schedule: a paged copy
 # keeps its registers in page RAMs, not a distributed RAM an instance deep.
 # RUN: python3 %S/Inputs/slr-copy-cap/model.py %foldsim_tools/foldsim.py | FileCheck %s --check-prefix=MODEL
@@ -16,7 +17,7 @@
 # MODEL: no lut cap: {{\['distributed', 'distributed'\]}}
 # MODEL: lut cap: {{\['block', 'block'\]}} copy luts 500000 cap 520000.0
 # MODEL: smallest {'name': 'B', 'uram': 1.0, 'bram': 4.0} A {'name': 'A', 'uram': 10.0, 'bram': 20.0}
-# MODEL: luts {'name': 'A', 'uram': 10.0, 'bram': 20.0, 'lut': 50.0, 'lutram': 25.0}
+# MODEL: luts {'name': 'A', 'uram': 10.0, 'bram': 20.0, 'lut': 43.4{{[0-9]+}}, 'lutram': 21.7{{[0-9]+}}, 'ff': 100.0}
 # MODEL: copy sites: unscheduled {{[0-9]+}}, paged {{[0-9]+}}, paged smaller True
 # MODEL: read buffers: block lutram 114 comb True
 # MODEL: off: block lutram 0.0

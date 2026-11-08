@@ -25,7 +25,7 @@
 # RUN: FileCheck %s --check-prefix=AUTO < %t/auto/degree.txt
 # AUTO: copies {{.*}} bram uram largest_copy congestion routes
 # AUTO: <- pick
-# AUTO: storage chosen per store; fits: 90% of the V80 region's 3269043 LUT sites (a LUTRAM LUT 4.08 sites), 2415 RAMB36 and 1211 URAM288
+# AUTO: storage chosen per store; fits: 90% of the V80 region's 3269043 LUT sites over the placed / priced 1.15 (a LUTRAM LUT 4.08 sites), 2415 RAMB36 and 1211 URAM288
 # AUTO: routes: congestion = {{.*}} L (L / S) % {{.*}} S = the region's 1.8 SLRs; {{.*}} <= 31.65 %: a load of at most 1270515 LUTs
 # With --slr-groups each copy stays whole in one SLR: a choice of fewer
 # copies than the region's SLRs is priced in as many.

@@ -110,6 +110,18 @@ DEVICE_SLRS = 3
 LUTRAM_SITES = 4.08
 # Placement is not routing: the margin kept on every capacity.
 MARGIN = 0.9
+# Placed LUTs per priced LUT: the price (as built) under-estimates what the
+# placer uses, one-sidedly (11-07, placed fold LUTs over priced: b4e 1.15,
+# b4ct150 1.13, y8r1di 1.08, c2d 1.08, r16c synthesized 1.09), so the LUT
+# sites a point may use are the region's over the worst of them.
+PLACED_PER_PRICED = 1.15
+
+
+def capacities():
+    """Per pool (sites, bram, uram), the most a point may use: the region's
+    times the margin, LUT sites also over PLACED_PER_PRICED."""
+    return {p: MARGIN * REGION[p] / (PLACED_PER_PRICED if p == 'sites' else 1.0)
+            for p in ('sites', 'bram', 'uram')}
 
 KINDS = ('registers', 'distributed', 'block', 'ultra')
 # RAMB36E5 in simple dual port (a write and a read port): depth x width, and

@@ -73,10 +73,12 @@ PLACE_MARGIN = 0.9
 
 
 def placement(logic, lutram, bram=0.0):
-    """(LUT sites the placer needs, whether they and the block RAMs fit the
-    region with margin)."""
+    """(LUT sites the placer needs, whether they, as placed (times
+    storage.PLACED_PER_PRICED), and the block RAMs fit the region with
+    margin)."""
     sites = logic + LUTRAM_SITES * lutram
-    return sites, sites <= PLACE_MARGIN * PLACE_SITES and bram <= PLACE_MARGIN * BRAM_SITES
+    return sites, (sites * storage.PLACED_PER_PRICED <= PLACE_MARGIN * PLACE_SITES
+                   and bram <= PLACE_MARGIN * BRAM_SITES)
 
 
 def parse_schedule(text):
@@ -358,7 +360,11 @@ def slr_copy_cap(region, slr='smallest', luts=False):
         # LUTs: the copy's own logic plus its stores' LUTs and LUTRAM (g32cdj,
         # 11-07: a slice copy of 604.9k LUTs refused against SLR2's 601.6k);
         # LUTRAM within the SLR's SLICEMs.
-        cap.update(lut=m * pick['luts'], lutram=m * pick.get('lutram_luts', pick['luts']))
+        # Priced LUTs place as storage.PLACED_PER_PRICED as many.
+        cap.update(lut=m * pick['luts'] / storage.PLACED_PER_PRICED,
+                   lutram=m * pick.get('lutram_luts', pick['luts']) / storage.PLACED_PER_PRICED,
+                   # A Versal CLB: two flip-flops a LUT.
+                   ff=m * 2 * pick['luts'])
     return cap
 
 
@@ -384,6 +390,12 @@ def copy_cap_pools(units, caps, base, copy_logic=None):
                 if COPY_CAP.get('lut') is not None:
                     amounts['lut'] = pc.get('lut', 0.0) + pc.get('lutram', 0.0)
                     amounts['lutram'] = pc.get('lutram', 0.0)
+                if COPY_CAP.get('ff') is not None:
+                    # The stores' flops (register stores, read buffers' read
+                    # registers); a staged copy's stage registers are not
+                    # priced here (foldsim_sll_check.py counts them on the
+                    # netlist).
+                    amounts['ff'] = pc.get('ff', 0.0)
                 for res, x in amounts.items():
                     key = f"{res}@{u['class']}#{j}"
                     if res == 'lut':
@@ -1065,7 +1077,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                     u.get('fixed') != 'ultra'):
                 u['costs'].pop('ultra', None)
                 u['per'].pop('ultra', None)
-    caps = {p: storage.MARGIN * storage.REGION[p] for p in ('sites', 'bram', 'uram')}
+    caps = storage.capacities()
     # The links' storage, as the compiler emits it (the schedule report's
     # link kinds), in the base usage the stores' kinds are chosen against.
     lk = link_cost(cal, (sched or {}).get('__links__'))
@@ -2475,7 +2487,7 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
         for u in lu[0]:
             for p in ('lutram', 'bram', 'uram'):
                 lk[p] += min(c[p] for c in u['costs'].values())
-    caps = {p: storage.MARGIN * storage.REGION[p] for p in ('sites', 'bram', 'uram')}
+    caps = storage.capacities()
     if (rest + storage.LUTRAM_SITES * lk['lutram'] > caps['sites'] or lk['bram'] > caps['bram']
             or lk['uram'] > caps['uram'] or
             (route and storage.fold_load(rest + lk['lutram'], lk['bram'], lk['uram']) >
@@ -2659,7 +2671,8 @@ def table(result):
         r = storage.REGION
         lines.append('* Pareto front (ns per simulated cycle against LUTs); '
                      f"budget {result['budget'] or 'none'}; storage chosen per store; fits: "
-                     f"{storage.MARGIN:.0%} of the V80 region's {r['sites']} LUT sites (a LUTRAM "
+                     f"{storage.MARGIN:.0%} of the V80 region's {r['sites']} LUT sites over the placed / priced "
+                     f"{storage.PLACED_PER_PRICED} (a LUTRAM "
                      f"LUT {storage.LUTRAM_SITES} sites), {r['bram']} RAMB36 and "
                      + (f"{r['uram']} URAM288" if result.get('uram', True) else 'no URAM288'))
         pick = result['pick']
@@ -2668,7 +2681,8 @@ def table(result):
     else:
         lines.append('* Pareto front (ns per simulated cycle against LUTs); '
                      f"budget {result['budget'] or 'none'}; fits: {PLACE_MARGIN:.0%} of "
-                     f'{PLACE_SITES} V80 LUT sites (a LUTRAM LUT {LUTRAM_SITES} sites) and of '
+                     f'{PLACE_SITES} V80 LUT sites over the placed / priced {storage.PLACED_PER_PRICED} '
+                     f'(a LUTRAM LUT {LUTRAM_SITES} sites) and of '
                      f'{BRAM_SITES} RAMB36')
     if route:
         per = storage.ROUTE_PER
@@ -2859,9 +2873,10 @@ def main():
                          'instance, LUTRAM of the read width) in every on-chip kind of the memory, as the fold '
                          "builds them (rows page them with the instance's registers)")
     st.add_argument('--copy-cap-luts', action='store_true',
-                    help="with --copy-cap: each copy's LUTs (its logic plus its stores' LUTs and LUTRAM) "
-                         "and LUTRAM within the SLR's too (times the margin); a copy whose LUTRAM stores "
-                         'outgrow it moves them to block or ultra RAM or off chip')
+                    help="with --copy-cap: each copy's LUTs (its logic plus its stores' LUTs and LUTRAM, the "
+                         'read buffers priced: implies --read-buffers) and LUTRAM within the SLR\'s too (times '
+                         'the margin, over the placed / priced LUTs), and its stores\' flops within the SLR\'s; '
+                         'a copy whose LUTRAM stores outgrow it moves them to block or ultra RAM or off chip')
     st.add_argument('--links-from', default='', metavar='SCHEDULE',
                     help='another schedule report of the same fold to read the link storage from '
                          '(one made by a compiler that reports it)')
@@ -2931,7 +2946,9 @@ def state_main(a):
         # build).
         storage.no_forward()
     global COPY_CAP
-    if getattr(a, 'read_buffers', False):
+    if getattr(a, 'read_buffers', False) or getattr(a, 'copy_cap_luts', False):
+        # Per-copy LUT caps count the read buffers too (g64cj, 11-07: 175k
+        # LUTs of a slice copy's 401k LUTRAM, unpriced, past SLR2's cap).
         storage.READ_BUFFERS = True
     if getattr(a, 'copy_cap', ''):
         path, _, slr = a.copy_cap.partition(':')
@@ -2990,7 +3007,7 @@ def state_main(a):
         print(f"links: {(links['lutram_bits'] + links['bram_bits'] + links['uram_bits']) / 1e6:.1f} "
               f"Mbit in memories ({lk['lutram']:.0f} LUTRAM LUTs, {lk['bram']:.1f} RAMB36, "
               f"{lk['uram']:.0f} URAM288), {links['ff']} register bits; region caps "
-              f"{storage.MARGIN * storage.REGION['sites'] / 1e6:.2f}M sites, "
+              f"{storage.capacities()['sites'] / 1e6:.2f}M sites (placed / priced {storage.PLACED_PER_PRICED}), "
               f"{storage.MARGIN * storage.REGION['bram']:.0f} RAMB36, "
               f"{storage.MARGIN * storage.REGION['uram']:.0f} URAM288")
     if out is None:
