@@ -550,8 +550,15 @@ private:
     unsigned k = serialOf(p);
     return (bits + k - 1) / k;
   }
+  /// The host cycles a link of class `c` takes between groups: 1 (its
+  /// register), or with slr-serialize k + 1 (the pass's bits held, then k
+  /// chunks sent, each in a register fed only by registers).
+  unsigned crossLatency(int c) const {
+    unsigned k = serialOf(c);
+    return k > 1 ? k + 1 : 1;
+  }
   int crossDelay(int p, int c) const {
-    return crosses(p, c) ? int(serialOf(p)) : 0;
+    return crosses(p, c) ? int(crossLatency(p)) : 0;
   }
   /// `slr-serialize`: the spacing of each class's passes of one kind (its
   /// k, where a link of it crosses groups and k > 1; else 0).
@@ -12104,10 +12111,11 @@ LogicalResult StaticFolder::buildSim() {
     // slr-serialize: the host cycles the crossing takes; every register of
     // the write (enable, entry, bank) is that many host cycles late.
     unsigned serial = crossing ? serialOf(c) : 1;
+    unsigned crossLate = crossing ? crossLatency(c) : 1;
     auto lateBy = [&](Value v, const Twine &lateName) {
       std::string n0 = lateName.str();
       v = copyReg(v, n0);
-      for (unsigned j = 1; j < serial; ++j)
+      for (unsigned j = 1; j < crossLate; ++j)
         v = copyReg(v, n0 + std::to_string(j + 1));
       return v;
     };
@@ -12133,8 +12141,12 @@ LogicalResult StaticFolder::buildSim() {
           } else {
             // slr-serialize: the producer's group holds the bits of its
             // pass (host cycle T) and sends chunk j of them in a register
-            // over T + 1 + j; the reader's group shifts them along, so at
-            // T + k the last chunk and the shifted ones are the bits.
+            // over T + 2 + j, every chunk from the held bits: the crossing
+            // register is fed by registers alone (a mux of the hold), never
+            // by the pass's own logic, so a crossing adds no logic level to
+            // the producer's paths. The reader's group shifts the chunks
+            // along, so at T + k + 1 the last chunk and the shifted ones are
+            // the bits.
             Operation *mark = &body->back();
             unsigned cw = (w + serial - 1) / serial;
             Value &e0 = serialEnable[{c, producer.atReady ? 1 + producer.readyLevel : 0u}];
@@ -12149,7 +12161,7 @@ LogicalResult StaticFolder::buildSim() {
               e0 = copyReg(copyReg(base, en + "1"), en + "0");
             }
             SmallVector<Value> step{e0};
-            for (unsigned j = 1; j < serial; ++j)
+            for (unsigned j = 1; j <= serial; ++j)
               step.push_back(copyReg(step.back(), crossName + "_step" +
                                                       std::to_string(j)));
             Value hold = seq::CompRegClockEnabledOp::create(
@@ -12168,8 +12180,7 @@ LogicalResult StaticFolder::buildSim() {
             };
             Value next = constant(cw, 0);
             for (unsigned j = serial; j-- > 0;)
-              next = comb::MuxOp::create(b, step[j], chunk(j ? hold : data, j),
-                                         next);
+              next = comb::MuxOp::create(b, step[j + 1], chunk(hold, j), next);
             Value sent = copyReg(next, crossName);
             for (auto *op = mark->getNextNode(); op; op = op->getNextNode())
               if (!isa<hw::ConstantOp>(op))
