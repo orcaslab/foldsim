@@ -1,0 +1,9 @@
+# foldsim_cost with FOLDSIM_COST_SLICED_HOLDS=1 (an option): a register whose next value is a
+# concat of slices, each a mux holding the register's own bits at that slice's place (as
+# replicate-controls cuts a fetch buffer's load per replicated land strobe), is clock-enabled per
+# slice: no LUTs. Without the option the muxes cost two bits a LUT (4 x 2 = 8 LUTs: r's and s's);
+# with it r's are refunded and s's (its slices swapped: no hold) are not.
+# RUN: python3 -c "import sys; sys.path.insert(0, '%foldsim_tools'); import foldsim_cost as c; m = c.parse('%S/Inputs/cost-sliced/m.mlir')[0]['M']; print('mux', m.lut['mux'])" | FileCheck %s --check-prefix=OFF
+# RUN: env FOLDSIM_COST_SLICED_HOLDS=1 python3 -c "import sys; sys.path.insert(0, '%foldsim_tools'); import foldsim_cost as c; m = c.parse('%S/Inputs/cost-sliced/m.mlir')[0]['M']; print('mux', m.lut['mux'])" | FileCheck %s --check-prefix=ON
+# OFF: mux 8.0
+# ON: mux 4.0

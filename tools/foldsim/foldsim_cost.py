@@ -6,7 +6,7 @@ black boxes by the table below. Memories map to distributed RAM or block RAM by
 depth and read latency, as Vivado infers them (`mem_cost`). The fold-degree
 search calibrates these per class against Vivado (foldsim_degree.py).
 """
-import json, math, re, sys
+import json, math, os, re, sys
 from collections import defaultdict
 
 # A wide constant's decimal text (hw.constant of a 16,861-bit word: 5,076
@@ -107,6 +107,7 @@ class Mod:
         self.uses = defaultdict(int)          # value -> its uses
         self.ands, self.ors = {}, []          # and -> (cost, operands); or ops (result, operands, cost, width)
         self.shifts, self.extracts = {}, defaultdict(list)   # shift -> (cost, width, op); value -> [(low, width)]
+        self.cat, self.ext = {}, {}           # SLICED_HOLDS: concat -> [(operand, width)] low first; extract -> (src, low)
         self.ids = {}
 
     def sid(self, v):
@@ -114,6 +115,11 @@ class Mod:
 
 
 PROV_MIN = 16      # provenance is tracked for values at least this wide
+# FOLDSIM_COST_SLICED_HOLDS=1 (an option, not the default yet): a register whose next value is
+# a concat of slices each holding the register's own bits at their place (mux(c, x, r[lo +: w]),
+# as replicate-controls cuts a fetch buffer's load per replicated land strobe) is clock-enabled
+# per slice: Vivado maps such a mux to the flops' CE, no LUTs (refund_enables).
+SLICED_HOLDS = os.environ.get('FOLDSIM_COST_SLICED_HOLDS', '') == '1'
 
 
 def prov(mod, v, w):
@@ -467,6 +473,12 @@ def parse(path):
                 ew = int_width(result_type(rhs).split('->')[-1])
                 if lo and ew:
                     cur.extracts[operands[0]].append((int(lo.group(1)), ew))
+                    if SLICED_HOLDS and len(res) == 1:
+                        cur.ext[res[0]] = (operands[0], int(lo.group(1)))
+            elif SLICED_HOLDS and op == 'comb.concat' and len(res) == 1:
+                ws = [int_width(x) for x in split_top(result_type(rhs).split('->')[-1])]
+                if None not in ws and len(ws) == len(operands):
+                    cur.cat[res[0]] = list(reversed(list(zip(operands, ws))))
             track(cur, op, rhs, res, operands)
             continue
         if op in REGS:
@@ -565,6 +577,28 @@ def refund_enables(mod):
             mod.lut['mux'] -= c
             done.add(v)
             v = b if a == r else a
+    if not SLICED_HOLDS:
+        return
+    # Per-slice holds: each slice of the next value a mux whose held input is the register's bits
+    # at that slice's place (nested holds too).
+    for r, nxt in mod.regs.items():
+        parts = mod.cat.get(nxt)
+        if not parts:
+            continue
+        pos = 0
+        for v, w in parts:
+            for _ in range(6):
+                m = mod.muxes.get(v)
+                if not m or v in done:
+                    break
+                c, a, b = m
+                held = mod.ext.get(b) == (r, pos) and a or mod.ext.get(a) == (r, pos) and b
+                if not held:
+                    break
+                mod.lut['mux'] -= c
+                done.add(v)
+                v = held
+            pos += w
 
 
 def mem_cost(depth, w, rports, rlat, style=None):
