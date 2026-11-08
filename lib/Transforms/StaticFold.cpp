@@ -369,6 +369,8 @@ public:
   uint64_t foldStoreRam = 0;
   std::string foldStoreStyle = "auto";
   unsigned foldStoreLead = 2;
+  /// `staged-link-direct`: see stagedDirect.
+  bool stagedLinkDirect = false;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
   /// landing) a member is streamed with (0: the decision lead + 6). A
   /// member with less room is built as an on-chip link: its landing would
@@ -808,6 +810,11 @@ private:
     return it == stagedMembers.end() ? nullptr : &it->second;
   }
   bool stagedLinks;
+  /// `staged-link-direct` (stagedLinkDirect): a reader of one instance reads
+  /// the staged link's second register in place, no read register between.
+  bool stagedDirect(unsigned reader) const {
+    return stagedLinkDirect && classes[reader].threads() == 1;
+  }
   /// `link-block-depth`, `link-ultra-depth`: a link memory at least this
   /// deep, the only source of its reader's bits and never forwarded or
   /// taken in its producer's host cycle, in block (ultra) RAM, read a host
@@ -3844,9 +3851,12 @@ StaticFolder::stagedWindow(unsigned p, unsigned inst, unsigned reader,
   // frame f-1: after it lands (t >= written + 1 - II), before the write of
   // frame f lands (t <= written), after the last read of frame f-1
   // (t >= last - 1 - II), and in time for the first read of frame f
-  // (t <= first - 2).
-  int low = std::max(written + 1, last - 1) - int(ii);
-  int high = std::min(written, first - 2);
+  // (t <= first - 2). Read in place (`staged-link-direct`), the reads are
+  // of the second register itself at their slots, a host cycle after the
+  // read register's loads: t >= last - II, t <= first - 1.
+  int shift = stagedDirect(reader) ? 1 : 0;
+  int low = std::max(written + 1, last - 1 + shift) - int(ii);
+  int high = std::min(written, first - 2 + shift);
   if (low > high)
     return std::nullopt;
   return std::make_pair(low, high);
@@ -12279,7 +12289,8 @@ LogicalResult StaticFolder::buildSim() {
   // register (forwarded the host cycle the write lands), for the report.
   unsigned linkReads = 0, forwardedReads = 0, forwardedAfter = 0, nowReads = 0,
            lateReads = 0, forwardedLate = 0, compactReads = 0, stagedReads = 0,
-           syncReads = 0, earlyReads = 0, pagedReads = 0, streamReads = 0;
+           syncReads = 0, earlyReads = 0, pagedReads = 0, streamReads = 0,
+           stagedDirectReads = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
   SmallVector<unsigned> classReaders(producers.size(), 0);
@@ -12869,6 +12880,12 @@ LogicalResult StaticFolder::buildSim() {
                   b.getStringAttr(regName), Value(), Value(), Value(),
                   hw::InnerSymAttr{});
             };
+            // Read in place: the second register is the read register
+            // (its window a host cycle later, stagedWindow).
+            if (stagedDirect(c) && sources.size() == 1) {
+              syncPart = true;
+              ++stagedDirectReads;
+            }
             if (gathered) {
               Value read = stagedMemoryRead(*gathered, data);
               sourceData[index] = enabledReg(read, copy, name + "_held");
@@ -13203,6 +13220,8 @@ LogicalResult StaticFolder::buildSim() {
       os << "; compact " << compactReads;
     if (stagedLinks)
       os << "; staged " << stagedReads;
+    if (stagedLinkDirect)
+      os << " (read in place " << stagedDirectReads << ")";
     if (linkBlockDepth || linkUltraDepth)
       os << "; block/ultra " << syncReads << " (read ahead " << earlyReads
          << ")";
@@ -14251,6 +14270,7 @@ void FoldStaticPass::runOnOperation() {
   folder.slrSerializeSpecs.assign(slrSerialize.begin(), slrSerialize.end());
   folder.readyChoice = readyChoice;
   folder.stagedLinkMemories = stagedLinks && stagedLinkMemories;
+  folder.stagedLinkDirect = stagedLinks && stagedLinkDirect;
   if (failed(folder.run()))
     return signalPassFailure();
 }

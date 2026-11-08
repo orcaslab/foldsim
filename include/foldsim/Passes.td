@@ -716,6 +716,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "take (distributed RAM), written at the producer's passes; each "
            "link's second register is loaded from it at its own copy "
            "position (distinct positions in the frame: one read port)">,
+    Option<"stagedLinkDirect", "staged-link-direct", "bool", "false",
+           "With staged-links: a reader of one instance reads a staged link's "
+           "second register in place, without a read register of its own "
+           "(the copy then a host cycle later in the frame: after the last "
+           "read of the frame before, by the first of this one), so the "
+           "link's bits are held in two flops (or a memory row and a flop) "
+           "instead of three">,
     Option<"shareLinks", "share-links", "bool", "false",
            "Outputs of a model driven by the same value (a bus broadcast to "
            "several children) are one producer: their readers share its "

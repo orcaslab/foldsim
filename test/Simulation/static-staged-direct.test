@@ -1,0 +1,42 @@
+# REQUIRES: verilator
+# Staged links read in place (`--staged-link-direct`): a reader of one
+# instance reads a staged link's second register itself, with no read
+# register of its own, the copy into it a host cycle later in the frame
+# (after the last read of the frame before, by the first read of this one).
+# Exact against the target, channels stalled or not, at the same host cycles
+# as with the read registers (static-staged-memories.test's designs):
+# - the broadcast's top reads its four lane accumulators in place (4 of 11
+#   staged reads; the lanes, of four instances, keep their read registers);
+# - the arbiter tree (zero-latency links and chains): 5 of 11;
+# - one producer port, a bit to each of four readers (staged-bits): 8 of 13;
+# - staged registers without memories: the broadcast's 4 again.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/broadcast
+# RUN: foldsim --srcs top.f --top Top --out %t/bc --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --staged-link-direct Lane 2>&1 | FileCheck %s --check-prefix=BC
+# RUN: FileCheck %s --check-prefix=BCSIM < %t/bc/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/bc/obj %S/Inputs/tb_reset.sv top.sv %t/bc/foldsim_sim.sv > %t/bc/build.log 2>&1
+# RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s --check-prefix=H0
+# RUN: %t/bc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=60 | FileCheck %s --check-prefix=H60
+# RUN: foldsim --srcs top.f --top Top --out %t/bcr --static --nest --modulo --share-links --compact-links --staged-links --staged-link-direct Lane 2>&1 | FileCheck %s --check-prefix=BC
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/bcr/obj %S/Inputs/tb_reset.sv top.sv %t/bcr/foldsim_sim.sv > %t/bcr/build.log 2>&1
+# RUN: %t/bcr/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=60 | FileCheck %s --check-prefix=H60
+# Without the option: every staged read through a read register.
+# RUN: foldsim --srcs top.f --top Top --out %t/bc0 --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories Lane 2>&1 | FileCheck %s --check-prefix=BC0
+# RUN: cd %S/../Driver/Inputs/tree-arb
+# RUN: foldsim --srcs top.f --top Top --out %t/tz --static --nest --modulo --compact-links --staged-links --staged-link-memories --staged-link-direct --share-links --zero-latency-links --zero-latency-chains --class-at 'sl@*.slice' --class-at 'root@inner:arb' --class-at 'root@inner:*.join_arb' 'root+Bank' 2>&1 | FileCheck %s --check-prefix=TREE
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/tz/obj %S/Inputs/tb_reset.sv top.sv %t/tz/foldsim_sim.sv > %t/tz/build.log 2>&1
+# RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s
+# RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=60 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/staged-bits
+# RUN: foldsim --srcs top.f --top Top --out %t/sb --static --nest --modulo --share-links --compact-links --staged-links --staged-link-memories --staged-link-direct Sw Lnk 2>&1 | FileCheck %s --check-prefix=SB
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/sb/obj %S/Inputs/tb_reset.sv top.sv %t/sb/foldsim_sim.sv > %t/sb/build.log 2>&1
+# RUN: %t/sb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +stall=0 | FileCheck %s
+# RUN: %t/sb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+10 +stall=30 | FileCheck %s
+# BC: staged 11 (read in place 4)
+# BC0-NOT: read in place
+# The top's accumulator inputs: the second registers, no read register.
+# BCSIM-NOT: %Top_model_g_lane_{{[0-9]}}_lane_acc_read =
+# TREE: staged 11 (read in place 5)
+# SB: staged 13 (read in place 8)
+# H0: {{^}}MATCH 196 cycles in 1200 host cycles
+# H60: {{^}}MATCH 196 cycles in {{1383|1394}} host cycles
+# CHECK: {{^}}MATCH 196 cycles
