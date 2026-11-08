@@ -10740,11 +10740,33 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       } else if (gatedPages >= p) {
         writeData = comb::OrOp::create(b, words, false);
       } else {
+        // The ungated pages' select: their own (p - n):1 array, indexed by
+        // the page index less n, a zero entry while a gated page writes.
         SmallVector<Value> ors(words.begin(), words.begin() + gatedPages);
-        SmallVector<Value> rest(words);
-        for (unsigned j = 0; j < gatedPages; ++j)
-          rest[j] = hw::ConstantOp::create(b, bits(col.width), 0);
-        ors.push_back(select(rest, col.width));
+        unsigned ungated = p - gatedPages;
+        unsigned rw = llvm::Log2_32_Ceil(ungated + 1);
+        SmallVector<Value> elems;
+        for (unsigned k = 1u << rw; k-- > 0;)
+          elems.push_back(k < ungated ? words[gatedPages + k]
+                                      : hw::ConstantOp::create(b, bits(col.width), 0));
+        Value index = col.writeIndex;
+        unsigned iw = hw::getBitWidth(index.getType());
+        unsigned w = std::max(iw, rw);
+        auto widen = [&](Value v, unsigned to) -> Value {
+          unsigned have = hw::getBitWidth(v.getType());
+          return have == to ? v
+                            : b.createOrFold<comb::ConcatOp>(
+                                  hw::ConstantOp::create(b, bits(to - have), 0), v);
+        };
+        Value wide = widen(index, w);
+        Value n = hw::ConstantOp::create(b, bits(w), gatedPages);
+        Value gated = comb::ICmpOp::create(b, comb::ICmpPredicate::ult, wide, n);
+        Value rel = b.createOrFold<comb::ExtractOp>(
+            bits(rw), comb::SubOp::create(b, wide, n), 0);
+        Value at = comb::MuxOp::create(
+            b, gated, hw::ConstantOp::create(b, bits(rw), (1u << rw) - 1), rel);
+        ors.push_back(hw::ArrayGetOp::create(
+            b, hw::ArrayCreateOp::create(b, elems), at));
         writeData = comb::OrOp::create(b, ors, false);
       }
       if (bytesMasked)
