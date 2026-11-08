@@ -17,6 +17,16 @@
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/m/obj %S/Inputs/tb_staged.sv %t/m/sim.sv > %t/m/build.log 2>&1
 // RUN: %t/m/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 // RUN: %t/m/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+// The same with every slot table cut into one-bit column slices (`max-table-bits=1`, as a 128-SM frame's
+// 2^17-row tables are cut at Vivado's 1,000,000-bit variable limit): the same tokens.
+// RUN: mkdir -p %t/t && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Queue,Sink netlist},foldsim-fold-static{module=Top modulo copies=Sink:2 max-table-bits=1})" -o %t/t/sim.mlir
+// RUN: FileCheck %s --check-prefix=SLICED < %t/t/sim.mlir
+// RUN: firtool --format=mlir %t/t/sim.mlir -o %t/t/sim.sv
+// RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/t/obj %S/Inputs/tb_staged.sv %t/t/sim.sv > %t/t/build.log 2>&1
+// RUN: %t/t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+// RUN: %t/t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+// SLICED: hw.aggregate_constant {{.*}} : !hw.array<{{[0-9]+}}xi1>
+// SLICED-NOT: hw.aggregate_constant {{.*}} : !hw.array<{{[0-9]+}}xi{{([2-9]|[1-9][0-9]+)}}>
 // RUN: mkdir -p %t/z && foldsim-opt %s --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Queue,Sink netlist},foldsim-fold-static{module=Top zero-latency-links})" -o %t/z/sim.mlir
 // RUN: firtool --format=mlir %t/z/sim.mlir -o %t/z/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/z/obj %S/Inputs/tb_staged.sv %t/z/sim.sv > %t/z/build.log 2>&1

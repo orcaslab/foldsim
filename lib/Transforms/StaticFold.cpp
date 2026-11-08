@@ -7894,6 +7894,9 @@ static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
 /// A slot table: `rows[index]` (`width` bits; zero past the rows).
 static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                    unsigned width);
+/// `max-table-bits`: the largest table constant, in bits (Vivado's variable
+/// limit); a larger one is cut into column slices.
+static uint64_t gMaxTableBits = 1000000;
 
 /// The regions sharing a copy of the slot controls two host cycles ahead.
 static constexpr unsigned kRegionsPerGroup = 16;
@@ -11041,10 +11044,37 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
   // canonicalization makes of a uniform array.
   if (llvm::all_equal(elements))
     return hw::ConstantOp::create(b, cast<IntegerAttr>(elements[0]));
-  auto arrayType = hw::ArrayType::get(type, elements.size());
-  Value array = hw::AggregateConstantOp::create(b, arrayType,
-                                                b.getArrayAttr(elements));
-  return hw::ArrayGetOp::create(b, array, index);
+  // Synthesis bounds a variable's size (Vivado: 1,000,000 bits, Synth
+  // 8-4556): a table larger than that is cut into column slices of at most
+  // that many bits, each its own constant, read at the same index.
+  uint64_t kMaxConstantBits = gMaxTableBits;
+  uint64_t entries = elements.size();
+  if (entries * width <= kMaxConstantBits || width <= 1) {
+    auto arrayType = hw::ArrayType::get(type, entries);
+    Value array = hw::AggregateConstantOp::create(b, arrayType,
+                                                  b.getArrayAttr(elements));
+    return hw::ArrayGetOp::create(b, array, index);
+  }
+  unsigned slice = unsigned(std::max<uint64_t>(1, kMaxConstantBits / entries));
+  SmallVector<Value> parts;   // most significant first
+  for (unsigned hi = width; hi > 0;) {
+    unsigned lo = hi > slice ? hi - slice : 0, n = hi - lo;
+    auto partType = b.getIntegerType(n);
+    SmallVector<Attribute> partElements;
+    partElements.reserve(entries);
+    for (auto e : elements)
+      partElements.push_back(b.getIntegerAttr(
+          partType, cast<IntegerAttr>(e).getValue().extractBits(n, lo)));
+    if (llvm::all_equal(partElements)) {
+      parts.push_back(hw::ConstantOp::create(b, cast<IntegerAttr>(partElements[0])));
+    } else {
+      Value array = hw::AggregateConstantOp::create(
+          b, hw::ArrayType::get(partType, entries), b.getArrayAttr(partElements));
+      parts.push_back(hw::ArrayGetOp::create(b, array, index));
+    }
+    hi = lo;
+  }
+  return b.createOrFold<comb::ConcatOp>(parts);
 }
 
 void StaticFolder::buildFrameTable(bool stalls) {
@@ -14495,6 +14525,7 @@ void FoldStaticPass::runOnOperation() {
   folder.stagedLinkMemories = stagedLinks && stagedLinkMemories;
   folder.stagedLinkDirect = stagedLinks && stagedLinkDirect;
   folder.dropDeadInputs = dropDeadInputs;
+  gMaxTableBits = std::max<uint64_t>(1, maxTableBits);
   if (failed(folder.run()))
     return signalPassFailure();
 }
