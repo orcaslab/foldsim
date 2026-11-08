@@ -9529,7 +9529,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     bool ram = style == "block" || style == "ultra";
     // `fold-store-lead` host cycles ahead (2: into the RAM's register and an
     // output register; 1: into the RAM's register alone), at most the state
-    // gap less one (the slot then as the instance's last issue left it), and
+    // gap less two (the slot then stored as the instance's last issue left
+    // it, a host cycle after the issue), and
     // only as far as every write to the entry has landed by then (see
     // above): else less, down to a combinational read (distributed RAM) as
     // without `fold-store-ram`. None for a read in a stage (`stage-levels`:
@@ -9541,7 +9542,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
              uint64_t(fold.outAt) + lead + 2;
     };
     unsigned lead = ram && !staged ? foldStoreLead : 0;
-    lead = unsigned(std::min<int>(int(lead), std::max(0, gap - 1)));
+    lead = unsigned(std::min<int>(int(lead), std::max(0, gap - 2)));
     while (lead && !landed(lead))
       --lead;
     if (!lead && ram && rule)
@@ -9601,12 +9602,16 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           comb::ICmpOp::create(b, comb::ICmpPredicate::eq, fold.thread1, inst));
       return comb::MuxOp::create(b, hit, stepped, slot);
     };
-    // The issue's: its instance's issue before it was a frame earlier.
-    fold.slotNow->setValue(slotOf(folding->thread, ii < 2));
+    // The issue's: its instance's issue before it was a frame (II >= the
+    // copy's instances >= 2 host cycles) earlier, its step stored since.
+    if (ii < 2)
+      return memory.emitError("fold-store-ram: a frame of ") << ii
+             << " host cycle for a folded pipeline of several instances";
+    fold.slotNow->setValue(slotOf(folding->thread, /*forward=*/false));
 
     // The read: `lead` host cycles ahead, at the instance and slot due then;
-    // the slot as the instance's last issue left it (a state gap of lead + 1:
-    // forwarded from that issue's step).
+    // the slot as the instance's last issue left it (read combinationally at
+    // a state gap of 1: forwarded from that issue's step, not yet stored).
     Value inst = lead == 2   ? region.inst2
                  : lead == 1 ? region.inst1
                  : staged    ? staged
