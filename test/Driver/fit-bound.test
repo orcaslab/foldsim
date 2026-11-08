@@ -48,3 +48,12 @@
 # RUN: not python3 %foldsim_tools/foldsim_fit_bound.py --schedule %S/Inputs/fit-bound/schedule.txt --slr-region %S/Inputs/fit-bound/region.json | FileCheck %s --check-prefix=SCHED
 # SCHED: schedule floor (II 64), link storage only: lut 130 (6 %), lutram 130 (13 %), ff 4,500 (112 %), uram 1 (25 %), bram 1 (5 %)
 # SCHED: REFUSE: schedule floor ff 112 % of the region
+# A fit written before the prediction bounds (no `lo` / `hi`, no `format`): the observed min / max stand in, with a
+# note, never a KeyError (11-08: fit_synth_vortex.json from the first seed).
+# RUN: python3 %foldsim_tools/foldsim_fit_bound.py --count %t/count.json --fit %S/Inputs/fit-bound/fit-v1.json --slr-region %S/Inputs/fit-bound/region.json | FileCheck %s --check-prefix=OLDFIT
+# OLDFIT: note: {{.*}}fit-v1.json has no prediction bounds (written before them): the observed min / max stand in
+# OLDFIT: design ucb: lut 1,300 (65 %)
+# OLDFIT: count.json: PASS
+# A new fit says its format.
+# RUN: python3 -c "import json; print('format', json.load(open('%t/fit.json'))['format'])" | FileCheck %s --check-prefix=FMT
+# FMT: format 2

@@ -93,9 +93,16 @@ def schedule_floor(path):
     return out, int(ii.group(1)) if ii else None
 
 
+# A fit written before the prediction bounds (foldsim_fitdb.py fit without `lo` / `hi`, no `format`): its
+# observed range stands in for them, and the check says so (refit for the bounds).
+OLD_FIT = dict(lo='min', hi='max')
+
+
 def ratio(fit, scope, r, which):
     s = ((fit or {}).get(scope) or {}).get(r)
-    return s[which] if s else None
+    if not s:
+        return None
+    return s[which] if which in s else s[OLD_FIT[which]] if which in OLD_FIT else None
 
 
 def kernel(fit, region, which):
@@ -180,6 +187,8 @@ def main():
     fills = dict(DEFAULT_FILL, **(region.get('placement', {}).get('region_fill', {})))
     margin = region.get('margin', 0.85)
     fit = json.load(open(a.fit)) if a.fit else None
+    old_fit = bool(fit) and fit.get('format', 1) < 2 and not any(
+        'lo' in v for sc in ('design', 'copy') for v in (fit.get(sc) or {}).values() if v)
     name = a.name or os.path.basename((a.gen or a.count or a.schedule or '').rstrip('/'))
     lines, refuse, warn = [], [], []
     res = dict(name=name, cap=cap)
@@ -215,6 +224,9 @@ def main():
                      + ', '.join(f'{r} {sim.get(r, 0):,.0f}' for r in RES + ('lutram_forced', 'logic', 'dsp')))
         lines.append('  region: ' + ', '.join(f'{r} {cap[r]:,.0f}' for r in RES) + '; fill '
                      + ', '.join(f'{r} {100 * fills[r]:.0f} %' for r in LOGIC) + f', memories {100 * a.memory_fill:.0f} %')
+        if old_fit:
+            lines.append(f'  note: {a.fit} has no prediction bounds (written before them): the observed min / max '
+                         'stand in; refit (foldsim_fitdb.py fit) for the bounds')
         lines.append(f'  design floor{"" if fit else " (uncalibrated storage)"}: '
                      + ', '.join(f'{r} {fl[r]:,.0f} ({pct(fl[r], cap[r])})' for r in RES))
         if uc:

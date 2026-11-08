@@ -300,7 +300,7 @@ def fit(a):
     db = [json.loads(l) for l in open(a.db)]
     db = [r for r in db if r['stage'] == a.stage and (not a.family or r['family'] == a.family)
           and r['sim']['count']['lut'] >= a.min_design_luts]
-    out = dict(stage=a.stage, family=a.family or 'all', designs=[r['name'] for r in db], min_luts=a.min_luts,
+    out = dict(format=2, stage=a.stage, family=a.family or 'all', designs=[r['name'] for r in db], min_luts=a.min_luts,
                design={}, copy={}, level={}, kernel={}, loo={})
     # Each design's copies together, measured per counted (a resource the design counts at least 1 % of its
     # total of, so that a design without URAM does not give URAM a ratio).
