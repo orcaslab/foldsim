@@ -1234,10 +1234,11 @@ def build_parser():
                          'whatever their depth (--state auto chooses them; foldsim-fold-static)')
     ap.add_argument('--stage-levels', type=int, default=0, metavar='N',
                     help='with --static: a class whose state cone is deeper than N estimated logic '
-                         'levels (no late output, virtual memory or black box) evaluates over '
-                         'several host cycles, its logic cut into segments of at most N levels by '
-                         'stage registers that step with the frame; its state and inputs read '
-                         'the stages before its state pass (foldsim-fold-static; 0: none)')
+                         'levels (no black box or folded pipeline) evaluates over several host '
+                         'cycles, its logic cut into segments of at most N levels by stage '
+                         'registers that step with the frame; each pass reads its state and '
+                         'inputs the stages before its slot, so late outputs take the stages as '
+                         'latency (foldsim-fold-static; 0: none)')
     ap.add_argument('--multicycle', default='', metavar='CLASS[:M],...',
                     help='with --stage-levels: these classes (globs) staged without stage registers: '
                          'one evaluation at a time over M host cycles (the cone over the levels a '

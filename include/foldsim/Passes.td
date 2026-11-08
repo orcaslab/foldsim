@@ -709,10 +709,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "many levels by registers that step with the frame's positions "
            "(none moves in a bubble or between frames), its state and inputs "
            "read the stages' positions before its state pass, which writes "
-           "as before. Only for a class with no late output, virtual memory "
-           "or black box. The schedule places such a state pass at least the "
-           "stages into the frame, its inputs' links the stages earlier, and "
-           "its state gap from the read. 0: none">,
+           "as before. Not for a class with black boxes or folded pipelines. "
+           "Every pass of such a class (its ready passes too) reads the "
+           "stages before its slot and writes its outputs at its slot from "
+           "the last stage: its late outputs take the stages as latency. A "
+           "held virtual-memory read's request leaves a host cycle after the "
+           "state pass from the last stage's registered row and held row. "
+           "The schedule places such a pass at least the stages into the "
+           "frame, its inputs' links the stages earlier, and its state gap "
+           "from the read. 0: none">,
     ListOption<"multicycle", "multicycle", "std::string",
                "With stage-levels: classes (globs; a copy goes by its class's "
                "name) staged without stage registers. A copy evaluates one "
