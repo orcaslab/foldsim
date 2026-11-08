@@ -803,7 +803,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "matching class of more than one instance, whose written "
                "register bits an instance (not the ready passes' registers) "
                "are at least min-bits (default 1), keeps them in a RAM of a "
-               "row an instance times P plus a pass, in columns of whole "
+               "row an instance times P plus a pass (P auto: the fewest that "
+               "fill a column's depth, 512 or 4096 rows, within "
+               "state-in-ram-h), in columns of whole "
                "72-bit ports, a mask lane a write enable. P = 1 (default): the "
                "row read in place two host cycles ahead, through the RAM's "
                "register and an output register, written whole a host cycle "
@@ -817,6 +819,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"stateInRamReadBits", "state-in-ram-read-bits", "unsigned", "0",
            "With state-in-ram: the RAM bits an evaluation reads a host cycle "
            "(N > 0): P = ceil(bits / N) for a class whose spec gives no P">,
+    Option<"stateInRamH", "state-in-ram-h", "unsigned", "0",
+           "With state-in-ram and P auto: the most host cycles a copy's "
+           "passes may take, instances x P (0: no bound)">,
     ListOption<"registeredLinks", "registered-links", "std::string",
                "Classes (globs; a copy goes by its class's name) whose links "
                "are never taken in their producer's host cycle: with "

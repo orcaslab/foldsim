@@ -6,6 +6,13 @@
 // RUN: FileCheck %s --check-prefix=LOG < %t.log
 // RUN: foldsim-opt %S/fold-static-storage.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top state-in-ram=Leaf:1000})' 2> %t.small.log | FileCheck %s --check-prefix=SMALL
 // RUN: foldsim-opt %S/fold-static-storage.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top state-in-ram=Leaf storage=Leaf:sir=block})' | FileCheck %s --check-prefix=BLOCK
+// P auto: the fewest passes that fill a column's depth, no more than one column needs (100 bits: 2),
+// as pages with masks; the RAM by SLR group once scheduled.
+// RUN: foldsim-opt %S/fold-static-storage.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top state-in-ram=Leaf::auto})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=AUTO
+// AUTO: state-in-ram: Leaf: 100 bits/instance, 4 instances, 1 x 72 columns, P 2, block (4 registers, 8 rows, 1 RAMB36 a copy, 8 host cycles a copy's passes)
+// AUTO: state-in-ram: Leaf: 0 hazard registers, 100 capture bits
+// AUTO: state-in-ram: RAM by SLR group: -1: 1 RAMB36, 0 URAM288;
+// AUTO: pages Leaf: p 2
 // Off: the same netlist as the register stores of the storage test (no `sir`).
 // RUN: foldsim-opt %S/fold-static-storage.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top})' | FileCheck %s --check-prefix=OFF
 // A class below the minimum bits keeps its per-register stores.

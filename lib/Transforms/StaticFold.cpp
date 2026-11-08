@@ -157,6 +157,8 @@ struct Class {
   unsigned sir = 0;
   std::string sirStyle;
   bool sirLogged = false;
+  /// State in RAM: its RAM primitives a copy (RAMB36, URAM288), as planned.
+  uint64_t sirBrams = 0, sirUrams = 0;
   /// With --vmem-skip-held-reads: a virtual memory of it reads at a held
   /// address (heldReadRow), so its requests leave from registers a host
   /// cycle after the state pass, given a state gap of the lead + 2.
@@ -353,6 +355,11 @@ public:
   /// `state-in-ram` / `state-in-ram-read-bits` (planStateInRam).
   SmallVector<std::string> stateInRamSpecs;
   unsigned stateInRamReadBits = 0;
+  /// `state-in-ram-h`: the most host cycles a copy's P passes take,
+  /// instances x P (0: no bound), for `auto` P.
+  unsigned stateInRamH = 0;
+  /// The state-in-ram classes' RAM primitives by SLR group, once scheduled.
+  void reportStateInRam() const;
   /// `link-hbm-lead`: the most positions a stream's request precedes its
   /// landing.
   unsigned linkHbmLead = kLinkHbmLead;
@@ -6513,6 +6520,8 @@ StaticFolder::memoriesAsRows(Class &cls, const DenseSet<Operation *> &ready,
     auto type = memory.getType();
     unsigned depth = type.getDepth(), width = type.getWidth();
     bits += uint64_t(depth) * width;
+    // Its storage rule, if any, is met by the pages it moves into.
+    storageFor(cls, memory.getName().value_or(""), /*reg=*/false, width);
     ImplicitLocOpBuilder b(memory.getLoc(), memory);
     auto rowType = b.getIntegerType(width);
     BackedgeBuilder edges(b, memory.getLoc());
@@ -6639,7 +6648,7 @@ LogicalResult StaticFolder::planStateInRam() {
     std::string glob;
     uint64_t minBits = 1;
     unsigned passes = 0;
-    bool used = false;
+    bool autoPasses = false, used = false;
   };
   SmallVector<Spec> specs;
   for (auto &text : stateInRamSpecs) {
@@ -6647,13 +6656,16 @@ LogicalResult StaticFolder::planStateInRam() {
     StringRef(text).split(parts, ':');
     Spec spec;
     spec.glob = parts[0].str();
+    spec.autoPasses = parts.size() > 2 && parts[2] == "auto";
     if (parts.size() > 3 || parts[0].empty() ||
         !llvm::GlobPattern::create(parts[0]) ||
-        (parts.size() > 1 && parts[1].getAsInteger(10, spec.minBits)) ||
-        (parts.size() > 2 && (parts[2].getAsInteger(10, spec.passes) ||
-                              !spec.passes)))
+        (parts.size() > 1 && !parts[1].empty() &&
+         parts[1].getAsInteger(10, spec.minBits)) ||
+        (parts.size() > 2 && !spec.autoPasses &&
+         (parts[2].getAsInteger(10, spec.passes) || !spec.passes)))
       return netlist.emitError("state-in-ram: '")
-             << text << "' is not <glob>[:<min-bits>[:<P>]], P at least 1";
+             << text
+             << "' is not <glob>[:<min-bits>[:<P>|auto]], P at least 1";
     specs.push_back(spec);
   }
   for (auto &cls : classes) {
@@ -6699,30 +6711,66 @@ LogicalResult StaticFolder::planStateInRam() {
             << ", skipped\n";
       continue;
     }
-    unsigned p = match->passes;
-    if (!p)
-      p = stateInRamReadBits
-              ? unsigned(std::max<uint64_t>(
-                    1, llvm::divideCeil(bits, stateInRamReadBits)))
-              : 1;
     unsigned entries = 1u << llvm::Log2_32_Ceil(threads);
-    std::string style;
+    std::string ruleStyle;
     if (auto *rule = storageFor(cls, "sir", /*reg=*/false, 0)) {
       if (rule->kind != "block" && rule->kind != "ultra")
         return netlist.emitError("storage: '")
                << rule->kind << "' is not block or ultra for state-in-ram";
-      style = rule->kind;
-    } else {
-      // RAMB36 at 512 x 72 while the rows fit, else URAM288 (4096 x 72).
-      style = uint64_t(entries) * p <= 512 ? "block" : "ultra";
+      ruleStyle = rule->kind;
     }
+    // A style's primitives at P: a 72-bit port a column, RAMB36 512 deep,
+    // URAM288 4096 deep.
+    auto prims = [&](StringRef style, unsigned p) -> uint64_t {
+      uint64_t columns = llvm::divideCeil(llvm::divideCeil(bits, p), 72);
+      return columns * llvm::divideCeil(uint64_t(entries) * p,
+                                        style == "ultra" ? 4096 : 512);
+    };
+    // `auto`: per style, the fewest passes that fill a column's depth (the
+    // rows an instance x P) and no more than one column needs, within
+    // `state-in-ram-h` host cycles a copy, a
+    // multiple of 4 past 4 (the write select's LUT6 takes four rows); the
+    // style ultra where it takes fewer than half as many primitives (the
+    // device has about half as many URAM288 as RAMB36), as fold-store-style.
+    auto autoP = [&](StringRef style) {
+      unsigned depth = style == "ultra" ? 4096 : 512;
+      unsigned p = std::max(1u, unsigned(llvm::divideCeil(depth, entries)));
+      // No more passes than a single column needs.
+      p = std::min(p, unsigned(llvm::divideCeil(bits, 72)));
+      if (stateInRamH)
+        p = std::max(1u, std::min(p, stateInRamH / threads));
+      if (p > 4)
+        p = p / 4 * 4;
+      return p;
+    };
+    unsigned p = match->passes;
+    std::string style = ruleStyle;
+    if (match->autoPasses) {
+      if (style.empty()) {
+        unsigned pb = autoP("block"), pu = autoP("ultra");
+        style = 2 * prims("ultra", pu) < prims("block", pb) ? "ultra" : "block";
+      }
+      p = autoP(style);
+    } else if (!p) {
+      p = stateInRamReadBits
+              ? unsigned(std::max<uint64_t>(
+                    1, llvm::divideCeil(bits, stateInRamReadBits)))
+              : 1;
+    }
+    // RAMB36 at 512 x 72 while the rows fit, else URAM288 (4096 x 72).
+    if (style.empty())
+      style = uint64_t(entries) * p <= 512 ? "block" : "ultra";
     cls.sir = p;
     cls.sirStyle = style;
     uint64_t rowBits = llvm::divideCeil(bits, p);
     uint64_t columns = llvm::divideCeil(rowBits, 72);
+    (style == "ultra" ? cls.sirUrams : cls.sirBrams) = prims(style, p);
     log() << bits << " bits/instance, " << threads << " instances, " << columns
           << " x 72 columns, P " << p << ", " << style << " (" << regs
-          << " registers, " << entries * p << " rows)\n";
+          << " registers, " << entries * p << " rows, "
+          << (style == "ultra" ? cls.sirUrams : cls.sirBrams)
+          << (style == "ultra" ? " URAM288" : " RAMB36") << " a copy, "
+          << threads * p << " host cycles a copy's passes)\n";
     if (p > 1) {
       // Built as pages of the row's bits, on chip, with masks: every row read
       // into the capture registers (the fetch buffer) and the evaluation on
@@ -6739,6 +6787,29 @@ LogicalResult StaticFolder::planStateInRam() {
     if (!spec.used)
       return netlist.emitError("state-in-ram: no model '") << spec.glob << "'";
   return success();
+}
+
+void StaticFolder::reportStateInRam() const {
+  std::map<int, std::pair<uint64_t, uint64_t>> bySlr;
+  bool any = false;
+  for (auto [i, cls] : llvm::enumerate(classes)) {
+    if (!cls.sir)
+      continue;
+    any = true;
+    int slr = i < slrOf.size() ? slrOf[i] : -1;
+    llvm::errs() << "foldsim-fold-static: state-in-ram: " << cls.name
+                 << ": slr " << slr << ", P " << cls.sir << ", "
+                 << cls.sirBrams << " RAMB36, " << cls.sirUrams << " URAM288\n";
+    bySlr[slr].first += cls.sirBrams;
+    bySlr[slr].second += cls.sirUrams;
+  }
+  if (!any)
+    return;
+  llvm::errs() << "foldsim-fold-static: state-in-ram: RAM by SLR group:";
+  for (auto &[slr, n] : bySlr)
+    llvm::errs() << " " << slr << ": " << n.first << " RAMB36, " << n.second
+                 << " URAM288;";
+  llvm::errs() << "\n";
 }
 
 int StaticFolder::minStateGap(const Class &cls) const {
@@ -14743,6 +14814,7 @@ LogicalResult StaticFolder::run() {
   }
   chooseWindows();
   choosePageGates();
+  reportStateInRam();
   if (scheduleOnly) {
     // The page engines the build would take (and the link streams they
     // carry), in the report too: a cost model prices a schedule as built.
@@ -14810,6 +14882,7 @@ void FoldStaticPass::runOnOperation() {
   folder.passSplitSpecs.assign(passSplit.begin(), passSplit.end());
   folder.stateInRamSpecs.assign(stateInRam.begin(), stateInRam.end());
   folder.stateInRamReadBits = stateInRamReadBits;
+  folder.stateInRamH = stateInRamH;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
   folder.linkHbmShift = linkHbmShift;
