@@ -52,9 +52,9 @@
 # the boundary's SLLs, a warning over the budget's 30.
 # RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-place.json --foldsim-opt foldsim-opt --copy-cap none --out %t/place | FileCheck %s --check-prefix=PLACE
 # PLACE: (no whole assignment: Leaf left out, spread over the room the others leave)
-# PLACE: the design over the region: lut 69 %, lutram 24 %, ff 61 % (placement fill lut 75 %, lutram 75 %, ff 75 %)
+# PLACE: the design over the region: lut 69 %, lutram 24 %, ff 61 % (region fill lut 75 %, lutram 75 %, ff 75 %)
 # PLACE: SLR1 as placed: lut 112 (75 %)
-# PLACE: Leaf cut over the SLRs: SLR1 58 %, SLR0 42 % of its logic
+# PLACE: Leaf cut over the SLRs: SLR1 56 %, SLR0 44 % of its logic
 # PLACE: boundary SLR1-SLR0: 22 SLLs projected (links 2, cut copies 19, simulator level and kernel 1)
 # PLACE: x: WARN: 22 SLLs projected over SLR1-SLR0 (budget 30); Leaf cut over SLRs
 

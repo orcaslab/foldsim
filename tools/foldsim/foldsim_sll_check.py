@@ -124,61 +124,112 @@ def subtree(mods, name, stop, acc):
     return acc
 
 
-def top_registers(sim):
-    """(name, bits) of each register of the simulator level (@foldsim_sim)."""
-    inside = False
+def level_registers(sim, modules):
+    """(module, name, bits) of each register of the simulator's level modules
+    (@foldsim_sim and its SLR group modules)."""
+    cur = None
     for line in open(sim):
         t = line.strip()
         if t.startswith('hw.module'):
-            inside = bool(re.match(r'hw\.module(?:\s+private)?\s+@foldsim_sim\(', t))
+            m = re.match(r'hw\.module(?:\s+private)?\s+@([\w$.]+)\(', t)
+            cur = m.group(1) if m and m.group(1) in modules else None
             continue
-        if inside and ' = seq.' in t:
+        if cur and ' = seq.' in t:
             lhs, rhs = t.split(' = ', 1)
             if rhs.split()[0] in foldsim_cost.REGS:
-                yield lhs.strip().lstrip('%'), foldsim_cost.width(foldsim_cost.result_type(rhs))
+                yield cur, lhs.strip().lstrip('%'), foldsim_cost.width(foldsim_cost.result_type(rhs))
 
 
-def netlist_resources(sim, copies, region):
-    """{copy: {lut, ff, uram, bram}} of a generated simulator (`sim`, its
-    foldsim_sim.mlir) for the schedule's `copies`, LUTs and flops scaled to
-    synthesized ones (region netlist_lut_scale / netlist_ff_scale), and the
-    simulator level's rest ('__top__': its logic and the link memories no
-    copy's name prefixes)."""
+def synthesized(path):
+    """{copy instance: {lut, lutram, ff}} of a Vivado hierarchical utilization
+    report (report_utilization -hierarchical) of a synthesis of the netlist:
+    each `<copy>_copy` instance's Total LUTs, LUTRAMs (+ SRLs) and FFs."""
+    out = {}
+    for line in open(path):
+        cells = [c.strip() for c in line.split('|')]
+        if len(cells) < 12 or cells[1].startswith('('):
+            continue
+        off = 3 if re.match(r'\d', cells[3]) else 5
+        nums = [int(re.match(r'(\d+)', c).group(1)) if re.match(r'\d+', c) else None for c in cells[off:off + 5]]
+        if nums[0] is None or not cells[1].endswith('_copy'):
+            continue
+        out.setdefault(cells[1][:-len('_copy')], dict(lut=nums[0], lutram=nums[2] + (nums[3] or 0), ff=nums[4]))
+    return out
+
+
+def netlist_resources(sim, copies, region, synthesis=None):
+    """{copy: {lut, lutram, ff, uram, bram}} of a generated simulator (`sim`,
+    its foldsim_sim.mlir) for the schedule's `copies`, scaled to placed ones:
+    the netlist count (foldsim_cost) times the region's netlist_*_scale
+    (synthesized per counted) and placed_per_synthesized; the links read into
+    a copy charged to it; the simulator level's rest and the region's kernel
+    in '__top__'. With `synthesis` (a hierarchical utilization report of a
+    synthesis of this netlist), each copy's own LUTs, LUTRAM and flops are
+    the synthesized ones, and the copies it lacks take the measured ones'
+    synthesized / counted ratio (a calibration per design)."""
     mods, _ = foldsim_cost.parse(sim)
     statics = {f'{c}_static' for c in copies if f'{c}_static' in mods}
-    out = {}
+    own, link = {}, {c: new_acc() for c in copies}
     for c in copies:
         acc = new_acc()
         if f'{c}_static' in mods:
             subtree(mods, f'{c}_static', statics - {f'{c}_static'}, acc)
             acc['io_bits'] = mods[f'{c}_static'].ins + mods[f'{c}_static'].outs
-        out[c] = acc
-    top = mods.get('foldsim_sim')
+        own[c] = acc
     rest = new_acc()
-    if top is not None:
-        # The simulator level's array reads are its link registers' reads by
-        # instance, which synthesis builds in the registers' read selects (r16c:
-        # 2.23M LUTs counted as array_get, the whole simulator level 129k LUTs
+    # The simulator's level: @foldsim_sim and the SLR group modules under it.
+    level = [m for m in ['foldsim_sim'] + [ch for ch, _ in mods['foldsim_sim'].insts
+                                            if ch in mods and ch not in statics]] if 'foldsim_sim' in mods else []
+    names = sorted(copies, key=len, reverse=True)
+
+    def owner(n):
+        # A link memory or register `<producer>_<port>_to_<reader>_<port>` is
+        # placed with its reader (the compiler puts the links read into an SLR
+        # group in that group: b4e's opt checkpoint, 11-07, its group 0 670,951
+        # LUTs against 498,646 counted with the links at their producers);
+        # without a reader in its name, with its producer.
+        return next((c for c in names if f'_to_{c}_' in n or n.endswith(f'_to_{c}')), None) or \
+            next((c for c in names if n.startswith(c + '_')), None)
+    for lv in level:
+        m = mods[lv]
+        # The level's array reads are its link registers' reads by instance,
+        # which synthesis builds in the registers' read selects (r16c: 2.23M
+        # LUTs counted as array_get, the whole simulator level 129k LUTs
         # synthesized besides its copies): its other logic only.
-        rest['lut'] += sum(v for k, v in top.lut.items() if k != 'array_get')
-        # A link memory or register is its producer's output register: the copy
-        # whose name (the longest) prefixes the memory's or register's.
-        names = sorted(copies, key=len, reverse=True)
-        for reg, w in top_registers(sim):
-            owner = next((c for c in names if reg.startswith(c + '_')), None)
-            (out[owner] if owner else rest)['ff'] += w
-        for rec in top.mems:
-            owner = next((c for c in names if rec[0].startswith(c + '_')), None)
-            add_memory(out[owner] if owner else rest, rec)
-        for child, _ in top.insts:
-            if child not in statics and child in mods:
+        rest['lut'] += sum(v for k, v in m.lut.items() if k != 'array_get')
+        for rec in m.mems:
+            o = owner(rec[0])
+            add_memory(link[o] if o else rest, rec)
+        for child, _ in m.insts:
+            if child not in statics and child not in level and child in mods:
                 subtree(mods, child, statics, rest)
+    for _, reg, w in level_registers(sim, set(level)):
+        o = owner(reg)
+        (link[o] if o else rest)['ff'] += w
     ls, fs = region.get('netlist_lut_scale', 1.0), region.get('netlist_ff_scale', 1.0)
+    lr = region.get('netlist_lutram_scale', ls)
     pl = region.get('placed_per_synthesized', {})
-    for v in list(out.values()) + [rest]:
-        v['lut'] *= ls * pl.get('lut', 1.0)
-        v['lutram'] *= ls * pl.get('lutram', 1.0)
-        v['ff'] *= fs * pl.get('ff', 1.0)
+    syn = synthesized(synthesis) if synthesis else {}
+    measured = [c for c in copies if c in syn]
+    ratio = {r: (sum(syn[c][r] for c in measured) / max(1e-9, sum(own[c][r] for c in measured))) if measured else None
+             for r in ('lut', 'lutram', 'ff')}
+
+    def scale(v, sy=None):
+        for r, f in (('lut', ls), ('lutram', lr), ('ff', fs)):
+            v[r] = (sy[r] if sy else v[r] * (ratio[r] if syn and ratio[r] else f)) * pl.get(r, 1.0)
+    out = {}
+    for c in copies:
+        scale(own[c], syn.get(c))
+        scale(link[c])
+        out[c] = {r: own[c][r] + link[c][r] for r in RESOURCES}
+        out[c]['io_bits'] = own[c].get('io_bits', 0)
+        out[c]['port_bits'] = own[c].get('port_bits', 0) + link[c].get('port_bits', 0)
+    scale(rest)
+    # The kernel beside the simulator (its memory endpoints, virtual memory
+    # controllers, host interface): not in the netlist, placed with it.
+    k = region.get('kernel', {})
+    rest['lut'] += k.get('lut', 0.0)
+    rest['ff'] += k.get('ff', 0.0)
     out['__top__'] = rest
     return out
 
@@ -315,6 +366,9 @@ def main():
                          'netlist\'s own logic are not in it)')
     ap.add_argument('--foldsim-opt', default=os.path.join(HERE, 'foldsim-opt'))
     ap.add_argument('--out')
+    ap.add_argument('--synthesis', help='a hierarchical utilization report (report_utilization -hierarchical) of a '
+                                        'synthesis of this netlist: the copies\' synthesized sizes instead of the '
+                                        'counted ones (a calibration per design)')
     ap.add_argument('--models', help='the pre-fold models (models.mlir) instead of running the logged pipeline\'s '
                                      'passes before the fold on its input again')
     ap.add_argument('--fold-options', help='the fold\'s options (foldsim-fold-static{...}) instead of the log\'s; '
@@ -394,7 +448,7 @@ def main():
 
     top_share = None
     if mode == 'netlist':
-        res = netlist_resources(sim, list(classes), region)
+        res = netlist_resources(sim, list(classes), region, a.synthesis)
         top_share = res.pop('__top__')
     else:
         cal = json.load(open(os.path.join(HERE, 'foldsim_v80.json')))
@@ -522,17 +576,24 @@ def main():
     # The whole design against the region at the placer's fill (the placed builds: 66-74 % of its LUTs).
     region_fill = {r: (sum(x[r] for x in res.values()) + (top_share or {}).get(r, 0.0)) / sum(c[r] for c in full)
                    for r in LOGIC if sum(c[r] for c in full)}
+    # The placer fills an SLR's room to `fill` with whole copies, the region as a whole to `region_fill` (placed
+    # builds 66-74 % of its LUTs; r16c failed partitioning at 84 %).
+    region_cap = {r: model.get('region_fill', {}).get(r, fill_of[r]) for r in LOGIC}
     lines.append('  the design over the region: ' + ', '.join(f'{r} {100 * f:.0f} %' for r, f in region_fill.items())
-                 + ' (placement fill ' + ', '.join(f'{r} {100 * fill_of[r]:.0f} %' for r in LOGIC) + ')')
-    fill_over = [r for r, f in region_fill.items() if f > fill_of[r] + 1e-9]
+                 + ' (region fill ' + ', '.join(f'{r} {100 * region_cap[r]:.0f} %' for r in LOGIC) + ')')
+    fill_over = [r for r, f in region_fill.items() if f > region_cap[r] + 1e-9]
     if groups is not None:
         shares = {c: {r: [float(c in g) for g in groups] for r in RESOURCES} for c in classes}
-        room = [{r: room0[g][r] - sum(res[c][r] for c in groups[g] if c not in cuts) for r in RESOURCES}
+        # A cut copy fills the SLRs up to the region's fill (the placer fills past an SLR's whole-copy room to
+        # place it).
+        roomr = [{r: (region_cap[r] * full[g][r] - top_spread[g][r]) if r in LOGIC else room0[g][r]
+                  for r in RESOURCES} for g in range(len(groups))]
+        room = [{r: roomr[g][r] - sum(res[c][r] for c in groups[g] if c not in cuts) for r in RESOURCES}
                 for g in range(len(groups))]
         failed = None
         for c in cuts:
             home = next(g for g, cs in enumerate(groups) if c in cs)
-            use = [{r: room0[g][r] - room[g][r] + top_spread[g][r] for r in RESOURCES} for g in range(len(groups))]
+            use = [{r: roomr[g][r] - room[g][r] + top_spread[g][r] for r in RESOURCES} for g in range(len(groups))]
             shares[c] = distribute(res[c], room, home, use, full)
             if shares[c] is None:
                 failed = c
@@ -565,7 +626,7 @@ def main():
             ' (a copy past its SLR is cut by the placer, its SLLs unknown: r16c failed so)'
     elif fill_over:
         verdict = 'REFUSE: the design\'s ' + ', '.join(f'{r} {100 * region_fill[r]:.0f} %' for r in fill_over) + \
-            ' of the region, past the placement fill (' + ', '.join(f'{100 * fill_of[r]:.0f} %' for r in fill_over) + \
+            ' of the region, past the placement fill (' + ', '.join(f'{100 * region_cap[r]:.0f} %' for r in fill_over) + \
             '; r16c failed placement at 84 % of its LUTs)'
     elif mem_over:
         verdict = f'REFUSE: the copies\' {"/".join(mem_over)} past the region\'s at the placement fill'

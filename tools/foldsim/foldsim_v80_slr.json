@@ -1,5 +1,5 @@
 {
- "about": "The V80 compute shell's dynamic region (pblock_slash, SLASH linker/slashkit/resources/base/compute/constraints/impl.xdc) per SLR, its sites counted by Vivado 2025.2 on b4e's opt checkpoint (11-07). Unequal: the static region owns most of SLR0. sites_per_lut converts placed LUTs to foldsim_degree's LUT sites: b4e's largest SLR group, 978,886 estimated sites placed as 672,695 LUTs (post-synth hierarchical utilization), the group that spilled over SLR2/SLR1 at 95 % of SLR2's LUTs. margin: the share of an SLR's LUTs a group may fill and still route at 200 MHz. sll_per_boundary: the V80's super long lines between adjacent SLRs (report_utilization -slr, both boundaries 18,870; Vivado refuses a partition past it: r16c, 11-07, 23,987 needed between SLR1 and SLR2). sll_margin: the share of them the fold's link bits may take (the rest for the shell's crossings and the placer). netlist_lut_scale / netlist_ff_scale (foldsim_sll_check.py --resources netlist): synthesized LUTs and flip-flops per foldsim_cost LUT / flop of a class copy's module in the generated netlist, r16c's Vivado 2025.2 synthesis (11-07, hier_utilization.rpt): all copies 998,386 LUTs for 1,476,513 counted (0.676; the five largest 0.64-0.78), 1,477,464 flops for 1,801,740 (0.82; the slice copy 0.90). URAM by ram_style as built: the slice copy 522 counted, 517 synthesized. placed_per_synthesized (foldsim_sll_check.py): placed LUTs, LUTRAM LUTs and flops per synthesized one of the netlist count (copies and simulator level), the kernel beside the simulator and the placer's replication included: placed fold (total minus pv80's shell) over the netlist count x netlist scale, 11-07: LUT b4e 1.290, b4ct150 1.261, y8r1di 1.267; LUTRAM 1.392 / 1.391 / 1.400; flops 0.931 / 0.935 / 0.876 (b4e's slice copy placed 524k LUTs, counted 414k x 1.27 = 527k). placement: foldsim_sll_check.py's placement model (its own about).",
+ "about": "The V80 compute shell's dynamic region (pblock_slash, SLASH linker/slashkit/resources/base/compute/constraints/impl.xdc) per SLR, its sites counted by Vivado 2025.2 on b4e's opt checkpoint (11-07). Unequal: the static region owns most of SLR0. sites_per_lut converts placed LUTs to foldsim_degree's LUT sites: b4e's largest SLR group, 978,886 estimated sites placed as 672,695 LUTs (post-synth hierarchical utilization), the group that spilled over SLR2/SLR1 at 95 % of SLR2's LUTs. margin: the share of an SLR's LUTs a group may fill and still route at 200 MHz. sll_per_boundary: the V80's super long lines between adjacent SLRs (report_utilization -slr, both boundaries 18,870; Vivado refuses a partition past it: r16c, 11-07, 23,987 needed between SLR1 and SLR2). sll_margin: the share of them the fold's link bits may take (the rest for the shell's crossings and the placer). netlist_lut_scale / netlist_lutram_scale / netlist_ff_scale (foldsim_sll_check.py --resources netlist): synthesized LUTs, LUTRAM and flip-flops per foldsim_cost LUT, memory LUT and flop of a class copy's module, fit 11-07 (est) over 172 copies of 7 synthesized designs (hierarchical utilization: r16c, y8r1di, b4e opt, b4ct150, c2d, pv80, FSD vD) with foldsim_cost packing AND-OR selects and trimming extract-only shifts: one LUT scale 0.782, the designs' copy totals r16c +12.5 %, y8r1di 0, b4e -9.9 %, b4ct150 -7.6 %, c2d -3.8 %, vD +6.6 % (before the packing vD was 0.52 against Vortex's 0.68-0.85); LUTRAM 0.896, flops 0.851. Per copy the residual is larger (b4e core -27 %, vD node model +47 %): foldsim_sll_check.py --synthesis takes a design's own synthesis instead. URAM by ram_style as built: the slice copy 522 counted, 517 synthesized. placed_per_synthesized: placed per synthesized LUT / LUTRAM / flop (b4e's slice copy: 523,144 synthesized and opt, about 524k placed: 1.0; set to make the three placed builds' totals within -4..+4 %). kernel: the kernel beside the simulator (memory endpoints, virtual memory controllers, host interface), not in the netlist: AFU minus simulator level, synthesized, r16c 184k, y8r1di 146k, b4e 140k, c2d 162k, vD 189k LUTs (155k placed); flops b4e 65k. placement: foldsim_sll_check.py's placement model (its own about).",
  "sites_per_lut": 1.455,
  "margin": 0.85,
  "slrs": [
@@ -27,19 +27,19 @@
  ],
  "sll_per_boundary": 18870,
  "sll_margin": 0.85,
- "netlist_lut_scale": 0.68,
- "netlist_ff_scale": 0.9,
+ "netlist_lut_scale": 0.782,
+ "netlist_ff_scale": 0.851,
  "placed_per_synthesized": {
-  "lut": 1.27,
-  "lutram": 1.39,
-  "ff": 0.91
+  "lut": 1.02,
+  "lutram": 0.98,
+  "ff": 0.99
  },
  "placement": {
-  "about": "foldsim_sll_check.py's placement model, fit 11-07 on three placed V80 builds (b4e routed, y8r1di post-place phys_opt, b4ct150 post-place; per-copy SLR placement and SLR-crossing nets read from the checkpoints, est_1107/inv). The placer balances the SLRs: whole copies fill each SLR up to `fill` of a resource (logic: LUT, LUTRAM, flops; memories whole counts, their primitives placed apart), the copies other than the cut ones up to the region's fill of the whole design plus balance_slack; where no whole assignment exists the largest copies by logic (at most cut_copies) fill their SLR's room and level the next SLRs' fill. Measured: y8r1di's slice copy 11/62/26 % over SLR2/1/0 (model 14/58/28), SLR fills 60/75/59 % (model 60/75/60); b4e's 8/60/32 % (model 8/66/26). A cut copy's own SLLs follow Rent's rule over its smaller side, rent_t x placed LUTs^rent_p (per-copy fit of the crossing nets: t 0.93-1.52 at p 0.75); links: SLLs per link wire bit between the two sides (measured 0.002-0.065: link memories are read a word at a time); other_slls the simulator level and shell; sll_per_vmem_bit the virtual memory ports' wiring to the kernel's controllers (only y8r1di has many: 23,570 bits). Least squares over the 6 boundaries with links 0.01 and other 500 fixed: worst boundary b4e 9,326 vs 10,114 placed (-8 %), y8r1di 15,015 vs 15,631 (-4 %), b4ct150 9,746 vs 8,981 (+9 %); leave one build out: -10 / -29 / +14 % (the vmem term rests on y8r1di alone).",
+  "about": "foldsim_sll_check.py's placement model, fit 11-07 on three placed V80 builds (b4e routed, y8r1di post-place phys_opt, b4ct150 post-place; per-copy SLR placement and SLR-crossing nets read from the checkpoints, est_1107/inv). The placer balances the SLRs: whole copies fill each SLR up to `fill` of a resource (0.70), the region as a whole to `region_fill` (0.80: placed builds 66-74 % of its LUTs, r16c failed at 85 %), a cut copy up to the region fill (logic: LUT, LUTRAM, flops; memories whole counts, their primitives placed apart), the copies other than the cut ones up to the region's fill of the whole design plus balance_slack; where no whole assignment exists the largest copies by logic (at most cut_copies) fill their SLR's room and level the next SLRs' fill. Measured: y8r1di's slice copy 11/62/26 % over SLR2/1/0 (model 14/58/28), SLR fills 60/75/59 % (model 60/75/60); b4e's 8/60/32 % (model 8/66/26). A cut copy's own SLLs follow Rent's rule over its smaller side, rent_t x placed LUTs^rent_p (per-copy fit of the crossing nets: t 0.93-1.52 at p 0.75); links: SLLs per link wire bit between the two sides (measured 0.002-0.065: link memories are read a word at a time); other_slls the simulator level and shell; sll_per_vmem_bit the virtual memory ports' wiring to the kernel's controllers (only y8r1di has many: 23,570 bits). Least squares over the 6 boundaries with links 0.01 and other 500 fixed: worst boundary b4e 9,326 vs 10,114 placed (-8 %), y8r1di 15,015 vs 15,631 (-4 %), b4ct150 9,746 vs 8,981 (+9 %); leave one build out: -10 / -29 / +14 % (the vmem term rests on y8r1di alone). Refit 11-07 19:00 with the synthesis-fit scales and links charged to their readers: worst boundary b4e 9,403 vs 10,134 (-7 %), y8r1di 13,953 vs 15,631 (-11 %), b4ct150 9,436 vs 8,981 (+5 %); modelled slice cuts y8r1di 11 / 62 / 26 % (measured 11 / 62 / 26), b4e 24 / 48 / 28 (8 / 60 / 32), b4ct150 24 / 48 / 28 (13 / 70 / 17); b4ct150's own slice crossing nets 4,150 / 6,447 against Rent 4.7k / 5.7k (not in the fit).",
   "fill": {
-   "lut": 0.75,
-   "lutram": 0.75,
-   "ff": 0.75,
+   "lut": 0.7,
+   "lutram": 0.7,
+   "ff": 0.7,
    "uram": 0.95,
    "bram": 0.95
   },
@@ -49,6 +49,16 @@
   "rent_p": 0.75,
   "sll_per_link_bit": 0.01,
   "other_slls": 500,
-  "sll_per_vmem_bit": 0.242
+  "sll_per_vmem_bit": 0.242,
+  "region_fill": {
+   "lut": 0.8,
+   "lutram": 0.8,
+   "ff": 0.8
+  }
+ },
+ "netlist_lutram_scale": 0.896,
+ "kernel": {
+  "lut": 155000,
+  "ff": 65000
  }
 }
