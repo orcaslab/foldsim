@@ -457,7 +457,8 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "Report the SLLs the design needs at the least: of the assignments "
            "of the classes to the region's SLRs (slr-capacities, in order, "
            "and slr-sites), the smallest worst boundary of link bits; a class "
-           "larger than every SLR is named (its own cut is not known)">,
+           "larger than every SLR is named (its own cut is not known); and "
+           "the wires between each pair of classes">,
     Option<"slrSllBudget", "slr-sll-budget", "uint64_t", "0",
            "With slr-groups and slr-capacities, the most link bits an "
            "assignment may put over any one SLR boundary (its SLLs; 0: any)">,

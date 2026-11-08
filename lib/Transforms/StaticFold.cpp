@@ -6102,6 +6102,14 @@ LogicalResult StaticFolder::estimateSlls() {
   }
   if (!tooLarge.empty())
     os << "    larger than every SLR (its own cut unknown):" << tooLarge << "\n";
+  // The wires between each pair of classes (both ways, serialized links a
+  // k-th), for a placement model past whole copies (foldsim_sll_check.py: a
+  // copy cut by an SLR boundary).
+  for (unsigned c = 0; c < n; ++c)
+    for (unsigned d = c + 1; d < n; ++d)
+      if (uint64_t w = bits[c][d] + bits[d][c])
+        os << "    wires " << classes[c].name << " " << classes[d].name << " "
+           << w << "\n";
   sllReport = text;
   return success();
 }
