@@ -427,6 +427,10 @@ def frame_options(a):
         fold += ' page-write-gate'
     if getattr(a, 'read_buffer_bits', 0):
         fold += f' read-buffer-bits={a.read_buffer_bits}'
+    if getattr(a, 'fold_store_ram', 0):
+        fold += f' fold-store-ram={a.fold_store_ram}'
+        if getattr(a, 'fold_store_style', 'auto') != 'auto':
+            fold += f' fold-store-style={a.fold_store_style}'
     if getattr(a, 'link_hbm_fit_slots', False):
         fold += ' link-hbm-fit-slots'
     if getattr(a, 'fold_ports', ''):
@@ -1204,6 +1208,14 @@ def build_parser():
                     help="with --static: a threaded memory's per-instance read-register buffer of at least N bits "
                          'read synchronously (a block RAM, read first) instead of combinationally (LUTs); 0: none '
                          '(foldsim-fold-static read-buffer-bits)')
+    ap.add_argument('--fold-store-ram', type=int, default=0, metavar='N',
+                    help="with --static: folded pipelines' result stores of at least N bits read through a "
+                         'register, a host cycle or two ahead, in block or ultra RAM (their slot counters '
+                         'the copy\'s own; a write landing in between forwarded unless the schedule shows '
+                         'none can). Exact; 0: read combinationally, LUTs (foldsim-fold-static fold-store-ram)')
+    ap.add_argument('--fold-store-style', choices=('auto', 'ultra', 'block'), default='auto',
+                    help='with --fold-store-ram: the stores\' RAM style (auto: ultra from 2048 entries deep, '
+                         'block below); a --storage rule <model>:fold<k>_store=<kind> takes precedence')
     ap.add_argument('--page-write-gate', action='store_true',
                     help='with --static and --page-engines: off-chip pages written back through a gated '
                          'register a page (loaded the host cycle before its write, else held at zero) and an OR '

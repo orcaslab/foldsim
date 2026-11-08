@@ -80,6 +80,14 @@ struct Fold {
   seq::FirMemOp store;
   Value threadedStore;
   Value slot, thread, valid, data;
+  /// `fold-store-ram`: the store read through a register, ahead of its
+  /// reads; its slot counter physical, an entry per instance, built with the
+  /// copy (`slotNow`: the issuing instance's slot at its state pass), stepped
+  /// from the issue's tags a host cycle on (`valid1`, `slot1`, `thread1`).
+  bool ahead = false;
+  unsigned depth = 0, outAt = 0;
+  Value valid1, slot1, thread1;
+  std::optional<Backedge> slotNow;
 };
 struct Folding {
   /// The unthreaded copies' ops: on the host clock, not target state.
@@ -355,6 +363,12 @@ public:
   /// `read-buffer-bits`: a per-instance read-register buffer of at least this
   /// many bits read synchronously (a block RAM); 0: none.
   unsigned readBufferBits = 0;
+  /// `fold-store-ram` / `fold-store-style`: folded pipelines' stores of at
+  /// least this many bits read through a register (block or ultra RAM);
+  /// 0: none.
+  uint64_t foldStoreRam = 0;
+  std::string foldStoreStyle = "auto";
+  unsigned foldStoreLead = 2;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
   /// landing) a member is streamed with (0: the decision lead + 6). A
   /// member with less room is built as an on-chip link: its landing would
@@ -7290,7 +7304,13 @@ static bool inCone(Operation *op) {
 /// host cycles apart, so its edges are at least two host cycles apart, as the
 /// fold needs. The copy's host clock, slot instance, state pass and the store's
 /// writes are filled in when the copy is built.
+///
+/// A store of at least `aheadBits` bits (`fold-store-ram`; 0: none) is read
+/// through a register when the copy is built, ahead of its reads: its slot
+/// counter is then no target state but the copy's own (`Fold::ahead`), and
+/// the model's read of it a placeholder at slot 0.
 static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
+                                   uint64_t aheadBits,
                                    std::unique_ptr<Folding> &out) {
   auto *body = model.getBodyBlock();
   ImplicitLocOpBuilder b(model.getLoc(), body->getTerminator());
@@ -7392,37 +7412,54 @@ static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
              << readable << " host cycles after issue, after their first "
              << "read at " << firstRead;
 
+    unsigned width = words[pi].size();
+    // `fold-store-ram`: read ahead through a register when the copy is built,
+    // its slot counter the copy's (a store of one slot has none).
+    bool ahead = aheadBits && depth >= 2 &&
+                 uint64_t(depth) * llvm::PowerOf2Ceil(threads) * width >=
+                     aheadBits;
     // The instance's slot: its enabled edges modulo the store's depth.
     auto slotType = b.getIntegerType(llvm::Log2_32_Ceil(depth));
-    auto slotNext = f.edges->get(slotType);
-    Value slot = seq::FirRegOp::create(b, slotNext, modelClock,
-                                       b.getStringAttr(prefix + "_slot"));
-    // The count is state of no reset: from any value it starts in range, so
-    // that each result is read where it was written from the first edge on.
-    if (!llvm::isPowerOf2_32(depth)) {
-      Value size = hw::ConstantOp::create(b, slotType, depth);
-      Value over = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, slot, size);
-      slot = comb::MuxOp::create(b, over, comb::SubOp::create(b, slot, size),
-                                 slot);
+    std::optional<Backedge> slotNow;
+    Value slot;
+    if (ahead) {
+      slotNow = f.edges->get(slotType);
+      slot = *slotNow;
+    } else {
+      auto slotNext = f.edges->get(slotType);
+      slot = seq::FirRegOp::create(b, slotNext, modelClock,
+                                   b.getStringAttr(prefix + "_slot"));
+      // The count is state of no reset: from any value it starts in range,
+      // so that each result is read where it was written from the first
+      // edge on.
+      if (!llvm::isPowerOf2_32(depth)) {
+        Value size = hw::ConstantOp::create(b, slotType, depth);
+        Value over =
+            comb::ICmpOp::create(b, comb::ICmpPredicate::uge, slot, size);
+        slot = comb::MuxOp::create(b, over, comb::SubOp::create(b, slot, size),
+                                   slot);
+      }
+      Value last = comb::ICmpOp::create(
+          b, comb::ICmpPredicate::eq, slot,
+          hw::ConstantOp::create(b, slotType, depth - 1));
+      Value step = comb::MuxOp::create(
+          b, last, hw::ConstantOp::create(b, slotType, 0),
+          comb::AddOp::create(b, slot,
+                              hw::ConstantOp::create(b, slotType, 1)));
+      slotNext.setValue(
+          p.enable ? Value(comb::MuxOp::create(b, p.enable, step, slot))
+                   : step);
     }
-    Value last = comb::ICmpOp::create(
-        b, comb::ICmpPredicate::eq, slot,
-        hw::ConstantOp::create(b, slotType, depth - 1));
-    Value step = comb::MuxOp::create(
-        b, last, hw::ConstantOp::create(b, slotType, 0),
-        comb::AddOp::create(b, slot, hw::ConstantOp::create(b, slotType, 1)));
-    slotNext.setValue(p.enable
-                          ? Value(comb::MuxOp::create(b, p.enable, step, slot))
-                          : step);
 
-    unsigned width = words[pi].size();
     auto memType = seq::FirMemType::get(context, depth, width, 1);
     auto store = seq::FirMemOp::create(
         b, memType, /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined,
         seq::WUW::Undefined, b.getStringAttr(prefix + "_store"),
         hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+    // Read ahead: the copy builds the read (the slot here is the issue's).
     storeRead[pi] = seq::FirMemReadOp::create(
-        b, store, slot, modelClock, hw::ConstantOp::create(b, i1, 1));
+        b, store, ahead ? Value(hw::ConstantOp::create(b, slotType, 0)) : slot,
+        modelClock, hw::ConstantOp::create(b, i1, 1));
     f.foldOfStore[store] = f.folds.size();
 
     // The unthreaded copy.
@@ -7575,13 +7612,28 @@ static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
     Value valid = p.enable ? Value(comb::AndOp::create(b, f.edge, p.enable))
                            : Value(f.edge);
     Value slotTag = slot, threadTag = f.thread;
+    Fold fold;
     for (unsigned k = 1; k <= outAt + 1; ++k) {
       valid = hostReg(valid, prefix + "_valid" + Twine(k), /*cleared=*/true);
       slotTag = hostReg(slotTag, prefix + "_slot" + Twine(k));
       threadTag = hostReg(threadTag, prefix + "_thread" + Twine(k));
+      if (k == 1) {
+        fold.valid1 = valid;
+        fold.slot1 = slotTag;
+        fold.thread1 = threadTag;
+      }
     }
     Value data = hostReg(word, prefix + "_wdata");
-    f.folds.push_back({store, {}, slotTag, threadTag, valid, data});
+    fold.store = store;
+    fold.slot = slotTag;
+    fold.thread = threadTag;
+    fold.valid = valid;
+    fold.data = data;
+    fold.ahead = ahead;
+    fold.depth = depth;
+    fold.outAt = outAt;
+    fold.slotNow = slotNow;
+    f.folds.push_back(fold);
   }
 
   // The target keeps each pipeline register's bits that stay, the last layer
@@ -9419,6 +9471,155 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     return {rdValid, inst, rdRow, wrValid, inst, wrRow, wrData, wrMask, pending};
   };
 
+  // `fold-store-ram`: a folded pipeline's store read through a register,
+  // `lead` host cycles ahead of the read it serves, at the instance then due
+  // and its slot. The slot counter is the copy's: an entry per instance,
+  // stepped a host cycle after each issue (from the issue's tags), read at
+  // the issuing instance for the issue's write and at the instance ahead for
+  // the read. The read takes the store as it is `lead` host cycles before the
+  // read it serves, as far ahead as the schedule shows no write to the entry
+  // lands in between, so that there is nothing to forward: an entry read at
+  // a pass was written by the issue `depth` enabled edges before the one that
+  // moved the slot to it, each at least a frame (II) apart, the write landing
+  // `outAt + 1` host cycles after its issue, and the first read is a state
+  // gap after the last edge, so (depth - 1) II + gap >= outAt + lead + 2
+  // leaves it landed before the read ahead. (A write in the same host cycle
+  // as a read ahead, of the same instance, is of another slot: the issue's,
+  // read `depth` edges on.)
+  auto aheadFold = [&](seq::FirMemOp memory) -> Fold * {
+    if (!folding)
+      return nullptr;
+    auto it = folding->foldOfStore.find(memory);
+    if (it == folding->foldOfStore.end() || !folding->folds[it->second].ahead)
+      return nullptr;
+    return &folding->folds[it->second];
+  };
+  struct AheadStats {
+    unsigned stores = 0, combinational = 0;
+    uint64_t bits = 0;
+    unsigned leads[3] = {0, 0, 0};
+  } aheadStats;
+  auto buildAheadStore = [&](Class &cls, seq::FirMemOp memory, Fold &fold,
+                             Region &region,
+                             seq::FirMemType threadedType) -> LogicalResult {
+    StringRef name = memory.getName().value_or("fold_store");
+    unsigned width = threadedType.getWidth();
+    seq::FirMemReadOp read;
+    for (auto *user : memory->getUsers())
+      if (auto r = dyn_cast<seq::FirMemReadOp>(user))
+        read = r;
+    if (!read)
+      return memory.emitError("folded pipeline store without its read");
+    auto *rule = storageFor(cls, name, /*reg=*/false, width);
+    StringRef style = rule ? StringRef(rule->kind)
+                      : foldStoreStyle != "auto"
+                          ? StringRef(foldStoreStyle)
+                          : StringRef(threadedType.getDepth() >= 2048 ? "ultra"
+                                                                      : "block");
+    bool ram = style == "block" || style == "ultra";
+    // `fold-store-lead` host cycles ahead (2: into the RAM's register and an
+    // output register; 1: into the RAM's register alone), at most the state
+    // gap less one (the slot then as the instance's last issue left it), and
+    // only as far as every write to the entry has landed by then (see
+    // above): else less, down to a combinational read (distributed RAM) as
+    // without `fold-store-ram`. None for a read in a stage (`stage-levels`:
+    // its instance is its stage's).
+    Value staged = readInst.lookup(read);
+    int gap = cls.stateGap;
+    auto landed = [&](unsigned lead) {
+      return uint64_t(fold.depth - 1) * ii + uint64_t(std::max(gap, 0)) >=
+             uint64_t(fold.outAt) + lead + 2;
+    };
+    unsigned lead = ram && !staged ? foldStoreLead : 0;
+    lead = unsigned(std::min<int>(int(lead), std::max(0, gap - 1)));
+    while (lead && !landed(lead))
+      --lead;
+    if (!lead && ram && rule)
+      return memory.emitError("storage: '")
+             << style << "' RAM for '" << name
+             << "', a folded pipeline's store read "
+             << (staged ? "in a stage" : "with no host cycle to read ahead")
+             << ": it reads combinationally";
+    auto threaded = seq::FirMemOp::create(
+        b, threadedType, /*readLatency=*/lead ? 1 : 0, /*writeLatency=*/1,
+        lead ? seq::RUW::Old : seq::RUW::Undefined, seq::WUW::Undefined,
+        memory.getNameAttr(), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+        memory.getPrefixAttr(), memory.getOutputFileAttr());
+    threaded->setDialectAttrs(memory->getDialectAttrs());
+    if (lead)
+      setRamStyle(threaded, style);
+    fold.threadedStore = threaded;
+
+    // The slot counter: an entry per instance, from any value in range (a
+    // count past the depth wraps), stepped a host cycle after an issue.
+    auto slotType = cast<IntegerType>(fold.slot1.getType());
+    auto slotConst = [&](uint64_t v) -> Value {
+      return hw::ConstantOp::create(b, slotType, v);
+    };
+    auto wrap = [&](Value slot) -> Value {
+      if (llvm::isPowerOf2_32(fold.depth))
+        return slot;
+      Value size = slotConst(fold.depth);
+      Value over = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, slot, size);
+      return comb::MuxOp::create(b, over, comb::SubOp::create(b, slot, size),
+                                 slot);
+    };
+    auto slotsType =
+        seq::FirMemType::get(context, entries, slotType.getWidth(), 1);
+    auto slots = seq::FirMemOp::create(
+        b, slotsType, /*readLatency=*/0, /*writeLatency=*/1,
+        seq::RUW::Undefined, seq::WUW::Undefined,
+        b.getStringAttr(name + "_slots"), hw::InnerSymAttr{},
+        seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+    keepShallowInFlops(slots);
+    Value last = comb::ICmpOp::create(b, comb::ICmpPredicate::eq, fold.slot1,
+                                      slotConst(fold.depth - 1));
+    Value stepped = comb::MuxOp::create(
+        b, last, slotConst(0),
+        comb::AddOp::create(b, fold.slot1, slotConst(1)));
+    seq::FirMemWriteOp::create(b, slots, fold.thread1, hostClock, fold.valid1,
+                               stepped, Value{});
+    // An instance's slot now; `forward`: the step of an issue a host cycle
+    // ago is not yet stored.
+    auto slotOf = [&](Value inst, bool forward) -> Value {
+      Value slot = wrap(seq::FirMemReadOp::create(b, slots, inst, hostClock,
+                                                  one()));
+      if (!forward)
+        return slot;
+      Value hit = comb::AndOp::create(
+          b, fold.valid1,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::eq, fold.thread1, inst));
+      return comb::MuxOp::create(b, hit, stepped, slot);
+    };
+    // The issue's: its instance's issue before it was a frame earlier.
+    fold.slotNow->setValue(slotOf(folding->thread, ii < 2));
+
+    // The read: `lead` host cycles ahead, at the instance and slot due then;
+    // the slot as the instance's last issue left it (a state gap of lead + 1:
+    // forwarded from that issue's step).
+    Value inst = lead == 2   ? region.inst2
+                 : lead == 1 ? region.inst1
+                 : staged    ? staged
+                             : region.inst;
+    Value slot = slotOf(inst, gap <= int(lead) + 1);
+    Value addr = b.createOrFold<comb::ConcatOp>(slot, inst);
+    Value data = seq::FirMemReadOp::create(b, threaded, addr, hostClock, one());
+    // Ahead: the RAM's register (read first: every write to the entry landed
+    // before), then, two ahead, the output register.
+    if (lead == 2)
+      data = seq::FirRegOp::create(b, data, hostClock,
+                                   b.getStringAttr(name + "_read"));
+    if (!lead)
+      ++aheadStats.combinational;
+    ++aheadStats.stores;
+    ++aheadStats.leads[lead];
+    aheadStats.bits += uint64_t(threadedType.getDepth()) * width;
+    read.getData().replaceAllUsesWith(
+        b.createOrFold<hw::BitcastOp>(read.getData().getType(), data));
+    read.erase();
+    return success();
+  };
+
   SmallVector<seq::FirRegOp> registers;
   SmallVector<seq::FirMemOp> memories;
   for (auto &op : *body) {
@@ -9695,6 +9896,14 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     auto threadedType = seq::FirMemType::get(
         context, memType.getDepth() * entries, memType.getWidth(),
         memType.getMaskWidth());
+    // `fold-store-ram`: a folded pipeline's store read through a register,
+    // `lead` host cycles ahead of the read it serves.
+    if (Fold *fold = aheadFold(memory)) {
+      if (failed(buildAheadStore(cls, memory, *fold, region, threadedType)))
+        return failure();
+      memory.erase();
+      continue;
+    }
     auto threadedMemory = seq::FirMemOp::create(
         b, threadedType, memory.getReadLatency(), memory.getWriteLatency(),
         memory.getRuw(), memory.getWuw(), memory.getNameAttr(),
@@ -10454,6 +10663,13 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           b, fold.threadedStore,
           b.createOrFold<comb::ConcatOp>(fold.slot, fold.thread), hostClock,
           fold.valid, fold.data, Value{});
+    if (aheadStats.stores)
+      llvm::errs() << "fold-store-ram: " << cls.name << ": "
+                   << aheadStats.stores << " stores, " << aheadStats.bits
+                   << " bits; lead 2/1/0: " << aheadStats.leads[2] << "/"
+                   << aheadStats.leads[1] << "/" << aheadStats.leads[0]
+                   << " (state gap "
+                   << cls.stateGap << ", II " << ii << ")\n";
     folding->physClock.setValue(hostClock);
     folding->thread.setValue(inst);
     folding->edge.setValue(state);
@@ -13909,7 +14125,8 @@ LogicalResult StaticFolder::run() {
     return failure();
   for (auto &cls : classes)
     if (cls.threads() > 1 &&
-        failed(foldPipelines(cls.model, cls.threads(), cls.folding)))
+        failed(foldPipelines(cls.model, cls.threads(), foldStoreRam,
+                             cls.folding)))
       return failure();
   for (auto &cls : classes)
     if (failed(analyze(cls)))
@@ -14015,6 +14232,20 @@ void FoldStaticPass::runOnOperation() {
   folder.linkHbmFitSlots = linkHbmFitSlots;
   folder.pageWriteGate = pageWriteGate;
   folder.readBufferBits = readBufferBits;
+  folder.foldStoreRam = foldStoreRam;
+  folder.foldStoreStyle = foldStoreStyle;
+  folder.foldStoreLead = foldStoreLead;
+  if (foldStoreLead < 1 || foldStoreLead > 2) {
+    getOperation().emitError("fold-store-lead: ")
+        << unsigned(foldStoreLead) << " is not 1 or 2";
+    return signalPassFailure();
+  }
+  if (foldStoreStyle != "auto" && foldStoreStyle != "ultra" &&
+      foldStoreStyle != "block") {
+    getOperation().emitError("fold-store-style: '")
+        << foldStoreStyle << "' is not ultra, block or auto";
+    return signalPassFailure();
+  }
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.minII = minII;
   folder.slrSerializeSpecs.assign(slrSerialize.begin(), slrSerialize.end());

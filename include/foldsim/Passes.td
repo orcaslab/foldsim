@@ -643,6 +643,24 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "value: block RAM rather than LUTs), the read register's bypass of "
            "data just out of the memory registered beside it. The same value "
            "every host cycle. 0: every buffer read combinationally">,
+    Option<"foldStoreRam", "fold-store-ram", "uint64_t", "0",
+           "Folded pipelines' result stores of at least N bits (an entry per "
+           "slot and instance) read through a register, in block or ultra "
+           "RAM: each read a host cycle or two ahead (fold-store-lead), at the "
+           "instance then due and its slot (the slot counter physical, an "
+           "entry per instance, beside the store), into the RAM's output "
+           "register, as far ahead as the schedule shows every write to the "
+           "entry landed. Exact. 0: every store read combinationally (LUTs)">,
+    Option<"foldStoreLead", "fold-store-lead", "unsigned", "2",
+           "With fold-store-ram: host cycles a store is read ahead, 2 (the "
+           "RAM's register and an output register) or 1 (the RAM's register "
+           "alone); less where the state gap or a write landing in between "
+           "leaves less room, down to a combinational read">,
+    Option<"foldStoreStyle", "fold-store-style", "std::string", "\"auto\"",
+           "With fold-store-ram: the stores' RAM style, ultra, block, or auto "
+           "(ultra from 2048 entries deep, block below); a storage rule for "
+           "the store by name (<model>:fold<k>_store=<kind>) takes "
+           "precedence">,
     Option<"pageWriteGate", "page-write-gate", "bool", "false",
            "Off-chip pages on page engines (page-engines): each page's "
            "write-back bits through a register of its own, loaded the host "
