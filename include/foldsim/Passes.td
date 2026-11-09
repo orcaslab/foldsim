@@ -401,6 +401,26 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "order, read address and enable, and write address, registers "
            "that always agree counting as the same) are one virtual memory: "
            "a row of whole-byte lanes, each written under its own enable">,
+    Option<"vmemAutoBits", "vmem-auto-bits", "uint64_t", "0",
+           "Virtual memories by size (the constant shell): every registered-"
+           "read target memory of a folded class with one read port and at "
+           "most one write port whose threaded image (instances x rows x "
+           "width) is at least N bits is a virtual memory, beside those "
+           "virtual-memories names, whatever storage rule names it; a memory "
+           "that cannot be one (read combinationally, more ports, too short a "
+           "state gap) stays on chip and is counted in the report. 0: none by "
+           "size">,
+    Option<"vmemRings", "vmem-rings", "unsigned", "0",
+           "With virtual memories, each one's per-instance read buffer as a "
+           "fixed ring (VmemRings.h): a read's answer is written to the "
+           "instance's row of an image (a second virtual memory, a row per "
+           "instance), read back N positions before the instance's next first "
+           "use into entry instance mod R of a ring of R entries, R the "
+           "smallest power of two the schedule's window allows. A class whose "
+           "schedule leaves no room keeps its buffers (reported). 0: none">,
+    Option<"vmemRingEntries", "vmem-ring-entries", "unsigned", "1024",
+           "With vmem-rings: the most entries a ring may take; a class that "
+           "needs more keeps its buffers">,
     Option<"vmemSkipHeldReads", "vmem-skip-held-reads", "bool", "false",
            "With virtual-memories, a read whose address is provably the "
            "previous target cycle's (the address a function of mux(c, A, q) "

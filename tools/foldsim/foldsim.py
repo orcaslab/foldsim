@@ -376,6 +376,10 @@ def frame_options(a):
             fold += ' vmem-merge-lanes'
         if getattr(a, 'vmem_skip_held_reads', False):
             fold += ' vmem-skip-held-reads'
+    if getattr(a, 'vmem_auto_bits', 0):
+        fold += f' vmem-auto-bits={a.vmem_auto_bits}'
+    if getattr(a, 'vmem_rings', 0):
+        fold += f' vmem-rings={a.vmem_rings} vmem-ring-entries={a.vmem_ring_entries}'
     if a.unstaged_env:
         fold += ' staged-env=false'
     if getattr(a, 'register_state_entries', None) is not None:
@@ -1312,6 +1316,16 @@ def build_parser():
                     help='with --virtual-memories: the arrays a front end split from one target RAM '
                          '(byte lanes, ways: the same read address and enable, the same write '
                          'address) are one virtual memory, each lane its own bytes of the row')
+    ap.add_argument('--vmem-auto-bits', type=int, default=0, metavar='N',
+                    help='with --static: every registered-read target memory (one read port, at most one write '
+                         'port) whose threaded image is at least N bits is a virtual memory too, whatever storage '
+                         'rule names it (foldsim-fold-static vmem-auto-bits; 0: none by size)')
+    ap.add_argument('--vmem-rings', type=int, default=0, metavar='LEAD',
+                    help="with virtual memories: each one's per-instance read buffer as a fixed ring, refilled "
+                         "from an image of the answers in HBM LEAD positions before each instance's first use "
+                         "(foldsim-fold-static vmem-rings; 0: none)")
+    ap.add_argument('--vmem-ring-entries', type=int, default=1024, metavar='N',
+                    help='with --vmem-rings: the most entries a ring may take (default 1024)')
     ap.add_argument('--vmem-skip-held-reads', action='store_true',
                     help='with --virtual-memories: a read whose address register holds (a registered '
                          'read address with its enable low) is not issued unless its row was written '

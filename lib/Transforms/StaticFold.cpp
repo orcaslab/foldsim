@@ -18,6 +18,7 @@
 #include "FAME5.h"
 #include "PassSplit.h"
 #include "Pipelines.h"
+#include "VmemRings.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/SV/SVAttributes.h"
@@ -223,8 +224,13 @@ struct Class {
     /// alone; 0 for a memory of the model (the class's instances).
     bool pages = false;
     unsigned instWidth = 0, instances = 0;
+    /// `vmem-rings`: its read buffer a ring (the class's `ring` plan), its
+    /// answers written to an image read back a lead before each use.
+    bool ring = false;
   };
   SmallVector<VirtualMemory> virtualMemories;
+  /// `vmem-rings`: the class's ring plan, if any of its memories take one.
+  std::shared_ptr<foldsim::RingPlan> ring;
   /// With virtual memories, the copy's host reset input (their pending reads
   /// clear with the controllers').
   unsigned resetInput = 0;
@@ -491,6 +497,12 @@ public:
   /// `read-buffer-bits`: a per-instance read-register buffer of at least this
   /// many bits read synchronously (a block RAM); 0: none.
   unsigned readBufferBits = 0;
+  /// `vmem-auto-bits` / `vmem-rings` / `vmem-ring-entries` (VmemRings.h).
+  uint64_t vmemAutoBits = 0;
+  unsigned vmemRingLead = 0, vmemRingEntries = 1024;
+  /// Plans a class's rings (`vmem-rings`): marks its virtual memories that
+  /// take one, or none if the schedule leaves no room (the reason reported).
+  void planClassRing(Class &cls, function_ref<bool(const Class::VirtualMemory &)> eligible);
   /// `fold-store-ram` / `fold-store-style`: folded pipelines' stores of at
   /// least this many bits read through a register (block or ultra RAM);
   /// 0: none.
@@ -7510,10 +7522,18 @@ int StaticFolder::minStateGap(const Class &cls) const {
   if (cls.deferSpan)
     gap = std::max(gap, int(cls.deferSpan) + 4 +
                             (cls.page ? 2 * int(cls.page) + int(cls.pageLead()) : 0));
-  if (!virtualMemoryPattern.empty()) {
+  if (!virtualMemoryPattern.empty() || vmemAutoBits) {
     llvm::Regex pattern(virtualMemoryPattern);
     StringRef model = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
                                          : StringRef(cls.name);
+    // `vmem-auto-bits`: a registered read of that image at least; `vmem-rings`:
+    // two positions more, from the issue's pending bit to the prefetch's
+    // decision and on to the first use (VmemRings.h).
+    auto bySize = [&](seq::FirMemOp memory) {
+      auto type = memory.getType();
+      return vmemAutoBits && cls.threads() > 1 && memory.getReadLatency() == 1 &&
+             uint64_t(type.getDepth()) * cls.threads() * type.getWidth() >= vmemAutoBits;
+    };
     auto *folding = cls.folding.get();
     // As buildCopy finds its virtual memories: by name or <class model>:<name>.
     // A held-read class's requests leave a host cycle after the state pass:
@@ -7522,8 +7542,11 @@ int StaticFolder::minStateGap(const Class &cls) const {
          const_cast<hw::HWModuleOp &>(cls.model).getBodyBlock()->getOps<seq::FirMemOp>()) {
       StringRef name = memory.getName().value_or("");
       if (!(folding && folding->physical.contains(memory)) &&
-          (pattern.match(name) || pattern.match((model + ":" + name).str()))) {
-        gap = std::max(gap, decisionLead() + (cls.heldReads ? 2 : 1));
+          ((!virtualMemoryPattern.empty() &&
+            (pattern.match(name) || pattern.match((model + ":" + name).str()))) ||
+           bySize(memory))) {
+        gap = std::max(gap, decisionLead() + (cls.heldReads ? 2 : 1) +
+                                (vmemRingLead && cls.threads() > 1 ? 2 : 0));
         break;
       }
     }
@@ -8236,7 +8259,7 @@ LogicalResult StaticFolder::schedule() {
       os << "\n";
     }
   }
-  buildFrameTable(bubbles || !virtualMemoryPattern.empty());
+  buildFrameTable(bubbles || !virtualMemoryPattern.empty() || vmemAutoBits);
   reportLinks(os);
   for (auto [k, consumer] : llvm::enumerate(consumers))
     if (consumer.cls < 0)
@@ -10859,6 +10882,52 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
   return success();
 }
 
+void StaticFolder::planClassRing(
+    Class &cls, function_ref<bool(const Class::VirtualMemory &)> eligible) {
+  if (!llvm::any_of(cls.virtualMemories, eligible))
+    return;
+  auto refuse = [&](const std::string &why) {
+    llvm::errs() << "foldsim-fold-static: vmem-rings: " << cls.name
+                 << ": read buffers kept (" << why << ")\n";
+  };
+  // Every slot within the frame: an overlapped class's tail slots run a
+  // frame late, from its second frame on.
+  auto past = [&](ArrayRef<int> slots) {
+    return llvm::any_of(slots, [&](int s) { return s >= int(ii) || s < 0; });
+  };
+  if (past(cls.slot[kState]) || (cls.hasReady && past(cls.slot[kReady])) ||
+      llvm::any_of(cls.laterReady, [&](auto &l) { return past(l); }))
+    return refuse("overlapped frames");
+  SmallVector<foldsim::RingInstance> insts(cls.threads());
+  for (unsigned i = 0; i < cls.threads(); ++i) {
+    insts[i].issue = cls.slot[kState][i];
+    // Its evaluations of the next frame read at their read positions.
+    insts[i].uses.push_back(cls.readSlot(kState, 0, i) + int(ii));
+    if (cls.hasReady)
+      for (unsigned l = 0; l < std::max(1u, cls.readyLevels); ++l)
+        insts[i].uses.push_back(cls.readSlot(kReady, l, i) + int(ii));
+    // The state pass reads last (a ready pass after it would read the
+    // frame after's state).
+    if (*llvm::max_element(insts[i].uses) != insts[i].uses.front())
+      return refuse("a ready pass after its state pass");
+  }
+  auto plan = std::make_shared<foldsim::RingPlan>(
+      foldsim::planRing(insts, ii, vmemRingLead, decisionLead() + 2, vmemRingEntries));
+  if (!plan->ok)
+    return refuse(plan->why);
+  unsigned rings = 0;
+  for (auto &vm : cls.virtualMemories)
+    if (eligible(vm)) {
+      vm.ring = true;
+      ++rings;
+    }
+  cls.ring = plan;
+  llvm::errs() << "foldsim-fold-static: vmem-rings: " << cls.name << ": "
+               << rings << " read buffers as rings of " << plan->entries
+               << " entries (window " << plan->window << ", " << cls.threads()
+               << " instances, lead " << vmemRingLead << ")\n";
+}
+
 LogicalResult StaticFolder::buildCopy(Class &cls) {
   auto model = cls.model;
   auto *context = model.getContext();
@@ -10985,7 +11054,29 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   };
   bool anyHbmFold =
       folding && llvm::any_of(folding->folds, [](const Fold &f) { return f.hbm; });
-  if (!virtualMemoryPattern.empty() || anyHbmFold) {
+  // `vmem-auto-bits`: by size too (the memories that cannot be one, kept):
+  // the checks below, silently.
+  auto autoVirtual = [&](seq::FirMemOp memory, const Class &cls) {
+    if (memory.getReadLatency() != 1 || cls.stateGap < decisionLead() + 1)
+      return false;
+    unsigned reads = 0, writes = 0;
+    for (auto *user : memory->getUsers()) {
+      if (isa<seq::FirMemReadOp>(user))
+        ++reads;
+      else if (isa<seq::FirMemWriteOp>(user))
+        ++writes;
+      else
+        return false;
+    }
+    auto type = memory.getType();
+    unsigned maskWidth = type.getMaskWidth().value_or(1);
+    return reads == 1 && writes <= 1 &&
+           !(maskWidth > 1 && (type.getWidth() % maskWidth ||
+                               (type.getWidth() / maskWidth) % 8));
+  };
+  unsigned autoKept = 0;
+  uint64_t autoKeptBits = 0;
+  if (!virtualMemoryPattern.empty() || anyHbmFold || vmemAutoBits) {
     llvm::Regex pattern(virtualMemoryPattern);
     StringRef model =
         cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : cls.name;
@@ -11007,6 +11098,18 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       } else if (virtualMemoryPattern.empty() ||
                  (!pattern.match(memName) &&
                   !pattern.match((model + ":" + memName).str()))) {
+        if (!vmemAutoBits || threads < 2)
+          continue;
+        auto type = memory.getType();
+        uint64_t image = uint64_t(type.getDepth()) * threads * type.getWidth();
+        if (image < vmemAutoBits)
+          continue;
+        if (!autoVirtual(memory, cls)) {
+          ++autoKept;
+          autoKeptBits += image;
+          continue;
+        }
+        candidates.push_back(memory);
         continue;
       }
       if (memory.getReadLatency() != 1)
@@ -11118,6 +11221,15 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       virtualOf[lane] = cls.virtualMemories.size();
     cls.virtualMemories.push_back(std::move(vm));
   }
+  if (vmemAutoBits && (autoKept || !cls.virtualMemories.empty()))
+    llvm::errs() << "foldsim-fold-static: vmem-auto-bits: " << cls.name << ": "
+                 << cls.virtualMemories.size() << " virtual memories; "
+                 << autoKept << " kept on chip (" << autoKeptBits
+                 << " bits: read combinationally, more ports or a short state gap)\n";
+  if (vmemRingLead && threads > 1)
+    planClassRing(cls, [&](const Class::VirtualMemory &vm) {
+      return !vm.pages && !vm.delayed && !hbmFold(vm.lanes.front());
+    });
 
   // Paged register state: the registers a ready pass reads (the cone of an
   // output written at a ready pass, through the logic and combinational
@@ -11578,6 +11690,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     auto readBuffer = [&]() -> Value {
       auto readName = vm.name + "_rdata";
       Value data;
+      // `vmem-rings`: the response port carries the ring's entry for the
+      // pass two host cycles ahead, out of the ring's own register a host
+      // cycle before it (the simulator's); this is the read register.
+      if (vm.ring)
+        return seq::FirRegOp::create(b, rspData, hostClock,
+                                     b.getStringAttr(readName + "_read"));
       if (threads == 1) {
         auto nextEdge = edges.get(rspData.getType());
         auto buffer = seq::FirRegOp::create(b, nextEdge, hostClock,
@@ -13946,6 +14064,9 @@ LogicalResult StaticFolder::buildSim() {
     bool stream = false;
     /// An HBM page stream's engine (`k` its index), not a class's.
     bool engine = false;
+    /// `vmem-rings`: the image of class `cls`'s memory `k` (a row per
+    /// instance), not the memory.
+    bool image = false;
   };
   SmallVector<SimVirtual> simVirtuals;
   if (!linkStreams.empty() && failed(planStreams()))
@@ -13977,6 +14098,33 @@ LogicalResult StaticFolder::buildSim() {
       addPort(name + "wr_row", IntegerType::get(context, vm.rowWidth), false);
       addPort(name + "wr_data", IntegerType::get(context, vm.dataWidth), false);
       addPort(name + "wr_mask", IntegerType::get(context, vm.maskWidth), false);
+    }
+  // `vmem-rings`: each ring's image, a row per instance (row 0 of each),
+  // written with the memory's answers, read by the ring's prefetches.
+  std::map<std::pair<unsigned, unsigned>, unsigned> imageOf;
+  for (auto [c, cls] : llvm::enumerate(classes))
+    for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
+      if (!vm.ring || !simOf.count({unsigned(c), unsigned(k)}))
+        continue;
+      imageOf[{unsigned(c), unsigned(k)}] = simVirtuals.size();
+      std::string name = ("vm" + Twine(simVirtuals.size()) + "_").str();
+      auto iw = IntegerType::get(
+          context, std::max(llvm::Log2_32_Ceil(cls.threads()), 1u));
+      auto dw = IntegerType::get(context, vm.dataWidth);
+      simVirtuals.push_back({unsigned(c), unsigned(k), unsigned(numIn)});
+      simVirtuals.back().image = true;
+      addPort(name + "rsp_valid", i1, true);
+      addPort(name + "rsp_inst", iw, true);
+      addPort(name + "rsp_data", dw, true);
+      addPort(name + "free", IntegerType::get(context, kVirtualFreeWidth), true);
+      addPort(name + "rd_valid", i1, false);
+      addPort(name + "rd_inst", iw, false);
+      addPort(name + "rd_row", i1, false);
+      addPort(name + "wr_valid", i1, false);
+      addPort(name + "wr_inst", iw, false);
+      addPort(name + "wr_row", i1, false);
+      addPort(name + "wr_data", dw, false);
+      addPort(name + "wr_mask", i1, false);
     }
   // Each HBM link stream's: its rows a single address (instances 1), the
   // request's tag a landing slot.
@@ -14584,6 +14732,106 @@ LogicalResult StaticFolder::buildSim() {
     return copy;
   };
 
+  // `vmem-rings` (VmemRings.h): a ring memory's entries (instance mod R),
+  // filled by the prefetches' answers from its image and read at each use's
+  // instance two host cycles ahead (the copy's read register loads it a host
+  // cycle later); a use whose prefetch would have come before the first frame
+  // reads zero. Its image is written with the memory's answers, a host cycle
+  // after each. Built before the copy, whose response data it is.
+  struct RingBuilt {
+    Value pref0, pinst0, landed, seen, wv, winst, wdata;
+    /// Each entry's instance high bits (none if an entry is an instance's).
+    seq::FirMemOp owner;
+  };
+  std::map<std::pair<unsigned, unsigned>, RingBuilt> ringBuilt;
+  auto buildRing = [&](unsigned c, unsigned k) -> Value {
+    auto &cls = classes[c];
+    auto &vm = cls.virtualMemories[k];
+    auto &plan = *cls.ring;
+    auto &rb = ringBuilt[{c, k}];
+    auto &main = simVirtuals[simOf.at({c, k})];
+    auto &image = simVirtuals[imageOf.at({c, k})];
+    std::string prefix = vm.name + "_ring";
+    unsigned idxWidth = llvm::Log2_32_Ceil(cls.threads());
+    unsigned iw = std::max(idxWidth, 1u);
+    unsigned eb = llvm::Log2_32_Ceil(plan.entries);
+    Value at = controls[c].at3;
+    auto entryOf = [&](Value inst) -> Value {
+      return eb ? b.createOrFold<comb::ExtractOp>(b.getIntegerType(eb), inst, 0)
+                : constant(1, 0);
+    };
+    auto bitOf = [&](Value on, Value inst) -> Value {
+      unsigned n = plan.entries;
+      Value one = n > 1 ? b.createOrFold<comb::ConcatOp>(constant(n - 1, 0), on) : on;
+      if (!eb)
+        return one;
+      return comb::ShlOp::create(
+          b, one, b.createOrFold<comb::ConcatOp>(constant(n - eb, 0), entryOf(inst)));
+    };
+    // A frame's last position shown: the uses after it have had their
+    // prefetches.
+    auto seenNext = backedges.get(b.getI1Type());
+    rb.seen = resetReg(seenNext, prefix + "_seen", 0);
+    seenNext.setValue(comb::OrOp::create(b, rb.seen, eq(at, ii - 1)));
+    Value uinst2 = idxWidth ? reg(table(b, at, plan.useInst, idxWidth), prefix + "_uinst2")
+                            : constant(1, 0);
+    Value skip2 = reg(comb::AndOp::create(b, table(b, at, plan.useCross, 1), notOf(rb.seen)),
+                      prefix + "_skip2");
+    Value skip1 = reg(skip2, prefix + "_skip1");
+    // The prefetches, now.
+    auto chain3r = [&](Value v, const Twine &n) {
+      return resetReg(resetReg(resetReg(v, n + "2", 0), n + "1", 0), n + "0", 0);
+    };
+    rb.pref0 = chain3r(table(b, at, plan.prefValid, 1), prefix + "_pref");
+    rb.pinst0 = idxWidth ? reg(reg(reg(table(b, at, plan.prefInst, idxWidth), prefix + "_pinst2"),
+                                   prefix + "_pinst1"),
+                               prefix + "_pinst0")
+                         : constant(1, 0);
+    Value irspValid = body->getArgument(image.firstInput);
+    Value irspInst = body->getArgument(image.firstInput + 1);
+    Value irspData = body->getArgument(image.firstInput + 2);
+    auto ring = seq::FirMemOp::create(
+        b, seq::FirMemType::get(context, plan.entries, vm.dataWidth, 1),
+        /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old, seq::WUW::Undefined,
+        b.getStringAttr(prefix), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+        StringAttr{}, Attribute{});
+    seq::FirMemWriteOp::create(b, ring, entryOf(irspInst), hostClock, irspValid,
+                               irspData, Value{});
+    Value data = seq::FirMemReadOp::create(b, ring, entryOf(uinst2), hostClock,
+                                           constant(1, 1));
+    // Landed entries: set by an answer (the entry's owner its instance's
+    // high bits), cleared by the instance's last use of the frame, now.
+    Value last0 = resetReg(resetReg(resetReg(table(b, at, plan.useLast, 1), prefix + "_last2", 0),
+                                    prefix + "_last1", 0),
+                           prefix + "_last0", 0);
+    Value uinst0 = reg(reg(uinst2, prefix + "_uinst1"), prefix + "_uinst0");
+    auto landedNext = backedges.get(b.getIntegerType(plan.entries));
+    rb.landed = resetReg(landedNext, prefix + "_landed", 0);
+    landedNext.setValue(comb::AndOp::create(
+        b, comb::OrOp::create(b, rb.landed, bitOf(irspValid, irspInst)),
+        comb::XorOp::create(b, bitOf(last0, uinst0), constant(plan.entries, ~0ull))));
+    if (idxWidth > eb) {
+      rb.owner = seq::FirMemOp::create(
+          b, seq::FirMemType::get(context, plan.entries, idxWidth - eb, 1),
+          /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
+          b.getStringAttr(prefix + "_owner"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+          StringAttr{}, Attribute{});
+      seq::FirMemWriteOp::create(
+          b, rb.owner, entryOf(irspInst), hostClock, irspValid,
+          b.createOrFold<comb::ExtractOp>(b.getIntegerType(idxWidth - eb), irspInst, eb),
+          Value{});
+    }
+    // The image's writes: the memory's answers, a host cycle on.
+    rb.wv = resetReg(body->getArgument(main.firstInput), prefix + "_wv", 0);
+    Value minst = body->getArgument(main.firstInput + 1);
+    rb.winst = reg(hw::getBitWidth(minst.getType()) == iw
+                       ? minst
+                       : b.createOrFold<comb::ExtractOp>(b.getIntegerType(iw), minst, 0),
+                   prefix + "_winst");
+    rb.wdata = reg(body->getArgument(main.firstInput + 2), prefix + "_wdata");
+    return comb::MuxOp::create(b, skip1, constant(vm.dataWidth, 0), data);
+  };
+
   // The copies, their inputs backedges until the links are built.
   SmallVector<hw::InstanceOp> copies(classes.size());
   SmallVector<SmallVector<Backedge>> copyInputs(classes.size());
@@ -14624,8 +14872,10 @@ LogicalResult StaticFolder::buildSim() {
       auto carried = pageEngineOf.find({unsigned(c), unsigned(k)});
       if (carried == pageEngineOf.end()) {
         auto &v = simVirtuals[simOf.at({unsigned(c), unsigned(k)})];
-        for (unsigned j = 0; j < 3; ++j)
+        for (unsigned j = 0; j < (vm.ring ? 2u : 3u); ++j)
           operands.push_back(body->getArgument(v.firstInput + j));
+        if (vm.ring)
+          operands.push_back(buildRing(c, k));
         continue;
       }
       auto [e, m] = carried->second;
@@ -16527,6 +16777,45 @@ LogicalResult StaticFolder::buildSim() {
         pageInst = table(b, next, fetchInst, idxWidth);
       }
       for (auto &vm : cls.virtualMemories) {
+        if (vm.ring) {
+          // `vmem-rings`: a prefetch waits for its instance's answer (its
+          // image row written), a use for its entry (VmemRings.h).
+          auto &plan = *cls.ring;
+          auto &rb = ringBuilt.at({unsigned(c), unsigned(&vm - cls.virtualMemories.data())});
+          Value pending = copies[c].getResult(vm.firstOutput + 8);
+          auto bitAt = [&](Value bits, unsigned n, Value index, unsigned w) -> Value {
+            if (!w)
+              return b.createOrFold<comb::ExtractOp>(i1, bits, 0);
+            return b.createOrFold<comb::ExtractOp>(
+                i1,
+                comb::ShrUOp::create(b, bits,
+                                     b.createOrFold<comb::ConcatOp>(constant(n - w, 0), index)),
+                0);
+          };
+          unsigned eb = llvm::Log2_32_Ceil(plan.entries);
+          Value pv = table(b, next, plan.prefValid, 1);
+          Value pbit = bitAt(pending, 1u << idxWidth,
+                             idxWidth ? table(b, next, plan.prefInst, idxWidth) : Value(),
+                             idxWidth);
+          terms.push_back(comb::OrOp::create(b, notOf(pv), notOf(pbit)));
+          Value uv = table(b, next, plan.useValid, 1);
+          Value uinst = idxWidth ? table(b, next, plan.useInst, idxWidth) : Value();
+          Value entry = eb ? b.createOrFold<comb::ExtractOp>(b.getIntegerType(eb), uinst, 0)
+                           : Value();
+          Value seen = comb::OrOp::create(b, rb.seen, eq(posD, ii - 1));
+          Value skip = comb::AndOp::create(b, table(b, next, plan.useCross, 1), notOf(seen));
+          Value landed = bitAt(rb.landed, plan.entries, entry, eb);
+          if (rb.owner)
+            landed = comb::AndOp::create(
+                b, landed,
+                comb::ICmpOp::create(
+                    b, comb::ICmpPredicate::eq,
+                    seq::FirMemReadOp::create(b, rb.owner, entry ? entry : constant(1, 0),
+                                              hostClock, constant(1, 1)),
+                    b.createOrFold<comb::ExtractOp>(b.getIntegerType(idxWidth - eb), uinst, eb)));
+          terms.push_back(comb::OrOp::create(b, ValueRange{notOf(uv), skip, landed}, false));
+          continue;
+        }
         Value used = vm.pages ? stateUse : use;
         Value pending = copies[c].getResult(vm.firstOutput + 8);
         Value bit = pending;
@@ -16542,6 +16831,27 @@ LogicalResult StaticFolder::buildSim() {
       }
     }
     for (auto &v : simVirtuals) {
+      if (v.image) {
+        // `vmem-rings`: an image's room also holds the writes of the
+        // memory's reads not yet answered, and of those the decisions in
+        // flight may issue.
+        auto &vm = classes[v.cls].virtualMemories[v.k];
+        auto &main = simVirtuals[simOf.at({v.cls, v.k})];
+        unsigned w = kVirtualFreeWidth;
+        auto outNext = backedges.get(b.getIntegerType(w));
+        Value out = resetReg(outNext, vm.name + "_ring_out", 0);
+        Value issued = copies[v.cls].getResult(vm.firstOutput);
+        Value answered = body->getArgument(main.firstInput);
+        outNext.setValue(comb::SubOp::create(
+            b,
+            comb::AddOp::create(b, out, b.createOrFold<comb::ConcatOp>(constant(w - 1, 0), issued)),
+            b.createOrFold<comb::ConcatOp>(constant(w - 1, 0), answered)));
+        Value need = comb::AddOp::create(
+            b, out, constant(w, virtualRoom(false) + decisionLead() + 2));
+        terms.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge,
+                                             body->getArgument(v.firstInput + 3), need));
+        continue;
+      }
       // (An HBM link stream's page writes are at positions too, one a
       // position: no room past the decisions' in flight. Before they were,
       // its `pages` writes after a pass needed that many more, which a
@@ -16681,6 +16991,14 @@ LogicalResult StaticFolder::buildSim() {
                       any(wrInst), any(wrRow), any(wrData), any(wrMask)});
       continue;
     }
+    if (v.image) {
+      // `vmem-rings`: the prefetches' reads (row 0 of each instance) and the
+      // answers' writes.
+      auto &rb = ringBuilt.at({v.cls, v.k});
+      results.append({rb.pref0, rb.pinst0, constant(1, 0), rb.wv, rb.winst,
+                      constant(1, 0), rb.wdata, constant(1, 1)});
+      continue;
+    }
     auto &vm = classes[v.cls].virtualMemories[v.k];
     for (unsigned j = 0; j < 8; ++j)
       results.push_back(copies[v.cls].getResult(vm.firstOutput + j));
@@ -16717,6 +17035,14 @@ LogicalResult StaticFolder::buildSim() {
       }
       auto &cls = classes[v.cls];
       auto &vm = cls.virtualMemories[v.k];
+      if (v.image) {
+        // A ring's image: a row per instance (instances x 1 row).
+        virtuals.push_back(b.getStringAttr(
+            vm.name + "_img:" + cls.name + ":" +
+            Twine(std::max(llvm::Log2_32_Ceil(cls.threads()), 1u)) + ":1:" +
+            Twine(vm.dataWidth) + ":1:1:" + Twine(cls.threads())));
+        continue;
+      }
       unsigned instWidth =
           vm.instWidth ? vm.instWidth
                        : std::max(cls.threads() > 1 ? llvm::Log2_32_Ceil(cls.threads()) : 0u,
@@ -17258,6 +17584,9 @@ void FoldStaticPass::runOnOperation() {
     folder.pageGatePages[model.str()] = n;
   }
   folder.readBufferBits = readBufferBits;
+  folder.vmemAutoBits = vmemAutoBits;
+  folder.vmemRingLead = vmemRings;
+  folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));
   folder.foldStoreRam = foldStoreRam;
   folder.foldStoreStyle = foldStoreStyle;
   folder.foldStoreHbm = foldStoreHbm;
