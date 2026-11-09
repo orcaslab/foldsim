@@ -677,6 +677,8 @@ public:
   SmallVector<std::array<double, 3>> linkKindGroupCap, linkKindGroupBase;
   /// `slr-link-rams`: with SLR groups, links may be block or ultra RAM too.
   bool slrLinkRams = false;
+  /// `slr-kept`: the SLR group assignments chooseGroups schedules.
+  unsigned slrKept = 8;
   struct LinkCandidate {
     std::tuple<unsigned, unsigned, uint64_t> key;
     /// Its rows and columns in block or ultra RAM (paged as built), and its
@@ -7583,7 +7585,9 @@ LogicalResult StaticFolder::chooseGroups() {
   // by branch and bound over the classes, the largest first; a group is
   // opened in order (the groups are alike) unless some class is pinned or
   // the groups' capacities differ.
-  constexpr unsigned kKept = 64;
+  // `slr-kept`: the assignments kept (fewest bits between groups) and then
+  // scheduled, the shortest frame chosen.
+  const unsigned kKept = std::max(1u, slrKept);
   SmallVector<unsigned> order;
   for (unsigned c = 0; c < n; ++c)
     order.push_back(c);
@@ -7679,16 +7683,26 @@ LogicalResult StaticFolder::chooseGroups() {
                         : std::string());
   }
 
-  // Of those, the shortest frame, then the fewest bits between groups.
+  // Of those, the shortest frame, then the fewest bits between groups: each
+  // scheduled in turn (a line each), stopping at the first whose frame is the
+  // modulo search's lower bound, which no other can beat.
   unsigned bestLength = 0;
   SmallVector<int> best;
-  for (auto &entry : kept) {
+  for (auto [i, entry] : llvm::enumerate(kept)) {
     slrOf = entry.second;
-    unsigned length = searchReady().length;
+    Choice choice = searchReady();
+    unsigned length = choice.length;
+    bool bound = length && choice.lower && length <= choice.lower;
+    llvm::errs() << "foldsim-fold-static: slr-groups: assignment " << i + 1 << " of "
+                 << kept.size() << ": " << entry.first << " link bits between groups, II "
+                 << length << (length ? "" : " (no schedule)")
+                 << (bound ? " = the lower bound: chosen" : "") << "\n";
     if (length && (!bestLength || length < bestLength)) {
       bestLength = length;
       best = entry.second;
     }
+    if (bound)
+      break;
   }
   if (!bestLength)
     return netlist.emitError("the evaluations of a frame depend on each other "
@@ -20543,6 +20557,7 @@ void FoldStaticPass::runOnOperation() {
   folder.readBufferBits = readBufferBits;
   folder.linkKindCost = linkKindCost;
   folder.slrLinkRams = slrLinkRams;
+  folder.slrKept = std::max(1u, unsigned(slrKept));
   for (auto [spec, out, name] :
        {std::tuple{std::string(linkKindGroups), &folder.linkKindGroupCap, "link-kind-groups"},
         std::tuple{std::string(linkKindGroupOthers), &folder.linkKindGroupBase,

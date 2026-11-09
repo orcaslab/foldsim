@@ -505,6 +505,8 @@ def frame_options(a):
                     a.slr_region, getattr(a, 'state_scratch_fill', 0.85)))
             if getattr(a, 'link_kind_group_others', ''):
                 fold += f' link-kind-group-others={a.link_kind_group_others}'
+    if getattr(a, 'slr_kept', None):
+        fold += f' slr-kept={a.slr_kept}'
     if getattr(a, 'slr_link_rams', False):
         fold += ' slr-link-rams'
     if getattr(a, 'registered_links', ''):
@@ -1682,6 +1684,10 @@ def build_parser():
     ap.add_argument('--link-kind-group-others', default='', metavar='U,B,L;...',
                     help='with --link-kind-cost and --slr-groups: what the rest takes of each group\'s '
                          '(foldsim_link_kinds.py <gen dir> --groups, from a first build)')
+    ap.add_argument('--slr-kept', type=int, default=None, metavar='K',
+                    help='with --slr-groups: the assignments (fewest link bits between groups) scheduled to choose '
+                         'the shortest frame, stopping at one at the modulo lower bound (foldsim-fold-static '
+                         'slr-kept; default 8)')
     ap.add_argument('--slr-link-rams', action='store_true',
                     help='with --slr-groups: links may be block or ultra RAM too, in their reader\'s group '
                          '(foldsim-fold-static slr-link-rams); else every link of a grouped fold is distributed '
