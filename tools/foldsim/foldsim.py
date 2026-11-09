@@ -344,6 +344,10 @@ def frame_options(a):
         fold += ' modulo'
     if getattr(a, 'min_ii', 0):
         fold += f' min-ii={a.min_ii}'
+    if getattr(a, 'affine_slots', False):
+        fold += ' affine-slots'
+    if getattr(a, 'slot_segments', 0):
+        fold += f' slot-segments={a.slot_segments}'
     if getattr(a, 'modulo_linear', None) is not None:
         fold += f' modulo-linear={a.modulo_linear}'
     if getattr(a, 'ready_choice', ''):
@@ -1259,6 +1263,13 @@ def build_parser():
     ap.add_argument('--min-ii', type=int, default=0, metavar='N',
                     help='with --static --modulo: the shortest frame in host cycles (foldsim-fold-static '
                          'min-ii); positions past the schedule\'s own stay idle, a longer prefetch distance')
+    ap.add_argument('--affine-slots', action='store_true',
+                    help='with --static --modulo: each copy\'s passes of a kind placed as one affine run over its '
+                         'instances (foldsim-fold-static affine-slots): slot tables of a segment a pass')
+    ap.add_argument('--slot-segments', type=int, default=0, metavar='K',
+                    help='with --static: slot tables of at most K affine segments as decoders of the position or '
+                         'instance (a size independent of II and N), not constant arrays (foldsim-fold-static '
+                         'slot-segments)')
     ap.add_argument('--csf-ready-copies', default='', metavar='MODEL:K,...',
                     help='with --static and --csf-ready-cones: each model\'s ready cone (its late outputs of '
                          'logic alone) as a model of its own, MODEL_rc, of K copies (the ready lanes) '

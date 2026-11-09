@@ -1,0 +1,46 @@
+# REQUIRES: verilator
+# --slot-segments K: a slot table of more than 64 rows whose nonzero rows are
+# at most K affine segments (position s + j*ds holding v + j*dv, ds and dv
+# powers of two) is a decoder of its index instead of a constant array, so
+# its size does not grow with the frame or the instances. The frames here are
+# padded past 64 positions (--min-ii 160), so every table of the frame is one.
+# Against the target, exact: virtual memories at any response latency with
+# stalled channels, nested sequencers with bubbles, a short lead with copies;
+# HBM link streams on shared page engines (paged classes, nested, bubbles).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem
+# RUN: foldsim --srcs top.f --top Top --out %t/a --static --modulo --min-ii 160 --virtual-memories ram --slot-segments 8 Leaf > %t/a.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/a.log
+# RUN: FileCheck %s --check-prefix=SIM < %t/a/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/a/obj %S/Inputs/tb_vmem.sv top.sv %t/a/foldsim_sim.sv > %t/a/build.log 2>&1
+# RUN: %t/a/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/b --static --modulo --min-ii 160 --virtual-memories ram --nest --bubbles --slot-segments 8 Leaf > %t/b.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/b.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -Mdir %t/b/obj %S/Inputs/tb_vmem.sv top.sv %t/b/foldsim_sim.sv > %t/b/build.log 2>&1
+# RUN: %t/b/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +bubble=60 +burst=8 +stall=10 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/c --static --modulo --min-ii 160 --virtual-memories ram --short-lead --copies Leaf:2 --slot-segments 8 Leaf > %t/c.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/c.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DCOPIES2 -DIW=1 -Mdir %t/c/obj %S/Inputs/tb_vmem.sv top.sv %t/c/foldsim_sim.sv > %t/c/build.log 2>&1
+# RUN: %t/c/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=40 +stall=30 +full=10 | FileCheck %s
+# LOG: foldsim-fold-static: II = 160
+# LOG: foldsim-fold-static: slot-sequencer: {{[1-9][0-9]*}} tables decoded ({{.*}}), 0 tables kept
+# SIM-NOT: hw.aggregate_constant {{.*}}!hw.array<256x
+# CHECK-NOT: PROTOCOL
+# CHECK: {{^}}MATCH
+# HBM link streams on shared page engines, paged classes (pages of 4: a page
+# of 3 puts the passes 3 apart, which a segment does not decode), nested
+# sequencers and bubbles (Inputs/linkshare, as static-link-hbm-shift.test).
+# RUN: cd %S/../Driver/Inputs/linkshare
+# RUN: foldsim --srcs top.f --top Top --out %t/hbm --static --nest --modulo --bubbles --min-ii 160 --page Unit:4,Vnit:4,Reader:4,Sink:4 --page-engines auto --link-hbm-shift 8 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm --slot-segments 8 Unit Vnit Reader Sink > %t/hbm.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/hbm.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/hbm -DBUBBLES -Mdir %t/hbm/obj %S/Inputs/tb_linkhbm.sv top.sv %t/hbm/foldsim_sim.sv > %t/hbm/build.log 2>&1
+# RUN: %t/hbm/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +lo=1 +hi=30 +bubble=30 +stall=30 +full=20 | FileCheck %s --check-prefix=HBM
+# RUN: %t/hbm/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=40 +hi=60 +full=40 | FileCheck %s --check-prefix=HBM
+# HBM-NOT: PROTOCOL
+# HBM: {{^}}MATCH
+# --affine-slots: each copy's passes of a kind placed as one run over its
+# instances (o + k*P); exact, its tables decoded (vmem, nested, bubbles).
+# RUN: cd %S/../Driver/Inputs/vmem
+# RUN: foldsim --srcs top.f --top Top --out %t/aff --static --modulo --min-ii 160 --virtual-memories ram --nest --bubbles --copies Leaf:2 --affine-slots --slot-segments 8 Leaf > %t/aff.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/aff.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DCOPIES2 -DIW=1 -Mdir %t/aff/obj %S/Inputs/tb_vmem.sv top.sv %t/aff/foldsim_sim.sv > %t/aff/build.log 2>&1
+# RUN: %t/aff/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=40 +bubble=60 +burst=8 +stall=20 +full=20 | FileCheck %s

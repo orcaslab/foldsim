@@ -12,6 +12,8 @@ add_mlir_library(FoldsimTransforms
   LowerWideNegation.cpp
   CompressAddTrees.cpp
   CsfReadySplit.cpp
+  SlotSequencer.cpp
+  AffineSlots.cpp
   Pipelines.cpp
   RemoveDeadState.cpp
   ReplicateControls.cpp

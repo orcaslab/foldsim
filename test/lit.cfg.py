@@ -15,6 +15,8 @@ config.excludes = ["CMakeLists.txt", "lit.cfg.py", "lit.site.cfg.py", "Inputs"]
 
 llvm_config.use_default_substitutions()
 llvm_config.with_environment("PATH", config.llvm_tools_dir, append_path=True)
+# FOLDSIM_SLOT_SEGMENTS: run the suite with slot-table decoders (foldsim-fold-static).
+llvm_config.with_system_environment(["FOLDSIM_SLOT_SEGMENTS"])
 # The CIRCT tools (circt-verilog, circt-opt, firtool) of the CIRCT foldsim is
 # built against, ahead of the LLVM tools: a CIRCT built on its own has them
 # in a directory of its own.

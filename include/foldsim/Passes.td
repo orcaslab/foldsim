@@ -764,6 +764,21 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "is cut into column slices, each its own constant read at the same "
            "index (synthesis bounds a variable's size: Vivado's Synth 8-4556 "
            "at 1,000,000 bits; a 128-SM frame of 2^17 positions met it)">,
+    Option<"affineSlots", "affine-slots", "bool", "false",
+           "With modulo: each copy's (or ready lane's) passes of a kind are "
+           "placed as one affine run over its instances, the k-th at o + k*P "
+           "(P a power of two per copy, at least its kinds of passes and its "
+           "page, link page or serialized spacing), only the offsets chosen: "
+           "a class's slot tables are then a segment a pass (slot-segments), "
+           "whatever its instances, and the frame grows instead">,
+    Option<"slotSegments", "slot-segments", "unsigned", "0",
+           "Slot tables (constants read by the frame's position or an "
+           "instance) of at most this many affine segments of nonzero rows "
+           "(index s + j*ds holding v + j*dv, ds and dv powers of two) are "
+           "decoders of the index, a range and residue compare and a "
+           "shift-add a segment, instead of constant arrays of 2^(index "
+           "bits) rows; a table of more segments stays a constant and is "
+           "counted. 0: every table a constant">,
     Option<"lookaheadTables", "lookahead-tables", "bool", "true",
            "With virtual memories: the readiness a frame's position waits on "
            "reads its slot tables (the next position's use and instance) from "
