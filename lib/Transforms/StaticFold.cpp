@@ -509,6 +509,9 @@ public:
   bool stagedLinkDirect = false;
   /// `drop-dead-inputs`: model inputs never read take no link.
   bool dropDeadInputs = false;
+  /// `lookahead-tables`: the virtual-memory readiness reads its slot tables
+  /// from registers loaded a host cycle before (the same values).
+  bool lookaheadTables = true;
   unsigned deadInputs = 0, partlyDeadInputs = 0;
   uint64_t deadInputBits = 0;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
@@ -16480,6 +16483,40 @@ LogicalResult StaticFolder::buildSim() {
     Value next = comb::MuxOp::create(
         b, end, constant(posWidth, 0),
         comb::AddOp::create(b, posD, constant(posWidth, 1)));
+    // A table at `next`, read from a register loaded a host cycle before
+    // (the lookahead): the readiness a decision waits on no longer chains the
+    // position's increment and the table's decoder before the pending bit's
+    // select; it is the same value, so neither the schedule nor any host
+    // cycle moves. The register's next is the table at the position's next's
+    // `next`: posD's next is posD (no advance), posD + 1 (advance within the
+    // frame), 0 (a frame's end, the next frame starting) or `ii` (a frame's
+    // end, none), so the register takes one of two tables read at posD itself
+    // or one of two constants, chosen by the decision alone.
+    auto nx = [&](unsigned p) -> unsigned {
+      return p + 1 >= ii ? 0 : p + 1;   // `next` of position p (ii - 1, ii: 0)
+    };
+    unsigned aheadCount = 0;
+    auto atNext = [&](ArrayRef<uint64_t> row, unsigned width) -> Value {
+      if (!lookaheadTables)
+        return table(b, next, row, width);
+      bool uniform = llvm::all_of(row, [&](uint64_t v) { return v == row[0]; });
+      if (row.empty() || uniform)
+        return table(b, next, row, width);
+      SmallVector<uint64_t> hold(ii + 1, 0), step(ii + 1, 0);
+      for (unsigned p = 0; p <= ii; ++p) {
+        hold[p] = row[nx(p)];           // posD stays
+        step[p] = row[nx(nx(p))];       // posD + 1 within the frame
+      }
+      Value onStep = comb::MuxOp::create(
+          b, end, comb::MuxOp::create(b, go, constant(width, row[nx(0)]),
+                                      constant(width, row[nx(ii)])),
+          table(b, posD, step, width));
+      Value nextValue = comb::MuxOp::create(b, advance, onStep,
+                                            table(b, posD, hold, width));
+      // posD resets to `ii`: the register to the table at nx(ii).
+      return resetReg(nextValue, "vready_ahead" + Twine(aheadCount++),
+                      row[nx(ii)]);
+    };
     SmallVector<Value> terms;
     for (auto [c, cls] : llvm::enumerate(classes)) {
       if (cls.virtualMemories.empty())
@@ -16498,8 +16535,8 @@ LogicalResult StaticFolder::buildSim() {
           useRow[at] = 1;
           instRow[at] = i;
         }
-      Value use = table(b, next, useRow, 1);
-      Value inst = threads > 1 ? table(b, next, instRow, idxWidth) : Value();
+      Value use = atNext(useRow, 1);
+      Value inst = threads > 1 ? atNext(instRow, idxWidth) : Value();
       Value classInst = inst;
       // A page word off chip is waited for by the state pass alone (staged,
       // by its evaluation's read position, the stages before it, where the
@@ -16514,7 +16551,7 @@ LogicalResult StaticFolder::buildSim() {
           int r = cls.slot[kState][i] - int(cls.stages);
           stateRow[unsigned(((r % int(ii)) + int(ii)) % int(ii))] = 1;
         }
-        stateUse = table(b, next, stateRow, 1);
+        stateUse = atNext(stateRow, 1);
       } else if (cls.pagesOffChip) {
         SmallVector<uint64_t> fetchRow(ii + 1, 0), fetchInst(ii + 1, 0);
         for (unsigned i = 0; i < threads; ++i) {
@@ -16523,8 +16560,8 @@ LogicalResult StaticFolder::buildSim() {
           fetchRow[pos] = 1;
           fetchInst[pos] = i;
         }
-        stateUse = table(b, next, fetchRow, 1);
-        pageInst = table(b, next, fetchInst, idxWidth);
+        stateUse = atNext(fetchRow, 1);
+        pageInst = atNext(fetchInst, idxWidth);
       }
       for (auto &vm : cls.virtualMemories) {
         Value used = vm.pages ? stateUse : use;
@@ -16571,7 +16608,7 @@ LogicalResult StaticFolder::buildSim() {
         clear.push_back(notOf(bit));
       }
       terms.push_back(comb::OrOp::create(
-          b, notOf(table(b, next, st.popValid, 1)),
+          b, notOf(atNext(st.popValid, 1)),
           comb::AndOp::create(b, clear, false)));
     }
     virtualReady.setValue(comb::AndOp::create(b, terms, false));
@@ -17283,6 +17320,7 @@ void FoldStaticPass::runOnOperation() {
   folder.stagedLinkMemories = stagedLinks && stagedLinkMemories;
   folder.stagedLinkDirect = stagedLinks && stagedLinkDirect;
   folder.dropDeadInputs = dropDeadInputs;
+  folder.lookaheadTables = lookaheadTables;
   gMaxTableBits = std::max<uint64_t>(1, maxTableBits);
   if (failed(folder.run()))
     return signalPassFailure();

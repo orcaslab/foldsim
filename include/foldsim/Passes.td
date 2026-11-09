@@ -764,6 +764,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "is cut into column slices, each its own constant read at the same "
            "index (synthesis bounds a variable's size: Vivado's Synth 8-4556 "
            "at 1,000,000 bits; a 128-SM frame of 2^17 positions met it)">,
+    Option<"lookaheadTables", "lookahead-tables", "bool", "true",
+           "With virtual memories: the readiness a frame's position waits on "
+           "reads its slot tables (the next position's use and instance) from "
+           "registers loaded a host cycle before, chosen by the decision, not "
+           "through the position's increment and the table's decoder in the "
+           "decision's host cycle (the same values: no schedule or host cycle "
+           "moves; Beacon, 16 SMs: 13 levels on the position, sequencers, "
+           "bubbles and output dues)">,
     Option<"dropDeadInputs", "drop-dead-inputs", "bool", "true",
            "A model input its body never reads (left over from a class cut: "
            "its bits go to a sibling class directly) takes no link, no "
