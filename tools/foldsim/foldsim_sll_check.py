@@ -46,6 +46,7 @@ memories and the SLLs past a boundary still refuse. --slr-policy strict: the 11-
 refuses; the driver's --slr-policy strict and fit_gate.sh FIT_SLR_POLICY=strict fail on any cut).
 """
 import argparse, json, math, os, re, shlex, subprocess, sys
+from collections import defaultdict
 from itertools import takewhile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -174,6 +175,7 @@ def netlist_resources(sim, copies, region, synthesis=None):
     the synthesized ones, and the copies it lacks take the measured ones'
     synthesized / counted ratio (a calibration per design)."""
     mods, _ = foldsim_cost.parse(sim)
+    PARSED['mods'] = mods
     statics = {f'{c}_static' for c in copies if f'{c}_static' in mods}
     own, link = {}, {c: new_acc() for c in copies}
     for c in copies:
@@ -237,6 +239,49 @@ def netlist_resources(sim, copies, region, synthesis=None):
     rest['lut'] += k.get('lut', 0.0)
     rest['ff'] += k.get('ff', 0.0)
     out['__top__'] = rest
+    return out
+
+
+PARSED = {}
+
+
+def split_copies(sim, gdir, res, names):
+    """Copies split over SLRs by foldsim-slr-split (`<copy>_static_p<k>` parts, instances
+    `fs_split_<copy>_static_p<k>`, each assigned to an SLR in <gen>/foldsim_floorplan.tcl): {copy: {'slr': [SLR index
+    per part], 'frac': {resource: [share per part]}, 'cross': [(part, part, bits)]}}. A part's share of each resource
+    is its subtree's share of the copy's netlist count (the copy's resources as counted: its links and scales kept);
+    the crossing bits are the part instances' inputs from another part (each crossing a register to a register, one
+    SLL a bit per boundary between their SLRs)."""
+    mods = PARSED.get('mods') or foldsim_cost.parse(sim)[0]
+    fp = os.path.join(gdir, 'foldsim_floorplan.tcl')
+    where = {}
+    if os.path.exists(fp):
+        for m in re.finditer(r'get_cells -quiet -hierarchical (fs_split_\S+)\]\s*\n.*?USER_SLR_ASSIGNMENT (\S+) ',
+                             open(fp).read()):
+            where[m.group(1)] = m.group(2)
+    out = {}
+    for c in res:
+        parts = sorted((int(m.group(1)), n) for n in mods for m in [re.fullmatch(re.escape(c) + r'_static_p(\d+)', n)]
+                       if m)
+        if not parts:
+            continue
+        slr = []
+        for k, n in parts:
+            s = where.get(f'fs_split_{n}')
+            if s not in names:
+                sys.exit(f'{c} is split but its part {n} has no SLR in {fp}')
+            slr.append(names.index(s))
+        accs = [subtree(mods, n, set(), new_acc()) for _, n in parts]
+        frac = {r: [x[r] / max(1e-9, sum(y[r] for y in accs)) if sum(y[r] for y in accs) else 1.0 / len(accs)
+                    for x in accs] for r in RESOURCES}
+        cross = defaultdict(int)
+        text = ''.join(line for line in open(sim) if 'hw.instance "fs_split_' + c + '_static_p' in line)
+        for line in text.splitlines():
+            k = int(re.search(r'hw\.instance "fs_split_' + re.escape(c) + r'_static_p(\d+)"', line).group(1))
+            for j, t in re.findall(r'%fs_split_' + re.escape(c) + r'_static_p(\d+)\.[\w.$-]+: ([^,)]+)', line):
+                cross[(int(j), k)] += foldsim_cost.width(t)
+        out[c] = dict(slr=slr, frac=frac, cross=[(i, j, b) for (i, j), b in cross.items() if i != j],
+                      parts=[n for _, n in parts])
     return out
 
 
@@ -333,7 +378,7 @@ def vmem_bits(gdir):
     return sum(2 * v['data_width'] + v['row_width'] + v['inst_width'] for v in json.load(open(path)).get('vmem', []))
 
 
-def boundary_slls(shares, res, wires, top_share, model, vbits=0):
+def boundary_slls(shares, res, wires, top_share, model, vbits=0, splits=None):
     """Each boundary's SLLs: SLLs per link wire bit times the link wires
     between the copies' shares on either side; Rent's rule (t x LUTs^p) over
     each cut copy's smaller side (and over the simulator level's, with
@@ -348,7 +393,12 @@ def boundary_slls(shares, res, wires, top_share, model, vbits=0):
         low = {c: sum(x['lut'][:b + 1]) for c, x in shares.items()}
         link = sum(w * (low[c] * (1 - low[d]) + low[d] * (1 - low[c]))
                    for (c, d), w in wires.items() if c in low and d in low)
-        cut = sum(t * (min(f, 1 - f) * res[c]['lut']) ** p for c, f in low.items() if 1e-9 < f < 1 - 1e-9)
+        cut = sum(t * (min(f, 1 - f) * res[c]['lut']) ** p for c, f in low.items()
+                  if 1e-9 < f < 1 - 1e-9 and c not in (splits or {}))
+        # A split copy's crossings: its parts' bits between SLRs on either side of the boundary.
+        for sp in (splits or {}).values():
+            cut += sum(bits for i, j, bits in sp['cross'] if min(sp['slr'][i], sp['slr'][j]) <= b < max(sp['slr'][i],
+                                                                                                        sp['slr'][j]))
         tl = sum(x['lut'] for x in top_share[:b + 1])
         th = sum(x['lut'] for x in top_share[b + 1:])
         # The simulator level and the kernel beside it, spread over the SLRs.
@@ -480,6 +530,16 @@ def main():
     top_spread = spread(top_share, full)
     fill_of = {r: fills.get(r, region.get('margin', 1.0) if r in LOGIC else 1.0) for r in RESOURCES}
     room0 = [{r: fill_of[r] * c[r] - t[r] for r in RESOURCES} for c, t in zip(full, top_spread)]
+    # Copies split over SLRs (foldsim-slr-split): each part placed in its SLR (the floorplan's), not assigned; the
+    # SLRs' room what the parts leave.
+    splits = split_copies(sim, gdir, res, names) if mode == 'netlist' else {}
+    part_of = lambda c, k: {r: res[c][r] * splits[c]['frac'][r][k] for r in RESOURCES}
+    for c, sp in splits.items():
+        for k, g in enumerate(sp['slr']):
+            for r in RESOURCES:
+                room0[g][r] -= part_of(c, k)[r]
+    res_est = dict(res, **{c: new_acc() for c in splits})
+    room_whole = [{r: fill_of[r] * c[r] - t[r] for r in RESOURCES} for c, t in zip(full, top_spread)]
 
     lines = [f'{name}: SLRs {",".join(names)}, resources from the {mode}'
              + (f' (LUT x{region.get("netlist_lut_scale", 1.0)}, FF x{region.get("netlist_ff_scale", 1.0)}, '
@@ -510,7 +570,19 @@ def main():
         lines.append(f'    {c}: ' + ', '.join(f'{r} {fmt(r, res[c][r])}' for r in RESOURCES)
                      + '; of each SLR\'s capacity (binding resource): '
                      + ', '.join(f'{s["name"]} {100 * fill(c, s):.0f} %' for s in caps))
+    for c, sp in splits.items():
+        lines.append(f'    {c} split in {len(sp["slr"])} parts (foldsim-slr-split): ' + '; '.join(
+            f'{n} in {names[g]}: ' + ', '.join(f'{r} {fmt(r, part_of(c, k)[r])}' for r in RESOURCES)
+            for k, (n, g) in enumerate(zip(sp['parts'], sp['slr'])))
+            + '; crossings ' + ', '.join(f'p{i}->p{j} {b:,} bits' for i, j, b in sp['cross']))
     for c in res:
+        if c in splits:
+            # Each part within its SLR's capacity.
+            bad = [(sp_k, r) for sp_k, g in enumerate(splits[c]['slr']) for r in RESOURCES
+                   if part_of(c, sp_k)[r] > caps[g][r] + 1e-9]
+            if bad:
+                over.append((c, names[splits[c]['slr'][bad[0][0]]], sorted({r for _, r in bad})))
+            continue
         if all(fill(c, s) > 1 + 1e-9 for s in allowed):
             s = min(allowed, key=lambda s: fill(c, s))
             over.append((c, s['name'], [r for r in RESOURCES if res[c][r] > s[r] + 1e-9]))
@@ -553,7 +625,7 @@ def main():
                 groups.append(mm.group(1).split() if mm else [])
         return text, sec, wires, groups
 
-    text, sec, wires, groups = estimate(res, room0)
+    text, sec, wires, groups = estimate(res_est, room0)
     # The refold must be the generation's schedule: a compiler that does not take the generation's options the same
     # way (an older one without staging: e8, 11-07, refolded to II 2,748 for 2,931) checks another netlist.
     rii = schedule_ii(text)
@@ -563,7 +635,8 @@ def main():
     # No assignment of whole copies: the largest copies by logic (at most model['cut_copies']) left out one by one
     # and spread over the room the others leave.
     cuts = []
-    by_logic = sorted(res, key=lambda c: -max(res[c][r] / room0[0][r] for r in LOGIC if room0[0][r] > 0))
+    by_logic = sorted((c for c in res if c not in splits),
+                      key=lambda c: -max(res[c][r] / room0[0][r] for r in LOGIC if room0[0][r] > 0))
     # Guide (--slr-policy guide, any SLR): a copy past every SLR is cut by the placer, as a copy left out of the
     # assignment is (its own cut by Rent's rule, its links over the boundary): left out from the start.
     guide = a.slr_policy == 'guide' and a.copy_cap == 'any'
@@ -577,13 +650,13 @@ def main():
                  for r in RESOURCES} for g in range(len(full))]
     if forced:
         cuts = list(forced)
-        _, sec2, _, groups = estimate(dict(res, **{c: new_acc() for c in cuts}), balanced, memories=False)
+        _, sec2, _, groups = estimate(dict(res_est, **{c: new_acc() for c in cuts}), balanced, memories=False)
         sec += ['    (past every SLR: ' + ', '.join(cuts) + ' left out, spread over the room the others leave)'] \
             + sec2[1:]
     while groups is None and mode == 'netlist' and (not over or guide) and \
             len(cuts) < len(forced) + model.get('cut_copies', 2):
         cuts.append(next(c for c in by_logic if c not in cuts))
-        _, sec2, _, groups = estimate(dict(res, **{c: new_acc() for c in cuts}), balanced, memories=False)
+        _, sec2, _, groups = estimate(dict(res_est, **{c: new_acc() for c in cuts}), balanced, memories=False)
         sec += ['    (no whole assignment: ' + ', '.join(cuts) + ' left out, spread over the room the others leave)'] \
             + sec2[1:]
     cut_copy = cuts[-1] if cuts else None
@@ -594,7 +667,7 @@ def main():
         + ' of the SLR\'s capacity (its binding resource)')
     shares = slls = failed = None
     # Memories go apart (a copy's primitives where there is room): within the region's, at the fill.
-    mem_over = [r for r in ('uram', 'bram') if sum(x[r] for x in res.values()) > sum(x[r] for x in room0) + 1e-9]
+    mem_over = [r for r in ('uram', 'bram') if sum(x[r] for x in res.values()) > sum(x[r] for x in room_whole) + 1e-9]
     # The whole design against the region at the placer's fill (the placed builds: 66-74 % of its LUTs).
     region_fill = {r: (sum(x[r] for x in res.values()) + (top_share or {}).get(r, 0.0)) / sum(c[r] for c in full)
                    for r in LOGIC if sum(c[r] for c in full)}
@@ -608,10 +681,14 @@ def main():
         shares = {c: {r: [float(c in g) for g in groups] for r in RESOURCES} for c in classes}
         # A cut copy fills the SLRs up to the region's fill (the placer fills past an SLR's whole-copy room to
         # place it).
-        roomr = [{r: (region_cap[r] * full[g][r] - top_spread[g][r]) if r in LOGIC else room0[g][r]
+        roomr = [{r: (region_cap[r] * full[g][r] - top_spread[g][r]) if r in LOGIC else room_whole[g][r]
                   for r in RESOURCES} for g in range(len(groups))]
-        room = [{r: roomr[g][r] - sum(res[c][r] for c in groups[g] if c not in cuts) for r in RESOURCES}
-                for g in range(len(groups))]
+        room = [{r: roomr[g][r] - sum(res[c][r] for c in groups[g] if c not in cuts and c not in splits)
+                 - sum(part_of(c, k)[r] for c, sp in splits.items() for k, h in enumerate(sp['slr']) if h == g)
+                 for r in RESOURCES} for g in range(len(groups))]
+        for c, sp in splits.items():
+            shares[c] = {r: [sum(sp['frac'][r][k] for k, h in enumerate(sp['slr']) if h == g)
+                             for g in range(len(groups))] for r in RESOURCES}
         failed = None
         for c in cuts:
             home = next(g for g, cs in enumerate(groups) if c in cs)
@@ -630,10 +707,11 @@ def main():
                 lines.append(f'    {c} cut over the SLRs: ' + ', '.join(
                     f'{s["name"]} {100 * x:.0f} %' for s, x in zip(full, shares[c]['lut'])) + ' of its logic')
             if model:
-                slls = boundary_slls(shares, res, wires, top_spread, model, vmem_bits(gdir))
+                slls = boundary_slls(shares, res, wires, top_spread, model, vmem_bits(gdir), splits)
                 for b, (lk, ct, sm) in enumerate(slls):
                     lines.append(f'    boundary {names[b]}-{names[b + 1]}: {lk + ct + sm:,.0f} SLLs projected '
-                                 f'(links {lk:,.0f}, cut copies {ct:,.0f}, simulator level and kernel {sm:,.0f})')
+                                 f'(links {lk:,.0f}, cut copies {ct:,.0f}{" and split crossings" if splits else ""}, '
+                                 f'simulator level and kernel {sm:,.0f})')
     if a.json:
         json.dump(dict(name=name, ii=ii, mode=mode, copies=res, top=top_share, wires=[[x, y, w] for (x, y), w in
                                                                                      wires.items()],

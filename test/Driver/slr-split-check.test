@@ -1,0 +1,22 @@
+# The SLL check of a copy split over SLRs (foldsim-slr-split): its parts are
+# copies of their own, each in the SLR the floorplan assigns it (not assigned
+# by the check, not cut by the placer), the room they leave the others', and
+# the bits their instances pass between them are the split's crossings, one
+# SLL a bit over each boundary between their SLRs (no Rent's rule for it).
+# The leaf copy split in two: its wide store (memory, read register, write
+# data and enable) in part 1, the rest in part 0 (region-split.json: two SLRs
+# of 300 LUTs). The wide store's 80-bit read register and its slices cross to
+# part 0, the read address and enables to part 1: 101 bits, the boundary's
+# cut term.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/storage
+# RUN: foldsim --srcs top.f --top Top --out %t/x --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --storage 'Leaf:mem=ultra' Leaf 2> %t/x.log
+# RUN: python3 -c "import sys; l = open(sys.argv[1]).read().split('\n'); i = next(k for k, s in enumerate(l) if 'hw.module @Leaf_static(' in s); j = next(k for k in range(i, len(l)) if l[k].strip().startswith('hw.output')); print('\n'.join('1' if 'wide' in s else '0' for s in l[i + 1:j] if s.strip()))" %t/x/foldsim_sim.mlir > %t/leaf.map
+# RUN: foldsim-opt %t/x/foldsim_sim.mlir --pass-pipeline='builtin.module(foldsim-slr-split{module=Leaf_static map=%t/leaf.map parts=2})' -o %t/x/split.mlir 2>&1 | FileCheck %s --check-prefix=SPLIT
+# RUN: mv %t/x/split.mlir %t/x/foldsim_sim.mlir
+# RUN: printf 'set c [get_cells -quiet -hierarchical fs_split_Leaf_static_p0]\nif {[llength $c] == 1} { set_property USER_SLR_ASSIGNMENT SLR1 $c }\nset c [get_cells -quiet -hierarchical fs_split_Leaf_static_p1]\nif {[llength $c] == 1} { set_property USER_SLR_ASSIGNMENT SLR0 $c }\n' > %t/x/foldsim_floorplan.tcl
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-split.json --foldsim-opt foldsim-opt --copy-cap none --out %t/place | FileCheck %s
+# SPLIT: foldsim-slr-split: Leaf_static: 2 parts
+# CHECK: Leaf split in 2 parts (foldsim-slr-split): Leaf_static_p0 in SLR1: {{.*}}; Leaf_static_p1 in SLR0: {{.*}}; crossings p1->p0 96 bits, p0->p1 5 bits
+# CHECK-NOT: cut over the SLRs
+# CHECK: boundary SLR1-SLR0: {{[0-9,]+}} SLLs projected (links {{[0-9,]+}}, cut copies 101 and split crossings, simulator level and kernel 1)
+# CHECK: x: OK
