@@ -10927,7 +10927,8 @@ void StaticFolder::planClassRing(
   llvm::errs() << "foldsim-fold-static: vmem-rings: " << cls.name << ": "
                << rings << " read buffers as rings of " << plan->entries
                << " entries (window " << plan->window << ", " << cls.threads()
-               << " instances, lead " << vmemRingLead << ")\n";
+               << " instances, " << plan->prefetches << " prefetches a frame, lead "
+               << vmemRingLead << ")\n";
 }
 
 LogicalResult StaticFolder::buildCopy(Class &cls) {
@@ -11111,6 +11112,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           autoKeptBits += image;
           continue;
         }
+        // A storage rule naming it is overridden (and so used).
+        storageFor(cls, memName, /*reg=*/false, type.getWidth());
         candidates.push_back(memory);
         continue;
       }
@@ -14110,8 +14113,10 @@ LogicalResult StaticFolder::buildSim() {
         continue;
       imageOf[{unsigned(c), unsigned(k)}] = simVirtuals.size();
       std::string name = ("vm" + Twine(simVirtuals.size()) + "_").str();
-      auto iw = IntegerType::get(
-          context, std::max(llvm::Log2_32_Ceil(cls.threads()), 1u));
+      // {write, entry, instance 0} (a read's tag its entry; foldsim_vmem
+      // TAGW), the row the instance.
+      auto iw = IntegerType::get(context, llvm::Log2_32_Ceil(cls.ring->entries) + 2);
+      auto aw = IntegerType::get(context, std::max(llvm::Log2_32_Ceil(cls.threads()), 1u));
       auto dw = IntegerType::get(context, vm.dataWidth);
       simVirtuals.push_back({unsigned(c), unsigned(k), unsigned(numIn)});
       simVirtuals.back().image = true;
@@ -14121,10 +14126,10 @@ LogicalResult StaticFolder::buildSim() {
       addPort(name + "free", IntegerType::get(context, kVirtualFreeWidth), true);
       addPort(name + "rd_valid", i1, false);
       addPort(name + "rd_inst", iw, false);
-      addPort(name + "rd_row", i1, false);
+      addPort(name + "rd_row", aw, false);
       addPort(name + "wr_valid", i1, false);
       addPort(name + "wr_inst", iw, false);
-      addPort(name + "wr_row", i1, false);
+      addPort(name + "wr_row", aw, false);
       addPort(name + "wr_data", dw, false);
       addPort(name + "wr_mask", i1, false);
     }
@@ -14741,7 +14746,7 @@ LogicalResult StaticFolder::buildSim() {
   // reads zero. Its image is written with the memory's answers, a host cycle
   // after each. Built before the copy, whose response data it is.
   struct RingBuilt {
-    Value pref0, pinst0, landed, seen, wv, winst, wdata;
+    Value pref0, pinst0, pentry0, landed, seen, wv, winst, wdata;
     /// Each shared entry's instance (none if an entry is an instance's).
     seq::FirMemOp owner;
   };
@@ -14756,18 +14761,11 @@ LogicalResult StaticFolder::buildSim() {
     std::string prefix = vm.name + "_ring";
     unsigned idxWidth = llvm::Log2_32_Ceil(cls.threads());
     unsigned iw = std::max(idxWidth, 1u);
-    unsigned eb = llvm::Log2_32_Ceil(plan.entries);
+    unsigned eb = llvm::Log2_32_Ceil(plan.entries);  // >= 1: R >= 2
     Value at = controls[c].at3;
-    // An entry by position (the tables), or by an answer's instance (its
-    // entry, a table by instance).
-    auto byInst = [&](Value inst) -> Value {
-      return eb ? table(b, inst, plan.entryOf, eb) : constant(1, 0);
-    };
     auto bitOf = [&](Value on, Value entry) -> Value {
       unsigned n = plan.entries;
-      Value one = n > 1 ? b.createOrFold<comb::ConcatOp>(constant(n - 1, 0), on) : on;
-      if (!eb)
-        return one;
+      Value one = b.createOrFold<comb::ConcatOp>(constant(n - 1, 0), on);
       return comb::ShlOp::create(
           b, one, b.createOrFold<comb::ConcatOp>(constant(n - eb, 0), entry));
     };
@@ -14776,24 +14774,26 @@ LogicalResult StaticFolder::buildSim() {
     auto seenNext = backedges.get(b.getI1Type());
     rb.seen = resetReg(seenNext, prefix + "_seen", 0);
     seenNext.setValue(comb::OrOp::create(b, rb.seen, eq(at, ii - 1)));
-    Value uentry2 = eb ? reg(table(b, at, plan.useEntry, eb), prefix + "_uentry2")
-                       : constant(1, 0);
+    Value uentry2 = reg(table(b, at, plan.useEntry, eb), prefix + "_uentry2");
     Value skip2 = reg(comb::AndOp::create(b, table(b, at, plan.useCross, 1), notOf(rb.seen)),
                       prefix + "_skip2");
     Value skip1 = reg(skip2, prefix + "_skip1");
-    // The prefetches, now.
-    auto chain3r = [&](Value v, const Twine &n) {
-      return resetReg(resetReg(resetReg(v, n + "2", 0), n + "1", 0), n + "0", 0);
+    // The prefetches, now: {instance, entry} and the position (the entry's
+    // owner).
+    auto chain3 = [&](Value v, const Twine &n) {
+      return reg(reg(reg(v, n + "2"), n + "1"), n + "0");
     };
-    rb.pref0 = chain3r(table(b, at, plan.prefValid, 1), prefix + "_pref");
-    rb.pinst0 = idxWidth ? reg(reg(reg(table(b, at, plan.prefInst, idxWidth), prefix + "_pinst2"),
-                                   prefix + "_pinst1"),
-                               prefix + "_pinst0")
+    rb.pref0 = resetReg(resetReg(resetReg(table(b, at, plan.prefValid, 1), prefix + "_pref2", 0),
+                                 prefix + "_pref1", 0),
+                        prefix + "_pref0", 0);
+    rb.pinst0 = idxWidth ? chain3(table(b, at, plan.prefInst, idxWidth), prefix + "_pinst")
                          : constant(1, 0);
+    rb.pentry0 = chain3(table(b, at, plan.prefEntry, eb), prefix + "_pentry");
+    Value pq0 = chain3(at, prefix + "_pq");
     Value irspValid = body->getArgument(image.firstInput);
-    Value irspInst = body->getArgument(image.firstInput + 1);
+    Value irspEntry = b.createOrFold<comb::ExtractOp>(
+        b.getIntegerType(eb), body->getArgument(image.firstInput + 1), 1);
     Value irspData = body->getArgument(image.firstInput + 2);
-    Value irspEntry = byInst(irspInst);
     auto ring = seq::FirMemOp::create(
         b, seq::FirMemType::get(context, plan.entries, vm.dataWidth, 1),
         /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old, seq::WUW::Undefined,
@@ -14801,28 +14801,25 @@ LogicalResult StaticFolder::buildSim() {
         StringAttr{}, Attribute{});
     seq::FirMemWriteOp::create(b, ring, irspEntry, hostClock, irspValid, irspData, Value{});
     Value data = seq::FirMemReadOp::create(b, ring, uentry2, hostClock, constant(1, 1));
-    // Landed entries: set by an answer (the entry's owner its instance),
-    // cleared by the instance's last use of the frame, now.
+    // Landed entries: set by an answer, cleared by a prefetch's issue and by
+    // its group's last use, now; each entry's owner, the position of the
+    // prefetch that took it last.
     Value last0 = resetReg(resetReg(resetReg(table(b, at, plan.useLast, 1), prefix + "_last2", 0),
                                     prefix + "_last1", 0),
                            prefix + "_last0", 0);
     Value uentry0 = reg(reg(uentry2, prefix + "_uentry1"), prefix + "_uentry0");
     auto landedNext = backedges.get(b.getIntegerType(plan.entries));
     rb.landed = resetReg(landedNext, prefix + "_landed", 0);
+    Value cleared = comb::OrOp::create(b, bitOf(last0, uentry0), bitOf(rb.pref0, rb.pentry0));
     landedNext.setValue(comb::AndOp::create(
         b, comb::OrOp::create(b, rb.landed, bitOf(irspValid, irspEntry)),
-        comb::XorOp::create(b, bitOf(last0, uentry0), constant(plan.entries, ~0ull))));
-    // Shared entries: each one's instance, for the uses' check.
-    if (idxWidth && plan.entries < cls.threads()) {
-      rb.owner = seq::FirMemOp::create(
-          b, seq::FirMemType::get(context, plan.entries, idxWidth, 1),
-          /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
-          b.getStringAttr(prefix + "_owner"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
-          StringAttr{}, Attribute{});
-      seq::FirMemWriteOp::create(
-          b, rb.owner, irspEntry, hostClock, irspValid,
-          b.createOrFold<comb::ExtractOp>(b.getIntegerType(idxWidth), irspInst, 0), Value{});
-    }
+        comb::XorOp::create(b, cleared, constant(plan.entries, ~0ull))));
+    rb.owner = seq::FirMemOp::create(
+        b, seq::FirMemType::get(context, plan.entries, hw::getBitWidth(at.getType()), 1),
+        /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
+        b.getStringAttr(prefix + "_owner"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+        StringAttr{}, Attribute{});
+    seq::FirMemWriteOp::create(b, rb.owner, rb.pentry0, hostClock, rb.pref0, pq0, Value{});
     // The image's writes: the memory's answers, a host cycle on.
     rb.wv = resetReg(body->getArgument(main.firstInput), prefix + "_wv", 0);
     Value minst = body->getArgument(main.firstInput + 1);
@@ -16801,19 +16798,16 @@ LogicalResult StaticFolder::buildSim() {
                              idxWidth);
           terms.push_back(comb::OrOp::create(b, notOf(pv), notOf(pbit)));
           Value uv = table(b, next, plan.useValid, 1);
-          Value uinst = idxWidth ? table(b, next, plan.useInst, idxWidth) : Value();
-          Value entry = eb ? table(b, next, plan.useEntry, eb) : Value();
+          Value entry = table(b, next, plan.useEntry, eb);
           Value seen = comb::OrOp::create(b, rb.seen, eq(posD, ii - 1));
           Value skip = comb::AndOp::create(b, table(b, next, plan.useCross, 1), notOf(seen));
           Value landed = bitAt(rb.landed, plan.entries, entry, eb);
-          if (rb.owner)
-            landed = comb::AndOp::create(
-                b, landed,
-                comb::ICmpOp::create(
-                    b, comb::ICmpPredicate::eq,
-                    seq::FirMemReadOp::create(b, rb.owner, entry ? entry : constant(1, 0),
-                                              hostClock, constant(1, 1)),
-                    uinst));
+          landed = comb::AndOp::create(
+              b, landed,
+              comb::ICmpOp::create(
+                  b, comb::ICmpPredicate::eq,
+                  seq::FirMemReadOp::create(b, rb.owner, entry, hostClock, constant(1, 1)),
+                  table(b, next, plan.useOwner, posWidth)));
           terms.push_back(comb::OrOp::create(b, ValueRange{notOf(uv), skip, landed}, false));
           continue;
         }
@@ -16997,8 +16991,13 @@ LogicalResult StaticFolder::buildSim() {
       // `vmem-rings`: the prefetches' reads (row 0 of each instance) and the
       // answers' writes.
       auto &rb = ringBuilt.at({v.cls, v.k});
-      results.append({rb.pref0, rb.pinst0, constant(1, 0), rb.wv, rb.winst,
-                      constant(1, 0), rb.wdata, constant(1, 1)});
+      unsigned eb = llvm::Log2_32_Ceil(classes[v.cls].ring->entries);
+      results.append(
+          {rb.pref0,
+           b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 0), rb.pentry0, constant(1, 0)}),
+           rb.pinst0, rb.wv,
+           b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 1), constant(eb, 0), constant(1, 0)}),
+           rb.winst, rb.wdata, constant(1, 1)});
       continue;
     }
     auto &vm = classes[v.cls].virtualMemories[v.k];
@@ -17039,10 +17038,12 @@ LogicalResult StaticFolder::buildSim() {
       auto &vm = cls.virtualMemories[v.k];
       if (v.image) {
         // A ring's image: a row per instance (instances x 1 row).
+        // {write, entry} tags over instance 0, a row per instance.
+        unsigned tags = llvm::Log2_32_Ceil(cls.ring->entries) + 1;
         virtuals.push_back(b.getStringAttr(
-            vm.name + "_img:" + cls.name + ":" +
-            Twine(std::max(llvm::Log2_32_Ceil(cls.threads()), 1u)) + ":1:" +
-            Twine(vm.dataWidth) + ":1:1:" + Twine(cls.threads())));
+            vm.name + "_img:" + cls.name + ":" + Twine(tags + 1) + ":" +
+            Twine(std::max(llvm::Log2_32_Ceil(cls.threads()), 1u)) + ":" +
+            Twine(vm.dataWidth) + ":1:1:1:" + Twine(tags)));
         continue;
       }
       unsigned instWidth =

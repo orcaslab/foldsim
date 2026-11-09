@@ -1097,9 +1097,9 @@ def vmem_groups(vmems, choice, weights=None, kz_bits=0):
         # foldsim_vmem_group keeps one instance for a member's read and write
         # of a host cycle: an off-chip page column (a read of one instance's
         # page and a write of another's in one host cycle) has a controller
-        # of its own.
+        # of its own, as has a memory with tagged requests (its tags are its own).
         keys.setdefault((v['class'], v['instances'], v['inst_width'], v['row_bytes'],
-                         v['read_first'], k if v.get('pages') else -1), []).append(k)
+                         v['read_first'], k if v.get('pages') or v.get('tag_width') else -1), []).append(k)
     groups, offset = [], 0
     for ks in vmem_partition(vmems, list(keys.values()), choice, weights):
         first = vmems[ks[0]]
