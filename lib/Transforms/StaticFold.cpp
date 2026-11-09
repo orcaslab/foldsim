@@ -188,6 +188,11 @@ struct Class {
   unsigned ppResident = 0;
   /// Column-granular instead: the columns kept on chip whole (0: none).
   unsigned ppResidentColumns = 0;
+  /// Its on-chip columns split over the RAM kinds (state-scratch per kind):
+  /// the first ppUltraColumns in ultra RAM, the others in block RAM
+  /// (ppMixed; else all in sirStyle's).
+  bool ppMixed = false;
+  unsigned ppUltraColumns = 0;
   SmallVector<uint8_t> ppStreamed;
   SmallVector<unsigned> residentSlot;
   /// The PP build's counts (rows, columns, captures, holds, hazards).
@@ -446,7 +451,7 @@ public:
   /// The device's block RAM bits (state-scratch-device-block-bits; the
   /// ultra RAM's are stateScratchDeviceBits), and auto's room left in each
   /// kind for the rows (ultra, block).
-  uint64_t stateScratchDeviceBlockBits = 0;
+  uint64_t stateScratchDeviceBlockBits = 0, stateScratchReserveUltra = 10000000;
   uint64_t scratchLeft[2] = {0, 0};
   /// auto: the scratch from the device, before the fold stores take theirs
   /// (computed once, before the folded pipelines are planned).
@@ -11238,22 +11243,21 @@ void StaticFolder::autoScratch() {
         inUltra += bits;
     }
   }
-  // Per kind: the memories in theirs, the reserve shared as the kinds'
-  // bits (links past link-ultra-depth go to ultra RAM too).
+  // Per kind: the memories in theirs, and each kind's reserve (block RAM:
+  // links, read buffers, windows, the folded pipelines' smaller stores;
+  // ultra RAM: deep links).
   auto less = [](uint64_t a, uint64_t b) { return a > b ? a - b : 0; };
-  uint64_t device = stateScratchDeviceBits + stateScratchDeviceBlockBits;
-  uint64_t ultraReserve =
-      device ? uint64_t(double(stateScratchReserve) * stateScratchDeviceBits / device) : 0;
+  uint64_t ultraReserve = stateScratchReserveUltra;
   scratchLeft[0] = less(stateScratchDeviceBits, inUltra + ultraReserve);
   scratchLeft[1] = less(stateScratchDeviceBlockBits,
-                        memories - inUltra + stateScratchReserve - ultraReserve);
+                        memories - inUltra + stateScratchReserve);
   stateScratchBits = scratchLeft[0] + scratchLeft[1];
   llvm::errs() << "foldsim-fold-static: state-scratch: auto " << stateScratchBits
                << " bits (ultra " << scratchLeft[0] << ", block " << scratchLeft[1]
                << "): the device's ultra " << stateScratchDeviceBits << " and block "
                << stateScratchDeviceBlockBits << " less the models' memories on chip "
                << memories << " (" << inUltra << " ultra) and the reserve "
-               << stateScratchReserve << " (" << ultraReserve << " ultra)\n";
+               << stateScratchReserve << " block, " << ultraReserve << " ultra\n";
 }
 
 LogicalResult StaticFolder::planScratch() {
@@ -11308,6 +11312,11 @@ LogicalResult StaticFolder::planScratch() {
       // Its columns: P rows (a power of two) an instance, 72 bits each.
       item.rowsPow = llvm::PowerOf2Ceil(cls.pp);
       item.columns = llvm::divideCeil(llvm::divideCeil(cls.rowStateBits, cls.pp), 72);
+      // Per kind, the columns as packed: the row packing (dependency groups,
+      // byte runs) adds 5-16 % to the bits' columns (b4e 15 %, small 5 %,
+      // e1 9 %): priced at 12 % more, so that the kinds' RAM holds them.
+      if (perKind)
+        item.columns = llvm::divideCeil(item.columns * 112, 100);
       item.entries = entries;
       item.bits = ramCost(entries * item.rowsPow, item.columns, item.ultra);
       item.pp = true;
@@ -11368,6 +11377,25 @@ LogicalResult StaticFolder::planScratch() {
       if (!perKind)
         break;
     }
+    // Per kind, a PP class neither kind holds whole: its columns over both,
+    // ultra RAM first, then block RAM.
+    if (!placed && perKind && item->pp) {
+      uint64_t rows = item->entries * item->rowsPow;
+      uint64_t perU = ramCost(rows, 1, true), perB = ramCost(rows, 1, false);
+      uint64_t u = std::min<uint64_t>(item->columns, left[0] / perU);
+      uint64_t k = std::min<uint64_t>(item->columns - u, left[1] / perB);
+      if (u + k == item->columns) {
+        left[0] -= u * perU;
+        left[1] -= k * perB;
+        resident += u * perU + k * perB;
+        cls.ppMixed = true;
+        cls.ppUltraColumns = unsigned(u);
+        llvm::errs() << "foldsim-fold-static: state-scratch: " << cls.name
+                     << ": its rows on chip in " << u << " ultra and " << k
+                     << " block RAM columns\n";
+        continue;
+      }
+    }
     if (placed)
       continue;
     ++streamedClasses;
@@ -11409,15 +11437,30 @@ LogicalResult StaticFolder::planScratch() {
       // Column-granular where it streams fewer bits (a RAM's depth holds
       // every instance's rows: fewer instances save no primitive): whole
       // columns on chip, in the kind with the more room.
-      uint64_t perColumn = ramCost(item->entries * item->rowsPow, 1, ultra);
-      unsigned cols = perColumn ? unsigned(std::min<uint64_t>(l / perColumn,
-                                                              item->columns - 1))
-                                : 0;
+      // Per kind, ultra RAM columns first, then block RAM ones.
+      uint64_t rows = item->entries * item->rowsPow;
+      uint64_t perU = ramCost(rows, 1, true), perB = ramCost(rows, 1, false);
+      uint64_t u = 0, k = 0;
+      if (perKind) {
+        u = std::min<uint64_t>(item->columns - 1, left[0] / perU);
+        k = std::min<uint64_t>(item->columns - 1 - u, left[1] / perB);
+      } else {
+        uint64_t per = ultra ? perU : perB;
+        (ultra ? u : k) = per ? std::min<uint64_t>(item->columns - 1, l / per) : 0;
+      }
+      unsigned cols = unsigned(u + k);
       if (uint64_t(item->columns - cols) * n < uint64_t(n - keepCount) * item->columns) {
         cls.ppResidentColumns = cols;
-        cls.sirStyle = ultra ? "ultra" : "block";
-        uint64_t kept = uint64_t(cols) * perColumn;
-        l -= std::min(l, kept);
+        cls.sirStyle = u ? "ultra" : "block";
+        cls.ppMixed = perKind;
+        cls.ppUltraColumns = unsigned(u);
+        uint64_t kept = u * perU + k * perB;
+        if (perKind) {
+          left[0] -= std::min(left[0], u * perU);
+          left[1] -= std::min(left[1], k * perB);
+        } else {
+          l -= std::min(l, kept);
+        }
         resident += kept;
         uint64_t streamedBits = uint64_t(item->columns - cols) * n * item->rowsPow * 72;
         streamed += streamedBits;
@@ -11425,7 +11468,7 @@ LogicalResult StaticFolder::planScratch() {
                      << item->columns - cols << " of " << item->columns
                      << " columns' PP rows (" << streamedBits
                      << " bits) stream from HBM, " << cols << " on chip ("
-                     << cls.sirStyle << ")\n";
+                     << u << " ultra, " << k << " block)\n";
         continue;
       }
     }
@@ -11577,6 +11620,9 @@ LogicalResult StaticFolder::chooseStreamWindows() {
     // (The columns as planned; the packing may add a few.)
     unsigned columns =
         unsigned(llvm::divideCeil(llvm::divideCeil(cls.rowStateBits, P), 72));
+    // (Priced as planScratch prices them: per kind, as packed.)
+    if (stateScratchDeviceBits)
+      columns = unsigned(llvm::divideCeil(uint64_t(columns) * 112, 100));
     columns -= std::min(columns - 1, cls.ppResidentColumns);
     uint64_t bits = 0;
     for (unsigned k = 0, e = ppChunks(columns); k < e; ++k) {
@@ -13666,7 +13712,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     // request's byte enables).
     bool hbm = cls.ppHbm;
     bool masked = llvm::any_of(ppRegs, [](auto &r) { return r.enabled; });
-    unsigned grain = masked ? (kind == "ultra" || hbm ? 8 : 9) : 1;
+    unsigned grain = masked ? (kind == "ultra" || hbm || cls.ppMixed ? 8 : 9) : 1;
     auto bits = [&](unsigned width) { return b.getIntegerType(width); };
     auto enableOf = [&](unsigned k) {
       return ppRegs[k].enabled ? rowValues[2 * k + 1] : Value();
@@ -13808,7 +13854,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           b, memType, /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old,
           seq::WUW::Undefined, b.getStringAttr("pp_col" + Twine(c)),
           hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
-      setRamStyle(col.memory, streams ? StringRef("block") : kind);
+      setRamStyle(col.memory,
+                  streams ? StringRef("block")
+                  : cls.ppMixed ? StringRef(c < cls.ppUltraColumns ? "ultra" : "block")
+                                : kind);
       Value data = seq::FirMemReadOp::create(
           b, col.memory, streams ? groups.back().readAddr : groups.back().instRead,
           hostClock, one());
@@ -13936,9 +13985,11 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                  << " columns x " << uint64_t(hbm ? slotsPow : entries) * rowsPow
                  << " rows ("
                  << (hbm ? StringRef("block") : kind) << ")"
-                 << (hbm && rc ? ", " + std::to_string(rc) + " of them on chip (" +
-                                     kind.str() + ")"
-                               : std::string())
+                 << (hbm && rc ? ", " + std::to_string(rc) + " of them on chip" : std::string())
+                 << (cls.ppMixed ? " (" + std::to_string(std::min(rc, cls.ppUltraColumns)) +
+                                       " ultra, the others block)"
+                     : hbm && rc ? " (" + kind.str() + ")"
+                                 : std::string())
                  << ", " << groups.size() << " control groups\n";
   }
 
@@ -18399,6 +18450,7 @@ void FoldStaticPass::runOnOperation() {
   folder.stateScratchPartial = stateScratchPartial;
   folder.stateScratchDeviceBits = stateScratchDeviceBits;
   folder.stateScratchDeviceBlockBits = stateScratchDeviceBlockBits;
+  folder.stateScratchReserveUltra = stateScratchReserveUltra;
   folder.stateScratchReserve = stateScratchReserve;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;

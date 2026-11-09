@@ -890,10 +890,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "With state-scratch-device-bits (the ultra RAM's): the device's "
            "block RAM bits at the placer's fill. The scratch is budgeted per "
            "kind: a class's rows go in its style's RAM, else the other's">,
-    Option<"stateScratchReserve", "state-scratch-reserve", "uint64_t", "30000000",
-           "With state-scratch-device-bits: bits kept from the scratch for "
-           "what the fold places after it (link memories, read buffers and "
-           "rings, the landing windows, the shell)">,
+    Option<"stateScratchReserve", "state-scratch-reserve", "uint64_t", "45000000",
+           "With state-scratch-device-bits: block RAM bits kept from the "
+           "scratch for what the fold places after it (link memories, read "
+           "buffers and rings, the landing windows, the folded pipelines' "
+           "smaller stores; 44 Mbit in e1's A100-sized 128-SM fold)">,
+    Option<"stateScratchReserveUltra", "state-scratch-reserve-ultra", "uint64_t",
+           "10000000",
+           "With state-scratch-device-bits: ultra RAM bits kept from the "
+           "scratch for what the fold places after it (deep link memories)">,
     Option<"stateScratchPartial", "state-scratch-partial", "bool", "true",
            "With state-scratch-bits: a state-in-ram-pp class past the scratch "
            "keeps the instances the rest of the scratch holds resident (in "

@@ -484,14 +484,19 @@ def frame_options(a):
         # The device's on-chip RAM at the placer's fill: the fold pass takes
         # the other memories it places off it (state-scratch-device-bits).
         uram, bram = region_ram_bits(check_region(a)) if getattr(a, 'static', False) else (0, 0)
+        if getattr(a, 'state_scratch_device', ''):
+            uram, bram = (int(x) for x in a.state_scratch_device.split(','))
         if uram or bram:
             fold += f' state-scratch-device-bits={uram} state-scratch-device-block-bits={bram}'
     elif scratch is not None:
         fold += f' state-scratch-bits={int(scratch)}'
     if getattr(a, 'state_stream_window', 0):
         fold += f' state-stream-window={a.state_stream_window}'
-    if getattr(a, 'state_scratch_reserve', 0):
-        fold += f' state-scratch-reserve={a.state_scratch_reserve}'
+    if getattr(a, 'state_scratch_reserve', ''):
+        block, _, ultra = str(a.state_scratch_reserve).partition(',')
+        fold += f' state-scratch-reserve={int(block)}'
+        if ultra:
+            fold += f' state-scratch-reserve-ultra={int(ultra)}'
     if getattr(a, 'state_scratch_whole', False):
         fold += ' state-scratch-partial=false'
     return fold
@@ -1521,10 +1526,13 @@ def build_parser():
                          'state-scratch-bits). auto (default): the region\'s block and ultra RAM at the placer\'s '
                          'fill, less the other memories the fold places on chip and state-scratch-reserve '
                          '(foldsim-fold-static state-scratch-device-bits); 250,000,000 without a region')
-    ap.add_argument('--state-scratch-reserve', type=int, default=0, metavar='N',
-                    help='with --state-scratch-bits auto: on-chip RAM bits kept from the scratch for what the '
-                         'fold places after it (links, rings, read buffers, the shell; foldsim-fold-static '
-                         'state-scratch-reserve; 0: its default)')
+    ap.add_argument('--state-scratch-device', default='', metavar='URAM,BRAM',
+                    help='with --state-scratch-bits auto: the ultra and block RAM bits the scratch is taken from, '
+                         'in place of the region\'s at the placer\'s fill (a smaller device, or a test)')
+    ap.add_argument('--state-scratch-reserve', default='', metavar='BLOCK[,ULTRA]',
+                    help='with --state-scratch-bits auto: block (and ultra) RAM bits kept from the scratch for what '
+                         'the fold places after it (links, rings, read buffers, the shell; foldsim-fold-static '
+                         'state-scratch-reserve / state-scratch-reserve-ultra; default 45,000,000 and 10,000,000)')
     ap.add_argument('--state-scratch-whole', action='store_true',
                     help='with --state-scratch-bits: a PP class past the scratch streams whole (default: the '
                          'instances the rest of the scratch holds stay resident; foldsim-fold-static '
