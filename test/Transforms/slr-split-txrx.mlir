@@ -4,11 +4,14 @@
 // (a copy of `a`, its own) and a receive register in part 1, both
 // USER_SLL_REG and DONT_TOUCH: part 1 runs a host cycle late (lag 1). Its
 // other inputs (`y`, the instance counter's value) are aligned by a register
-// each; its memory's write (lag 1) lands a host cycle after its read is
-// taken (lag 0), within the slack. Every output is 2 host cycles late (the
+// each; its memory (a combinational read, rows by the fold's instance
+// counter: elastic) has its write (lag 1) land a host cycle after its read is
+// taken (lag 0), within the slack. A memory read through a register (a store
+// read ahead of its pass) or addressed by data keeps them in step. Every output is 2 host cycles late (the
 // class's split-latency): part 1's `b` by one more register, the read and the
 // counter by two.
 
+// CHECK: foldsim-slr-split: crossing=txrx: 1 memories elastic (addressed by the fold's control), 0 in step
 // CHECK: foldsim-slr-split: crossing=txrx: 1 send and 1 receive registers (4 bits), 7 alignment registers; outputs 2 host cycles late (the most lag 1)
 // CHECK-LABEL: hw.module private @copy_p0(
 // CHECK:         %a = seq.firreg %[[X:.+]] clock %clk : i4
@@ -33,7 +36,7 @@ hw.module @copy(in %clk : !seq.clock, in %x : i4, in %y : i4, out b : i4, out rd
   %a = seq.firreg %1 clock %clk : i4
   %2 = comb.add %a, %y : i4
   %b = seq.firreg %2 clock %clk : i4
-  %mem = seq.firmem 1, 1, undefined, undefined : <16 x 4>
+  %mem = seq.firmem 0, 1, undefined, undefined : <16 x 4>
   seq.firmem.write_port %mem[%inst] = %b, clock %clk : <16 x 4>
   %rd = seq.firmem.read_port %mem[%inst], clock %clk : <16 x 4>
   hw.output %b, %rd, %inst : i4, i4, i4

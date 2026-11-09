@@ -216,11 +216,57 @@ LogicalResult SlrSplitPass::registerCrossings(hw::HWModuleOp module,
       edges.push_back({unsigned(from), unsigned(to), need(operand, op)});
     }
   }
+  // A memory is elastic (its writes may land up to `slack` later than its
+  // reads are taken) when it is read combinationally and every port's address
+  // is the fold's control: rows by instance (copied control, wiring of it,
+  // constants), each row read again only at its instance's next evaluation. Any other memory (a target
+  // RAM addressed by data, a buffer read soon after its write) keeps its
+  // writes and reads in step.
+  auto controlOnly = [&](Value v) {
+    SmallVector<Value> work{v};
+    DenseSet<Value> seen;
+    while (!work.empty()) {
+      Value x = work.pop_back_val();
+      if (!seen.insert(x).second)
+        continue;
+      auto *def = x.getDefiningOp();
+      if (!def)
+        return false;
+      if (isConstant(def) || partOf.lookup(def) < 0)
+        continue;
+      if (!isWiring(def))
+        return false;
+      for (auto operand : def->getOperands())
+        work.push_back(operand);
+    }
+    return true;
+  };
+  unsigned elastic = 0, rigid = 0;
   for (auto &[memory, w] : writeVar) {
     unsigned r = var[memory];
+    // A store read through a register (block or ultra RAM) is read ahead of
+    // its pass, as close after its row's write as the schedule allows
+    // (fold-store-lead): never elastic.
+    bool isElastic = cast<seq::FirMemOp>(memory).getReadLatency() == 0;
+    for (auto *user : memory->getUsers()) {
+      Value address;
+      if (auto read = dyn_cast<seq::FirMemReadOp>(user))
+        address = read.getAddress();
+      else if (auto write = dyn_cast<seq::FirMemWriteOp>(user))
+        address = write.getAddress();
+      else {
+        isElastic = false;
+        break;
+      }
+      isElastic &= controlOnly(address);
+    }
+    (isElastic ? elastic : rigid)++;
     edges.push_back({r, w, 0});
-    edges.push_back({w, r, -int(slack)});
+    edges.push_back({w, r, isElastic ? -int(slack) : 0});
   }
+  llvm::errs() << "foldsim-slr-split: crossing=txrx: " << elastic
+               << " memories elastic (addressed by the fold's control), "
+               << rigid << " in step\n";
   // Longest paths from 0 (every lag at least 0); a lag past `latency` plus
   // the slack has gone round a positive cycle.
   SmallVector<int> lag(n, 0);
