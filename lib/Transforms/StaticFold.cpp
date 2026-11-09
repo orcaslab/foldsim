@@ -15645,7 +15645,8 @@ LogicalResult StaticFolder::buildSim() {
   unsigned linkReads = 0, forwardedReads = 0, forwardedAfter = 0, nowReads = 0,
            lateReads = 0, forwardedLate = 0, compactReads = 0, stagedReads = 0,
            syncReads = 0, earlyReads = 0, pagedReads = 0, streamReads = 0,
-           stagedDirectReads = 0, singleReads = 0, doubleReads = 0;
+           stagedDirectReads = 0, singleReads = 0, doubleReads = 0,
+           partialStreamReads = 0;
   uint64_t singleBits = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
@@ -16353,25 +16354,18 @@ LogicalResult StaticFolder::buildSim() {
             if (!anyKept) {
               hbmSkip = true;
             } else if (anyRest) {
-              bool restCross = to >= 0 && slrOf[producer.cls] != to;
-              bool restNow = zeroLink(key.first, c, consumer.port) &&
-                             takesNow(key.first, c, rest, rows);
-              bool restForward =
-                  oneCycleLinks &&
-                  (restCross || needsForward(key.first, c, rest, rows));
               hbmSkip = true;
-              if (!restNow && !restForward) {
-                auto [atSlot, ahead] = hbmRegisters(pm->second, mine);
-                auto &ph = partialHbm[index];
-                ph.atSlot = atSlot;
-                ph.ahead = ahead;
-                ph.mine.assign(mine.begin(), mine.end());
-                ++streamReads;
-                takes.assign(rest.begin(), rest.end());
-                for (unsigned i = 0; i < threads; ++i)
-                  if (!takes[i])
-                    rows[i] = 0;
-              }
+              auto [atSlot, ahead] = hbmRegisters(pm->second, mine);
+              auto &ph = partialHbm[index];
+              ph.atSlot = atSlot;
+              ph.ahead = ahead;
+              ph.mine.assign(mine.begin(), mine.end());
+              ++streamReads;
+              ++partialStreamReads;
+              takes.assign(rest.begin(), rest.end());
+              for (unsigned i = 0; i < threads; ++i)
+                if (!takes[i])
+                  rows[i] = 0;
             }
           }
         }
@@ -16662,12 +16656,23 @@ LogicalResult StaticFolder::buildSim() {
                              after ? &sourceAfter[index] : nullptr, late,
                              forwardLate, kept, style, 0, nullptr, single);
       }
-      // csf-mailbox-hbm: the stream's value for the instances it carries.
+      // csf-mailbox-hbm: the stream's value for the instances it carries;
+      // the on-chip rest's takes in the slot and forwards past the read
+      // register (address compares) for its own instances alone.
       for (auto &[index, ph] : partialHbm) {
         Value pick = syncPart ? table(b, ctl.inst, ph.mine, 1)
                               : table(b, ctl.inst1, ph.mine, 1);
         sourceData[index] = comb::MuxOp::create(
             b, pick, syncPart ? ph.atSlot : ph.ahead, sourceData[index]);
+        SmallVector<uint64_t> others(ph.mine.size());
+        for (size_t i = 0; i < others.size(); ++i)
+          others[i] = !ph.mine[i];
+        if (sourceNow[index].first)
+          sourceNow[index].first = comb::AndOp::create(
+              b, sourceNow[index].first, table(b, ctl.inst, others, 1));
+        for (auto &piece : sourceAfter[index])
+          piece.hit = comb::AndOp::create(b, piece.hit,
+                                          table(b, ctl.inst1, others, 1));
       }
       if (syncPart) {
         // Registered already: wired around the read register.
@@ -17072,6 +17077,8 @@ LogicalResult StaticFolder::buildSim() {
       os << "; paged " << pagedReads;
     if (streamReads)
       os << "; hbm " << streamReads;
+    if (partialStreamReads)
+      os << " (" << partialStreamReads << " of some reader instances)";
     os << "\n";
     reportPageEngines(os);
     llvm::errs() << os.str();
