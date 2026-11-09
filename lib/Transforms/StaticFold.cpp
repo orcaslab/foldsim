@@ -18,6 +18,7 @@
 #include "CsfReadySplit.h"
 #include "SlotSequencer.h"
 #include "AffineSlots.h"
+#include "PosCounters.h"
 #include "FAME5.h"
 #include "PassSplit.h"
 #include "Pipelines.h"
@@ -10343,6 +10344,18 @@ static uint64_t gMaxTableBits = 1000000;
 /// `slot-segments`: a slot table of at most this many affine segments is a
 /// decoder of its index (SlotSequencer.cpp), not a constant (0: tables).
 static unsigned gSlotSegments = 0;
+/// `rows[index]` as a slot-segments decoder (through the position counters
+/// where the index is the frame's position), or null if it does not decode.
+static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
+                            ArrayRef<uint64_t> rows, unsigned width);
+/// While the simulator is built: the classes' pass sequences (each pass
+/// kind of each class of several instances) and the frame, for position
+/// tables that do not decode to be read through one (slot-segments).
+static SmallVector<foldsim::PassSequence> gPassSeqs;
+static unsigned gPassII = 0;
+static bool gFactoring = false;
+/// A table built as a constant whatever slot-segments could make of it.
+static bool gTableRaw = false;
 
 /// The regions sharing a copy of the slot controls two host cycles ahead.
 static constexpr unsigned kRegionsPerGroup = 16;
@@ -16267,10 +16280,44 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     const char *env = getenv("FOLDSIM_SLOT_MIN_INDEX_BITS");  // a test hook
     return env ? atoi(env) : 7;
   }();
-  if (gSlotSegments && int(indexWidth) >= minIndexBits) {
-    if (Value decoded =
-            foldsim::decodeSlotTable(b, index, rows, width, gSlotSegments))
+  if (gSlotSegments && !gTableRaw && int(indexWidth) >= minIndexBits) {
+    auto *pc = foldsim::currentPosCounters();
+    bool counted = pc && pc->knows(index);
+    if (Value decoded = foldsim::decodeSlotTable(
+            b, index, rows, width, gSlotSegments,
+            counted ? llvm::function_ref<std::pair<Value, Value>(unsigned)>(
+                          [&](unsigned d) { return pc->divmod(b, index, d); })
+                    : nullptr))
       return decoded;
+    // A position table through a class's pass sequence: the sequence's
+    // passes and instance at p + offset (position tables, the same for every
+    // table of that class and offset, so one after CSE) and the table's
+    // value per instance (an instance table). An HBM link stream's landing,
+    // request and use rows of a reader are such tables.
+    foldsim::SequenceFactor fac;
+    if (!gFactoring && gPassII && rows.size() == gPassII + 1 &&
+        foldsim::factorThroughSequence(rows, width, gPassII, gPassSeqs, fac)) {
+      gFactoring = true;
+      auto &seq = gPassSeqs[fac.seq];
+      unsigned ii = gPassII;
+      unsigned iw = std::max(1u, llvm::Log2_32_Ceil(std::max(seq.instances, 2u)));
+      SmallVector<uint64_t> valid(ii + 1, 0), inst(ii + 1, 0);
+      for (unsigned p = 0; p < ii; ++p) {
+        int i = seq.instAt[(p + fac.offset) % ii];
+        if (i >= 0) {
+          valid[p] = 1;
+          inst[p] = unsigned(i);
+        }
+      }
+      Value hit = table(b, index, valid, 1);
+      Value at = table(b, index, inst, iw);
+      Value v = table(b, at, fac.perInstance, width);
+      gFactoring = false;
+      auto &st = foldsim::slotSequencerStats();
+      ++st.factored;
+      st.factoredBits += (uint64_t(1) << indexWidth) * width;
+      return comb::MuxOp::create(b, hit, v, hw::ConstantOp::create(b, type, 0));
+    }
     auto segs = foldsim::slotSegments(rows, width);
     foldsim::countFallback(indexWidth, width, segs.size());
     if (getenv("FOLDSIM_AFFINE_LOG")) {
@@ -16327,6 +16374,19 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     hi = lo;
   }
   return b.createOrFold<comb::ConcatOp>(parts);
+}
+
+static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
+                            ArrayRef<uint64_t> rows, unsigned width) {
+  if (!gSlotSegments)
+    return {};
+  auto *pc = foldsim::currentPosCounters();
+  bool counted = pc && pc->knows(index);
+  return foldsim::decodeSlotTable(
+      b, index, rows, width, gSlotSegments,
+      counted ? llvm::function_ref<std::pair<Value, Value>(unsigned)>(
+                    [&](unsigned d) { return pc->divmod(b, index, d); })
+              : nullptr);
 }
 
 void StaticFolder::buildFrameTable(bool stalls) {
@@ -16553,6 +16613,30 @@ void StaticFolder::offerMailboxLinks(
 }
 
 LogicalResult StaticFolder::buildSim() {
+  // slot-segments: each class's pass sequences, for position tables that
+  // read through one (table()).
+  gPassSeqs.clear();
+  gPassII = gSlotSegments ? ii : 0;
+  llvm::scope_exit clearSeqs([&] {
+    gPassSeqs.clear();
+    gPassII = 0;
+  });
+  if (gPassII)
+    for (auto &cls : classes) {
+      if (cls.threads() < 2)
+        continue;
+      auto add = [&](ArrayRef<int> slots) {
+        foldsim::PassSequence seq;
+        seq.instAt.assign(ii, -1);
+        seq.instances = cls.threads();
+        for (unsigned i = 0; i < cls.threads(); ++i)
+          seq.instAt[unsigned(((slots[i] % int(ii)) + int(ii)) % int(ii))] = int(i);
+        gPassSeqs.push_back(std::move(seq));
+      };
+      add(cls.slot[kState]);
+      for (unsigned l = 0; l < cls.readyLevels; ++l)
+        add(cls.readySlots(l));
+    }
   auto *context = top.getContext();
   auto i1 = IntegerType::get(context, 1);
 
@@ -16801,13 +16885,29 @@ LogicalResult StaticFolder::buildSim() {
   }
   // A position's next: the next slot, or at the frame's end the next frame's
   // first if it starts, else `ii`; with bubbles, itself when not advancing.
+  // slot-segments: the position's quotient and remainder of a period, as
+  // counters beside its registers (PosCounters), for runs of any period.
+  foldsim::PosCounters posCounters;
+  // (`go` and `advance` may be backedges set later: the counters read them
+  // through ops made now, whose operands are replaced when they are set.)
+  if (gSlotSegments) {
+    auto stable = [&](Value v) -> Value {
+      return v ? Value(comb::OrOp::create(b, v, constant(1, 0))) : v;
+    };
+    posCounters.begin(ii, posWidth, hostClock, hostReset, stable(go),
+                      stable(advance));
+  }
+  foldsim::currentPosCounters() = gSlotSegments ? &posCounters : nullptr;
+  llvm::scope_exit dropCounters([&] { foldsim::currentPosCounters() = nullptr; });
   auto nextPosition = [&](Value pos) -> Value {
     Value end = comb::OrOp::create(b, eq(pos, ii - 1), eq(pos, ii));
     Value next = comb::MuxOp::create(
         b, end,
         comb::MuxOp::create(b, go, constant(posWidth, 0), constant(posWidth, ii)),
         comb::AddOp::create(b, pos, constant(posWidth, 1)));
-    return advance ? comb::MuxOp::create(b, advance, next, pos) : next;
+    Value r = advance ? comb::MuxOp::create(b, advance, next, pos) : next;
+    posCounters.addNext(r, pos);
+    return r;
   };
   // The position the slot tables read: `ii` in a bubble. With a short lead
   // the tables read a position as it is decided, so a bubble is this host
@@ -16816,8 +16916,11 @@ LogicalResult StaticFolder::buildSim() {
     return shortLead ? notOf(advance) : resetReg(notOf(advance), regName, 0);
   };
   auto shown = [&](Value pos, Value bubble) -> Value {
-    return advance ? comb::MuxOp::create(b, bubble, constant(posWidth, ii), pos)
-                   : pos;
+    if (!advance)
+      return pos;
+    Value r = comb::MuxOp::create(b, bubble, constant(posWidth, ii), pos);
+    posCounters.addShown(r, pos, bubble);
+    return r;
   };
   // With a short lead the frame is decided a host cycle later, on the
   // position two host cycles ahead: the one three ahead is its next, which
@@ -16830,6 +16933,7 @@ LogicalResult StaticFolder::buildSim() {
     starting = comb::AndOp::create(b, starting, advance);
   Value posDN = nextPosition(posD);
   posDNext.setValue(posDN);
+  posCounters.addReg(posD, posDN);
   auto parDNext = backedges.get(i1);
   Value parD = resetReg(parDNext, shortLead ? "parity2" : "parity3", 1);
   Value parDN = comb::MuxOp::create(b, starting, notOf(parD), parD);
@@ -16841,14 +16945,21 @@ LogicalResult StaticFolder::buildSim() {
   // With bubbles and a short lead, the decision's register is not the
   // position shown a host cycle before: in a bubble it holds.
   Value pos2 = shortLead && !advance ? posD : resetReg(pos3, "pos2", ii);
+  if (pos2 != posD)
+    posCounters.addReg(pos2, pos3);
   Value par2 = shortLead ? parD : reg(parD, "parity2");
   Value pos1 = resetReg(pos2, "pos1", ii), par1 = reg(par2, "parity1");
   Value pos0 = resetReg(pos1, "pos0", ii);
+  posCounters.addReg(pos1, pos2);
+  posCounters.addReg(pos0, pos1);
 
   // Each class's slot table, its instance and passes three host cycles ahead
   // (the table's), two, one, then now.
   struct Controls {
     Value inst3, state3;
+    /// The instance at each position (inst3's rows), for a table read at
+    /// inst3 to be composed into one read at the position.
+    SmallVector<uint64_t> instRow3;
     /// Paged: the instance whose pages are read, from three host cycles
     /// ahead (a page before its state pass). Off chip: each position's page
     /// read [valid, instance, page] and page write [valid, page].
@@ -16909,6 +17020,7 @@ LogicalResult StaticFolder::buildSim() {
           b, load, hostClock, b.getStringAttr(cls.name + "_seq"), hostReset,
           hw::ConstantOp::create(b, type, ii), hw::InnerSymAttr{},
           /*isAsync=*/false, b.getIntegerAttr(type, ii)));
+      posCounters.addReg(sequencer[c], load);
     }
   }
   // Overlapped frames: a slot past the frame runs in the next frame's, for
@@ -16974,6 +17086,7 @@ LogicalResult StaticFolder::buildSim() {
     ctl.ready = reg(ready1, prefix + "_ready0");
     if (threads > 1) {
       ctl.inst3 = table(b, at, instRow, idxWidth);
+      ctl.instRow3.assign(instRow.begin(), instRow.end());
       ctl.inst2 = reg(ctl.inst3, prefix + "_inst2");
       ctl.inst1 = reg(ctl.inst2, prefix + "_inst1");
       ctl.inst = reg(ctl.inst1, prefix + "_inst0");
@@ -17068,6 +17181,7 @@ LogicalResult StaticFolder::buildSim() {
         rctl.pre3 = table(b, at, preRow, 1);
       if (threads > 1) {
         rctl.inst3 = table(b, at, rinstRow, idxWidth);
+        rctl.instRow3.assign(rinstRow.begin(), rinstRow.end());
         rctl.inst2 = reg(rctl.inst3, prefix + "_rinst2");
         rctl.inst1 = reg(rctl.inst2, prefix + "_rinst1");
         rctl.inst = reg(rctl.inst1, prefix + "_rinst0");
@@ -18826,6 +18940,24 @@ LogicalResult StaticFolder::buildSim() {
             return Value();
           if (threads == 1)
             return constant(w, entryRows[0]);
+          // Read at the position itself where that decodes (one decoder,
+          // not the instance's decoder into the rows' adder).
+          if (!ctl.instRow3.empty()) {
+            SmallVector<uint64_t> composed(ctl.instRow3.size());
+            for (auto [p, i] : llvm::enumerate(ctl.instRow3))
+              composed[p] = i < entryRows.size() ? entryRows[i] : 0;
+            if (Value v = tryDecodeTable(b, ctl.at3, composed, w))
+              return copyReg(v, consumer.name + "_addr2_" + Twine(at) + "_" +
+                                    Twine(addressCopies++));
+            // Not decoded: one table of the position, not the instance's
+            // table into a decoder's adder (one table's depth, as before
+            // the decoders).
+            gTableRaw = true;
+            Value v = table(b, ctl.at3, composed, w);
+            gTableRaw = false;
+            return copyReg(v, consumer.name + "_addr2_" + Twine(at) + "_" +
+                                  Twine(addressCopies++));
+          }
           return copyReg(table(b, ctl.inst3, entryRows, w),
                          consumer.name + "_addr2_" + Twine(at) + "_" +
                              Twine(addressCopies++));
@@ -19822,6 +19954,7 @@ LogicalResult StaticFolder::buildSim() {
     Value next = comb::MuxOp::create(
         b, end, constant(posWidth, 0),
         comb::AddOp::create(b, posD, constant(posWidth, 1)));
+    posCounters.addNextFree(next, posD);
     // A table at `next`, read from a register loaded a host cycle before
     // (the lookahead): the readiness a decision waits on no longer chains the
     // position's increment and the table's decoder before the pending bit's
@@ -20988,6 +21121,8 @@ void FoldStaticPass::runOnOperation() {
                  << " table bits replaced), " << st.fallback
                  << " tables kept (" << st.fallbackBits
                  << " bits, at most " << st.fallbackMaxSegments
-                 << " segments)\n";
+                 << " segments), " << st.factored
+                 << " read through a class's passes (" << st.factoredBits
+                 << " bits)\n";
   }
 }

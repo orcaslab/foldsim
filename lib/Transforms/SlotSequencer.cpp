@@ -62,7 +62,7 @@ bool stepOk(uint64_t x, unsigned width) {
 } // namespace
 
 SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
-                                      unsigned maxSegments) {
+                                      unsigned maxSegments, bool anyStride) {
   uint64_t mask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
   size_t n = rows.size();
   auto row = [&](uint64_t k) { return k < n ? rows[k] & mask : 0; };
@@ -116,8 +116,26 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
     SmallVector<uint64_t, 2> starts{k0};
     if (k0 > 0 && !covered[k0 - 1] && row(k0 - 1) == 0)
       starts.push_back(k0 - 1);
+    // The strides tried: the powers of two, and with position counters
+    // (anyStride) the distances to the next live rows (a pass every 5
+    // positions, a block of 3 every 5).
+    SmallVector<uint64_t, 48> strides;
+    for (uint64_t st = 1; st < n - k0; st *= 2)
+      strides.push_back(st);
+    if (anyStride) {
+      unsigned seen = 0;
+      for (uint64_t p = k0 + 1; p < n && seen < 16; ++p)
+        if (row(p)) {
+          ++seen;
+          if (!llvm::isPowerOf2_64(p - k0))
+            strides.push_back(p - k0);
+        }
+    }
     for (uint64_t s : starts)
-      for (uint64_t stride = 1; stride < n - s; stride *= 2) {
+      for (uint64_t stride : strides) {
+        if (stride >= n - s)
+          continue;
+        bool p2 = llvm::isPowerOf2_64(stride);
         SlotSegment seg;
         seg.start = s;
         seg.stride = stride;
@@ -145,9 +163,9 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
             inner = -int64_t(negc);
           else
             continue;
-          uint64_t r = s & (stride - 1), len = 1;
+          uint64_t r = s % stride, len = 1;
           while ((len + 1) * e <= stride && s + len * e < n &&
-                 (e == 1 || r + len * e < stride) && !covered[s + len * e] &&
+                 ((e == 1 && p2) || r + len * e < stride) && !covered[s + len * e] &&
                  row(s + len * e) == ((row(s) + uint64_t(inner) * len) & mask))
             ++len;
           if (len >= 2 && stepOk(d, width)) {
@@ -161,7 +179,7 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
         }
         // A digit of k: bits [shift, shift + bits) of k, the step from the
         // first k whose digit is 1 (stride 1, where no run is long).
-        if (stride == 1 && bestLive < 64)
+        if (stride == 1 && p2 && bestLive < 64)
           for (unsigned shift = 0; shift < 10; ++shift)
             for (unsigned bits = 1; bits <= 10; ++bits) {
               uint64_t k1 = s + (uint64_t(1) << shift);
@@ -199,6 +217,25 @@ static bool decodesExactly(ArrayRef<SlotSegment> segments,
   for (uint64_t idx = 0; idx <= top; ++idx) {
     uint64_t got = 0;
     for (auto &seg : segments) {
+      if (seg.stride > 1 && !llvm::isPowerOf2_64(seg.stride)) {
+        // A period D of the position counters: quotient and remainder.
+        uint64_t d = seg.stride, q = idx / d, rr = idx % d;
+        uint64_t rs = seg.start % d, qs = seg.start / d;
+        unsigned le = llvm::Log2_64(seg.istride);
+        bool hit = idx >= seg.start && idx <= seg.end();
+        if (seg.len == 1)
+          hit &= rr == rs;
+        else
+          hit &= rr >= rs && rr < rs + seg.len * seg.istride &&
+                 (rr & (seg.istride - 1)) == (rs & (seg.istride - 1));
+        if (!hit)
+          continue;
+        uint64_t value = seg.value - uint64_t(seg.step) * qs -
+                         uint64_t(seg.inner) * (rs >> le) +
+                         uint64_t(seg.step) * q + uint64_t(seg.inner) * (rr >> le);
+        got |= value & mask;
+        continue;
+      }
       unsigned a = seg.stride > 1 ? llvm::Log2_64(seg.stride) : 0;
       uint64_t r = a ? seg.start & (seg.stride - 1) : 0;
       bool wraps = seg.len > 1 && r + seg.len > seg.stride;
@@ -264,13 +301,14 @@ static bool decodesExactly(ArrayRef<SlotSegment> segments,
   return true;
 }
 
-Value decodeSlotTable(ImplicitLocOpBuilder &b, Value index,
-                      ArrayRef<uint64_t> rows, unsigned width,
-                      unsigned maxSegments) {
+Value decodeSlotTable(
+    ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+    unsigned width, unsigned maxSegments,
+    function_ref<std::pair<Value, Value>(unsigned)> divmod) {
   unsigned w = hw::getBitWidth(index.getType());
   if (w == 0 || w > 63 || width == 0 || width > 64)
     return {};
-  auto segments = slotSegments(rows, width, maxSegments);
+  auto segments = slotSegments(rows, width, maxSegments, bool(divmod));
   if (segments.size() > maxSegments)
     return {};
   // The decoder's own arithmetic, at every index, against the rows: a
@@ -315,6 +353,69 @@ Value decodeSlotTable(ImplicitLocOpBuilder &b, Value index,
   bool uniform = true;
   for (auto &seg : segments) {
     uint64_t end = seg.end();
+    if (seg.stride > 1 && !llvm::isPowerOf2_64(seg.stride)) {
+      // A period D: the position counters' quotient q and remainder r. The
+      // hit tests the index's range and r's residues; the value is
+      // c0 + step * q + inner * (r >> log2 istride).
+      unsigned d = unsigned(seg.stride), le = llvm::Log2_64(seg.istride);
+      auto [q, rr] = divmod(d);
+      uint64_t rs = seg.start % d, qs = seg.start / d;
+      auto rType = rr.getType();
+      SmallVector<Value> conds;
+      if (seg.start > 0)
+        conds.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge, index,
+                                             constant(indexType, seg.start)));
+      if (end < top)
+        conds.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::ule, index,
+                                             constant(indexType, end)));
+      if (seg.len == 1) {
+        conds.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::eq, rr,
+                                             constant(rType, rs)));
+      } else {
+        if (rs)
+          conds.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge, rr,
+                                               constant(rType, rs)));
+        conds.push_back(comb::ICmpOp::create(
+            b, comb::ICmpPredicate::ult, rr,
+            constant(rType, rs + seg.len * seg.istride)));
+        if (le)
+          conds.push_back(comb::ICmpOp::create(
+              b, comb::ICmpPredicate::eq, comb::ExtractOp::create(b, rr, 0, le),
+              constant(b.getIntegerType(le), rs & (seg.istride - 1))));
+      }
+      hits.push_back(conds.size() == 1 ? conds[0]
+                                       : Value(comb::AndOp::create(b, conds, false)));
+      bool varies = (seg.step != 0 && seg.count > 1) || (seg.inner != 0 && seg.len > 1);
+      Value value = constant(type, seg.value);
+      if (varies) {
+        uniform = false;
+        uint64_t c0 = seg.value - uint64_t(seg.step) * qs -
+                      uint64_t(seg.inner) * (rs >> le);
+        SmallVector<Value> plus, minus;
+        SmallVector<std::pair<bool, unsigned>> terms;
+        if (seg.step && seg.count > 1 &&
+            csdTerms(uint64_t(seg.step), width, kMaxStepTerms, terms))
+          for (auto [neg, sh] : terms)
+            (neg ? minus : plus).push_back(shifted(q, sh));
+        unsigned rw = hw::getBitWidth(rType);
+        if (seg.inner && seg.len > 1 && le < rw) {
+          uint64_t mag = seg.inner < 0 ? uint64_t(-seg.inner) : uint64_t(seg.inner);
+          Value jv = comb::ExtractOp::create(b, rr, le, rw - le);
+          (seg.inner < 0 ? minus : plus).push_back(shifted(jv, llvm::Log2_64(mag)));
+        }
+        SmallVector<Value> sum(plus.begin(), plus.end());
+        for (auto v : minus)
+          sum.push_back(comb::XorOp::create(b, v, constant(type, wmask)));
+        uint64_t c = (c0 + uint64_t(minus.size())) & wmask;
+        if (c || sum.empty())
+          sum.push_back(constant(type, c));
+        value = sum.size() == 1 ? sum[0] : Value(comb::AddOp::create(b, sum, false));
+      } else if (seg.value != segments[0].value) {
+        uniform = false;
+      }
+      values.push_back(value);
+      continue;
+    }
     unsigned a = seg.stride > 1 ? llvm::Log2_64(seg.stride) : 0;
     uint64_t r = a ? seg.start & (seg.stride - 1) : 0;
     // The block's rows within each stride: [r, r + len) of the index's low
@@ -457,6 +558,58 @@ Value decodeSlotTable(ImplicitLocOpBuilder &b, Value index,
     masked.push_back(comb::MuxOp::create(b, hit, value, constant(type, 0)));
   return masked.size() == 1 ? masked[0]
                             : Value(comb::OrOp::create(b, masked, false));
+}
+
+bool factorThroughSequence(ArrayRef<uint64_t> rows, unsigned width,
+                           unsigned ii, ArrayRef<PassSequence> seqs,
+                           SequenceFactor &out) {
+  uint64_t mask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
+  auto row = [&](uint64_t p) { return p < rows.size() ? rows[p] & mask : 0; };
+  if (rows.size() != ii + 1 || row(ii) || ii == 0)
+    return false;
+  SmallVector<unsigned, 8> live;
+  for (unsigned p = 0; p < ii && live.size() < 8; ++p)
+    if (row(p))
+      live.push_back(p);
+  if (live.empty())
+    return false;
+  for (auto [si, seq] : llvm::enumerate(seqs)) {
+    if (seq.instAt.size() != ii)
+      continue;
+    for (unsigned q = 0; q < ii; ++q) {
+      if (seq.instAt[q] < 0)
+        continue;
+      // The first live row on this pass: offset = q - live[0].
+      unsigned o = (q + ii - live[0]) % ii;
+      bool ok = true;
+      for (unsigned p : live)
+        ok &= seq.instAt[(p + o) % ii] >= 0;
+      if (!ok)
+        continue;
+      SmallVector<uint64_t> f(seq.instances, 0);
+      SmallVector<bool> set(seq.instances, false);
+      for (unsigned p = 0; p < ii && ok; ++p) {
+        int i = seq.instAt[(p + o) % ii];
+        if (i < 0) {
+          ok = row(p) == 0;
+          continue;
+        }
+        if (!set[i]) {
+          set[i] = true;
+          f[i] = row(p);
+        } else {
+          ok = f[i] == row(p);
+        }
+      }
+      if (!ok)
+        continue;
+      out.seq = unsigned(si);
+      out.offset = o;
+      out.perInstance = std::move(f);
+      return true;
+    }
+  }
+  return false;
 }
 
 void countFallback(unsigned indexWidth, unsigned width, unsigned segments) {

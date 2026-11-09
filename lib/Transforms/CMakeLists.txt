@@ -14,6 +14,7 @@ add_mlir_library(FoldsimTransforms
   CompressAddTrees.cpp
   CsfReadySplit.cpp
   SlotSequencer.cpp
+  PosCounters.cpp
   AffineSlots.cpp
   CsfMailboxes.cpp
   Pipelines.cpp
