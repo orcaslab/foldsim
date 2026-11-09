@@ -438,6 +438,12 @@ public:
   /// `state-scratch-partial`: a PP class past the scratch keeps the
   /// instances the rest holds resident, only the others stream.
   bool stateScratchPartial = true;
+  /// `state-scratch-device-bits` / `state-scratch-reserve`: the scratch
+  /// from the device (auto), less what else the fold places on chip.
+  uint64_t stateScratchDeviceBits = 0, stateScratchReserve = 30000000;
+  /// auto: the scratch from the device, before the fold stores take theirs
+  /// (computed once, before the folded pipelines are planned).
+  void autoScratch();
   /// The scratch's bits that folded pipelines' stores (fold-store-hbm's by
   /// size) keep on chip: placed first, before the state rows.
   uint64_t scratchFoldBits = 0;
@@ -10960,6 +10966,37 @@ static unsigned ppChunkBits(unsigned n) {
   return std::max(32u, unsigned(llvm::PowerOf2Ceil(n * 72)));
 }
 
+void StaticFolder::autoScratch() {
+  if (!stateScratchDeviceBits)
+    return;
+  // The models' memories the fold keeps on chip outside the scratch: a
+  // threaded image (instances x rows x width) past 18 kbit (block or ultra
+  // RAM), unless a virtual memory (virtual-memories' pattern).
+  llvm::Regex pattern(virtualMemoryPattern);
+  uint64_t memories = 0;
+  for (auto &cls : classes) {
+    StringRef model =
+        cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : cls.name;
+    uint64_t entries = cls.threads() > 1 ? llvm::PowerOf2Ceil(cls.threads()) : 1;
+    for (auto memory : cls.model.getBodyBlock()->getOps<seq::FirMemOp>()) {
+      StringRef name = memory.getName().value_or("");
+      if (!virtualMemoryPattern.empty() &&
+          (pattern.match(name) || pattern.match((model + ":" + name).str())))
+        continue;
+      uint64_t bits = entries * memory.getType().getDepth() *
+                      memory.getType().getWidth();
+      if (bits > 18 * 1024)
+        memories += bits;
+    }
+  }
+  uint64_t taken = memories + stateScratchReserve;
+  stateScratchBits = stateScratchDeviceBits > taken ? stateScratchDeviceBits - taken : 0;
+  llvm::errs() << "foldsim-fold-static: state-scratch: auto " << stateScratchBits
+               << " bits: the device's " << stateScratchDeviceBits
+               << " less the models' memories on chip " << memories
+               << " and the reserve " << stateScratchReserve << "\n";
+}
+
 LogicalResult StaticFolder::planScratch() {
   struct Item {
     unsigned c;
@@ -17835,6 +17872,7 @@ LogicalResult StaticFolder::run() {
       return netlist.emitError("fold-stage-levels-class: '")
              << spec << "' is not <glob>:<levels> or <glob>:off";
   }
+  autoScratch();
   for (auto &cls : classes) {
     StringRef baseName = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
                                             : StringRef(cls.name);
@@ -18000,6 +18038,8 @@ void FoldStaticPass::runOnOperation() {
   folder.stateScratchBits = stateScratchBits;
   folder.stateStreamWindow = stateStreamWindow;
   folder.stateScratchPartial = stateScratchPartial;
+  folder.stateScratchDeviceBits = stateScratchDeviceBits;
+  folder.stateScratchReserve = stateScratchReserve;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
   folder.linkHbmShift = linkHbmShift;

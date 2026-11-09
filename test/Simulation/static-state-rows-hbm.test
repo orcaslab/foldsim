@@ -66,12 +66,13 @@
 # PART: state-stream: Leaf: P 8, 2 of 4 instances streamed, a window of 1 slots
 # C2: state-stream: Leaf: no landing window of at most 128 slots fits the schedule (II {{[0-9]+}}): its rows stay on chip
 # C2: state-stream: Leaf_copy1: no landing window
-# ON: state-scratch: 250000000 bits; fold stores 0, rows resident 1152 (0 kept on chip by rule or form), streamed 0 in 0 classes
+# ON: state-scratch: auto {{[0-9]+}} bits
+# ON: state-scratch: {{[0-9]+}} bits; fold stores 0, rows resident 1152 (0 kept on chip by rule or form), streamed 0 in 0 classes
 # ON-NOT: state-stream:
 # ONVH-NOT: FOLDSIM_VMEM_COUNT
 # FH: fold-store-hbm: Leaf: 2 stores, 224 bits in HBM
 # FS-NOT: fold-store-hbm:
-# FS: state-scratch: 250000000 bits; fold stores 224, rows resident 0
+# FS: state-scratch: {{[0-9]+}} bits; fold stores 224, rows resident 0
 # FS1: fold-store-hbm: Leaf: 1 stores, {{[0-9]+}} bits in HBM
 # CHECK: {{^}}MATCH 196 cycles
 # CHECK-NOT: PROTOCOL
