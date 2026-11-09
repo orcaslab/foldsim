@@ -854,6 +854,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "with its crossings registered (slr-split). Its links are never "
                "taken in its own host cycle and every reader takes them n host "
                "cycles later">,
+    Option<"splitLatencyFile", "split-latency-file", "std::string", "\"\"",
+           "Per class output, its own split-latency: lines `<class> <output "
+           "index> <host cycles>` (foldsim-slr-split crossing=txrx lags=: "
+           "each output as late as its own paths through the crossings), "
+           "over split-latency">,
     ListOption<"registeredLinks", "registered-links", "std::string",
                "Classes (globs; a copy goes by its class's name) whose links "
                "are never taken in their producer's host cycle: with "
@@ -1326,6 +1331,10 @@ def SlrSplit : Pass<"foldsim-slr-split", "::mlir::ModuleOp"> {
     Option<"latency", "latency", "unsigned", "2",
            "crossing=txrx: the host cycles the outputs come late (the fold's "
            "split-latency for the class)">,
+    Option<"lagsPath", "lags", "std::string", "\"\"",
+           "crossing=txrx: each output as late as its own value (no padding to "
+           "`latency`), its lag written here as `<class> <output> <n>` lines: "
+           "the fold's split-latency-file for the class">,
     Option<"slack", "slack", "unsigned", "8",
            "crossing=txrx: host cycles a memory's writes may land later than "
            "its reads are taken (under the class's state gap)">,

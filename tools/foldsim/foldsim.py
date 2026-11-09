@@ -451,6 +451,8 @@ def frame_options(a):
         fold += f' registered-links={a.registered_links}'
     if getattr(a, 'split_latency', ''):
         fold += f' split-latency={a.split_latency}'
+    if getattr(a, 'split_latency_file', ''):
+        fold += f' split-latency-file={os.path.abspath(a.split_latency_file)}'
     if getattr(a, 'stage_levels', 0):
         fold += f' stage-levels={a.stage_levels}'
     if getattr(a, 'stage_levels_class', ''):
@@ -1597,6 +1599,9 @@ def build_parser():
     ap.add_argument('--split-latency', default='', metavar='GLOB:N,...',
                     help='with --static: the classes\' results N host cycles later (fold-static split-latency): the '
                          'schedule and the links\' writes; for a copy split with --slr-split-pass crossing=txrx latency=N')
+    ap.add_argument('--split-latency-file', default='', metavar='FILE',
+                    help='with --static: per class output its own split-latency (fold-static split-latency-file: '
+                         'lines <class> <output> <n>, as foldsim-slr-split crossing=txrx lags= writes them)')
     ap.add_argument('--slr-split-python', default=sys.executable,
                     help='the Python that runs foldsim_slr_split.py (it needs the mtkahypar module)')
     ap.add_argument('--slr-split-options', default='--variants p --imbalance 0.15',

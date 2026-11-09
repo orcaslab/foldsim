@@ -35,6 +35,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <fstream>
+#include <limits>
 #include <map>
 #include <tuple>
 
@@ -187,6 +188,11 @@ LogicalResult SlrSplitPass::registerCrossings(hw::HWModuleOp module,
     int weight;
   };
   SmallVector<Edge> edges;
+  struct DataEdge {
+    unsigned from, to;
+    Value value;
+  };
+  SmallVector<DataEdge> dataEdges;
   auto isFlop = [](Value v) {
     return v.getDefiningOp<seq::FirRegOp>() != nullptr;
   };
@@ -214,6 +220,7 @@ LogicalResult SlrSplitPass::registerCrossings(hw::HWModuleOp module,
       if (from < 0)
         continue;
       edges.push_back({unsigned(from), unsigned(to), need(operand, op)});
+      dataEdges.push_back({unsigned(from), unsigned(to), operand});
     }
   }
   // A memory is elastic (its writes may land up to `slack` later than its
@@ -290,12 +297,81 @@ LogicalResult SlrSplitPass::registerCrossings(hw::HWModuleOp module,
         }
       }
   }
+  // Fewer registers: the longest paths give each op its earliest lag; an op
+  // whose readers' values are wider than its own operands' moves later (and
+  // the reverse), within its edges' bounds: coordinate descent on the bits of
+  // the delay chains (one chain a value, as long as its latest reader needs).
+  {
+    SmallVector<SmallVector<std::pair<unsigned, int>>> in(n), out(n);
+    for (auto &e : edges) {
+      out[e.from].push_back({e.to, e.weight});
+      in[e.to].push_back({e.from, e.weight});
+    }
+    // Per var: its values' bits, its data readers (vars), and the vars whose
+    // values it reads.
+    SmallVector<uint64_t> bits(n, 0);
+    SmallVector<SmallVector<unsigned>> readers(n), reads(n);
+    DenseSet<std::pair<void *, unsigned>> seenValue;
+    for (auto &d : dataEdges) {
+      readers[d.from].push_back(d.to);
+      reads[d.to].push_back(d.from);
+      if (seenValue.insert({d.value.getAsOpaquePointer(), d.from}).second)
+        bits[d.from] += std::max<int64_t>(0, hw::getBitWidth(d.value.getType()));
+    }
+    // Values from outside (inputs, replicated control) at lag 0, per reader.
+    SmallVector<uint64_t> fixedIn(n, 0);
+    auto chainCost = [&](unsigned u) -> int64_t {
+      int m = lag[u];
+      for (unsigned s : readers[u])
+        m = std::max(m, lag[s]);
+      return int64_t(bits[u]) * (m - lag[u]);
+    };
+    auto localCost = [&](unsigned v) {
+      int64_t c = chainCost(v);
+      for (unsigned u : reads[v])
+        c += chainCost(u);
+      return c;
+    };
+    for (unsigned round = 0; round < 8; ++round) {
+      bool moved = false;
+      for (unsigned v = 0; v < n; ++v) {
+        int lo = 0, hi = std::numeric_limits<int>::max();
+        for (auto [u, w] : in[v])
+          lo = std::max(lo, lag[u] + w);
+        for (auto [s, w] : out[v])
+          hi = std::min(hi, lag[s] - w);
+        if (hi == std::numeric_limits<int>::max())
+          hi = lag[v];
+        int best = lag[v];
+        int64_t bestCost = localCost(v);
+        for (int cand : {lo, hi}) {
+          if (cand == lag[v] || cand < lo || cand > hi)
+            continue;
+          int keep = lag[v];
+          lag[v] = cand;
+          int64_t c = localCost(v);
+          lag[v] = keep;
+          if (c < bestCost) {
+            bestCost = c;
+            best = cand;
+          }
+        }
+        if (best != lag[v]) {
+          lag[v] = best;
+          moved = true;
+        }
+      }
+      if (!moved)
+        break;
+    }
+  }
   int outLag = 0;
   for (auto operand : terminator->getOperands())
     if (auto *def = operand.getDefiningOp())
       if (int v = lagVar(def); v >= 0)
         outLag = std::max(outLag, lag[v]);
-  if (outLag > int(latency))
+  bool perOutput = !lagsPath.empty();
+  if (!perOutput && outLag > int(latency))
     return module.emitError("slr-split: crossing=txrx: the outputs need ")
            << outLag << " host cycles, past latency=" << unsigned(latency);
 
@@ -313,7 +389,11 @@ LogicalResult SlrSplitPass::registerCrossings(hw::HWModuleOp module,
   SmallVector<std::pair<Operation *, Operation *>> clones;
   OpBuilder b(terminator);
   unsigned sent = 0, received = 0, aligned = 0;
-  uint64_t crossBits = 0;
+  uint64_t crossBits = 0, alignBits = 0;
+  // Alignment registers: plain shift chains (no reset, no enable, one reader
+  // a stage), marked for shift-register extraction: a chain of more than one
+  // stage maps to a LUT's SRL instead of a flop per stage.
+  auto srl = sv::SVAttributeAttr::get(context, "srl_style", R"("srl")", false);
   auto nameOf = [&](Value v) -> std::string {
     if (auto arg = dyn_cast<BlockArgument>(v))
       return module.getInputName(arg.getArgNumber()).str();
@@ -364,8 +444,12 @@ LogicalResult SlrSplitPass::registerCrossings(hw::HWModuleOp module,
       cur = rx->getResult(0);
     }
     for (int k = 0; k < left; ++k) {
-      cur = newReg(cur, base + "_a" + std::to_string(k), to)->getResult(0);
+      auto *reg = newReg(cur, base + "_a" + std::to_string(k), to);
+      if (left > 1)
+        sv::addSVAttributes(reg, {srl});
+      cur = reg->getResult(0);
       ++aligned;
+      alignBits += std::max<int64_t>(0, hw::getBitWidth(cur.getType()));
     }
     chains[key] = cur;
     return cur;
@@ -393,21 +477,39 @@ LogicalResult SlrSplitPass::registerCrossings(hw::HWModuleOp module,
   for (auto [tx, reg] : clones)
     for (unsigned i = 0; i < reg->getNumOperands(); ++i)
       tx->setOperand(i, reg->getOperand(i));
-  // The outputs, all `latency` late.
+  // The outputs, all `latency` late; with `lags`, each as late as its own
+  // value (its lag, written to the file for the fold's split-latency-file).
+  std::string lagText;
+  StringRef className = StringRef(moduleName).drop_back(
+      StringRef(moduleName).ends_with("_static") ? 7 : 0);
   for (auto &operand : terminator->getOpOperands()) {
     Value v = operand.get();
     auto *def = v.getDefiningOp();
     int from = (def && partOf[def] >= 0) ? lagVar(def) : -1;
-    int d = int(latency) - (from >= 0 ? lag[from] : 0);
+    int own = from >= 0 ? lag[from] : 0;
+    if (perOutput) {
+      lagText += (className + " " + Twine(operand.getOperandNumber()) + " " +
+                  Twine(own) + "\n")
+                     .str();
+      continue;
+    }
+    int d = int(latency) - own;
     if (d > 0) {
       int part = def && partOf[def] >= 0 ? partOfOp(def) : 0;
       operand.set(delayed(v, d, part, false));
     }
   }
+  if (perOutput) {
+    std::error_code ec;
+    llvm::raw_fd_ostream os(lagsPath, ec);
+    if (ec)
+      return module.emitError("slr-split: cannot write lags '") << lagsPath << "'";
+    os << lagText;
+  }
   llvm::errs() << "foldsim-slr-split: crossing=txrx: " << sent
                << " send and " << received << " receive registers ("
                << crossBits << " bits), " << aligned
-               << " alignment registers; outputs " << latency
+               << " alignment registers (" << alignBits << " bits); outputs " << latency
                << " host cycles late (the most lag " << outLag << ")\n";
   return success();
 }

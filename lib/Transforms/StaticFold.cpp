@@ -41,6 +41,7 @@
 #include "llvm/Support/Format.h"
 #include "llvm/Support/GlobPattern.h"
 #include "llvm/Support/Regex.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <deque>
 #include <optional>
@@ -373,8 +374,22 @@ public:
   /// (a copy split over SLRs, its crossings registered: slr-split).
   SmallVector<std::string> splitLatencySpecs;
   SmallVector<unsigned> splitLat;
+  /// `split-latency-file`: per class output (port), its own latency (a split
+  /// copy's outputs each as late as their own paths through its crossings).
+  std::string splitLatencyFile;
+  std::map<std::pair<unsigned, unsigned>, unsigned> splitLatPort;
   unsigned splitDelay(int c) const {
     return c >= 0 && unsigned(c) < splitLat.size() ? splitLat[c] : 0;
+  }
+  /// The host cycles producer `p`'s output comes late.
+  unsigned splitDelayP(int p) const {
+    if (p < 0)
+      return 0;
+    auto &producer = producers[p];
+    if (producer.cls < 0)
+      return 0;
+    auto it = splitLatPort.find({unsigned(producer.cls), producer.port});
+    return it != splitLatPort.end() ? it->second : splitDelay(producer.cls);
   }
   LogicalResult parseSplitLatency();
   unsigned stateInRamReadBits = 0;
@@ -603,7 +618,7 @@ private:
     return k > 1 ? k + 1 : 1;
   }
   int crossDelay(int p, int c) const {
-    return (crosses(p, c) ? int(crossLatency(p)) : 0) + int(splitDelay(p));
+    return crosses(p, c) ? int(crossLatency(p)) : 0;
   }
   /// `slr-serialize`: the spacing of each class's passes of one kind (its
   /// k, where a link of it crosses groups and k > 1; else 0).
@@ -2986,6 +3001,31 @@ LogicalResult StaticFolder::parseSplitLatency() {
       return netlist.emitError("split-latency: no class matches '")
              << spec << "'";
   }
+  if (!splitLatencyFile.empty()) {
+    // Lines `<class> <output index> <host cycles>`.
+    auto buffer = llvm::MemoryBuffer::getFile(splitLatencyFile);
+    if (!buffer)
+      return netlist.emitError("split-latency-file: cannot read '")
+             << splitLatencyFile << "'";
+    SmallVector<StringRef> lines;
+    (*buffer)->getBuffer().split(lines, '\n', -1, false);
+    for (auto line : lines) {
+      SmallVector<StringRef> f;
+      line.split(f, ' ', -1, false);
+      unsigned port = 0, k = 0;
+      if (f.size() != 3 || f[1].getAsInteger(10, port) || f[2].getAsInteger(10, k))
+        return netlist.emitError("split-latency-file: '") << line
+                                                          << "' is not <class> <output> <n>";
+      bool any = false;
+      for (auto [c, cls] : llvm::enumerate(classes))
+        if (cls.name == f[0]) {
+          splitLatPort[{unsigned(c), port}] = k;
+          any = true;
+        }
+      if (!any)
+        return netlist.emitError("split-latency-file: no class '") << f[0] << "'";
+    }
+  }
   return success();
 }
 
@@ -3818,7 +3858,7 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   if (!registeredLinks.empty() && registeredLinks[producer.cls])
     return false;
   // A split class's results come over its crossing registers.
-  if (splitDelay(producer.cls))
+  if (splitDelayP(int(p)))
     return false;
   // Between SLR groups a link is registered on both sides of the crossing.
   if (crosses(producer.cls, c))
@@ -4576,7 +4616,7 @@ void StaticFolder::frameGraph(ArrayRef<bool> ready, ReadyWrites &writes,
                  zeroLink(piece.producer, c, input)
                      ? 0
                      : int(linkLatency + crossDelay(producer.cls, c) +
-                           cls.stages)});
+                           splitDelayP(int(piece.producer)) + cls.stages)});
           }
         }
     }
@@ -4877,7 +4917,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
         int written = slots[producer.cls * 2 + kState][piece.inst];
         length = std::max(length, written - first(consumer.cls, i) +
                                       linkLatency +
-                                      crossDelay(producer.cls, consumer.cls));
+                                      crossDelay(producer.cls, consumer.cls) +
+                                      int(splitDelayP(int(piece.producer))));
       }
   }
 
@@ -5365,7 +5406,8 @@ unsigned StaticFolder::placeModulo(
             continue;
           int written = slots[producer.cls * 2 + kState][piece.inst];
           if (written - first(consumer.cls, i) + linkLatency +
-                      crossDelay(producer.cls, consumer.cls) >
+                      crossDelay(producer.cls, consumer.cls) +
+                      int(splitDelayP(int(piece.producer))) >
                   int(period) ||
               last(consumer.cls, i) - written >= int(period))
             ok = false;
@@ -12726,13 +12768,17 @@ LogicalResult StaticFolder::buildSim() {
     SmallVector<Value> readyLate;
     uint64_t used = 0;
   };
-  std::map<std::pair<unsigned, int>, SmallVector<LinkGroup>> linkGroups;
-  auto linkGroupFor = [&](unsigned c, int to, uint64_t bits) -> LinkGroup & {
-    auto &groups = linkGroups[{c, to}];
+  // (By the output's split-latency too: a group's write registers are as late
+  // as its outputs.)
+  std::map<std::tuple<unsigned, int, unsigned>, SmallVector<LinkGroup>> linkGroups;
+  auto linkGroupFor = [&](unsigned c, int to, uint64_t bits,
+                          unsigned late = 0) -> LinkGroup & {
+    auto &groups = linkGroups[{c, to, late}];
     if (groups.empty() || groups.back().used + bits > regionBits) {
       LinkGroup group;
       group.prefix = (classes[c].name +
-                      (to >= 0 ? "_slr" + Twine(to) : Twine()) + "_links" +
+                      (to >= 0 ? "_slr" + Twine(to) : Twine()) +
+                      (late ? "_late" + Twine(late) : Twine()) + "_links" +
                       Twine(groups.size()))
                          .str();
       groups.push_back(group);
@@ -12883,7 +12929,7 @@ LogicalResult StaticFolder::buildSim() {
     // split-latency: the class's outputs come splitDelay host cycles after its
     // pass (a copy split over SLRs, its crossings registered): every register
     // of the write (enable, entry, bank) is that much later too.
-    unsigned splitLate = splitDelay(int(c));
+    unsigned splitLate = splitDelayP(int(p));
     auto splitBy = [&](Value v, const Twine &lateName) {
       std::string n0 = lateName.str();
       for (unsigned j = 0; j < splitLate; ++j)
@@ -12969,7 +13015,7 @@ LogicalResult StaticFolder::buildSim() {
         }
         data = registered;
       }
-      auto &group = linkGroupFor(c, to, w);
+      auto &group = linkGroupFor(c, to, w, splitLate);
       unsigned level = producer.atReady ? producer.readyLevel : 0;
       if (level && group.laterReady.size() < level)
         group.laterReady.resize(level);
@@ -15264,6 +15310,7 @@ void FoldStaticPass::runOnOperation() {
   folder.passSplitSpecs.assign(passSplit.begin(), passSplit.end());
   folder.stateInRamSpecs.assign(stateInRam.begin(), stateInRam.end());
   folder.splitLatencySpecs.assign(splitLatency.begin(), splitLatency.end());
+  folder.splitLatencyFile = splitLatencyFile;
   folder.stageLevelClassSpecs.assign(stageLevelsClass.begin(),
                                      stageLevelsClass.end());
   folder.stateInRamReadBits = stateInRamReadBits;

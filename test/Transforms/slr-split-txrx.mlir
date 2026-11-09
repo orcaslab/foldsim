@@ -1,4 +1,6 @@
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-slr-split{module=copy map=%S/Inputs/slr-split/two.map parts=2 crossing=txrx latency=2})' 2>&1 | FileCheck %s
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-slr-split{module=copy map=%S/Inputs/slr-split/two.map parts=2 crossing=txrx lags=%t.lags})' 2>&1 | FileCheck %s --check-prefix=OWN
+// RUN: FileCheck %s --check-prefix=LAGS < %t.lags
 
 // crossing=txrx: part 0's flop `a` read in part 1 crosses as a send register
 // (a copy of `a`, its own) and a receive register in part 1, both
@@ -12,7 +14,7 @@
 // counter by two.
 
 // CHECK: foldsim-slr-split: crossing=txrx: 1 memories elastic (addressed by the fold's control), 0 in step
-// CHECK: foldsim-slr-split: crossing=txrx: 1 send and 1 receive registers (4 bits), 7 alignment registers; outputs 2 host cycles late (the most lag 1)
+// CHECK: foldsim-slr-split: crossing=txrx: 1 send and 1 receive registers (4 bits), 7 alignment registers (28 bits); outputs 2 host cycles late (the most lag 1)
 // CHECK-LABEL: hw.module private @copy_p0(
 // CHECK:         %a = seq.firreg %[[X:.+]] clock %clk : i4
 // CHECK:         %a_lag1_tx = seq.firreg %[[X]] clock %clk {sv.attributes = [#sv.attribute<"USER_SLL_REG" = "\22TRUE\22">, #sv.attribute<"DONT_TOUCH" = "\22TRUE\22">]} : i4
@@ -27,6 +29,16 @@
 // CHECK:         %y_lag1_a0 = seq.firreg %y
 // CHECK:         %b_lag1_a0 = seq.firreg %b
 // CHECK:         hw.output %b_lag1_a0, %split_lag2_a1
+
+// With lags=, each output as late as its own value, nothing padded: `b` 1
+// (part 1's lag), the read and the counter 0; the lags file is the fold's
+// split-latency-file for the class.
+// OWN: foldsim-slr-split: crossing=txrx: 1 send and 1 receive registers (4 bits), 2 alignment registers (8 bits); outputs 2 host cycles late (the most lag 1)
+// OWN-LABEL: hw.module private @copy_p1(
+// OWN:         hw.output %b, %{{.+}} : i4, i4
+// LAGS: copy 0 1
+// LAGS-NEXT: copy 1 0
+// LAGS-NEXT: copy 2 0
 
 hw.module @copy(in %clk : !seq.clock, in %x : i4, in %y : i4, out b : i4, out rd : i4, out inst : i4) {
   %c1_i4 = hw.constant 1 : i4
