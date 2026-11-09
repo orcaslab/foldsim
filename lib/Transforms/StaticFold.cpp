@@ -15,6 +15,8 @@
 
 #include <chrono>
 #include "CsfReadySplit.h"
+#include "SlotSequencer.h"
+#include "AffineSlots.h"
 #include "FAME5.h"
 #include "PassSplit.h"
 #include "Pipelines.h"
@@ -427,6 +429,9 @@ public:
   /// copies first, then the lanes), and the resources in all.
   SmallVector<std::string> csfReadyCopySpecs;
   bool csfMailboxes = false;
+  /// `affine-slots`: each copy's (or ready lane's) passes of a kind placed as
+  /// one affine run over its instances (AffineSlots.cpp).
+  bool affineSlots = false;
   /// `csf-ready-cones`: csf-ready-copies built, each named model's late
   /// outputs split into a cone model (CsfReadySplit.cpp) of k copies. The
   /// split models' cone models, by model.
@@ -509,6 +514,9 @@ public:
   bool stagedLinkDirect = false;
   /// `drop-dead-inputs`: model inputs never read take no link.
   bool dropDeadInputs = false;
+  /// `lookahead-tables`: the virtual-memory readiness reads its slot tables
+  /// from registers loaded a host cycle before (the same values).
+  bool lookaheadTables = true;
   unsigned deadInputs = 0, partlyDeadInputs = 0;
   uint64_t deadInputBits = 0;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
@@ -5339,15 +5347,21 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     SmallVector<SmallVector<int>> overlapped;
     SmallVector<int> aloneSlot = outputSlot;
     SmallVector<bool> aloneEarly = outputEarly;
+    // affine-slots: the affine frame however long (the frame alone is not
+    // affine).
     unsigned period =
         placeModulo(nodes, preds, succs, height, writes, overlapped,
-                    below ? std::min<unsigned>(below, length) : length);
-    if (period && period < unsigned(length)) {
+                    affineSlots ? (below ? below : UINT_MAX / 4)
+                    : below ? std::min<unsigned>(below, length) : length);
+    if (period && (period < unsigned(length) || affineSlots)) {
       slots = std::move(overlapped);
       return period;
     }
     outputSlot = aloneSlot;
     outputEarly = aloneEarly;
+    // affine-slots: no affine frame below `below` places this choice.
+    if (affineSlots)
+      return 0;
   }
   // `min-ii`: the frame alone, its positions past the schedule's idle.
   return std::max(length, int(minII));
@@ -5394,6 +5408,9 @@ unsigned StaticFolder::placeModulo(
   // the constraint that binds it (csf report).
   std::map<unsigned, std::string> whyFailed;
   auto noteFail = [&](unsigned period, std::string why) {
+    if (getenv("FOLDSIM_FAIL_LOG"))
+      llvm::errs() << "foldsim-fold-static: period " << period << " failed: "
+                   << why << "\n";
     whyFailed.emplace(period, std::move(why));
   };
   lastModuloPeriodFound = 0;
@@ -5644,6 +5661,69 @@ unsigned StaticFolder::placeModulo(
         heap.push_back(n);
     std::make_heap(heap.begin(), heap.end(), cmp);
     bool fits = true;
+    // affine-slots: the groups placed whole (AffineSlots.cpp), not the list
+    // schedule below, nor its moves toward the readers.
+    if (affineSlots) {
+      std::map<std::tuple<unsigned, unsigned, unsigned>, unsigned> groupOf;
+      SmallVector<foldsim::AffineGroup> groups;
+      SmallVector<SmallVector<unsigned>> members;
+      SmallVector<foldsim::AffineNode> anodes(nodes.size());
+      for (auto [n, node] : llvm::enumerate(nodes)) {
+        auto key = std::make_tuple(resourceOf(node), unsigned(node.pass), node.level);
+        auto [it, fresh] = groupOf.try_emplace(key, groups.size());
+        if (fresh) {
+          groups.push_back({std::get<0>(key), 0, 1});
+          members.emplace_back();
+        }
+        auto &g = groups[it->second];
+        unsigned c = node.cls;
+        g.minStride = std::max({g.minStride, pages(n) ? passSpacing(c) : 1u,
+                                spaced(n) ? linkSpacing(c) : 1u,
+                                serialed(n) ? serial[c] : 1u});
+        ++g.count;
+        members[it->second].push_back(unsigned(n));
+        anodes[n] = {it->second, 0, int(classes[c].stages)};
+      }
+      for (auto &m : members) {
+        llvm::stable_sort(m, [&](unsigned a, unsigned b) { return nodes[a].inst < nodes[b].inst; });
+        for (auto [k, n] : llvm::enumerate(m))
+          anodes[n].index = unsigned(k);
+      }
+      auto strides = foldsim::affineStrides(groups);
+      auto fitsAt = [&](unsigned n, int t) {
+        unsigned c = nodes[n].cls;
+        return t >= 0 && !busy[resourceOf(nodes[n])].test(unsigned(t) % period) &&
+               (!pages(n) || pageFree(c, t)) && (!spaced(n) || linkFree(c, t)) &&
+               (!serialed(n) || serialFree(n, t));
+      };
+      auto takeAt = [&](unsigned n, int t, bool on) {
+        unsigned c = nodes[n].cls;
+        auto &taken = busy[resourceOf(nodes[n])];
+        if (on)
+          takeSlot(taken, t, period);
+        else
+          taken.reset(unsigned(t) % period);
+        if (pages(n))
+          pageTake(c, t, on);
+        if (spaced(n))
+          linkTake(c, t, on);
+        if (serialed(n))
+          serialTake(n, t, on);
+      };
+      std::string why;
+      if (!foldsim::placeAffine(period, anodes, groups, strides, preds, fitsAt,
+                                takeAt, slotOf, why, [&](unsigned g) {
+                                  auto &n = nodes[members[g][0]];
+                                  return classes[n.cls].name +
+                                         (n.pass == kState ? std::string(".state")
+                                                           : ".ready" + std::to_string(n.level)) +
+                                         "@" + std::to_string(groups[g].resource);
+                                })) {
+        noteFail(period, why);
+        continue;
+      }
+      heap.clear();
+    }
     while (fits && !heap.empty()) {
       std::pop_heap(heap.begin(), heap.end(), cmp);
       unsigned n = heap.back();
@@ -5693,6 +5773,8 @@ unsigned StaticFolder::placeModulo(
     llvm::stable_sort(byStart,
                       [&](unsigned a, unsigned b) { return slotOf[a] > slotOf[b]; });
     for (auto n : byStart) {
+      if (affineSlots)
+        break;
       auto &node = nodes[n];
       if (node.pass == kState &&
           llvm::any_of(preds[n], [&](auto pred) {
@@ -9194,6 +9276,9 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
 /// `max-table-bits`: the largest table constant, in bits (Vivado's variable
 /// limit); a larger one is cut into column slices.
 static uint64_t gMaxTableBits = 1000000;
+/// `slot-segments`: a slot table of at most this many affine segments is a
+/// decoder of its index (SlotSequencer.cpp), not a constant (0: tables).
+static unsigned gSlotSegments = 0;
 
 /// The regions sharing a copy of the slot controls two host cycles ahead.
 static constexpr unsigned kRegionsPerGroup = 16;
@@ -13918,6 +14003,28 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
   if (rows.empty() || uniform)
     return hw::ConstantOp::create(b, type, rows.empty() ? 0 : rows[0]);
   unsigned indexWidth = hw::getBitWidth(index.getType());
+  // A table of at most 64 rows is a LUT per bit (and as large at any frame
+  // or instance count): kept.
+  static const int minIndexBits = [] {
+    const char *env = getenv("FOLDSIM_SLOT_MIN_INDEX_BITS");  // a test hook
+    return env ? atoi(env) : 7;
+  }();
+  if (gSlotSegments && int(indexWidth) >= minIndexBits) {
+    if (Value decoded =
+            foldsim::decodeSlotTable(b, index, rows, width, gSlotSegments))
+      return decoded;
+    auto segs = foldsim::slotSegments(rows, width);
+    foldsim::countFallback(indexWidth, width, segs.size());
+    if (getenv("FOLDSIM_AFFINE_LOG")) {
+      llvm::errs() << "slot-sequencer: kept a table of " << rows.size()
+                   << " x " << width << " bits, " << segs.size()
+                   << " segments:";
+      for (auto &sg : ArrayRef(segs).take_front(12))
+        llvm::errs() << " [" << sg.start << "+" << sg.stride << "j=" << sg.value
+                     << "+" << sg.step << "j x" << sg.count << "]";
+      llvm::errs() << "\n";
+    }
+  }
   // One constant of the whole array (what canonicalization makes of an
   // array of constants), not an op per row: a frame of 2^17 positions times
   // thousands of tables (128 SMs) is otherwise hundreds of millions of ops.
@@ -16732,6 +16839,40 @@ LogicalResult StaticFolder::buildSim() {
     Value next = comb::MuxOp::create(
         b, end, constant(posWidth, 0),
         comb::AddOp::create(b, posD, constant(posWidth, 1)));
+    // A table at `next`, read from a register loaded a host cycle before
+    // (the lookahead): the readiness a decision waits on no longer chains the
+    // position's increment and the table's decoder before the pending bit's
+    // select; it is the same value, so neither the schedule nor any host
+    // cycle moves. The register's next is the table at the position's next's
+    // `next`: posD's next is posD (no advance), posD + 1 (advance within the
+    // frame), 0 (a frame's end, the next frame starting) or `ii` (a frame's
+    // end, none), so the register takes one of two tables read at posD itself
+    // or one of two constants, chosen by the decision alone.
+    auto nx = [&](unsigned p) -> unsigned {
+      return p + 1 >= ii ? 0 : p + 1;   // `next` of position p (ii - 1, ii: 0)
+    };
+    unsigned aheadCount = 0;
+    auto atNext = [&](ArrayRef<uint64_t> row, unsigned width) -> Value {
+      if (!lookaheadTables)
+        return table(b, next, row, width);
+      bool uniform = llvm::all_of(row, [&](uint64_t v) { return v == row[0]; });
+      if (row.empty() || uniform)
+        return table(b, next, row, width);
+      SmallVector<uint64_t> hold(ii + 1, 0), step(ii + 1, 0);
+      for (unsigned p = 0; p <= ii; ++p) {
+        hold[p] = row[nx(p)];           // posD stays
+        step[p] = row[nx(nx(p))];       // posD + 1 within the frame
+      }
+      Value onStep = comb::MuxOp::create(
+          b, end, comb::MuxOp::create(b, go, constant(width, row[nx(0)]),
+                                      constant(width, row[nx(ii)])),
+          table(b, posD, step, width));
+      Value nextValue = comb::MuxOp::create(b, advance, onStep,
+                                            table(b, posD, hold, width));
+      // posD resets to `ii`: the register to the table at nx(ii).
+      return resetReg(nextValue, "vready_ahead" + Twine(aheadCount++),
+                      row[nx(ii)]);
+    };
     SmallVector<Value> terms;
     for (auto [c, cls] : llvm::enumerate(classes)) {
       if (cls.virtualMemories.empty())
@@ -16750,8 +16891,8 @@ LogicalResult StaticFolder::buildSim() {
           useRow[at] = 1;
           instRow[at] = i;
         }
-      Value use = table(b, next, useRow, 1);
-      Value inst = threads > 1 ? table(b, next, instRow, idxWidth) : Value();
+      Value use = atNext(useRow, 1);
+      Value inst = threads > 1 ? atNext(instRow, idxWidth) : Value();
       Value classInst = inst;
       // A page word off chip is waited for by the state pass alone (staged,
       // by its evaluation's read position, the stages before it, where the
@@ -16766,7 +16907,7 @@ LogicalResult StaticFolder::buildSim() {
           int r = cls.slot[kState][i] - int(cls.stages);
           stateRow[unsigned(((r % int(ii)) + int(ii)) % int(ii))] = 1;
         }
-        stateUse = table(b, next, stateRow, 1);
+        stateUse = atNext(stateRow, 1);
       } else if (cls.pagesOffChip) {
         SmallVector<uint64_t> fetchRow(ii + 1, 0), fetchInst(ii + 1, 0);
         for (unsigned i = 0; i < threads; ++i) {
@@ -16775,8 +16916,8 @@ LogicalResult StaticFolder::buildSim() {
           fetchRow[pos] = 1;
           fetchInst[pos] = i;
         }
-        stateUse = table(b, next, fetchRow, 1);
-        pageInst = table(b, next, fetchInst, idxWidth);
+        stateUse = atNext(fetchRow, 1);
+        pageInst = atNext(fetchInst, idxWidth);
       }
       for (auto &vm : cls.virtualMemories) {
         Value used = vm.pages ? stateUse : use;
@@ -16823,7 +16964,7 @@ LogicalResult StaticFolder::buildSim() {
         clear.push_back(notOf(bit));
       }
       terms.push_back(comb::OrOp::create(
-          b, notOf(table(b, next, st.popValid, 1)),
+          b, notOf(atNext(st.popValid, 1)),
           comb::AndOp::create(b, clear, false)));
     }
     virtualReady.setValue(comb::AndOp::create(b, terms, false));
@@ -17535,7 +17676,26 @@ void FoldStaticPass::runOnOperation() {
   folder.stagedLinkMemories = stagedLinks && stagedLinkMemories;
   folder.stagedLinkDirect = stagedLinks && stagedLinkDirect;
   folder.dropDeadInputs = dropDeadInputs;
+  folder.lookaheadTables = lookaheadTables;
+  folder.affineSlots = affineSlots;
   gMaxTableBits = std::max<uint64_t>(1, maxTableBits);
+  gSlotSegments = slotSegments;
+  // FOLDSIM_SLOT_SEGMENTS: the default for runs that leave it 0 (a test
+  // hook: the whole suite with decoders).
+  if (!gSlotSegments)
+    if (const char *env = getenv("FOLDSIM_SLOT_SEGMENTS"))
+      gSlotSegments = unsigned(atoi(env));
+  foldsim::slotSequencerStats().reset();
   if (failed(folder.run()))
     return signalPassFailure();
+  if (gSlotSegments) {
+    auto &st = foldsim::slotSequencerStats();
+    llvm::errs() << "foldsim-fold-static: slot-sequencer: " << st.decoded
+                 << " tables decoded (" << st.segments << " segments, at most "
+                 << st.maxSegments << "; " << st.decodedBits
+                 << " table bits replaced), " << st.fallback
+                 << " tables kept (" << st.fallbackBits
+                 << " bits, at most " << st.fallbackMaxSegments
+                 << " segments)\n";
+  }
 }
