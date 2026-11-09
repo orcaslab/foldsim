@@ -14,6 +14,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <chrono>
+#include "CsfReadySplit.h"
 #include "FAME5.h"
 #include "PassSplit.h"
 #include "Pipelines.h"
@@ -420,6 +421,12 @@ public:
   /// copies first, then the lanes), and the resources in all.
   SmallVector<std::string> csfReadyCopySpecs;
   bool csfMailboxes = false;
+  /// `csf-ready-cones`: csf-ready-copies built, each named model's late
+  /// outputs split into a cone model (CsfReadySplit.cpp) of k copies. The
+  /// split models' cone models, by model.
+  bool csfReadyCones = false;
+  llvm::StringMap<std::string> csfConeOf;
+  LogicalResult splitCsfReadyCones();
   unsigned csfMailboxLatency = 1;
   SmallVector<unsigned> readyLanes, laneBase;
   unsigned numResources = 0;
@@ -539,7 +546,7 @@ public:
                unsigned linkUltraDepth, StringRef linkKindSpec,
                unsigned stageLevels, ArrayRef<std::string> multicycle)
       : top(top), netlist(netlist), simName(simName), regionBits(regionBits),
-        reportPath(report), copies(copies), nest(nest),
+        reportPath(report), copies(copies.begin(), copies.end()), nest(nest),
         specGroupSpecs(specGroups), envSinkNames(envSinks),
         specDepth(specDepth), slrGroups(slrGroups), slrSiteSpecs(slrSites),
         slrCapacity(slrCapacity), slrCapacitySpecs(slrCapacities),
@@ -794,7 +801,7 @@ private:
   StringRef simName;
   unsigned regionBits;
   StringRef reportPath;
-  ArrayRef<std::string> copies;
+  SmallVector<std::string> copies;
   bool nest;
   ArrayRef<std::string> specGroupSpecs, envSinkNames;
   // Frames of a group's select its offers span, and the values a token holds.
@@ -1977,6 +1984,13 @@ LogicalResult StaticFolder::splitCopies() {
     if (k <= 1)
       continue;
     unsigned n = classes[c].instances.size();
+    // A cone model's lanes (csf-ready-cones): at most one an instance.
+    if (k > n && llvm::any_of(csfConeOf, [&](auto &entry) {
+          return entry.second == classes[c].name;
+        }))
+      k = n;
+    if (k <= 1)
+      continue;
     if (k > n)
       return classes[c].instances[0].emitError("copies: ")
              << n << " instances of '" << classes[c].name
@@ -6286,8 +6300,37 @@ StaticFolder::Choice StaticFolder::searchReady() {
   if (!readyChoice.empty()) {
     StringRef spec = readyChoice;
     bool split = spec.consume_front("split:");
-    SmallVector<StringRef> names;
-    spec.split(names, ',', -1, /*KeepEmpty=*/false);
+    SmallVector<StringRef> given;
+    spec.split(given, ',', -1, /*KeepEmpty=*/false);
+    // csf-ready-cones: a split model (or a copy of it) names its cone
+    // model's classes too, and itself only while it keeps a late output.
+    std::vector<std::string> owned;
+    for (StringRef name : given) {
+      StringRef base = name;
+      if (auto it = llvm::find_if(classes, [&](const Class &cls) {
+            return cls.name == name;
+          });
+          it != classes.end() && it->splitFrom >= 0)
+        base = classes[it->splitFrom].name;
+      auto cone = csfConeOf.find(base);
+      if (cone == csfConeOf.end()) {
+        owned.push_back(name.str());
+        continue;
+      }
+      if (auto it = llvm::find_if(classes, [&](const Class &cls) {
+            return cls.name == name;
+          });
+          it != classes.end() && late(*it))
+        owned.push_back(name.str());
+      for (auto &cls : classes) {
+        StringRef from =
+            cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : cls.name;
+        if (from == cone->second && late(cls) &&
+            !llvm::is_contained(owned, cls.name))
+          owned.push_back(cls.name);
+      }
+    }
+    SmallVector<StringRef> names(owned.begin(), owned.end());
     SmallVector<bool> ready(classes.size(), false);
     for (StringRef name : names) {
       auto it = llvm::find_if(classes, [&](const Class &cls) {
@@ -7157,6 +7200,60 @@ LogicalResult StaticFolder::planStateInRam() {
   for (auto &spec : specs)
     if (!spec.used)
       return netlist.emitError("state-in-ram: no model '") << spec.glob << "'";
+  return success();
+}
+
+/// `csf-ready-cones`: the lanes of csf-ready-copies built. Each named model's
+/// ready cone becomes a model of its own (CsfReadySplit.cpp), of k copies
+/// (`copies`, at most one an instance); its spec then leaves the
+/// schedule-only lanes. Without the option a build refuses csf-ready-copies:
+/// its schedule would not be the simulator's.
+LogicalResult StaticFolder::splitCsfReadyCones() {
+  if (csfReadyCopySpecs.empty())
+    return success();
+  if (!csfReadyCones) {
+    if (!scheduleOnly)
+      return netlist.emitError("csf-ready-copies: schedule only, or built "
+                               "with csf-ready-cones");
+    return success();
+  }
+  SmallVector<std::string> models;
+  SmallVector<unsigned> lanes;
+  for (auto &entry : csfReadyCopySpecs) {
+    auto split = StringRef(entry).rsplit(':');
+    unsigned k = 0;
+    if (split.second.getAsInteger(10, k) || k == 0)
+      return netlist.emitError("csf-ready-copies: '")
+             << entry << "' is not <model>:<count>";
+    models.push_back(split.first.str());
+    lanes.push_back(k);
+  }
+  SmallVector<foldsim::ReadySplit> done;
+  if (failed(foldsim::splitReadyCones(top, models, done)))
+    return failure();
+  for (auto [split, k] : llvm::zip(done, lanes)) {
+    llvm::errs() << "foldsim-fold-static: csf-ready-cones: " << split.model;
+    if (!split.moved) {
+      llvm::errs() << ": no late output of logic alone ("
+                   << split.kept << " kept): no lanes\n";
+      continue;
+    }
+    llvm::errs() << ": " << split.moved << " late outputs to " << split.cone
+                 << " (" << split.ops << " ops; " << split.regs
+                 << " registers, " << split.regBits << " bits, in "
+                 << foldsim::kReadyRegsPort << "), " << split.kept
+                 << " kept; " << k << " lanes\n";
+    csfConeOf[split.model] = split.cone;
+    if (llvm::any_of(copies, [&](const std::string &entry) {
+          return StringRef(entry).split(':').first == split.cone;
+        }))
+      return netlist.emitError("csf-ready-cones: copies names ")
+             << split.cone << ": its lanes are csf-ready-copies'";
+    if (k > 1)
+      copies.push_back(split.cone + ":" + std::to_string(k));
+  }
+  // The lanes are classes now: none left to the schedule-only model.
+  csfReadyCopySpecs.clear();
   return success();
 }
 
@@ -16867,6 +16964,8 @@ void StaticFolder::staggerPortPushes() {
 }
 
 LogicalResult StaticFolder::run() {
+  if (failed(splitCsfReadyCones()))
+    return failure();
   inlineNetlists();
   if (failed(collect()) || failed(resolveEnvironment()) || failed(resolvePortFold()) ||
       failed(parseRegisteredLinks()) || failed(parseSplitLatency()) ||
@@ -17014,6 +17113,7 @@ void FoldStaticPass::runOnOperation() {
   folder.stateInRamH = stateInRamH;
   folder.csfReadyCopySpecs.assign(csfReadyCopies.begin(), csfReadyCopies.end());
   folder.csfMailboxes = csfMailboxes;
+  folder.csfReadyCones = csfReadyCones;
   folder.csfMailboxLatency = csfMailboxLatency;
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.stateInRamPP = stateInRamPP;

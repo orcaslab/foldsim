@@ -1,0 +1,52 @@
+# Ready-cone lanes of the constant-shell fold, built (foldsim-fold-static
+# csf-ready-copies with csf-ready-cones; scalable_state_arch_design_1109 3.3):
+# a model's late outputs of logic alone move to a stateless cone model
+# <model>_rc fed the registers they read (the model's early output
+# csf_ready_regs), its k copies the lanes. The statically folded simulator
+# against its target (tb_late.sv, stalls and bubbles):
+# - Driver/Inputs/lanes_late (a chain of four leaves, one late output each):
+#   two lanes; and with the ready-choice of the unsplit schedule
+#   (split:Leaf,Top_model), which names the cone's classes once the leaf
+#   has no late output left;
+# - Driver/Inputs/csf_cones (four leaves, a late output of logic alone, one
+#   through a combinational memory read that stays with the leaf, and an
+#   early output): three lanes of four instances.
+# A build with csf-ready-copies and no csf-ready-cones is refused (its
+# schedule would not be the simulator's); a schedule-only run takes it.
+# REQUIRES: verilator
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/lanes_late
+# RUN: foldsim --srcs top.f --top Top --out %t/l2 --static --modulo --bubbles --csf-ready-copies Leaf:2 --csf-ready-cones Leaf > %t/l2.log 2>&1
+# RUN: FileCheck %s --check-prefix=L2LOG < %t/l2.log
+# RUN: FileCheck %s --check-prefix=L2 < %t/l2/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/l2/obj %S/Inputs/tb_late.sv top.sv %t/l2/foldsim_sim.sv > %t/l2/build.log 2>&1
+# RUN: %t/l2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +stall=20 +bubble=20 | FileCheck %s
+# RUN: %t/l2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +stall=20 +bubble=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/rc --static --modulo --bubbles --csf-ready-copies Leaf:2 --csf-ready-cones --ready-choice split:Leaf,Top_model Leaf > %t/rc.log 2>&1
+# RUN: FileCheck %s --check-prefix=RC < %t/rc/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/rc/obj %S/Inputs/tb_late.sv top.sv %t/rc/foldsim_sim.sv > %t/rc/build.log 2>&1
+# RUN: %t/rc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +stall=20 +bubble=20 | FileCheck %s
+# RUN: not foldsim --srcs top.f --top Top --out %t/x --static --modulo --csf-ready-copies Leaf:2 Leaf > %t/x.log 2>&1
+# RUN: FileCheck %s --check-prefix=BAD < %t/x.log
+# RUN: cd %S/../Driver/Inputs/csf_cones
+# RUN: foldsim --srcs top.f --top Top --out %t/c3 --static --modulo --bubbles --csf-ready-copies Leaf:3 --csf-ready-cones Leaf > %t/c3.log 2>&1
+# RUN: FileCheck %s --check-prefix=C3LOG < %t/c3.log
+# RUN: FileCheck %s --check-prefix=C3 < %t/c3/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/c3/obj %S/Inputs/tb_late.sv top.sv %t/c3/foldsim_sim.sv > %t/c3/build.log 2>&1
+# RUN: %t/c3/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +stall=20 +bubble=20 | FileCheck %s
+# RUN: %t/c3/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +stall=30 +bubble=10 | FileCheck %s
+# L2LOG: csf-ready-cones: Leaf: 1 late outputs to Leaf_rc ({{[0-9]+}} ops; 4 registers, 160 bits, in csf_ready_regs), 0 kept; 2 lanes
+# L2: {{^}}  Leaf x4 state gap
+# L2-DAG: {{^}}  Leaf_rc x2
+# L2-DAG: {{^}}  Leaf_rc_copy1 x2
+# L2-DAG: late q @{{ready|state}} <- d csf_ready_regs
+# RC: {{^}}  Leaf x4 state gap
+# RC-DAG: {{^}}  Leaf_rc x2 (ready pass)
+# RC-DAG: {{^}}  Leaf_rc_copy1 x2 (ready pass)
+# BAD: csf-ready-copies: schedule only, or built with csf-ready-cones
+# C3LOG: csf-ready-cones: Leaf: 1 late outputs to Leaf_rc ({{[0-9]+}} ops; 3 registers, 32 bits, in csf_ready_regs), 1 kept; 3 lanes
+# C3: {{^}}  Leaf x4 (ready pass)
+# C3-DAG: late m @ready
+# C3-DAG: {{^}}  Leaf_rc x2
+# C3-DAG: {{^}}  Leaf_rc_copy1 x1
+# C3-DAG: {{^}}  Leaf_rc_copy2 x1
+# CHECK: {{^}}MATCH

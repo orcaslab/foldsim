@@ -350,6 +350,10 @@ def frame_options(a):
         fold += f' ready-choice={a.ready_choice}'
     if a.interleave_copies:
         fold += ' interleave-copies'
+    if getattr(a, 'csf_ready_copies', ''):
+        fold += f' csf-ready-copies={a.csf_ready_copies}'
+    if getattr(a, 'csf_ready_cones', False):
+        fold += ' csf-ready-cones'
     if getattr(a, 'spec_groups', ''):
         fold += f' spec-groups={a.spec_groups}'
         if a.axi_spec == 2:
@@ -1253,6 +1257,13 @@ def build_parser():
     ap.add_argument('--min-ii', type=int, default=0, metavar='N',
                     help='with --static --modulo: the shortest frame in host cycles (foldsim-fold-static '
                          'min-ii); positions past the schedule\'s own stay idle, a longer prefetch distance')
+    ap.add_argument('--csf-ready-copies', default='', metavar='MODEL:K,...',
+                    help='with --static and --csf-ready-cones: each model\'s ready cone (its late outputs of '
+                         'logic alone) as a model of its own, MODEL_rc, of K copies (the ready lanes) '
+                         '(foldsim-fold-static csf-ready-copies)')
+    ap.add_argument('--csf-ready-cones', action='store_true',
+                    help='with --csf-ready-copies: build the lanes (foldsim-fold-static csf-ready-cones); '
+                         'without it csf-ready-copies is schedule only')
     ap.add_argument('--ready-choice', default='', metavar='[split:]CLASS,...',
                     help='with --static: the classes that get a ready pass, given instead of searched '
                          '(foldsim-fold-static ready-choice; "split:" first when ready outputs are split by '

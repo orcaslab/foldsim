@@ -11,6 +11,7 @@ add_mlir_library(FoldsimTransforms
   FuseModels.cpp
   LowerWideNegation.cpp
   CompressAddTrees.cpp
+  CsfReadySplit.cpp
   Pipelines.cpp
   RemoveDeadState.cpp
   ReplicateControls.cpp

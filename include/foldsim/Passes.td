@@ -870,6 +870,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "Instance i's ready passes take lane i mod k; they no longer "
                "take the slots of the model's copies, whose state passes "
                "keep them">,
+    Option<"csfReadyCones", "csf-ready-cones", "bool", "false",
+           "csf-ready-copies built (schedule and simulator alike): each named "
+           "model's late outputs whose cones are logic alone move to a "
+           "stateless model <model>_rc of the inputs they read and of the "
+           "registers they read (the model's early output csf_ready_regs), "
+           "an instance of it beside each of the model's; its k copies "
+           "(copies=<model>_rc:k) are the lanes. A ready-choice naming the "
+           "model names its cone's classes too. Without it csf-ready-copies "
+           "is for schedule-only runs">,
     Option<"csfMailboxLatency", "csf-mailbox-latency", "unsigned", "1",
            "With csf-mailboxes: the host cycles a mailbox read takes past a "
            "register link's (1: the RAM's output register; 2 with a cascade "
