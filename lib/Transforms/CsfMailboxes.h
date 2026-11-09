@@ -33,20 +33,24 @@ struct MailboxLink {
   llvm::SmallVector<int64_t> readerOf;
 };
 
-/// A chain link: every instance j of a class but the last read by its
-/// instance j + 1 (or every one but the first by j - 1), a self-link of a
-/// chain class. It stays an on-chip one-entry forward: constant in N, and a
-/// mailbox's latency would multiply along the chain.
+/// A chain link: a self-link of a class each of whose entries is read by
+/// the next instance (j by j + 1; or each by the one before), covering at
+/// least half of the instances: chains of siblings (a ring of a level's
+/// children, a chain class). It stays an on-chip forward: constant in N, and
+/// a mailbox's latency would multiply along the chain.
 inline bool isChainLink(const MailboxLink &link) {
   if (link.pcls != link.rcls || link.readerOf.size() < 2)
     return false;
-  size_t up = 0, down = 0;
+  size_t up = 0, down = 0, entries = 0;
   for (auto [j, r] : llvm::enumerate(link.readerOf)) {
+    if (r < 0)
+      continue;
+    ++entries;
     up += r == int64_t(j) + 1;
     down += r == int64_t(j) - 1;
   }
-  size_t chain = link.readerOf.size() - 1;
-  return up == chain || down == chain;
+  return 2 * entries >= link.readerOf.size() &&
+         (up == entries || down == entries);
 }
 
 /// A mailbox: links of one class pair and write key whose producer instances

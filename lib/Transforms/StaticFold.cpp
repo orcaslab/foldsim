@@ -1144,6 +1144,9 @@ private:
     /// is in (`runDomain`, `mbDomains[d][j]`). Each reader pass needs its
     /// row alone.
     bool mailbox = false;
+    /// `csf-mailbox-hbm`'s streams: one row a pass lands in two sets of
+    /// the members' read registers in turn (no spacing of the reader).
+    bool twoSets = false;
     unsigned mbRows = 0;
     SmallVector<uint64_t> mbWriteRow;
     SmallVector<int64_t> mbReaderRow;
@@ -3323,7 +3326,7 @@ void StaticFolder::streamPages() {
     classes[s.pcls].linkPage = std::max(classes[s.pcls].linkPage, s.pages);
     // (A mailbox of one row a pass lands in two sets in turn: no spacing.)
     classes[s.rcls].linkPage = std::max(
-        classes[s.rcls].linkPage, s.mailbox && s.maxNeed == 1 ? 1u : s.maxNeed + 2);
+        classes[s.rcls].linkPage, s.twoSets && s.maxNeed == 1 ? 1u : s.maxNeed + 2);
   }
 }
 
@@ -3421,8 +3424,21 @@ void StaticFolder::layoutMailboxStreams(std::vector<LinkStream> &out,
   // The links offered: early, of a producer of several instances, more than
   // one entry read, no stream's yet, no producer instance read by two
   // reader instances.
-  SmallVector<MailboxLink> links;
-  SmallVector<const LinkUse *> useOf;
+  // Per class pair and pass: whether every reader instance reads one
+  // producer row of it. Then a producer-indexed stream needs one landing a
+  // reader pass, as a mailbox does, in one stream rather than one a plan
+  // (a parent's outputs to its children): those links, and those that fan
+  // out, go to producer-indexed streams (layoutStreamsOf).
+  std::map<std::tuple<unsigned, unsigned, unsigned>,
+           std::map<unsigned, std::set<uint64_t>>>
+      rowsRead;
+  std::set<std::tuple<unsigned, unsigned, unsigned, unsigned, unsigned>>
+      byProducer;
+  auto keyOf = [](const LinkUse &use) {
+    return std::make_tuple(use.reader, use.port, use.at, use.producer,
+                           use.low);
+  };
+  SmallVector<std::pair<const LinkUse *, MailboxLink>> offered;
   for (auto &use : uses) {
     auto &producer = producers[use.producer];
     if (producer.cls < 0 || producer.late || use.rows.size() < 2 ||
@@ -3443,10 +3459,42 @@ void StaticFolder::layoutMailboxStreams(std::vector<LinkStream> &out,
       fanout |= r >= 0 && r != int64_t(i);
       r = i;
     }
-    if (fanout || isChainLink(link))
+    if (!fanout && isChainLink(link))
       continue;
-    links.push_back(std::move(link));
-    useOf.push_back(&use);
+    auto &read = rowsRead[{link.pcls, link.rcls, link.writeKey}];
+    for (auto [i, row] : llvm::zip(use.readers, use.readerRows))
+      read[i].insert(row);
+    if (fanout)
+      byProducer.insert(keyOf(use));
+    else
+      offered.push_back({&use, std::move(link)});
+  }
+  SmallVector<MailboxLink> links;
+  SmallVector<const LinkUse *> useOf;
+  for (auto &[use, link] : offered) {
+    bool oneRow = true;
+    for (auto &[i, rows] : rowsRead[{link.pcls, link.rcls, link.writeKey}])
+      oneRow &= rows.size() == 1;
+    if (oneRow) {
+      byProducer.insert(keyOf(*use));
+      continue;
+    }
+    links.push_back(link);
+    useOf.push_back(use);
+  }
+  if (!byProducer.empty()) {
+    std::vector<LinkStream> more;
+    decltype(streamMembers) moreMembers;
+    layoutStreamsOf([&](const LinkUse &use) { return byProducer.count(keyOf(use)) > 0; },
+                    more, &moreMembers);
+    unsigned base = out.size();
+    for (auto &s : more) {
+      s.twoSets = true;
+      out.push_back(std::move(s));
+    }
+    if (members)
+      for (auto &[key, m] : moreMembers)
+        (*members)[key] = StreamMember{base + m.stream, m.offset, false};
   }
   SmallVector<MailboxPlan> plans;
   SmallVector<int> planOf;
@@ -3510,6 +3558,7 @@ void StaticFolder::layoutMailboxStreams(std::vector<LinkStream> &out,
       s.atReady = plan.writeKey > 0;
       s.level = plan.writeKey > 0 ? plan.writeKey - 1 : 0;
       s.mailbox = true;
+      s.twoSets = true;
       s.mbDomains = domains;
       unsigned offset = 0;
       int dom = -1;
@@ -15673,7 +15722,7 @@ LogicalResult StaticFolder::buildSim() {
           b, comb::ICmpPredicate::ugt,
           reg(t1(cross, cb, "cross"), prefix + "_cross0"), ran);
     Value pop0 = resetReg(sb.pop1, prefix + "_pop0", 0);
-    if (st.mailbox && st.maxNeed == 1) {
+    if (st.twoSets && st.maxNeed == 1) {
       // Ping-pong: a set per landing in turn, read by the passes in turn.
       sb.pingPong = true;
       auto popParNext = backedges.get(i1);

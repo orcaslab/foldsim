@@ -43,8 +43,9 @@
 # RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s
 # RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=60 | FileCheck %s
 # `--csf-mailbox-hbm`: the mailboxes in HBM, a stream of reader rows each
-# (Src -> Sink: two Sink rows of four lanes; Sink -> Src: a stream a lane, its
-# Src rows), written byte-masked at the producer's pass, a row landing for
+# (Src -> Sink: two Sink rows of four lanes, a reader-indexed mailbox; Sink ->
+# Src, where each Src reads one Sink row: a producer-indexed stream, its
+# readiness lanes fanning out), written byte-masked at the producer's pass, a row landing for
 # each reader pass in the stream's landing slots, two sets of read registers
 # in turn (no spacing of the reader's passes). Against the controllers'
 # model (Inputs/tb_mailbox_hbm.sv: 1 to 60 host cycles, stalls, full, the
@@ -54,21 +55,24 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/h40 --static --nest --modulo --min-ii 40 --compact-links --csf-mailbox-hbm --bubbles Src Sink 2>&1 | FileCheck %s --check-prefix=HBM
 # RUN: FileCheck %s --check-prefix=HBMS < %t/h40/schedule.txt
 # RUN: FileCheck %s --check-prefix=HBMVH < %t/h40/foldsim_sim.vh
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/h40 -DVM1 -DVM2 -DVM3 -DVM4 -DBUBBLES -Mdir %t/h40/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/h40/foldsim_sim.sv > %t/h40/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/h40 -DVM1 -DBUBBLES -Mdir %t/h40/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/h40/foldsim_sim.sv > %t/h40/build.log 2>&1
 # RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 # RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
 # RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/h24 --static --nest --modulo --min-ii 24 --compact-links --share-links --staged-links --csf-single-bank --csf-mailbox-builder --csf-mailbox-hbm --bubbles Src Sink > %t/h24.log 2>&1
 # RUN: FileCheck %s --check-prefix=HBMS < %t/h24/schedule.txt
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/h24 -DVM1 -DVM2 -DVM3 -DVM4 -DBUBBLES -Mdir %t/h24/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/h24/foldsim_sim.sv > %t/h24/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/h24 -DVM1 -DBUBBLES -Mdir %t/h24/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/h24/foldsim_sim.sv > %t/h24/build.log 2>&1
 # RUN: %t/h24/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 | FileCheck %s
 # RUN: %t/h24/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
 # RUN: %t/h24/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=1 +hi=60 | FileCheck %s
 # HBM: II = 40
-# HBMS: link streams: 5 streams, 12 links, 80 bits
+# HBMS: link streams: 2 streams, 12 links, 80 bits
+# HBMS: link stream Sink Src 4 0 4 4 1 2 8 1
 # HBMS: link stream Src Sink 8 0 32 32 1 8 2 1
-# HBMVH: FOLDSIM_VMEM_4_DW 32
-# HBMVH-NEXT: FOLDSIM_VMEM_4_MW 4
+# HBMVH: FOLDSIM_VMEM_0_DW 4
+# HBMVH-NEXT: FOLDSIM_VMEM_0_MW 1
+# HBMVH: FOLDSIM_VMEM_1_DW 32
+# HBMVH-NEXT: FOLDSIM_VMEM_1_MW 4
 # PLAIN: csf mailboxes: 2 (1 two banks) of 2 plans, 11 links as lanes (416 producer-entry bits), 2 memories (2 masked), 224 bits
 # CP: csf mailboxes: 4 (2 two banks) of 4 plans, 22 links as lanes (416 producer-entry bits), 4 memories (4 masked), 320 bits
 # ZL: csf mailboxes: 2 (1 two banks) of 2 plans, 10 links as lanes (320 producer-entry bits), 2 memories (2 masked), 192 bits
