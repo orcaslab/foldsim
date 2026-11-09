@@ -1,0 +1,20 @@
+# slr-kept: with --slr-groups, the SLR group assignments with the fewest link
+# bits between groups are kept (default 8) and each scheduled in turn, a line
+# each; the shortest frame is chosen, and the first whose frame is the modulo
+# search's lower bound is chosen at once (none can beat it). The synthetic
+# design of link-kind-cost.test, in the V80 region's three SLR groups.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/linkkind
+# With modulo, the first assignment reaches the lower bound: no other is
+# scheduled.
+# RUN: foldsim --srcs top.f --top Top --out %t/m --static --modulo --slr-groups --slr-region v80 node lvl1 2> %t/m.log > /dev/null
+# RUN: FileCheck %s --check-prefix=STOP < %t/m.log
+# Without modulo, no bound: every kept assignment is scheduled (3 here).
+# RUN: foldsim --srcs top.f --top Top --out %t/k --static --slr-groups --slr-region v80 --slr-kept 3 node lvl1 2> %t/k.log > /dev/null
+# RUN: FileCheck %s --check-prefix=ALL < %t/k.log
+# STOP: slr-groups: assignment 1 of 8: 0 link bits between groups, II 16 = the lower bound: chosen
+# STOP-NOT: slr-groups: assignment 2 of
+# STOP: foldsim-fold-static: II = 16
+# ALL: slr-groups: assignment 1 of 3: {{[0-9]+}} link bits between groups, II 17
+# ALL-NEXT: {{.*}}slr-groups: assignment 2 of 3:
+# ALL-NEXT: {{.*}}slr-groups: assignment 3 of 3:
+# ALL: foldsim-fold-static: II = 17

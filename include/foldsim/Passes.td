@@ -637,6 +637,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"linkKindGroupOthers", "link-kind-group-others", "std::string", "\"\"",
            "With link-kind-groups: what the rest takes of each group's, "
            "\"<uram>,<ramb36>,<luts>;...\" (missing groups: none)">,
+    Option<"slrKept", "slr-kept", "unsigned", "8",
+           "With slr-groups: the assignments with the fewest bits between "
+           "groups kept and each scheduled (a line each), the shortest frame "
+           "chosen; the first whose frame is the modulo search's lower bound "
+           "is chosen at once (none can beat it). Each is a whole schedule: at "
+           "32 SMs tens of seconds">,
     Option<"slrLinkRams", "slr-link-rams", "bool", "false",
            "With SLR groups: links may be block or ultra RAM too (by "
            "link-block-depth / link-ultra-depth or link-kind-cost), the memory "
