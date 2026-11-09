@@ -357,6 +357,9 @@ static constexpr unsigned kRingReads = 32;
 /// `vmem-rings`: the prefetches a ring memory may hold queued (waiting for
 /// their instances' reads).
 static constexpr unsigned kRingQueue = 64;
+/// `vmem-rings`: the host cycles an image's `free` may take to show the
+/// requests taken.
+static constexpr unsigned kRingFreeLag = 4;
 /// The control stages from a slot table's read to its pass: the state and
 /// ready passes' two staged registers and the one that makes them now.
 static constexpr int kControlStages = 3;
@@ -16545,6 +16548,8 @@ LogicalResult StaticFolder::buildSim() {
     SmallVector<Value> flightValid, flightInst;
     /// The prefetch queue's head leaving now: valid, instance, entry; its count.
     Value issValid, issInst, issEntry, queued;
+    /// The answers' image write leaving now: valid, instance, data.
+    Value wissValid, wissInst, wissData;
   };
   std::map<std::pair<unsigned, unsigned>, RingBuilt> ringBuilt;
   auto buildRing = [&](unsigned c, unsigned k) -> Value {
@@ -19124,14 +19129,15 @@ LogicalResult StaticFolder::buildSim() {
           auto &plan = *cls.ring;
           auto &rb = ringBuilt.at({unsigned(c), unsigned(&vm - cls.virtualMemories.data())});
           // The reads in flight: a table of kRingReads entries, each a read's
-          // instance, set at its issue (the first free entry) and cleared by
-          // its answer. Its room: the decisions in flight may issue L + 1
-          // more (a term below keeps them within it).
+          // instance, set at its issue (the first free entry) and cleared as
+          // its answer's image write leaves (below). Its room: the decisions
+          // in flight may issue L + 1 more (a term below keeps them within it).
           unsigned iw = std::max(idxWidth, 1u);
+          auto wissNext = backedges.get(i1);
+          auto wissInstNext = backedges.get(b.getIntegerType(iw));
+          Value wiss = wissNext, wissInst = wissInstNext;
           Value issued = copies[c].getResult(vm.firstOutput);
           Value issuedInst = copies[c].getResult(vm.firstOutput + 1);
-          auto &mainV = simVirtuals[simOf.at({unsigned(c), unsigned(&vm - cls.virtualMemories.data())})];
-          Value answered = body->getArgument(mainV.firstInput);
           std::string fp = vm.name + "_ring_flight";
           Value taken = constant(1, 0);
           for (unsigned e = 0; e < kRingReads; ++e) {
@@ -19141,10 +19147,10 @@ LogicalResult StaticFolder::buildSim() {
             Value in = reg(iNext, fp + Twine(e) + "_inst");
             Value alloc = comb::AndOp::create(b, ValueRange{issued, notOf(v), notOf(taken)}, false);
             taken = comb::OrOp::create(b, taken, notOf(v));
-            // Cleared by the answer's image write (a host cycle after the
-            // answer): a prefetch then leaves after that write.
+            // Cleared by the answer's image write as it leaves: a prefetch of
+            // the instance then leaves after that write.
             Value done = comb::AndOp::create(
-                b, rb.wv, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, in, rb.winst));
+                b, wiss, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, in, wissInst));
             vNext.setValue(comb::OrOp::create(b, comb::AndOp::create(b, v, notOf(done)), alloc));
             iNext.setValue(comb::MuxOp::create(b, alloc, issuedInst, in));
             rb.flightValid.push_back(v);
@@ -19157,7 +19163,7 @@ LogicalResult StaticFolder::buildSim() {
             outNext.setValue(comb::SubOp::create(
                 b,
                 comb::AddOp::create(b, rb.out, b.createOrFold<comb::ConcatOp>(constant(w - 1, 0), issued)),
-                b.createOrFold<comb::ConcatOp>(constant(w - 1, 0), answered)));
+                b.createOrFold<comb::ConcatOp>(constant(w - 1, 0), wiss)));
             terms.push_back(comb::ICmpOp::create(
                 b, comb::ICmpPredicate::ult,
                 comb::AddOp::create(b, rb.out, constant(w, decisionLead() + 1)),
@@ -19203,7 +19209,67 @@ LogicalResult StaticFolder::buildSim() {
                   b, v, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, in, topInst)));
             Value busy = comb::OrOp::create(b, hits, false);
             Value any = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, count, constant(qb + 1, 0));
-            rb.issValid = comb::AndOp::create(b, any, notOf(busy));
+            // The image's requests leave within its room: each counts two of
+            // `free` (a group member's FIFO entry holds a read and a write of a
+            // host cycle: an unpaired request takes an entry, free counts two),
+            // and the requests of the last kRingFreeLag host cycles are not in
+            // the `free` seen yet. The answers' writes first (a queue of
+            // kRingReads, as many as the reads in flight), then a prefetch.
+            unsigned fw = kVirtualFreeWidth;
+            Value freeImg = body->getArgument(simVirtuals[imageOf.at({unsigned(c), unsigned(&vm - cls.virtualMemories.data())})].firstInput + 3);
+            auto sentNext = backedges.get(b.getIntegerType(2));
+            SmallVector<Value> lag{resetReg(sentNext, fp + "_sent1", 0)};
+            for (unsigned l = 2; l <= kRingFreeLag; ++l)
+              lag.push_back(resetReg(lag.back(), fp + "_sent" + Twine(l), 0));
+            Value recent = constant(fw, 0);
+            for (Value x : lag)
+              recent = comb::AddOp::create(b, recent, b.createOrFold<comb::ConcatOp>(constant(fw - 2, 0), x));
+            Value used = comb::ShlOp::create(b, recent, constant(fw, 1));
+            Value credit = comb::SubOp::create(b, freeImg, used);
+            Value enough = comb::AndOp::create(
+                b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used),
+                comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit, constant(fw, 2)));
+            Value enough2 = comb::AndOp::create(
+                b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used),
+                comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit, constant(fw, 4)));
+            // The answers' writes: {instance, data}, queued a host cycle after
+            // the answer (rb.wv).
+            unsigned dw = vm.dataWidth, wb = llvm::Log2_32_Ceil(kRingReads);
+            auto wq = seq::FirMemOp::create(
+                b, seq::FirMemType::get(context, kRingReads, iw + dw, 1), /*readLatency=*/0,
+                /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
+                b.getStringAttr(fp + "_writes"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+                StringAttr{}, Attribute{});
+            auto wheadNext = backedges.get(b.getIntegerType(wb));
+            auto wtailNext = backedges.get(b.getIntegerType(wb));
+            auto wcountNext = backedges.get(b.getIntegerType(wb + 1));
+            Value whead = resetReg(wheadNext, fp + "_whead", 0);
+            Value wtail = resetReg(wtailNext, fp + "_wtail", 0);
+            Value wcount = resetReg(wcountNext, fp + "_wcount", 0);
+            seq::FirMemWriteOp::create(b, wq, wtail, hostClock, rb.wv,
+                                       b.createOrFold<comb::ConcatOp>(rb.winst, rb.wdata), Value{});
+            Value wtop = seq::FirMemReadOp::create(b, wq, whead, hostClock, constant(1, 1));
+            Value wany = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, wcount, constant(wb + 1, 0));
+            Value wgo = comb::AndOp::create(b, wany, enough);
+            wissNext.setValue(wgo);
+            Value wtopInst = b.createOrFold<comb::ExtractOp>(b.getIntegerType(iw), wtop, dw);
+            wissInstNext.setValue(wtopInst);
+            rb.wissValid = wgo;
+            rb.wissInst = wtopInst;
+            rb.wissData = b.createOrFold<comb::ExtractOp>(b.getIntegerType(dw), wtop, 0);
+            rb.issValid = comb::AndOp::create(
+                b, ValueRange{any, notOf(busy), comb::MuxOp::create(b, wgo, enough2, enough)}, false);
+            sentNext.setValue(comb::AddOp::create(
+                b, b.createOrFold<comb::ConcatOp>(constant(1, 0), wgo),
+                b.createOrFold<comb::ConcatOp>(constant(1, 0), rb.issValid)));
+            auto wstep = [&](Value v, Value on) -> Value {
+              return comb::AddOp::create(
+                  b, v, b.createOrFold<comb::ConcatOp>(constant(hw::getBitWidth(v.getType()) - 1, 0), on));
+            };
+            wheadNext.setValue(wstep(whead, wgo));
+            wtailNext.setValue(wstep(wtail, rb.wv));
+            wcountNext.setValue(comb::SubOp::create(
+                b, wstep(wcount, rb.wv), b.createOrFold<comb::ConcatOp>(constant(wb, 0), wgo)));
             rb.issInst = topInst;
             rb.issEntry = b.createOrFold<comb::ExtractOp>(b.getIntegerType(eb), top, 0);
             auto step = [&](Value v, Value on) -> Value {
@@ -19245,22 +19311,10 @@ LogicalResult StaticFolder::buildSim() {
       }
     }
     for (auto &v : simVirtuals) {
-      if (v.image) {
-        // `vmem-rings`: an image's room: the prefetches of the decisions in
-        // flight (L + 1), the writes of the memory's reads not yet answered
-        // (`out`) and of those the decisions in flight may issue (L + 1), and
-        // an answer's write on its way (1).
-        unsigned w = kVirtualFreeWidth;
-        auto &rbi = ringBuilt.at({v.cls, v.k});
-        unsigned qw = hw::getBitWidth(rbi.queued.getType());
-        Value need = comb::AddOp::create(
-            b, ValueRange{rbi.out, b.createOrFold<comb::ConcatOp>(constant(w - qw, 0), rbi.queued),
-                          constant(w, virtualRoom(false) + 1)},
-            false);
-        terms.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge,
-                                             body->getArgument(v.firstInput + 3), need));
+      // `vmem-rings`: an image's requests (its queued prefetches and its
+      // answers' writes) leave only within its room, not at decisions.
+      if (v.image)
         continue;
-      }
       // (An HBM link stream's page writes are at positions too, one a
       // position: no room past the decisions' in flight. Before they were,
       // its `pages` writes after a pass needed that many more, which a
@@ -19410,9 +19464,9 @@ LogicalResult StaticFolder::buildSim() {
       results.append(
           {rb.issValid,
            b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 0), rb.issEntry, constant(1, 0)}),
-           rb.issInst, rb.wv,
+           rb.issInst, rb.wissValid,
            b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 1), constant(eb, 0), constant(1, 0)}),
-           rb.winst, rb.wdata, constant(1, 1)});
+           rb.wissInst, rb.wissData, constant(1, 1)});
       continue;
     }
     auto &vm = classes[v.cls].virtualMemories[v.k];

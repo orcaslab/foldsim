@@ -7,18 +7,24 @@
 // answers may take their own latency: +lo1=<n> +hi1=<n> (default +lo/+hi).
 module vmem_model #(parameter IW = 2, AW = 4, TW = 0, ROWS = 1 << AW) (
     input logic clk, rst,
-    input int cyc, lo, hi, full,
+    input int cyc, lo, hi, full, fifo, drain,
     output logic rsp_valid, output logic [IW-1:0] rsp_inst, output logic [7:0] rsp_data,
     output logic [15:0] free,
     input logic rd_valid, input logic [IW-1:0] rd_inst, input logic [AW-1:0] rd_row,
     input logic wr_valid, input logic [IW-1:0] wr_inst, input logic [AW-1:0] wr_row,
     input logic [7:0] wr_data, input logic wr_mask,
     output bit ok, output int reads);
+  // +fifo=<n> (n > 0): requests wait in a FIFO of n entries (a host cycle's
+  // read and write one entry, as a foldsim_vmem_group member's), one taken a
+  // host cycle with probability +drain=<percent> (default 75); `free` is twice its free entries but one, as the
+  // group shows it; a request into a full FIFO is a PROTOCOL error.
   localparam INSTS = 1 << IW, AINSTS = 1 << (IW - TW);
   logic [7:0] mem [AINSTS][ROWS];
   bit outstanding [INSTS];
   int due [INSTS];
   logic [7:0] data [INSTS];
+  typedef struct { bit rd, wr; logic [IW-1:0] ri, wi; logic [AW-1:0] rr, wrr; logic [7:0] d; bit m; } ent_t;
+  ent_t q [$];
   initial begin
     ok = 1; reads = 0;
     for (int i = 0; i < INSTS; i++) begin
@@ -27,19 +33,33 @@ module vmem_model #(parameter IW = 2, AW = 4, TW = 0, ROWS = 1 << AW) (
     end
   end
   always @(negedge clk) begin
-    free = ($urandom % 100 >= full) ? 16'd64 : 16'd0;
+    if (fifo > 0)
+      free = (q.size() < fifo) ? 16'(2 * (fifo - 1 - q.size())) : 16'd0;
+    else
+      free = ($urandom % 100 >= full) ? 16'd64 : 16'd0;
     // One due response a host cycle, any instance.
     rsp_valid = 0;
     for (int i = 0; i < INSTS; i++)
-      if (!rsp_valid && outstanding[i] && cyc >= due[i]) begin
+      if (!rsp_valid && outstanding[i] && due[i] >= 0 && cyc >= due[i]) begin
         rsp_valid = 1; rsp_inst = IW'(i); rsp_data = data[i];
       end
   end
+  task automatic apply(ent_t e);
+`ifdef WRITE_FIRST
+    if (e.wr && e.m) mem[e.wi[IW-TW-1:0]][e.wrr] = e.d;
+`endif
+    if (e.rd) begin
+      due[e.ri] = cyc + lo + int'($urandom % (hi - lo + 1));
+      data[e.ri] = mem[e.ri[IW-TW-1:0]][e.rr];
+    end
+`ifndef WRITE_FIRST
+    if (e.wr && e.m) mem[e.wi[IW-TW-1:0]][e.wrr] = e.d;
+`endif
+  endtask
   always @(posedge clk) if (!rst) begin
     if (rsp_valid) outstanding[rsp_inst] = 0;
-`ifdef WRITE_FIRST
-    if (wr_valid && wr_mask) mem[wr_inst[IW-TW-1:0]][wr_row] = wr_data;
-`endif
+    if (fifo > 0 && q.size() != 0 && $urandom % 100 < drain)
+      apply(q.pop_front());
     if (rd_valid) begin
       reads++;
       if (outstanding[rd_inst]) begin
@@ -47,12 +67,21 @@ module vmem_model #(parameter IW = 2, AW = 4, TW = 0, ROWS = 1 << AW) (
         ok = 0;
       end
       outstanding[rd_inst] = 1;
-      due[rd_inst] = cyc + lo + int'($urandom % (hi - lo + 1));
-      data[rd_inst] = mem[rd_inst[IW-TW-1:0]][rd_row];
+      due[rd_inst] = -1;
     end
-`ifndef WRITE_FIRST
-    if (wr_valid && wr_mask) mem[wr_inst[IW-TW-1:0]][wr_row] = wr_data;
-`endif
+    if (rd_valid || wr_valid) begin
+      automatic ent_t e;
+      e.rd = rd_valid; e.wr = wr_valid; e.ri = rd_inst; e.wi = wr_inst; e.rr = rd_row; e.wrr = wr_row;
+      e.d = wr_data; e.m = wr_mask;
+      if (fifo > 0) begin
+        if (q.size() >= fifo) begin
+          if (ok) $display("PROTOCOL: vmem FIFO overflow at host cycle %0d", cyc);
+          ok = 0;
+        end
+        q.push_back(e);
+      end else
+        apply(e);
+    end
   end
 endmodule
 
@@ -132,7 +161,10 @@ module tb;
   initial if (!$value$plusargs("hi=%d", hi)) hi = lo;
   assign rd_inst[0][7:4] = 0; assign wr_inst[0][7:4] = 0;
   assign rd_inst[1][7:`IW1] = 0; assign wr_inst[1][7:`IW1] = 0;
-  int lo1, hi1;
+  int lo1, hi1, fifo;
+  int drain;
+  initial if (!$value$plusargs("fifo=%d", fifo)) fifo = 0;
+  initial if (!$value$plusargs("drain=%d", drain)) drain = 75;
   initial begin
     if (!$value$plusargs("lo1=%d", lo1) && !$value$plusargs("lo=%d", lo1)) lo1 = 1;
     if (!$value$plusargs("hi1=%d", hi1) && !$value$plusargs("hi=%d", hi1)) hi1 = lo1;
@@ -140,7 +172,7 @@ module tb;
   end
   for (genvar k = 0; k < V; k++) begin : g_vm
     localparam IWK = k ? `IW1 : 4;
-    vmem_model #(.IW(IWK), .AW(4), .TW(k ? `IW1 - 1 : 0)) model(.clk, .rst, .cyc, .lo(k ? lo1 : lo), .hi(k ? hi1 : hi), .full,
+    vmem_model #(.IW(IWK), .AW(4), .TW(k ? `IW1 - 1 : 0)) model(.clk, .rst, .cyc, .lo(k ? lo1 : lo), .hi(k ? hi1 : hi), .full, .fifo, .drain,
       .rsp_valid(rsp_valid[k]), .rsp_inst(rsp_inst[k][IWK-1:0]), .rsp_data(rsp_data[k]), .free(free[k]),
       .rd_valid(rd_valid[k]), .rd_inst(rd_inst[k][IWK-1:0]), .rd_row(rd_row[k]),
       .wr_valid(wr_valid[k]), .wr_inst(wr_inst[k][IWK-1:0]), .wr_row(wr_row[k]),

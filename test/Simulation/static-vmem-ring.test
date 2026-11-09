@@ -31,6 +31,14 @@
 # The lead covers a one-host-cycle answer: H stays II (22).
 # RUN: %t/l8/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=1 | FileCheck %s --check-prefix=FAST
 # RUN: %t/l8/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# Controllers whose requests wait in a FIFO of 8 entries drained slowly (a
+# group member's, `free` twice its free entries): the image's requests (a
+# prefetch's read and an answer's write, rarely in one host cycle) leave only
+# within its room. Before, the answers' writes left as they came and the FIFO
+# overflowed (PROTOCOL) at drain 40 and 25.
+# RUN: %t/l8/obj/Vtb +verilator+rand+reset+0 +verilator+seed+14 +lo=1 +fifo=8 +drain=40 | FileCheck %s
+# RUN: %t/l8/obj/Vtb +verilator+rand+reset+0 +verilator+seed+15 +lo=1 +fifo=8 +drain=25 | FileCheck %s
+# RUN: %t/l8/obj/Vtb +verilator+rand+reset+0 +verilator+seed+16 +lo=40 +hi=200 +lo1=1 +hi1=2 +fifo=8 +drain=50 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/m40 --static --modulo --min-ii 40 --virtual-memories ram --vmem-rings 6 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW1=5 -Mdir %t/m40/obj %S/Inputs/tb_vmem_ring.sv top.sv %t/m40/foldsim_sim.sv > %t/m40/build.log 2>&1
 # RUN: %t/m40/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
@@ -44,6 +52,7 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW1=5 -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_vmem_ring.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
 # RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +lo=5 +hi=60 +full=30 +bubble=30 | FileCheck %s
 # RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +lo=20 +hi=200 +full=50 +bubble=60 +burst=8 | FileCheck %s
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+17 +lo=1 +fifo=8 +drain=25 +bubble=30 | FileCheck %s
 # A cap below the window keeps the buffers (and the simulator as without rings).
 # RUN: foldsim --srcs top.f --top Top --out %t/cap --static --virtual-memories ram --vmem-rings 8 --vmem-ring-entries 4 Leaf 2> %t/cap.log > /dev/null
 # RUN: FileCheck %s --check-prefix=CAP < %t/cap.log
@@ -64,10 +73,12 @@
 # VH: `define FOLDSIM_VMEM_1_TAGW 3
 # CAPVH: `define FOLDSIM_VMEM_COUNT 1
 # No per-instance buffer: a ring of 4 entries, filled by the image's answers,
-# and the queue of prefetches waiting for their instances' reads ({instance, entry}).
+# the queue of prefetches waiting for their instances' reads ({instance, entry})
+# and the queue of the answers' image writes ({instance, data}).
 # MLIR-NOT: ram_rdata = seq.firmem
 # MLIR: %ram_ring = seq.firmem 1, 1, old, undefined : <4 x 8, mask 1>
 # MLIR: seq.firmem.write_port %ram_ring[{{.*}}] = %vm1_rsp_data, clock %hostClock enable %vm1_rsp_valid
 # MLIR: %ram_ring_flight_queue = seq.firmem 0, 1, undefined, undefined : <64 x 6, mask 1>
+# MLIR: %ram_ring_flight_writes = seq.firmem 0, 1, undefined, undefined : <32 x 12, mask 1>
 # FAST: {{^}}MATCH 196 cycles in 4400 host cycles, H 22.00
 # CHECK: {{^}}MATCH
