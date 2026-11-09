@@ -848,6 +848,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"stateInRamH", "state-in-ram-h", "unsigned", "0",
            "With state-in-ram and P auto: the most host cycles a copy's "
            "passes may take, instances x P (0: no bound)">,
+    ListOption<"splitLatency", "split-latency", "std::string",
+               "Classes (globs; a copy goes by its class's name) whose results "
+               "take n host cycles more, as <glob>:<n>: a copy split over SLRs "
+               "with its crossings registered (slr-split). Its links are never "
+               "taken in its own host cycle and every reader takes them n host "
+               "cycles later">,
     ListOption<"registeredLinks", "registered-links", "std::string",
                "Classes (globs; a copy goes by its class's name) whose links "
                "are never taken in their producer's host cycle: with "

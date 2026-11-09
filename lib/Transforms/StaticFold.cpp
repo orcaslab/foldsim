@@ -369,6 +369,14 @@ public:
   SmallVector<std::string> stateInRamSpecs;
   /// `stage-levels-class`: <glob>:<N|off> per class over `stage-levels`.
   SmallVector<std::string> stageLevelClassSpecs;
+  /// `split-latency`: <glob>:<n>, host cycles a class's results take more
+  /// (a copy split over SLRs, its crossings registered: slr-split).
+  SmallVector<std::string> splitLatencySpecs;
+  SmallVector<unsigned> splitLat;
+  unsigned splitDelay(int c) const {
+    return c >= 0 && unsigned(c) < splitLat.size() ? splitLat[c] : 0;
+  }
+  LogicalResult parseSplitLatency();
   unsigned stateInRamReadBits = 0;
   /// `state-in-ram-h`: the most host cycles a copy's P passes take,
   /// instances x P (0: no bound), for `auto` P.
@@ -595,7 +603,7 @@ private:
     return k > 1 ? k + 1 : 1;
   }
   int crossDelay(int p, int c) const {
-    return crosses(p, c) ? int(crossLatency(p)) : 0;
+    return (crosses(p, c) ? int(crossLatency(p)) : 0) + int(splitDelay(p));
   }
   /// `slr-serialize`: the spacing of each class's passes of one kind (its
   /// k, where a link of it crosses groups and k > 1; else 0).
@@ -2957,6 +2965,30 @@ LogicalResult StaticFolder::parseRegisteredLinks() {
   return success();
 }
 
+LogicalResult StaticFolder::parseSplitLatency() {
+  splitLat.assign(classes.size(), 0);
+  for (auto &spec : splitLatencySpecs) {
+    auto [g, n] = StringRef(spec).rsplit(':');
+    unsigned k = 0;
+    auto glob = llvm::GlobPattern::create(g);
+    if (!glob || n.getAsInteger(10, k))
+      return netlist.emitError("split-latency: '") << spec
+                                                   << "' is not <glob>:<n>";
+    bool any = false;
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      int base = cls.splitFrom >= 0 ? cls.splitFrom : int(c);
+      if (glob->match(classes[base].name)) {
+        splitLat[c] = k;
+        any = true;
+      }
+    }
+    if (!any)
+      return netlist.emitError("split-latency: no class matches '")
+             << spec << "'";
+  }
+  return success();
+}
+
 LogicalResult StaticFolder::parseSerialize() {
   serialK.assign(classes.size(), 1);
   for (auto &spec : slrSerializeSpecs) {
@@ -3784,6 +3816,9 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   if (!zeroLatencyLinks || producer.cls < 0 || !producer.late)
     return false;
   if (!registeredLinks.empty() && registeredLinks[producer.cls])
+    return false;
+  // A split class's results come over its crossing registers.
+  if (splitDelay(producer.cls))
     return false;
   // Between SLR groups a link is registered on both sides of the crossing.
   if (crosses(producer.cls, c))
@@ -15076,7 +15111,8 @@ void StaticFolder::staggerPortPushes() {
 LogicalResult StaticFolder::run() {
   inlineNetlists();
   if (failed(collect()) || failed(resolveEnvironment()) || failed(resolvePortFold()) ||
-      failed(parseRegisteredLinks()) || failed(parseSerialize()) ||
+      failed(parseRegisteredLinks()) || failed(parseSplitLatency()) ||
+      failed(parseSerialize()) ||
       failed(parseLinkKinds()))
     return failure();
   // `fold-stage-levels-class`: per class (its class's name for a copy) over
@@ -15212,6 +15248,7 @@ void FoldStaticPass::runOnOperation() {
   folder.moduloLinear = moduloLinear;
   folder.passSplitSpecs.assign(passSplit.begin(), passSplit.end());
   folder.stateInRamSpecs.assign(stateInRam.begin(), stateInRam.end());
+  folder.splitLatencySpecs.assign(splitLatency.begin(), splitLatency.end());
   folder.stageLevelClassSpecs.assign(stageLevelsClass.begin(),
                                      stageLevelsClass.end());
   folder.stateInRamReadBits = stateInRamReadBits;
