@@ -16294,6 +16294,9 @@ LogicalResult StaticFolder::buildSim() {
     unsigned link, producer, low, width;
     bool single;
     Backedge out;
+    /// Per producer instance: the reader instance that takes it here (the
+    /// plan's, less the reader instances an HBM stream carries), or -1.
+    SmallVector<int64_t> readerOf;
   };
   struct Mailbox {
     unsigned plan;
@@ -16306,7 +16309,8 @@ LogicalResult StaticFolder::buildSim() {
   std::map<std::tuple<unsigned, bool, bool, bool, int>, unsigned> mailboxOf;
   auto joinMailbox = [&](unsigned link, unsigned p, unsigned low,
                          unsigned width, StringRef style, bool early,
-                         bool late, bool single, int to) -> Value {
+                         bool late, bool single, int to,
+                         ArrayRef<int64_t> readerOf) -> Value {
     unsigned plan = unsigned(mailboxPlanOf[link]);
     auto [it, fresh] = mailboxOf.try_emplace(
         {plan, !style.empty(), early, late, to}, unsigned(mailboxes.size()));
@@ -16314,8 +16318,9 @@ LogicalResult StaticFolder::buildSim() {
       mailboxes.push_back({plan, !style.empty(), early, late, to,
                            style.str(), {}});
     auto &box = mailboxes[it->second];
-    box.lanes.push_back(
-        {link, p, low, width, single, backedges.get(b.getIntegerType(width))});
+    box.lanes.push_back({link, p, low, width, single,
+                         backedges.get(b.getIntegerType(width)),
+                         SmallVector<int64_t>(readerOf.begin(), readerOf.end())});
     return box.lanes.back().out;
   };
 
@@ -16874,9 +16879,13 @@ LogicalResult StaticFolder::buildSim() {
               mailboxLinkOf.find({unsigned(k), at, key.first, key.second});
           if (planned != mailboxLinkOf.end() &&
               mailboxPlanOf[planned->second] >= 0) {
+            SmallVector<int64_t> readerOf(pThreadsAll, -1);
+            for (unsigned i = 0; i < threads; ++i)
+              if (takes[i])
+                readerOf[rows[i]] = i;
             sourceData[index] =
                 joinMailbox(planned->second, unsigned(key.first), key.second,
-                            width, style, early, late, single, to);
+                            width, style, early, late, single, to, readerOf);
             continue;
           }
         }
@@ -17092,7 +17101,7 @@ LogicalResult StaticFolder::buildSim() {
       SmallVector<unsigned> widths, domainOf;
       SmallVector<SmallVector<bool>> domainMembers;
       for (auto &lane : box.lanes) {
-        auto &link = mailboxLinks[lane.link];
+        auto &link = lane;
         SmallVector<bool> members;
         for (auto [j, reader] : llvm::enumerate(link.readerOf)) {
           members.push_back(reader >= 0);
@@ -17110,7 +17119,7 @@ LogicalResult StaticFolder::buildSim() {
         if (row >= 0)
           row = rows++;
       for (auto &lane : box.lanes)
-        for (auto [j, reader] : llvm::enumerate(mailboxLinks[lane.link].readerOf))
+        for (auto [j, reader] : llvm::enumerate(lane.readerOf))
           if (reader >= 0)
             rowOfProducer[j] = rowOfReader[reader];
       bool identity = rows == rThreads;
