@@ -13,6 +13,7 @@ add_mlir_library(FoldsimTransforms
   LowerWideNegation.cpp
   CompressAddTrees.cpp
   CsfReadySplit.cpp
+  CsfMailboxes.cpp
   Pipelines.cpp
   RemoveDeadState.cpp
   ReplicateControls.cpp

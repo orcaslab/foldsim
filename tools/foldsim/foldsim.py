@@ -481,6 +481,8 @@ def frame_options(a):
             fold += f' state-in-ram-pp-fanout={a.state_in_ram_pp_fanout}'
     if getattr(a, 'csf_single_bank', False):
         fold += ' csf-single-bank'
+    if getattr(a, 'csf_mailbox_builder', False):
+        fold += ' csf-mailbox-builder'
     if getattr(a, 'csf_mailboxes', False):
         fold += ' csf-mailboxes'
         if getattr(a, 'csf_mailbox_latency', 1) != 1:
@@ -1494,6 +1496,9 @@ def build_parser():
     ap.add_argument('--state-in-ram-pp-fanout', type=int, default=0, metavar='N',
                     help='with --state-in-ram-pp: the most RAM primitives a combinationally read memory\'s '
                          'registered address copy drives (foldsim-fold-static state-in-ram-pp-fanout; 0: 96)')
+    ap.add_argument('--csf-mailbox-builder', action='store_true',
+                    help='constant-shell fold: the links of a producer class to a reader class as lanes of one '
+                         'reader-indexed mailbox, a row per reader instance (foldsim-fold-static csf-mailbox-builder)')
     ap.add_argument('--csf-single-bank', action='store_true',
                     help='constant-shell fold: an early link read before its producer\'s next write keeps one '
                          'bank, the others two, as the schedule decides (foldsim-fold-static csf-single-bank)')

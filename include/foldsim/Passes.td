@@ -899,6 +899,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "all of whose reads of a frame come before its producer writes "
            "the entry in that frame keeps one bank, not two; the others "
            "keep two (the schedule decides, link by link)">,
+    Option<"csfMailboxBuilder", "csf-mailbox-builder", "bool", "false",
+           "Constant-shell fold: the links from a producer class to a reader "
+           "class whose producer instances are each read by one reader "
+           "instance become lanes of one reader-indexed mailbox (a row per "
+           "reader instance, a lane per link, written masked at the "
+           "producer's pass, read whole at the reader's); links that fan "
+           "out, are taken now, forwarded, cross SLR groups, paged, staged "
+           "or streamed stay as they are">,
     Option<"csfMailboxes", "csf-mailboxes", "bool", "false",
            "Constant-shell fold (schedule only): links are rows of RAM "
            "mailboxes owned by their reader, one read port each: a link not "
