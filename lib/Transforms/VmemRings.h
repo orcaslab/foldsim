@@ -20,10 +20,13 @@
 // - a prefetch is decided only once its instance's read is answered (its
 //   pending bit clear) and so its image row written, at least a decision lead
 //   after the state pass that issued it;
-// - a use is decided only once its entry holds its prefetch's answer: a landed
-//   bit (cleared by a prefetch's issue and by its group's last use, set by its
-//   answer) and an owner (the position of the prefetch that last took the
-//   entry);
+// - a prefetch is queued at its position (the entry's landed bit cleared then)
+//   and leaves the queue once its instance has no read in flight (a fixed table
+//   of the reads in flight), so its decision waits for nothing;
+// - a use is decided only once its entry has landed: the bit is cleared by the
+//   entry's prefetch, queued at least `useGap` positions before the group's
+//   first use (so before that use's decision), and set by the prefetch's answer
+//   (the entry's previous group answered before its own uses);
 // - two prefetches share an entry only if, frame after frame, the later one
 //   comes after the earlier one's last use (checked over the schedule).
 //
@@ -58,10 +61,9 @@ struct RingPlan {
   std::string why;
   unsigned entries = 0, prefetches = 0;
   /// Per position: a prefetch there, its instance (the image's row) and its
-  /// entry; a use there, its entry, its prefetch's position (the entry's
-  /// owner), whether the prefetch is a frame before the use (a use of the
-  /// first frame run then reads zero: nothing was prefetched), and whether it
-  /// is its group's last.
+  /// entry; a use there, its entry, its prefetch's position, whether the
+  /// prefetch is a frame before the use (a use of the first frame run then
+  /// reads zero: nothing was prefetched), and whether it is its group's last.
   llvm::SmallVector<uint64_t> prefValid, prefInst, prefEntry;
   llvm::SmallVector<uint64_t> useValid, useEntry, useOwner, useCross, useLast;
   /// The most entries in use at once (prefetched, not yet used last).
@@ -71,13 +73,15 @@ struct RingPlan {
 /// Plans the ring of a class of `instances.size()` instances in a frame of
 /// `ii` positions: an instance's uses less than `lead` positions apart share a
 /// prefetch, each prefetch `lead` positions before its group's first use if it
-/// can, at least `minGap` positions after the issue (the pending bit set by the
-/// issue seen by the prefetch's decision) and at least one before the first
-/// use; one prefetch a position; a prefetch's entry its rank in the frame's
+/// can, at least `minGap` positions after the issue (the read in flight by the
+/// time the prefetch is queued) and at least `useGap` before the first use (the
+/// entry's landed bit cleared before that use's decision); one prefetch a
+/// position; a prefetch's entry its rank in the frame's
 /// prefetches mod R, R the smallest power of two (at least the window) with
 /// which no two live prefetches share an entry, at most `maxEntries`.
 RingPlan planRing(llvm::ArrayRef<RingInstance> instances, unsigned ii,
-                  unsigned lead, unsigned minGap, unsigned maxEntries);
+                  unsigned lead, unsigned minGap, unsigned useGap,
+                  unsigned maxEntries);
 
 } // namespace foldsim
 

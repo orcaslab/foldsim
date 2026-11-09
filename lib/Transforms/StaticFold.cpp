@@ -326,6 +326,9 @@ static constexpr unsigned kVirtualFreeWidth = 16;
 /// `vmem-rings`: the most reads of a ring memory in flight (its table's
 /// entries), whatever the instances.
 static constexpr unsigned kRingReads = 32;
+/// `vmem-rings`: the prefetches a ring memory may hold queued (waiting for
+/// their instances' reads).
+static constexpr unsigned kRingQueue = 64;
 /// The control stages from a slot table's read to its pass: the state and
 /// ready passes' two staged registers and the one that makes them now.
 static constexpr int kControlStages = 3;
@@ -7533,8 +7536,8 @@ int StaticFolder::minStateGap(const Class &cls) const {
     StringRef model = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
                                          : StringRef(cls.name);
     // `vmem-auto-bits`: a registered read of that image at least; `vmem-rings`:
-    // two positions more, from the issue's pending bit to the prefetch's
-    // decision and on to the first use (VmemRings.h).
+    // a decision lead + 3 more, from the read's issue to its prefetch's
+    // queueing and from that to the first use's decision (VmemRings.h).
     auto bySize = [&](seq::FirMemOp memory) {
       auto type = memory.getType();
       return vmemAutoBits && cls.threads() > 1 && memory.getReadLatency() == 1 &&
@@ -7552,7 +7555,7 @@ int StaticFolder::minStateGap(const Class &cls) const {
             (pattern.match(name) || pattern.match((model + ":" + name).str()))) ||
            bySize(memory))) {
         gap = std::max(gap, decisionLead() + (cls.heldReads ? 2 : 1) +
-                                (vmemRingLead && cls.threads() > 1 ? 2 : 0));
+                                (vmemRingLead && cls.threads() > 1 ? decisionLead() + 3 : 0));
         break;
       }
     }
@@ -10920,7 +10923,8 @@ void StaticFolder::planClassRing(
       return refuse("a ready pass after its state pass");
   }
   auto plan = std::make_shared<foldsim::RingPlan>(
-      foldsim::planRing(insts, ii, vmemRingLead, decisionLead() + 2, vmemRingEntries));
+      foldsim::planRing(insts, ii, vmemRingLead, decisionLead() + 2, decisionLead() + 2,
+                        vmemRingEntries));
   if (!plan->ok)
     return refuse(plan->why);
   unsigned rings = 0;
@@ -14786,8 +14790,8 @@ LogicalResult StaticFolder::buildSim() {
     /// to come) and a fixed table of their instances (`kRingReads` entries).
     Value out;
     SmallVector<Value> flightValid, flightInst;
-    /// Each shared entry's instance (none if an entry is an instance's).
-    seq::FirMemOp owner;
+    /// The prefetch queue's head leaving now: valid, instance, entry; its count.
+    Value issValid, issInst, issEntry, queued;
   };
   std::map<std::pair<unsigned, unsigned>, RingBuilt> ringBuilt;
   auto buildRing = [&](unsigned c, unsigned k) -> Value {
@@ -14817,8 +14821,7 @@ LogicalResult StaticFolder::buildSim() {
     Value skip2 = reg(comb::AndOp::create(b, table(b, at, plan.useCross, 1), notOf(rb.seen)),
                       prefix + "_skip2");
     Value skip1 = reg(skip2, prefix + "_skip1");
-    // The prefetches, now: {instance, entry} and the position (the entry's
-    // owner).
+    // The prefetches, queued now: {instance, entry}.
     auto chain3 = [&](Value v, const Twine &n) {
       return reg(reg(reg(v, n + "2"), n + "1"), n + "0");
     };
@@ -14828,7 +14831,6 @@ LogicalResult StaticFolder::buildSim() {
     rb.pinst0 = idxWidth ? chain3(table(b, at, plan.prefInst, idxWidth), prefix + "_pinst")
                          : constant(1, 0);
     rb.pentry0 = chain3(table(b, at, plan.prefEntry, eb), prefix + "_pentry");
-    Value pq0 = chain3(at, prefix + "_pq");
     Value irspValid = body->getArgument(image.firstInput);
     Value irspEntry = b.createOrFold<comb::ExtractOp>(
         b.getIntegerType(eb), body->getArgument(image.firstInput + 1), 1);
@@ -14840,9 +14842,9 @@ LogicalResult StaticFolder::buildSim() {
         StringAttr{}, Attribute{});
     seq::FirMemWriteOp::create(b, ring, irspEntry, hostClock, irspValid, irspData, Value{});
     Value data = seq::FirMemReadOp::create(b, ring, uentry2, hostClock, constant(1, 1));
-    // Landed entries: set by an answer, cleared by a prefetch's issue and by
-    // its group's last use, now; each entry's owner, the position of the
-    // prefetch that took it last.
+    // Landed entries: set by an answer, cleared by a prefetch's queueing (a
+    // use group of the entry's later than the previous one's uses) and by its
+    // group's last use, now.
     Value last0 = resetReg(resetReg(resetReg(table(b, at, plan.useLast, 1), prefix + "_last2", 0),
                                     prefix + "_last1", 0),
                            prefix + "_last0", 0);
@@ -14853,12 +14855,6 @@ LogicalResult StaticFolder::buildSim() {
     landedNext.setValue(comb::AndOp::create(
         b, comb::OrOp::create(b, rb.landed, bitOf(irspValid, irspEntry)),
         comb::XorOp::create(b, cleared, constant(plan.entries, ~0ull))));
-    rb.owner = seq::FirMemOp::create(
-        b, seq::FirMemType::get(context, plan.entries, hw::getBitWidth(at.getType()), 1),
-        /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
-        b.getStringAttr(prefix + "_owner"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
-        StringAttr{}, Attribute{});
-    seq::FirMemWriteOp::create(b, rb.owner, rb.pentry0, hostClock, rb.pref0, pq0, Value{});
     // The image's writes: the memory's answers, a host cycle on.
     rb.wv = resetReg(body->getArgument(main.firstInput), prefix + "_wv", 0);
     Value minst = body->getArgument(main.firstInput + 1);
@@ -16829,7 +16825,6 @@ LogicalResult StaticFolder::buildSim() {
           Value issuedInst = copies[c].getResult(vm.firstOutput + 1);
           auto &mainV = simVirtuals[simOf.at({unsigned(c), unsigned(&vm - cls.virtualMemories.data())})];
           Value answered = body->getArgument(mainV.firstInput);
-          Value answeredInst = body->getArgument(mainV.firstInput + 1);
           std::string fp = vm.name + "_ring_flight";
           Value taken = constant(1, 0);
           for (unsigned e = 0; e < kRingReads; ++e) {
@@ -16839,8 +16834,10 @@ LogicalResult StaticFolder::buildSim() {
             Value in = reg(iNext, fp + Twine(e) + "_inst");
             Value alloc = comb::AndOp::create(b, ValueRange{issued, notOf(v), notOf(taken)}, false);
             taken = comb::OrOp::create(b, taken, notOf(v));
+            // Cleared by the answer's image write (a host cycle after the
+            // answer): a prefetch then leaves after that write.
             Value done = comb::AndOp::create(
-                b, answered, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, in, answeredInst));
+                b, rb.wv, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, in, rb.winst));
             vNext.setValue(comb::OrOp::create(b, comb::AndOp::create(b, v, notOf(done)), alloc));
             iNext.setValue(comb::MuxOp::create(b, alloc, issuedInst, in));
             rb.flightValid.push_back(v);
@@ -16869,25 +16866,60 @@ LogicalResult StaticFolder::buildSim() {
                 0);
           };
           unsigned eb = llvm::Log2_32_Ceil(plan.entries);
-          Value pv = table(b, next, plan.prefValid, 1);
-          Value pinst = idxWidth ? table(b, next, plan.prefInst, idxWidth) : constant(1, 0);
-          SmallVector<Value> hits;
-          for (auto [v, in] : llvm::zip(rb.flightValid, rb.flightInst))
-            hits.push_back(comb::AndOp::create(
-                b, v, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, in, pinst)));
-          Value pbit = comb::OrOp::create(b, hits, false);
-          terms.push_back(comb::OrOp::create(b, notOf(pv), notOf(pbit)));
+          // The prefetch queue (kRingQueue entries of {instance, entry}): a
+          // prefetch queued at its position leaves, one a host cycle, once its
+          // instance has no read in flight. Its decisions wait only for room.
+          {
+            unsigned qb = llvm::Log2_32_Ceil(kRingQueue);
+            unsigned ew = iw + eb;
+            auto queue = seq::FirMemOp::create(
+                b, seq::FirMemType::get(context, kRingQueue, ew, 1), /*readLatency=*/0,
+                /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
+                b.getStringAttr(fp + "_queue"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+                StringAttr{}, Attribute{});
+            auto headNext = backedges.get(b.getIntegerType(qb));
+            auto tailNext = backedges.get(b.getIntegerType(qb));
+            auto countNext = backedges.get(b.getIntegerType(qb + 1));
+            Value head = resetReg(headNext, fp + "_qhead", 0);
+            Value tail = resetReg(tailNext, fp + "_qtail", 0);
+            Value count = resetReg(countNext, fp + "_qcount", 0);
+            Value pinst0 = hw::getBitWidth(rb.pinst0.getType()) == iw
+                               ? rb.pinst0
+                               : b.createOrFold<comb::ExtractOp>(b.getIntegerType(iw), rb.pinst0, 0);
+            seq::FirMemWriteOp::create(b, queue, tail, hostClock, rb.pref0,
+                                       b.createOrFold<comb::ConcatOp>(pinst0, rb.pentry0), Value{});
+            Value top = seq::FirMemReadOp::create(b, queue, head, hostClock, constant(1, 1));
+            Value topInst = b.createOrFold<comb::ExtractOp>(b.getIntegerType(iw), top, eb);
+            SmallVector<Value> hits;
+            for (auto [v, in] : llvm::zip(rb.flightValid, rb.flightInst))
+              hits.push_back(comb::AndOp::create(
+                  b, v, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, in, topInst)));
+            Value busy = comb::OrOp::create(b, hits, false);
+            Value any = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, count, constant(qb + 1, 0));
+            rb.issValid = comb::AndOp::create(b, any, notOf(busy));
+            rb.issInst = topInst;
+            rb.issEntry = b.createOrFold<comb::ExtractOp>(b.getIntegerType(eb), top, 0);
+            auto step = [&](Value v, Value on) -> Value {
+              return comb::AddOp::create(
+                  b, v, b.createOrFold<comb::ConcatOp>(constant(hw::getBitWidth(v.getType()) - 1, 0), on));
+            };
+            headNext.setValue(step(head, rb.issValid));
+            tailNext.setValue(step(tail, rb.pref0));
+            countNext.setValue(comb::SubOp::create(
+                b, step(count, rb.pref0),
+                b.createOrFold<comb::ConcatOp>(constant(qb, 0), rb.issValid)));
+            rb.queued = count;
+            terms.push_back(comb::ICmpOp::create(
+                b, comb::ICmpPredicate::ult,
+                comb::AddOp::create(b, b.createOrFold<comb::ConcatOp>(constant(1, 0), count),
+                                    constant(qb + 2, decisionLead() + 2)),
+                constant(qb + 2, kRingQueue)));
+          }
           Value uv = table(b, next, plan.useValid, 1);
           Value entry = table(b, next, plan.useEntry, eb);
           Value seen = comb::OrOp::create(b, rb.seen, eq(posD, ii - 1));
           Value skip = comb::AndOp::create(b, table(b, next, plan.useCross, 1), notOf(seen));
           Value landed = bitAt(rb.landed, plan.entries, entry, eb);
-          landed = comb::AndOp::create(
-              b, landed,
-              comb::ICmpOp::create(
-                  b, comb::ICmpPredicate::eq,
-                  seq::FirMemReadOp::create(b, rb.owner, entry, hostClock, constant(1, 1)),
-                  table(b, next, plan.useOwner, posWidth)));
           terms.push_back(comb::OrOp::create(b, ValueRange{notOf(uv), skip, landed}, false));
           continue;
         }
@@ -16912,8 +16944,12 @@ LogicalResult StaticFolder::buildSim() {
         // (`out`) and of those the decisions in flight may issue (L + 1), and
         // an answer's write on its way (1).
         unsigned w = kVirtualFreeWidth;
+        auto &rbi = ringBuilt.at({v.cls, v.k});
+        unsigned qw = hw::getBitWidth(rbi.queued.getType());
         Value need = comb::AddOp::create(
-            b, ringBuilt.at({v.cls, v.k}).out, constant(w, virtualRoom(false) + 1));
+            b, ValueRange{rbi.out, b.createOrFold<comb::ConcatOp>(constant(w - qw, 0), rbi.queued),
+                          constant(w, virtualRoom(false) + 1)},
+            false);
         terms.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge,
                                              body->getArgument(v.firstInput + 3), need));
         continue;
@@ -17063,9 +17099,9 @@ LogicalResult StaticFolder::buildSim() {
       auto &rb = ringBuilt.at({v.cls, v.k});
       unsigned eb = llvm::Log2_32_Ceil(classes[v.cls].ring->entries);
       results.append(
-          {rb.pref0,
-           b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 0), rb.pentry0, constant(1, 0)}),
-           rb.pinst0, rb.wv,
+          {rb.issValid,
+           b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 0), rb.issEntry, constant(1, 0)}),
+           rb.issInst, rb.wv,
            b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 1), constant(eb, 0), constant(1, 0)}),
            rb.winst, rb.wdata, constant(1, 1)});
       continue;

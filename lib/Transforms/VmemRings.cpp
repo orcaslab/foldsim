@@ -16,7 +16,8 @@ using llvm::SmallVector;
 static int floorDiv(int x, int d) { return x >= 0 ? x / d : -((-x + d - 1) / d); }
 
 RingPlan foldsim::planRing(llvm::ArrayRef<RingInstance> instances, unsigned ii,
-                           unsigned lead, unsigned minGap, unsigned maxEntries) {
+                           unsigned lead, unsigned minGap, unsigned useGap,
+                           unsigned maxEntries) {
   RingPlan plan;
   int frame = int(ii);
   auto wrap = [&](int p) { return unsigned(((p % frame) + frame) % frame); };
@@ -50,12 +51,12 @@ RingPlan foldsim::planRing(llvm::ArrayRef<RingInstance> instances, unsigned ii,
   }
   for (auto &g : groups) {
     g.lo = instances[g.inst].issue + int(minGap);
-    g.hi = g.uses.front() - 1;
+    g.hi = g.uses.front() - int(std::max(1u, useGap));
     if (g.lo > g.hi) {
       plan.why = "instance " + std::to_string(g.inst) + ": " +
                  std::to_string(g.uses.front() - instances[g.inst].issue) +
                  " positions from its read's issue to its next first use, fewer than " +
-                 std::to_string(minGap + 1);
+                 std::to_string(minGap + std::max(1u, useGap));
       return plan;
     }
     g.want = std::max(g.lo, g.uses.front() - int(lead));

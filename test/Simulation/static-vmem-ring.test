@@ -6,8 +6,8 @@
 # window. Sixteen leaves (a class of 16 instances, a read held when bit 1 is
 # low, read first), against a model of both controllers (Inputs/tb_vmem_ring.sv):
 # the static simulator matches the target at any answer latency, with stalled
-# channels, controllers out of room and bubbles; with rings of 16, 8, 4 and 2
-# entries (shared by 1, 2, 4 and 8 instances), nested sequencers, a short lead.
+# channels, controllers out of room and bubbles; with rings of 16, 8 and 4
+# entries (shared by 1, 2 and 4 instances), nested sequencers, a short lead.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmemring
 # RUN: foldsim --srcs top.f --top Top --out %t/l2 --static --virtual-memories ram --vmem-rings 2 Leaf 2> %t/l2.log > /dev/null
 # RUN: FileCheck %s --check-prefix=L2 < %t/l2.log
@@ -23,7 +23,7 @@
 # RUN: %t/l2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+13 +lo=1 +hi=100 +lo1=1 +hi1=1 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/l1 --static --virtual-memories ram --vmem-rings 1 Leaf 2> %t/l1.log > /dev/null
 # RUN: FileCheck %s --check-prefix=L1 < %t/l1.log
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW1=3 -Mdir %t/l1/obj %S/Inputs/tb_vmem_ring.sv top.sv %t/l1/foldsim_sim.sv > %t/l1/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW1=4 -Mdir %t/l1/obj %S/Inputs/tb_vmem_ring.sv top.sv %t/l1/foldsim_sim.sv > %t/l1/build.log 2>&1
 # RUN: %t/l1/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=5 +hi=60 +full=30 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/l8 --static --virtual-memories ram --vmem-rings 8 Leaf 2> %t/l8.log > /dev/null
 # RUN: FileCheck %s --check-prefix=L8 < %t/l8.log
@@ -35,21 +35,21 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW1=5 -Mdir %t/m40/obj %S/Inputs/tb_vmem_ring.sv top.sv %t/m40/foldsim_sim.sv > %t/m40/build.log 2>&1
 # RUN: %t/m40/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/nest --static --virtual-memories ram --vmem-rings 3 --nest Leaf > /dev/null 2>&1
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW1=4 -Mdir %t/nest/obj %S/Inputs/tb_vmem_ring.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW1=5 -Mdir %t/nest/obj %S/Inputs/tb_vmem_ring.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
 # RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=1 +hi=30 +stall=20 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/short --static --virtual-memories ram --vmem-rings 3 --short-lead Leaf > /dev/null 2>&1
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW1=4 -Mdir %t/short/obj %S/Inputs/tb_vmem_ring.sv top.sv %t/short/foldsim_sim.sv > %t/short/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW1=5 -Mdir %t/short/obj %S/Inputs/tb_vmem_ring.sv top.sv %t/short/foldsim_sim.sv > %t/short/build.log 2>&1
 # RUN: %t/short/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=30 +stall=20 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/bub --static --virtual-memories ram --vmem-rings 3 --bubbles --nest Leaf > /dev/null 2>&1
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW1=4 -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_vmem_ring.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW1=5 -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_vmem_ring.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
 # RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +lo=5 +hi=60 +full=30 +bubble=30 | FileCheck %s
 # RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +lo=20 +hi=200 +full=50 +bubble=60 +burst=8 | FileCheck %s
 # A cap below the window keeps the buffers (and the simulator as without rings).
 # RUN: foldsim --srcs top.f --top Top --out %t/cap --static --virtual-memories ram --vmem-rings 8 --vmem-ring-entries 4 Leaf 2> %t/cap.log > /dev/null
 # RUN: FileCheck %s --check-prefix=CAP < %t/cap.log
 # RUN: FileCheck %s --check-prefix=CAPVH < %t/cap/foldsim_sim.vh
-# L2: vmem-rings: Leaf: 1 read buffers as rings of 4 entries (window 3, 16 instances, 16 prefetches a frame, lead 2)
-# L1: vmem-rings: Leaf: 1 read buffers as rings of 2 entries (window 2, 16 instances, 16 prefetches a frame, lead 1)
+# L2: vmem-rings: Leaf: 1 read buffers as rings of 4 entries (window 4, 16 instances, 16 prefetches a frame, lead 2)
+# L1: vmem-rings: Leaf: 1 read buffers as rings of 4 entries (window 3, 16 instances, 16 prefetches a frame, lead 1)
 # L8: vmem-rings: Leaf: 1 read buffers as rings of 16 entries (window 9, 16 instances, 16 prefetches a frame, lead 8)
 # CAP: vmem-rings: Leaf: read buffers kept (more than 4 entries (a window of 9))
 # The memory and its image (16 instances x 1 row).
@@ -64,11 +64,10 @@
 # VH: `define FOLDSIM_VMEM_1_TAGW 3
 # CAPVH: `define FOLDSIM_VMEM_COUNT 1
 # No per-instance buffer: a ring of 4 entries, filled by the image's answers,
-# and each entry's owner (the position of the prefetch that took it last).
+# and the queue of prefetches waiting for their instances' reads ({instance, entry}).
 # MLIR-NOT: ram_rdata = seq.firmem
 # MLIR: %ram_ring = seq.firmem 1, 1, old, undefined : <4 x 8, mask 1>
 # MLIR: seq.firmem.write_port %ram_ring[{{.*}}] = %vm1_rsp_data, clock %hostClock enable %vm1_rsp_valid
-# MLIR: %ram_ring_owner = seq.firmem 0, 1, undefined, undefined : <4 x 5, mask 1>
-# MLIR: seq.firmem.write_port %ram_ring_owner[%ram_ring_pentry0] = %ram_ring_pq0, clock %hostClock enable %ram_ring_pref0
+# MLIR: %ram_ring_flight_queue = seq.firmem 0, 1, undefined, undefined : <64 x 6, mask 1>
 # FAST: {{^}}MATCH 196 cycles in 4400 host cycles, H 22.00
 # CHECK: {{^}}MATCH
