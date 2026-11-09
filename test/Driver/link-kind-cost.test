@@ -3,7 +3,9 @@
 # device budget per kind (URAM288, RAMB36, LUTs), largest first, evening the
 # kinds' utilizations out, instead of the link-block-depth / link-ultra-depth
 # thresholds. A synthetic design (synth_1109 gen.py --hier 2,8 --link 24): 16
-# nodes under 2 levels, 72 such links in 33 groups. With one kind's budget only,
+# nodes under 2 levels, 72 such links in 5 groups (a producer class's links to
+# a reader at one depth take one kind: foldsim-merge-memories lays those read
+# alike side by side). With one kind's budget only,
 # every link takes that kind (ultra RAM, block RAM, distributed RAM read
 # combinationally); with all three, the kinds are mixed and evened out; with
 # the rest of the design taking a kind (link-kind-others), the links avoid it.
@@ -28,12 +30,13 @@
 # Without it, the thresholds (none here: every link distributed).
 # RUN: foldsim --srcs top.f --top Top --out %t/n --static node lvl1 2> %t/n.log > /dev/null
 # RUN: FileCheck %s --check-prefix=DM < %t/n/foldsim_sim.mlir
-# U: link-kind-cost: 33 link groups (72 links): ultra 33 (72 URAM288), block 0 (0.0 RAMB36), distributed 0 (0 LUTs)
+# U: link-kind-cost: 5 link groups (72 links): ultra 5 (21 URAM288), block 0 (0.0 RAMB36), distributed 0 (0 LUTs)
+# U: link-kind-cost: the build asked 72 links' kinds of the plan, 0 outside it (thresholds)
 # UM: %node_q0_addr_to_lvl1_model_u0_q0_addr_0 = seq.firmem 1, 1, old, undefined {sv.attributes = [#sv.attribute<"ram_style" = "\22ultra\22">]} : <32 x 24, mask 1>
-# B: link-kind-cost: 33 link groups (72 links): ultra 0 (0 URAM288), block 33 (40.5 RAMB36), distributed 0 (0 LUTs)
+# B: link-kind-cost: 5 link groups (72 links): ultra 0 (0 URAM288), block 5 (19.5 RAMB36), distributed 0 (0 LUTs)
 # BM: %node_q0_addr_to_lvl1_model_u0_q0_addr_0 = seq.firmem 1, 1, old, undefined {sv.attributes = [#sv.attribute<"ram_style" = "\22block\22">]} : <32 x 24, mask 1>
-# D: link-kind-cost: 33 link groups (72 links): ultra 0 (0 URAM288), block 0 (0.0 RAMB36), distributed 33 (747 LUTs)
+# D: link-kind-cost: 5 link groups (72 links): ultra 0 (0 URAM288), block 0 (0.0 RAMB36), distributed 5 (747 LUTs)
 # DM: %node_q0_addr_to_lvl1_model_u0_q0_addr_0 = seq.firmem 0, 1, undefined, undefined : <32 x 24, mask 1>
-# M: link-kind-cost: 33 link groups (72 links): ultra 1 (7 URAM288), block 9 (10.5 RAMB36), distributed 23 (141 LUTs); with the rest: URAM288 35.0 % RAMB36 52.5 % LUTs 35.2 % of the budget
-# O: link-kind-cost: 33 link groups (72 links): ultra 0 (0 URAM288), block 8 (15.0 RAMB36), distributed 25 (200 LUTs); with the rest: URAM288 75.0 % RAMB36 37.5 % LUTs 25.0 % of the budget
+# M: link-kind-cost: 5 link groups (72 links): ultra 1 (4 URAM288), block 1 (12.5 RAMB36), distributed 3 (106 LUTs); with the rest: URAM288 20.0 % RAMB36 62.5 % LUTs 26.5 % of the budget
+# O: link-kind-cost: 5 link groups (72 links): ultra 0 (0 URAM288), block 2 (14.5 RAMB36), distributed 3 (181 LUTs); with the rest: URAM288 75.0 % RAMB36 36.2 % LUTs 22.7 % of the budget
 # V: link-kind-cost link-kind-device=1029,2052,1307904
