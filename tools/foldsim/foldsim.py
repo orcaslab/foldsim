@@ -533,6 +533,8 @@ def frame_options(a):
             fold += ' state-in-ram-zero-links'
         if getattr(a, 'state_in_ram_pp', False):
             fold += ' state-in-ram-pp'
+        if getattr(a, 'state_in_ram_pp_replicas', 0):
+            fold += f' state-in-ram-pp-replicas={a.state_in_ram_pp_replicas}'
         if getattr(a, 'state_in_ram_pp_no_pack', False):
             fold += ' state-in-ram-pp-pack=false'
         if getattr(a, 'state_in_ram_pp_fanout', 0):
@@ -1763,6 +1765,10 @@ def build_parser():
     ap.add_argument('--state-stream-window', type=int, default=0, metavar='N',
                     help='with --state-scratch-bits: a streamed PP class\'s landing window, in instance slots '
                          '(foldsim-fold-static state-stream-window; 0: a RAMB36 deep, 512 / P)')
+    ap.add_argument('--state-in-ram-pp-replicas', type=int, default=0, metavar='N',
+                    help='with --state-in-ram-pp: each column\'s output register replicated per subtree (the first '
+                         'N path components) of the registers it holds (foldsim-fold-static state-in-ram-pp-replicas; '
+                         '0: off)')
     ap.add_argument('--state-in-ram-pp-no-pack', action='store_true',
                     help='with --state-in-ram-pp: the registers a class\'s rows leave out keep a store each '
                          '(default: packed into 72-bit columns of an instance\'s row each; foldsim-fold-static '
