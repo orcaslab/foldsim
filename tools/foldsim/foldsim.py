@@ -827,14 +827,53 @@ def check_region(a):
     return v80_region() if r == 'v80' else r
 
 
+# The SLR check's physical refusals (guide policy: they fail): the design past
+# the placement fill, the memories past the region's, SLLs past a boundary, no
+# assignment even with copies cut.
+PHYSICAL = re.compile(r'past the placement fill|past the region\'s at the placement fill|SLLs projected over .* past '
+                      r'its|no assignment of the copies within|does not fit the room the other copies leave')
 STRADDLE = re.compile(r'fits no SLR whole|no assignment of the copies|does not fit the room the other copies leave')
 
 
+def slr_guide(a, out, verdict):
+    """--slr-policy guide (default): a class copy crossing an SLR boundary is a
+    guide, not a failure: a warning naming each straddling copy, its resources,
+    the SLRs it spreads over, the projected SLLs per boundary and the suggested
+    assignment of the others (<out>/sll/sll.json). foldsim_sim.sv is kept."""
+    j = json.load(open(out('sll/sll.json'))) if os.path.exists(out('sll/sll.json')) else {}
+    copies, caps, cuts = j.get('copies', {}), j.get('caps', []), list(j.get('cuts') or [])
+    if a.allow_slr_straddle:
+        print('foldsim: warning: --allow-slr-straddle is no longer needed (--slr-policy guide: a straddle is a '
+              'guide, not a failure); ignored', file=sys.stderr)
+    if not cuts:
+        return
+    res = ('lut', 'lutram', 'ff', 'uram', 'bram')
+    fmt = lambda r, x: f'{x:,.1f}' if r in ('uram', 'bram') else f'{x:,.0f}'
+    names = [s['name'] for s in caps]
+    lines = [f'foldsim: GUIDE: SLR straddle (a guide, --slr-policy guide): {verdict}']
+    for c in cuts:
+        sh = (j.get('shares') or {}).get(c) or {}
+        spread = ''
+        if sh.get('lut'):
+            spread = ' over ' + '/'.join(f'{n} {100 * x:.0f} %' for n, x in zip(names, sh['lut']) if x > 0.005)
+        lines.append(f'  GUIDE: {c} straddles{spread}: ' + ', '.join(f'{r} {fmt(r, copies[c][r])}' for r in res
+                                                                    if c in copies))
+    for b, sl in enumerate(j.get('slls') or []):
+        if b + 1 < len(names):
+            lines.append(f'  GUIDE: boundary {names[b]}-{names[b + 1]}: {sum(sl):,.0f} SLLs projected '
+                         f'(links {sl[0]:,.0f}, cut copies {sl[1]:,.0f}, simulator level and kernel {sl[2]:,.0f})')
+    for g, cs in enumerate(j.get('assignment') or []):
+        if g < len(names):
+            lines.append(f'  GUIDE: suggested {names[g]}: ' + ' '.join(x for x in cs if x not in cuts))
+    lines.append(f'  report: {out("sll")}/sll.txt')
+    print('\n'.join(lines), file=sys.stderr)
+
+
 def slr_rule(a, out, verdict, rc):
-    """The hard SLR rule on the check's verdict and JSON (<out>/sll/sll.json):
-    no class copy may cross an SLR boundary. Exits with an error naming each
-    straddling copy, its resources and each SLR's capacity, unless
-    --allow-slr-straddle gives the reason."""
+    """--slr-policy strict, the hard SLR rule on the check's verdict and JSON
+    (<out>/sll/sll.json): no class copy may cross an SLR boundary. Exits with an
+    error naming each straddling copy, its resources and each SLR's capacity,
+    unless --allow-slr-straddle gives the reason."""
     if rc == 2 or verdict is None:
         sys.exit('foldsim: error: SLR rule: the SLR check failed, so no copy is proven to fit an SLR whole '
                  f'(report {out("sll")}); --allow-slr-straddle does not cover a failed check')
@@ -1588,19 +1627,27 @@ def build_parser():
                          'also keep the boundary budget (sll_per_boundary x sll_margin) in link bits')
     ap.add_argument('--region', default='auto', metavar='JSON',
                     help='with --static: the dynamic region the simulator is placed in (JSON, per SLR its LUTs, '
-                         'LUTRAM, URAM and RAMB36 and the margin: foldsim_v80_slr.json, or `v80`). HARD RULE: no '
-                         'class copy may cross an SLR boundary. After the fold the driver checks the netlist '
-                         '(foldsim_sll_check.py: each copy\'s LUT, LUTRAM, FF, URAM and RAMB36 counted on '
-                         'foldsim_sim.mlir, an assignment of whole copies to the SLRs; report in <out>/sll/sll.txt) '
-                         'and FAILS when a copy fits no SLR whole, when no assignment of whole copies exists, or '
-                         'when a copy is cut over SLRs (FireSim vD, 11-07: its ToR switch straddled SLR1/SLR2 and '
-                         'routing failed after 18 h); foldsim_sim.sv is then renamed foldsim_sim.sv.slr-refused. '
+                         'LUTRAM, URAM and RAMB36 and the margin: foldsim_v80_slr.json, or `v80`). After the fold the '
+                         'driver checks the netlist (foldsim_sll_check.py: each copy\'s LUT, LUTRAM, FF, URAM and '
+                         'RAMB36 counted on foldsim_sim.mlir, an assignment of whole copies to the SLRs, the SLLs '
+                         'each boundary takes; report in <out>/sll/sll.txt): a copy crossing an SLR boundary is a '
+                         'GUIDE warning (--slr-policy guide, the default), the design past the placement fill, the '
+                         'memories past the region\'s or SLLs past a boundary fail; --slr-policy strict keeps the '
+                         '11-08 hard rule (a straddle fails, foldsim_sim.sv renamed foldsim_sim.sv.slr-refused). '
                          'Default `auto`: --slr-region if given, else the V80 compute shell\'s region (the static '
                          'fold\'s target) unless the manifest\'s [platform] device is not an xcv80 part')
     ap.add_argument('--allow-slr-straddle', default='', metavar='REASON',
-                    help='the ONLY override of the SLR rule (--region): the compilation finishes with a straddling '
-                         'copy, the reason (who approved it, when, why) recorded in <out>/SLR_STRADDLE_APPROVED and '
-                         'in foldsim_sim.json (slr_straddle_approved)')
+                    help='with --slr-policy strict, the only override of the SLR rule: the compilation finishes with '
+                         'a straddling copy, the reason recorded in <out>/SLR_STRADDLE_APPROVED and foldsim_sim.json '
+                         '(slr_straddle_approved); with guide (the default) accepted and ignored (no longer needed)')
+    ap.add_argument('--slr-policy', choices=('guide', 'strict'), default='guide',
+                    help='with a region (--region): guide (default, 11-08): a class copy crossing an SLR boundary is a '
+                         'warning (GUIDE lines: each straddling copy, its resources and SLRs, the projected SLLs per '
+                         'boundary, the suggested assignment), foldsim_sim.sv kept; the SLR check\'s physical refusals '
+                         '(the design past the placement fill, memories past the region\'s, SLLs past a boundary) '
+                         'fail. strict: the 11-08 hard rule (a straddle fails, foldsim_sim.sv renamed '
+                         'foldsim_sim.sv.slr-refused, only --allow-slr-straddle overrides it; the other refusals '
+                         'fail with --sll-check, else warn)')
     ap.add_argument('--slr-sites', default='', metavar='JSON',
                     help="with --slr-groups: each copy's LUTs measured on a generated netlist of the same recipe "
                          '(JSON {copy: {"lut": n}}, foldsim_sll_check.py netlist resources) instead of the '
@@ -1856,7 +1903,7 @@ def main():
         sys.exit('--storage needs --static')
     if a.schedule_only and not a.static:
         sys.exit('--schedule-only needs --static')
-    # The hard SLR rule's region (--region): the check runs on every static fold's netlist.
+    # The SLR check's region (--region): the check runs on every static fold's netlist (--slr-policy).
     region = check_region(a)
     if a.static:
         fold = f'module={a.top} sim=foldsim_sim report={out("schedule.txt")}'
@@ -2108,17 +2155,36 @@ def main():
         # The per-copy SLR / SLL check on the netlist just generated (its
         # stage registers, read buffers and simulator level counted; schedule
         # estimates said "fits" where placement failed): <out>/sll/sll.txt.
-        # HARD RULE: a copy that cannot be placed whole in an SLR fails the
-        # compilation (slr_rule; only --allow-slr-straddle overrides it); the
-        # check's other refusals fail it with --sll-check, else warn.
+        # --slr-policy guide (default): a copy crossing an SLR boundary is a
+        # GUIDE warning (slr_guide); the check's physical refusals fail.
+        # strict: the 11-08 hard rule (slr_rule; only --allow-slr-straddle
+        # overrides it); the check's other refusals fail with --sll-check,
+        # else warn.
         os.makedirs(out('sll'), exist_ok=True)
         r = run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_sll_check.py'),
                  a.out, '--models', out('models.mlir'), '--fold-options', sll_fold, '--foldsim-opt', foldsim_opt,
-                 '--slr-region', region, '--out', out('sll'), '--json', out('sll/sll.json')],
+                 '--slr-region', region, '--out', out('sll'), '--json', out('sll/sll.json'),
+                 '--slr-policy', a.slr_policy],
                 check=False, capture_output=True)
         line = next((l for l in reversed(r.stdout.splitlines()) if re.search(r': (OK|WARN|REFUSE):', l)), None)
         print(f'foldsim: SLL check: {line or "failed: " + (r.stderr or r.stdout)[-2000:]}', file=sys.stderr)
         verdict = line.split(': ', 1)[1] if line else None
+        if a.slr_policy == 'guide':
+            # A straddle is a guide; a failed check, the design past the placement fill, the memories past the
+            # region's and SLLs past a boundary are physical failures (r16c: Place 30-5425): they fail.
+            if r.returncode == 2 or verdict is None:
+                sys.exit(f'foldsim: error: the SLR check failed (report {out("sll")})')
+            slr_guide(a, out, verdict)
+            if r.returncode and PHYSICAL.search(verdict):
+                sys.exit(f'foldsim: error: the SLR check refuses this netlist: {verdict} (report {out("sll")}/sll.txt; '
+                         'a placement past the fill or SLLs past a boundary fails as placed)')
+            if r.returncode:
+                # Not a physical refusal (a refold that does not reproduce the generation's II, ...): as before.
+                if a.sll_check:
+                    sys.exit(f'foldsim: --sll-check refuses this netlist (report {out("sll")}/sll.txt)')
+                print(f'foldsim: WARNING: the SLL check refuses this netlist (report {out("sll")}/sll.txt; '
+                      '--sll-check fails on it)', file=sys.stderr)
+            return
         slr_rule(a, out, verdict, r.returncode)
         if r.returncode and not STRADDLE.search(verdict):
             if a.sll_check:
