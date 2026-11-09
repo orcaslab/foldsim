@@ -13753,7 +13753,11 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
   unsigned indexWidth = hw::getBitWidth(index.getType());
   // A table of at most 64 rows is a LUT per bit (and as large at any frame
   // or instance count): kept.
-  if (gSlotSegments && indexWidth > 6) {
+  static const int minIndexBits = [] {
+    const char *env = getenv("FOLDSIM_SLOT_MIN_INDEX_BITS");  // a test hook
+    return env ? atoi(env) : 7;
+  }();
+  if (gSlotSegments && int(indexWidth) >= minIndexBits) {
     if (Value decoded =
             foldsim::decodeSlotTable(b, index, rows, width, gSlotSegments))
       return decoded;

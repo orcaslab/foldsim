@@ -186,9 +186,21 @@ Value decodeSlotTable(ImplicitLocOpBuilder &b, Value index,
       uint64_t mag = seg.step < 0 ? uint64_t(-seg.step) : uint64_t(seg.step);
       unsigned shift = llvm::Log2_64(mag);
       // f = (index - start) >> low, of its bits; (f << shift) in `width`.
-      Value offset = seg.start ? Value(comb::SubOp::create(
-                                     b, index, constant(indexType, seg.start)))
-                               : index;
+      // Where the start's own digits allow, the index's bits stand for j's
+      // (no subtraction, one carry chain less): for an affine run, j's
+      // multiple is the index's less a constant; for a digit, when the
+      // start's low digits are zero, j's digit is the index's.
+      uint64_t a = seg.stride > 1 ? llvm::Log2_64(seg.stride) : 0;
+      uint64_t sa = seg.start >> a;
+      Value offset = index;
+      if (seg.bits >= 64 && seg.shift == 0) {
+        value = constant(type, seg.value - uint64_t(seg.step) * (sa << seg.shift));
+      } else if (seg.shift + seg.bits < 64 &&
+                 (sa & ((uint64_t(1) << (seg.shift + seg.bits)) - 1)) == 0) {
+        // the index's digit is j's
+      } else if (seg.start) {
+        offset = comb::SubOp::create(b, index, constant(indexType, seg.start));
+      }
       if (shift < width && low < w) {
         unsigned jBits = std::min<unsigned>(w - low, seg.bits),
                  keep = std::min(jBits, width - shift);
