@@ -1183,6 +1183,10 @@ private:
   struct StreamMember {
     unsigned stream, offset;
     bool kept = false;
+    /// `csf-mailbox-hbm` (a twoSets stream): the reader instances whose
+    /// rows the stream carries, where the schedule leaves room for some
+    /// alone (the rest read an on-chip link of their own rows); empty: all.
+    SmallVector<bool> keepInst;
   };
   std::map<std::tuple<unsigned, unsigned, unsigned, unsigned, unsigned>,
            StreamMember>
@@ -1211,6 +1215,8 @@ private:
     decltype(streamMembers)::iterator member;
     int most, least, late;
     const LinkUse *use;
+    /// The same, per reader instance of the use (as `use->readers`).
+    SmallVector<int> imost, ileast, ilate;
   };
   /// The members the schedule keeps (streamMembers' kept; each stream's
   /// lead, kept and dropped), from the laid-out needs; `uses` (linkUses')
@@ -3640,6 +3646,7 @@ void StaticFolder::keepStreamMembers(const std::vector<LinkUse> &uses,
     auto &pcls = classes[producer.cls];
     int most = std::numeric_limits<int>::max(), least = 0,
         late = std::numeric_limits<int>::min();
+    SmallVector<int> imost, ileast, ilate;
     auto writeSlot = [&](uint64_t j) {
       return producer.atReady ? pcls.readySlots(producer.readyLevel)[j]
                               : pcls.slot[kState][j];
@@ -3654,13 +3661,21 @@ void StaticFolder::keepStreamMembers(const std::vector<LinkUse> &uses,
           if (r == uint64_t(st.mbReaderRow[i]) && st.writes(j))
             next = std::min(next, writeSlot(j));
       int n = int(st.needs[i].size());
+      int m = std::numeric_limits<int>::max(), l = 0,
+          t = std::numeric_limits<int>::min();
       for (int s : streamReadPasses(classes[use.reader], i)) {
-        most = std::min(most, (s - n - 1) - (w + int(st.pages) + 4 - frame) - 1);
-        least = std::max(least, (s - 2) - (next + frame) + 1);
-        late = std::max(late, (s - 2) - (next + frame));
+        m = std::min(m, (s - n - 1) - (w + int(st.pages) + 4 - frame) - 1);
+        l = std::max(l, (s - 2) - (next + frame) + 1);
+        t = std::max(t, (s - 2) - (next + frame));
       }
+      imost.push_back(m);
+      ileast.push_back(l);
+      ilate.push_back(t);
+      most = std::min(most, m);
+      least = std::max(least, l);
+      late = std::max(late, t);
     }
-    rooms.push_back({it, most, least, late, &use});
+    rooms.push_back({it, most, least, late, &use, imost, ileast, ilate});
   }
   for (auto &st : linkStreams) {
     st.lead = linkHbmLead;
@@ -3668,22 +3683,65 @@ void StaticFolder::keepStreamMembers(const std::vector<LinkUse> &uses,
     st.dropped = 0;
     st.readRows = 0;
   }
-  for (auto &r : rooms)
-    if (r.most >= int(linkHbmMinLead()) && r.least <= r.most && r.late <= 0) {
-      auto &st = linkStreams[r.member->second.stream];
-      st.lead = std::min<unsigned>(st.lead, r.most);
+  // A twoSets stream (csf-mailbox-hbm) keeps the reader instances with
+  // room, each member those alone: its lead is kLinkHbmLead or less, the
+  // room of all but the tenth of its instances with the least (at least
+  // linkHbmMinLead()).
+  std::map<unsigned, SmallVector<int>> instRooms;
+  for (auto &r : rooms) {
+    auto &st = linkStreams[r.member->second.stream];
+    if (!st.twoSets) {
+      if (r.most >= int(linkHbmMinLead()) && r.least <= r.most && r.late <= 0)
+        st.lead = std::min<unsigned>(st.lead, r.most);
+      continue;
     }
+    for (size_t x = 0; x < r.imost.size(); ++x)
+      if (r.imost[x] >= int(linkHbmMinLead()) && r.ileast[x] <= r.imost[x] &&
+          r.ilate[x] <= 0)
+        instRooms[r.member->second.stream].push_back(r.imost[x]);
+  }
+  for (auto &[k, ms] : instRooms) {
+    llvm::sort(ms);
+    linkStreams[k].lead =
+        std::min<unsigned>(linkStreams[k].lead, unsigned(ms[ms.size() / 10]));
+  }
   // A member (a reader input's bits from a producer output) may stand for
   // several uses (other readers and rows of the same wiring): kept only if
   // every one of them is.
-  for (auto &r : rooms)
+  for (auto &r : rooms) {
     r.member->second.kept = true;
+    r.member->second.keepInst.clear();
+  }
+  std::map<decltype(streamMembers)::iterator::pointer, SmallVector<bool>> bad;
   for (auto &r : rooms) {
     auto &st = linkStreams[r.member->second.stream];
+    if (st.twoSets) {
+      auto &keep = r.member->second.keepInst;
+      auto &no = bad[&*r.member];
+      if (keep.empty()) {
+        keep.assign(classes[r.use->reader].threads(), false);
+        no.assign(keep.size(), false);
+      }
+      for (auto [x, i] : llvm::enumerate(r.use->readers))
+        if (r.imost[x] >= int(st.lead) && r.ileast[x] <= int(st.lead) &&
+            r.ilate[x] <= 0 && st.lead >= linkHbmMinLead() && !st.excluded)
+          keep[i] = true;
+        else
+          no[i] = true;
+      continue;
+    }
     bool ok = r.most >= int(st.lead) && r.least <= int(st.lead) &&
               r.late <= 0 && st.lead >= linkHbmMinLead() && !st.excluded;
     if (!ok)
       r.member->second.kept = false;
+  }
+  // A twoSets member: kept if any reader instance of its uses is; all of
+  // them kept is a whole member.
+  for (auto &[member, no] : bad) {
+    auto &keep = member->second.keepInst;
+    for (size_t i = 0; i < keep.size(); ++i)
+      keep[i] = keep[i] && !no[i];
+    member->second.kept = llvm::any_of(keep, [](bool k) { return k; });
   }
   std::set<decltype(streamMembers)::iterator::pointer> counted;
   for (auto &r : rooms)
@@ -3715,9 +3773,12 @@ LogicalResult StaticFolder::planStreams() {
         continue;
       unsigned k = r.member->second.stream, off = r.member->second.offset;
       auto &st = linkStreams[k];
-      // (A mailbox's reader needs its own row.)
+      // (A mailbox's reader needs its own row; a member of some reader
+      // instances alone, theirs.)
+      auto &keep = r.member->second.keepInst;
       for (auto [i, row] : llvm::zip(r.use->readers, r.use->readerRows))
-        for (unsigned j = off / st.dw; j <= (off + r.use->width - 1) / st.dw; ++j)
+        for (unsigned j = off / st.dw;
+             (keep.empty() || keep[i]) && j <= (off + r.use->width - 1) / st.dw; ++j)
           need[k][i].insert(
               {st.mailbox ? uint64_t(st.mbReaderRow[i]) : uint64_t(row), j});
     }
@@ -16087,6 +16148,14 @@ LogicalResult StaticFolder::buildSim() {
       SmallVector<std::pair<int, unsigned>> sourceOf(threads);
       SmallVector<uint64_t> producerInst(threads, 0);
       SmallVector<APInt> constants(threads);
+      // csf-mailbox-hbm: a source whose stream carries some reader
+      // instances alone: their value from the stream (set to the read
+      // register's timing or a host cycle ahead), chosen by instance.
+      struct PartialHbm {
+        Value atSlot, ahead;
+        SmallVector<uint64_t> mine;
+      };
+      std::map<unsigned, PartialHbm> partialHbm;
       bool frame = false;
       for (unsigned i = 0; i < threads; ++i) {
         auto [piece, offset] = pieceAt(i, at);
@@ -16184,6 +16253,128 @@ LogicalResult StaticFolder::buildSim() {
         SmallVector<uint64_t> rows;
         SmallVector<bool> takes;
         rowsOf(key, rows, takes);
+        // An HBM stream member's read registers, of the reader instances
+        // `mine` (two sets in turn for a twoSets stream: the set the slot's
+        // pass reads, and the next pass's a host cycle ahead).
+        auto hbmRegisters = [&](const StreamMember &sm, ArrayRef<bool> mine)
+            -> std::pair<Value, Value> {
+          auto &st = linkStreams[sm.stream];
+          auto &sb = streamFor(sm.stream);
+          unsigned off = sm.offset;
+          unsigned pIdx = st.rowIndexBits(pThreadsAll);
+          unsigned pgBits = st.pages > 1 ? llvm::Log2_32_Ceil(st.pages) : 0;
+          // (A mailbox's landing row is the reader's own.)
+          SmallVector<uint64_t> wantRows(rows.begin(), rows.end());
+          if (st.mailbox)
+            for (unsigned i = 0; i < threads; ++i)
+              wantRows[i] = st.mbReaderRow[i] >= 0 ? uint64_t(st.mbReaderRow[i]) : 0;
+          std::string name = (producer.name + "_to_" + consumer.name + "_" +
+                              Twine(at) + "_hbm")
+                                 .str();
+          Value mine1 = sb.pop1;
+          if (threads > 1) {
+            SmallVector<uint64_t> takeRow(threads, 0);
+            for (unsigned i = 0; i < threads; ++i)
+              takeRow[i] = mine[i];
+            mine1 = comb::AndOp::create(b, mine1, table(b, sb.inst1, takeRow, 1));
+          }
+          if (pIdx) {
+            Value want = threads > 1 ? table(b, sb.inst1, wantRows, pIdx)
+                                     : constant(pIdx, wantRows[0]);
+            mine1 = comb::AndOp::create(
+                b, mine1,
+                comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.row1, want));
+          }
+          SmallVector<Value> slices, early;
+          for (unsigned j = off / st.dw; j <= (off + width - 1) / st.dw; ++j) {
+            unsigned lo = std::max(off, j * st.dw);
+            unsigned hi = std::min(off + width, (j + 1) * st.dw);
+            Value en1 = mine1;
+            if (pgBits)
+              en1 = comb::AndOp::create(
+                  b, en1,
+                  comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.page1,
+                                       constant(pgBits, j)));
+            Value en0 = resetReg(en1, name + "_en" + Twine(j), 0);
+            Value bits = b.createOrFold<comb::ExtractOp>(
+                b.getIntegerType(hi - lo), sb.data, lo - j * st.dw);
+            if (sb.pingPong) {
+              // Two sets, loaded in turn, read in turn.
+              Value setA = seq::CompRegClockEnabledOp::create(
+                  b, bits, hostClock,
+                  comb::AndOp::create(b, en0, notOf(sb.popPar)),
+                  b.getStringAttr(name + Twine(j) + "_a"), Value(), Value(),
+                  Value(), hw::InnerSymAttr());
+              Value setB = seq::CompRegClockEnabledOp::create(
+                  b, bits, hostClock, comb::AndOp::create(b, en0, sb.popPar),
+                  b.getStringAttr(name + Twine(j) + "_b"), Value(), Value(),
+                  Value(), hw::InnerSymAttr());
+              slices.push_back(comb::MuxOp::create(b, sb.useSel, setB, setA));
+              early.push_back(comb::MuxOp::create(b, sb.useSelEarly, setB, setA));
+              continue;
+            }
+            Value r = seq::CompRegClockEnabledOp::create(
+                b, bits, hostClock, en0, b.getStringAttr(name + Twine(j)),
+                Value(), Value(), Value(), hw::InnerSymAttr());
+            slices.push_back(r);
+            early.push_back(r);
+          }
+          std::reverse(slices.begin(), slices.end());
+          std::reverse(early.begin(), early.end());
+          return {b.createOrFold<comb::ConcatOp>(slices),
+                  b.createOrFold<comb::ConcatOp>(early)};
+        };
+        // A twoSets member that carries some of the reader instances that
+        // take this source: the others take it as below (their own rows
+        // alone), where that needs no forward or take in its host cycle
+        // (else the whole source stays on chip).
+        bool hbmSkip = false;
+        {
+          auto pm = streamMembers.find(
+              {c, consumer.port, at, unsigned(key.first), key.second});
+          if (pm != streamMembers.end() && pm->second.kept &&
+              linkStreams[pm->second.stream].kept &&
+              linkStreams[pm->second.stream].twoSets &&
+              !pm->second.keepInst.empty()) {
+            auto &keep = pm->second.keepInst;
+            SmallVector<bool> rest(takes.begin(), takes.end()), mine(threads, false);
+            bool anyKept = false, anyRest = false;
+            for (unsigned i = 0; i < threads; ++i) {
+              if (!takes[i])
+                continue;
+              if (keep[i]) {
+                mine[i] = true;
+                rest[i] = false;
+                anyKept = true;
+              } else {
+                anyRest = true;
+              }
+            }
+            if (!anyKept) {
+              hbmSkip = true;
+            } else if (anyRest) {
+              bool restCross = to >= 0 && slrOf[producer.cls] != to;
+              bool restNow = zeroLink(key.first, c, consumer.port) &&
+                             takesNow(key.first, c, rest, rows);
+              bool restForward =
+                  oneCycleLinks &&
+                  (restCross || needsForward(key.first, c, rest, rows));
+              hbmSkip = true;
+              if (!restNow && !restForward) {
+                auto [atSlot, ahead] = hbmRegisters(pm->second, mine);
+                auto &ph = partialHbm[index];
+                ph.atSlot = atSlot;
+                ph.ahead = ahead;
+                ph.mine.assign(mine.begin(), mine.end());
+                ++streamReads;
+                takes.assign(rest.begin(), rest.end());
+                for (unsigned i = 0; i < threads; ++i)
+                  if (!takes[i])
+                    rows[i] = 0;
+              }
+            }
+          }
+        }
         // A compact link: the producer instances taken, and each instance's
         // index among them for its address.
         SmallVector<uint64_t> kept;
@@ -16398,73 +16589,13 @@ LogicalResult StaticFolder::buildSim() {
         // the landings, page by page, each where its row lands.
         auto member = streamMembers.find(
             {c, consumer.port, at, unsigned(key.first), key.second});
-        if (member != streamMembers.end() && member->second.kept &&
+        if (!hbmSkip && member != streamMembers.end() && member->second.kept &&
             linkStreams[member->second.stream].kept) {
-          auto &st = linkStreams[member->second.stream];
-          auto &sb = streamFor(member->second.stream);
-          unsigned off = member->second.offset;
-          unsigned pIdx = st.rowIndexBits(pThreadsAll);
-          unsigned pgBits = st.pages > 1 ? llvm::Log2_32_Ceil(st.pages) : 0;
-          // (A mailbox's landing row is the reader's own.)
-          SmallVector<uint64_t> wantRows(rows.begin(), rows.end());
-          if (st.mailbox)
-            for (unsigned i = 0; i < threads; ++i)
-              wantRows[i] = st.mbReaderRow[i] >= 0 ? uint64_t(st.mbReaderRow[i]) : 0;
-          std::string name = (producer.name + "_to_" + consumer.name + "_" +
-                              Twine(at) + "_hbm")
-                                 .str();
-          Value mine1 = sb.pop1;
-          if (threads > 1) {
-            SmallVector<uint64_t> takeRow(threads, 0);
-            for (unsigned i = 0; i < threads; ++i)
-              takeRow[i] = takes[i];
-            mine1 = comb::AndOp::create(b, mine1, table(b, sb.inst1, takeRow, 1));
-          }
-          if (pIdx) {
-            Value want = threads > 1 ? table(b, sb.inst1, wantRows, pIdx)
-                                     : constant(pIdx, wantRows[0]);
-            mine1 = comb::AndOp::create(
-                b, mine1,
-                comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.row1, want));
-          }
-          SmallVector<Value> slices;
-          for (unsigned j = off / st.dw; j <= (off + width - 1) / st.dw; ++j) {
-            unsigned lo = std::max(off, j * st.dw);
-            unsigned hi = std::min(off + width, (j + 1) * st.dw);
-            Value en1 = mine1;
-            if (pgBits)
-              en1 = comb::AndOp::create(
-                  b, en1,
-                  comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.page1,
-                                       constant(pgBits, j)));
-            Value en0 = resetReg(en1, name + "_en" + Twine(j), 0);
-            Value bits = b.createOrFold<comb::ExtractOp>(
-                b.getIntegerType(hi - lo), sb.data, lo - j * st.dw);
-            if (sb.pingPong) {
-              // Two sets, loaded in turn, read in turn.
-              Value setA = seq::CompRegClockEnabledOp::create(
-                  b, bits, hostClock,
-                  comb::AndOp::create(b, en0, notOf(sb.popPar)),
-                  b.getStringAttr(name + Twine(j) + "_a"), Value(), Value(),
-                  Value(), hw::InnerSymAttr());
-              Value setB = seq::CompRegClockEnabledOp::create(
-                  b, bits, hostClock, comb::AndOp::create(b, en0, sb.popPar),
-                  b.getStringAttr(name + Twine(j) + "_b"), Value(), Value(),
-                  Value(), hw::InnerSymAttr());
-              slices.push_back(comb::MuxOp::create(
-                  b, sources.size() == 1 ? sb.useSel : sb.useSelEarly, setB,
-                  setA));
-              continue;
-            }
-            slices.push_back(seq::CompRegClockEnabledOp::create(
-                b, bits, hostClock, en0, b.getStringAttr(name + Twine(j)),
-                Value(), Value(), Value(), hw::InnerSymAttr()));
-          }
-          std::reverse(slices.begin(), slices.end());
-          sourceData[index] = b.createOrFold<comb::ConcatOp>(slices);
-          ++streamReads;
+          auto [atSlot, ahead] = hbmRegisters(member->second, takes);
           // The only source: the read register (valid from the host cycle
           // before the slot); one of several: as an early read's output.
+          sourceData[index] = sources.size() == 1 ? atSlot : ahead;
+          ++streamReads;
           if (sources.size() == 1)
             syncPart = true;
           continue;
@@ -16530,6 +16661,13 @@ LogicalResult StaticFolder::buildSim() {
                              to, now ? &sourceNow[index] : nullptr, forward,
                              after ? &sourceAfter[index] : nullptr, late,
                              forwardLate, kept, style, 0, nullptr, single);
+      }
+      // csf-mailbox-hbm: the stream's value for the instances it carries.
+      for (auto &[index, ph] : partialHbm) {
+        Value pick = syncPart ? table(b, ctl.inst, ph.mine, 1)
+                              : table(b, ctl.inst1, ph.mine, 1);
+        sourceData[index] = comb::MuxOp::create(
+            b, pick, syncPart ? ph.atSlot : ph.ahead, sourceData[index]);
       }
       if (syncPart) {
         // Registered already: wired around the read register.
