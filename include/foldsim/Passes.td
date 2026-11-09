@@ -1222,6 +1222,24 @@ def SplitMaskedMemories
   let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect"];
 }
 
+def MergeMemories
+    : Pass<"foldsim-merge-memories", "::circt::hw::HWModuleOp"> {
+  let summary = "Merge memories of equal ports side by side";
+  let description = [{
+    Memories with one unmasked write port and one read port whose addresses,
+    enables and clocks are the same values up to copies (registers and logic
+    of one kind and attributes, names aside, over the same operands) take the
+    same entries at the same host cycles: laid side by side in one memory of
+    at most `max-bits` bits, they read and write as before, in fewer and
+    fuller RAM columns. The constant-shell fold's link mailboxes.
+  }];
+  let options = [
+    Option<"maxBits", "max-bits", "unsigned", "512",
+           "The widest merged memory, in bits">,
+  ];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect"];
+}
+
 def MemoriesToRegisters
     : Pass<"foldsim-memories-to-registers", "::mlir::ModuleOp"> {
   let summary = "Keep the named memories as registers, a register an entry";

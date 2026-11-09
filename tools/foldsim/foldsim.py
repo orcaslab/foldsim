@@ -1481,6 +1481,10 @@ def build_parser():
     ap.add_argument('--csf-single-bank', action='store_true',
                     help='constant-shell fold: an early link read before its producer\'s next write keeps one '
                          'bank, the others two, as the schedule decides (foldsim-fold-static csf-single-bank)')
+    ap.add_argument('--csf-merge-links', type=int, default=0, metavar='BITS',
+                    help='constant-shell fold: link memories of equal ports (a producer and reader class '
+                         'pair) merged side by side into mailboxes of at most BITS bits '
+                         '(foldsim-merge-memories; 0: off)')
     ap.add_argument('--csf-mailboxes', action='store_true',
                     help='constant-shell fold, schedule only: links as reader-owned RAM mailboxes '
                          '(foldsim-fold-static csf-mailboxes)')
@@ -1998,7 +2002,9 @@ def main():
         if a.fanout:
             rc += f' fanout={a.fanout}' + (' fanout-logic' if a.fanout_logic else '')
         replicate = f'hw.module(foldsim-replicate-controls{{{rc}}})'
-        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}', SPLIT, replicate,
+        merge = ([f'hw.module(foldsim-merge-memories{{max-bits={a.csf_merge_links}}})']
+                 if getattr(a, 'csf_merge_links', 0) else [])
+        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}'] + merge + [SPLIT, replicate,
                                         'canonicalize', 'foldsim-sort', 'cse']
         if a.copies == 'auto' or a.slr_groups or region:
             sim_input = out('models.mlir')

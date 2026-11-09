@@ -8,6 +8,7 @@ add_mlir_library(FoldsimTransforms
   FAME5.cpp
   FindPipelines.cpp
   MemoriesToRegisters.cpp
+  MergeMemories.cpp
   FuseModels.cpp
   LowerWideNegation.cpp
   CompressAddTrees.cpp
