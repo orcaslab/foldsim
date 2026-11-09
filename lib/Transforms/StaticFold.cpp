@@ -7764,6 +7764,12 @@ LogicalResult StaticFolder::chooseGroups() {
   bool budgeted = sllBudget && !slrCapacitySpecs.empty();
   SmallVector<uint64_t> boundary(slrGroups ? slrGroups - 1 : 0, 0);
   uint64_t visited = 0;
+  // Why candidates were pruned, for the message when none is left: by a
+  // group's capacity, by an SLR boundary's link budget (and the least
+  // overflow of a boundary seen, and which).
+  uint64_t prunedCapacity = 0, prunedBudget = 0;
+  uint64_t leastOver = std::numeric_limits<uint64_t>::max();
+  unsigned leastOverAt = 0;
   std::function<void(unsigned, unsigned, uint64_t)> visit =
       [&](unsigned k, unsigned opened, uint64_t cut) {
         if (++visited > 20'000'000 ||
@@ -7783,8 +7789,10 @@ LogicalResult StaticFolder::chooseGroups() {
         for (unsigned g = 0; g < limit; ++g) {
           if (pinned[c] >= 0 && int(g) != pinned[c])
             continue;
-          if (slrCaps[g] && used[g] + slrSites[c] > slrCaps[g])
+          if (slrCaps[g] && used[g] + slrSites[c] > slrCaps[g]) {
+            ++prunedCapacity;
             continue;
+          }
           // A link between groups takes a k-th of its bits in wires
           // (slr-serialize).
           auto wires = [&](unsigned x, unsigned y) {
@@ -7807,10 +7815,24 @@ LogicalResult StaticFolder::chooseGroups() {
               for (unsigned b = std::min(g, h); b < std::max(g, h); ++b)
                 added[b] += wires(c, d);
             }
+            uint64_t worst = 0;
+            unsigned worstAt = 0;
             for (unsigned b = 0; b < boundary.size(); ++b)
-              over |= boundary[b] + added[b] > sllBudget;
-            if (over)
+              if (boundary[b] + added[b] > sllBudget) {
+                over = true;
+                if (boundary[b] + added[b] - sllBudget > worst) {
+                  worst = boundary[b] + added[b] - sllBudget;
+                  worstAt = b;
+                }
+              }
+            if (over) {
+              ++prunedBudget;
+              if (worst < leastOver) {
+                leastOver = worst;
+                leastOverAt = worstAt;
+              }
               continue;
+            }
             for (unsigned b = 0; b < boundary.size(); ++b)
               boundary[b] += added[b];
           }
@@ -7839,7 +7861,18 @@ LogicalResult StaticFolder::chooseGroups() {
            << " sites (the largest class copy: " << largest << " sites)"
            << (budgeted ? " with at most " + std::to_string(sllBudget) +
                               " link bits over each SLR boundary"
-                        : std::string());
+                        : std::string())
+           << ": " << prunedCapacity << " placements past a group's sites"
+           << (budgeted ? ", " + std::to_string(prunedBudget) +
+                              " past a boundary's link bits" +
+                              (prunedBudget ? " (the least overflow " +
+                                                  std::to_string(leastOver) +
+                                                  " link bits, boundary " +
+                                                  std::to_string(leastOverAt) + "-" +
+                                                  std::to_string(leastOverAt + 1) + ")"
+                                            : std::string())
+                        : std::string())
+           << (visited > 20'000'000 ? "; the search stopped at 20,000,000 nodes" : "");
   }
 
   // Of those, the shortest frame, then the fewest bits between groups: each
