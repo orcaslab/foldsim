@@ -894,12 +894,14 @@ def slr_options(a, foldsim_opt, models, fold, out):
 
 def slr_region_capacities(path):
     """[(SLR name, LUT sites)] of a dynamic region's SLRs (--slr-region): each
-    SLR's LUTs times the margin a group may fill, in foldsim_degree's LUT
-    sites (sites_per_lut, calibrated on a placed build)."""
+    SLR's LUTs times the margin a group may fill (the SLR's own `margin` if it
+    has one, e.g. an SLR whose copies route only at a lower fill, else the
+    region's), in foldsim_degree's LUT sites (sites_per_lut, calibrated on a
+    placed build)."""
     if path == 'v80':
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
     region = json.load(open(path))
-    return [(slr['name'], round(region['margin'] * slr['luts'] * region['sites_per_lut']))
+    return [(slr['name'], round(slr.get('margin', region['margin']) * slr['luts'] * region['sites_per_lut']))
             for slr in region['slrs']]
 
 

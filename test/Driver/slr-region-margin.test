@@ -1,0 +1,6 @@
+# --slr-region: an SLR may carry its own `margin` (the share of its LUTs a group may fill), e.g. an SLR whose copy
+# routes only at a lower fill; the others keep the region's. Two SLRs of 300 LUTs, sites_per_lut 1.0, the region's
+# margin 0.9, the first SLR's own 0.5: groups of at most 150 and 270 LUT sites.
+# RUN: rm -rf %t && cd %S/Inputs/source-list
+# RUN: foldsim --srcs top.f --top Top --out %t/m --static --copies Leaf:2 --slr-groups --slr-region %S/Inputs/slr-margin/region.json Leaf 2>&1 | FileCheck %s
+# CHECK: 2 SLR groups of at most SLR1 150, SLR0 270 LUT sites
