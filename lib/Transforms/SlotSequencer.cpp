@@ -429,11 +429,16 @@ Value decodeSlotTable(ImplicitLocOpBuilder &b, Value index,
         uint64_t mag = seg.inner < 0 ? uint64_t(-seg.inner) : uint64_t(seg.inner);
         (seg.inner < 0 ? minus : plus).push_back(shifted(jv, llvm::Log2_64(mag)));
       }
-      value = constant(type, c0 & wmask);
-      for (auto v : plus)
-        value = comb::AddOp::create(b, value, v);
+      // One sum of every term (a subtracted term as its complement, its +1s
+      // in the constant): a single adder tree, not a chain of carry chains.
+      SmallVector<Value> terms2(plus.begin(), plus.end());
       for (auto v : minus)
-        value = comb::SubOp::create(b, value, v);
+        terms2.push_back(comb::XorOp::create(b, v, constant(type, wmask)));
+      uint64_t c = (c0 + uint64_t(minus.size())) & wmask;
+      if (c || terms2.empty())
+        terms2.push_back(constant(type, c));
+      value = terms2.size() == 1 ? terms2[0]
+                                 : Value(comb::AddOp::create(b, terms2, false));
     } else if (seg.value != segments[0].value) {
       uniform = false;
     }
