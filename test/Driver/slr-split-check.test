@@ -20,3 +20,18 @@
 # CHECK-NOT: cut over the SLRs
 # CHECK: boundary SLR1-SLR0: {{[0-9,]+}} SLLs projected (links {{[0-9,]+}}, cut copies 101 and split crossings, simulator level and kernel 1)
 # CHECK: x: OK
+
+# The links by their port widths (sll_per_port_bit: each link's bits once, the
+# schedule's `A -> B` lines, where its ends sit in different SLRs; a split
+# copy's ends by its parts' shares of its inputs and outputs), and the global
+# plan (--plan): every whole copy and split part an SLR within the caps, the
+# parts apart, the worst boundary least; its floorplan puts the parts in
+# pblocks and the copies in soft SLR assignments.
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-split-port.json --foldsim-opt foldsim-opt --copy-cap none --out %t/port --plan %t/plan.tcl | FileCheck %s --check-prefix=PORT
+# RUN: FileCheck %s --check-prefix=TCL < %t/plan.tcl
+# PORT: boundary SLR1-SLR0: {{[0-9,]+}} SLLs projected (links {{[0-9,]+}}, cut copies 101 and split crossings
+# PORT: plan SLR1: {{.*}}Leaf_p{{[01]}}
+# PORT: plan SLR0: {{.*}}Leaf_p{{[01]}}
+# PORT: plan SLLs: SLR1-SLR0 {{[0-9,]+}}
+# TCL: set c [get_cells -quiet -hierarchical fs_split_Leaf_static_p0]
+# TCL-NEXT: if {[llength $c] == 1} { set_property USER_SLR_ASSIGNMENT SLR{{[01]}} $c; fs_slr_pblock $c SLR{{[01]}} }

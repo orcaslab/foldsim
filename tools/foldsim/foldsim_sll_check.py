@@ -280,6 +280,19 @@ def split_copies(sim, gdir, res, names):
             k = int(re.search(r'hw\.instance "fs_split_' + re.escape(c) + r'_static_p(\d+)"', line).group(1))
             for j, t in re.findall(r'%fs_split_' + re.escape(c) + r'_static_p(\d+)\.[\w.$-]+: ([^,)]+)', line):
                 cross[(int(j), k)] += foldsim_cost.width(t)
+        # Each part's share of the copy's inputs and outputs (the links it reads and writes).
+        io_in, io_out = [0] * len(parts), [0] * len(parts)
+        for line in text.splitlines():
+            k = int(re.search(r'hw\.instance "fs_split_' + re.escape(c) + r'_static_p(\d+)"', line).group(1))
+            for name, t in re.findall(r'(%[\w.$-]+): ([^,)]+)', line.split(') -> ')[0]):
+                if not name.startswith('%fs_split_') and not t.startswith('!seq.clock'):
+                    io_in[k] += foldsim_cost.width(t)
+        body = re.search(r'hw\.module @' + re.escape(c) + r'_static\(.*?\n(.*?)\n\s*hw\.output ([^\n]*)', open(sim).read(), re.S)
+        if body:
+            for k2 in re.findall(r'%fs_split_' + re.escape(c) + r'_static_p(\d+)\.', body.group(2).split(' : ')[0]):
+                io_out[int(k2)] += 1
+        norm = lambda v: [x / sum(v) if sum(v) else 1.0 / len(v) for x in v]
+        frac['in'], frac['out'] = norm(io_in), norm(io_out)
         out[c] = dict(slr=slr, frac=frac, cross=[(i, j, b) for (i, j), b in cross.items() if i != j],
                       parts=[n for _, n in parts])
     return out
@@ -378,7 +391,141 @@ def vmem_bits(gdir):
     return sum(2 * v['data_width'] + v['row_width'] + v['inst_width'] for v in json.load(open(path)).get('vmem', []))
 
 
-def boundary_slls(shares, res, wires, top_share, model, vbits=0, splits=None):
+def port_links(stext):
+    """{(producer class, reader class): bits} of the schedule's `A -> B: n links, m bits` lines: each link's bits
+    once (its producer's output port), what crosses when the two sit in different SLRs."""
+    out = {}
+    for line in stext.split('\n'):
+        m = re.match(r'\s+(\S+) -> (\S+): (\d+) links, (\d+) bits', line)
+        if m:
+            out[(m.group(1), m.group(2))] = int(m.group(4))
+    return out
+
+
+def link_slls(shares, links, b, splits=None):
+    """Port-width link bits over boundary b: each link's bits times the chance its two ends sit on either side
+    (a split copy's ends by its parts' shares of the copy's outputs and inputs)."""
+    def low(c, end):
+        if splits and c in splits:
+            sp = splits[c]
+            return sum(f for f, g in zip(sp['frac']['out' if end == 'p' else 'in'], sp['slr']) if g <= b)
+        return sum(shares[c]['lut'][:b + 1])
+    return sum(w * (low(p, 'p') * (1 - low(c, 'c')) + low(c, 'c') * (1 - low(p, 'p')))
+               for (p, c), w in links.items() if p in shares and c in shares)
+
+
+PLAN_OVER = []
+
+
+def plan(res, splits, links, room, model, other):
+    """The global SLR plan (--plan): every whole copy and every split part a node, each in one SLR within `room`
+    (per SLR and resource), minimising the worst boundary's SLLs, then their sum: the links' port widths over the
+    boundaries (sll_per_port_bit), the split parts' crossings (one SLL a bit) and `other` (the simulator level and
+    kernel). Greedy by size, then single moves and swaps while they improve. {node: SLR index}, [SLLs a boundary]."""
+    n = len(room)
+    nodes = {}
+    for c, x in res.items():
+        if c in splits:
+            for k, part in enumerate(splits[c]['parts']):
+                nodes[(c, k)] = {r: x[r] * splits[c]['frac'][r][k] for r in RESOURCES}
+        else:
+            nodes[(c, None)] = dict(x)
+    k_port = model.get('sll_per_port_bit', model.get('sll_per_link_bit', 0.01))
+
+    def ends(c, end):
+        """[(node, weight)] a class's link end goes to."""
+        if c in splits:
+            fr = splits[c]['frac']['out' if end == 'p' else 'in']
+            return [((c, k), f) for k, f in enumerate(fr) if f]
+        return [((c, None), 1.0)]
+    pairs = []
+    for (p, c), w in links.items():
+        if p in res and c in res:
+            for a, fa in ends(p, 'p'):
+                for d, fd in ends(c, 'c'):
+                    pairs.append((a, d, w * fa * fd * k_port))
+    for c, sp in splits.items():
+        for i, j, bits in sp['cross']:
+            pairs.append(((c, i), (c, j), float(bits)))
+
+    def slls(at):
+        out = []
+        for b in range(n - 1):
+            out.append(other + sum(w for a, d, w in pairs if a in at and d in at and
+                                   min(at[a], at[d]) <= b < max(at[a], at[d])))
+        return out
+
+    def over(at):
+        """How far the assignment is past the caps (each resource's excess as a share of its cap), and whether a
+        split copy's parts share an SLR."""
+        use = [{r: 0.0 for r in RESOURCES} for _ in range(n)]
+        for v, g in at.items():
+            for r in RESOURCES:
+                use[g][r] += nodes[v][r]
+        # Logic within each SLR's cap; memories within the region's (a copy's block RAMs, each on narrow ports, go
+        # apart where there is room, as the check's placement model has them).
+        x = sum(max(0.0, use[g][r] - room[g][r]) / max(1.0, room[g][r]) for g in range(n) for r in LOGIC)
+        x += sum(max(0.0, sum(u[r] for u in use) - sum(rm[r] for rm in room)) / max(1.0, sum(rm[r] for rm in room))
+                 for r in ('uram', 'bram'))
+        # A split copy's parts each in an SLR of its own (the split is for the copy that fits no SLR with the rest).
+        for c, sp in splits.items():
+            gs = [at[(c, k)] for k in range(len(sp['parts'])) if (c, k) in at]
+            x += len(gs) - len(set(gs))
+        return x
+
+    def score(at):
+        x = slls(at)
+        return (round(over(at), 9), max(x) if x else 0.0, sum(x))
+    at = {}
+    order = sorted(nodes, key=lambda v: -max(nodes[v][r] / max(1e-9, max(rm[r] for rm in room)) for r in RESOURCES))
+    for v in order:
+        best = None
+        for g in range(n):
+            at[v] = g
+            sc = score(at)
+            if best is None or sc < best[0]:
+                best = (sc, g)
+        at[v] = best[1]
+    improved = True
+    while improved:
+        improved = False
+        cur = score(at)
+        for v in list(nodes):
+            for g in range(n):
+                if g == at[v]:
+                    continue
+                old = at[v]
+                at[v] = g
+                sc = score(at)
+                if sc < cur:
+                    cur = sc
+                    improved = True
+                else:
+                    at[v] = old
+        for v in list(nodes):
+            for u in list(nodes):
+                if at[u] == at[v]:
+                    continue
+                at[v], at[u] = at[u], at[v]
+                sc = score(at)
+                if sc < cur:
+                    cur = sc
+                    improved = True
+                else:
+                    at[v], at[u] = at[u], at[v]
+    if over(at) > 1e-9:
+        # Past the caps: the closest assignment, its overflow per SLR and resource reported.
+        use = [{r: 0.0 for r in RESOURCES} for _ in range(n)]
+        for v, g in at.items():
+            for r in RESOURCES:
+                use[g][r] += nodes[v][r]
+        PLAN_OVER[:] = [(g, r, use[g][r], room[g][r]) for g in range(n) for r in LOGIC
+                        if use[g][r] > room[g][r] + 1e-9]
+        return None, None
+    return at, slls(at)
+
+
+def boundary_slls(shares, res, wires, top_share, model, vbits=0, splits=None, links=None):
     """Each boundary's SLLs: SLLs per link wire bit times the link wires
     between the copies' shares on either side; Rent's rule (t x LUTs^p) over
     each cut copy's smaller side (and over the simulator level's, with
@@ -391,8 +538,12 @@ def boundary_slls(shares, res, wires, top_share, model, vbits=0, splits=None):
     out = []
     for b in range(n - 1):
         low = {c: sum(x['lut'][:b + 1]) for c, x in shares.items()}
-        link = sum(w * (low[c] * (1 - low[d]) + low[d] * (1 - low[c]))
-                   for (c, d), w in wires.items() if c in low and d in low)
+        if links is not None and 'sll_per_port_bit' in model:
+            # The links' port widths (each link's bits once), calibrated (sll_per_port_bit).
+            link = link_slls(shares, links, b, splits) * model['sll_per_port_bit'] / model['sll_per_link_bit']
+        else:
+            link = sum(w * (low[c] * (1 - low[d]) + low[d] * (1 - low[c]))
+                       for (c, d), w in wires.items() if c in low and d in low)
         cut = sum(t * (min(f, 1 - f) * res[c]['lut']) ** p for c, f in low.items()
                   if 1e-9 < f < 1 - 1e-9 and c not in (splits or {}))
         # A split copy's crossings: its parts' bits between SLRs on either side of the boundary.
@@ -429,6 +580,9 @@ def main():
                                      'passes before the fold on its input again')
     ap.add_argument('--fold-options', help='the fold\'s options (foldsim-fold-static{...}) instead of the log\'s; '
                                            'needs --models')
+    ap.add_argument('--plan', metavar='FLOORPLAN',
+                    help='the global SLR plan: every whole copy and split part assigned to an SLR within its caps, '
+                         'the worst boundary\'s SLLs least; its floorplan (parts in pblocks, copies soft) written here')
     ap.add_argument('--json', help='write the copies\' resources, wires and assignment here (calibration)')
     ap.add_argument('--register-state-entries', type=int, default=None)
     ap.add_argument('--slr-policy', choices=('guide', 'strict'), default='guide',
@@ -707,11 +861,33 @@ def main():
                 lines.append(f'    {c} cut over the SLRs: ' + ', '.join(
                     f'{s["name"]} {100 * x:.0f} %' for s, x in zip(full, shares[c]['lut'])) + ' of its logic')
             if model:
-                slls = boundary_slls(shares, res, wires, top_spread, model, vmem_bits(gdir), splits)
+                slls = boundary_slls(shares, res, wires, top_spread, model, vmem_bits(gdir), splits,
+                                     port_links(stext))
                 for b, (lk, ct, sm) in enumerate(slls):
                     lines.append(f'    boundary {names[b]}-{names[b + 1]}: {lk + ct + sm:,.0f} SLLs projected '
                                  f'(links {lk:,.0f}, cut copies {ct:,.0f}{" and split crossings" if splits else ""}, '
                                  f'simulator level and kernel {sm:,.0f})')
+    if a.plan:
+        # The global plan: the region's caps (the margin) less the simulator level's spread share.
+        room_p = [{r: caps[g][r] - top_spread[g][r] for r in RESOURCES} for g in range(len(caps))]
+        other = model.get('other_slls', 0.0) + model.get('sll_per_vmem_bit', 0.0) * vmem_bits(gdir)
+        at, pl = plan(res, splits, port_links(stext), room_p, model, other)
+        if at is None:
+            lines.append('  plan: no assignment of the copies and split parts within the SLRs\' caps; the closest past them: '
+                         + ', '.join(f'{names[g]} {r} {fmt(r, u)} > {fmt(r, c_)}' for g, r, u, c_ in PLAN_OVER))
+        else:
+            for g, s_ in enumerate(names):
+                lines.append(f'  plan {s_}: ' + ' '.join(sorted(c if k is None else f'{c}_p{k}' for (c, k), h in
+                                                              at.items() if h == g)))
+            lines.append('  plan SLLs: ' + ', '.join(f'{names[b]}-{names[b + 1]} {x:,.0f}' for b, x in enumerate(pl)))
+            with open(a.plan, 'w') as f:
+                f.write('# Generated by foldsim_sll_check.py --plan: split parts in pblocks of their SLR, every other '
+                        'copy a soft USER_SLR_ASSIGNMENT (run with FOLDSIM_SLR_PBLOCKS=0).\n')
+                for (c, k), h in sorted(at.items(), key=lambda x: (x[0][0], -1 if x[0][1] is None else x[0][1])):
+                    cell = f'fs_split_{c}_static_p{k}' if k is not None else f'{c}_copy'
+                    f.write(f'set c [get_cells -quiet -hierarchical {cell}]\n'
+                            f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT {names[h]} $c'
+                            + (f'; fs_slr_pblock $c {names[h]}' if k is not None else '') + ' }\n')
     if a.json:
         json.dump(dict(name=name, ii=ii, mode=mode, copies=res, top=top_share, wires=[[x, y, w] for (x, y), w in
                                                                                      wires.items()],
