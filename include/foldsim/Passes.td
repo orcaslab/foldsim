@@ -674,6 +674,17 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "RAM's register and an output register) or 1 (the RAM's register "
            "alone); less where the state gap or a write landing in between "
            "leaves less room, down to a combinational read">,
+    Option<"foldStoreHbm", "fold-store-hbm", "uint64_t", "0",
+           "Constant-shell fold: folded pipelines' result stores of at least "
+           "N bits (an entry per slot and instance; a depth of 2 or more) "
+           "kept in HBM as virtual memories (virtual-memories' controllers): "
+           "at an instance's state pass the copy requests the row its next "
+           "pass reads (the slot after this pass's issue: a frame ahead) and "
+           "writes the row its last issue's results landed for (from a "
+           "landing buffer of an entry per instance, written as the results "
+           "come back); its next pass waits in a bubble only if the row is "
+           "late. A storage rule <model>:fold<k>_store=hbm puts one store in "
+           "HBM, another kind keeps it on chip. 0: none by size">,
     Option<"foldStoreStyle", "fold-store-style", "std::string", "\"auto\"",
            "With fold-store-ram: the stores' RAM style, ultra, block, or auto "
            "(ultra where it takes fewer than half as many primitives as "

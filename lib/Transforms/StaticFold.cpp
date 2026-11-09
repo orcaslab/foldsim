@@ -87,6 +87,12 @@ struct Fold {
   /// copy (`slotNow`: the issuing instance's slot at its state pass), stepped
   /// from the issue's tags a host cycle on (`valid1`, `slot1`, `thread1`).
   bool ahead = false;
+  /// `fold-store-hbm`: the store a virtual memory (in HBM), read a frame
+  /// ahead at the next slot; its writes from `landing` (an entry per
+  /// instance, written as the results come back), requested at the
+  /// instance's next state pass.
+  bool hbm = false;
+  seq::FirMemOp landing;
   unsigned depth = 0, outAt = 0;
   /// `fold-stage-levels`: the host cycles its stage registers add to the
   /// copy (in `outAt`), checked against the schedule when the copy is built.
@@ -495,6 +501,9 @@ public:
   /// `fold-stage-levels-class`: <glob>:<N|off> per class over it.
   SmallVector<std::string> foldStageLevelClassSpecs;
   std::string foldStoreStyle = "auto";
+  /// `fold-store-hbm`: folded pipelines' stores of at least this many bits
+  /// in HBM (0: by storage rule only).
+  uint64_t foldStoreHbm = 0;
   unsigned foldStoreLead = 2;
   /// `staged-link-direct`: see stagedDirect.
   bool stagedLinkDirect = false;
@@ -8328,9 +8337,10 @@ static bool inCone(Operation *op) {
 /// through a register when the copy is built, ahead of its reads: its slot
 /// counter is then no target state but the copy's own (`Fold::ahead`), and
 /// the model's read of it a placeholder at slot 0.
-static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
-                                   uint64_t aheadBits, unsigned stageLevels,
-                                   std::unique_ptr<Folding> &out) {
+static LogicalResult foldPipelines(
+    hw::HWModuleOp model, unsigned threads, uint64_t aheadBits,
+    unsigned stageLevels, std::unique_ptr<Folding> &out,
+    function_ref<bool(unsigned, uint64_t, unsigned)> inHbm = {}) {
   auto *body = model.getBodyBlock();
   ImplicitLocOpBuilder b(model.getLoc(), body->getTerminator());
   foldsim::PipelineAnalysis analysis(model);
@@ -8434,13 +8444,18 @@ static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
     unsigned width = words[pi].size();
     // `fold-store-ram`: read ahead through a register when the copy is built,
     // its slot counter the copy's (a store of one slot has none).
-    bool ahead = aheadBits && depth >= 2 &&
-                 uint64_t(depth) * llvm::PowerOf2Ceil(threads) * width >=
-                     aheadBits;
+    // `fold-store-hbm`: a virtual memory read at the next slot instead.
+    uint64_t storeBits = uint64_t(depth) * llvm::PowerOf2Ceil(threads) * width;
+    bool hbm = inHbm && inHbm(pi, storeBits, depth);
+    if (hbm && depth < 2)
+      return model.emitError("fold-store-hbm: ")
+             << prefix << "_store has one slot: its result is read the "
+             << "target cycle after its write, no frame to fetch it in";
+    bool ahead = !hbm && aheadBits && depth >= 2 && storeBits >= aheadBits;
     // The instance's slot: its enabled edges modulo the store's depth.
     auto slotType = b.getIntegerType(llvm::Log2_32_Ceil(depth));
     std::optional<Backedge> slotNow;
-    Value slot;
+    Value slot, nextSlot;
     if (ahead) {
       slotNow = f.edges->get(slotType);
       slot = *slotNow;
@@ -8465,20 +8480,40 @@ static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
           b, last, hw::ConstantOp::create(b, slotType, 0),
           comb::AddOp::create(b, slot,
                               hw::ConstantOp::create(b, slotType, 1)));
-      slotNext.setValue(
-          p.enable ? Value(comb::MuxOp::create(b, p.enable, step, slot))
-                   : step);
+      nextSlot = p.enable ? Value(comb::MuxOp::create(b, p.enable, step, slot))
+                          : step;
+      slotNext.setValue(nextSlot);
     }
 
     auto memType = seq::FirMemType::get(context, depth, width, 1);
+    // In HBM: a registered read of the next slot (the row the next edge
+    // reads, a frame ahead), written first, so that a row written and read
+    // at the same pass (a depth of 2) reads the new results.
     auto store = seq::FirMemOp::create(
-        b, memType, /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined,
-        seq::WUW::Undefined, b.getStringAttr(prefix + "_store"),
-        hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+        b, memType, /*readLatency=*/hbm ? 1 : 0, /*writeLatency=*/1,
+        hbm ? seq::RUW::New : seq::RUW::Undefined, seq::WUW::Undefined,
+        b.getStringAttr(prefix + "_store"), hw::InnerSymAttr{},
+        seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
     // Read ahead: the copy builds the read (the slot here is the issue's).
     storeRead[pi] = seq::FirMemReadOp::create(
-        b, store, ahead ? Value(hw::ConstantOp::create(b, slotType, 0)) : slot,
+        b, store,
+        ahead ? Value(hw::ConstantOp::create(b, slotType, 0))
+        : hbm ? nextSlot
+              : slot,
         modelClock, hw::ConstantOp::create(b, i1, 1));
+    if (hbm) {
+      // The row the last edge's issue writes, and whether it issued: target
+      // state, so that the next pass requests that row's write (its data
+      // from the copy's landing buffer).
+      Value wslot = seq::FirRegOp::create(b, slot, modelClock,
+                                          b.getStringAttr(prefix + "_hbm_wslot"));
+      Value wvalid = seq::FirRegOp::create(
+          b, p.enable ? p.enable : Value(hw::ConstantOp::create(b, i1, 1)),
+          modelClock, b.getStringAttr(prefix + "_hbm_wvalid"));
+      seq::FirMemWriteOp::create(b, store, wslot, modelClock, wvalid,
+                                 hw::ConstantOp::create(b, b.getIntegerType(width), 0),
+                                 Value{});
+    }
     f.foldOfStore[store] = f.folds.size();
 
     // The unthreaded copy (its registers `layerRegs`); the ops made for it
@@ -8803,6 +8838,7 @@ static LogicalResult foldPipelines(hw::HWModuleOp model, unsigned threads,
     fold.valid = valid;
     fold.data = data;
     fold.ahead = ahead;
+    fold.hbm = hbm;
     fold.depth = depth;
     fold.outAt = outAt;
     fold.staged = staged;
@@ -9158,9 +9194,14 @@ LogicalResult StaticFolder::parseStorage() {
       return netlist.emitError("storage: '")
              << spec << "' is not <model>:<store>=<kind>";
     // `hbm`: a paged model's page word kept off chip (`pages` only).
-    if (kind == "hbm" && store != "pages" && store != "sir-rows")
+    // (A folded pipeline's store, fold<k>_store, too: fold-store-hbm.)
+    bool foldStore = store.starts_with("fold") && store.ends_with("_store") &&
+                     llvm::all_of(store.drop_front(4).drop_back(6), llvm::isDigit) &&
+                     store.size() > 10;
+    if (kind == "hbm" && store != "pages" && store != "sir-rows" && !foldStore)
       return netlist.emitError("storage: 'hbm' is for a model's pages, not '")
-             << store << "' (or a state-in-ram class's memory rows, sir-rows)";
+             << store << "' (or a state-in-ram class's memory rows, sir-rows, "
+             << "or a folded pipeline's store, fold<k>_store)";
     if (store == "sir-rows" && kind != "hbm")
       return netlist.emitError("storage: sir-rows takes hbm, not '") << kind
                                                                      << "'";
@@ -10932,7 +10973,19 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // with the same path, as the storage rules name them.
   DenseMap<Operation *, unsigned> virtualOf;
   SmallVector<seq::FirMemOp> candidates;
-  if (!virtualMemoryPattern.empty()) {
+  // `fold-store-hbm`: a folded pipeline's store in HBM is a virtual memory
+  // too, whatever the pattern.
+  auto hbmFold = [&](Operation *memory) -> Fold * {
+    if (!folding)
+      return nullptr;
+    auto it = folding->foldOfStore.find(memory);
+    if (it == folding->foldOfStore.end() || !folding->folds[it->second].hbm)
+      return nullptr;
+    return &folding->folds[it->second];
+  };
+  bool anyHbmFold =
+      folding && llvm::any_of(folding->folds, [](const Fold &f) { return f.hbm; });
+  if (!virtualMemoryPattern.empty() || anyHbmFold) {
     llvm::Regex pattern(virtualMemoryPattern);
     StringRef model =
         cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : cls.name;
@@ -10941,9 +10994,21 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       if (!memory || physical(&op))
         continue;
       StringRef memName = memory.getName().value_or("");
-      if (!pattern.match(memName) &&
-          !pattern.match((model + ":" + memName).str()))
+      if (Fold *fold = hbmFold(memory)) {
+        // Its landing buffer is read a host cycle before the next state
+        // pass, after the results of the last landed (a frame on).
+        if (ii < fold->outAt + 3)
+          return memory.emitError("fold-store-hbm: ")
+                 << cls.name << ":" << memName << ": its results land "
+                 << fold->outAt + 2 << " host cycles after their issue, "
+                 << "past the next state pass (II " << ii << ")";
+        // A storage rule for it (=hbm) is used.
+        storageFor(cls, memName, /*reg=*/false, memory.getType().getWidth());
+      } else if (virtualMemoryPattern.empty() ||
+                 (!pattern.match(memName) &&
+                  !pattern.match((model + ":" + memName).str()))) {
         continue;
+      }
       if (memory.getReadLatency() != 1)
         return memory.emitError("a virtual memory needs a registered read");
       unsigned reads = 0, writes = 0;
@@ -11028,7 +11093,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       unsigned bytes = bytesOf(memory);
       for (auto other : ArrayRef(candidates).drop_front(i + 1)) {
         if (merged.contains(other) || (bytes + bytesOf(other)) * 8 > 4096 ||
-            !sameRam(memory, other))
+            hbmFold(memory) || hbmFold(other) || !sameRam(memory, other))
           continue;
         vm.lanes.push_back(other);
         vm.laneOffset.push_back(bytes * 8);
@@ -11481,6 +11546,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // (no bypass: the state gap covers the buffer), and the instances whose
   // read is pending, set as it is issued and cleared as its response comes.
   SmallVector<Operation *> virtualPorts(cls.virtualMemories.size(), nullptr);
+  struct HbmStats {
+    unsigned stores = 0;
+    uint64_t bits = 0, landing = 0;
+  } hbmStats;
   auto buildVirtualMemory = [&](seq::FirMemOp memory,
                                 unsigned k) -> SmallVector<Value> {
     auto &vm = cls.virtualMemories[k];
@@ -11649,6 +11718,30 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       data = b.createOrFold<hw::BitcastOp>(read.getData().getType(), data);
       read.getData().replaceAllUsesWith(data);
       read.erase();
+    }
+    if (Fold *fold = hbmFold(memory)) {
+      // `fold-store-hbm`: the write's data, the results of the instance's
+      // last issue, from a landing buffer of an entry per instance: written
+      // as they come back (outAt + 1 host cycles after the issue, the
+      // copy's write below), read a host cycle before the instance's next
+      // state pass (a frame on: II >= outAt + 3, checked), registered, so
+      // it may be block RAM. The row and enable are the target's (the slot
+      // of that issue and whether it issued).
+      auto landingType =
+          seq::FirMemType::get(context, entries, vm.dataWidth, 1);
+      auto landing = seq::FirMemOp::create(
+          b, landingType, /*readLatency=*/1, /*writeLatency=*/1,
+          seq::RUW::Old, seq::WUW::Undefined,
+          b.getStringAttr(vm.name + "_landing"), hw::InnerSymAttr{},
+          seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+      keepShallowInFlops(landing);
+      Value winst1 = region.inst.getDefiningOp<seq::FirRegOp>().getNext();
+      wrData = seq::FirMemReadOp::create(b, landing, winst1, hostClock, one());
+      fold->landing = landing;
+      ++hbmStats.stores;
+      hbmStats.bits += uint64_t(memory.getType().getDepth()) * entries *
+                       vm.dataWidth;
+      hbmStats.landing += 2 * uint64_t(entries) * vm.dataWidth;
     }
     memory.erase();
     auto bitOf = [&](Value index) -> Value {
@@ -13405,11 +13498,23 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         b.getStringAttr("fold_inst1")));
     Value inst = keep(seq::FirRegOp::create(b, inst1, hostClock,
                                             b.getStringAttr("fold_inst")));
-    for (auto &fold : folding->folds)
+    for (auto &fold : folding->folds) {
+      if (fold.hbm) {
+        // In HBM: the results into the landing buffer, at their instance.
+        seq::FirMemWriteOp::create(b, fold.landing, fold.thread, hostClock,
+                                   fold.valid, fold.data, Value{});
+        continue;
+      }
       seq::FirMemWriteOp::create(
           b, fold.threadedStore,
           b.createOrFold<comb::ConcatOp>(fold.slot, fold.thread), hostClock,
           fold.valid, fold.data, Value{});
+    }
+    if (hbmStats.stores)
+      llvm::errs() << "fold-store-hbm: " << cls.name << ": " << hbmStats.stores
+                   << " stores, " << hbmStats.bits << " bits in HBM; landing and "
+                   << "read buffers " << hbmStats.landing
+                   << " bits on chip (II " << ii << ")\n";
     if (aheadStats.stores)
       llvm::errs() << "fold-store-ram: " << cls.name << ": "
                    << aheadStats.stores << " stores, " << aheadStats.bits
@@ -16997,9 +17102,24 @@ LogicalResult StaticFolder::run() {
           given.getAsInteger(10, levels);
       }
     }
+    // `fold-store-hbm`: by size, unless a storage rule names the store
+    // (<model>:fold<k>_store=<kind>: hbm, or on chip).
+    auto inHbm = [&](unsigned k, uint64_t bits, unsigned) {
+      std::string store = "fold" + std::to_string(k) + "_store";
+      std::optional<bool> ruled;
+      for (auto &spec : storageSpecs) {
+        auto [m, rest] = StringRef(spec).split(':');
+        auto [name, kind] = rest.rsplit('=');
+        if (m == baseName && name == store)
+          ruled = kind == "hbm";
+      }
+      if (ruled)
+        return *ruled;
+      return foldStoreHbm && bits >= foldStoreHbm;
+    };
     if (cls.threads() > 1 &&
         failed(foldPipelines(cls.model, cls.threads(), foldStoreRam, levels,
-                             cls.folding)))
+                             cls.folding, inHbm)))
       return failure();
   }
   for (auto [k, spec] : llvm::enumerate(foldStageLevelClassSpecs))
@@ -17140,6 +17260,7 @@ void FoldStaticPass::runOnOperation() {
   folder.readBufferBits = readBufferBits;
   folder.foldStoreRam = foldStoreRam;
   folder.foldStoreStyle = foldStoreStyle;
+  folder.foldStoreHbm = foldStoreHbm;
   folder.foldStoreLead = foldStoreLead;
   folder.foldStageLevels = foldStageLevels;
   folder.foldStageLevelClassSpecs.assign(foldStageLevelsClass.begin(),

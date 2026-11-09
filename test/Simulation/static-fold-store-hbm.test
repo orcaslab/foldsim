@@ -1,0 +1,49 @@
+# Folded pipelines' stores in HBM (foldsim-fold-static fold-store-hbm;
+# scalable_state_arch_design_1109 4b: the constant-shell fold's fold stores
+# off chip): a store of at least N bits is a virtual memory (write first),
+# read at each state pass at the next slot (the row the next pass reads, a
+# frame ahead) and written at the row the instance's last issue filled, its
+# data from a landing buffer of an entry per instance that the folded copy
+# writes as its results come back. Driver/Inputs/fold_hbm (per leaf, a
+# pipeline of five stages and one of four, on enables of their own) against
+# models of the kernel's controllers (Inputs/tb_vmem_multi.sv): responses 1
+# to 60 host cycles late, stalled channels, a controller out of room; two
+# copies with bubbles; one store by a storage rule (=hbm), the other kept on
+# chip by one. A write at the wrong row fails it (checked by hand).
+# REQUIRES: verilator
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/fold_hbm
+# RUN: foldsim --srcs top.f --top Top --out %t/all --static --fold-store-hbm 1 Leaf > %t/all.log 2>&1
+# RUN: FileCheck %s --check-prefix=ALL < %t/all.log
+# RUN: FileCheck %s --check-prefix=IR < %t/all/foldsim_sim.mlir
+# RUN: FileCheck %s --check-prefix=JSON < %t/all/foldsim_sim.json
+# RUN: python3 %S/Inputs/vmem_bind.py %t/all/foldsim_sim.json %t/all
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/all --top-module tb -Mdir %t/all/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/all/foldsim_sim.sv > %t/all/build.log 2>&1
+# RUN: %t/all/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=FAST
+# RUN: %t/all/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: %t/all/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/cb --static --fold-store-hbm 1 --copies Leaf:2 --bubbles Leaf > %t/cb.log 2>&1
+# RUN: FileCheck %s --check-prefix=CB < %t/cb.log
+# RUN: python3 %S/Inputs/vmem_bind.py %t/cb/foldsim_sim.json %t/cb
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/cb --top-module tb -DBUBBLES -Mdir %t/cb/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/cb/foldsim_sim.sv > %t/cb/build.log 2>&1
+# RUN: %t/cb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=20 +bubble=20 | FileCheck %s
+# RUN: %t/cb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=3 +hi=20 +full=20 +bubble=10 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/rule --static --storage Leaf:fold1_store=hbm Leaf > %t/rule.log 2>&1
+# RUN: FileCheck %s --check-prefix=RULE < %t/rule.log
+# RUN: python3 %S/Inputs/vmem_bind.py %t/rule/foldsim_sim.json %t/rule
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/rule --top-module tb -Mdir %t/rule/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/rule/foldsim_sim.sv > %t/rule/build.log 2>&1
+# RUN: %t/rule/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/keep --static --fold-store-hbm 1 --storage Leaf:fold1_store=distributed Leaf > %t/keep.log 2>&1
+# RUN: FileCheck %s --check-prefix=KEEP < %t/keep.log
+# ALL: fold-store-hbm: Leaf: 2 stores, 224 bits in HBM; landing and read buffers 128 bits on chip
+# IR-DAG: %fold0_store_landing = seq.firmem 1, 1, old, undefined : <4 x 8
+# IR-DAG: seq.firmem.write_port %fold0_store_landing[{{.*}}] = %fold0_wdata, clock %hostClock enable %fold0_valid{{[0-9]+}}
+# IR-DAG: %fold1_store_rdata = seq.firmem 1, 1, old, undefined : <4 x 8
+# JSON: "memory": "fold0_store"
+# JSON: "read_first": false
+# JSON: "memory": "fold1_store"
+# CB: fold-store-hbm: Leaf: 2 stores
+# CB: fold-store-hbm: Leaf_copy1: 2 stores
+# RULE: fold-store-hbm: Leaf: 1 stores, 96 bits in HBM
+# KEEP: fold-store-hbm: Leaf: 1 stores, 128 bits in HBM
+# FAST: {{^}}MATCH 196 cycles in 2200 host cycles
+# CHECK: {{^}}MATCH

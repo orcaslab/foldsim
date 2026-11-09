@@ -219,8 +219,11 @@ def vmem_cache_rows(vmems, choice, budget):
     A cache's lines live in block RAM in one port pair (bram36). An HBM link
     stream's (class `__link<k>`: every row written once and read once a
     frame, in slot order) has none, nor an HBM page stream's engine
-    (`__pages<k>`: each page row written and read once a frame)."""
-    caps = [0 if str(v.get('class', '')).startswith(('__link', '__pages')) else
+    (`__pages<k>`: each page row written and read once a frame), nor a folded
+    pipeline's store in HBM (`fold<k>_store`, fold-store-hbm: each row written
+    once and read once, depth frames later)."""
+    caps = [0 if str(v.get('class', '')).startswith(('__link', '__pages')) or
+            re.fullmatch(r'fold\d+_store', str(v.get('memory', ''))) else
             pow2_floor(v['instances'] << v['row_width']) for v in vmems]
     if choice != 'auto':
         n = int(choice)

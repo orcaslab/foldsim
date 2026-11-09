@@ -437,6 +437,8 @@ def frame_options(a):
     if getattr(a, 'read_buffer_bits', 0):
         fold += f' read-buffer-bits={a.read_buffer_bits}'
     fold += f' fold-store-ram={getattr(a, "fold_store_ram", 32768)}'
+    if getattr(a, 'fold_store_hbm', 0):
+        fold += f' fold-store-hbm={a.fold_store_hbm}'
     if getattr(a, 'fold_stage_levels', 0):
         fold += f' fold-stage-levels={a.fold_stage_levels}'
     if getattr(a, 'fold_stage_levels_class', ''):
@@ -1402,6 +1404,11 @@ def build_parser():
                     help="with --static: a threaded memory's per-instance read-register buffer of at least N bits "
                          'read synchronously (a block RAM, read first) instead of combinationally (LUTs); 0: none '
                          '(foldsim-fold-static read-buffer-bits)')
+    ap.add_argument('--fold-store-hbm', type=int, default=0, metavar='N',
+                    help='with --static: folded pipelines\' stores of at least N bits (depth 2 or more) kept in HBM '
+                         'as virtual memories, a row read a frame ahead and written from a landing buffer at each '
+                         'state pass (foldsim-fold-static fold-store-hbm; a storage rule <model>:fold<k>_store=hbm '
+                         'names one, another kind keeps one on chip); 0: none by size')
     ap.add_argument('--fold-store-ram', type=int, default=32768, metavar='N',
                     help="with --static: folded pipelines' result stores of at least N bits read through a "
                          'register, a host cycle or two ahead, in block or ultra RAM (their slot counters '
