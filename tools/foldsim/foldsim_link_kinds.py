@@ -75,11 +75,54 @@ def others(path):
             max(0.0, total.get('logic', 0) + total.get('lutram', 0) - lk['lutram'])), lk, total
 
 
+def groups(path):
+    """With SLR groups: per group (foldsim_sim_slr<g>, every copy and link in
+    it) its resources and its links' as links() counts them, and the rest's
+    (uram, ramb36, luts): link-kind-group-others. [] without groups."""
+    sim = path if path.endswith('.mlir') else foldsim_fitdb.sim_path(path)
+    mods, _ = foldsim_cost.parse(sim)
+    out = []
+    g = 0
+    while f'foldsim_sim_slr{g}' in mods:
+        acc = foldsim_fitdb.subtree(mods, f'foldsim_sim_slr{g}', set(), foldsim_fitdb.new())
+        lk = {'uram': 0.0, 'bram': 0.0, 'lutram': 0.0}
+
+        def walk(name):
+            for rec in mods[name].mems:
+                if is_link(rec[0]):
+                    mm = foldsim_fitdb.memory(rec)
+                    for r in lk:
+                        lk[r] += mm[r]
+            for child, _ in mods[name].insts:
+                if child in mods:
+                    walk(child)
+        walk(f'foldsim_sim_slr{g}')
+        rest = (max(0.0, acc['uram'] - lk['uram']), max(0.0, acc['bram'] - lk['bram']),
+                max(0.0, acc['logic'] + acc['lutram'] - lk['lutram']))
+        out.append({'total': {r: acc[r] for r in ('uram', 'bram', 'logic', 'lutram')}, 'links': lk,
+                    'others': rest})
+        g += 1
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('path')
     ap.add_argument('--json', default='')
+    ap.add_argument('--groups', action='store_true',
+                    help='per SLR group (foldsim_sim_slr<g>): the link-kind-group-others value')
     a = ap.parse_args()
+    if a.groups:
+        gs = groups(a.path)
+        for g, x in enumerate(gs):
+            t, lk = x['total'], x['links']
+            print(f"group {g}: {t['uram']:.0f} URAM288, {t['bram']:.1f} RAMB36, {t['logic']:,.0f} logic + "
+                  f"{t['lutram']:,.0f} LUTRAM LUTs; links {lk['uram']:.0f} URAM288, {lk['bram']:.1f} RAMB36, "
+                  f"{lk['lutram']:,.0f} LUTRAM LUTs")
+        if a.json:
+            json.dump(gs, open(a.json, 'w'), indent=1)
+        print(';'.join(f'{x["others"][0]:.0f},{x["others"][1]:.0f},{x["others"][2]:.0f}' for x in gs))
+        return
     others_, lk, total = others(a.path)
     others = others_
     print(f"links: {lk['memories']} memories, {lk['bits']:,} bits: {lk['uram']:.0f} URAM288, "
