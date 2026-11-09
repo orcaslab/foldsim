@@ -487,6 +487,16 @@ def frame_options(a):
             fold += f' fold-ports-reset={a.fold_ports_reset}'
     if getattr(a, 'link_kinds', ''):
         fold += f' link-kinds={a.link_kinds}'
+    if getattr(a, 'link_kind_cost', False):
+        # The device's URAM288, RAMB36 and LUTs at the fill target (the region's,
+        # at --state-scratch-fill), unless given.
+        dev = getattr(a, 'link_kind_device', '')
+        if not dev:
+            dev = ','.join(str(x) for x in region_kind_capacity(check_region(a),
+                                                                getattr(a, 'state_scratch_fill', 0.85)))
+        fold += f' link-kind-cost link-kind-device={dev}'
+        if getattr(a, 'link_kind_others', ''):
+            fold += f' link-kind-others={a.link_kind_others}'
     if getattr(a, 'registered_links', ''):
         fold += f' registered-links={a.registered_links}'
     if getattr(a, 'split_latency', ''):
@@ -957,6 +967,17 @@ def region_ram_bits(path, target=None):
     uram = sum(s.get('uram', 0) for s in region.get('slrs', [])) * 288 * 1024
     bram = sum(s.get('ramb36', 0) for s in region.get('slrs', [])) * 36 * 1024
     return int(uram * fu), int(bram * fb)
+
+
+def region_kind_capacity(path, target=0.85):
+    """A region's URAM288, RAMB36 and LUTs at a fill target (--link-kind-cost's
+    budget), never past the fit check's own limits; the V80's without a region."""
+    region = json.load(open(path or v80_region()))
+    fill = region.get('placement', {}).get('fill', {})
+    total = lambda k: sum(s.get(k, 0) for s in region.get('slrs', []))
+    return (int(total('uram') * min(fill.get('uram', 1.0), target)),
+            int(total('ramb36') * min(fill.get('bram', 1.0), target)),
+            int(total('luts') * min(region.get('placement', {}).get('region_fill', {}).get('lut', 1.0), target)))
 
 
 def v80_region():
@@ -1608,6 +1629,15 @@ def build_parser():
                          'm_axi_mem_ for m_axi_mem_<bundle>_<field> (foldsim-fold-static; foldsim_sim.vh FOLDSIM_PORTS_*)')
     ap.add_argument('--fold-ports-reset', default='reset', metavar='INPUT',
                     help='with --fold-ports: the netlist input whose frame token rides on each request record')
+    ap.add_argument('--link-kind-cost', action='store_true',
+                    help='with --static: each link memory that may be block or ultra RAM takes the kind (block, '
+                         'ultra or distributed RAM) by primitive cost against the remaining device budget per kind '
+                         '(foldsim-fold-static link-kind-cost), not by --link-block-depth / --link-ultra-depth')
+    ap.add_argument('--link-kind-device', default='', metavar='URAM,RAMB36,LUTS',
+                    help='with --link-kind-cost: the budget per kind (default: the region\'s at --state-scratch-fill)')
+    ap.add_argument('--link-kind-others', default='', metavar='URAM,RAMB36,LUTS',
+                    help='with --link-kind-cost: what the rest of the simulator takes of each, as a first fold built '
+                         'it (foldsim_link_kinds.py <gen dir>); default none')
     ap.add_argument('--link-kinds', default='', metavar='P:R:KIND,...',
                     help='with --static: the RAM (distributed, block or ultra) of the links from model P '
                          'to model R that --link-block-depth\'s rules let block or ultra RAM hold, '

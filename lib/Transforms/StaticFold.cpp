@@ -661,6 +661,20 @@ public:
   bool pageWriteGate = false;
   /// `page-write-gate-pages`: per model, the pages gated (absent: all).
   std::map<std::string, unsigned> pageGatePages;
+  /// `link-kind-cost`: link memories' kinds by primitive cost against the
+  /// device's budget per kind (URAM288, RAMB36, LUTs): its capacity at the fill
+  /// target and what the rest takes; the plan by (producer, reader, depth,
+  /// width), as buildSim asks linkStyle, made by planLinkKinds from the
+  /// candidates reportLinks lists (linkCandidates while it collects).
+  bool linkKindCost = false;
+  double linkKindCap[3] = {1029, 2052, 1307904}, linkKindBase[3] = {0, 0, 0};
+  struct LinkCandidate {
+    std::tuple<unsigned, unsigned, uint64_t, unsigned> key;
+    double cost[3];
+  };
+  std::vector<LinkCandidate> *linkCandidates = nullptr;
+  std::map<std::tuple<unsigned, unsigned, uint64_t, unsigned>, std::string> linkKindPlan;
+  void planLinkKinds(raw_ostream &os);
   /// `read-buffer-bits`: a per-instance read-register buffer of at least this
   /// many bits read synchronously (a block RAM); 0: none.
   unsigned readBufferBits = 0;
@@ -1469,6 +1483,11 @@ private:
         return it->second.kind == "distributed" || it->second.kind == "hbm"
                    ? StringRef()
                    : StringRef(it->second.kind);
+    }
+    if (linkKindCost) {
+      auto it = linkKindPlan.find({p, reader, depth, width});
+      if (it != linkKindPlan.end())
+        return it->second;
     }
     return syncLinkStyle(depth, width);
   }
@@ -8462,6 +8481,83 @@ LogicalResult StaticFolder::parsePages() {
   return success();
 }
 
+void StaticFolder::planLinkKinds(raw_ostream &os) {
+  // The candidates as buildSim cuts the links (reportLinks' walk), a key's
+  // links one item (they take one kind).
+  std::vector<LinkCandidate> cands;
+  linkKindPlan.clear();
+  linkCandidates = &cands;
+  reportLinks(llvm::nulls());
+  linkCandidates = nullptr;
+  std::map<std::tuple<unsigned, unsigned, uint64_t, unsigned>, std::array<double, 3>> items;
+  for (auto &c : cands) {
+    auto &it = items[c.key];
+    for (unsigned k = 0; k < 3; ++k)
+      it[k] += c.cost[k];
+  }
+  static const char *kKinds[3] = {"ultra", "block", ""};
+  static const char *kNames[3] = {"URAM288", "RAMB36", "LUTs"};
+  // Largest first (by its least share of a kind's capacity), each to the kind
+  // that keeps every kind within its budget if one does, and of those leaves
+  // the utilizations' sum of squares lowest (the kinds evened out; ties: the
+  // smaller share of its kind).
+  std::vector<std::pair<std::tuple<unsigned, unsigned, uint64_t, unsigned>, std::array<double, 3>>>
+      order(items.begin(), items.end());
+  auto share = [&](const std::array<double, 3> &c, unsigned k) {
+    return linkKindCap[k] > 0 ? c[k] / linkKindCap[k] : 1e18;
+  };
+  auto least = [&](const std::array<double, 3> &c) {
+    return std::min({share(c, 0), share(c, 1), share(c, 2)});
+  };
+  llvm::stable_sort(order, [&](auto &x, auto &y) { return least(x.second) > least(y.second); });
+  double used[3] = {0, 0, 0};
+  unsigned count[3] = {0, 0, 0};
+  for (auto &[key, cost] : order) {
+    unsigned best = 2;
+    bool bestFits = false;
+    double bestScore = 1e300, bestShare = 1e300;
+    for (unsigned k = 0; k < 3; ++k) {
+      if (linkKindCap[k] <= 0)
+        continue;
+      double score = 0;
+      bool fits = true;
+      for (unsigned j = 0; j < 3; ++j) {
+        if (linkKindCap[j] <= 0)
+          continue;
+        double u = (linkKindBase[j] + used[j] + (j == k ? cost[j] : 0)) / linkKindCap[j];
+        fits &= u <= 1.0;
+        score += u * u;
+      }
+      bool better = fits != bestFits ? fits
+                    : score < bestScore - 1e-15 ||
+                          (score <= bestScore + 1e-15 && share(cost, k) < bestShare);
+      if (better) {
+        best = k;
+        bestFits = fits;
+        bestScore = score;
+        bestShare = share(cost, k);
+      }
+    }
+    used[best] += cost[best];
+    ++count[best];
+    linkKindPlan[key] = kKinds[best];
+  }
+  std::string line;
+  llvm::raw_string_ostream ls(line);
+  ls << "foldsim-fold-static: link-kind-cost: " << order.size() << " link groups ("
+     << cands.size() << " links): ultra " << count[0] << " ("
+     << llvm::format("%.0f", used[0]) << " URAM288), block " << count[1] << " ("
+     << llvm::format("%.1f", used[1]) << " RAMB36), distributed " << count[2] << " ("
+     << llvm::format("%.0f", used[2]) << " LUTs); with the rest:";
+  for (unsigned k = 0; k < 3; ++k)
+    ls << " " << kNames[k] << " "
+       << llvm::format("%.1f", 100.0 * (linkKindBase[k] + used[k]) / std::max(1.0, linkKindCap[k]))
+       << " %";
+  ls << " of the budget\n";
+  llvm::errs() << ls.str();
+  os << ls.str();
+}
+
 void StaticFolder::reportLinks(raw_ostream &os) {
   // The links' storage, as buildSim makes it: a register for a late link of
   // one entry, two (staged) for an early one where the schedule allows, else
@@ -8640,6 +8736,16 @@ void StaticFolder::reportLinks(raw_ostream &os) {
       }
       if (syncOk)
         style = linkStyle(use.producer, use.reader, depth, use.width);
+      // `link-kind-cost`: the candidate's cost in each kind (paged in block
+      // or ultra RAM as it would be), keyed as buildSim asks.
+      if (linkCandidates && syncOk) {
+        unsigned pg = linkPaged(use, banked, entries);
+        uint64_t r = pg ? depth * llvm::PowerOf2Ceil(pg) : depth;
+        unsigned w = pg ? (use.width + pg - 1) / pg : use.width;
+        linkCandidates->push_back(
+            {{use.producer, use.reader, depth, use.width},
+             {uram(r, w), bram36(r, w), lutram(depth, use.width)}});
+      }
       // A paged link: p rows an entry of a p-th of its bits.
       if (!style.empty())
         page = linkPaged(use, banked, entries);
@@ -9175,6 +9281,8 @@ LogicalResult StaticFolder::schedule() {
     }
   }
   buildFrameTable(bubbles || !virtualMemoryPattern.empty() || vmemAutoBits);
+  if (linkKindCost)
+    planLinkKinds(os);
   reportLinks(os);
   for (auto [k, consumer] : llvm::enumerate(consumers))
     if (consumer.cls < 0)
@@ -20366,6 +20474,22 @@ void FoldStaticPass::runOnOperation() {
     folder.pageGatePages[model.str()] = n;
   }
   folder.readBufferBits = readBufferBits;
+  folder.linkKindCost = linkKindCost;
+  for (auto [spec, out, name] :
+       {std::tuple{std::string(linkKindDevice), folder.linkKindCap, "link-kind-device"},
+        std::tuple{std::string(linkKindOthers), folder.linkKindBase, "link-kind-others"}}) {
+    SmallVector<StringRef> parts;
+    StringRef(spec).split(parts, ',');
+    if (parts.size() != 3 || llvm::any_of(parts, [](StringRef x) {
+          double v;
+          return x.trim().getAsDouble(v) || v < 0;
+        })) {
+      getOperation().emitError(name) << ": '" << spec << "' is not <uram>,<ramb36>,<luts>";
+      return signalPassFailure();
+    }
+    for (unsigned k = 0; k < 3; ++k)
+      parts[k].trim().getAsDouble(out[k]);
+  }
   folder.vmemAutoBits = vmemAutoBits;
   folder.vmemRingLead = vmemRings;
   folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));

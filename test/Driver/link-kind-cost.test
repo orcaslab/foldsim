@@ -1,0 +1,39 @@
+# link-kind-cost: each link memory that may be block or ultra RAM (read through
+# its output register) takes the kind by primitive cost against the remaining
+# device budget per kind (URAM288, RAMB36, LUTs), largest first, evening the
+# kinds' utilizations out, instead of the link-block-depth / link-ultra-depth
+# thresholds. A synthetic design (synth_1109 gen.py --hier 2,8 --link 24): 16
+# nodes under 2 levels, 72 such links in 33 groups. With one kind's budget only,
+# every link takes that kind (ultra RAM, block RAM, distributed RAM read
+# combinationally); with all three, the kinds are mixed and evened out; with
+# the rest of the design taking a kind (link-kind-others), the links avoid it.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/linkkind
+# RUN: foldsim --srcs top.f --top Top --out %t/u --static --link-kind-cost --link-kind-device 100,0,0 node lvl1 2> %t/u.log > /dev/null
+# RUN: FileCheck %s --check-prefix=U < %t/u.log
+# RUN: FileCheck %s --check-prefix=UM < %t/u/foldsim_sim.mlir
+# RUN: foldsim --srcs top.f --top Top --out %t/b --static --link-kind-cost --link-kind-device 0,100,0 node lvl1 2> %t/b.log > /dev/null
+# RUN: FileCheck %s --check-prefix=B < %t/b.log
+# RUN: FileCheck %s --check-prefix=BM < %t/b/foldsim_sim.mlir
+# RUN: foldsim --srcs top.f --top Top --out %t/d --static --link-kind-cost --link-kind-device 0,0,100000 node lvl1 2> %t/d.log > /dev/null
+# RUN: FileCheck %s --check-prefix=D < %t/d.log
+# RUN: FileCheck %s --check-prefix=DM < %t/d/foldsim_sim.mlir
+# RUN: foldsim --srcs top.f --top Top --out %t/m --static --link-kind-cost --link-kind-device 20,20,400 node lvl1 2> %t/m.log > /dev/null
+# RUN: FileCheck %s --check-prefix=M < %t/m.log
+# RUN: foldsim --srcs top.f --top Top --out %t/o --static --link-kind-cost --link-kind-device 40,40,800 --link-kind-others 30,0,0 node lvl1 2> %t/o.log > /dev/null
+# RUN: FileCheck %s --check-prefix=O < %t/o.log
+# The driver's default budget: the V80 region's at --state-scratch-fill (0.85;
+# LUTs at the placer's region fill, 0.80).
+# RUN: foldsim --srcs top.f --top Top --out %t/v --static --link-kind-cost node lvl1 2> %t/v.log > /dev/null
+# RUN: FileCheck %s --check-prefix=V < %t/v.log
+# Without it, the thresholds (none here: every link distributed).
+# RUN: foldsim --srcs top.f --top Top --out %t/n --static node lvl1 2> %t/n.log > /dev/null
+# RUN: FileCheck %s --check-prefix=DM < %t/n/foldsim_sim.mlir
+# U: link-kind-cost: 33 link groups (72 links): ultra 33 (72 URAM288), block 0 (0.0 RAMB36), distributed 0 (0 LUTs)
+# UM: %node_q0_addr_to_lvl1_model_u0_q0_addr_0 = seq.firmem 1, 1, old, undefined {sv.attributes = [#sv.attribute<"ram_style" = "\22ultra\22">]} : <32 x 24, mask 1>
+# B: link-kind-cost: 33 link groups (72 links): ultra 0 (0 URAM288), block 33 (40.5 RAMB36), distributed 0 (0 LUTs)
+# BM: %node_q0_addr_to_lvl1_model_u0_q0_addr_0 = seq.firmem 1, 1, old, undefined {sv.attributes = [#sv.attribute<"ram_style" = "\22block\22">]} : <32 x 24, mask 1>
+# D: link-kind-cost: 33 link groups (72 links): ultra 0 (0 URAM288), block 0 (0.0 RAMB36), distributed 33 (747 LUTs)
+# DM: %node_q0_addr_to_lvl1_model_u0_q0_addr_0 = seq.firmem 0, 1, undefined, undefined : <32 x 24, mask 1>
+# M: link-kind-cost: 33 link groups (72 links): ultra 1 (7 URAM288), block 9 (10.5 RAMB36), distributed 23 (141 LUTs); with the rest: URAM288 35.0 % RAMB36 52.5 % LUTs 35.2 % of the budget
+# O: link-kind-cost: 33 link groups (72 links): ultra 0 (0 URAM288), block 8 (15.0 RAMB36), distributed 25 (200 LUTs); with the rest: URAM288 75.0 % RAMB36 37.5 % LUTs 25.0 % of the budget
+# V: link-kind-cost link-kind-device=1029,2052,1307904

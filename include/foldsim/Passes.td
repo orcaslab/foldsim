@@ -616,6 +616,24 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "which is the read register (0: none)">,
     Option<"linkUltraDepth", "link-ultra-depth", "unsigned", "0",
            "As link-block-depth, in ultra RAM (0: none)">,
+    Option<"linkKindCost", "link-kind-cost", "bool", "false",
+           "Each link memory that may be block or ultra RAM (read through its "
+           "output register) takes the kind (block RAM, ultra RAM, distributed "
+           "RAM) by primitive cost against the remaining device budget per "
+           "kind, instead of the link-block-depth / link-ultra-depth "
+           "thresholds: largest first, the kind that leaves the highest "
+           "utilization of the three (URAM288, RAMB36, LUTs) lowest. link-kinds "
+           "rules still win. Reported as `link-kind-cost:`">,
+    Option<"linkKindDevice", "link-kind-device", "std::string",
+           "\"1029,2052,1307904\"",
+           "With link-kind-cost: the device's URAM288, RAMB36 and LUTs at the "
+           "fill target, \"<uram>,<ramb36>,<luts>\" (default: the V80 "
+           "region's at 0.85)">,
+    Option<"linkKindOthers", "link-kind-others", "std::string", "\"0,0,0\"",
+           "With link-kind-cost: what the rest of the simulator takes of each "
+           "(\"<uram>,<ramb36>,<luts>\": URAM288, RAMB36, logic and other "
+           "LUTRAM LUTs), as a first fold built it "
+           "(foldsim_link_kinds.py); 0,0,0: links alone">,
     Option<"linkHbmLead", "link-hbm-lead", "unsigned", "48",
            "HBM link streams (link-kinds kind hbm): the most positions a "
            "row's request precedes its landing (the memory's round trip in "
