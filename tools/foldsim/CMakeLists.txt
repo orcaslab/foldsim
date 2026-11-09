@@ -49,6 +49,8 @@ configure_file(foldsim_fitdb.py ${CMAKE_BINARY_DIR}/bin/foldsim_fitdb.py COPYONL
 install(PROGRAMS foldsim_fitdb.py DESTINATION bin)
 configure_file(foldsim_scratch_built.py ${CMAKE_BINARY_DIR}/bin/foldsim_scratch_built.py COPYONLY)
 install(PROGRAMS foldsim_scratch_built.py DESTINATION bin)
+configure_file(foldsim_pp_columns.py ${CMAKE_BINARY_DIR}/bin/foldsim_pp_columns.py COPYONLY)
+install(PROGRAMS foldsim_pp_columns.py DESTINATION bin)
 configure_file(foldsim_fit_bound.py ${CMAKE_BINARY_DIR}/bin/foldsim_fit_bound.py COPYONLY)
 install(PROGRAMS foldsim_fit_bound.py DESTINATION bin)
 configure_file(foldsim_sv_limits.py ${CMAKE_BINARY_DIR}/bin/foldsim_sv_limits.py COPYONLY)

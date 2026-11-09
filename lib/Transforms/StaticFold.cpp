@@ -14506,6 +14506,24 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     }
     unsigned columns = unsigned(llvm::divideCeil(maxBits, 72));
     unsigned lanes = 72 / grain;
+    // (FOLDSIM_PP_COLUMNS=<file>: the rows' layout, for a column-locality
+    // study (foldsim_pp_columns.py): per register, its name, width, row,
+    // first bit in its row's word (column = bit / 72), and its enable's run
+    // (-1: written every pass). Measurement only: nothing built changes.)
+    if (const char *path = getenv("FOLDSIM_PP_COLUMNS")) {
+      std::error_code ec;
+      llvm::raw_fd_ostream os(std::string(path) + "." + cls.name, ec);
+      DenseMap<Value, unsigned> enableIndex;
+      os << "# P " << P << " columns " << columns << " grain " << grain << "\n";
+      for (auto [k, reg] : llvm::enumerate(ppRegs)) {
+        Value en = enableOf(k);
+        int idx = -1;
+        if (en)
+          idx = int(enableIndex.try_emplace(en, enableIndex.size()).first->second);
+        os << reg.name << " " << reg.width << " " << reg.row << " " << bitAt[k]
+           << " " << idx << "\n";
+      }
+    }
     for (auto &row : laneEnable)
       while (row.size() < uint64_t(columns) * lanes)
         row.push_back(zero1);
