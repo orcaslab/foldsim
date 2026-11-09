@@ -449,6 +449,8 @@ def frame_options(a):
         fold += f' link-kinds={a.link_kinds}'
     if getattr(a, 'registered_links', ''):
         fold += f' registered-links={a.registered_links}'
+    if getattr(a, 'split_latency', ''):
+        fold += f' split-latency={a.split_latency}'
     if getattr(a, 'stage_levels', 0):
         fold += f' stage-levels={a.stage_levels}'
     if getattr(a, 'stage_levels_class', ''):
@@ -904,9 +906,9 @@ def slr_split(a, foldsim_opt, sim, out):
             mp = out(f'slr_split_{c}.map')
             run([a.slr_split_python, os.path.join(os.path.dirname(os.path.realpath(__file__)), 'foldsim_slr_split.py'), sim, '--copy', c, '--parts', str(k),
                  '--slrs', ','.join(slrs[:k]), '--chunk', '0', '--apply-map', mp, '--out', out('slr_split')]
-                + shlex.split(a.slr_split_options))
+                + shlex.split(a.slr_split_options.replace('+', ' ')))
             run([foldsim_opt, sim, NO_OP_DUMP, '--pass-pipeline=builtin.module(foldsim-slr-split{'
-                 f'module={c}_static map={mp} parts={k}}})', '-o', sim + '.split'])
+                 f'module={c}_static map={mp} parts={k} {a.slr_split_pass.replace(",", " ")}}})', '-o', sim + '.split'])
             os.replace(sim + '.split', sim)
             plan += [(f'fs_split_{c}_static_p{p}', slrs[p]) for p in range(k)]
     return plan
@@ -1549,10 +1551,17 @@ def build_parser():
                          'which copies the little logic a part reads from another into it): no register added, no '
                          'cycle changed. Each part <prefix><copy>_static_p<k> is assigned to the SLR named in order '
                          '(default SLR2,SLR1,SLR0) in <out>/foldsim_floorplan.tcl. Repeatable')
+    ap.add_argument('--slr-split-pass', default='',
+                    help='foldsim-slr-split options for --slr-split, comma-separated, e.g. crossing=txrx,latency=2,slack=8 (a send and '
+                         'a receive register on every crossing, the copy retimed around them, its outputs latency late: '
+                         'give the fold the same --split-latency)')
+    ap.add_argument('--split-latency', default='', metavar='GLOB:N,...',
+                    help='with --static: the classes\' results N host cycles later (fold-static split-latency): the '
+                         'schedule and the links\' writes; for a copy split with --slr-split-pass crossing=txrx latency=N')
     ap.add_argument('--slr-split-python', default=sys.executable,
                     help='the Python that runs foldsim_slr_split.py (it needs the mtkahypar module)')
     ap.add_argument('--slr-split-options', default='--variants p --imbalance 0.15',
-                    help='foldsim_slr_split.py options for --slr-split (the partition)')
+                    help='foldsim_slr_split.py options for --slr-split (the partition; "+" separates them too)')
     ap.add_argument('--slr-groups', action='store_true',
                     help='with --static: the copies in --slr-count groups, each in an SLR '
                          '(Vivado picks which): within --slr-capacity, the shortest frame, '

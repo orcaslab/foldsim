@@ -1317,13 +1317,26 @@ def SlrSplit : Pass<"foldsim-slr-split", "::mlir::ModuleOp"> {
            "The parts' instance names' prefix (the floorplan finds them)">,
     Option<"copyLogic", "copy-logic", "bool", "true",
            "Copy another part's logic a part reads into it (else an error)">,
+    Option<"crossing", "crossing", "std::string", "\"source\"",
+           "source: a crossing leaves its part from a register, no register "
+           "added; txrx: every crossing a send and a receive register "
+           "(USER_SLL_REG, DONT_TOUCH), the module retimed around them (each "
+           "op a lag, a memory's writes up to `slack` later than its reads, "
+           "the outputs `latency` late: the class's split-latency)">,
+    Option<"latency", "latency", "unsigned", "2",
+           "crossing=txrx: the host cycles the outputs come late (the fold's "
+           "split-latency for the class)">,
+    Option<"slack", "slack", "unsigned", "8",
+           "crossing=txrx: host cycles a memory's writes may land later than "
+           "its reads are taken (under the class's state gap)">,
   ];
   let statistics = [
     Statistic<"numCutValues", "cut-values", "Values crossing between parts">,
     Statistic<"numCutBits", "cut-bits", "Bits crossing between parts">,
     Statistic<"numCopiedLogic", "copied-logic", "Logic ops copied into a reading part">,
   ];
-  let dependentDialects = ["circt::hw::HWDialect", "circt::seq::SeqDialect"];
+  let dependentDialects = ["circt::hw::HWDialect", "circt::seq::SeqDialect",
+                           "circt::sv::SVDialect"];
 }
 
 def RemoveDeadState : Pass<"foldsim-remove-dead-state", "::circt::hw::HWModuleOp"> {

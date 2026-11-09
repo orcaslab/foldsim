@@ -12880,6 +12880,16 @@ LogicalResult StaticFolder::buildSim() {
         v = copyReg(v, n0 + std::to_string(j + 1));
       return v;
     };
+    // split-latency: the class's outputs come splitDelay host cycles after its
+    // pass (a copy split over SLRs, its crossings registered): every register
+    // of the write (enable, entry, bank) is that much later too.
+    unsigned splitLate = splitDelay(int(c));
+    auto splitBy = [&](Value v, const Twine &lateName) {
+      std::string n0 = lateName.str();
+      for (unsigned j = 0; j < splitLate; ++j)
+        v = copyReg(v, n0 + std::to_string(j + 1));
+      return v;
+    };
     Value bits = asBits(b, copies[c].getResult(producer.port));
     std::string baseName = linkName.str();
     SmallVector<Value> pieces, nowPieces;
@@ -12978,6 +12988,7 @@ LogicalResult StaticFolder::buildSim() {
             group.prefix + pass + "0");
         if (crossing)
           enable = lateBy(enable, group.prefix + pass + "_late");
+        enable = splitBy(enable, group.prefix + pass + "_split");
       }
       // A compact link's entry and mask, registered as the group's.
       Value member, memberLate, compactInst, compactInstLate;
@@ -13000,6 +13011,7 @@ LogicalResult StaticFolder::buildSim() {
                               prefix + "_member0");
           if (crossing)
             cw.member = lateBy(cw.member, prefix + "_member_late");
+          cw.member = splitBy(cw.member, prefix + "_member_split");
           if (threads > 1) {
             cw.inst = copyReg(
                 copyReg(table(b, ctl.inst2, index, llvm::Log2_32_Ceil(threads)),
@@ -13007,6 +13019,7 @@ LogicalResult StaticFolder::buildSim() {
                 prefix + "_inst0");
             if (crossing)
               cw.inst = lateBy(cw.inst, prefix + "_inst_late");
+            cw.inst = splitBy(cw.inst, prefix + "_inst_split");
           }
         }
         member = cw.member;
@@ -13100,6 +13113,7 @@ LogicalResult StaticFolder::buildSim() {
           group.bank = notOf(parity);
           if (crossing)
             group.bank = lateBy(group.bank, group.prefix + "_bank_late");
+          group.bank = splitBy(group.bank, group.prefix + "_bank_split");
         }
         writeAddress.push_back(group.bank);
         readAddress.push_back(bank());
@@ -13110,6 +13124,7 @@ LogicalResult StaticFolder::buildSim() {
                                group.prefix + "_inst0");
           if (crossing)
             group.inst = lateBy(group.inst, group.prefix + "_inst_late");
+          group.inst = splitBy(group.inst, group.prefix + "_inst_split");
         }
         writeAddress.push_back(compact.empty() ? group.inst : compactInst);
         readAddress.push_back(address());
