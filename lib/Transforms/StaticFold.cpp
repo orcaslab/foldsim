@@ -323,6 +323,9 @@ static constexpr int kLinkLatency = 2, kForwardedLinkLatency = 1;
 /// A virtual memory's controller reports its free request entries in this
 /// many bits (VMEM_INTERFACE.md, guarantee 2: StaticFolder::virtualRoom).
 static constexpr unsigned kVirtualFreeWidth = 16;
+/// `vmem-rings`: the most reads of a ring memory in flight (its table's
+/// entries), whatever the instances.
+static constexpr unsigned kRingReads = 32;
 /// The control stages from a slot table's read to its pass: the state and
 /// ready passes' two staged registers and the one that makes them now.
 static constexpr int kControlStages = 3;
@@ -11967,6 +11970,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       wrData = wrDataQ;
       wrMask = wrMaskQ;
     }
+    // `vmem-rings`: no bit per instance; the simulator keeps the reads in
+    // flight (a fixed table of them, VmemRings.h).
+    if (vm.ring)
+      return {rdValid, inst, rdRow, wrValid, inst, wrRow, wrData, wrMask, zero(entries)};
     Value set = comb::MuxOp::create(b, rdValid, bitOf(inst), zero(entries));
     Value clear = comb::MuxOp::create(b, rspValid, bitOf(rspInst), zero(entries));
     auto pendingNext = edges.get(intType(entries));
@@ -14775,6 +14782,10 @@ LogicalResult StaticFolder::buildSim() {
   // after each. Built before the copy, whose response data it is.
   struct RingBuilt {
     Value pref0, pinst0, pentry0, landed, seen, wv, winst, wdata;
+    /// The memory's reads not yet answered: their count (each an image write
+    /// to come) and a fixed table of their instances (`kRingReads` entries).
+    Value out;
+    SmallVector<Value> flightValid, flightInst;
     /// Each shared entry's instance (none if an entry is an instance's).
     seq::FirMemOp owner;
   };
@@ -16809,7 +16820,45 @@ LogicalResult StaticFolder::buildSim() {
           // image row written), a use for its entry (VmemRings.h).
           auto &plan = *cls.ring;
           auto &rb = ringBuilt.at({unsigned(c), unsigned(&vm - cls.virtualMemories.data())});
-          Value pending = copies[c].getResult(vm.firstOutput + 8);
+          // The reads in flight: a table of kRingReads entries, each a read's
+          // instance, set at its issue (the first free entry) and cleared by
+          // its answer. Its room: the decisions in flight may issue L + 1
+          // more (a term below keeps them within it).
+          unsigned iw = std::max(idxWidth, 1u);
+          Value issued = copies[c].getResult(vm.firstOutput);
+          Value issuedInst = copies[c].getResult(vm.firstOutput + 1);
+          auto &mainV = simVirtuals[simOf.at({unsigned(c), unsigned(&vm - cls.virtualMemories.data())})];
+          Value answered = body->getArgument(mainV.firstInput);
+          Value answeredInst = body->getArgument(mainV.firstInput + 1);
+          std::string fp = vm.name + "_ring_flight";
+          Value taken = constant(1, 0);
+          for (unsigned e = 0; e < kRingReads; ++e) {
+            auto vNext = backedges.get(i1);
+            auto iNext = backedges.get(b.getIntegerType(iw));
+            Value v = resetReg(vNext, fp + Twine(e) + "_valid", 0);
+            Value in = reg(iNext, fp + Twine(e) + "_inst");
+            Value alloc = comb::AndOp::create(b, ValueRange{issued, notOf(v), notOf(taken)}, false);
+            taken = comb::OrOp::create(b, taken, notOf(v));
+            Value done = comb::AndOp::create(
+                b, answered, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, in, answeredInst));
+            vNext.setValue(comb::OrOp::create(b, comb::AndOp::create(b, v, notOf(done)), alloc));
+            iNext.setValue(comb::MuxOp::create(b, alloc, issuedInst, in));
+            rb.flightValid.push_back(v);
+            rb.flightInst.push_back(in);
+          }
+          {
+            unsigned w = kVirtualFreeWidth;
+            auto outNext = backedges.get(b.getIntegerType(w));
+            rb.out = resetReg(outNext, vm.name + "_ring_out", 0);
+            outNext.setValue(comb::SubOp::create(
+                b,
+                comb::AddOp::create(b, rb.out, b.createOrFold<comb::ConcatOp>(constant(w - 1, 0), issued)),
+                b.createOrFold<comb::ConcatOp>(constant(w - 1, 0), answered)));
+            terms.push_back(comb::ICmpOp::create(
+                b, comb::ICmpPredicate::ult,
+                comb::AddOp::create(b, rb.out, constant(w, decisionLead() + 1)),
+                constant(w, kRingReads)));
+          }
           auto bitAt = [&](Value bits, unsigned n, Value index, unsigned w) -> Value {
             if (!w)
               return b.createOrFold<comb::ExtractOp>(i1, bits, 0);
@@ -16821,9 +16870,12 @@ LogicalResult StaticFolder::buildSim() {
           };
           unsigned eb = llvm::Log2_32_Ceil(plan.entries);
           Value pv = table(b, next, plan.prefValid, 1);
-          Value pbit = bitAt(pending, 1u << idxWidth,
-                             idxWidth ? table(b, next, plan.prefInst, idxWidth) : Value(),
-                             idxWidth);
+          Value pinst = idxWidth ? table(b, next, plan.prefInst, idxWidth) : constant(1, 0);
+          SmallVector<Value> hits;
+          for (auto [v, in] : llvm::zip(rb.flightValid, rb.flightInst))
+            hits.push_back(comb::AndOp::create(
+                b, v, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, in, pinst)));
+          Value pbit = comb::OrOp::create(b, hits, false);
           terms.push_back(comb::OrOp::create(b, notOf(pv), notOf(pbit)));
           Value uv = table(b, next, plan.useValid, 1);
           Value entry = table(b, next, plan.useEntry, eb);
@@ -16859,19 +16911,9 @@ LogicalResult StaticFolder::buildSim() {
         // flight (L + 1), the writes of the memory's reads not yet answered
         // (`out`) and of those the decisions in flight may issue (L + 1), and
         // an answer's write on its way (1).
-        auto &vm = classes[v.cls].virtualMemories[v.k];
-        auto &main = simVirtuals[simOf.at({v.cls, v.k})];
         unsigned w = kVirtualFreeWidth;
-        auto outNext = backedges.get(b.getIntegerType(w));
-        Value out = resetReg(outNext, vm.name + "_ring_out", 0);
-        Value issued = copies[v.cls].getResult(vm.firstOutput);
-        Value answered = body->getArgument(main.firstInput);
-        outNext.setValue(comb::SubOp::create(
-            b,
-            comb::AddOp::create(b, out, b.createOrFold<comb::ConcatOp>(constant(w - 1, 0), issued)),
-            b.createOrFold<comb::ConcatOp>(constant(w - 1, 0), answered)));
         Value need = comb::AddOp::create(
-            b, out, constant(w, virtualRoom(false) + 1));
+            b, ringBuilt.at({v.cls, v.k}).out, constant(w, virtualRoom(false) + 1));
         terms.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge,
                                              body->getArgument(v.firstInput + 3), need));
         continue;
