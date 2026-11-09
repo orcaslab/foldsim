@@ -1,0 +1,6 @@
+# The cost model's type reader takes a function type's '->' as an arrow, not a closing bracket: a struct result after
+# it is the whole struct (it was read as its last field: `i5>`, width 0), and a field's ':' does not split the type.
+# RUN: python3 -c "import sys; sys.path.insert(0, '%S/../../tools/foldsim'); import foldsim_cost as c; r = 'hw.bitcast %%x : (i6) -> !hw.struct<a: i1, b: i5>'; t = c.result_type(r); print('type', t); print('width', c.width(t.split('->')[-1])); print('extract', c.result_type('comb.extract %%y from 2 : (i32) -> i4'))" | FileCheck %s
+# CHECK: type (i6) -> !hw.struct<a: i1, b: i5>
+# CHECK: width 6
+# CHECK: extract (i32) -> i4

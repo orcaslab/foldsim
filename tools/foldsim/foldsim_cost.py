@@ -30,12 +30,15 @@ BLACKBOX = {'xil_fma': (850, 1400, 2), 'xil_fdiv': (800, 1400, 0), 'xil_fsqrt': 
 
 
 def split_top(s, sep=','):
-    out, depth, cur = [], 0, []
+    # The '>' of a function type's '->' closes nothing ((i6) -> !hw.struct<a: i1, b: i5> is one type, not split
+    # at its fields' ':').
+    out, depth, cur, prev = [], 0, [], ''
     for ch in s:
         if ch in '<([{':
             depth += 1
-        elif ch in '>)]}':
+        elif ch in '>)]}' and not (ch == '>' and prev == '-'):
             depth -= 1
+        prev = ch
         if ch == sep and depth == 0:
             out.append(''.join(cur)); cur = []
         else:
