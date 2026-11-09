@@ -537,6 +537,8 @@ def frame_options(a):
         fold += ' csf-mailbox-builder'
     if getattr(a, 'csf_mailbox_hbm', False):
         fold += ' csf-mailbox-hbm'
+    if getattr(a, 'csf_mailbox_hbm_lead', 0):
+        fold += f' csf-mailbox-hbm-lead={a.csf_mailbox_hbm_lead}'
     if getattr(a, 'csf_mailboxes', False):
         fold += ' csf-mailboxes'
         if getattr(a, 'csf_mailbox_latency', 1) != 1:
@@ -1607,6 +1609,9 @@ def build_parser():
     ap.add_argument('--state-in-ram-pp-fanout', type=int, default=0, metavar='N',
                     help='with --state-in-ram-pp: the most RAM primitives a combinationally read memory\'s '
                          'registered address copy drives (foldsim-fold-static state-in-ram-pp-fanout; 0: 96)')
+    ap.add_argument('--csf-mailbox-hbm-lead', type=int, default=0, metavar='N',
+                    help='with --csf-mailbox-hbm: the most positions a mailbox stream\'s request precedes its landing '
+                         '(foldsim-fold-static csf-mailbox-hbm-lead; 0: its default, 112)')
     ap.add_argument('--csf-mailbox-hbm', action='store_true',
                     help='constant-shell fold: reader-indexed link mailboxes in HBM, as HBM link streams of reader '
                          'rows (foldsim-fold-static csf-mailbox-hbm)')
