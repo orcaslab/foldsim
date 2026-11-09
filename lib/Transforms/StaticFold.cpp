@@ -9952,13 +9952,28 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
     auto *op = value.getDefiningOp();
     return op && isa<hw::ConstantOp, hw::AggregateConstantOp>(op);
   };
+  // A class of one instance evaluated once a frame (no ready pass): its
+  // registers change only at the last stage and its inputs' read registers
+  // load once before the first, so both hold over the stages and, like a
+  // constant, cross no stage register; only the values its logic computes
+  // do. (A copy of several instances reads another instance's state and
+  // inputs at each slot; a ready pass reads the inputs again.)
+  bool stableLeaves = cls.threads() == 1 && !cls.hasReady;
+  auto stableLeaf = [&](Value value) {
+    if (!stableLeaves)
+      return false;
+    if (auto arg = dyn_cast<BlockArgument>(value))
+      return arg.getOwner() == body;
+    auto *op = value.getDefiningOp();
+    return isa_and_nonnull<seq::FirRegOp>(op) && op->getBlock() == body;
+  };
   auto soonest = [&](Value value) -> int {
-    if (constantAt(value))
+    if (constantAt(value) || stableLeaf(value))
       return -1;
     return std::min<int>(memo.lookup(value).stage, stages);
   };
   auto latest = [&](Value value) -> int {
-    if (constantAt(value))
+    if (constantAt(value) || stableLeaf(value))
       return -1;
     auto it = late.find(value.getDefiningOp());
     if (it == late.end())

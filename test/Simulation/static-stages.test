@@ -41,6 +41,15 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/nest --static --bubbles --nest --modulo --short-lead --copies Leaf:2 --page 2 --stage-levels 8 Leaf > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_late.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
 # RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +bubble=30 +stall=20 | FileCheck %s
+# A copy per instance at 4 levels: each copy a class of one instance with no
+# ready pass, whose registers and inputs hold over its stages, so only the
+# values its logic computes cross stage registers (under a thousand
+# bits, against over five thousand for the 4-instance copy, S4).
+# RUN: foldsim --srcs top.f --top Top --out %t/x1 --static --bubbles --copies Leaf:4 --stage-levels 4 Leaf > %t/x1.log 2>&1
+# RUN: FileCheck %s --check-prefix=STABLE < %t/x1.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/x1/obj %S/Inputs/tb_late.sv top.sv %t/x1/foldsim_sim.sv > %t/x1/build.log 2>&1
+# RUN: %t/x1/obj/Vtb +verilator+rand+reset+0 +verilator+seed+12 +bubble=30 +stall=20 | FileCheck %s
+# STABLE: Leaf staged: 14 stages, soonest {{[0-9]+}} stage register bits, latest {{[0-9][0-9]?[0-9]?}} (latest)
 # Per class (--stage-levels-class): Leaf at 4 over a global 6 (14 stages, as
 # at 4; against the target), Leaf off (unstaged), Leaf at 6 alone (as at 6),
 # and a spec that matches no class.
@@ -73,5 +82,6 @@
 # S6: Leaf staged: 9 stages, soonest {{[0-9]+}} stage register bits, latest {{[0-9]+}} (latest)
 # CUT6: #1 levels {{[4-7]}}:
 # S4: Leaf x4 state gap 4 stages 14
+# S4: Leaf staged: 14 stages, soonest {{[0-9]+}} stage register bits, latest {{[0-9][0-9][0-9][0-9]+}} (latest)
 # CUT4: #1 levels {{[3-6]}}:
 # CHECK: {{^}}MATCH 196 cycles
