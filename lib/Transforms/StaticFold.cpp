@@ -11709,12 +11709,34 @@ static unsigned ppChunkBits(unsigned n) {
   return std::max(32u, unsigned(llvm::PowerOf2Ceil(n * 72)));
 }
 
+/// `vmem-auto-bits`' form rule: a registered read, one read port, at most one
+/// write port, mask lanes that divide the row. (buildCopy also asks for the
+/// state gap, which minStateGap gives such a memory.)
+static bool autoVirtualForm(seq::FirMemOp memory) {
+  if (memory.getReadLatency() != 1)
+    return false;
+  unsigned reads = 0, writes = 0;
+  for (auto *user : memory->getUsers()) {
+    if (isa<seq::FirMemReadOp>(user))
+      ++reads;
+    else if (isa<seq::FirMemWriteOp>(user))
+      ++writes;
+    else
+      return false;
+  }
+  auto type = memory.getType();
+  unsigned maskWidth = type.getMaskWidth().value_or(1);
+  // (Mask lanes of any width: padded to whole bytes, laneBits.)
+  return reads == 1 && writes <= 1 && !(maskWidth > 1 && type.getWidth() % maskWidth);
+}
+
 void StaticFolder::autoScratch() {
   if (!stateScratchDeviceBits)
     return;
   // The models' memories the fold keeps on chip outside the scratch: a
   // threaded image (instances x rows x width) past 18 kbit (block or ultra
-  // RAM), unless a virtual memory (virtual-memories' pattern).
+  // RAM), unless a virtual memory (virtual-memories' pattern, or by size:
+  // vmem-auto-bits).
   llvm::Regex pattern(virtualMemoryPattern);
   uint64_t memories = 0, inUltra = 0;
   for (auto &cls : classes) {
@@ -11725,6 +11747,11 @@ void StaticFolder::autoScratch() {
       StringRef name = memory.getName().value_or("");
       if (!virtualMemoryPattern.empty() &&
           (pattern.match(name) || pattern.match((model + ":" + name).str())))
+        continue;
+      if (vmemAutoBits && cls.threads() > 1 &&
+          uint64_t(memory.getType().getDepth()) * cls.threads() *
+                  memory.getType().getWidth() >= vmemAutoBits &&
+          autoVirtualForm(memory))
         continue;
       uint64_t bits = entries * memory.getType().getDepth() *
                       memory.getType().getWidth();
@@ -12548,21 +12575,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // `vmem-auto-bits`: by size too (the memories that cannot be one, kept):
   // the checks below, silently.
   auto autoVirtual = [&](seq::FirMemOp memory, const Class &cls) {
-    if (memory.getReadLatency() != 1 || cls.stateGap < decisionLead() + 1)
-      return false;
-    unsigned reads = 0, writes = 0;
-    for (auto *user : memory->getUsers()) {
-      if (isa<seq::FirMemReadOp>(user))
-        ++reads;
-      else if (isa<seq::FirMemWriteOp>(user))
-        ++writes;
-      else
-        return false;
-    }
-    auto type = memory.getType();
-    unsigned maskWidth = type.getMaskWidth().value_or(1);
-    // (Mask lanes of any width: padded to whole bytes, laneBits.)
-    return reads == 1 && writes <= 1 && !(maskWidth > 1 && type.getWidth() % maskWidth);
+    return cls.stateGap >= decisionLead() + 1 && autoVirtualForm(memory);
   };
   unsigned autoKept = 0;
   uint64_t autoKeptBits = 0;

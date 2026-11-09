@@ -1,0 +1,15 @@
+# The auto state scratch (--state-scratch-bits auto, the default with --static) is the device's RAM less the models'
+# memories the fold keeps on chip. A memory vmem-auto-bits makes virtual is in HBM, so it is not taken off the
+# scratch, as a memory the virtual-memories pattern names is not (cs_1109 INT: e1's 64-kbit node memory moved to HBM
+# took 67 Mbit off the scratch at 256 nodes, so more state streamed). Sixteen leaves of a 256 x 8 memory: 32 kbit.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/scratchvm
+# RUN: foldsim --srcs top.f --top Top --out %t/chip --static Leaf > %t/chip.log 2>&1
+# RUN: FileCheck %s --check-prefix=CHIP < %t/chip.log
+# RUN: foldsim --srcs top.f --top Top --out %t/auto --static --vmem-auto-bits 1 Leaf > %t/auto.log 2>&1
+# RUN: FileCheck %s --check-prefix=AUTO < %t/auto.log
+# RUN: FileCheck %s --check-prefix=AUTOV < %t/auto.log
+# RUN: foldsim --srcs top.f --top Top --out %t/named --static --virtual-memories ram Leaf > %t/named.log 2>&1
+# RUN: FileCheck %s --check-prefix=AUTO < %t/named.log
+# CHIP: state-scratch: auto {{[0-9]+}} bits {{.*}} less the models' memories on chip 32768
+# AUTO: state-scratch: auto {{[0-9]+}} bits {{.*}} less the models' memories on chip 0 (0 ultra)
+# AUTOV: vmem-auto-bits: {{[A-Za-z_]+}}: 1 virtual memories; 0 kept on chip
