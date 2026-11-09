@@ -878,12 +878,18 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "pages=hbm). A class a storage rule keeps on chip is resident "
            "whatever the budget">,
     Option<"stateScratchDeviceBits", "state-scratch-device-bits", "uint64_t", "0",
-           "Constant shell, state-scratch-bits auto: the device's block and "
-           "ultra RAM bits at the placer's fill. The scratch is then this, "
+           "Constant shell, state-scratch-bits auto: the device's ultra RAM "
+           "bits at the placer's fill (its block RAM's: "
+           "state-scratch-device-block-bits). The scratch is then this, "
            "less the memories the fold places on chip outside it (the "
            "models' memories past 18 kbit a copy, as instances x rows x "
            "width, unless virtual) and state-scratch-reserve; it overrides "
            "state-scratch-bits. 0: state-scratch-bits as given">,
+    Option<"stateScratchDeviceBlockBits", "state-scratch-device-block-bits",
+           "uint64_t", "0",
+           "With state-scratch-device-bits (the ultra RAM's): the device's "
+           "block RAM bits at the placer's fill. The scratch is budgeted per "
+           "kind: a class's rows go in its style's RAM, else the other's">,
     Option<"stateScratchReserve", "state-scratch-reserve", "uint64_t", "30000000",
            "With state-scratch-device-bits: bits kept from the scratch for "
            "what the fold places after it (link memories, read buffers and "
