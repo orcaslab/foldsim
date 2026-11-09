@@ -224,6 +224,9 @@ struct Class {
     /// alone; 0 for a memory of the model (the class's instances).
     bool pages = false;
     unsigned instWidth = 0, instances = 0;
+    /// Mask lanes of this many bits (not whole bytes), each padded to whole
+    /// bytes in the row (dataWidth, maskWidth the padded ones); 0: none.
+    unsigned laneBits = 0;
     /// `vmem-rings`: its read buffer a ring (the class's `ring` plan), its
     /// answers written to an image read back a lead before each use.
     bool ring = false;
@@ -11073,9 +11076,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     }
     auto type = memory.getType();
     unsigned maskWidth = type.getMaskWidth().value_or(1);
-    return reads == 1 && writes <= 1 &&
-           !(maskWidth > 1 && (type.getWidth() % maskWidth ||
-                               (type.getWidth() / maskWidth) % 8));
+    // (Mask lanes of any width: padded to whole bytes, laneBits.)
+    return reads == 1 && writes <= 1 && !(maskWidth > 1 && type.getWidth() % maskWidth);
   };
   unsigned autoKept = 0;
   uint64_t autoKeptBits = 0;
@@ -11142,9 +11144,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       auto type = memory.getType();
       unsigned maskWidth = type.getMaskWidth().value_or(1);
       unsigned width = type.getWidth();
-      // The controller takes byte enables, or none.
-      if (maskWidth > 1 && (width % maskWidth || (width / maskWidth) % 8))
-        return memory.emitError("a virtual memory's mask covers whole bytes");
+      // The controller takes byte enables, or none: a mask lane of other
+      // than whole bytes is padded to them (laneBits).
+      if (maskWidth > 1 && width % maskWidth)
+        return memory.emitError("a virtual memory's mask lanes are not equal");
       candidates.push_back(memory);
     }
   }
@@ -11194,10 +11197,16 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     vm.rowWidth = std::max(1u, llvm::Log2_64_Ceil(type.getDepth()));
     vm.dataWidth = type.getWidth();
     vm.maskWidth = maskWidth > 1 ? type.getWidth() / 8 : 1;
+    if (maskWidth > 1 && (type.getWidth() / maskWidth) % 8) {
+      vm.laneBits = type.getWidth() / maskWidth;
+      unsigned laneBytes = (vm.laneBits + 7) / 8;
+      vm.dataWidth = maskWidth * laneBytes * 8;
+      vm.maskWidth = maskWidth * laneBytes;
+    }
     vm.readFirst = memory.getRuw() != seq::RUW::New;
     vm.lanes.push_back(memory);
     vm.laneOffset.push_back(0);
-    if (mergeLanes) {
+    if (mergeLanes && !vm.laneBits) {
       unsigned bytes = bytesOf(memory);
       for (auto other : ArrayRef(candidates).drop_front(i + 1)) {
         if (merged.contains(other) || (bytes + bytesOf(other)) * 8 > 4096 ||
@@ -11691,6 +11700,21 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     Value rdValid = zero(1), rdRow = zero(vm.rowWidth);
     Value wrValid = zero(1), wrRow = zero(vm.rowWidth);
     Value wrData = zero(vm.dataWidth), wrMask = zero(vm.maskWidth);
+    // Mask lanes of laneBits each, padded to whole bytes in the row, and back.
+    auto padLanes = [&](Value data, unsigned lanes) -> Value {
+      unsigned lw = vm.laneBits, pw = vm.dataWidth / lanes;
+      SmallVector<Value> parts;
+      for (unsigned j = lanes; j-- > 0;)
+        parts.push_back(widen(b.createOrFold<comb::ExtractOp>(intType(lw), data, j * lw), pw));
+      return b.createOrFold<comb::ConcatOp>(parts);
+    };
+    auto unpadLanes = [&](Value data, unsigned lanes) -> Value {
+      unsigned lw = vm.laneBits, pw = vm.dataWidth / lanes;
+      SmallVector<Value> parts;
+      for (unsigned j = lanes; j-- > 0;)
+        parts.push_back(b.createOrFold<comb::ExtractOp>(intType(lw), data, j * pw));
+      return b.createOrFold<comb::ConcatOp>(parts);
+    };
     // Each instance's read data, from the responses.
     auto readBuffer = [&]() -> Value {
       auto readName = vm.name + "_rdata";
@@ -11813,6 +11837,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         wrRow = widen(write.getAddress(), vm.rowWidth);
         wrData = asBits(b, write.getData());
         unsigned maskBits = memory.getType().getMaskWidth().value_or(1);
+        if (vm.laneBits)
+          wrData = padLanes(wrData, maskBits);
         if (vm.maskWidth == 1 || !write.getMask()) {
           wrMask = hw::ConstantOp::create(b, APInt::getAllOnes(vm.maskWidth));
         } else {
@@ -11838,6 +11864,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         rdValid = comb::AndOp::create(b, rdValid, read.getEnable());
       rdRow = widen(read.getAddress(), vm.rowWidth);
       Value data = readBuffer();
+      if (vm.laneBits)
+        data = unpadLanes(data, memory.getType().getMaskWidth().value_or(1));
       data = b.createOrFold<hw::BitcastOp>(read.getData().getType(), data);
       read.getData().replaceAllUsesWith(data);
       read.erase();
