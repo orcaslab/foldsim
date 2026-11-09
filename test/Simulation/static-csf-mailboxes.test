@@ -59,6 +59,11 @@
 # RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 # RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
 # RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 | FileCheck %s
+# A fixed HBM latency below the streams' leads (28 and 33 at II 40) is hidden:
+# H is the frame's (II 40), at latency 1 as at 20 (the landings decided and
+# not yet run alone are waited for, not the next ones of a sparse stream).
+# RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=1 +hi=1 | FileCheck %s --check-prefix=HII
+# RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=20 +hi=20 | FileCheck %s --check-prefix=HII
 # RUN: foldsim --srcs top.f --top Top --out %t/h24 --static --nest --modulo --min-ii 24 --compact-links --share-links --staged-links --csf-single-bank --csf-mailbox-builder --csf-mailbox-hbm --bubbles Src Sink > %t/h24.log 2>&1
 # RUN: FileCheck %s --check-prefix=HBMS < %t/h24/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/h24 -DVM1 -DBUBBLES -Mdir %t/h24/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/h24/foldsim_sim.sv > %t/h24/build.log 2>&1
@@ -66,6 +71,7 @@
 # RUN: %t/h24/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
 # RUN: %t/h24/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=1 +hi=60 | FileCheck %s
 # HBM: II = 40
+# HII: MATCH 196 cycles in 7966 host cycles, H 39.83
 # HBMS: link streams: 2 streams, 12 links, 80 bits
 # HBMS: link stream Sink Src 4 0 4 4 1 2 8 1
 # HBMS: link stream Src Sink 8 0 32 32 1 8 2 1

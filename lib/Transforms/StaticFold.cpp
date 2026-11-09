@@ -19326,14 +19326,26 @@ LogicalResult StaticFolder::buildSim() {
                                classes[v.cls].virtualMemories[v.k].delayed))));
     }
     // An HBM link stream's landing at the position: the next slots to land
-    // (as many as the landings decided and not yet run) answered.
+    // (as many as the landings decided and not yet run) answered. Those are
+    // the landings of the decisionLead() + 3 positions up to it (a table of
+    // the position: one a position for a stream that lands every host
+    // cycle, fewer for one that lands at a reader's passes alone), not the
+    // next decisionLead() + 3 landings, which for a sparse stream reach
+    // landings whose requests are not yet answered (no lead left).
+    unsigned window = unsigned(decisionLead()) + 3;
     for (auto [k, st] : llvm::enumerate(linkStreams)) {
       if (!st.kept)
         continue;
       auto &sb = streamFor(k);
       unsigned ib = st.instBits(), slots = st.slots();
+      SmallVector<uint64_t> inflight(ii + 1, 0);
+      for (unsigned q = 0; q < ii; ++q)
+        for (unsigned d = 0; d < window && d < ii; ++d)
+          inflight[q] += st.popValid[(q + ii - d) % ii];
+      unsigned cw = llvm::Log2_32_Ceil(window + 1);
+      Value count = table(b, next, inflight, cw);
       SmallVector<Value> clear;
-      for (unsigned d = 0; d <= unsigned(decisionLead()) + 2; ++d) {
+      for (unsigned d = 0; d < window; ++d) {
         Value at = comb::AddOp::create(b, sb.popPtr, constant(ib, d));
         Value bit = b.createOrFold<comb::ExtractOp>(
             i1,
@@ -19341,7 +19353,10 @@ LogicalResult StaticFolder::buildSim() {
                 b, sb.pending,
                 b.createOrFold<comb::ConcatOp>(constant(slots - ib, 0), at)),
             0);
-        clear.push_back(notOf(bit));
+        // (Slot d is one of them where d < the count.)
+        Value beyond = comb::ICmpOp::create(b, comb::ICmpPredicate::uge,
+                                            constant(cw, d), count);
+        clear.push_back(comb::OrOp::create(b, notOf(bit), beyond));
       }
       terms.push_back(comb::OrOp::create(
           b, notOf(atNext(st.popValid, 1)),
