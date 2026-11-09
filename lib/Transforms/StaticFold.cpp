@@ -11043,18 +11043,14 @@ LogicalResult StaticFolder::planScratch() {
       continue;
     }
     // A PP class: the instances the rest of the scratch holds stay resident
-    // (in RAMs of a power of two of them), the others stream; the streamed
+    // (in RAMs of their own, a row an instance and pass), the others stream; the streamed
     // ones a multiple of 16 (of n / 2 for fewer than 32), so that a window
     // divides them.
     cls.ppHbm = true;
     unsigned n = cls.threads();
     unsigned keepCount = 0;
     if (stateScratchPartial && item->perInstance) {
-      uint64_t fits = budget / item->perInstance;
-      // The resident RAMs' rows are a power of two of instances.
-      unsigned r = unsigned(std::min<uint64_t>(fits, n));
-      while (r && uint64_t(llvm::PowerOf2Ceil(r)) * item->perInstance > budget)
-        r = 1u << llvm::Log2_32(r);
+      unsigned r = unsigned(std::min<uint64_t>(budget / item->perInstance, n));
       unsigned align = std::max(1u, std::min(16u, n / 2));
       unsigned s = std::min(n, unsigned(llvm::alignTo(n - r, align)));
       keepCount = n - s;
@@ -11062,7 +11058,7 @@ LogicalResult StaticFolder::planScratch() {
         keepCount = 0;
     }
     cls.ppResident = keepCount;
-    uint64_t kept = keepCount ? uint64_t(llvm::PowerOf2Ceil(keepCount)) * item->perInstance : 0;
+    uint64_t kept = uint64_t(keepCount) * item->perInstance;
     budget -= kept;
     resident += kept;
     streamed += uint64_t(n - keepCount) * item->perInstance;
@@ -13361,6 +13357,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     // the column's read data the pass's instance's, a host cycle before its
     // output register.
     bool partial = hbm && cls.ppResident;
+    // (Its rows {resident index, row}: ppResident x 2^ceil(log2 P) of them.)
     unsigned resPow = partial ? unsigned(llvm::PowerOf2Ceil(cls.ppResident)) : 0;
     Value res3, str3;
     if (partial) {
@@ -13426,7 +13423,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                              hostClock, one());
       if (partial) {
         auto resType = seq::FirMemType::get(
-            context, uint64_t(resPow) * rowsPow, 72,
+            context, uint64_t(cls.ppResident) * rowsPow, 72,
             masked ? std::optional<size_t>(lanes) : std::optional<size_t>(1));
         col.resident = seq::FirMemOp::create(
             b, resType, /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old,
