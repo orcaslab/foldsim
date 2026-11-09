@@ -10924,6 +10924,10 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
 /// Usable HBM bits a host cycle on the kernel's 8 masters (10,240 b/hc read
 /// and write at 200 MHz, at an efficiency of 0.8), for the II model.
 static constexpr uint64_t kStreamBitsPerCycle = 8192;
+/// The positions a streamed row's prefetch leads its first pass by, where the
+/// window allows: an HBM round trip at the kernel's clock and a margin (as
+/// kLinkHbmLead).
+static constexpr unsigned kStreamLead = 64;
 
 LogicalResult StaticFolder::planScratch() {
   struct Item {
@@ -11045,22 +11049,35 @@ LogicalResult StaticFolder::chooseStreamWindows() {
     unsigned rowsPow = unsigned(llvm::PowerOf2Ceil(P));
     unsigned cap = stateStreamWindow ? stateStreamWindow
                                      : std::max(1u, 512u / rowsPow);
+    // The fewest slots whose prefetches lead their first passes by an HBM
+    // round trip (kStreamLead positions), else the most that fit: the
+    // window's counters and slot logic are a slot's each.
     SmallVector<int> pf;
     cls.pageWindow = 0;
-    for (unsigned w = std::min(cap, n - 1); w >= 1 && !cls.pageWindow; --w) {
+    unsigned fits = 0;
+    for (unsigned w = 1; w <= std::min(cap, n - 1); ++w) {
       if (n % w)
         continue;
       ppPrefetches(cls, w, pf);
       bool ok = true;
+      int lead = INT_MAX;
       for (unsigned i = 0; ok && i < n; ++i) {
         int s = cls.slot[kState][i], r = s - int(cls.stages);
         // The prefetch pending before its first pass is decided, and the
         // next frame's after its last pass's write (registered once).
         ok = pf[i] + 4 <= r && pf[i] + int(ii) >= s + 3;
+        lead = std::min(lead, r - pf[i]);
       }
-      if (ok)
+      if (!ok)
+        continue;
+      fits = w;
+      if (lead >= int(kStreamLead)) {
         cls.pageWindow = w;
+        break;
+      }
     }
+    if (!cls.pageWindow)
+      cls.pageWindow = fits;
     if (!cls.pageWindow) {
       // (Few instances, their passes too close for a prefetch between
       // them: a small class, kept on chip.)
@@ -11219,10 +11236,20 @@ LogicalResult StaticFolder::buildPPStream(
     rrow0 = reg(rrow0, "pps_rd_row" + Twine(d));
   }
   Value rdInst = instOf(rinst0, rrow0);
-  // The slot whose prefetch starts (three ahead) and its instance's bit.
+  // The slot whose prefetch starts (three ahead) and its bit: the pending
+  // bits are the window's slots' (zero-extended to the instances' port).
   Value startSlot = ppStreamSlot(cls, b, idxWidth ? offChip3[1] : Value());
-  Value startBit = comb::ShlOp::create(b, constant(entries, 1), widen(offChip3[1]));
-  Value all = hw::ConstantOp::create(b, APInt::getAllOnes(entries));
+  auto slotBit = [&](Value slot) -> Value {
+    Value index = slotBits ? slot : constant(1, 0);
+    unsigned have = std::max(1u, slotBits);
+    if (have < slotsPow)
+      index = b.createOrFold<comb::ConcatOp>(constant(slotsPow - have, 0), index);
+    else if (have > slotsPow)
+      index = low(index, slotsPow);
+    return comb::ShlOp::create(b, constant(slotsPow, 1), index);
+  };
+  Value startBit = slotBit(startSlot);
+  Value all = hw::ConstantOp::create(b, APInt::getAllOnes(slotsPow));
 
   // A chunk of at most 56 columns (4,032 bits): a virtual memory each.
   constexpr unsigned kChunkColumns = 56;
@@ -11295,19 +11322,20 @@ LogicalResult StaticFolder::buildPPStream(
                               count)));
     }
     Value done = doneOf.size() == 1 ? doneOf[0] : comb::OrOp::create(b, doneOf, false);
-    auto pendingNext = edges.get(bits(entries));
+    auto pendingNext = edges.get(bits(slotsPow));
     Value pending = resetReg(pendingNext, prefix + "_pending");
-    Value doneBit = rspInstance ? Value(comb::ShlOp::create(b, constant(entries, 1),
-                                                            widen(rspInstance)))
-                                : all;
+    Value doneBit = slotBit(rspSlot);
     pendingNext.setValue(comb::OrOp::create(
         b,
         comb::AndOp::create(
             b, pending,
             comb::XorOp::create(
-                b, comb::MuxOp::create(b, done, doneBit, constant(entries, 0)),
+                b, comb::MuxOp::create(b, done, doneBit, constant(slotsPow, 0)),
                 all)),
-        comb::MuxOp::create(b, first3, startBit, constant(entries, 0))));
+        comb::MuxOp::create(b, first3, startBit, constant(slotsPow, 0))));
+    if (slotsPow < entries)
+      pending = b.createOrFold<comb::ConcatOp>(constant(entries - slotsPow, 0),
+                                               pending);
     // The pass's write: the chunk's columns, their bytes enabled by their
     // lanes (8-bit lanes; every byte without masks); the padding off.
     SmallVector<Value> words, masks;
@@ -17053,13 +17081,14 @@ LogicalResult StaticFolder::buildSim() {
         pageInst = table(b, next, fetchInst, idxWidth);
       } else if (cls.ppHbm) {
         // State rows in HBM: waited for at the first pass's read position
-        // (the stages before the state pass), all P rows in.
+        // (the stages before the state pass), all P rows of its window slot
+        // in (the pending bits are the slots').
         SmallVector<uint64_t> fetchRow(ii + 1, 0), fetchInst(ii + 1, 0);
         for (unsigned i = 0; i < threads; ++i) {
           int f = cls.slot[kState][i] - int(cls.stages);
           unsigned pos = unsigned(((f % int(ii)) + int(ii)) % int(ii));
           fetchRow[pos] = 1;
-          fetchInst[pos] = i;
+          fetchInst[pos] = cls.windowSlot[i];
         }
         stateUse = table(b, next, fetchRow, 1);
         pageInst = table(b, next, fetchInst, idxWidth);
