@@ -11977,14 +11977,32 @@ LogicalResult StaticFolder::planScratch() {
     cls.ppHbm = true;
     unsigned n = cls.threads();
     unsigned keepCount = 0;
+    // A streamed column's landing window: a block RAM of the window's rows
+    // (at most state-stream-window slots x 2^ceil(log2 P), 512 by default:
+    // one RAMB36), priced up front so that the refold as built is rare.
+    uint64_t windowRows =
+        stateStreamWindow ? uint64_t(llvm::PowerOf2Ceil(stateStreamWindow)) * item->rowsPow
+                          : std::max<uint64_t>(512, item->rowsPow);
+    // (Per kind only: a given state-scratch-bits is the rows' budget.)
+    uint64_t perWindow = perKind ? ramCost(windowRows, 1, false) : 0;
+    uint64_t &windowLeft = left[slot(false)];
+    auto chargeWindows = [&](uint64_t columns) {
+      uint64_t bits = columns * perWindow;
+      windowLeft -= std::min(windowLeft, bits);
+      resident += bits;
+      return bits;
+    };
     bool ultra = !perKind ? item->ultra : left[0] >= left[1];
     uint64_t &l = left[slot(ultra)];
     if (stateScratchPartial) {
       unsigned r = 0;
-      // The most instances whose rows' primitives fit.
+      // The most instances whose rows' primitives fit, beside the windows
+      // where they share the kind.
+      uint64_t allWindows = item->columns * perWindow;
+      uint64_t room = slot(ultra) == slot(false) ? (l > allWindows ? l - allWindows : 0) : l;
       for (unsigned lo = 0, hi = n; lo <= hi && hi;) {
         unsigned mid = (lo + hi) / 2;
-        if (ramCost(uint64_t(mid) * item->rowsPow, item->columns, ultra) <= l) {
+        if (ramCost(uint64_t(mid) * item->rowsPow, item->columns, ultra) <= room) {
           r = mid;
           lo = mid + 1;
         } else {
@@ -12005,12 +12023,23 @@ LogicalResult StaticFolder::planScratch() {
       uint64_t rows = item->entries * item->rowsPow;
       uint64_t perU = ramCost(rows, 1, true), perB = ramCost(rows, 1, false);
       uint64_t u = 0, k = 0;
+      // The streamed columns' windows from the block budget too: a block
+      // column resident in place of a window takes perB less perWindow.
+      auto blockFits = [&](uint64_t rest, uint64_t room) -> uint64_t {
+        uint64_t windows = rest * perWindow;
+        if (room <= windows)
+          return 0;
+        uint64_t more = perB > perWindow ? (room - windows) / (perB - perWindow) : rest;
+        return std::min<uint64_t>(rest - (rest ? 1 : 0), more);
+      };
       if (perKind) {
         u = std::min<uint64_t>(item->columns - 1, left[0] / perU);
-        k = std::min<uint64_t>(item->columns - 1 - u, left[1] / perB);
+        k = blockFits(item->columns - u, left[1]);
+      } else if (ultra) {
+        uint64_t room = l > (item->columns - 1) * perWindow ? l - (item->columns - 1) * perWindow : 0;
+        u = std::min<uint64_t>(item->columns - 1, room / perU);
       } else {
-        uint64_t per = ultra ? perU : perB;
-        (ultra ? u : k) = per ? std::min<uint64_t>(item->columns - 1, l / per) : 0;
+        k = blockFits(item->columns, l);
       }
       unsigned cols = unsigned(u + k);
       if (uint64_t(item->columns - cols) * n < uint64_t(n - keepCount) * item->columns) {
@@ -12026,13 +12055,15 @@ LogicalResult StaticFolder::planScratch() {
           l -= std::min(l, kept);
         }
         resident += kept;
+        uint64_t windows = chargeWindows(item->columns - cols);
         uint64_t streamedBits = uint64_t(item->columns - cols) * n * item->rowsPow * 72;
         streamed += streamedBits;
         llvm::errs() << "foldsim-fold-static: state-scratch: " << cls.name << ": "
                      << item->columns - cols << " of " << item->columns
                      << " columns' PP rows (" << streamedBits
                      << " bits) stream from HBM, " << cols << " on chip ("
-                     << u << " ultra, " << k << " block)\n";
+                     << u << " ultra, " << k << " block); their windows "
+                     << windows << " bits\n";
         continue;
       }
     }
@@ -12044,13 +12075,15 @@ LogicalResult StaticFolder::planScratch() {
                               : 0;
     l -= std::min(l, kept);
     resident += kept;
+    uint64_t windows = chargeWindows(item->columns);
     uint64_t perInstance = item->rowsPow * item->columns * 72;
     streamed += uint64_t(n - keepCount) * perInstance;
     llvm::errs() << "foldsim-fold-static: state-scratch: " << cls.name << ": "
                  << n - keepCount << " of " << n << " instances' PP rows ("
                  << uint64_t(n - keepCount) * perInstance
                  << " bits) stream from HBM, " << keepCount << " resident"
-                 << (keepCount ? (ultra ? " (ultra)" : " (block)") : "") << "\n";
+                 << (keepCount ? (ultra ? " (ultra)" : " (block)") : "")
+                 << "; their windows " << windows << " bits\n";
   }
   llvm::errs() << "foldsim-fold-static: state-scratch: " << stateScratchBits
                << " bits; fold stores " << scratchFoldBits << ", rows resident "

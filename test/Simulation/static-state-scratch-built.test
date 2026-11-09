@@ -25,7 +25,7 @@
 # RUN: FileCheck %s --check-prefix=DF < %t/df.log
 
 # LOG: state-scratch: auto 1 bits (ultra 1, block 0): the device's ultra 1 and block 147456 less the models' memories on chip 0 (0 ultra) and the reserve 147456 block, 0 ultra
-# LOG: state-scratch: Leaf: 4 of 4 instances' PP rows (2304 bits) stream from HBM, 0 resident
+# LOG: state-scratch: Leaf: 4 of 4 instances' PP rows (2304 bits) stream from HBM, 0 resident; their windows 73728 bits
 # LOG: state-scratch: planned ultra 0 of 1, block 147456 of 147456
 # LOG: foldsim: state scratch: past the fill in bram: refolding with the others as built (0,184320 bits)
 # LOG: state-scratch: auto 1 bits (ultra 1, block 0): the device's ultra 1 and block 147456 less the other memories as built, ultra 0 and block 184320
