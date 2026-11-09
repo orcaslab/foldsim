@@ -10928,6 +10928,26 @@ static constexpr uint64_t kStreamBitsPerCycle = 8192;
 /// window allows: an HBM round trip at the kernel's clock and a margin (as
 /// kLinkHbmLead).
 static constexpr unsigned kStreamLead = 64;
+/// The kernel's device-memory masters a streamed class's chunks spread over
+/// (foldsim_vmem_share: controller k on master k mod M).
+static constexpr unsigned kStreamMasters = 8;
+
+/// A streamed PP class's chunks of `columns` 72-bit columns, each a virtual
+/// memory: at least ceil(columns / 56) (4,032 bits, a row of 8 beats), and
+/// one a master while a chunk keeps a beat's columns (7), so that its rows
+/// spread over the masters. Chunk k takes columns [lo, hi).
+static unsigned ppChunks(unsigned columns) {
+  unsigned least = unsigned(llvm::divideCeil(columns, 56));
+  unsigned spread = std::min(kStreamMasters, unsigned(llvm::divideCeil(columns, 7)));
+  return std::max({1u, least, spread});
+}
+static std::pair<unsigned, unsigned> ppChunk(unsigned columns, unsigned k) {
+  unsigned chunks = ppChunks(columns);
+  return {k * columns / chunks, (k + 1) * columns / chunks};
+}
+static unsigned ppChunkBits(unsigned n) {
+  return std::max(32u, unsigned(llvm::PowerOf2Ceil(n * 72)));
+}
 
 LogicalResult StaticFolder::planScratch() {
   struct Item {
@@ -11042,6 +11062,10 @@ void StaticFolder::ppPrefetches(const Class &cls, unsigned w,
 
 LogicalResult StaticFolder::chooseStreamWindows() {
   uint64_t hbmBits = 0;
+  // Each master's bits a frame, the chunks taken in turn (as the kernel
+  // numbers the controllers, approximately: other virtual memories share).
+  SmallVector<uint64_t> masterBits(kStreamMasters, 0);
+  unsigned nextMaster = 0;
   for (auto &cls : classes) {
     if (!cls.ppHbm)
       continue;
@@ -11098,8 +11122,17 @@ LogicalResult StaticFolder::chooseStreamWindows() {
     cls.windowSlot.assign(n, 0);
     for (unsigned k = 0; k < n; ++k)
       cls.windowSlot[order[k]] = k % cls.pageWindow;
-    uint64_t columns = llvm::divideCeil(llvm::divideCeil(cls.rowStateBits, P), 72);
-    uint64_t bits = 2 * uint64_t(n) * P * columns * 72;
+    // (The columns as planned; the packing may add a few.)
+    unsigned columns =
+        unsigned(llvm::divideCeil(llvm::divideCeil(cls.rowStateBits, P), 72));
+    uint64_t bits = 0;
+    for (unsigned k = 0, e = ppChunks(columns); k < e; ++k) {
+      auto [lo, hi] = ppChunk(columns, k);
+      // A row of the chunk moves its whole power-of-two bytes.
+      uint64_t chunk = 2 * uint64_t(n) * P * ppChunkBits(hi - lo);
+      masterBits[nextMaster++ % kStreamMasters] += chunk;
+      bits += chunk;
+    }
     hbmBits += bits;
     llvm::errs() << "foldsim-fold-static: state-stream: " << cls.name << ": P "
                  << P << ", " << n << " instances, a window of "
@@ -11112,10 +11145,15 @@ LogicalResult StaticFolder::chooseStreamWindows() {
       hbmBits += 2 * uint64_t(cls.threads()) * cls.page *
                  llvm::divideCeil(cls.rowStateBits, cls.page);
   if (hbmBits) {
-    uint64_t bw = llvm::divideCeil(hbmBits, kStreamBitsPerCycle);
+    // The busiest master bounds it too (a master's share of the usable).
+    uint64_t perMaster = kStreamBitsPerCycle / kStreamMasters;
+    uint64_t busiest = *llvm::max_element(masterBits);
+    uint64_t bw = std::max(llvm::divideCeil(hbmBits, kStreamBitsPerCycle),
+                           llvm::divideCeil(busiest, perMaster));
     llvm::errs() << "foldsim-fold-static: state-stream: II_sched " << ii
-                 << ", HBM state bits a frame " << hbmBits << ", II_bw " << bw
-                 << " (8 masters, " << kStreamBitsPerCycle
+                 << ", HBM state bits a frame " << hbmBits
+                 << " (busiest master " << busiest << "), II_bw " << bw << " ("
+                 << kStreamMasters << " masters, " << kStreamBitsPerCycle
                  << " b/hc usable): II " << std::max<uint64_t>(ii, bw) << "\n";
   }
   return success();
@@ -11238,7 +11276,11 @@ LogicalResult StaticFolder::buildPPStream(
   Value rdInst = instOf(rinst0, rrow0);
   // The slot whose prefetch starts (three ahead) and its bit: the pending
   // bits are the window's slots' (zero-extended to the instances' port).
-  Value startSlot = ppStreamSlot(cls, b, idxWidth ? offChip3[1] : Value());
+  // (Registered: the slot table after the position tables, a host cycle
+  // before the prefetch's first read leaves at stage 0.)
+  Value startSlot = reg(ppStreamSlot(cls, b, idxWidth ? offChip3[1] : Value()),
+                        "pps_start_slot2");
+  Value first2 = resetReg(first3, "pps_first2");
   auto slotBit = [&](Value slot) -> Value {
     Value index = slotBits ? slot : constant(1, 0);
     unsigned have = std::max(1u, slotBits);
@@ -11252,15 +11294,14 @@ LogicalResult StaticFolder::buildPPStream(
   Value all = hw::ConstantOp::create(b, APInt::getAllOnes(slotsPow));
 
   // A chunk of at most 56 columns (4,032 bits): a virtual memory each.
-  constexpr unsigned kChunkColumns = 56;
-  unsigned chunks = unsigned(llvm::divideCeil(columns.size(), kChunkColumns));
+  unsigned chunks = ppChunks(columns.size());
   unsigned cw = llvm::Log2_32_Ceil(P + 1);
   Value one = constant(1, 1);
   for (unsigned k = 0; k < chunks; ++k) {
-    unsigned lo = k * kChunkColumns;
-    unsigned n = std::min<unsigned>(kChunkColumns, columns.size() - lo);
+    auto [lo, hi] = ppChunk(columns.size(), k);
+    unsigned n = hi - lo;
     unsigned width = n * 72;
-    unsigned dw = std::max(32u, unsigned(llvm::PowerOf2Ceil(width)));
+    unsigned dw = ppChunkBits(n);
     std::string prefix = ("pps" + Twine(k)).str();
     Class::VirtualMemory vm;
     vm.name = prefix + "_rows";
@@ -11307,7 +11348,7 @@ LogicalResult StaticFolder::buildPPStream(
         return comb::ICmpOp::create(b, comb::ICmpPredicate::eq, slot,
                                     constant(slotBits, w));
       };
-      Value mineStart = comb::AndOp::create(b, first3, isSlot(startSlot));
+      Value mineStart = comb::AndOp::create(b, first2, isSlot(startSlot));
       Value mineIn = comb::AndOp::create(b, valid, isSlot(rspSlot));
       auto countNext = edges.get(bits(cw));
       Value count = resetReg(countNext, prefix + "_rows_in_" + Twine(w));
@@ -11332,7 +11373,7 @@ LogicalResult StaticFolder::buildPPStream(
             comb::XorOp::create(
                 b, comb::MuxOp::create(b, done, doneBit, constant(slotsPow, 0)),
                 all)),
-        comb::MuxOp::create(b, first3, startBit, constant(slotsPow, 0))));
+        comb::MuxOp::create(b, first2, startBit, constant(slotsPow, 0))));
     if (slotsPow < entries)
       pending = b.createOrFold<comb::ConcatOp>(constant(entries - slotsPow, 0),
                                                pending);

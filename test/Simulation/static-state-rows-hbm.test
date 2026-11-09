@@ -49,7 +49,7 @@
 # P2LOG: state-scratch: Leaf: 1152 bits of PP rows stream from HBM
 # P2LOG: state-scratch: 0 bits; fold stores 0, rows resident 0 (0 kept on chip by rule or form), streamed 1152 in 1 classes
 # P2LOG: state-stream: Leaf: P 2, 4 instances, a window of 2 slots
-# P2LOG: state-stream: II_sched [[II:[0-9]+]], HBM state bits a frame {{[0-9]+}}, II_bw 1 (8 masters, 8192 b/hc usable): II [[II]]
+# P2LOG: state-stream: II_sched [[II:[0-9]+]], HBM state bits a frame [[B:[0-9]+]] (busiest master [[B]]), II_bw {{[0-9]+}} (8 masters, 8192 b/hc usable): II [[II]]
 # P2LOG: state-stream: Leaf: {{[0-9]+}} columns in 1 virtual memories, a window of 2 slots x 2 rows
 # P2LOG: state-in-ram-pp: Leaf (rows in HBM, a window of 2 slots): built {{.*}} x 4 rows (block)
 # P2VH: `define FOLDSIM_VMEM_COUNT 1
