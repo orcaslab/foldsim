@@ -840,6 +840,22 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"stateInRamReadBits", "state-in-ram-read-bits", "unsigned", "0",
            "With state-in-ram: the RAM bits an evaluation reads a host cycle "
            "(N > 0): P = ceil(bits / N) for a class whose spec gives no P">,
+    Option<"stateInRamPP", "state-in-ram-pp", "bool", "false",
+           "With state-in-ram: a class of P > 1 in the constant-shell fold's "
+           "pass-partitioned form (CSF PP): no pages, no capture or write-back "
+           "buffer. Its registers are packed into P rows in dependency order; "
+           "the class is staged with P stages, and pass j reads row j of every "
+           "72-bit column in place (the RAM's output register feeds the logic) "
+           "and writes it from the logic in the same host cycle through a P:1 "
+           "row select. Values that cross passes are captured once, at their "
+           "pass; a register whose next value needs a later pass than its row "
+           "stays in a store (a hazard register). A combinationally read memory "
+           "of the class is read a stage after its address, from replicated "
+           "address registers (state-in-ram-pp-fanout)">,
+    Option<"stateInRamPPFanout", "state-in-ram-pp-fanout", "unsigned", "96",
+           "With state-in-ram-pp: the most RAM primitives a combinationally "
+           "read memory's address register drives (the memory is banked by "
+           "width, a registered address copy per bank)">,
     Option<"stateInRamZeroLinks", "state-in-ram-zero-links", "bool", "false",
            "With state-in-ram and zero-latency-links: links into a class of "
            "P > 1 may be taken in their producer's host cycle (default: from "

@@ -163,6 +163,14 @@ struct Class {
   /// is built as pages, `page` = P, with masks), and its RAM style.
   unsigned sir = 0;
   std::string sirStyle;
+  /// CSF pass-partitioned state in RAM (`state-in-ram-pp`, P > 1): P, the
+  /// rows an instance and the passes of an evaluation (0: off). The class is
+  /// staged with P stages: pass j (stage j) reads row j of every column in
+  /// place, from the RAM's output register, and writes it from the logic the
+  /// same host cycle; the state pass (stage P) takes the other writes.
+  unsigned pp = 0;
+  /// The PP build's counts (rows, columns, captures, holds, hazards).
+  std::string ppReport;
   /// State in RAM with its memories' page rows off chip (`<model>:sir-rows=
   /// hbm`): the registers in on-chip pages, the rows in off-chip pages, one
   /// page count and schedule (the class is scheduled as off chip).
@@ -398,6 +406,14 @@ public:
   unsigned stateInRamH = 0;
   /// `state-in-ram-zero-links`: zero-latency links into a P > 1 class.
   bool stateInRamZeroLinks = false;
+  /// `state-in-ram-pp`: P > 1 classes in the CSF pass-partitioned form.
+  bool stateInRamPP = false;
+  /// `state-in-ram-pp-fanout`: in such a class, a combinationally read
+  /// memory's read address is registered a stage early and replicated, a
+  /// copy per bank of at most this many RAM primitives.
+  unsigned ppAddressFanout = 96;
+  /// CSF PP: the most estimated levels of a next value written in its pass.
+  unsigned ppWriteLevels = 16;
   /// Constant-shell fold, schedule only (`csf-ready-copies`, `csf-mailboxes`).
   /// The ready-cone lanes of each class (0: its ready passes take its
   /// copy's slots), the first of its lanes among the resources (the classes'
@@ -748,6 +764,24 @@ private:
                            Value rinst, bool keepOld,
                            DenseMap<Operation *, Value> &readInst,
                            DenseSet<Operation *> &readyRegs);
+  /// CSF PP (state-in-ram-pp): a register of the class's rows, its value a
+  /// placeholder until the columns are built, its row (the pass that reads
+  /// and writes it) and its next value's data and enable at that pass (held
+  /// in `held`, operands 2k and 2k + 1, until the columns are built).
+  struct PPReg {
+    Value value;
+    unsigned width = 0, row = 0;
+    bool enabled = false;
+    std::string name;
+  };
+  /// CSF PP: stages the class's logic by its rows (see the definition).
+  LogicalResult stagePP(Class &cls, Block *body, ArrayRef<Operation *> helds,
+                        Value hostClock, Value live1, Value rinst,
+                        function_ref<Value(unsigned)> passEnable,
+                        DenseMap<Operation *, Value> &readInst,
+                        DenseSet<Operation *> &readyRegs,
+                        BackedgeBuilder &placeholders,
+                        SmallVectorImpl<PPReg> &ppRegs, Operation *&held);
   /// Multicycle: checks that the capture registers of `copy` reach only its
   /// end registers through logic, and the end registers are reached only
   /// from its capture registers and constants: the multicycle paths are
@@ -1207,7 +1241,7 @@ private:
   unsigned passSpacing(unsigned c) const {
     auto &cls = classes[c];
     unsigned defer = cls.deferSpan ? cls.deferSpan + 1 + cls.page : 0u;
-    return std::max({cls.pageLead(), cls.multicycle, defer});
+    return std::max({cls.pageLead(), cls.multicycle, defer, cls.pp});
   }
   /// `pass-split`: each named class's deferred lanes, planned on its model.
   LogicalResult planPassSplits();
@@ -2725,6 +2759,18 @@ LogicalResult StaticFolder::chooseStages() {
     if (!levelMatched[k])
       return netlist.emitError("stage-levels-class: '")
              << spec << "' matches no class";
+  // CSF PP (state-in-ram-pp): P stages, whatever the levels: rows 0..P-1 at
+  // stages 0..P-1 and the state pass at stage P. Its folded pipelines issue
+  // at the state pass from the last stage; their stores are read at the
+  // evaluation's read (stagePP).
+  for (auto &cls : classes)
+    if (cls.pp) {
+      if (cls.deferSpan || cls.page)
+        return cls.model.emitError("state-in-ram-pp: ")
+               << cls.name << ": not with pages or pass-split";
+      cls.stages = cls.pp;
+      cls.stageLevels = 0;
+    }
   if (!anyStaged) {
     if (!multicycleSpecs.empty())
       return netlist.emitError("multicycle: needs stage-levels (the levels a "
@@ -2756,6 +2802,14 @@ LogicalResult StaticFolder::chooseStages() {
     unsigned stageLevels = cls.stageLevels;
     bool listed = false;
     unsigned given = 0;
+    if (cls.pp) {
+      for (auto [k, spec] : llvm::enumerate(multicycleSpecs))
+        if (auto glob = llvm::GlobPattern::create(StringRef(spec).split(':').first);
+            glob && glob->match(baseName))
+          return cls.model.emitError("multicycle: ")
+                 << cls.name << " is state-in-ram-pp (staged by its rows)";
+      continue;
+    }
     for (auto [k, spec] : llvm::enumerate(multicycleSpecs)) {
       auto [pattern, cycles] = StringRef(spec).split(':');
       if (auto glob = llvm::GlobPattern::create(pattern);
@@ -7072,7 +7126,17 @@ LogicalResult StaticFolder::planStateInRam() {
     if (p == 1 && storageFor(cls, "sir-rows", /*reg=*/false, 0))
       return netlist.emitError("state-in-ram: ")
              << cls.name << ": sir-rows needs P > 1 (its rows are pages)";
-    if (p > 1) {
+    if (p > 1 && stateInRamPP) {
+      // CSF pass-partitioned (PP): no pages. Pass j reads row j in place and
+      // writes it from the logic; the class is staged with P stages
+      // (chooseStages), its copy's passes P apart (passSpacing).
+      if (storageFor(cls, "sir-rows", /*reg=*/false, 0))
+        return netlist.emitError("state-in-ram-pp: ")
+               << cls.name << ": sir-rows is the paged form's (rows by address here)";
+      cls.pp = p;
+      log() << "PP: " << p << " passes, rows read in place and written in "
+            << "pass, staged with " << p << " stages\n";
+    } else if (p > 1) {
       // Built as pages of the row's bits, on chip, with masks: every row read
       // into the capture registers (the fetch buffer) and the evaluation on
       // the last, so no register's row is written before it is read; the
@@ -9654,6 +9718,1009 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
   return success();
 }
 
+/// CSF PP (`state-in-ram-pp`; the constant-shell fold's pass-partitioned state
+/// in RAM): the class's logic staged by the rows of its registers, P passes
+/// (stages 0..P-1) and the state pass (stage P), one state evaluation in
+/// flight (its copy's state passes P apart, passSpacing).
+///
+/// Rows: the registers an instance writes (no ready pass reads them, as
+/// pages keep those) in dependency order, the strongly connected groups of
+/// the registers' next values in topological order of their levels, packed
+/// into P rows of whole 72-bit columns (lanes of one enable each, 9 bits in
+/// block RAM, 8 in ultra). Row j is read at pass j: its column's RAM output
+/// register is what the logic reads, nothing between. A register's next value
+/// is written at its own row's pass, from the logic that host cycle (through
+/// the P:1 row select): in place, with no write-back register. A register
+/// whose next value needs a later pass than its row (a hazard) leaves the
+/// rows and keeps a store, read at the evaluation's read as a staged class's.
+///
+/// Stages: each op at the latest pass of its operands (soonest): a row's
+/// register at its row, the inputs, the stores, registered reads' data and
+/// folded pipelines' stores at 0 (the read position, the stages before the
+/// state pass), the folded pipelines' own ops at the state pass. A value read
+/// at a later pass is captured once, at its own pass, by a register that the
+/// state evaluation's pass enables (`passEnable`): one evaluation is in
+/// flight, so a capture holds until the next instance's same pass, P host
+/// cycles on, at or after the latest stage that reads it. The cone of the
+/// outputs a ready pass writes (on its stores, the inputs and the memories
+/// only) is evaluated by every pass, ready or state: its values cross stages
+/// through stage registers that step with the positions (`live1`), as
+/// stageLogic's do. The state pass's writes (the stores' registers, the
+/// memories, registered reads, the outputs, the folded pipelines' issues)
+/// take their values at stage P, through captures.
+///
+/// A memory read combinationally whose read port drives more than
+/// `ppAddressFanout` LUT RAM primitives is banked by width, a bank per that
+/// many, and read a stage after its address: each bank's address and
+/// instance a register of its own (kept), so no address net drives more.
+LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
+                                    ArrayRef<Operation *> helds, Value hostClock,
+                                    Value live1, Value rinst,
+                                    function_ref<Value(unsigned)> passEnable,
+                                    DenseMap<Operation *, Value> &readInst,
+                                    DenseSet<Operation *> &readyRegs,
+                                    BackedgeBuilder &placeholders,
+                                    SmallVectorImpl<PPReg> &ppRegs,
+                                    Operation *&heldOut) {
+  const unsigned P = cls.pp, last = cls.stages;
+  auto *context = cls.model.getContext();
+  ImplicitLocOpBuilder b(cls.model.getLoc(), body, body->end());
+  auto *folding = cls.folding.get();
+  auto physical = [&](Operation *op) {
+    return op && folding && folding->physical.contains(op);
+  };
+  auto isHeld = [&](Operation *op) { return llvm::is_contained(helds, op); };
+  unsigned threads = cls.threads();
+  unsigned entries = threads > 1 ? 1u << llvm::Log2_32_Ceil(threads) : 1u;
+
+  // Registers: each replaced by one whose next value is set below, as
+  // stageLogic does; the old next values' cones die.
+  struct RegWrite {
+    seq::FirRegOp reg;
+    Backedge next;
+    Value enable, data;
+    bool holds = false;
+  };
+  BackedgeBuilder edges(b, cls.model.getLoc());
+  SmallVector<RegWrite> writes;
+  {
+    SmallVector<seq::FirRegOp> regs;
+    for (auto &op : *body)
+      if (auto reg = dyn_cast<seq::FirRegOp>(op); reg && !physical(reg))
+        regs.push_back(reg);
+    for (auto reg : regs) {
+      b.setLoc(reg.getLoc());
+      Value next = reg.getNext();
+      if (reg.getReset())
+        next = comb::MuxOp::create(b, reg.getReset(), reg.getResetValue(), next);
+      RegWrite write;
+      auto peeled = foldsim::peelHolds(b, next, reg.getResult());
+      write.holds = peeled.holds;
+      write.enable = peeled.enable;
+      write.data = peeled.holds ? Value() : peeled.data ? peeled.data : next;
+      write.next = edges.get(reg.getType());
+      write.reg = seq::FirRegOp::create(b, write.next, reg.getClk(),
+                                        reg.getNameAttr());
+      writes.push_back(write);
+    }
+    SmallVector<Value> kept;
+    for (auto &write : writes) {
+      if (write.enable)
+        kept.push_back(write.enable);
+      if (write.data)
+        kept.push_back(write.data);
+    }
+    auto *keeper = UnrealizedConversionCastOp::create(b, TypeRange{}, kept)
+                       .getOperation();
+    for (auto [reg, write] : llvm::zip(regs, writes)) {
+      reg.getResult().replaceAllUsesWith(write.reg.getResult());
+      if (readyRegs.erase(reg))
+        readyRegs.insert(write.reg);
+      reg.erase();
+    }
+    for (bool erased = true; erased;) {
+      erased = false;
+      for (auto &op : llvm::make_early_inc_range(llvm::reverse(*body)))
+        if (!isHeld(&op) && &op != keeper && !physical(&op) &&
+            (isa<comb::CombDialect>(op.getDialect()) ||
+             isa<hw::ConstantOp, hw::AggregateConstantOp, hw::BitcastOp,
+                 hw::ArrayCreateOp, hw::ArrayGetOp, hw::ArraySliceOp,
+                 hw::ArrayConcatOp, hw::ArrayInjectOp, hw::StructCreateOp,
+                 hw::StructExtractOp, hw::StructInjectOp, hw::StructExplodeOp,
+                 seq::FirMemReadOp>(op)) &&
+            isOpTriviallyDead(&op)) {
+          op.erase();
+          erased = true;
+        }
+    }
+    unsigned k = 0;
+    for (auto &write : writes) {
+      if (write.enable)
+        write.enable = keeper->getOperand(k++);
+      if (write.data)
+        write.data = keeper->getOperand(k++);
+    }
+    keeper->erase();
+  }
+
+  auto memoryOf = [](seq::FirMemReadOp read) {
+    return read.getMemory().getDefiningOp<seq::FirMemOp>();
+  };
+  auto registeredRead = [&](Operation *op) {
+    auto read = dyn_cast<seq::FirMemReadOp>(op);
+    if (!read)
+      return false;
+    auto memory = memoryOf(read);
+    return memory && memory.getReadLatency() > 0;
+  };
+  // A folded pipeline's store read through a register ahead (fold-store-ram):
+  // built by buildAheadStore at the read's instance, its data a leaf at the
+  // evaluation's read.
+  auto aheadRead = [&](Operation *op) {
+    auto read = dyn_cast<seq::FirMemReadOp>(op);
+    if (!read || !folding)
+      return false;
+    auto memory = memoryOf(read);
+    auto it = memory ? folding->foldOfStore.find(memory)
+                     : folding->foldOfStore.end();
+    return it != folding->foldOfStore.end() && folding->folds[it->second].ahead;
+  };
+  auto isNode = [&](Operation *op) {
+    if (!op || op->getBlock() != body || isHeld(op) || physical(op) ||
+        op->getNumResults() == 0 ||
+        isa<seq::FirRegOp, seq::CompRegClockEnabledOp, seq::FirMemOp,
+            hw::ConstantOp, hw::AggregateConstantOp, UnrealizedConversionCastOp,
+            hw::InstanceOp>(op))
+      return false;
+    return !registeredRead(op) && !aheadRead(op);
+  };
+
+  // The ops in dependency order (operands first).
+  SmallVector<Operation *> topo;
+  {
+    DenseSet<Operation *> seen;
+    for (auto &root : *body) {
+      if (!isNode(&root) || seen.contains(&root))
+        continue;
+      SmallVector<std::pair<Operation *, unsigned>> stack{{&root, 0}};
+      seen.insert(&root);
+      while (!stack.empty()) {
+        auto &[op, next] = stack.back();
+        if (next < op->getNumOperands()) {
+          auto *def = op->getOperand(next++).getDefiningOp();
+          if (isNode(def) && seen.insert(def).second)
+            stack.push_back({def, 0});
+          continue;
+        }
+        topo.push_back(op);
+        stack.pop_back();
+      }
+    }
+  }
+
+  // The cone of the outputs a ready pass writes: evaluated at every pass.
+  DenseSet<Operation *> lateCone;
+  auto *heldResults = helds.front();
+  SmallVector<bool> lateOut(heldResults->getNumOperands(), false);
+  {
+    SmallVector<Value> stack;
+    for (unsigned o = 0; o < heldResults->getNumOperands(); ++o)
+      if (o < cls.late.size() && cls.late[o] &&
+          producers[cls.producerOf[o]].atReady) {
+        lateOut[o] = true;
+        stack.push_back(heldResults->getOperand(o));
+      }
+    while (!stack.empty()) {
+      auto *op = stack.pop_back_val().getDefiningOp();
+      if (!isNode(op) || !lateCone.insert(op).second)
+        continue;
+      for (auto operand : op->getOperands())
+        stack.push_back(operand);
+    }
+  }
+
+  // Comb-read memories to bank: their read ports' LUT RAM primitives past
+  // the fanout (threaded: entries x depth rows, 64 a primitive).
+  DenseSet<Operation *> early;
+  {
+    DenseSet<Operation *> memories;
+    for (auto *op : topo)
+      if (auto read = dyn_cast<seq::FirMemReadOp>(op))
+        if (auto memory = memoryOf(read);
+            memory && memory.getReadLatency() == 0 && !physical(memory) &&
+            !(folding && folding->foldOfStore.count(memory)))
+          memories.insert(memory);
+    for (auto *op : memories) {
+      auto memory = cast<seq::FirMemOp>(op);
+      uint64_t deep = llvm::divideCeil(uint64_t(memory.getType().getDepth()) * entries, 64);
+      if (uint64_t(memory.getType().getWidth()) * deep > ppAddressFanout)
+        early.insert(memory);
+    }
+  }
+  auto isEarly = [&](Operation *op) {
+    auto read = dyn_cast<seq::FirMemReadOp>(op);
+    return read && early.contains(memoryOf(read));
+  };
+
+  // The rows' candidates: the registers an instance writes that no ready
+  // pass reads.
+  SmallVector<unsigned> cand;
+  DenseMap<Operation *, unsigned> candOf;
+  for (auto [i, write] : llvm::enumerate(writes))
+    if (!write.holds && hw::getBitWidth(write.reg.getType()) > 0 &&
+        !readyRegs.contains(write.reg)) {
+      candOf[write.reg] = cand.size();
+      cand.push_back(i);
+    }
+  auto widthOf = [&](unsigned k) {
+    return unsigned(hw::getBitWidth(writes[cand[k]].reg.getType()));
+  };
+
+  // Each candidate's dependences: the candidates its next value reads.
+  SmallVector<SmallVector<unsigned>> deps(cand.size());
+  {
+    DenseMap<Operation *, unsigned> stamp;
+    unsigned gen = 0;
+    for (unsigned k = 0; k < cand.size(); ++k) {
+      ++gen;
+      auto &write = writes[cand[k]];
+      SmallVector<Value> stack;
+      if (write.enable)
+        stack.push_back(write.enable);
+      stack.push_back(write.data);
+      DenseSet<unsigned> found;
+      while (!stack.empty()) {
+        auto *op = stack.pop_back_val().getDefiningOp();
+        if (!op)
+          continue;
+        if (auto it = candOf.find(op); it != candOf.end()) {
+          if (it->second != k)
+            found.insert(it->second);
+          continue;
+        }
+        if (!isNode(op))
+          continue;
+        auto &s = stamp[op];
+        if (s == gen)
+          continue;
+        s = gen;
+        for (auto operand : op->getOperands())
+          stack.push_back(operand);
+      }
+      deps[k].assign(found.begin(), found.end());
+      llvm::sort(deps[k]);
+    }
+  }
+
+  // Strongly connected groups (Tarjan, iterative) of the candidates still
+  // in the rows. A group must fit a row (its registers read one another's
+  // values in their next values: in one row, none needs a later pass), so a
+  // group past half a row's share loses its narrowest registers (control
+  // bits, whose next values are wide registers' functions) to stores, 1 bit
+  // and then twice as wide each round, up to 64: they leave the rows as
+  // hazards do, their values at the read (stage 0) for every pass.
+  StringRef style = cls.sirStyle.empty() ? StringRef("block") : StringRef(cls.sirStyle);
+  bool masked = llvm::any_of(cand, [&](unsigned i) { return bool(writes[i].enable); });
+  unsigned grain = masked ? (style == "ultra" ? 8 : 9) : 1;
+  uint64_t total = 0;
+  for (unsigned k = 0; k < cand.size(); ++k)
+    total += llvm::divideCeil(widthOf(k), grain) * grain;
+  DenseSet<unsigned> broken;
+  SmallVector<int> comp(cand.size(), -1);
+  unsigned comps = 0;
+  auto findGroups = [&]() {
+    llvm::fill(comp, -1);
+    comps = 0;
+    SmallVector<int> index(cand.size(), -1), low(cand.size(), 0);
+    SmallVector<bool> onStack(cand.size(), false);
+    SmallVector<unsigned> stack;
+    int counter = 0;
+    for (unsigned root = 0; root < cand.size(); ++root) {
+      if (index[root] >= 0 || broken.contains(root))
+        continue;
+      SmallVector<std::pair<unsigned, unsigned>> call{{root, 0}};
+      index[root] = low[root] = counter++;
+      stack.push_back(root);
+      onStack[root] = true;
+      while (!call.empty()) {
+        auto &[v, next] = call.back();
+        if (next < deps[v].size()) {
+          unsigned w = deps[v][next++];
+          if (broken.contains(w))
+            continue;
+          if (index[w] < 0) {
+            index[w] = low[w] = counter++;
+            stack.push_back(w);
+            onStack[w] = true;
+            call.push_back({w, 0});
+          } else if (onStack[w]) {
+            low[v] = std::min(low[v], index[w]);
+          }
+          continue;
+        }
+        if (low[v] == index[v]) {
+          unsigned w;
+          do {
+            w = stack.pop_back_val();
+            onStack[w] = false;
+            comp[w] = comps;
+          } while (w != v);
+          ++comps;
+        }
+        unsigned done = v;
+        call.pop_back();
+        if (!call.empty())
+          low[call.back().first] = std::min(low[call.back().first], low[done]);
+      }
+    }
+  };
+  uint64_t share = llvm::divideCeil(total, P);
+  uint64_t firstLargest = 0;
+  SmallVector<uint64_t> compBits;
+  for (unsigned narrow = 1;; narrow *= 2) {
+    findGroups();
+    compBits.assign(comps, 0);
+    for (unsigned k = 0; k < cand.size(); ++k)
+      if (comp[k] >= 0)
+        compBits[comp[k]] += widthOf(k);
+    if (narrow == 1)
+      for (auto bits : compBits)
+        firstLargest = std::max(firstLargest, bits);
+    bool big = false;
+    for (unsigned k = 0; k < cand.size(); ++k)
+      if (comp[k] >= 0 && 2 * compBits[comp[k]] > share) {
+        big = true;
+        if (narrow <= 64 && widthOf(k) <= narrow)
+          broken.insert(k);
+      }
+    if (!big || narrow > 64)
+      break;
+  }
+  // Levels: a group after the groups it depends on (Tarjan's order).
+  SmallVector<unsigned> level(comps, 0);
+  SmallVector<SmallVector<unsigned>> members(comps);
+  for (unsigned k = 0; k < cand.size(); ++k)
+    if (comp[k] >= 0)
+      members[comp[k]].push_back(k);
+  for (unsigned c = 0; c < comps; ++c)
+    for (unsigned k : members[c])
+      for (unsigned d : deps[k])
+        if (comp[d] >= 0 && comp[d] != int(c))
+          level[c] = std::max(level[c], level[comp[d]] + 1);
+  uint64_t largestGroup = 0;
+  for (auto bits : compBits)
+    largestGroup = std::max(largestGroup, bits);
+  SmallVector<unsigned> groupOrder(comps);
+  for (unsigned c = 0; c < comps; ++c)
+    groupOrder[c] = c;
+  llvm::stable_sort(groupOrder, [&](unsigned x, unsigned y) {
+    return level[x] < level[y];
+  });
+  // A topological order of the groups that takes the first by name of those
+  // ready (Kahn's), so that a unit's registers stay together where their
+  // dependences allow: on the b4e slice at P 8, 148k capture + 21k hold
+  // bits against 199k + 36k by levels alone (FOLDSIM_PP_ORDER=level).
+  if (const char *o = getenv("FOLDSIM_PP_ORDER"); !o || StringRef(o) != "level") {
+    SmallVector<std::string> key(comps);
+    for (unsigned c = 0; c < comps; ++c) {
+      std::string best;
+      for (unsigned k : members[c]) {
+        std::string n = writes[cand[k]].reg.getName().str();
+        if (best.empty() || n < best)
+          best = n;
+      }
+      key[c] = best;
+    }
+    SmallVector<SmallVector<unsigned>> users(comps);
+    SmallVector<unsigned> pending(comps, 0);
+    for (unsigned c = 0; c < comps; ++c) {
+      DenseSet<unsigned> seen;
+      for (unsigned k : members[c])
+        for (unsigned d : deps[k])
+          if (comp[d] >= 0 && comp[d] != int(c) && seen.insert(comp[d]).second) {
+            users[comp[d]].push_back(c);
+            ++pending[c];
+          }
+    }
+    std::set<std::pair<std::string, unsigned>> ready;
+    for (unsigned c = 0; c < comps; ++c)
+      if (!pending[c])
+        ready.insert({key[c], c});
+    groupOrder.clear();
+    while (!ready.empty()) {
+      unsigned c = ready.begin()->second;
+      ready.erase(ready.begin());
+      groupOrder.push_back(c);
+      for (unsigned u : users[c])
+        if (!--pending[u])
+          ready.insert({key[u], u});
+    }
+  }
+
+  // Rows: the groups in order, each in one row, packed into P rows of
+  // `columns` 72-bit ports (a row ends at its share of the bits), each row's
+  // lanes one enable's (the always-written first).
+  unsigned widest = 0;
+  for (unsigned c = 0; c < comps; ++c)
+    widest = std::max<uint64_t>(widest, compBits[c]);
+  SmallVector<int> rowOf(cand.size(), -1);
+  unsigned columns = std::max<uint64_t>(
+      {1, llvm::divideCeil(total, uint64_t(P) * 72),
+       llvm::divideCeil(uint64_t(widest) + grain * 8, 72)});
+  // (FOLDSIM_PP_ROWS=balanced: a row also ends at its share of the bits,
+  // so that a small model's rows are several: for the tests.)
+  bool balanced = getenv("FOLDSIM_PP_ROWS") &&
+                  StringRef(getenv("FOLDSIM_PP_ROWS")) == "balanced";
+  for (;; ++columns) {
+    uint64_t capacity = uint64_t(columns) * 72;
+    unsigned row = 0;
+    llvm::MapVector<Value, uint64_t> runs;
+    auto padded = [&]() {
+      uint64_t bits = 0;
+      for (auto &[en, w] : runs)
+        bits += llvm::divideCeil(w, grain) * grain;
+      return bits;
+    };
+    bool fits = true;
+    for (unsigned c : groupOrder) {
+      // A group that would pass the row's columns starts the next row (the
+      // fewest columns that take the groups in order, first fit).
+      auto before = runs;
+      for (unsigned k : members[c])
+        runs[writes[cand[k]].enable] += widthOf(k);
+      uint64_t with = padded();
+      runs = before;
+      if (row + 1 < P && padded() > 0 &&
+          (with > capacity || (balanced && padded() >= share))) {
+        ++row;
+        runs.clear();
+      }
+      for (unsigned k : members[c]) {
+        Value en = writes[cand[k]].enable;
+        runs[en] += widthOf(k);
+        if (padded() > capacity) {
+          runs[en] -= widthOf(k);
+          if (++row == P) {
+            fits = false;
+            break;
+          }
+          runs.clear();
+          runs[en] = widthOf(k);
+        }
+        rowOf[k] = int(row);
+      }
+      if (!fits)
+        break;
+    }
+    if (fits)
+      break;
+  }
+
+  // Stages, soonest: -1 a constant (any stage); a row's register at its row;
+  // the stores, the inputs, registered and folded-store reads at 0; a folded
+  // pipeline's own values at the state pass; a banked read a stage after its
+  // address. Hazards leave the rows until none is left.
+  DenseSet<unsigned> hazards(broken.begin(), broken.end());
+  // A register whose next value is deep (past ppWriteLevels estimated
+  // levels: a product, a wide sum) is not written in its pass: the row's
+  // write would add the P:1 select and the RAM's setup to the path. It keeps
+  // a store, written at the state pass from a capture (the logic's own
+  // output register, which a DSP absorbs).
+  unsigned deepRegs = 0;
+  uint64_t deepBits = 0;
+  {
+    constexpr int kUnbounded = std::numeric_limits<int>::max() / 4;
+    unsigned eb = threads > 1 ? llvm::Log2_32_Ceil(threads) : 0;
+    DenseMap<Value, Staging> depths;
+    for (unsigned k = 0; k < cand.size(); ++k) {
+      if (broken.contains(k))
+        continue;
+      auto &write = writes[cand[k]];
+      int d = stageOf(write.data, kUnbounded, depths, eb).levels;
+      if (write.enable)
+        d = std::max(d, stageOf(write.enable, kUnbounded, depths, eb).levels);
+      // A product (a DSP's) in the cone, up to the registers and leaves.
+      bool product = false;
+      {
+        SmallVector<Value> stack{write.data};
+        DenseSet<Operation *> seen;
+        while (!stack.empty() && !product) {
+          auto *op = stack.pop_back_val().getDefiningOp();
+          if (!isNode(op) || !seen.insert(op).second)
+            continue;
+          if (isa<comb::MulOp>(op) && hw::getBitWidth(op->getResult(0).getType()) > 8)
+            product = true;
+          for (auto operand : op->getOperands())
+            stack.push_back(operand);
+        }
+      }
+      if (product || d > 2 * int(ppWriteLevels)) {
+        hazards.insert(k);
+        ++deepRegs;
+        deepBits += widthOf(k);
+      }
+    }
+  }
+  DenseMap<Value, int> stageOfValue;
+  auto leafStage = [&](Value value) -> int {
+    if (auto it = stageOfValue.find(value); it != stageOfValue.end())
+      return it->second;
+    auto *op = value.getDefiningOp();
+    if (!op)
+      return 0;  // an input
+    if (isa<hw::ConstantOp, hw::AggregateConstantOp>(op))
+      return -1;  // a constant
+    // A folded pipeline's own values, and the controls set when the copy is
+    // built (its issue's state pass, instance and slot): the state pass's.
+    if (physical(op) || isa<UnrealizedConversionCastOp>(op))
+      return int(last);
+    if (auto it = candOf.find(op); it != candOf.end() && !hazards.contains(it->second))
+      return rowOf[it->second];
+    return 0;
+  };
+  auto computeStages = [&]() {
+    stageOfValue.clear();
+    for (auto *op : topo) {
+      int stage = -1;
+      for (auto operand : op->getOperands())
+        stage = std::max(stage, leafStage(operand));
+      if (isa<seq::FirMemReadOp>(op))
+        stage = std::max(stage, 0) + (isEarly(op) ? 1 : 0);
+      for (auto result : op->getResults())
+        stageOfValue[result] = stage;
+    }
+  };
+  auto nextStage = [&](unsigned k) {
+    auto &write = writes[cand[k]];
+    int stage = leafStage(write.data);
+    if (write.enable)
+      stage = std::max(stage, leafStage(write.enable));
+    return stage;
+  };
+  for (;;) {
+    computeStages();
+    bool more = false;
+    for (unsigned k = 0; k < cand.size(); ++k)
+      if (!hazards.contains(k) && nextStage(k) > rowOf[k]) {
+        hazards.insert(k);
+        more = true;
+      }
+    if (!more)
+      break;
+  }
+  for (auto *op : topo)
+    if (isEarly(op) && stageOfValue.lookup(op->getResult(0)) > int(last))
+      return op->emitError("state-in-ram-pp: a banked read past the state pass");
+  // (FOLDSIM_PP_DUMP=<file>: the candidates' graph, for the row planner's
+  // study: index, name, width, enabled, group, level, row, hazard, next
+  // value's stage, dependences.)
+  if (const char *path = getenv("FOLDSIM_PP_DUMP")) {
+    std::error_code ec;
+    llvm::raw_fd_ostream os(std::string(path) + "." + cls.name, ec);
+    for (unsigned k = 0; k < cand.size(); ++k) {
+      os << k << " " << writes[cand[k]].reg.getName() << " " << widthOf(k) << " "
+         << bool(writes[cand[k]].enable) << " " << comp[k] << " "
+         << (comp[k] >= 0 ? int(level[comp[k]]) : -1) << " " << rowOf[k]
+         << " " << hazards.contains(k)
+         << " " << nextStage(k) << " :";
+      for (unsigned d : deps[k])
+        os << " " << d;
+      os << "\n";
+    }
+  }
+
+  // The rows' registers: placeholders at their rows, their writes' values
+  // kept aside until the columns are built.
+  SmallVector<Value> heldValues;
+  DenseSet<Operation *> ramRegs;
+  SmallVector<unsigned> rowBits(P, 0);
+  uint64_t hazardBits = 0, rowRegBits = 0;
+  for (unsigned k = 0; k < cand.size(); ++k) {
+    if (hazards.contains(k)) {
+      hazardBits += widthOf(k);
+      continue;
+    }
+    ramRegs.insert(writes[cand[k]].reg);
+    rowBits[rowOf[k]] += widthOf(k);
+    rowRegBits += widthOf(k);
+  }
+
+  // Delays. A ready pass's cone through stage registers stepping with the
+  // positions; the state evaluation's values captured once at their pass.
+  Value one = hw::ConstantOp::create(b, b.getI1Type(), 1);
+  DenseMap<std::pair<Value, unsigned>, Value> piped;
+  Value live;
+  unsigned onLive = 512, liveMade = 0;
+  uint64_t pipeBits = 0, captureBits = 0, holdBits = 0, rawBits = 0;
+  // (The captures by what first needed them, and by their pass.)
+  std::map<std::string, uint64_t> whyBits;
+  SmallVector<uint64_t> fromBits(P + 1, 0);
+  std::string why = "op";
+  DenseSet<Value> rowPlaceholders;
+  auto stageAt = [&](Value value) -> int { return leafStage(value); };
+  std::function<Value(Value, unsigned)> pipe = [&](Value value,
+                                                   unsigned k) -> Value {
+    int from = stageAt(value);
+    if (from < 0 || from >= int(k))
+      return value;
+    if (Value known = piped.lookup({value, k}))
+      return known;
+    Value before = pipe(value, k - 1);
+    if (onLive == 512) {
+      live = seq::CompRegClockEnabledOp::create(
+          b, live1.getType(), live1, hostClock, one,
+          b.getStringAttr("pp_live" + Twine(liveMade++)), Value(), Value(),
+          Value(), hw::InnerSymAttr{});
+      onLive = 0;
+    }
+    ++onLive;
+    Value bits = asBits(b, before);
+    pipeBits += hw::getBitWidth(bits.getType());
+    Value staged = seq::CompRegClockEnabledOp::create(
+        b, bits.getType(), bits, hostClock, live,
+        b.getStringAttr("pp_stage" + Twine(k)), Value(), Value(), Value(),
+        hw::InnerSymAttr{});
+    if (staged.getType() != value.getType())
+      staged = b.createOrFold<hw::BitcastOp>(value.getType(), staged);
+    piped[{value, k}] = staged;
+    stageOfValue[staged] = -1;
+    return staged;
+  };
+  DenseMap<Value, Value> captured;
+  auto capture = [&](Value value, bool hold) -> Value {
+    Value &known = captured[value];
+    if (known)
+      return known;
+    int from = stageAt(value);
+    Value bits = asBits(b, value);
+    (hold ? holdBits : captureBits) += hw::getBitWidth(bits.getType());
+    whyBits[why] += hw::getBitWidth(bits.getType());
+    {
+      // (And by what the captured value is: a leaf of stage 0, or logic.)
+      auto *def = value.getDefiningOp();
+      std::string what = !def ? "input"
+                         : rowPlaceholders.contains(value) ? "row value"
+                         : isa<seq::FirRegOp>(def) ? "stored register"
+                         : aheadRead(def) ? "fold store"
+                         : registeredRead(def) ? "registered read"
+                         : isa<seq::FirMemReadOp>(def) ? "comb read"
+                         : "logic";
+      whyBits["of " + what] += hw::getBitWidth(bits.getType());
+    }
+    if (from >= 0 && from <= int(P))
+      fromBits[from] += hw::getBitWidth(bits.getType());
+    // (A row's register value itself, or a slice of it: wired to its
+    // column's output register.)
+    {
+      Value v = value;
+      while (auto *def = v.getDefiningOp()) {
+        if (isa<comb::ExtractOp, hw::BitcastOp>(def))
+          v = def->getOperand(0);
+        else
+          break;
+      }
+      if (rowPlaceholders.contains(v))
+        rawBits += hw::getBitWidth(bits.getType());
+    }
+    Value reg = seq::CompRegClockEnabledOp::create(
+        b, bits.getType(), bits, hostClock, passEnable(unsigned(from)),
+        b.getStringAttr((hold ? "pp_hold" : "pp_cap") + Twine(from)), Value(),
+        Value(), Value(), hw::InnerSymAttr{});
+    if (reg.getType() != value.getType())
+      reg = b.createOrFold<hw::BitcastOp>(value.getType(), reg);
+    stageOfValue[reg] = -1;
+    return known = reg;
+  };
+  auto delayed = [&](Value value, unsigned k, bool late, bool hold = false) -> Value {
+    if (!value || !statePort(value))
+      return value;
+    int from = stageAt(value);
+    if (from < 0 || from >= int(k))
+      return value;
+    return late ? pipe(value, k) : capture(value, hold);
+  };
+
+  // The rows' registers become placeholders (their values at their rows).
+  for (auto &write : writes)
+    if (ramRegs.contains(write.reg)) {
+      heldValues.push_back(write.data);
+      heldValues.push_back(write.enable ? write.enable : one);
+    }
+  auto *keeper = UnrealizedConversionCastOp::create(b, TypeRange{}, heldValues)
+                     .getOperation();
+  for (auto &write : writes) {
+    if (!ramRegs.contains(write.reg))
+      continue;
+    unsigned k = candOf.lookup(write.reg);
+    Value ph = placeholders.get(write.reg.getType());
+    stageOfValue[ph] = rowOf[k];
+    rowPlaceholders.insert(ph);
+    PPReg pp;
+    pp.value = ph;
+    pp.width = widthOf(k);
+    pp.row = unsigned(rowOf[k]);
+    pp.enabled = bool(write.enable);
+    pp.name = write.reg.getName().str();
+    ppRegs.push_back(pp);
+    write.reg.getResult().replaceAllUsesWith(ph);
+    write.next.setValue(ph);
+    candOf.erase(write.reg);
+    write.reg.erase();
+    write.reg = {};
+  }
+  // (A row's next value may have been another row's register: read back.)
+  {
+    unsigned k = 0;
+    for (auto &write : writes)
+      if (!write.reg) {
+        write.data = keeper->getOperand(k++);
+        write.enable = write.enable ? keeper->getOperand(k) : Value();
+        ++k;
+      }
+  }
+  keeper->erase();
+
+  // Banked reads: each bank's own address, enable and instance registers.
+  struct Bank {
+    seq::FirMemOp memory;
+    unsigned low, width;
+  };
+  DenseMap<Operation *, SmallVector<Bank>> banksOf;
+  for (auto *op : early) {
+    auto memory = cast<seq::FirMemOp>(op);
+    auto type = memory.getType();
+    unsigned width = type.getWidth();
+    unsigned maskWidth = type.getMaskWidth().value_or(1);
+    unsigned laneBits = maskWidth > 1 ? width / maskWidth : 1;
+    uint64_t deep = llvm::divideCeil(uint64_t(type.getDepth()) * entries, 64);
+    unsigned per = unsigned(std::max<uint64_t>(1, ppAddressFanout / deep));
+    per = std::max(laneBits, per / laneBits * laneBits);
+    auto &banks = banksOf[op];
+    b.setLoc(memory.getLoc());
+    for (unsigned low = 0; low < width; low += per) {
+      unsigned w = std::min(per, width - low);
+      std::optional<size_t> mask;
+      if (maskWidth > 1)
+        mask = w / laneBits;
+      auto bankType = seq::FirMemType::get(context, type.getDepth(), w, mask);
+      auto bank = seq::FirMemOp::create(
+          b, bankType, memory.getReadLatency(), memory.getWriteLatency(),
+          memory.getRuw(), memory.getWuw(), memory.getNameAttr(),
+          hw::InnerSymAttr{}, seq::FirMemInitAttr{}, memory.getPrefixAttr(),
+          memory.getOutputFileAttr());
+      bank->setDialectAttrs(memory->getDialectAttrs());
+      banks.push_back({bank, low, w});
+    }
+  }
+
+  // The logic: each op's operands at its stage.
+  unsigned bankedReads = 0, bankCount = 0;
+  for (auto *op : topo) {
+    int stage = stageOfValue.lookup(op->getResult(0));
+    if (stage < 0)
+      continue;
+    unsigned k = unsigned(stage);
+    bool late = lateCone.contains(op);
+    b.setLoc(op->getLoc());
+    if (isEarly(op)) {
+      // Read a stage after its address: a bank a copy of the address,
+      // enable and instance registers.
+      auto read = cast<seq::FirMemReadOp>(op);
+      auto memory = memoryOf(read);
+      SmallVector<Value> datas;
+      for (auto &bank : banksOf[memory]) {
+        // A value at the stage before the read (k - 1), taken into the
+        // bank's own register for stage k: the state evaluation's by its
+        // pass's enable, a ready pass's cone by the positions'.
+        auto keepReg = [&](Value bits, Value enable, const Twine &name) {
+          auto regOp = seq::CompRegClockEnabledOp::create(
+              b, bits.getType(), bits, hostClock, enable, b.getStringAttr(name),
+              Value(), Value(), Value(), hw::InnerSymAttr{});
+          sv::addSVAttributes(regOp, {sv::SVAttributeAttr::get(
+                                         context, "keep", R"("true")",
+                                         /*emitAsComment=*/false)});
+          Value result = regOp;
+          stageOfValue[result] = -1;
+          return result;
+        };
+        auto liveNow = [&]() -> Value {
+          Value now = seq::CompRegClockEnabledOp::create(
+              b, live1.getType(), live1, hostClock, one,
+              b.getStringAttr("pp_blive"), Value(), Value(), Value(),
+              hw::InnerSymAttr{});
+          stageOfValue[now] = -1;
+          return now;
+        };
+        auto reg = [&](Value value, const Twine &name) -> Value {
+          if (!value)
+            return value;
+          int from = stageAt(value);
+          if (from < 0)
+            return value;
+          Value at = late ? pipe(value, k - 1)
+                          : from < int(k) - 1 ? capture(value, false) : value;
+          Value result = keepReg(asBits(b, at),
+                                 late ? liveNow() : passEnable(k - 1), name);
+          if (result.getType() != value.getType()) {
+            result = b.createOrFold<hw::BitcastOp>(value.getType(), result);
+            stageOfValue[result] = -1;
+          }
+          return result;
+        };
+        std::string base = (memory.getName().value_or("mem") + "_b" +
+                            Twine(&bank - banksOf[memory].begin()))
+                               .str();
+        // Registered at stage k - 1 of a stage-0 value: through the captures
+        // (state) or the stage registers (ready) up to k - 1 first.
+        Value addr = reg(read.getAddress(), "pp_" + base + "_addr");
+        Value en = read.getEnable() ? reg(read.getEnable(), "pp_" + base + "_en")
+                                    : Value();
+        auto bankRead = seq::FirMemReadOp::create(b, bank.memory, addr,
+                                                  read.getClk(), en);
+        // The instance: the stage registers' (any evaluation's) at k - 1.
+        if (rinst)
+          readInst[bankRead] =
+              keepReg(pipe(rinst, k - 1), liveNow(), "pp_" + base + "_inst");
+        datas.push_back(bankRead.getData());
+        ++bankCount;
+      }
+      std::reverse(datas.begin(), datas.end());
+      Value data = datas.size() == 1 ? datas[0]
+                                     : b.createOrFold<comb::ConcatOp>(datas);
+      stageOfValue[data] = int(k);
+      read.getData().replaceAllUsesWith(data);
+      stageOfValue.erase(read.getData());
+      read.erase();
+      ++bankedReads;
+      continue;
+    }
+    if (isa<seq::FirMemReadOp>(op) && rinst)
+      readInst[op] = pipe(rinst, k);
+    for (auto &operand : op->getOpOperands())
+      if (Value at = delayed(operand.get(), k, late); at != operand.get())
+        operand.set(at);
+  }
+  // The banked memories' writes: a bank's slice of each.
+  DenseSet<Operation *> bankWrites;
+  for (auto &[op, banks] : banksOf) {
+    auto memory = cast<seq::FirMemOp>(op);
+    unsigned maskWidth = memory.getType().getMaskWidth().value_or(1);
+    unsigned laneBits = maskWidth > 1 ? memory.getType().getWidth() / maskWidth : 1;
+    for (auto *user : llvm::make_early_inc_range(memory->getUsers())) {
+      auto write = dyn_cast<seq::FirMemWriteOp>(user);
+      if (!write)
+        return user->emitError("state-in-ram-pp: a banked memory read twice");
+      b.setLoc(write.getLoc());
+      // At the state pass, as any memory write (then sliced).
+      why = "memory write";
+      Value data = asBits(b, delayed(write.getData(), last, false));
+      Value address = delayed(write.getAddress(), last, false);
+      Value enable = delayed(write.getEnable(), last, false);
+      Value fullMask = delayed(write.getMask(), last, false);
+      for (auto &bank : banks) {
+        Value slice = b.createOrFold<comb::ExtractOp>(b.getIntegerType(bank.width),
+                                                      data, bank.low);
+        Value mask;
+        if (fullMask)
+          mask = b.createOrFold<comb::ExtractOp>(
+              b.getIntegerType(bank.width / laneBits), fullMask,
+              bank.low / laneBits);
+        auto bankWrite = seq::FirMemWriteOp::create(
+            b, bank.memory, address, write.getClk(), enable, slice, mask);
+        bankWrites.insert(bankWrite);
+      }
+      write.erase();
+    }
+    memory.erase();
+  }
+
+  // The writes at the state pass: the stores' registers, through captures.
+  for (auto &write : writes) {
+    if (!write.reg)
+      continue;
+    b.setLoc(write.reg.getLoc());
+    if (write.holds) {
+      write.next.setValue(write.reg.getResult());
+      continue;
+    }
+    why = "stored register";
+    Value data = delayed(write.data, last, false);
+    write.next.setValue(
+        write.enable ? Value(comb::MuxOp::create(b, delayed(write.enable, last, false),
+                                                 data, write.reg.getResult()))
+                     : data);
+  }
+  for (auto &op : *body) {
+    if (bankWrites.contains(&op))
+      continue;
+    bool sink = isa<seq::FirMemWriteOp>(op) || registeredRead(&op) ||
+                (isHeld(&op) && &op != heldResults);
+    // A folded pipeline's issue: its own ops take the target's values at
+    // the state pass.
+    bool issue = physical(&op);
+    if (!sink && !issue && &op != heldResults)
+      continue;
+    if (isa<seq::FirMemWriteOp>(op) && physical(op.getOperand(0).getDefiningOp()))
+      continue;
+    for (auto [o, operand] : llvm::enumerate(op.getOpOperands())) {
+      Value value = operand.get();
+      if (issue && physical(value.getDefiningOp()))
+        continue;
+      bool late = &op == heldResults && lateOut[o];
+      why = &op == heldResults ? "output"
+            : issue            ? "fold issue"
+            : isa<seq::FirMemWriteOp>(op) ? "memory write"
+            : registeredRead(&op) ? "registered read" : "other";
+      if (Value at = delayed(value, last, late); at != value)
+        operand.set(at);
+    }
+  }
+  // The rows' next values, at their rows (holds where complete earlier).
+  // (Rows in ppRegs' order: the writes' order.)
+  SmallVector<Value> rowValues;
+  {
+    unsigned n = 0;
+    for (auto &write : writes) {
+      if (write.reg)
+        continue;
+      auto &pp = ppRegs[n++];
+      why = "row write (hold)";
+      rowValues.push_back(delayed(write.data, pp.row, false, true));
+      rowValues.push_back(write.enable ? delayed(write.enable, pp.row, false, true)
+                                       : one);
+    }
+  }
+  heldOut = rowValues.empty()
+                ? nullptr
+                : UnrealizedConversionCastOp::create(b, TypeRange{}, rowValues)
+                      .getOperation();
+
+  // The counts.
+  {
+    std::string text;
+    llvm::raw_string_ostream os(text);
+    unsigned keptRegs = 0;
+    uint64_t keptBits = 0;
+    for (auto &write : writes)
+      if (write.reg && !write.holds) {
+        ++keptRegs;
+        keptBits += hw::getBitWidth(write.reg.getType());
+      }
+    unsigned maxLevel = 0;
+    for (auto l : level)
+      maxLevel = std::max(maxLevel, l);
+    os << "foldsim-fold-static: state-in-ram-pp: " << cls.name << ": P " << P
+       << ", " << ppRegs.size() << " registers, " << rowRegBits << " bits in "
+       << P << " rows x " << columns << " columns of 72 (" << style << ", "
+       << grain << "-bit lanes); rows";
+    for (unsigned j = 0; j < P; ++j)
+      os << " " << rowBits[j];
+    uint64_t brokenBits = 0;
+    for (unsigned k : broken)
+      brokenBits += widthOf(k);
+    os << "; " << comps << " groups, largest " << largestGroup << " bits (of "
+       << firstLargest << " before " << broken.size() << " narrow registers, "
+       << brokenBits << " bits, left them), " << maxLevel + 1 << " levels; "
+       << deepRegs << " deep registers (" << deepBits << " bits) stored; "
+       << hazards.size() << " hazard registers (with those; "
+       << hazardBits << " bits) and " << keptRegs - hazards.size()
+       << " other stored registers (" << keptBits - hazardBits
+       << " bits) kept; " << captureBits << " capture bits, " << holdBits
+       << " hold bits (" << rawBits << " of them a row's register values), " << pipeBits << " stage register bits (ready cone, "
+       << lateCone.size() << " ops); " << bankedReads << " banked reads, "
+       << bankCount << " bank address copies; captures by need:";
+    for (auto &[w, n] : whyBits)
+      os << " " << w << " " << n << ";";
+    os << " by pass:";
+    for (auto n : fromBits)
+      os << " " << n;
+    os << "\n";
+    cls.ppReport = os.str();
+    llvm::errs() << cls.ppReport;
+  }
+  return success();
+}
+
 LogicalResult StaticFolder::buildCopy(Class &cls) {
   auto model = cls.model;
   auto *context = model.getContext();
@@ -9897,6 +10964,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   auto *modelOutput = modelBody->getTerminator();
   DenseSet<Operation *> readyRegs;
   std::pair<unsigned, uint64_t> rowMemories{0, 0};
+  if (cls.pp)
+    readyRegisters(cls, readyRegs);
   if (cls.page) {
     readyRegisters(cls, readyRegs);
     // (Staged, with on-chip pages only: a staged class's rows with pages off
@@ -9970,6 +11039,17 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       preArg = numIn;
       addPort("pre3", IntegerType::get(context, 1), true);
     }
+  }
+  // CSF PP: the passes of the state evaluations, three host cycles ahead.
+  unsigned ppArg = 0;
+  if (cls.pp) {
+    ppArg = numIn;
+    addPort("ppvalid3", IntegerType::get(context, 1), true);
+    if (threads > 1)
+      addPort("ppinst3", IntegerType::get(context, idxWidth), true);
+    addPort("pprow3",
+            IntegerType::get(context, std::max(1u, llvm::Log2_32_Ceil(cls.pp))),
+            true);
   }
   SmallVector<unsigned> inputArg(cls.inputNames.size(), 0);
   for (auto [i, name] : llvm::enumerate(cls.inputNames)) {
@@ -10117,6 +11197,19 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // side's instance, `rinst3` on, its writes at the state pass's.
   Value readInst3 = inst3;
   DenseMap<Operation *, Value> readInst;
+  // CSF PP: the rows' registers (placeholders until the columns are built),
+  // their next values at their rows (held), the passes' controls, and the
+  // read side's instance at stage 0.
+  BackedgeBuilder ppEdges(b, model.getLoc());
+  SmallVector<PPReg> ppRegs;
+  Operation *ppHeld = nullptr;
+  Value ppValid3, ppInst3, ppRow3, ppRinst0;
+  if (cls.pp) {
+    ppValid3 = body->getArgument(ppArg);
+    if (threads > 1)
+      ppInst3 = body->getArgument(ppArg + 1);
+    ppRow3 = body->getArgument(ppArg + (threads > 1 ? 2 : 1));
+  }
   if (cls.stages) {
     auto chain = [&](Value value, unsigned regs, const Twine &name) {
       for (unsigned k = 0; k < regs; ++k)
@@ -10147,7 +11240,35 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     Operation *heldRows = heldRowValues.empty() ? nullptr : hold(heldRowValues);
     if (heldRows)
       helds.push_back(heldRows);
-    if (failed(stageLogic(cls, body, helds, hostClock, live1, pre1, rinst,
+    if (cls.pp) {
+      // Each pass's enable now (stage j of a state evaluation), from the
+      // passes three host cycles ahead: compared a host cycle ahead and
+      // registered, a copy per 512 registers it enables.
+      Value valid1 = chain(ppValid3, 2, "pp_valid");
+      Value row1 = chain(ppRow3, 2, "pp_row");
+      SmallVector<std::pair<Value, unsigned>> enables(cls.pp, {Value(), 512});
+      unsigned made = 0;
+      auto passEnable = [&](unsigned j) -> Value {
+        auto &[en, uses] = enables[j];
+        if (uses == 512) {
+          Value is = comb::AndOp::create(
+              b, valid1,
+              comb::ICmpOp::create(b, comb::ICmpPredicate::eq, row1,
+                                   hw::ConstantOp::create(b, row1.getType(), j)));
+          en = seq::CompRegClockEnabledOp::create(
+              b, i1, is, hostClock, one(),
+              b.getStringAttr("pp_pass" + Twine(j) + "_en" + Twine(made++)),
+              Value(), Value(), Value(), hw::InnerSymAttr{});
+          uses = 0;
+        }
+        ++uses;
+        return en;
+      };
+      ppRinst0 = rinst;
+      if (failed(stagePP(cls, body, helds, hostClock, live1, rinst, passEnable,
+                         readInst, readyRegs, ppEdges, ppRegs, ppHeld)))
+        return failure();
+    } else if (failed(stageLogic(cls, body, helds, hostClock, live1, pre1, rinst,
                           /*keepOld=*/cls.page && !pageMasks, readInst,
                           readyRegs)))
       return failure();
@@ -10662,9 +11783,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     // The read: `lead` host cycles ahead, at the instance and slot due then;
     // the slot as the instance's last issue left it (read combinationally at
     // a state gap of 1: forwarded from that issue's step, not yet stored).
+    // (CSF PP: a store read at the evaluation's read, stage 0: its
+    // instance there.)
     Value inst = lead == 2   ? region.inst2
                  : lead == 1 ? region.inst1
                  : staged    ? staged
+                 : ppRinst0  ? ppRinst0
                              : region.inst;
     Value slot = slotOf(inst, gap <= int(lead) + 1);
     Value addr = b.createOrFold<comb::ConcatOp>(slot, inst);
@@ -11318,6 +12442,196 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                    << "-bit lanes, " << runs.size() << " runs), " << columns
                    << " columns of " << colBits << " bits, " << kind << "\n";
     }
+  }
+
+  // CSF PP: the rows' columns, 72-bit ports of one RAM primitive each, a row
+  // per {instance, pass}. Row j's register values come out of each column's
+  // output register at pass j (the RAM's own output register: read at the
+  // pass's instance and row two host cycles ahead); its next values go in at
+  // pass j, a P:1 select of the rows' words by the pass, each lane of a row
+  // enabled by its registers' enable. A group of 16 columns has its own
+  // address, enable and instance registers; a column its own select.
+  if (!ppRegs.empty()) {
+    SmallVector<Value> rowValues;
+    release(ppHeld, rowValues);
+    unsigned P = cls.pp;
+    unsigned rowWidth = std::max(1u, llvm::Log2_32_Ceil(P));
+    unsigned rowsPow = 1u << rowWidth;
+    StringRef kind = cls.sirStyle.empty() ? StringRef("block") : StringRef(cls.sirStyle);
+    bool masked = llvm::any_of(ppRegs, [](auto &r) { return r.enabled; });
+    unsigned grain = masked ? (kind == "ultra" ? 8 : 9) : 1;
+    auto bits = [&](unsigned width) { return b.getIntegerType(width); };
+    auto enableOf = [&](unsigned k) {
+      return ppRegs[k].enabled ? rowValues[2 * k + 1] : Value();
+    };
+    SmallVector<uint64_t> bitAt(ppRegs.size(), 0);
+    // Each row's lanes' enables: null always written, `zero` a pad.
+    Value zero1 = hw::ConstantOp::create(b, i1, 0);
+    SmallVector<SmallVector<Value>> laneEnable(P);
+    uint64_t maxBits = 0;
+    for (unsigned j = 0; j < P; ++j) {
+      llvm::MapVector<Value, SmallVector<unsigned>> groups;
+      for (unsigned k = 0; k < ppRegs.size(); ++k)
+        if (ppRegs[k].row == j)
+          groups[enableOf(k)].push_back(k);
+      SmallVector<std::pair<Value, SmallVector<unsigned>>> runs;
+      if (auto it = groups.find(Value()); it != groups.end())
+        runs.push_back(*it);
+      for (auto &[enable, members] : groups)
+        if (enable)
+          runs.push_back({enable, members});
+      uint64_t at = 0;
+      for (auto &[enable, members] : runs) {
+        at = llvm::divideCeil(at, grain) * grain;
+        while (laneEnable[j].size() * grain < at)
+          laneEnable[j].push_back(zero1);
+        for (unsigned k : members) {
+          bitAt[k] = at;
+          at += ppRegs[k].width;
+        }
+        at = llvm::divideCeil(at, grain) * grain;
+        while (laneEnable[j].size() * grain < at)
+          laneEnable[j].push_back(enable);
+      }
+      maxBits = std::max(maxBits, at);
+    }
+    unsigned columns = unsigned(llvm::divideCeil(maxBits, 72));
+    unsigned lanes = 72 / grain;
+    for (auto &row : laneEnable)
+      while (row.size() < uint64_t(columns) * lanes)
+        row.push_back(zero1);
+    // Each column's parts: per row, its registers' next-value bits there.
+    struct Column {
+      seq::FirMemOp memory;
+      Value out;
+      SmallVector<SmallVector<std::pair<unsigned, Value>>> parts;
+    };
+    std::vector<Column> cols(columns);
+    for (auto &col : cols)
+      col.parts.resize(P);
+    SmallVector<Value> values;
+    // Controls of a group of 16 columns.
+    struct Group {
+      Value readAddr, wValid, wAddr, wRow1;
+    };
+    SmallVector<Group> groups;
+    auto keepReg = [&](Value v, const Twine &name) -> Value {
+      return keep(seq::FirRegOp::create(b, v, hostClock, b.getStringAttr(name)));
+    };
+    for (unsigned c = 0; c < columns; ++c) {
+      if (c % 16 == 0) {
+        Group g;
+        std::string prefix = ("pp_g" + Twine(c / 16)).str();
+        Value row2 = keepReg(ppRow3, prefix + "_rrow2");
+        g.readAddr = row2;
+        if (threads > 1)
+          g.readAddr = b.createOrFold<comb::ConcatOp>(
+              keepReg(ppInst3, prefix + "_rinst2"), row2);
+        Value valid2 = keepReg(ppValid3, prefix + "_wvalid2");
+        Value valid1 = keepReg(valid2, prefix + "_wvalid1");
+        g.wValid = keepReg(valid1, prefix + "_wvalid0");
+        Value wrow2 = keepReg(ppRow3, prefix + "_wrow2");
+        g.wRow1 = keepReg(wrow2, prefix + "_wrow1");
+        g.wAddr = keepReg(g.wRow1, prefix + "_wrow0");
+        if (threads > 1) {
+          Value inst2 = keepReg(ppInst3, prefix + "_winst2");
+          Value inst1 = keepReg(inst2, prefix + "_winst1");
+          g.wAddr = b.createOrFold<comb::ConcatOp>(
+              keepReg(inst1, prefix + "_winst0"), g.wAddr);
+        }
+        groups.push_back(g);
+      }
+      auto &col = cols[c];
+      auto memType = seq::FirMemType::get(
+          context, uint64_t(entries) * rowsPow, 72,
+          masked ? std::optional<size_t>(lanes) : std::optional<size_t>(1));
+      col.memory = seq::FirMemOp::create(
+          b, memType, /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old,
+          seq::WUW::Undefined, b.getStringAttr("pp_col" + Twine(c)),
+          hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+      setRamStyle(col.memory, kind);
+      Value data = seq::FirMemReadOp::create(b, col.memory, groups.back().readAddr,
+                                             hostClock, one());
+      col.out = seq::FirRegOp::create(b, data, hostClock,
+                                      b.getStringAttr("pp_col" + Twine(c) + "_out"));
+    }
+    for (auto [k, reg] : llvm::enumerate(ppRegs)) {
+      SmallVector<Value> parts;
+      Value next = asBits(b, rowValues[2 * k]);
+      for (unsigned lo = 0; lo < reg.width;) {
+        uint64_t g = bitAt[k] + lo;
+        unsigned c = unsigned(g / 72), offset = unsigned(g % 72);
+        unsigned n = std::min(reg.width - lo, 72 - offset);
+        parts.push_back(b.createOrFold<comb::ExtractOp>(bits(n), cols[c].out, offset));
+        cols[c].parts[reg.row].push_back(
+            {offset, b.createOrFold<comb::ExtractOp>(bits(n), next, lo)});
+        lo += n;
+      }
+      Value value = parts.size() == 1
+                        ? parts[0]
+                        : b.createOrFold<comb::ConcatOp>(
+                              SmallVector<Value>(parts.rbegin(), parts.rend()));
+      values.push_back(b.createOrFold<hw::BitcastOp>(reg.value.getType(), value));
+    }
+    Value zero72 = hw::ConstantOp::create(b, bits(72), 0);
+    for (auto [c, col] : llvm::enumerate(cols)) {
+      auto &g = groups[c / 16];
+      SmallVector<Value> words, masks;
+      for (unsigned j = 0; j < rowsPow; ++j) {
+        if (j >= P || col.parts[j].empty()) {
+          words.push_back(zero72);
+          if (masked)
+            masks.push_back(hw::ConstantOp::create(b, bits(lanes), 0));
+          continue;
+        }
+        auto &parts = col.parts[j];
+        llvm::sort(parts, [](auto &x, auto &y) { return x.first < y.first; });
+        SmallVector<Value> low;
+        unsigned have = 0;
+        for (auto &[off, value] : parts) {
+          if (off > have)
+            low.push_back(hw::ConstantOp::create(b, bits(off - have), 0));
+          low.push_back(value);
+          have = off + hw::getBitWidth(value.getType());
+        }
+        if (have < 72)
+          low.push_back(hw::ConstantOp::create(b, bits(72 - have), 0));
+        words.push_back(low.size() == 1 ? low[0]
+                                        : b.createOrFold<comb::ConcatOp>(
+                                              SmallVector<Value>(low.rbegin(), low.rend())));
+        if (masked) {
+          SmallVector<Value> high;
+          for (unsigned l = lanes; l-- > 0;) {
+            Value en = laneEnable[j][c * lanes + l];
+            high.push_back(en ? en : one());
+          }
+          masks.push_back(b.createOrFold<comb::ConcatOp>(high));
+        }
+      }
+      // The select a column's own, a host cycle ahead of the pass.
+      Value sel = keepReg(g.wRow1, "pp_col" + Twine(c) + "_sel");
+      auto pick = [&](ArrayRef<Value> items) -> Value {
+        if (items.size() == 1)
+          return items[0];
+        SmallVector<Value> high(items.rbegin(), items.rend());
+        return hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, high), sel);
+      };
+      Value data = pick(words);
+      Value mask = masked ? pick(masks) : Value();
+      Value enable = g.wValid;
+      if (masked && lanes == 1) {
+        enable = comb::AndOp::create(b, enable, mask);
+        mask = Value();
+      }
+      seq::FirMemWriteOp::create(b, col.memory, g.wAddr, hostClock, enable, data,
+                                 mask);
+    }
+    for (auto [reg, value] : llvm::zip(ppRegs, values))
+      reg.value.replaceAllUsesWith(value);
+    llvm::errs() << "foldsim-fold-static: state-in-ram-pp: " << cls.name
+                 << ": built " << ppRegs.size() << " registers in " << columns
+                 << " columns x " << uint64_t(entries) * rowsPow << " rows ("
+                 << kind << "), " << groups.size() << " control groups\n";
   }
 
   // The paged registers, one vector of W bits a row of `pages` pages of
@@ -11988,8 +13302,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                               b.getStringAttr("fold_state1")));
     Value state = keep(seq::FirRegOp::create(b, state1, hostClock,
                                              b.getStringAttr("fold_state")));
-    Value inst1 = keep(seq::FirRegOp::create(b, ahead.inst2, hostClock,
-                                             b.getStringAttr("fold_inst1")));
+    // (Staged: the state pass's instance, not the read's.)
+    Value inst1 = keep(seq::FirRegOp::create(
+        b, cls.stages && ahead.winst2 ? ahead.winst2 : ahead.inst2, hostClock,
+        b.getStringAttr("fold_inst1")));
     Value inst = keep(seq::FirRegOp::create(b, inst1, hostClock,
                                             b.getStringAttr("fold_inst")));
     for (auto &fold : folding->folds)
@@ -12627,12 +13943,15 @@ LogicalResult StaticFolder::buildSim() {
     /// one, not idle; multicycle, whether it is a read, and (`pre3`) whether
     /// it is the one before a state pass.
     Value live3, pre3;
+    /// CSF PP (state-in-ram-pp): whether the position three host cycles
+    /// ahead is a pass of a state evaluation, its instance and its row.
+    Value ppValid3, ppInst3, ppRow3;
   };
-  SmallVector<Controls> controls(classes.size());
+  SmallVector<Controls, 0> controls(classes.size());
   // Staged classes: what each reads at a position, its stages before each
   // state pass (its links' reads, the copy's reads of its state); the
   // writes are `controls`'.
-  SmallVector<Controls> readControls(classes.size());
+  SmallVector<Controls, 0> readControls(classes.size());
   auto readCtl = [&](unsigned c) -> Controls & {
     return classes[c].stages ? readControls[c] : controls[c];
   };
@@ -12824,6 +14143,33 @@ LogicalResult StaticFolder::buildSim() {
         rctl.tail3 = table(b, at, rtailRow, 1);
         rctl.tail2 = reg(rctl.tail3, prefix + "_rtail2");
       }
+    }
+    // CSF PP: each state evaluation's passes, row j at its read position + j
+    // (the stages before the state pass); a pass past the frame (the frame
+    // before's) runs once a frame has finished, as a state pass does.
+    if (cls.pp) {
+      unsigned rowWidth = std::max(1u, llvm::Log2_32_Ceil(cls.pp));
+      SmallVector<uint64_t> validRow(ii + 1, 0), pinstRow(ii + 1, 0),
+          prowRow(ii + 1, 0), ptailRow(ii + 1, 0);
+      for (unsigned i = 0; i < threads; ++i)
+        for (unsigned j = 0; j < cls.pp; ++j) {
+          int r = cls.slot[kState][i] - int(cls.stages) + int(j);
+          assert(r >= 0 && "a PP pass before the frame");
+          unsigned pos = unsigned(r) % ii;
+          assert(!validRow[pos] && "two PP passes at a position");
+          validRow[pos] = 1;
+          pinstRow[pos] = i;
+          prowRow[pos] = j;
+          ptailRow[pos] = r >= int(ii);
+        }
+      ctl.ppValid3 = table(b, at, validRow, 1);
+      if (overlapped)
+        ctl.ppValid3 = comb::AndOp::create(
+            b, ctl.ppValid3,
+            comb::OrOp::create(b, notOf(table(b, at, ptailRow, 1)), primed));
+      if (threads > 1)
+        ctl.ppInst3 = table(b, at, pinstRow, idxWidth);
+      ctl.ppRow3 = table(b, at, prowRow, rowWidth);
     }
   }
 
@@ -13055,6 +14401,12 @@ LogicalResult StaticFolder::buildSim() {
       operands.push_back(readControls[c].live3);
       if (cls.multicycle)
         operands.push_back(readControls[c].pre3);
+    }
+    if (cls.pp) {
+      operands.push_back(controls[c].ppValid3);
+      if (cls.threads() > 1)
+        operands.push_back(controls[c].ppInst3);
+      operands.push_back(controls[c].ppRow3);
     }
     for (auto [i, type] : llvm::enumerate(cls.inputTypes)) {
       if (int(i) == cls.clockInput)
@@ -15664,6 +17016,8 @@ void FoldStaticPass::runOnOperation() {
   folder.csfMailboxes = csfMailboxes;
   folder.csfMailboxLatency = csfMailboxLatency;
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
+  folder.stateInRamPP = stateInRamPP;
+  folder.ppAddressFanout = std::max(1u, unsigned(stateInRamPPFanout));
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
   folder.linkHbmShift = linkHbmShift;

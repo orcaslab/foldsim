@@ -469,6 +469,10 @@ def frame_options(a):
             fold += f' state-in-ram-h={a.state_in_ram_h}'
         if getattr(a, 'state_in_ram_zero_links', False):
             fold += ' state-in-ram-zero-links'
+        if getattr(a, 'state_in_ram_pp', False):
+            fold += ' state-in-ram-pp'
+        if getattr(a, 'state_in_ram_pp_fanout', 0):
+            fold += f' state-in-ram-pp-fanout={a.state_in_ram_pp_fanout}'
     return fold
 
 
@@ -1459,6 +1463,13 @@ def build_parser():
                     help='with --state-in-ram and --zero-latency-links: links into a P > 1 class may be taken '
                          'in their producer\'s host cycle (default: from read registers, so that no producer '
                          'logic chains into its last-pass evaluation; foldsim-fold-static state-in-ram-zero-links)')
+    ap.add_argument('--state-in-ram-pp', action='store_true',
+                    help='with --state-in-ram: classes of P > 1 in the CSF pass-partitioned form: rows read '
+                         'in place at their pass and written from the logic, staged with P stages, no capture '
+                         'or write-back buffer (foldsim-fold-static state-in-ram-pp)')
+    ap.add_argument('--state-in-ram-pp-fanout', type=int, default=0, metavar='N',
+                    help='with --state-in-ram-pp: the most RAM primitives a combinationally read memory\'s '
+                         'registered address copy drives (foldsim-fold-static state-in-ram-pp-fanout; 0: 96)')
     ap.add_argument('--state-in-ram-h', type=int, default=0, metavar='N',
                     help='with --state-in-ram and P auto: the most host cycles a copy\'s passes take '
                          '(instances x P; foldsim-fold-static state-in-ram-h; 0: no bound)')
