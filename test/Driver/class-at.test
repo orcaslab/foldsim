@@ -66,3 +66,19 @@
 # INNER-IR-LABEL: hw.module @Top(
 # INNER-IR-DAG: hw.instance "tall" @{{Arb[^ ]*}}(
 # INNER-IR-DAG: hw.instance "flat" @root(
+
+# `nest:GLOB` takes its match as a class and searches below it too: `p` is the
+# class `pr`, and holds the class `leaf` its `l1` is (as `q`'s `Pair` does).
+# RUN: rm -rf %t && cd %S/Inputs/class-at && foldsim --srcs top.f --top Top --out %t --static --class-at 'pr@nest:p' --class-at 'leaf@*.l1' 2>&1 | FileCheck %s --check-prefix=NEST
+# RUN: FileCheck %s --check-prefix=NEST-IR < %t/design.mlir
+# NEST: class-at leaf: leaf (Leaf) x2
+# NEST: class-at pr: pr (Pair) x1
+# NEST: foldsim: pr_model x1, leaf x2, Top_model x1
+# NEST-IR-LABEL: hw.module private @Pair(
+# NEST-IR: hw.instance "l1" @leaf(
+# NEST-IR-LABEL: hw.module @Top(
+# NEST-IR: hw.instance "p" @pr(
+# NEST-IR: hw.instance "q" @Pair(
+# NEST-IR-LABEL: hw.module private @pr(
+# NEST-IR: hw.instance "l0" @Leaf(
+# NEST-IR: hw.instance "l1" @leaf(

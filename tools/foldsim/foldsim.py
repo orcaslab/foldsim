@@ -94,6 +94,9 @@ INSTANCE = re.compile(r'hw\.instance "([^"]+)"( sym @\S+)? @([\w$.]+)\(')
 # `--class-at TAG@inner:GLOB`: innermost matches only (a word every shell
 # passes through, unlike a sign).
 INNER = 'inner:'
+# `--class-at TAG@nest:GLOB`: the class's own instances are searched too, so a
+# class may hold classes (an arbiter whose per-output buffers are a class).
+NEST = 'nest:'
 
 
 def class_at(text, top, specs):
@@ -107,8 +110,10 @@ def class_at(text, top, specs):
     innermost match: an instance with a match of any GLOB below it is not
     taken, the walk goes on below it (a tree of arbiters whose size depends on
     the configuration: its slices one class and its root another, or the
-    whole tree where it is one arbiter). Several GLOBs may share a TAG.
-    Returns the design and the new modules' names."""
+    whole tree where it is one arbiter). A GLOB written `nest:GLOB` takes its
+    match as a class and goes on searching below it, so that the class holds
+    the classes the other GLOBs make of its own instances. Several GLOBs may
+    share a TAG. Returns the design and the new modules' names."""
     lines = text.split('\n')
     span, order = {}, []
     for i, line in enumerate(lines):
@@ -143,8 +148,15 @@ def class_at(text, top, specs):
     leaves = []             # (tag, leaf module), every matched instance
     sys.setrecursionlimit(max(10000, sys.getrecursionlimit()))
 
+    nested = [g.startswith(NEST) for _, g in specs]
+    specs = [(t, g[len(NEST):] if n else g) for (t, g), n in zip(specs, nested)]
     innermost = [g.startswith(INNER) for _, g in specs]
     globs = [(t, g[len(INNER):] if inner else g) for (t, g), inner in zip(specs, innermost)]
+
+    def mod_of(leaf):
+        """A leaf is its module, or (module, variant) for a `nest:` class
+        whose own instances changed."""
+        return leaf[0] if isinstance(leaf, tuple) else leaf
 
     def match(p):
         return next((k for k, (_, g) in enumerate(globs) if fnmatch.fnmatchcase(p, g)), None)
@@ -166,8 +178,13 @@ def class_at(text, top, specs):
                 k = None
             tag = globs[k][0] if k is not None else None
             if tag:
-                leaves.append((tag, callee))
-                changes.append((rel, ('class', tag, callee)))
+                leaf = callee
+                if nested[k] and callee in body:
+                    v = walk(callee, p)
+                    if v is not None:
+                        leaf = (callee, v)
+                leaves.append((tag, leaf))
+                changes.append((rel, ('class', tag, leaf)))
             elif callee in body:
                 v = walk(callee, p)
                 if v is None:
@@ -231,7 +248,7 @@ def class_at(text, top, specs):
         if new != mod:
             copy(mod, new)
     for (tag, leaf), new in name.items():
-        copy(leaf, new)
+        copy(mod_of(leaf), new)
 
     def retarget(mod, rel, new):
         i = span[mod][0] + rel
@@ -241,9 +258,14 @@ def class_at(text, top, specs):
     for (mod, v), new in vname.items():
         for rel, (kind, a1, a2) in variants[mod][v]:
             retarget(new, rel, name[(a1, a2)] if kind == 'class' else vname[(a1, a2)])
+    # A `nest:` class's copy takes its own instances' changes.
+    for (tag, leaf), new in name.items():
+        if isinstance(leaf, tuple):
+            for rel, (kind, a1, a2) in variants[leaf[0]][leaf[1]]:
+                retarget(new, rel, name[(a1, a2)] if kind == 'class' else vname[(a1, a2)])
     for (tag, leaf), new in name.items():
         n = sum(1 for t, l in leaves if (t, l) == (tag, leaf))
-        print(f'class-at {tag}: {new} ({leaf}) x{n}', file=sys.stderr)
+        print(f'class-at {tag}: {new} ({mod_of(leaf)}) x{n}', file=sys.stderr)
     return '\n'.join(lines), list(name.values())
 
 
@@ -1211,7 +1233,8 @@ def build_parser():
                     help='the instances whose path (instance names joined by ".") matches GLOB '
                          'are a class: one module per parameter set, TAG or TAG_<k>; repeatable, '
                          'the first match takes an instance; `inner:GLOB` only an instance with no '
-                         'match below it. A class `A+B` may name them')
+                         'match below it; `nest:GLOB` a class whose own instances are searched too '
+                         '(a class holding classes). A class `A+B` may name them')
     ap.add_argument('--absorb-exclusive', default='', metavar='CLASS,...',
                     help="for these classes (globs), a model input whose logic in the parent is "
                          "over the absorb limit takes the part of it that reaches that input "
