@@ -1,0 +1,45 @@
+# REQUIRES: verilator
+# The state scratch as built (cs_1109 A.9: subtract the fold's other memories as built, at a fill target). With
+# --state-scratch-bits auto the planner takes the region's ultra and block RAM at --state-scratch-fill (0.85)
+# less an estimate of the other memories; after the fold the driver prices the netlist's RAM by kind as the fit
+# check does (foldsim_scratch_built.py: the scratch's memories, pp_col/pp_res/region*_sir/fold*_store/pages,
+# and every other one, here a state-in-ram-pp class's packed stores, region*_pp_sir) against the planner's
+# state_scratch.json. Past a kind's fill (or with rows streaming while the planner over-counted a kind by more
+# than 5 % of its device) the fold runs once more with the others as built plus what the planner's own pricing
+# missed (state-scratch-built-others). Here a device of 4 RAMB36 (--state-scratch-device), an estimate that
+# takes them all (--state-scratch-reserve): the rows stream, the netlist is past the fill, the refold takes the
+# others as built; the refolded netlist (a streamed class, its window and the controllers' models,
+# Inputs/tb_pages.sv) is exact. By default (the region at 0.85) the estimate's block reserve (45 Mbit) misses
+# the built block RAM by more than 5 %: the refold's planner takes the others as built and its own shortfall
+# (a third column as packed), and planned and built agree. --state-scratch-no-rebuild keeps the first fold.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/pp_pack
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/ab --static --state-in-ram Leaf::4 --state-in-ram-pp --state-scratch-device 1,147456 --state-scratch-reserve 147456,0 Leaf > %t/ab.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/ab.log
+# RUN: FileCheck %s --check-prefix=TXT < %t/ab/state_scratch.txt
+# RUN: python3 %foldsim_tools/foldsim_scratch_built.py %t/ab | FileCheck %s --check-prefix=TOOL
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/ab -Mdir %t/ab/obj %S/Inputs/tb_pages.sv top.sv %t/ab/foldsim_sim.sv > %t/ab/build.log 2>&1
+# RUN: %t/ab/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=40 +stall=20 | FileCheck %s
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/nr --static --state-in-ram Leaf::4 --state-in-ram-pp --state-scratch-device 1,147456 --state-scratch-reserve 147456,0 --state-scratch-no-rebuild Leaf > %t/nr.log 2>&1
+# RUN: FileCheck %s --check-prefix=NR < %t/nr.log
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/df --static --state-in-ram Leaf::4 --state-in-ram-pp Leaf > %t/df.log 2>&1
+# RUN: FileCheck %s --check-prefix=DF < %t/df.log
+
+# LOG: state-scratch: auto 1 bits (ultra 1, block 0): the device's ultra 1 and block 147456 less the models' memories on chip 0 (0 ultra) and the reserve 147456 block, 0 ultra
+# LOG: state-scratch: Leaf: 4 of 4 instances' PP rows (2304 bits) stream from HBM, 0 resident
+# LOG: state-scratch: planned ultra 0 of 1, block 147456 of 147456
+# LOG: foldsim: state scratch: past the fill in bram: refolding with the others as built (0,184320 bits)
+# LOG: state-scratch: auto 1 bits (ultra 1, block 0): the device's ultra 1 and block 147456 less the other memories as built, ultra 0 and block 184320
+# TXT: first fold:
+# TXT: bram {{ *}}147,456 {{ *}}110,592 (3) {{ *}}73,728 (2) {{ *}}184,320 {{ *}}1.250 {{ *}}1.250
+# TXT: as built (refolded):
+# TXT: bram {{ *}}147,456 {{ *}}110,592 (3) {{ *}}73,728 (2) {{ *}}184,320
+# TOOL: scratch pp_col#: 3 memories, 0 URAM288, 3 RAMB36
+# TOOL: other region#_pp_sir: 1 memories, 0 URAM288, 2 RAMB36
+# NR: state-scratch: planned ultra
+# NR-NOT: refolding
+# DF: state-scratch: planned ultra {{[0-9]+}} of 303567667, block {{[0-9]+}} of 75672576
+# DF: foldsim: state scratch: the planner missed the built bram by more than 5 % of the device: refolding with the others as built (0,110592 bits)
+# DF: state-scratch: planned ultra 0 of 303567667, block 184320 of 75672576
+# DF: foldsim:   bram {{ *}}184,320 {{.*}} 184,320 {{ *}}1.000
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL

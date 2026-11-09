@@ -47,6 +47,8 @@ install(PROGRAMS foldsim_sll_check.py DESTINATION bin)
 # against its region (floor, median, upper bound; per copy against the SLRs; the image's post-synthesis gate).
 configure_file(foldsim_fitdb.py ${CMAKE_BINARY_DIR}/bin/foldsim_fitdb.py COPYONLY)
 install(PROGRAMS foldsim_fitdb.py DESTINATION bin)
+configure_file(foldsim_scratch_built.py ${CMAKE_BINARY_DIR}/bin/foldsim_scratch_built.py COPYONLY)
+install(PROGRAMS foldsim_scratch_built.py DESTINATION bin)
 configure_file(foldsim_fit_bound.py ${CMAKE_BINARY_DIR}/bin/foldsim_fit_bound.py COPYONLY)
 install(PROGRAMS foldsim_fit_bound.py DESTINATION bin)
 configure_file(foldsim_sv_limits.py ${CMAKE_BINARY_DIR}/bin/foldsim_sv_limits.py COPYONLY)

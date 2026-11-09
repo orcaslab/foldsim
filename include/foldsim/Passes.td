@@ -945,6 +945,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "scratch for what the fold places after it (link memories, read "
            "buffers and rings, the landing windows, the folded pipelines' "
            "smaller stores; 44 Mbit in e1's A100-sized 128-SM fold)">,
+    Option<"stateScratchBuiltOthers", "state-scratch-built-others", "std::string",
+           "\"\"",
+           "With state-scratch-device-bits: the other memories (not the "
+           "scratch's) a first fold built, \"<ultra bits>,<block bits>\" as "
+           "the fit check prices them; the scratch is the device less them, "
+           "with no estimate and no reserve (the driver's as-built rerun)">,
+    Option<"stateScratchReport", "state-scratch-report", "std::string", "\"\"",
+           "With state-scratch-device-bits: a JSON file of the bits the "
+           "planner placed and counted, per kind, and the device's">,
     Option<"stateScratchReserveUltra", "state-scratch-reserve-ultra", "uint64_t",
            "10000000",
            "With state-scratch-device-bits: ultra RAM bits kept from the "

@@ -482,6 +482,9 @@ public:
   /// ultra RAM's are stateScratchDeviceBits), and auto's room left in each
   /// kind for the rows (ultra, block).
   uint64_t stateScratchDeviceBlockBits = 0, stateScratchReserveUltra = 10000000;
+  /// `state-scratch-built-others` ("<ultra>,<block>" bits) and
+  /// `state-scratch-report` (a JSON of the planned bits).
+  std::string stateScratchBuiltOthers, stateScratchReport;
   uint64_t scratchLeft[2] = {0, 0};
   /// auto: the scratch from the device, before the fold stores take theirs
   /// (computed once, before the folded pipelines are planned).
@@ -11744,6 +11747,25 @@ static bool autoVirtualForm(seq::FirMemOp memory) {
 void StaticFolder::autoScratch() {
   if (!stateScratchDeviceBits)
     return;
+  // As built (`state-scratch-built-others`): the other memories a first
+  // fold built, by kind, measured on its netlist; the scratch is the device
+  // less them, no estimate and no reserve.
+  if (!stateScratchBuiltOthers.empty()) {
+    auto [u, k] = StringRef(stateScratchBuiltOthers).split(',');
+    uint64_t others[2] = {0, 0};
+    u.getAsInteger(10, others[0]);
+    k.getAsInteger(10, others[1]);
+    auto less = [](uint64_t a, uint64_t b) { return a > b ? a - b : 0; };
+    scratchLeft[0] = less(stateScratchDeviceBits, others[0]);
+    scratchLeft[1] = less(stateScratchDeviceBlockBits, others[1]);
+    stateScratchBits = scratchLeft[0] + scratchLeft[1];
+    llvm::errs() << "foldsim-fold-static: state-scratch: auto " << stateScratchBits
+                 << " bits (ultra " << scratchLeft[0] << ", block " << scratchLeft[1]
+                 << "): the device's ultra " << stateScratchDeviceBits << " and block "
+                 << stateScratchDeviceBlockBits << " less the other memories as built, ultra "
+                 << others[0] << " and block " << others[1] << "\n";
+    return;
+  }
   // The models' memories the fold keeps on chip outside the scratch: a
   // threaded image (instances x rows x width) past 18 kbit (block or ultra
   // RAM), unless a virtual memory (virtual-memories' pattern, or by size:
@@ -11797,6 +11819,9 @@ LogicalResult StaticFolder::planScratch() {
   bool perKind = stateScratchDeviceBits != 0;
   uint64_t left[2] = {perKind ? scratchLeft[0] : stateScratchBits,
                       perKind ? scratchLeft[1] : 0};
+  // (What the scratch had, per kind, before it placed anything: the
+  // placed bits are this less what it leaves.)
+  uint64_t initialLeft[2] = {left[0], left[1]};
   // The folded pipelines' stores the scratch kept, first: in the kind with
   // the more room (without kinds, the one budget).
   {
@@ -11857,13 +11882,20 @@ LogicalResult StaticFolder::planScratch() {
       item.bits = entries * cls.rowStateBits;
       item.forced = true;
     } else if (cls.page && !cls.pagesOffChip && !cls.sirMixed) {
-      item.bits = entries * regBits(cls);
+      uint64_t perInstance = regBits(cls);
+      item.bits = entries * perInstance;
       for (auto &rule : storageRules)
         if (rule.model == model && !rule.regs && rule.store == "pages" &&
             rule.kind != "hbm") {
           item.forced = true;
           item.ultra = rule.kind == "ultra";
         }
+      // Per kind, as the page RAMs' primitives: a row an instance and
+      // page, the page word's 72-bit columns.
+      if (perKind && item.forced)
+        item.bits = ramCost(entries * cls.page,
+                            llvm::divideCeil(llvm::divideCeil(perInstance, cls.page), 72),
+                            item.ultra);
     } else {
       continue;
     }
@@ -12028,6 +12060,28 @@ LogicalResult StaticFolder::planScratch() {
   if (perKind)
     llvm::errs() << "; left ultra " << left[0] << ", block " << left[1];
   llvm::errs() << "\n";
+  if (perKind) {
+    // What the planner placed and counted, per kind: the device less what
+    // it left (the others it subtracted, the fold stores, the rows).
+    uint64_t planned[2] = {stateScratchDeviceBits - std::min(stateScratchDeviceBits, left[0]),
+                           stateScratchDeviceBlockBits -
+                               std::min(stateScratchDeviceBlockBits, left[1])};
+    llvm::errs() << "foldsim-fold-static: state-scratch: planned ultra " << planned[0]
+                 << " of " << stateScratchDeviceBits << ", block " << planned[1] << " of "
+                 << stateScratchDeviceBlockBits << "\n";
+    if (!stateScratchReport.empty()) {
+      std::error_code ec;
+      llvm::raw_fd_ostream os(stateScratchReport, ec);
+      if (!ec)
+        os << "{\"uram\": {\"planned\": " << planned[0] << ", \"device\": "
+           << stateScratchDeviceBits << "}, \"bram\": {\"planned\": " << planned[1]
+           << ", \"device\": " << stateScratchDeviceBlockBits << "}, \"as_built\": "
+           << (stateScratchBuiltOthers.empty() ? "false" : "true")
+           << ", \"streamed\": " << streamed << ", \"placed\": {\"uram\": "
+           << initialLeft[0] - std::min(initialLeft[0], left[0]) << ", \"bram\": "
+           << initialLeft[1] - std::min(initialLeft[1], left[1]) << "}}\n";
+    }
+  }
   if (forced > stateScratchBits)
     llvm::errs() << "foldsim-fold-static: state-scratch: warning: the rows "
                  << "kept on chip (" << forced << " bits) exceed the scratch\n";
@@ -14258,7 +14312,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                  : std::optional<size_t>(1));
       col.memory = seq::FirMemOp::create(
           b, memType, /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old,
-          seq::WUW::Undefined, b.getStringAttr(region.prefix + "_sir"),
+          seq::WUW::Undefined,
+          // (A PP class's packed stores: `_pp_sir`, a memory the scratch's
+          // planner does not place, as built.)
+          b.getStringAttr(region.prefix + (cls.pp ? "_pp_sir" : "_sir")),
           hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
       setRamStyle(col.memory, kind);
       Value data = seq::FirMemReadOp::create(b, col.memory, region.inst2,
@@ -20096,6 +20153,8 @@ void FoldStaticPass::runOnOperation() {
   folder.stateScratchDeviceBits = stateScratchDeviceBits;
   folder.stateScratchDeviceBlockBits = stateScratchDeviceBlockBits;
   folder.stateScratchReserveUltra = stateScratchReserveUltra;
+  folder.stateScratchBuiltOthers = stateScratchBuiltOthers;
+  folder.stateScratchReport = stateScratchReport;
   folder.stateScratchReserve = stateScratchReserve;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
