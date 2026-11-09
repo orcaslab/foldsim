@@ -899,6 +899,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "all of whose reads of a frame come before its producer writes "
            "the entry in that frame keeps one bank, not two; the others "
            "keep two (the schedule decides, link by link)">,
+    Option<"csfMailboxHbm", "csf-mailbox-hbm", "bool", "false",
+           "Constant-shell fold: early links whose producer instances are "
+           "each read by one reader instance (chain self-links aside) kept "
+           "in HBM as reader-indexed mailboxes: HBM link streams (link-kinds "
+           "hbm's machinery) whose rows are reader rows, written byte-masked "
+           "at the producer's pass at the row of the reader its instance "
+           "feeds, a row of at most link-hbm-row-bits a stream; each reader "
+           "pass's row lands in the stream's fixed landing slots. A link "
+           "whose room the schedule does not leave stays on chip">,
     Option<"csfMailboxBuilder", "csf-mailbox-builder", "bool", "false",
            "Constant-shell fold: the links from a producer class to a reader "
            "class whose producer instances are each read by one reader "
