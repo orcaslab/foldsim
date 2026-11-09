@@ -82,8 +82,14 @@ def groups(path):
     sim = path if path.endswith('.mlir') else foldsim_fitdb.sim_path(path)
     mods, _ = foldsim_cost.parse(sim)
     out = []
-    g = 0
-    while f'foldsim_sim_slr{g}' in mods:
+    present = [int(m[len('foldsim_sim_slr'):]) for m in mods
+               if m.startswith('foldsim_sim_slr') and m[len('foldsim_sim_slr'):].isdigit()]
+    for g in range(max(present) + 1 if present else 0):
+        if f'foldsim_sim_slr{g}' not in mods:
+            # An empty group: nothing in it.
+            out.append({'total': {'uram': 0, 'bram': 0, 'logic': 0, 'lutram': 0},
+                        'links': {'uram': 0.0, 'bram': 0.0, 'lutram': 0.0}, 'others': (0.0, 0.0, 0.0)})
+            continue
         acc = foldsim_fitdb.subtree(mods, f'foldsim_sim_slr{g}', set(), foldsim_fitdb.new())
         lk = {'uram': 0.0, 'bram': 0.0, 'lutram': 0.0}
 
@@ -101,7 +107,6 @@ def groups(path):
                 max(0.0, acc['logic'] + acc['lutram'] - lk['lutram']))
         out.append({'total': {r: acc[r] for r in ('uram', 'bram', 'logic', 'lutram')}, 'links': lk,
                     'others': rest})
-        g += 1
     return out
 
 

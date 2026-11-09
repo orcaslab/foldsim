@@ -980,8 +980,18 @@ def link_kinds_as_built(a, foldsim_opt, sim_input, pipeline, sim):
     print(f'foldsim: link-kind-cost: the rest as built {others} (links {links["uram"]:.0f} URAM288, '
           f'{links["bram"]:.1f} RAMB36, {links["lutram"]:,.0f} LUTRAM LUTs): refolding with link-kind-others',
           file=sys.stderr)
+    add = f' link-kind-others={others}'
+    # With SLR groups: each group's rest too (its own module, foldsim_sim_slr<g>),
+    # the budgets the plan places each group's links against.
+    if getattr(a, 'slr_groups', False) and not getattr(a, 'link_kind_group_others', ''):
+        gs = lk.groups(sim)
+        if gs:
+            group_others = ';'.join(f'{x["others"][0]:.0f},{x["others"][1]:.0f},{x["others"][2]:.0f}'
+                                    for x in gs)
+            print(f'foldsim: link-kind-cost: the rest as built per group {group_others}', file=sys.stderr)
+            add += f' link-kind-group-others={group_others}'
     pipeline = [re.sub(r'(foldsim-fold-static\{[^}]*)\}',
-                       lambda m: m.group(1) + f' link-kind-others={others}}}', step, count=1)
+                       lambda m: m.group(1) + add + '}', step, count=1)
                 if step.startswith('foldsim-fold-static{') else step for step in pipeline]
     run([foldsim_opt, sim_input, NO_OP_DUMP, f'--pass-pipeline=builtin.module({",".join(pipeline)})',
          '-o', sim])

@@ -692,6 +692,9 @@ public:
     uint64_t rows;
     unsigned cols;
     double luts;
+    /// A link whose kind is not the plan's to choose (forwarded or taken
+    /// now: distributed RAM): its LUTs count in its reader group's load.
+    bool fixed = false;
   };
   std::vector<LinkCandidate> *linkCandidates = nullptr;
   std::map<std::tuple<unsigned, unsigned, uint64_t>, std::string> linkKindPlan;
@@ -8803,7 +8806,15 @@ void StaticFolder::planLinkKinds(raw_ostream &os) {
   constexpr unsigned kMerged = 512;
   std::map<std::tuple<unsigned, unsigned, uint64_t>, std::map<uint64_t, unsigned>> colsByRows;
   std::map<std::tuple<unsigned, unsigned, uint64_t>, std::array<double, 3>> items;
+  // The fixed links' LUTs by reader (their group's load).
+  std::map<unsigned, double> fixedLuts;
+  unsigned fixedLinks = 0;
   for (auto &c : cands) {
+    if (c.fixed) {
+      fixedLuts[std::get<1>(c.key)] += c.luts;
+      ++fixedLinks;
+      continue;
+    }
     colsByRows[c.key][c.rows] += c.cols;
     items[c.key][2] += c.luts;
   }
@@ -8841,6 +8852,15 @@ void StaticFolder::planLinkKinds(raw_ostream &os) {
                               : linkKindBase[k];
       usedOf[g][k] = 0;
     }
+  // The links the plan cannot place take their LUTs first.
+  SmallVector<double> fixedOf(groups, 0.0);
+  double fixedAll = 0;
+  for (auto [reader, luts] : fixedLuts) {
+    unsigned g = perGroup ? std::min<unsigned>(slrOf[reader], groups - 1) : 0;
+    baseOf[g][2] += luts;
+    fixedOf[g] += luts;
+    fixedAll += luts;
+  }
   double used[3] = {0, 0, 0};
   unsigned count[3] = {0, 0, 0};
   for (auto &[key, cost] : order) {
@@ -8878,17 +8898,26 @@ void StaticFolder::planLinkKinds(raw_ostream &os) {
   std::string line;
   llvm::raw_string_ostream ls(line);
   ls << "foldsim-fold-static: link-kind-cost: " << order.size() << " link groups ("
-     << cands.size() << " links): ultra " << count[0] << " ("
+     << cands.size() - fixedLinks << " links): ultra " << count[0] << " ("
      << llvm::format("%.0f", used[0]) << " URAM288), block " << count[1] << " ("
      << llvm::format("%.1f", used[1]) << " RAMB36), distributed " << count[2] << " ("
-     << llvm::format("%.0f", used[2]) << " LUTs); with the rest:";
+     << llvm::format("%.0f", used[2]) << " LUTs); fixed (forwarded or taken now) "
+     << fixedLinks << " links (" << llvm::format("%.0f", fixedAll) << " LUTs); with the rest:";
   for (unsigned g = 0; g < groups; ++g) {
     if (perGroup)
       ls << (g ? ";" : "") << " group " << g << ":";
-    for (unsigned k = 0; k < 3; ++k)
-      ls << " " << kNames[k] << " "
-         << llvm::format("%.1f", 100.0 * (baseOf[g][k] + usedOf[g][k]) / std::max(1.0, capOf[g][k]))
-         << " %";
+    for (unsigned k = 0; k < 3; ++k) {
+      ls << " " << kNames[k] << " ";
+      if (capOf[g][k] > 0)
+        ls << llvm::format("%.1f", 100.0 * (baseOf[g][k] + usedOf[g][k]) / capOf[g][k]) << " %";
+      else
+        ls << "(no budget)";
+    }
+    // The links' own take, to set against the build's (foldsim_link_kinds.py
+    // --groups).
+    ls << " (links " << llvm::format("%.0f", usedOf[g][0]) << " URAM288, "
+       << llvm::format("%.1f", usedOf[g][1]) << " RAMB36, "
+       << llvm::format("%.0f", usedOf[g][2] + fixedOf[g]) << " LUTs)";
   }
   ls << " of the budget\n";
   llvm::errs() << ls.str();
@@ -9053,8 +9082,11 @@ void StaticFolder::reportLinks(raw_ostream &os) {
           takes[i] = true;
           rows[i] = r;
         }
+        // A crossing's write (data, enable, entry, bank) comes crossLatency
+        // host cycles late: the reads it reaches are as many later.
+        unsigned cross = crossing ? crossLatency(producer.cls) : 0;
         bool forward = oneCycleLinks &&
-                       (crossing || needsForward(use.producer, use.reader, takes, rows));
+                       needsForward(use.producer, use.reader, takes, rows, 1 + cross);
         bool now = zeroLink(use.producer, use.reader, use.port) &&
                    takesNow(use.producer, use.reader, takes, rows);
         bool late = shareLinkWrites && slrOf.empty() && classReaders[use.producer] > 1;
@@ -9066,10 +9098,10 @@ void StaticFolder::reportLinks(raw_ostream &os) {
         if (use.sources == 1 ? !forward && !now && !forwardLate
                              : !forward && !now &&
                                    !needsForward(use.producer, use.reader,
-                                                 takes, rows, crossing ? 3 : 2) &&
+                                                 takes, rows, 2 + cross) &&
                                    !(late && needsForward(use.producer,
                                                           use.reader, takes,
-                                                          rows, 3)))
+                                                          rows, 3 + cross)))
           syncOk = true;
       }
       if (syncOk)
@@ -9104,6 +9136,9 @@ void StaticFolder::reportLinks(raw_ostream &os) {
         block.cost += bram36(rows, cols);
       } else {
         kind = "distributed";
+        if (linkCandidates && !syncOk)
+          linkCandidates->push_back({{unsigned(producer.cls), use.reader, depth}, depth,
+                                     use.width, lutram(depth, use.width), true});
         distributed.memories++;
         distributed.bits += depth * use.width;
         distributed.cost += lutram(depth, use.width);
@@ -18923,12 +18958,16 @@ LogicalResult StaticFolder::buildSim() {
         bool now = zeroLink(key.first, c, consumer.port) &&
                    takesNow(key.first, c, takes, rows);
         nowAlone[index] = now && hitsOnlyTakes(key.first, c, takes, rows);
-        // A link between SLR groups is written a host cycle later, from
-        // registered bits in the producer's group: forwarded wherever links
-        // are, and never from a register shared with other groups' readers.
+        // A link between SLR groups is written crossLatency host cycles
+        // later (its data, enable, entry and bank), from registered bits in
+        // the producer's group, and never from a register shared with other
+        // groups' readers: forwarded where a read comes as many host cycles
+        // after a write as it would without the crossing; else its memory
+        // may be block or ultra RAM in the reader's group (slr-link-rams).
         bool crossing = to >= 0 && slrOf[producer.cls] != to;
+        unsigned cross = crossing ? crossLatency(producer.cls) : 0;
         bool forward = oneCycleLinks &&
-                       (crossing || needsForward(key.first, c, takes, rows));
+                       needsForward(key.first, c, takes, rows, 1 + cross);
         // Registered for the link writes where several classes read the
         // bits, or where a forward past the read register registers them.
         bool late = shareLinkWrites && slrOf.empty() &&
@@ -18975,11 +19014,12 @@ LogicalResult StaticFolder::buildSim() {
         // of an entry it reads lands in the two host cycles before its read
         // register loads (three for a write from a shared register).
         bool early = false;
-        // A link between groups lands a host cycle later: one more.
+        // A link between groups lands crossLatency host cycles later: as
+        // many more.
         if (style.empty() && sources.size() > 1 && !now && !forward &&
             !shortLead && (to < 0 || slrLinkRams) && pThreads != 1 &&
-            !needsForward(key.first, c, takes, rows, crossing ? 3 : 2) &&
-            !(late && needsForward(key.first, c, takes, rows, 3))) {
+            !needsForward(key.first, c, takes, rows, 2 + cross) &&
+            !(late && needsForward(key.first, c, takes, rows, 3 + cross))) {
           style = linkStyle(key.first, c, linkDepth(pThreads, !producer.late),
                             width);
           early = !style.empty();
