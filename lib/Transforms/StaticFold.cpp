@@ -178,6 +178,18 @@ struct Class {
   /// place, from the RAM's output register, and writes it from the logic the
   /// same host cycle; the state pass (stage P) takes the other writes.
   unsigned pp = 0;
+  /// State rows in HBM (`state-scratch-bits`): a PP class whose rows stream
+  /// from HBM, behind a landing window of `pageWindow` instance slots
+  /// (`windowSlot`); and the register bits an instance keeps in rows
+  /// (planStateInRam, for the scratch's placement).
+  bool ppHbm = false;
+  uint64_t rowStateBits = 0;
+  /// Partly resident (state-scratch-bits' remainder): the instances kept in
+  /// the scratch (0: all stream), and per instance whether it streams and
+  /// its resident index (chooseStreamWindows: spread over the frame).
+  unsigned ppResident = 0;
+  SmallVector<uint8_t> ppStreamed;
+  SmallVector<unsigned> residentSlot;
   /// The PP build's counts (rows, columns, captures, holds, hazards).
   std::string ppReport;
   /// State in RAM with its memories' page rows off chip (`<model>:sir-rows=
@@ -421,6 +433,56 @@ public:
   /// memory's read address is registered a stage early and replicated, a
   /// copy per bank of at most this many RAM primitives.
   unsigned ppAddressFanout = 96;
+  /// `state-scratch-bits` / `state-stream-window` (planScratch,
+  /// chooseStreamWindows: state rows in HBM).
+  uint64_t stateScratchBits = 250000000;
+  unsigned stateStreamWindow = 0;
+  /// `state-scratch-partial`: a PP class past the scratch keeps the
+  /// instances the rest holds resident, only the others stream.
+  bool stateScratchPartial = true;
+  /// `state-scratch-device-bits` / `state-scratch-reserve`: the scratch
+  /// from the device (auto), less what else the fold places on chip.
+  uint64_t stateScratchDeviceBits = 0, stateScratchReserve = 30000000;
+  /// auto: the scratch from the device, before the fold stores take theirs
+  /// (computed once, before the folded pipelines are planned).
+  void autoScratch();
+  /// The scratch's bits that folded pipelines' stores (fold-store-hbm's by
+  /// size) keep on chip: placed first, before the state rows.
+  uint64_t scratchFoldBits = 0;
+  LogicalResult planScratch();
+  LogicalResult chooseStreamWindows();
+  /// A streamed PP class's prefetch reads by position (ii + 1 each): valid,
+  /// instance, row (offChipRows' for pages).
+  void ppStreamRows(const Class &cls, SmallVectorImpl<uint64_t> &readRow,
+                    SmallVectorImpl<uint64_t> &instRow,
+                    SmallVectorImpl<uint64_t> &rowRow) const;
+  /// Each instance's prefetch position (its window slot's previous
+  /// occupant's state pass; negative: the frame before), for window `w`.
+  void ppPrefetches(const Class &cls, unsigned w, SmallVectorImpl<int> &at) const;
+  /// A streamed PP class's window slot of an instance (a table by instance).
+  Value ppStreamSlot(const Class &cls, ImplicitLocOpBuilder &b, Value inst) const;
+  /// The copy's values a streamed PP class's rows take: the copy, its body,
+  /// the host clock, the prefetch reads three ahead ([read, instance, row,
+  /// -, -]) and the passes' controls three ahead.
+  struct PPStreamPorts {
+    hw::HWModuleOp copy;
+    Block *body;
+    Value hostClock;
+    ArrayRef<Value> offChip3;
+    Value valid3, inst3, row3;
+    /// Partly resident: whether the pass's instance streams (else null).
+    Value streamed3;
+  };
+  /// Builds a streamed PP class's HBM rows: a virtual memory a chunk of
+  /// columns (at most 4,096 bits), the prefetches' responses written into
+  /// the columns' window rows, each pass's row written to HBM (its data and
+  /// byte enables, `writes`: a column's 72 bits and lane enables or null),
+  /// and the pending bits; its requests into `requests`.
+  LogicalResult
+  buildPPStream(Class &cls, ImplicitLocOpBuilder &b, const PPStreamPorts &ports,
+                ArrayRef<seq::FirMemOp> columns,
+                ArrayRef<std::pair<Value, Value>> writes, unsigned lanes,
+                SmallVectorImpl<std::pair<unsigned, Operation *>> &requests);
   /// CSF PP: the most estimated levels of a next value written in its pass.
   unsigned ppWriteLevels = 16;
   /// Constant-shell fold, schedule only (`csf-ready-copies`, `csf-mailboxes`).
@@ -7485,6 +7547,7 @@ LogicalResult StaticFolder::planStateInRam() {
       style = uint64_t(entries) * p <= 512 ? "block" : "ultra";
     cls.sir = p;
     cls.sirStyle = style;
+    cls.rowStateBits = bits;
     uint64_t rowBits = llvm::divideCeil(bits, p);
     uint64_t columns = llvm::divideCeil(rowBits, 72);
     (style == "ultra" ? cls.sirUrams : cls.sirBrams) = prims(style, p);
@@ -11196,6 +11259,609 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
   return success();
 }
 
+//===----------------------------------------------------------------------===//
+// State rows in HBM (constant shell, `state-scratch-bits`)
+//===----------------------------------------------------------------------===//
+//
+// The on-chip state scratch is a fixed budget of RAM bits for every class's
+// state rows. Every row is read and written once a frame, so any resident bit
+// saves the same HBM traffic (two bits a frame): the placement keeps the most
+// bits resident, whole classes, largest first while they fit, and streams the
+// others. A paged class streams as pages=hbm; a PP class (state-in-ram-pp)
+// through a landing window of a fixed number of instance slots: its columns
+// hold {slot, row}, each instance's P rows are prefetched into its slot at
+// its previous occupant's state pass, its passes read them in place as on
+// chip, and each pass writes its row to HBM (byte enables) as it writes it.
+// A late row is a bubble, so HBM's bandwidth bounds the frame's host cycles,
+// never its exactness. INTERFACES.md (cs_1109) section A.
+
+/// Usable HBM bits a host cycle on the kernel's 8 masters (10,240 b/hc read
+/// and write at 200 MHz, at an efficiency of 0.8), for the II model.
+static constexpr uint64_t kStreamBitsPerCycle = 8192;
+/// The positions a streamed row's prefetch leads its first pass by, where the
+/// window allows: an HBM round trip at the kernel's clock and a margin (as
+/// kLinkHbmLead).
+static constexpr unsigned kStreamLead = 64;
+/// The kernel's device-memory masters a streamed class's chunks spread over
+/// (foldsim_vmem_share: controller k on master k mod M).
+static constexpr unsigned kStreamMasters = 8;
+
+/// A streamed PP class's chunks of `columns` 72-bit columns, each a virtual
+/// memory: at least ceil(columns / 56) (4,032 bits, a row of 8 beats), and
+/// one a master while a chunk keeps a beat's columns (7), so that its rows
+/// spread over the masters. Chunk k takes columns [lo, hi).
+static unsigned ppChunks(unsigned columns) {
+  unsigned least = unsigned(llvm::divideCeil(columns, 56));
+  unsigned spread = std::min(kStreamMasters, unsigned(llvm::divideCeil(columns, 7)));
+  return std::max({1u, least, spread});
+}
+static std::pair<unsigned, unsigned> ppChunk(unsigned columns, unsigned k) {
+  unsigned chunks = ppChunks(columns);
+  return {k * columns / chunks, (k + 1) * columns / chunks};
+}
+static unsigned ppChunkBits(unsigned n) {
+  return std::max(32u, unsigned(llvm::PowerOf2Ceil(n * 72)));
+}
+
+void StaticFolder::autoScratch() {
+  if (!stateScratchDeviceBits)
+    return;
+  // The models' memories the fold keeps on chip outside the scratch: a
+  // threaded image (instances x rows x width) past 18 kbit (block or ultra
+  // RAM), unless a virtual memory (virtual-memories' pattern).
+  llvm::Regex pattern(virtualMemoryPattern);
+  uint64_t memories = 0;
+  for (auto &cls : classes) {
+    StringRef model =
+        cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : cls.name;
+    uint64_t entries = cls.threads() > 1 ? llvm::PowerOf2Ceil(cls.threads()) : 1;
+    for (auto memory : cls.model.getBodyBlock()->getOps<seq::FirMemOp>()) {
+      StringRef name = memory.getName().value_or("");
+      if (!virtualMemoryPattern.empty() &&
+          (pattern.match(name) || pattern.match((model + ":" + name).str())))
+        continue;
+      uint64_t bits = entries * memory.getType().getDepth() *
+                      memory.getType().getWidth();
+      if (bits > 18 * 1024)
+        memories += bits;
+    }
+  }
+  uint64_t taken = memories + stateScratchReserve;
+  stateScratchBits = stateScratchDeviceBits > taken ? stateScratchDeviceBits - taken : 0;
+  llvm::errs() << "foldsim-fold-static: state-scratch: auto " << stateScratchBits
+               << " bits: the device's " << stateScratchDeviceBits
+               << " less the models' memories on chip " << memories
+               << " and the reserve " << stateScratchReserve << "\n";
+}
+
+LogicalResult StaticFolder::planScratch() {
+  struct Item {
+    unsigned c;
+    uint64_t bits;
+    bool forced, pp;
+    /// A PP class's bits an instance (its P rows), for a partial residency.
+    uint64_t perInstance = 0;
+  };
+  SmallVector<Item> items;
+  uint64_t forced = 0;
+  auto regBits = [&](Class &cls) {
+    DenseSet<Operation *> ready;
+    readyRegisters(cls, ready);
+    auto *folding = cls.folding.get();
+    uint64_t bits = 0;
+    for (auto reg : cls.model.getBodyBlock()->getOps<seq::FirRegOp>())
+      if (!(folding && folding->physical.contains(reg)) &&
+          reg.getNext() != reg.getResult() &&
+          hw::getBitWidth(reg.getType()) > 0 && !ready.contains(reg))
+        bits += hw::getBitWidth(reg.getType());
+    return bits;
+  };
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    unsigned threads = cls.threads();
+    if (threads < 2)
+      continue;
+    uint64_t entries = uint64_t(1) << llvm::Log2_32_Ceil(threads);
+    StringRef model =
+        cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : cls.name;
+    Item item{unsigned(c), 0, false, false};
+    if (cls.pp) {
+      // Its columns: P rows (a power of two) an instance, 72 bits each.
+      uint64_t rowsPow = llvm::PowerOf2Ceil(cls.pp);
+      uint64_t columns = llvm::divideCeil(llvm::divideCeil(cls.rowStateBits, cls.pp), 72);
+      item.perInstance = rowsPow * columns * 72;
+      item.bits = entries * item.perInstance;
+      item.pp = true;
+    } else if (cls.sir) {
+      // State in RAM of P = 1 or paged with masks: resident only.
+      item.bits = entries * cls.rowStateBits;
+      item.forced = true;
+    } else if (cls.page && !cls.pagesOffChip && !cls.sirMixed) {
+      item.bits = entries * regBits(cls);
+      for (auto &rule : storageRules)
+        if (rule.model == model && !rule.regs && rule.store == "pages" &&
+            rule.kind != "hbm")
+          item.forced = true;
+    } else {
+      continue;
+    }
+    if (!item.bits)
+      continue;
+    if (item.forced)
+      forced += item.bits;
+    items.push_back(item);
+  }
+  if (items.empty() && !scratchFoldBits)
+    return success();
+  uint64_t taken = forced + scratchFoldBits;
+  uint64_t budget = stateScratchBits > taken ? stateScratchBits - taken : 0;
+  SmallVector<Item *> order;
+  for (auto &item : items)
+    if (!item.forced)
+      order.push_back(&item);
+  llvm::stable_sort(order, [](Item *x, Item *y) { return x->bits > y->bits; });
+  uint64_t resident = forced, streamed = 0;
+  unsigned streamedClasses = 0;
+  for (Item *item : order) {
+    auto &cls = classes[item->c];
+    if (item->bits <= budget) {
+      budget -= item->bits;
+      resident += item->bits;
+      continue;
+    }
+    ++streamedClasses;
+    if (!item->pp) {
+      streamed += item->bits;
+      cls.pagesOffChip = true;
+      llvm::errs() << "foldsim-fold-static: state-scratch: " << cls.name << ": "
+                   << item->bits << " bits of pages stream from HBM\n";
+      continue;
+    }
+    // A PP class: the instances the rest of the scratch holds stay resident
+    // (in RAMs of their own, a row an instance and pass), the others stream; the streamed
+    // ones a multiple of 16 (of n / 2 for fewer than 32), so that a window
+    // divides them.
+    cls.ppHbm = true;
+    unsigned n = cls.threads();
+    unsigned keepCount = 0;
+    if (stateScratchPartial && item->perInstance) {
+      unsigned r = unsigned(std::min<uint64_t>(budget / item->perInstance, n));
+      unsigned align = std::max(1u, std::min(16u, n / 2));
+      unsigned s = std::min(n, unsigned(llvm::alignTo(n - r, align)));
+      keepCount = n - s;
+      if (keepCount < 2)
+        keepCount = 0;
+    }
+    cls.ppResident = keepCount;
+    uint64_t kept = uint64_t(keepCount) * item->perInstance;
+    budget -= kept;
+    resident += kept;
+    streamed += uint64_t(n - keepCount) * item->perInstance;
+    llvm::errs() << "foldsim-fold-static: state-scratch: " << cls.name << ": "
+                 << n - keepCount << " of " << n << " instances' PP rows ("
+                 << uint64_t(n - keepCount) * item->perInstance
+                 << " bits) stream from HBM, " << keepCount << " resident\n";
+  }
+  llvm::errs() << "foldsim-fold-static: state-scratch: " << stateScratchBits
+               << " bits; fold stores " << scratchFoldBits << ", rows resident "
+               << resident << " (" << forced
+               << " kept on chip by rule or form), streamed " << streamed
+               << " in " << streamedClasses << " classes\n";
+  if (forced > stateScratchBits)
+    llvm::errs() << "foldsim-fold-static: state-scratch: warning: the rows "
+                 << "kept on chip (" << forced << " bits) exceed the scratch\n";
+  return success();
+}
+
+void StaticFolder::ppPrefetches(const Class &cls, unsigned w,
+                                SmallVectorImpl<int> &at) const {
+  // The streamed instances (all, unless partly resident), in state-pass
+  // order: instance k's slot's previous occupant is the streamed one w
+  // before it.
+  SmallVector<unsigned> order;
+  for (unsigned i = 0; i < cls.threads(); ++i)
+    if (cls.ppStreamed.empty() || cls.ppStreamed[i])
+      order.push_back(i);
+  unsigned n = order.size();
+  llvm::sort(order, [&](unsigned x, unsigned y) {
+    return cls.slot[kState][x] < cls.slot[kState][y];
+  });
+  auto stateAt = [&](int k) {
+    int f = k < 0 ? -1 : 0;
+    int r = ((k % int(n)) + int(n)) % int(n);
+    return cls.slot[kState][order[r]] + f * int(ii);
+  };
+  at.assign(cls.threads(), 0);
+  for (unsigned k = 0; k < n; ++k)
+    at[order[k]] = stateAt(int(k) - int(w));
+}
+
+LogicalResult StaticFolder::chooseStreamWindows() {
+  uint64_t hbmBits = 0;
+  // Each master's bits a frame, the chunks taken in turn (as the kernel
+  // numbers the controllers, approximately: other virtual memories share).
+  SmallVector<uint64_t> masterBits(kStreamMasters, 0);
+  unsigned nextMaster = 0;
+  for (auto &cls : classes) {
+    if (!cls.ppHbm)
+      continue;
+    unsigned P = cls.pp;
+    // Partly resident: the streamed instances spread over the frame (the
+    // k-th of the copy's state passes streams when (k + 1) s / n passes an
+    // integer, s of n), so that HBM's traffic is spread too.
+    unsigned all = cls.threads();
+    cls.ppStreamed.assign(all, 1);
+    cls.residentSlot.assign(all, 0);
+    if (cls.ppResident) {
+      SmallVector<unsigned> byState(all);
+      for (unsigned i = 0; i < all; ++i)
+        byState[i] = i;
+      llvm::sort(byState, [&](unsigned x, unsigned y) {
+        return cls.slot[kState][x] < cls.slot[kState][y];
+      });
+      uint64_t s = all - cls.ppResident;
+      unsigned resident = 0;
+      for (unsigned k = 0; k < all; ++k) {
+        bool streams = (uint64_t(k + 1) * s) / all > (uint64_t(k) * s) / all;
+        cls.ppStreamed[byState[k]] = streams;
+        if (!streams)
+          cls.residentSlot[byState[k]] = resident++;
+      }
+    }
+    auto streams = [&](unsigned i) { return bool(cls.ppStreamed[i]); };
+    unsigned n = all - cls.ppResident;
+    unsigned rowsPow = unsigned(llvm::PowerOf2Ceil(P));
+    unsigned cap = stateStreamWindow ? stateStreamWindow
+                                     : std::max(1u, 512u / rowsPow);
+    // The fewest slots whose prefetches lead their first passes by an HBM
+    // round trip (kStreamLead positions), else the most that fit: the
+    // window's counters and slot logic are a slot's each.
+    SmallVector<int> pf;
+    cls.pageWindow = 0;
+    unsigned fits = 0;
+    for (unsigned w = 1; w <= std::min(cap, n - 1); ++w) {
+      if (n % w)
+        continue;
+      ppPrefetches(cls, w, pf);
+      bool ok = true;
+      int lead = INT_MAX;
+      for (unsigned i = 0; ok && i < all; ++i) {
+        if (!streams(i))
+          continue;
+        int s = cls.slot[kState][i], r = s - int(cls.stages);
+        // The prefetch pending before its first pass is decided, and the
+        // next frame's after its last pass's write (registered once).
+        ok = pf[i] + 4 <= r && pf[i] + int(ii) >= s + 3;
+        lead = std::min(lead, r - pf[i]);
+      }
+      if (!ok)
+        continue;
+      fits = w;
+      if (lead >= int(kStreamLead)) {
+        cls.pageWindow = w;
+        break;
+      }
+    }
+    if (!cls.pageWindow)
+      cls.pageWindow = fits;
+    if (!cls.pageWindow) {
+      // (Few instances, their passes too close for a prefetch between
+      // them: a small class, kept on chip.)
+      llvm::errs() << "foldsim-fold-static: state-stream: " << cls.name
+                   << ": no landing window of at most " << cap
+                   << " slots fits the schedule (II " << ii
+                   << "): its rows stay on chip\n";
+      cls.ppHbm = false;
+      cls.ppResident = 0;
+      cls.ppStreamed.clear();
+      continue;
+    }
+    // The window's slots: the streamed instances in state-pass order, k
+    // mod w.
+    SmallVector<unsigned> order;
+    for (unsigned i = 0; i < all; ++i)
+      if (streams(i))
+        order.push_back(i);
+    llvm::sort(order, [&](unsigned x, unsigned y) {
+      return cls.slot[kState][x] < cls.slot[kState][y];
+    });
+    cls.windowSlot.assign(all, 0);
+    for (unsigned k = 0; k < n; ++k)
+      cls.windowSlot[order[k]] = k % cls.pageWindow;
+    // (The columns as planned; the packing may add a few.)
+    unsigned columns =
+        unsigned(llvm::divideCeil(llvm::divideCeil(cls.rowStateBits, P), 72));
+    uint64_t bits = 0;
+    for (unsigned k = 0, e = ppChunks(columns); k < e; ++k) {
+      auto [lo, hi] = ppChunk(columns, k);
+      // A row of the chunk moves its whole power-of-two bytes.
+      uint64_t chunk = 2 * uint64_t(n) * P * ppChunkBits(hi - lo);
+      masterBits[nextMaster++ % kStreamMasters] += chunk;
+      bits += chunk;
+    }
+    hbmBits += bits;
+    llvm::errs() << "foldsim-fold-static: state-stream: " << cls.name << ": P "
+                 << P << ", " << n << " of " << all
+                 << " instances streamed, a window of "
+                 << cls.pageWindow << " slots (" << cls.pageWindow * rowsPow
+                 << " rows x " << columns << " columns), " << bits
+                 << " HBM bits a frame\n";
+  }
+  for (auto &cls : classes)
+    if (cls.page && cls.pagesOffChip)
+      hbmBits += 2 * uint64_t(cls.threads()) * cls.page *
+                 llvm::divideCeil(cls.rowStateBits, cls.page);
+  if (hbmBits) {
+    // The busiest master bounds it too (a master's share of the usable).
+    uint64_t perMaster = kStreamBitsPerCycle / kStreamMasters;
+    uint64_t busiest = *llvm::max_element(masterBits);
+    uint64_t bw = std::max(llvm::divideCeil(hbmBits, kStreamBitsPerCycle),
+                           llvm::divideCeil(busiest, perMaster));
+    llvm::errs() << "foldsim-fold-static: state-stream: II_sched " << ii
+                 << ", HBM state bits a frame " << hbmBits
+                 << " (busiest master " << busiest << "), II_bw " << bw << " ("
+                 << kStreamMasters << " masters, " << kStreamBitsPerCycle
+                 << " b/hc usable): II " << std::max<uint64_t>(ii, bw) << "\n";
+  }
+  return success();
+}
+
+void StaticFolder::ppStreamRows(const Class &cls,
+                                SmallVectorImpl<uint64_t> &readRow,
+                                SmallVectorImpl<uint64_t> &instRow,
+                                SmallVectorImpl<uint64_t> &rowRow) const {
+  for (auto *row : {&readRow, &instRow, &rowRow})
+    row->assign(ii + 1, 0);
+  SmallVector<int> pf;
+  ppPrefetches(cls, cls.pageWindow, pf);
+  auto wrap = [&](int pos) { return unsigned(((pos % int(ii)) + int(ii)) % int(ii)); };
+  for (unsigned i = 0; i < cls.threads(); ++i)
+    for (unsigned j = 0; j < cls.pp && cls.ppStreamed[i]; ++j) {
+      unsigned pos = wrap(pf[i] + int(j));
+      assert(!readRow[pos] && "two prefetch reads at a position");
+      readRow[pos] = 1;
+      instRow[pos] = i;
+      rowRow[pos] = j;
+    }
+}
+
+Value StaticFolder::ppStreamSlot(const Class &cls, ImplicitLocOpBuilder &b,
+                                 Value inst) const {
+  unsigned width = cls.pageWindow > 1 ? llvm::Log2_32_Ceil(cls.pageWindow) : 1;
+  if (!inst)
+    return hw::ConstantOp::create(b, b.getIntegerType(width), 0);
+  unsigned entries = 1u << hw::getBitWidth(inst.getType());
+  SmallVector<uint64_t> slots(entries, 0);
+  for (unsigned i = 0; i < cls.threads(); ++i)
+    slots[i] = cls.windowSlot[i];
+  return table(b, inst, slots, width);
+}
+
+LogicalResult StaticFolder::buildPPStream(
+    Class &cls, ImplicitLocOpBuilder &b, const PPStreamPorts &ports,
+    ArrayRef<seq::FirMemOp> columns, ArrayRef<std::pair<Value, Value>> writes,
+    unsigned lanes, SmallVectorImpl<std::pair<unsigned, Operation *>> &requests) {
+  auto *context = b.getContext();
+  auto bits = [&](unsigned width) { return b.getIntegerType(width); };
+  auto i1 = b.getI1Type();
+  auto constant = [&](unsigned width, uint64_t value) -> Value {
+    return hw::ConstantOp::create(b, bits(width), value);
+  };
+  Value hostClock = ports.hostClock;
+  hw::HWModuleOp copy = ports.copy;
+  unsigned threads = cls.threads(), P = cls.pp;
+  unsigned idxWidth = threads > 1 ? llvm::Log2_32_Ceil(threads) : 0;
+  unsigned entries = 1u << idxWidth;
+  unsigned rowsPow = unsigned(llvm::PowerOf2Ceil(P));
+  unsigned rowBits = std::max(1u, llvm::Log2_32_Ceil(rowsPow));
+  unsigned slotsPow = unsigned(llvm::PowerOf2Ceil(cls.pageWindow));
+  unsigned slotBits = slotsPow > 1 ? llvm::Log2_32_Ceil(slotsPow) : 0;
+  BackedgeBuilder edges(b, b.getLoc());
+  if (cls.virtualMemories.empty()) {
+    auto [name, arg] = copy.appendInput("hostReset", i1);
+    cls.resetInput = arg.getArgNumber();
+  }
+  Value hostReset = ports.body->getArgument(cls.resetInput);
+  auto reg = [&](Value v, const Twine &name) -> Value {
+    return keep(seq::FirRegOp::create(b, v, hostClock, b.getStringAttr(name)));
+  };
+  auto resetReg = [&](Value next, const Twine &name) -> Value {
+    auto type = next.getType();
+    return seq::FirRegOp::create(b, next, hostClock, b.getStringAttr(name),
+                                 hostReset, hw::ConstantOp::create(b, type, 0),
+                                 hw::InnerSymAttr{}, /*isAsync=*/false,
+                                 b.getIntegerAttr(type, 0));
+  };
+  auto low = [&](Value v, unsigned width) -> Value {
+    return b.createOrFold<comb::ExtractOp>(bits(width), v, 0);
+  };
+  auto isRow = [&](Value row, unsigned j) -> Value {
+    return comb::ICmpOp::create(b, comb::ICmpPredicate::eq, row,
+                                constant(rowBits, j));
+  };
+  auto widen = [&](Value v) -> Value {
+    unsigned have = hw::getBitWidth(v.getType());
+    return have >= entries ? low(v, entries)
+                           : b.createOrFold<comb::ConcatOp>(
+                                 constant(entries - have, 0), v);
+  };
+  auto instOf = [&](Value inst, Value row) -> Value {
+    return idxWidth ? b.createOrFold<comb::ConcatOp>(inst, row) : row;
+  };
+  auto &offChip3 = ports.offChip3;
+  // Each pass's write, from the pass's host cycle (the columns' write
+  // controls), registered once into the requests.
+  Value wvalid0 = ports.valid3, winst0 = ports.inst3, wrow0 = ports.row3;
+  for (unsigned d = 3; d-- > 0;) {
+    wvalid0 = resetReg(wvalid0, "pps_wvalid" + Twine(d));
+    if (winst0)
+      winst0 = reg(winst0, "pps_winst" + Twine(d));
+    wrow0 = reg(wrow0, "pps_wrow" + Twine(d));
+  }
+  // (pprow3 is ceil(log2 P) bits, the rows' index rowBits.)
+  if (unsigned have = unsigned(hw::getBitWidth(wrow0.getType())); have < rowBits)
+    wrow0 = b.createOrFold<comb::ConcatOp>(constant(rowBits - have, 0), wrow0);
+  if (ports.streamed3) {
+    Value str0 = ports.streamed3;
+    for (unsigned d = 3; d-- > 0;)
+      str0 = reg(str0, "pps_wstr" + Twine(d));
+    wvalid0 = comb::AndOp::create(b, wvalid0, str0);
+  }
+  Value wvalidQ = resetReg(wvalid0, "pps_wr_valid");
+  Value winstQ = reg(instOf(winst0, wrow0), "pps_wr_inst");
+  // The prefetch reads, three ahead: only within a prefetch that started
+  // (its row 0's read; one wrapping from the frame before is partial in
+  // the first frame).
+  auto activeNext = edges.get(i1);
+  Value active = resetReg(activeNext, "pps_fetching");
+  Value first3 = comb::AndOp::create(b, offChip3[0], isRow(offChip3[2], 0));
+  Value last3 = comb::AndOp::create(b, offChip3[0], isRow(offChip3[2], P - 1));
+  activeNext.setValue(comb::MuxOp::create(
+      b, last3, constant(1, 0), comb::OrOp::create(b, first3, active)));
+  Value read0 = comb::AndOp::create(b, offChip3[0],
+                                    comb::OrOp::create(b, first3, active));
+  Value rinst0 = offChip3[1], rrow0 = offChip3[2];
+  for (unsigned d = 3; d-- > 0;) {
+    read0 = resetReg(read0, "pps_rd_valid" + Twine(d));
+    rinst0 = reg(rinst0, "pps_rd_inst" + Twine(d));
+    rrow0 = reg(rrow0, "pps_rd_row" + Twine(d));
+  }
+  Value rdInst = instOf(rinst0, rrow0);
+  // The slot whose prefetch starts (three ahead) and its bit: the pending
+  // bits are the window's slots' (zero-extended to the instances' port).
+  // (Registered: the slot table after the position tables, a host cycle
+  // before the prefetch's first read leaves at stage 0.)
+  Value startSlot = reg(ppStreamSlot(cls, b, idxWidth ? offChip3[1] : Value()),
+                        "pps_start_slot2");
+  Value first2 = resetReg(first3, "pps_first2");
+  auto slotBit = [&](Value slot) -> Value {
+    Value index = slotBits ? slot : constant(1, 0);
+    unsigned have = std::max(1u, slotBits);
+    if (have < slotsPow)
+      index = b.createOrFold<comb::ConcatOp>(constant(slotsPow - have, 0), index);
+    else if (have > slotsPow)
+      index = low(index, slotsPow);
+    return comb::ShlOp::create(b, constant(slotsPow, 1), index);
+  };
+  Value startBit = slotBit(startSlot);
+  Value all = hw::ConstantOp::create(b, APInt::getAllOnes(slotsPow));
+
+  // A chunk of at most 56 columns (4,032 bits): a virtual memory each.
+  unsigned chunks = ppChunks(columns.size());
+  unsigned cw = llvm::Log2_32_Ceil(P + 1);
+  Value one = constant(1, 1);
+  for (unsigned k = 0; k < chunks; ++k) {
+    auto [lo, hi] = ppChunk(columns.size(), k);
+    unsigned n = hi - lo;
+    unsigned width = n * 72;
+    unsigned dw = ppChunkBits(n);
+    std::string prefix = ("pps" + Twine(k)).str();
+    Class::VirtualMemory vm;
+    vm.name = prefix + "_rows";
+    vm.rowWidth = 1;
+    vm.dataWidth = dw;
+    vm.maskWidth = dw / 8;
+    vm.readFirst = true;
+    vm.pages = true;
+    vm.instWidth = idxWidth + rowBits;
+    vm.instances = entries * rowsPow;
+    std::string vmName = ("vm" + Twine(cls.virtualMemories.size()) + "_").str();
+    auto rspValid = copy.appendInput(vmName + "rsp_valid", i1).second;
+    vm.firstInput = rspValid.getArgNumber();
+    auto rspInst = copy.appendInput(vmName + "rsp_inst", bits(vm.instWidth)).second;
+    auto rspData = copy.appendInput(vmName + "rsp_data", bits(dw)).second;
+    // The responses, registered, into their slot's rows.
+    Value valid = resetReg(rspValid, prefix + "_rsp_valid");
+    Value rspAt = reg(rspInst, prefix + "_rsp_inst");
+    Value data = seq::FirRegOp::create(b, rspData, hostClock,
+                                       b.getStringAttr(prefix + "_rsp_data"));
+    Value rspRow = low(rspAt, rowBits);
+    Value rspInstance =
+        idxWidth ? b.createOrFold<comb::ExtractOp>(bits(idxWidth), rspAt, rowBits)
+                 : Value();
+    Value rspSlot = ppStreamSlot(cls, b, rspInstance);
+    Value writeAt = slotBits ? b.createOrFold<comb::ConcatOp>(rspSlot, rspRow) : rspRow;
+    for (unsigned c = 0; c < n; ++c) {
+      auto memory = columns[lo + c];
+      auto type = memory.getType();
+      Value word = b.createOrFold<comb::ExtractOp>(bits(72), data, c * 72);
+      Value mask;
+      if (type.getMaskWidth() && *type.getMaskWidth() > 1)
+        mask = hw::ConstantOp::create(
+            b, APInt::getAllOnes(unsigned(*type.getMaskWidth())));
+      seq::FirMemWriteOp::create(b, memory, writeAt, hostClock, valid, word, mask);
+    }
+    // Rows in, counted by slot from its prefetch's start: the last clears
+    // the instance's pending bit.
+    SmallVector<Value> doneOf;
+    for (unsigned w = 0; w < cls.pageWindow; ++w) {
+      auto isSlot = [&](Value slot) -> Value {
+        if (!slotBits)
+          return one;
+        return comb::ICmpOp::create(b, comb::ICmpPredicate::eq, slot,
+                                    constant(slotBits, w));
+      };
+      Value mineStart = comb::AndOp::create(b, first2, isSlot(startSlot));
+      Value mineIn = comb::AndOp::create(b, valid, isSlot(rspSlot));
+      auto countNext = edges.get(bits(cw));
+      Value count = resetReg(countNext, prefix + "_rows_in_" + Twine(w));
+      doneOf.push_back(comb::AndOp::create(
+          b, mineIn,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::eq, count,
+                               constant(cw, P - 1))));
+      countNext.setValue(comb::MuxOp::create(
+          b, mineStart, constant(cw, 0),
+          comb::MuxOp::create(b, mineIn,
+                              comb::AddOp::create(b, count, constant(cw, 1)),
+                              count)));
+    }
+    Value done = doneOf.size() == 1 ? doneOf[0] : comb::OrOp::create(b, doneOf, false);
+    auto pendingNext = edges.get(bits(slotsPow));
+    Value pending = resetReg(pendingNext, prefix + "_pending");
+    Value doneBit = slotBit(rspSlot);
+    pendingNext.setValue(comb::OrOp::create(
+        b,
+        comb::AndOp::create(
+            b, pending,
+            comb::XorOp::create(
+                b, comb::MuxOp::create(b, done, doneBit, constant(slotsPow, 0)),
+                all)),
+        comb::MuxOp::create(b, first2, startBit, constant(slotsPow, 0))));
+    if (slotsPow < entries)
+      pending = b.createOrFold<comb::ConcatOp>(constant(entries - slotsPow, 0),
+                                               pending);
+    // The pass's write: the chunk's columns, their bytes enabled by their
+    // lanes (8-bit lanes; every byte without masks); the padding off.
+    SmallVector<Value> words, masks;
+    for (unsigned c = 0; c < n; ++c) {
+      auto &[word, mask] = writes[lo + c];
+      words.push_back(word);
+      masks.push_back(mask && lanes == 9 ? mask : constant(9, 0x1ff));
+    }
+    auto pack = [&](SmallVector<Value> &parts, unsigned have, unsigned want) {
+      if (want > have)
+        parts.push_back(constant(want - have, 0));
+      return b.createOrFold<comb::ConcatOp>(
+          SmallVector<Value>(parts.rbegin(), parts.rend()));
+    };
+    Value wrData = reg(pack(words, width, dw), prefix + "_wr_data");
+    Value wrMask = reg(pack(masks, n * 9, dw / 8), prefix + "_wr_mask");
+    Value zero1 = constant(1, 0);
+    SmallVector<Value> values{read0,  rdInst, zero1,  wvalidQ, winstQ,
+                              zero1,  wrData, wrMask, pending};
+    auto builder = OpBuilder::atBlockEnd(ports.body);
+    requests.push_back({unsigned(cls.virtualMemories.size()),
+                        UnrealizedConversionCastOp::create(
+                            builder, b.getLoc(), TypeRange{}, values)});
+    cls.virtualMemories.push_back(vm);
+  }
+  (void)context;
+  llvm::errs() << "foldsim-fold-static: state-stream: " << cls.name << ": "
+               << columns.size() << " columns in " << chunks
+               << " virtual memories, a window of " << cls.pageWindow
+               << " slots x " << rowsPow << " rows\n";
+  return success();
+}
+
 LogicalResult StaticFolder::buildCopy(Class &cls) {
   auto model = cls.model;
   auto *context = model.getContext();
@@ -11504,6 +12170,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   unsigned pageBits = 0;
   if (cls.page)
     pageBits = std::max(1u, llvm::Log2_32_Ceil(unsigned(llvm::PowerOf2Ceil(cls.page))));
+  else if (cls.ppHbm)
+    pageBits = std::max(1u, llvm::Log2_32_Ceil(unsigned(llvm::PowerOf2Ceil(cls.pp))));
   // With a window, the fetch from it too, by slot.
   unsigned windowWidth =
       cls.pageWindow > 1 ? llvm::Log2_32_Ceil(cls.pageWindow) : 1;
@@ -11514,7 +12182,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     addPort("fetch3", IntegerType::get(context, 1), true);
     addPort("finst3", IntegerType::get(context, windowWidth), true);
   }
-  if (cls.page && cls.pagesOffChip) {
+  if ((cls.page && cls.pagesOffChip) || cls.ppHbm) {
     addPort("pread3", IntegerType::get(context, 1), true);
     addPort("pinst3", IntegerType::get(context, idxWidth), true);
     addPort("ppage3", IntegerType::get(context, pageBits), true);
@@ -11605,7 +12273,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   Value finst3 = fetches ? body->getArgument(4) : Value();
   // Off chip: [read, instance, page, write, write page], three ahead.
   SmallVector<Value> offChip3;
-  if (offChip)
+  if (offChip || cls.ppHbm)
     for (unsigned k = 0; k < 5; ++k)
       offChip3.push_back(body->getArgument((fetches ? 5 : 3) + k));
   unsigned pages = cls.page ? unsigned(llvm::PowerOf2Ceil(cls.page)) : 0;
@@ -12985,8 +13653,14 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     unsigned rowWidth = std::max(1u, llvm::Log2_32_Ceil(P));
     unsigned rowsPow = 1u << rowWidth;
     StringRef kind = cls.sirStyle.empty() ? StringRef("block") : StringRef(cls.sirStyle);
+    // Streamed from HBM (state-scratch-bits): the columns are the landing
+    // window's, {slot, row}, a block RAM each; byte lanes (the write
+    // request's byte enables).
+    bool hbm = cls.ppHbm;
+    if (hbm)
+      kind = "block";
     bool masked = llvm::any_of(ppRegs, [](auto &r) { return r.enabled; });
-    unsigned grain = masked ? (kind == "ultra" ? 8 : 9) : 1;
+    unsigned grain = masked ? (kind == "ultra" || hbm ? 8 : 9) : 1;
     auto bits = [&](unsigned width) { return b.getIntegerType(width); };
     auto enableOf = [&](unsigned k) {
       return ppRegs[k].enabled ? rowValues[2 * k + 1] : Value();
@@ -13029,7 +13703,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         row.push_back(zero1);
     // Each column's parts: per row, its registers' next-value bits there.
     struct Column {
-      seq::FirMemOp memory;
+      seq::FirMemOp memory, resident;
       Value out;
       SmallVector<SmallVector<std::pair<unsigned, Value>>> parts;
     };
@@ -13040,18 +13714,50 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     // Controls of a group of 16 columns.
     struct Group {
       Value readAddr, wValid, wAddr, wRow1;
+      /// Partly resident (Class::ppResident): the resident RAM's read and
+      /// write addresses, and whether the pass's instance streams, at the
+      /// read data (stage 1) and at the write (stage 0).
+      Value resRead, resWrite, str1, str0;
     };
     SmallVector<Group> groups;
     auto keepReg = [&](Value v, const Twine &name) -> Value {
       return keep(seq::FirRegOp::create(b, v, hostClock, b.getStringAttr(name)));
     };
+    // Streamed: each pass's window slot (its instance's), three ahead.
+    unsigned slotsPow = hbm ? unsigned(llvm::PowerOf2Ceil(cls.pageWindow)) : 0;
+    Value ppSlot3 = hbm ? ppStreamSlot(cls, b, ppInst3) : Value();
+    // Partly resident: the resident instances' rows in RAMs of their own
+    // ({resident index, row}, as on chip), the streamed ones' in the window;
+    // the column's read data the pass's instance's, a host cycle before its
+    // output register.
+    bool partial = hbm && cls.ppResident;
+    // (Its rows {resident index, row}: ppResident x 2^ceil(log2 P) of them.)
+    unsigned resPow = partial ? unsigned(llvm::PowerOf2Ceil(cls.ppResident)) : 0;
+    Value res3, str3;
+    if (partial) {
+      SmallVector<uint64_t> resRows(entries, 0), strRows(entries, 0);
+      for (unsigned i = 0; i < threads; ++i) {
+        resRows[i] = cls.residentSlot[i];
+        strRows[i] = cls.ppStreamed[i];
+      }
+      res3 = table(b, ppInst3, resRows, std::max(1u, llvm::Log2_32_Ceil(resPow)));
+      str3 = table(b, ppInst3, strRows, 1);
+    }
     for (unsigned c = 0; c < columns; ++c) {
       if (c % 16 == 0) {
         Group g;
         std::string prefix = ("pp_g" + Twine(c / 16)).str();
         Value row2 = keepReg(ppRow3, prefix + "_rrow2");
+        if (partial) {
+          Value r2 = keepReg(res3, prefix + "_rres2");
+          g.resRead = resPow > 1 ? b.createOrFold<comb::ConcatOp>(r2, row2) : row2;
+          g.str1 = keepReg(keepReg(str3, prefix + "_rstr2"), prefix + "_rstr1");
+        }
         g.readAddr = row2;
-        if (threads > 1)
+        if (hbm && slotsPow > 1)
+          g.readAddr = b.createOrFold<comb::ConcatOp>(
+              keepReg(ppSlot3, prefix + "_rslot2"), row2);
+        else if (threads > 1 && !hbm)
           g.readAddr = b.createOrFold<comb::ConcatOp>(
               keepReg(ppInst3, prefix + "_rinst2"), row2);
         Value valid2 = keepReg(ppValid3, prefix + "_wvalid2");
@@ -13066,11 +13772,21 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           g.wAddr = b.createOrFold<comb::ConcatOp>(
               keepReg(inst1, prefix + "_winst0"), g.wAddr);
         }
+        if (partial) {
+          Value r0 = keepReg(keepReg(keepReg(res3, prefix + "_wres2"),
+                                     prefix + "_wres1"),
+                             prefix + "_wres0");
+          Value wrow0 = keepReg(g.wRow1, prefix + "_wresrow0");
+          g.resWrite = resPow > 1 ? b.createOrFold<comb::ConcatOp>(r0, wrow0) : wrow0;
+          g.str0 = keepReg(keepReg(keepReg(str3, prefix + "_wstr2"),
+                                   prefix + "_wstr1"),
+                           prefix + "_wstr0");
+        }
         groups.push_back(g);
       }
       auto &col = cols[c];
       auto memType = seq::FirMemType::get(
-          context, uint64_t(entries) * rowsPow, 72,
+          context, uint64_t(hbm ? slotsPow : entries) * rowsPow, 72,
           masked ? std::optional<size_t>(lanes) : std::optional<size_t>(1));
       col.memory = seq::FirMemOp::create(
           b, memType, /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old,
@@ -13079,6 +13795,21 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       setRamStyle(col.memory, kind);
       Value data = seq::FirMemReadOp::create(b, col.memory, groups.back().readAddr,
                                              hostClock, one());
+      if (partial) {
+        auto resType = seq::FirMemType::get(
+            context, uint64_t(cls.ppResident) * rowsPow, 72,
+            masked ? std::optional<size_t>(lanes) : std::optional<size_t>(1));
+        col.resident = seq::FirMemOp::create(
+            b, resType, /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old,
+            seq::WUW::Undefined, b.getStringAttr("pp_res" + Twine(c)),
+            hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+        setRamStyle(col.resident,
+                    cls.sirStyle.empty() ? StringRef("block") : StringRef(cls.sirStyle));
+        Value resData = seq::FirMemReadOp::create(b, col.resident,
+                                                  groups.back().resRead, hostClock,
+                                                  one());
+        data = comb::MuxOp::create(b, groups.back().str1, data, resData);
+      }
       col.out = seq::FirRegOp::create(b, data, hostClock,
                                       b.getStringAttr("pp_col" + Twine(c) + "_out"));
     }
@@ -13101,6 +13832,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       values.push_back(b.createOrFold<hw::BitcastOp>(reg.value.getType(), value));
     }
     Value zero72 = hw::ConstantOp::create(b, bits(72), 0);
+    SmallVector<std::pair<Value, Value>> streamWrites;
     for (auto [c, col] : llvm::enumerate(cols)) {
       auto &g = groups[c / 16];
       SmallVector<Value> words, masks;
@@ -13146,6 +13878,19 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       Value data = pick(words);
       Value mask = masked ? pick(masks) : Value();
       Value enable = g.wValid;
+      if (hbm) {
+        // To HBM, from the pass: the column's data and lane enables; partly
+        // resident, a resident instance's into its RAM.
+        streamWrites.push_back({data, mask});
+        if (partial)
+          seq::FirMemWriteOp::create(
+              b, col.resident, g.resWrite, hostClock,
+              comb::AndOp::create(
+                  b, enable,
+                  comb::XorOp::create(b, g.str0, hw::ConstantOp::create(b, i1, 1))),
+              data, mask);
+        continue;
+      }
       if (masked && lanes == 1) {
         enable = comb::AndOp::create(b, enable, mask);
         mask = Value();
@@ -13153,11 +13898,25 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       seq::FirMemWriteOp::create(b, col.memory, g.wAddr, hostClock, enable, data,
                                  mask);
     }
+    if (hbm) {
+      SmallVector<seq::FirMemOp> memories;
+      for (auto &col : cols)
+        memories.push_back(col.memory);
+      PPStreamPorts ports{copy, body, hostClock, offChip3, ppValid3, ppInst3,
+                          ppRow3, str3};
+      if (failed(buildPPStream(cls, b, ports, memories, streamWrites, lanes,
+                               pageRequests)))
+        return failure();
+    }
     for (auto [reg, value] : llvm::zip(ppRegs, values))
       reg.value.replaceAllUsesWith(value);
     llvm::errs() << "foldsim-fold-static: state-in-ram-pp: " << cls.name
+                 << (hbm ? " (rows in HBM, a window of " +
+                               std::to_string(cls.pageWindow) + " slots)"
+                         : std::string())
                  << ": built " << ppRegs.size() << " registers in " << columns
-                 << " columns x " << uint64_t(entries) * rowsPow << " rows ("
+                 << " columns x " << uint64_t(hbm ? slotsPow : entries) * rowsPow
+                 << " rows ("
                  << kind << "), " << groups.size() << " control groups\n";
   }
 
@@ -14655,6 +15414,16 @@ LogicalResult StaticFolder::buildSim() {
       ctl.offChip3 = {table(b, at, readRow, 1), table(b, at, instRow, idxWidth),
                       table(b, at, pageRow, pageBits), table(b, at, writeRow, 1),
                       table(b, at, wpageRow, pageBits)};
+    } else if (cls.ppHbm) {
+      // State rows in HBM: each instance's P rows prefetched into its window
+      // slot (ppStreamRows); its writes are its passes' (no table).
+      unsigned rowBits = std::max(
+          1u, llvm::Log2_32_Ceil(unsigned(llvm::PowerOf2Ceil(cls.pp))));
+      SmallVector<uint64_t> readRow, instRow, rowRow;
+      ppStreamRows(cls, readRow, instRow, rowRow);
+      ctl.offChip3 = {table(b, at, readRow, 1), table(b, at, instRow, idxWidth),
+                      table(b, at, rowRow, rowBits), constant(1, 0),
+                      constant(rowBits, 0)};
     }
     for (auto [l, row] : llvm::enumerate(laterRows)) {
       Value later3 = table(b, at, row, 1);
@@ -14954,7 +15723,7 @@ LogicalResult StaticFolder::buildSim() {
       operands.push_back(controls[c].fetch3);
       operands.push_back(controls[c].finst3);
     }
-    if (cls.page && cls.pagesOffChip)
+    if ((cls.page && cls.pagesOffChip) || cls.ppHbm)
       operands.append(controls[c].offChip3.begin(), controls[c].offChip3.end());
     if (cls.stages) {
       if (cls.threads() > 1)
@@ -16918,6 +17687,21 @@ LogicalResult StaticFolder::buildSim() {
         }
         stateUse = atNext(fetchRow, 1);
         pageInst = atNext(fetchInst, idxWidth);
+      } else if (cls.ppHbm) {
+        // State rows in HBM: waited for at the first pass's read position
+        // (the stages before the state pass), all P rows of its window slot
+        // in (the pending bits are the slots').
+        SmallVector<uint64_t> fetchRow(ii + 1, 0), fetchInst(ii + 1, 0);
+        for (unsigned i = 0; i < threads; ++i) {
+          if (!cls.ppStreamed[i])
+            continue;
+          int f = cls.slot[kState][i] - int(cls.stages);
+          unsigned pos = unsigned(((f % int(ii)) + int(ii)) % int(ii));
+          fetchRow[pos] = 1;
+          fetchInst[pos] = cls.windowSlot[i];
+        }
+        stateUse = atNext(fetchRow, 1);
+        pageInst = atNext(fetchInst, idxWidth);
       }
       for (auto &vm : cls.virtualMemories) {
         Value used = vm.pages ? stateUse : use;
@@ -17481,6 +18265,7 @@ LogicalResult StaticFolder::run() {
       return netlist.emitError("fold-stage-levels-class: '")
              << spec << "' is not <glob>:<levels> or <glob>:off";
   }
+  autoScratch();
   for (auto &cls : classes) {
     StringRef baseName = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
                                             : StringRef(cls.name);
@@ -17508,7 +18293,14 @@ LogicalResult StaticFolder::run() {
       }
       if (ruled)
         return *ruled;
-      return foldStoreHbm && bits >= foldStoreHbm;
+      if (!foldStoreHbm || bits < foldStoreHbm)
+        return false;
+      // The state scratch first (state-scratch-bits): in HBM only past it.
+      if (scratchFoldBits + bits <= stateScratchBits) {
+        scratchFoldBits += bits;
+        return false;
+      }
+      return true;
     };
     if (cls.threads() > 1 &&
         failed(foldPipelines(cls.model, cls.threads(), foldStoreRam, levels,
@@ -17543,13 +18335,18 @@ LogicalResult StaticFolder::run() {
         cls.folding->edges->abandon();
   };
   if (failed(parsePages()) || failed(parseStorage()) ||
-      failed(planStateInRam()) || failed(pagesOffChip()) || failed(planCsf()) ||
+      failed(planStateInRam()) || failed(pagesOffChip()) ||
+      failed(planScratch()) || failed(planCsf()) ||
       failed(chooseStages()) || failed(planPassSplits()) ||
       failed(schedule())) {
     abandonFolds();
     return failure();
   }
   chooseWindows();
+  if (failed(chooseStreamWindows())) {
+    abandonFolds();
+    return failure();
+  }
   choosePageGates();
   reportStateInRam();
   if (scheduleOnly) {
@@ -17631,6 +18428,11 @@ void FoldStaticPass::runOnOperation() {
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.stateInRamPP = stateInRamPP;
   folder.ppAddressFanout = std::max(1u, unsigned(stateInRamPPFanout));
+  folder.stateScratchBits = stateScratchBits;
+  folder.stateStreamWindow = stateStreamWindow;
+  folder.stateScratchPartial = stateScratchPartial;
+  folder.stateScratchDeviceBits = stateScratchDeviceBits;
+  folder.stateScratchReserve = stateScratchReserve;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
   folder.linkHbmShift = linkHbmShift;

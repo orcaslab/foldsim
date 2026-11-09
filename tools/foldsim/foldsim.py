@@ -505,6 +505,21 @@ def frame_options(a):
             fold += ' state-in-ram-pp'
         if getattr(a, 'state_in_ram_pp_fanout', 0):
             fold += f' state-in-ram-pp-fanout={a.state_in_ram_pp_fanout}'
+    scratch = getattr(a, 'state_scratch_bits', 'auto')
+    if scratch == 'auto':
+        # The device's on-chip RAM at the placer's fill: the fold pass takes
+        # the other memories it places off it (state-scratch-device-bits).
+        device = region_ram_bits(check_region(a)) if getattr(a, 'static', False) else 0
+        if device:
+            fold += f' state-scratch-device-bits={device}'
+    elif scratch is not None:
+        fold += f' state-scratch-bits={int(scratch)}'
+    if getattr(a, 'state_stream_window', 0):
+        fold += f' state-stream-window={a.state_stream_window}'
+    if getattr(a, 'state_scratch_reserve', 0):
+        fold += f' state-scratch-reserve={a.state_scratch_reserve}'
+    if getattr(a, 'state_scratch_whole', False):
+        fold += ' state-scratch-partial=false'
     return fold
 
 
@@ -843,6 +858,18 @@ def slr_region_sll_budget(path):
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
     region = json.load(open(path))
     return int(region.get('sll_margin', 1.0) * region.get('sll_per_boundary', 0))
+
+
+def region_ram_bits(path):
+    """A region's block and ultra RAM bits at the placer's fill (its
+    placement model's `fill` of uram and bram): 0 without a region."""
+    if not path:
+        return 0
+    region = json.load(open(path))
+    fill = region.get('placement', {}).get('fill', {})
+    uram = sum(s.get('uram', 0) for s in region.get('slrs', [])) * 288 * 1024
+    bram = sum(s.get('ramb36', 0) for s in region.get('slrs', [])) * 36 * 1024
+    return int(uram * fill.get('uram', 1.0) + bram * fill.get('bram', 1.0))
 
 
 def v80_region():
@@ -1519,6 +1546,24 @@ def build_parser():
                     help='with --state-in-ram: classes of P > 1 in the CSF pass-partitioned form: rows read '
                          'in place at their pass and written from the logic, staged with P stages, no capture '
                          'or write-back buffer (foldsim-fold-static state-in-ram-pp)')
+    ap.add_argument('--state-scratch-bits', default='auto', metavar='N|auto',
+                    help='with --static: the constant shell\'s on-chip state scratch in bits (folded pipelines\' '
+                         'HBM-eligible stores first, then state rows: whole classes, largest first, while they '
+                         'fit; then a class\'s instances); the rest streams from HBM (foldsim-fold-static '
+                         'state-scratch-bits). auto (default): the region\'s block and ultra RAM at the placer\'s '
+                         'fill, less the other memories the fold places on chip and state-scratch-reserve '
+                         '(foldsim-fold-static state-scratch-device-bits); 250,000,000 without a region')
+    ap.add_argument('--state-scratch-reserve', type=int, default=0, metavar='N',
+                    help='with --state-scratch-bits auto: on-chip RAM bits kept from the scratch for what the '
+                         'fold places after it (links, rings, read buffers, the shell; foldsim-fold-static '
+                         'state-scratch-reserve; 0: its default)')
+    ap.add_argument('--state-scratch-whole', action='store_true',
+                    help='with --state-scratch-bits: a PP class past the scratch streams whole (default: the '
+                         'instances the rest of the scratch holds stay resident; foldsim-fold-static '
+                         'state-scratch-partial=false)')
+    ap.add_argument('--state-stream-window', type=int, default=0, metavar='N',
+                    help='with --state-scratch-bits: a streamed PP class\'s landing window, in instance slots '
+                         '(foldsim-fold-static state-stream-window; 0: a RAMB36 deep, 512 / P)')
     ap.add_argument('--state-in-ram-pp-fanout', type=int, default=0, metavar='N',
                     help='with --state-in-ram-pp: the most RAM primitives a combinationally read memory\'s '
                          'registered address copy drives (foldsim-fold-static state-in-ram-pp-fanout; 0: 96)')
