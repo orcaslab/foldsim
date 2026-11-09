@@ -398,6 +398,47 @@ public:
   unsigned stateInRamH = 0;
   /// `state-in-ram-zero-links`: zero-latency links into a P > 1 class.
   bool stateInRamZeroLinks = false;
+  /// Constant-shell fold, schedule only (`csf-ready-copies`, `csf-mailboxes`).
+  /// The ready-cone lanes of each class (0: its ready passes take its
+  /// copy's slots), the first of its lanes among the resources (the classes'
+  /// copies first, then the lanes), and the resources in all.
+  SmallVector<std::string> csfReadyCopySpecs;
+  bool csfMailboxes = false;
+  SmallVector<unsigned> readyLanes, laneBase;
+  unsigned numResources = 0;
+  /// Per class: the slots a pass holds its mailbox read port (1: none).
+  SmallVector<unsigned> mailboxSpacing;
+  /// Per class: (producer class, rows a reader instance reads, banked) of
+  /// its widest mailbox, for the report.
+  struct MailboxFanIn {
+    int pcls = -1;
+    unsigned rows = 1;
+    bool banked = true;
+  };
+  SmallVector<MailboxFanIn> mailboxFanIn;
+  /// The last modulo search's period found, and the constraint the highest
+  /// failed period below it broke.
+  unsigned lastModuloPeriodFound = 0;
+  std::string moduloBinding;
+  std::string csfChain;
+  LogicalResult planCsf();
+  void reportCsf(raw_ostream &os) const;
+  /// The slots an evaluation takes: its class's copy, or a ready-cone lane.
+  unsigned resourceOf(const Node &node) const {
+    unsigned c = node.cls;
+    if (node.pass == kReady && c < readyLanes.size() && readyLanes[c])
+      return laneBase[c] + node.inst % readyLanes[c];
+    return c;
+  }
+  unsigned resources() const {
+    return std::max<unsigned>(numResources, classes.size());
+  }
+  /// The slots a pass of class `c` keeps its link port: its paged links'
+  /// page, or its mailbox read port's.
+  unsigned linkSpacing(unsigned c) const {
+    unsigned m = c < mailboxSpacing.size() ? mailboxSpacing[c] : 1;
+    return std::max(classes[c].linkPage, m);
+  }
   /// The state-in-ram classes' RAM primitives by SLR group, once scheduled.
   void reportStateInRam() const;
   /// `link-hbm-lead`: the most positions a stream's request precedes its
@@ -4790,7 +4831,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
 
   // List scheduling: in topological order, highest first among the ready.
   SmallVector<int> slotOf(nodes.size(), -1);
-  std::vector<llvm::BitVector> busy(classes.size());
+  // Each copy's slots, and each ready-cone lane's (csf-ready-copies).
+  std::vector<llvm::BitVector> busy(resources());
   SmallVector<unsigned> waiting(nodes.size(), 0);
   for (unsigned n = 0; n < nodes.size(); ++n)
     waiting[n] = preds[n].size();
@@ -4830,8 +4872,8 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
       earliest = std::max(earliest, slotOf[p] + latency);
     unsigned c = nodes[n].cls;
     bool pages = nodes[n].pass == kState && passSpacing(c);
-    auto &taken = busy[c];
-    bool spaced = classes[c].linkPage > 1;
+    auto &taken = busy[resourceOf(nodes[n])];
+    bool spaced = linkSpacing(c) > 1;
     earliest = firstFree(taken, earliest, 0);
     // A slot clashing with a state pass x of the copy (|t - x| < p) clashes
     // for every t up to x + p - 1: the search resumes at x + p, past the
@@ -4847,7 +4889,7 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
       if (pages)
         past(pageSlots[c], passSpacing(c));
       if (spaced)
-        past(linkSlots[c], int(classes[c].linkPage));
+        past(linkSlots[c], int(linkSpacing(c)));
       if (serial[c] > 1)
         past(serialSlots[serialKey(n)], int(serial[c]));
       if (next == earliest)
@@ -4900,10 +4942,10 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
                                          int(serial[key.first]));
   // Paged links: the next frame's first pass a link page after the last.
   for (auto [c, cls] : llvm::enumerate(classes))
-    if (cls.linkPage > 1 && !linkSlots[c].empty())
+    if (linkSpacing(c) > 1 && !linkSlots[c].empty())
       length = std::max<int>(length, *linkSlots[c].rbegin() -
                                          *linkSlots[c].begin() +
-                                         int(cls.linkPage));
+                                         int(linkSpacing(c)));
   for (auto &consumer : consumers) {
     if (consumer.cls < 0)
       continue;
@@ -5033,12 +5075,36 @@ unsigned StaticFolder::placeModulo(
     const ReadyWrites &writes, SmallVectorImpl<SmallVector<int>> &slots,
     unsigned below) {
   auto &atReady = writes.atReady;
+  // Why each period failed: the last failure below the period returned is
+  // the constraint that binds it (csf report).
+  std::map<unsigned, std::string> whyFailed;
+  auto noteFail = [&](unsigned period, std::string why) {
+    whyFailed.emplace(period, std::move(why));
+  };
+  lastModuloPeriodFound = 0;
+  llvm::scope_exit keepWhy([&] {
+    if (!lastModuloPeriodFound)
+      return;
+    auto it = whyFailed.lower_bound(lastModuloPeriodFound);
+    moduloBinding = "period " + std::to_string(lastModuloPeriodFound) +
+                    " found, lower bound " + std::to_string(moduloLower);
+    if (it != whyFailed.begin()) {
+      --it;
+      moduloBinding += "; period " + std::to_string(it->first) + " failed: " +
+                       it->second;
+    }
+  });
   // No frame is shorter than a copy's evaluations of it.
   SmallVector<unsigned> evaluations(classes.size(), 0);
   for (auto &node : nodes)
     ++evaluations[node.cls];
+  // Each copy's evaluations, and each ready-cone lane's (its ready passes
+  // apart from its copy's state passes).
+  SmallVector<unsigned> taking(resources(), 0);
+  for (auto &node : nodes)
+    ++taking[resourceOf(node)];
   unsigned lower = 2;
-  for (auto count : evaluations)
+  for (auto count : taking)
     lower = std::max(lower, count);
   // Nor than a paged copy's state passes, each its page apart, nor its
   // page recurrence.
@@ -5048,8 +5114,8 @@ unsigned StaticFolder::placeModulo(
                         paged(c) ? cls.pageLead() + 4 : 0u});
   // Nor than a copy with paged links' passes, each its link page apart.
   for (auto [c, cls] : llvm::enumerate(classes))
-    if (cls.linkPage > 1)
-      lower = std::max(lower, cls.linkPage * evaluations[c]);
+    if (linkSpacing(c) > 1)
+      lower = std::max(lower, linkSpacing(c) * evaluations[c]);
   // Nor than a serialized copy's passes of a kind, each its k apart.
   auto serial = serialSpacing();
   for (auto [c, cls] : llvm::enumerate(classes))
@@ -5153,7 +5219,7 @@ unsigned StaticFolder::placeModulo(
     // List scheduling, a copy's slots taken modulo the frame; an evaluation
     // runs at most one frame late.
     SmallVector<int> slotOf(nodes.size(), -1);
-    std::vector<llvm::BitVector> busy(classes.size(),
+    std::vector<llvm::BitVector> busy(resources(),
                                       llvm::BitVector(period, false));
     // A paged copy's page port, modulo the frame: each state pass holds the
     // slots of its page-in, the page before it and its own: the residues
@@ -5181,7 +5247,7 @@ unsigned StaticFolder::placeModulo(
       if (port.empty())
         return true;
       bool free = true;
-      windowOf(classes[c].linkPage, t,
+      windowOf(linkSpacing(c), t,
                [&](int lo, int hi) { free &= port.find_first_in(lo, hi) < 0; });
       return free;
     };
@@ -5189,14 +5255,14 @@ unsigned StaticFolder::placeModulo(
       auto &port = linkPort[c];
       if (port.empty())
         port.resize(period);
-      windowOf(classes[c].linkPage, t, [&](int lo, int hi) {
+      windowOf(linkSpacing(c), t, [&](int lo, int hi) {
         if (take)
           port.set(lo, hi);
         else
           port.reset(lo, hi);
       });
     };
-    auto spaced = [&](unsigned n) { return classes[nodes[n].cls].linkPage > 1; };
+    auto spaced = [&](unsigned n) { return linkSpacing(nodes[n].cls) > 1; };
     // slr-serialize: each kind of pass of a copy whose link crosses groups
     // holds the k slots up to it, (t - k, t], modulo the frame.
     std::map<std::pair<unsigned, unsigned>, llvm::BitVector> serialPort;
@@ -5266,7 +5332,7 @@ unsigned StaticFolder::placeModulo(
       for (auto [p, latency] : preds[n])
         earliest = std::max(earliest, slotOf[p] + latency);
       unsigned c = nodes[n].cls;
-      auto &taken = busy[c];
+      auto &taken = busy[resourceOf(nodes[n])];
       earliest = firstFree(taken, earliest, period);
       while (earliest < int(2 * period) &&
              ((pages(n) && !pageFree(c, earliest)) ||
@@ -5275,6 +5341,8 @@ unsigned StaticFolder::placeModulo(
         earliest = firstFree(taken, earliest + 1, period);
       if (earliest >= int(2 * period)) {
         fits = false;
+        noteFail(period, classes[c].name + "[" + std::to_string(nodes[n].inst) +
+                             "] past two frames");
         break;
       }
       takeSlot(taken, earliest, period);
@@ -5330,7 +5398,7 @@ unsigned StaticFolder::placeModulo(
         continue;
       // The latest slot in (slotOf[n], latest] the copy leaves free, by
       // blocks of residues from `latest` down.
-      auto &taken = busy[node.cls];
+      auto &taken = busy[resourceOf(node)];
       taken.reset(slotOf[n] % period);
       if (pages(n))
         pageTake(node.cls, slotOf[n], false);
@@ -5385,13 +5453,25 @@ unsigned StaticFolder::placeModulo(
       for (unsigned i = 0; ok && i < cls.threads(); ++i) {
         ok = slots[c * 2 + kState][i] - first(c, i) + minStateGap(cls) <=
              int(period);
+        if (!ok)
+          noteFail(period, "state gap of " + cls.name + "[" + std::to_string(i) +
+                               "]: first " + std::to_string(first(c, i)) +
+                               ", state " +
+                               std::to_string(slots[c * 2 + kState][i]));
       }
     // A late link holds one frame's value: its readers read it before its
     // producer writes the next frame's.
     for (unsigned n = 0; ok && n < nodes.size(); ++n)
       for (auto [p, latency] : preds[n])
-        if (slotOf[n] - slotOf[p] >= int(period))
+        if (ok && slotOf[n] - slotOf[p] >= int(period)) {
           ok = false;
+          noteFail(period, "late link " + classes[nodes[p].cls].name + "[" +
+                               std::to_string(nodes[p].inst) + "] @" +
+                               std::to_string(slotOf[p]) + " -> " +
+                               classes[nodes[n].cls].name + "[" +
+                               std::to_string(nodes[n].inst) + "] @" +
+                               std::to_string(slotOf[n]));
+        }
     // An early link holds two, by frame: the next frame's write lands after
     // its reads of this frame's, and before them in the next.
     for (auto &consumer : consumers) {
@@ -5409,8 +5489,18 @@ unsigned StaticFolder::placeModulo(
                       crossDelay(producer.cls, consumer.cls) +
                       int(splitDelayP(int(piece.producer))) >
                   int(period) ||
-              last(consumer.cls, i) - written >= int(period))
+              last(consumer.cls, i) - written >= int(period)) {
+            if (ok)
+              noteFail(period, "early link " + classes[producer.cls].name + "[" +
+                                   std::to_string(piece.inst) + "] written @" +
+                                   std::to_string(written) + " -> " +
+                                   classes[consumer.cls].name + "[" +
+                                   std::to_string(i) + "] first @" +
+                                   std::to_string(first(consumer.cls, i)) +
+                                   ", last @" +
+                                   std::to_string(last(consumer.cls, i)));
             ok = false;
+          }
         }
     }
     if (!ok)
@@ -5443,11 +5533,62 @@ unsigned StaticFolder::placeModulo(
     for (auto [k, consumer] : llvm::enumerate(consumers))
       if (consumer.cls < 0 &&
           outputSlot[k] + (portFold.on && portFold.consumerPort[k] >= 0 ? 1 : 0) +
-                  envSlack(k, period) > int(period))
+                  envSlack(k, period) > int(period)) {
+        if (ok)
+          noteFail(period, "netlist output " + consumers[k].name + " @" +
+                               std::to_string(outputSlot[k]));
         ok = false;
+      }
     // The least period not ruled out: done; otherwise search below it.
-    if (ok && period <= failed + 1 && !probing)
+    if (ok && period <= failed + 1 && !probing) {
+      lastModuloPeriodFound = period;
+      // The chain to the frame's latest evaluation: each hop the predecessor
+      // that set its slot (slot = its slot + latency), or, where none did, the
+      // copy or lane whose slots it waited for.
+      if (numResources > classes.size() || csfMailboxes) {
+        unsigned n = 0;
+        for (unsigned m = 0; m < nodes.size(); ++m)
+          if (slotOf[m] > slotOf[n])
+            n = m;
+        std::string chain;
+        llvm::raw_string_ostream cs(chain);
+        std::string prevCls;
+        unsigned hops = 0;
+        for (unsigned guard = 0; guard < nodes.size(); ++guard) {
+          auto &node = nodes[n];
+          std::string name = classes[node.cls].name;
+          if (name != prevCls) {
+            if (hops++ < 24)
+              cs << (prevCls.empty() ? "" : " <- ") << name << "["
+                 << node.inst << "]" << (node.pass == kReady ? " ready" : "")
+                 << " @" << slotOf[n];
+            prevCls = name;
+          }
+          int tight = -1;
+          for (auto [q, latency] : preds[n])
+            if (slotOf[q] + latency == slotOf[n])
+              tight = int(q);
+          if (tight < 0) {
+            int earliest = int(classes[node.cls].stages), latest = -1;
+            for (auto [q, latency] : preds[n])
+              if (slotOf[q] + latency > earliest || latest < 0) {
+                earliest = std::max(earliest, slotOf[q] + latency);
+                latest = int(q);
+              }
+            if (hops < 24)
+              cs << " (" << name << "[" << node.inst << "] waited "
+                 << (slotOf[n] - earliest) << " for slots)";
+            if (latest < 0)
+              break;
+            tight = latest;
+            prevCls.clear();
+          }
+          n = unsigned(tight);
+        }
+        csfChain = chain;
+      }
       return logged(period);
+    }
     fitsNow = ok;
   }
   return logged(0);
@@ -6949,6 +7090,203 @@ LogicalResult StaticFolder::planStateInRam() {
   return success();
 }
 
+LogicalResult StaticFolder::planCsf() {
+  readyLanes.assign(classes.size(), 0);
+  laneBase.assign(classes.size(), 0);
+  mailboxSpacing.assign(classes.size(), 1);
+  mailboxFanIn.assign(classes.size(), MailboxFanIn());
+  numResources = classes.size();
+  for (auto &entry : csfReadyCopySpecs) {
+    auto split = StringRef(entry).rsplit(':');
+    unsigned k = 0;
+    if (split.second.getAsInteger(10, k) || k == 0)
+      return netlist.emitError("csf-ready-copies: '")
+             << entry << "' is not <model>:<count>";
+    bool found = false;
+    // A model's copies (`copies`) each get k lanes.
+    for (unsigned c = 0; c < classes.size(); ++c)
+      if (modelOf(c) == split.first) {
+        found = true;
+        readyLanes[c] = std::min(k, classes[c].threads());
+      }
+    if (!found)
+      return netlist.emitError("csf-ready-copies: no model '")
+             << split.first << "'";
+  }
+  for (unsigned c = 0; c < classes.size(); ++c)
+    if (readyLanes[c]) {
+      laneBase[c] = numResources;
+      numResources += readyLanes[c];
+    }
+  if (!csfMailboxes)
+    return success();
+  // A mailbox's row is a RAM's: read a host cycle on, from its output
+  // register (a link taken in its producer's host cycle is forwarded).
+  linkLatency += 1;
+  // Each reader instance's rows of one producer class's mailbox: the
+  // producer instances it reads. With b lanes (banks), row j in lane j mod b
+  // or in lane j / ceil(n / b), the reads of an instance are one access if
+  // its rows fall in distinct lanes under either map; else its pass holds
+  // the port a host cycle a row.
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    std::map<int, SmallVector<std::set<unsigned>>> rows;
+    for (unsigned input = 0; input < cls.inputNames.size(); ++input) {
+      int k = cls.consumerOf[input];
+      if (k < 0)
+        continue;
+      for (unsigned i = 0; i < cls.threads(); ++i)
+        for (auto &piece : consumers[k].pieces[i]) {
+          if (piece.producer < 0)
+            continue;
+          int pc = producers[piece.producer].cls;
+          if (pc < 0 || classes[pc].threads() <= 1)
+            continue;
+          auto &perInst = rows[pc];
+          if (perInst.empty())
+            perInst.resize(cls.threads());
+          perInst[i].insert(piece.inst);
+        }
+    }
+    for (auto &[pc, perInst] : rows) {
+      unsigned most = 1;
+      for (auto &set : perInst)
+        most = std::max<unsigned>(most, set.size());
+      if (most <= 1)
+        continue;
+      unsigned n = classes[pc].threads();
+      unsigned block = (n + most - 1) / most;
+      auto distinct = [&](auto lane) {
+        for (auto &set : perInst) {
+          std::set<unsigned> lanes;
+          for (unsigned j : set)
+            lanes.insert(lane(j));
+          if (lanes.size() != set.size())
+            return false;
+        }
+        return true;
+      };
+      // A lane is a slice of the mailbox row (its own write enable), so a
+      // reader's rows of one pass are its input bits laid side by side: as
+      // many lanes as rows a reader reads, no more ports than its input
+      // width needs.
+      bool banked = distinct([&](unsigned j) { return j % most; }) ||
+                    distinct([&](unsigned j) { return j / block; });
+      // Else a lane per producer instance by greedy coloring of the rows read
+      // together, in at most 2 x `most` lanes (a lane a column group).
+      if (!banked) {
+        std::vector<SmallVector<unsigned>> together(n);
+        for (auto &set : perInst)
+          for (unsigned a : set)
+            for (unsigned b : set)
+              if (a != b)
+                together[a].push_back(b);
+        SmallVector<int> lane(n, -1);
+        banked = true;
+        for (unsigned j = 0; j < n && banked; ++j) {
+          llvm::BitVector used(2 * most);
+          for (unsigned o : together[j])
+            if (lane[o] >= 0)
+              used.set(lane[o]);
+          int free = used.find_first_unset();
+          if (free < 0)
+            banked = false;
+          else
+            lane[j] = free;
+        }
+      }
+      unsigned spacing = banked ? 1 : most;
+      auto &fan = mailboxFanIn[c];
+      if (spacing > mailboxSpacing[c] ||
+          (fan.pcls < 0 || (fan.banked && most > fan.rows))) {
+        fan.pcls = pc;
+        fan.rows = most;
+        fan.banked = banked;
+      }
+      mailboxSpacing[c] = std::max(mailboxSpacing[c], spacing);
+    }
+  }
+  return success();
+}
+
+void StaticFolder::reportCsf(raw_ostream &os) const {
+  if (numResources == classes.size() && !csfMailboxes)
+    return;
+  os << "  csf: " << (numResources - classes.size())
+     << " ready-cone lanes; mailboxes " << (csfMailboxes ? "on" : "off")
+     << ", link latency " << linkLatency << "\n";
+  // What bounds the frame from below, per copy and lane: its evaluations,
+  // its state passes' spacing, its mailbox port's spacing.
+  std::vector<std::pair<uint64_t, std::string>> bounds;
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    unsigned ready = cls.hasReady ? 1 + cls.laterReady.size() : 0;
+    uint64_t own = cls.threads() * (1 + (readyLanes[c] ? 0 : ready));
+    uint64_t bound = std::max<uint64_t>(
+        {own, uint64_t(passSpacing(c)) * cls.threads(),
+         uint64_t(linkSpacing(c)) * own});
+    std::string why;
+    llvm::raw_string_ostream ws(why);
+    ws << cls.name << " (" << cls.threads() << " x " << (1 + ready)
+       << " passes, spacing " << passSpacing(c) << ", mailbox "
+       << linkSpacing(c) << ")";
+    bounds.push_back({bound, why});
+    if (readyLanes[c])
+      bounds.push_back({uint64_t(ready) * ((cls.threads() + readyLanes[c] - 1) /
+                                           readyLanes[c]),
+                        cls.name + " ready lanes x" +
+                            std::to_string(readyLanes[c])});
+  }
+  llvm::sort(bounds, [](auto &a, auto &b) { return a.first > b.first; });
+  if (!moduloBinding.empty())
+    os << "  csf: binding (the highest failed period below the frame's): "
+       << moduloBinding << "\n";
+  if (!csfChain.empty())
+    os << "  csf: chain to the latest evaluation: " << csfChain << "\n";
+  os << "  csf: resource bounds:";
+  for (unsigned k = 0; k < std::min<size_t>(6, bounds.size()); ++k)
+    os << " " << bounds[k].first << " " << bounds[k].second << ";";
+  os << "\n";
+  for (auto [c, fan] : llvm::enumerate(mailboxFanIn))
+    if (fan.pcls >= 0)
+      os << "  csf: mailbox " << classes[c].name << " <- "
+         << classes[fan.pcls].name << ": " << fan.rows << " rows a reader, "
+         << (fan.banked ? "banked" : "spaced") << "\n";
+  // Each class's evaluations' window in the frame (ready and state passes),
+  // for columns time-shared between classes whose windows do not overlap.
+  struct Window {
+    int lo = INT_MAX, hi = INT_MIN;
+  };
+  SmallVector<Window> windows(classes.size());
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    auto add = [&](ArrayRef<int> slots) {
+      for (int s : slots)
+        if (s >= 0) {
+          windows[c].lo = std::min(windows[c].lo, s);
+          windows[c].hi = std::max(windows[c].hi, s);
+        }
+    };
+    add(cls.slot[kState]);
+    add(cls.slot[kReady]);
+    for (auto &later : cls.laterReady)
+      add(later);
+  }
+  unsigned disjoint = 0, pairs = 0;
+  for (unsigned a = 0; a < classes.size(); ++a)
+    for (unsigned b = a + 1; b < classes.size(); ++b) {
+      if (classes[a].threads() <= 1 || classes[b].threads() <= 1 ||
+          windows[a].lo > windows[a].hi || windows[b].lo > windows[b].hi)
+        continue;
+      ++pairs;
+      disjoint += windows[a].hi < windows[b].lo || windows[b].hi < windows[a].lo;
+    }
+  os << "  csf: windows (first..last slot):";
+  for (auto [c, cls] : llvm::enumerate(classes))
+    if (cls.threads() > 1 && windows[c].lo <= windows[c].hi)
+      os << " " << cls.name << " " << windows[c].lo << ".." << windows[c].hi
+         << ";";
+  os << "\n  csf: column time-sharing: " << disjoint << " of " << pairs
+     << " class pairs have disjoint windows\n";
+}
+
 void StaticFolder::reportStateInRam() const {
   std::map<int, std::pair<uint64_t, uint64_t>> bySlr;
   bool any = false;
@@ -7572,6 +7910,7 @@ LogicalResult StaticFolder::schedule() {
   if (moduloTried)
     os << "modulo search: lower bound " << moduloLower << ", " << moduloTried
        << " periods tried (" << moduloTotal << " over the ready-pass search)\n";
+  reportCsf(os);
   if (zeroLatencyLinks) {
     // Each class input fed by a late link, and those taken in its producer's
     // host cycle.
@@ -15234,7 +15573,7 @@ LogicalResult StaticFolder::run() {
         cls.folding->edges->abandon();
   };
   if (failed(parsePages()) || failed(parseStorage()) ||
-      failed(planStateInRam()) || failed(pagesOffChip()) ||
+      failed(planStateInRam()) || failed(pagesOffChip()) || failed(planCsf()) ||
       failed(chooseStages()) || failed(planPassSplits()) ||
       failed(schedule())) {
     abandonFolds();
@@ -15315,6 +15654,8 @@ void FoldStaticPass::runOnOperation() {
                                      stageLevelsClass.end());
   folder.stateInRamReadBits = stateInRamReadBits;
   folder.stateInRamH = stateInRamH;
+  folder.csfReadyCopySpecs.assign(csfReadyCopies.begin(), csfReadyCopies.end());
+  folder.csfMailboxes = csfMailboxes;
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;

@@ -848,6 +848,19 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"stateInRamH", "state-in-ram-h", "unsigned", "0",
            "With state-in-ram and P auto: the most host cycles a copy's "
            "passes may take, instances x P (0: no bound)">,
+    ListOption<"csfReadyCopies", "csf-ready-copies", "std::string",
+               "Constant-shell fold (schedule only): models whose ready passes "
+               "run on k ready-cone copies of their own, as <model>:<k>. "
+               "Instance i's ready passes take lane i mod k; they no longer "
+               "take the slots of the model's copies, whose state passes "
+               "keep them">,
+    Option<"csfMailboxes", "csf-mailboxes", "bool", "false",
+           "Constant-shell fold (schedule only): links are rows of RAM "
+           "mailboxes owned by their reader, one read port each: a link not "
+           "taken in its producer's host cycle takes a host cycle more (the "
+           "RAM's output register), and a reader instance that reads several "
+           "producer instances of one class from rows no lane banking keeps "
+           "apart holds its mailbox port that many slots (its passes spaced)">,
     ListOption<"splitLatency", "split-latency", "std::string",
                "Classes (globs; a copy goes by its class's name) whose results "
                "take n host cycles more, as <glob>:<n>: a copy split over SLRs "
