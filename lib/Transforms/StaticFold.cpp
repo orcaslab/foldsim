@@ -10890,14 +10890,16 @@ void StaticFolder::planClassRing(
     llvm::errs() << "foldsim-fold-static: vmem-rings: " << cls.name
                  << ": read buffers kept (" << why << ")\n";
   };
-  // Every slot within the frame: an overlapped class's tail slots run a
-  // frame late, from its second frame on.
-  auto past = [&](ArrayRef<int> slots) {
-    return llvm::any_of(slots, [&](int s) { return s >= int(ii) || s < 0; });
+  // Positions are one stream (frame g's position p at g * II + p), so an
+  // overlapped class's tail slot (past the frame, run in the next frame's
+  // time) is its slot there too. Its first frame's tail evaluations do not
+  // run; their uses, a frame after a prefetch never made, are skipped as any
+  // first-frame use is.
+  auto before = [&](ArrayRef<int> slots) {
+    return llvm::any_of(slots, [&](int s) { return s < 0; });
   };
-  if (past(cls.slot[kState]) || (cls.hasReady && past(cls.slot[kReady])) ||
-      llvm::any_of(cls.laterReady, [&](auto &l) { return past(l); }))
-    return refuse("overlapped frames");
+  if (before(cls.slot[kState]) || (cls.hasReady && before(cls.slot[kReady])))
+    return refuse("a slot before the frame");
   SmallVector<foldsim::RingInstance> insts(cls.threads());
   for (unsigned i = 0; i < cls.threads(); ++i) {
     insts[i].issue = cls.slot[kState][i];
@@ -14740,7 +14742,7 @@ LogicalResult StaticFolder::buildSim() {
   // after each. Built before the copy, whose response data it is.
   struct RingBuilt {
     Value pref0, pinst0, landed, seen, wv, winst, wdata;
-    /// Each entry's instance high bits (none if an entry is an instance's).
+    /// Each shared entry's instance (none if an entry is an instance's).
     seq::FirMemOp owner;
   };
   std::map<std::pair<unsigned, unsigned>, RingBuilt> ringBuilt;
@@ -14756,25 +14758,26 @@ LogicalResult StaticFolder::buildSim() {
     unsigned iw = std::max(idxWidth, 1u);
     unsigned eb = llvm::Log2_32_Ceil(plan.entries);
     Value at = controls[c].at3;
-    auto entryOf = [&](Value inst) -> Value {
-      return eb ? b.createOrFold<comb::ExtractOp>(b.getIntegerType(eb), inst, 0)
-                : constant(1, 0);
+    // An entry by position (the tables), or by an answer's instance (its
+    // entry, a table by instance).
+    auto byInst = [&](Value inst) -> Value {
+      return eb ? table(b, inst, plan.entryOf, eb) : constant(1, 0);
     };
-    auto bitOf = [&](Value on, Value inst) -> Value {
+    auto bitOf = [&](Value on, Value entry) -> Value {
       unsigned n = plan.entries;
       Value one = n > 1 ? b.createOrFold<comb::ConcatOp>(constant(n - 1, 0), on) : on;
       if (!eb)
         return one;
       return comb::ShlOp::create(
-          b, one, b.createOrFold<comb::ConcatOp>(constant(n - eb, 0), entryOf(inst)));
+          b, one, b.createOrFold<comb::ConcatOp>(constant(n - eb, 0), entry));
     };
     // A frame's last position shown: the uses after it have had their
     // prefetches.
     auto seenNext = backedges.get(b.getI1Type());
     rb.seen = resetReg(seenNext, prefix + "_seen", 0);
     seenNext.setValue(comb::OrOp::create(b, rb.seen, eq(at, ii - 1)));
-    Value uinst2 = idxWidth ? reg(table(b, at, plan.useInst, idxWidth), prefix + "_uinst2")
-                            : constant(1, 0);
+    Value uentry2 = eb ? reg(table(b, at, plan.useEntry, eb), prefix + "_uentry2")
+                       : constant(1, 0);
     Value skip2 = reg(comb::AndOp::create(b, table(b, at, plan.useCross, 1), notOf(rb.seen)),
                       prefix + "_skip2");
     Value skip1 = reg(skip2, prefix + "_skip1");
@@ -14790,36 +14793,35 @@ LogicalResult StaticFolder::buildSim() {
     Value irspValid = body->getArgument(image.firstInput);
     Value irspInst = body->getArgument(image.firstInput + 1);
     Value irspData = body->getArgument(image.firstInput + 2);
+    Value irspEntry = byInst(irspInst);
     auto ring = seq::FirMemOp::create(
         b, seq::FirMemType::get(context, plan.entries, vm.dataWidth, 1),
         /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old, seq::WUW::Undefined,
         b.getStringAttr(prefix), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
         StringAttr{}, Attribute{});
-    seq::FirMemWriteOp::create(b, ring, entryOf(irspInst), hostClock, irspValid,
-                               irspData, Value{});
-    Value data = seq::FirMemReadOp::create(b, ring, entryOf(uinst2), hostClock,
-                                           constant(1, 1));
-    // Landed entries: set by an answer (the entry's owner its instance's
-    // high bits), cleared by the instance's last use of the frame, now.
+    seq::FirMemWriteOp::create(b, ring, irspEntry, hostClock, irspValid, irspData, Value{});
+    Value data = seq::FirMemReadOp::create(b, ring, uentry2, hostClock, constant(1, 1));
+    // Landed entries: set by an answer (the entry's owner its instance),
+    // cleared by the instance's last use of the frame, now.
     Value last0 = resetReg(resetReg(resetReg(table(b, at, plan.useLast, 1), prefix + "_last2", 0),
                                     prefix + "_last1", 0),
                            prefix + "_last0", 0);
-    Value uinst0 = reg(reg(uinst2, prefix + "_uinst1"), prefix + "_uinst0");
+    Value uentry0 = reg(reg(uentry2, prefix + "_uentry1"), prefix + "_uentry0");
     auto landedNext = backedges.get(b.getIntegerType(plan.entries));
     rb.landed = resetReg(landedNext, prefix + "_landed", 0);
     landedNext.setValue(comb::AndOp::create(
-        b, comb::OrOp::create(b, rb.landed, bitOf(irspValid, irspInst)),
-        comb::XorOp::create(b, bitOf(last0, uinst0), constant(plan.entries, ~0ull))));
-    if (idxWidth > eb) {
+        b, comb::OrOp::create(b, rb.landed, bitOf(irspValid, irspEntry)),
+        comb::XorOp::create(b, bitOf(last0, uentry0), constant(plan.entries, ~0ull))));
+    // Shared entries: each one's instance, for the uses' check.
+    if (idxWidth && plan.entries < cls.threads()) {
       rb.owner = seq::FirMemOp::create(
-          b, seq::FirMemType::get(context, plan.entries, idxWidth - eb, 1),
+          b, seq::FirMemType::get(context, plan.entries, idxWidth, 1),
           /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
           b.getStringAttr(prefix + "_owner"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
           StringAttr{}, Attribute{});
       seq::FirMemWriteOp::create(
-          b, rb.owner, entryOf(irspInst), hostClock, irspValid,
-          b.createOrFold<comb::ExtractOp>(b.getIntegerType(idxWidth - eb), irspInst, eb),
-          Value{});
+          b, rb.owner, irspEntry, hostClock, irspValid,
+          b.createOrFold<comb::ExtractOp>(b.getIntegerType(idxWidth), irspInst, 0), Value{});
     }
     // The image's writes: the memory's answers, a host cycle on.
     rb.wv = resetReg(body->getArgument(main.firstInput), prefix + "_wv", 0);
@@ -16800,8 +16802,7 @@ LogicalResult StaticFolder::buildSim() {
           terms.push_back(comb::OrOp::create(b, notOf(pv), notOf(pbit)));
           Value uv = table(b, next, plan.useValid, 1);
           Value uinst = idxWidth ? table(b, next, plan.useInst, idxWidth) : Value();
-          Value entry = eb ? b.createOrFold<comb::ExtractOp>(b.getIntegerType(eb), uinst, 0)
-                           : Value();
+          Value entry = eb ? table(b, next, plan.useEntry, eb) : Value();
           Value seen = comb::OrOp::create(b, rb.seen, eq(posD, ii - 1));
           Value skip = comb::AndOp::create(b, table(b, next, plan.useCross, 1), notOf(seen));
           Value landed = bitAt(rb.landed, plan.entries, entry, eb);
@@ -16812,7 +16813,7 @@ LogicalResult StaticFolder::buildSim() {
                     b, comb::ICmpPredicate::eq,
                     seq::FirMemReadOp::create(b, rb.owner, entry ? entry : constant(1, 0),
                                               hostClock, constant(1, 1)),
-                    b.createOrFold<comb::ExtractOp>(b.getIntegerType(idxWidth - eb), uinst, eb)));
+                    uinst));
           terms.push_back(comb::OrOp::create(b, ValueRange{notOf(uv), skip, landed}, false));
           continue;
         }
@@ -16832,9 +16833,10 @@ LogicalResult StaticFolder::buildSim() {
     }
     for (auto &v : simVirtuals) {
       if (v.image) {
-        // `vmem-rings`: an image's room also holds the writes of the
-        // memory's reads not yet answered, and of those the decisions in
-        // flight may issue.
+        // `vmem-rings`: an image's room: the prefetches of the decisions in
+        // flight (L + 1), the writes of the memory's reads not yet answered
+        // (`out`) and of those the decisions in flight may issue (L + 1), and
+        // an answer's write on its way (1).
         auto &vm = classes[v.cls].virtualMemories[v.k];
         auto &main = simVirtuals[simOf.at({v.cls, v.k})];
         unsigned w = kVirtualFreeWidth;
@@ -16847,7 +16849,7 @@ LogicalResult StaticFolder::buildSim() {
             comb::AddOp::create(b, out, b.createOrFold<comb::ConcatOp>(constant(w - 1, 0), issued)),
             b.createOrFold<comb::ConcatOp>(constant(w - 1, 0), answered)));
         Value need = comb::AddOp::create(
-            b, out, constant(w, virtualRoom(false) + decisionLead() + 2));
+            b, out, constant(w, virtualRoom(false) + 1));
         terms.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge,
                                              body->getArgument(v.firstInput + 3), need));
         continue;

@@ -8,8 +8,9 @@
 // the read its state pass of frame f issued. That answer is written, as it
 // comes, to the instance's row of an image in device memory (a second
 // virtual memory, a row per instance). A lead before the instance's first
-// use of frame f+1, a prefetch reads that row into entry `instance mod R` of
-// the ring, and every use reads the ring there. A read held by the target
+// use of frame f+1, a prefetch reads that row into the instance's entry of
+// the ring (its rank in the prefetches' order, mod R), and every use reads the
+// ring there. A read held by the target
 // (its enable low) issues nothing: the image keeps the instance's last read
 // data, as the target's read register does.
 //
@@ -24,8 +25,8 @@
 // - two instances share an entry only if, frame after frame, the later's
 //   prefetch comes after the earlier's last use (checked over the schedule).
 //
-// This file plans the positions: the prefetch of each instance and the
-// smallest power-of-two R. The hardware is StaticFold.cpp's.
+// This file plans the positions: the prefetch of each instance, its entry,
+// and the fewest entries R. The hardware is StaticFold.cpp's.
 //
 //===----------------------------------------------------------------------===//
 
@@ -63,6 +64,9 @@ struct RingPlan {
   /// Per position: the use there is its instance's last of the frame (its
   /// entry's landed bit clears with it).
   llvm::SmallVector<uint64_t> useLast;
+  /// Per position, the prefetch's and the use's entry; per instance, its
+  /// entry (the image's answers name the instance).
+  llvm::SmallVector<uint64_t> prefEntry, useEntry, entryOf;
   /// The most entries in use at once (prefetched, not yet used last).
   unsigned window = 0;
 };
@@ -71,8 +75,9 @@ struct RingPlan {
 /// `ii` positions: each prefetch `lead` positions before the first use if it
 /// can, at least `minGap` positions after the issue (the pending bit set by
 /// the issue seen by the prefetch's decision) and at least one before the
-/// first use; one prefetch a position; entries the smallest power of two
-/// that no two live instances share, at most `maxEntries`.
+/// first use; one prefetch a position; an instance's entry its rank in the
+/// prefetches' order mod R, R the fewest (at least the window) with which no
+/// two live instances share an entry, at most `maxEntries`.
 RingPlan planRing(llvm::ArrayRef<RingInstance> instances, unsigned ii,
                   unsigned lead, unsigned minGap, unsigned maxEntries);
 

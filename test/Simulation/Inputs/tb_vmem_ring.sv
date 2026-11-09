@@ -2,7 +2,8 @@
 // when bit 1 is low): `vm0` the leaves' RAM (IW 4, 16 rows), `vm1` its image
 // (a row per instance, row port 1 bit), each served by `vmem_model` as in
 // tb_vmem.sv (+lo, +hi, +full, +stall, read first). Prints MATCH or the first
-// difference, PROTOCOL on a read of an instance with one outstanding.
+// difference, PROTOCOL on a read of an instance with one outstanding. The image's
+// answers may take their own latency: +lo1=<n> +hi1=<n> (default +lo/+hi).
 module vmem_model #(parameter IW = 2, AW = 4, ROWS = 1 << AW) (
     input logic clk, rst,
     input int cyc, lo, hi, full,
@@ -124,8 +125,14 @@ module tb;
   initial if (!$value$plusargs("hi=%d", hi)) hi = lo;
   assign rd_row[1][3:1] = 0;
   assign wr_row[1][3:1] = 0;
+  int lo1, hi1;
+  initial begin
+    if (!$value$plusargs("lo1=%d", lo1) && !$value$plusargs("lo=%d", lo1)) lo1 = 1;
+    if (!$value$plusargs("hi1=%d", hi1) && !$value$plusargs("hi=%d", hi1)) hi1 = lo1;
+    if (hi1 < lo1) hi1 = lo1;
+  end
   for (genvar k = 0; k < V; k++) begin : g_vm
-    vmem_model #(.IW(4), .AW(k ? 1 : 4)) model(.clk, .rst, .cyc, .lo, .hi, .full,
+    vmem_model #(.IW(4), .AW(k ? 1 : 4)) model(.clk, .rst, .cyc, .lo(k ? lo1 : lo), .hi(k ? hi1 : hi), .full,
       .rsp_valid(rsp_valid[k]), .rsp_inst(rsp_inst[k]), .rsp_data(rsp_data[k]), .free(free[k]),
       .rd_valid(rd_valid[k]), .rd_inst(rd_inst[k]), .rd_row(rd_row[k][(k ? 1 : 4)-1:0]),
       .wr_valid(wr_valid[k]), .wr_inst(wr_inst[k]), .wr_row(wr_row[k][(k ? 1 : 4)-1:0]),

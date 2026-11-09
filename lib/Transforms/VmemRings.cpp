@@ -119,20 +119,38 @@ RingPlan foldsim::planRing(llvm::ArrayRef<RingInstance> instances, unsigned ii,
     }
     plan.window = std::max(plan.window, live);
   }
-  for (unsigned r = 1; r <= std::max(1u, maxEntries); r *= 2) {
+  // Entries by rank in the prefetches' order (a frame's, from its first
+  // position): consecutive prefetches take consecutive entries, so R a little
+  // over the window suffices but where a frame's wrap meets R.
+  SmallVector<unsigned> byQ(n);
+  std::iota(byQ.begin(), byQ.end(), 0u);
+  llvm::stable_sort(byQ, [&](unsigned x, unsigned y) {
+    return wrap(plan.prefetch[x]) < wrap(plan.prefetch[y]);
+  });
+  SmallVector<unsigned> rank(n);
+  for (auto [k, i] : llvm::enumerate(byQ))
+    rank[i] = k;
+  for (unsigned r = std::max(1u, plan.window); r <= std::min(n, std::max(1u, maxEntries)); ++r) {
     bool clash = false;
-    if (r < n) {
-      for (unsigned x = 0; x < n && !clash; ++x)
-        for (unsigned y = x + r; y < n && !clash; y += r)
-          clash = meet(x, y);
+    for (unsigned a = 0; a < n && !clash; ++a)
+      for (unsigned c = a + r; c < n && !clash; c += r)
+        clash = meet(byQ[a], byQ[c]);
+    if (clash)
+      continue;
+    plan.entries = r;
+    plan.ok = true;
+    plan.entryOf.assign(n, 0);
+    plan.prefEntry.assign(ii + 1, 0);
+    plan.useEntry.assign(ii + 1, 0);
+    for (unsigned i = 0; i < n; ++i)
+      plan.entryOf[i] = rank[i] % r;
+    for (unsigned p = 0; p < ii; ++p) {
+      if (plan.prefValid[p])
+        plan.prefEntry[p] = plan.entryOf[plan.prefInst[p]];
+      if (plan.useValid[p])
+        plan.useEntry[p] = plan.entryOf[plan.useInst[p]];
     }
-    if (!clash) {
-      plan.entries = r;
-      plan.ok = true;
-      return plan;
-    }
-    if (r >= n)
-      break;
+    return plan;
   }
   plan.why = "more than " + std::to_string(maxEntries) +
              " entries (a window of " + std::to_string(plan.window) + ")";

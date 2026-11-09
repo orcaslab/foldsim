@@ -17,6 +17,10 @@
 # RUN: %t/l2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
 # RUN: %t/l2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | FileCheck %s
 # RUN: %t/l2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=200 +full=50 +stall=10 | FileCheck %s
+# The image's answers fast and the memory's slow: a prefetch must wait for its
+# instance's answer (a prefetch that does not reads a stale image row).
+# RUN: %t/l2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+12 +lo=40 +hi=200 +lo1=1 +hi1=2 | FileCheck %s
+# RUN: %t/l2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+13 +lo=1 +hi=100 +lo1=1 +hi1=1 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/l1 --static --virtual-memories ram --vmem-rings 1 Leaf 2> %t/l1.log > /dev/null
 # RUN: FileCheck %s --check-prefix=L1 < %t/l1.log
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/l1/obj %S/Inputs/tb_vmem_ring.sv top.sv %t/l1/foldsim_sim.sv > %t/l1/build.log 2>&1
@@ -58,10 +62,11 @@
 # VH: `define FOLDSIM_VMEM_1_INSTANCES 16
 # CAPVH: `define FOLDSIM_VMEM_COUNT 1
 # No per-instance buffer: a ring of 4 entries, filled by the image's answers,
-# and each entry's owner (the instance's high bits).
+# and each entry's owner (its instance: entries are shared).
 # MLIR-NOT: ram_rdata = seq.firmem
 # MLIR: %ram_ring = seq.firmem 1, 1, old, undefined : <4 x 8, mask 1>
 # MLIR: seq.firmem.write_port %ram_ring[{{.*}}] = %vm1_rsp_data, clock %hostClock enable %vm1_rsp_valid
-# MLIR: %ram_ring_owner = seq.firmem 0, 1, undefined, undefined : <4 x 2, mask 1>
+# MLIR: %ram_ring_owner = seq.firmem 0, 1, undefined, undefined : <4 x 4, mask 1>
+# MLIR: seq.firmem.write_port %ram_ring_owner[{{.*}}] = %vm1_rsp_inst
 # FAST: {{^}}MATCH 196 cycles in 4400 host cycles, H 22.00
 # CHECK: {{^}}MATCH
