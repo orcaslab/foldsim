@@ -1,0 +1,32 @@
+# REQUIRES: verilator
+# Constant-shell fold, `--csf-single-bank`: an early link (a memory of several
+# entries) all of whose reads of a frame come at least 3 host cycles before
+# its producer writes the entry in that frame keeps one bank; the schedule
+# decides link by link, the others keep two. Each design exact against its
+# target, channels stalled or not.
+# - stateless: block RAM links (`--link-block-depth 2`), half of them single;
+# - linkpage: SLR groups and serialized crossings (crossing links keep two);
+# - lanes: pass-split lanes feeding an early output, with bubbles.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/stateless
+# RUN: foldsim --srcs top.f --top Top --out %t/blk --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --compact-links --link-block-depth 2 --csf-single-bank Sm Agu 2>&1 | FileCheck %s --check-prefix=BLK
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/blk/obj %S/Inputs/tb_reset.sv top.sv %t/blk/foldsim_sim.sv > %t/blk/build.log 2>&1
+# RUN: %t/blk/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +stall=0 | FileCheck %s
+# RUN: %t/blk/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +stall=30 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/linkpage
+# RUN: foldsim --srcs top.f --top Top --out %t/s2 --static --nest --modulo --slr-groups --slr-count 2 --slr-assign Unit:0,Reader:1,Top_model:1 --slr-serialize 2 --csf-single-bank Unit Reader 2>&1 | FileCheck %s --check-prefix=LP
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/s2/obj %S/Inputs/tb_reset.sv top.sv %t/s2/foldsim_sim.sv > %t/s2/build.log 2>&1
+# RUN: %t/s2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/s2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/lanes
+# RUN: foldsim --srcs top.f --top Top --out %t/early --static --bubbles --pass-split Leaf:4 --csf-single-bank Leaf 2>&1 | FileCheck %s --check-prefix=LANES
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/early/obj %S/Inputs/tb_late.sv top.sv %t/early/foldsim_sim.sv > %t/early/build.log 2>&1
+# RUN: %t/early/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +bubble=30 +stall=20 | FileCheck %s
+# RUN: %t/early/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +bubble=0 +stall=0 | FileCheck %s
+# The netlists: a single-bank link's memory is as deep as its entries.
+# RUN: FileCheck %s --check-prefix=BLKSIM < %t/blk/foldsim_sim.mlir
+# BLK: csf single-bank 6 (136 bits in one bank), two banks 6
+# LP: csf single-bank 2 (64 bits in one bank), two banks 5
+# LANES: csf single-bank 1 (32 bits in one bank), two banks 2
+# BLKSIM: seq.firmem
+# CHECK: {{^}}MATCH
+# CHECK-NOT: MISMATCH

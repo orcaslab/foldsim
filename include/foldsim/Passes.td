@@ -874,6 +874,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "With csf-mailboxes: the host cycles a mailbox read takes past a "
            "register link's (1: the RAM's output register; 2 with a cascade "
            "or a fabric register after it)">,
+    Option<"csfSingleBank", "csf-single-bank", "bool", "false",
+           "Constant-shell fold: an early link (a memory of several entries) "
+           "all of whose reads of a frame come before its producer writes "
+           "the entry in that frame keeps one bank, not two; the others "
+           "keep two (the schedule decides, link by link)">,
     Option<"csfMailboxes", "csf-mailboxes", "bool", "false",
            "Constant-shell fold (schedule only): links are rows of RAM "
            "mailboxes owned by their reader, one read port each: a link not "
