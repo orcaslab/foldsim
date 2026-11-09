@@ -513,9 +513,9 @@ def frame_options(a):
     if scratch == 'auto':
         # The device's on-chip RAM at the placer's fill: the fold pass takes
         # the other memories it places off it (state-scratch-device-bits).
-        device = region_ram_bits(check_region(a)) if getattr(a, 'static', False) else 0
-        if device:
-            fold += f' state-scratch-device-bits={device}'
+        uram, bram = region_ram_bits(check_region(a)) if getattr(a, 'static', False) else (0, 0)
+        if uram or bram:
+            fold += f' state-scratch-device-bits={uram} state-scratch-device-block-bits={bram}'
     elif scratch is not None:
         fold += f' state-scratch-bits={int(scratch)}'
     if getattr(a, 'state_stream_window', 0):
@@ -875,15 +875,17 @@ def slr_region_sll_budget(path):
 
 
 def region_ram_bits(path):
-    """A region's block and ultra RAM bits at the placer's fill (its
-    placement model's `fill` of uram and bram): 0 without a region."""
+    """A region's ultra and block RAM bits at the placer's fill: the fit
+    check's own limits (foldsim_sll_check.py: the region JSON's placement
+    `fill` of uram and bram), so that the scratch passes it by construction;
+    (0, 0) without a region."""
     if not path:
-        return 0
+        return 0, 0
     region = json.load(open(path))
     fill = region.get('placement', {}).get('fill', {})
     uram = sum(s.get('uram', 0) for s in region.get('slrs', [])) * 288 * 1024
     bram = sum(s.get('ramb36', 0) for s in region.get('slrs', [])) * 36 * 1024
-    return int(uram * fill.get('uram', 1.0) + bram * fill.get('bram', 1.0))
+    return int(uram * fill.get('uram', 1.0)), int(bram * fill.get('bram', 1.0))
 
 
 def v80_region():
