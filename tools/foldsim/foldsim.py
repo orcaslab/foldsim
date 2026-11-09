@@ -483,6 +483,8 @@ def frame_options(a):
         fold += f' state-scratch-bits={a.state_scratch_bits}'
     if getattr(a, 'state_stream_window', 0):
         fold += f' state-stream-window={a.state_stream_window}'
+    if getattr(a, 'state_scratch_whole', False):
+        fold += ' state-scratch-partial=false'
     return fold
 
 
@@ -1494,6 +1496,10 @@ def build_parser():
                          'HBM-eligible stores first, then state rows: whole classes, largest first, while they '
                          'fit); the rest streams from HBM (foldsim-fold-static state-scratch-bits; default '
                          '250,000,000)')
+    ap.add_argument('--state-scratch-whole', action='store_true',
+                    help='with --state-scratch-bits: a PP class past the scratch streams whole (default: the '
+                         'instances the rest of the scratch holds stay resident; foldsim-fold-static '
+                         'state-scratch-partial=false)')
     ap.add_argument('--state-stream-window', type=int, default=0, metavar='N',
                     help='with --state-scratch-bits: a streamed PP class\'s landing window, in instance slots '
                          '(foldsim-fold-static state-stream-window; 0: a RAMB36 deep, 512 / P)')

@@ -877,6 +877,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "fixed landing window, state-stream-window; a paged class as "
            "pages=hbm). A class a storage rule keeps on chip is resident "
            "whatever the budget">,
+    Option<"stateScratchPartial", "state-scratch-partial", "bool", "true",
+           "With state-scratch-bits: a state-in-ram-pp class past the scratch "
+           "keeps the instances the rest of the scratch holds resident (in "
+           "RAMs of their own, a power of two of them) and streams only the "
+           "others, spread over the frame (false: the whole class streams)">,
     Option<"stateStreamWindow", "state-stream-window", "unsigned", "0",
            "With state-in-ram-pp, a class streamed from HBM: the most "
            "instance slots of its landing window (each instance's P rows "

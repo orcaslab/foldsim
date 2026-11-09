@@ -182,6 +182,12 @@ struct Class {
   /// (planStateInRam, for the scratch's placement).
   bool ppHbm = false;
   uint64_t rowStateBits = 0;
+  /// Partly resident (state-scratch-bits' remainder): the instances kept in
+  /// the scratch (0: all stream), and per instance whether it streams and
+  /// its resident index (chooseStreamWindows: spread over the frame).
+  unsigned ppResident = 0;
+  SmallVector<uint8_t> ppStreamed;
+  SmallVector<unsigned> residentSlot;
   /// The PP build's counts (rows, columns, captures, holds, hazards).
   std::string ppReport;
   /// State in RAM with its memories' page rows off chip (`<model>:sir-rows=
@@ -429,6 +435,9 @@ public:
   /// chooseStreamWindows: state rows in HBM).
   uint64_t stateScratchBits = 250000000;
   unsigned stateStreamWindow = 0;
+  /// `state-scratch-partial`: a PP class past the scratch keeps the
+  /// instances the rest holds resident, only the others stream.
+  bool stateScratchPartial = true;
   /// The scratch's bits that folded pipelines' stores (fold-store-hbm's by
   /// size) keep on chip: placed first, before the state rows.
   uint64_t scratchFoldBits = 0;
@@ -453,6 +462,8 @@ public:
     Value hostClock;
     ArrayRef<Value> offChip3;
     Value valid3, inst3, row3;
+    /// Partly resident: whether the pass's instance streams (else null).
+    Value streamed3;
   };
   /// Builds a streamed PP class's HBM rows: a virtual memory a chunk of
   /// columns (at most 4,096 bits), the prefetches' responses written into
@@ -10954,6 +10965,8 @@ LogicalResult StaticFolder::planScratch() {
     unsigned c;
     uint64_t bits;
     bool forced, pp;
+    /// A PP class's bits an instance (its P rows), for a partial residency.
+    uint64_t perInstance = 0;
   };
   SmallVector<Item> items;
   uint64_t forced = 0;
@@ -10981,7 +10994,8 @@ LogicalResult StaticFolder::planScratch() {
       // Its columns: P rows (a power of two) an instance, 72 bits each.
       uint64_t rowsPow = llvm::PowerOf2Ceil(cls.pp);
       uint64_t columns = llvm::divideCeil(llvm::divideCeil(cls.rowStateBits, cls.pp), 72);
-      item.bits = entries * rowsPow * columns * 72;
+      item.perInstance = rowsPow * columns * 72;
+      item.bits = entries * item.perInstance;
       item.pp = true;
     } else if (cls.sir) {
       // State in RAM of P = 1 or paged with masks: resident only.
@@ -11020,15 +11034,42 @@ LogicalResult StaticFolder::planScratch() {
       resident += item->bits;
       continue;
     }
-    streamed += item->bits;
     ++streamedClasses;
-    if (item->pp)
-      cls.ppHbm = true;
-    else
+    if (!item->pp) {
+      streamed += item->bits;
       cls.pagesOffChip = true;
+      llvm::errs() << "foldsim-fold-static: state-scratch: " << cls.name << ": "
+                   << item->bits << " bits of pages stream from HBM\n";
+      continue;
+    }
+    // A PP class: the instances the rest of the scratch holds stay resident
+    // (in RAMs of a power of two of them), the others stream; the streamed
+    // ones a multiple of 16 (of n / 2 for fewer than 32), so that a window
+    // divides them.
+    cls.ppHbm = true;
+    unsigned n = cls.threads();
+    unsigned keepCount = 0;
+    if (stateScratchPartial && item->perInstance) {
+      uint64_t fits = budget / item->perInstance;
+      // The resident RAMs' rows are a power of two of instances.
+      unsigned r = unsigned(std::min<uint64_t>(fits, n));
+      while (r && uint64_t(llvm::PowerOf2Ceil(r)) * item->perInstance > budget)
+        r = 1u << llvm::Log2_32(r);
+      unsigned align = std::max(1u, std::min(16u, n / 2));
+      unsigned s = std::min(n, unsigned(llvm::alignTo(n - r, align)));
+      keepCount = n - s;
+      if (keepCount < 2)
+        keepCount = 0;
+    }
+    cls.ppResident = keepCount;
+    uint64_t kept = keepCount ? uint64_t(llvm::PowerOf2Ceil(keepCount)) * item->perInstance : 0;
+    budget -= kept;
+    resident += kept;
+    streamed += uint64_t(n - keepCount) * item->perInstance;
     llvm::errs() << "foldsim-fold-static: state-scratch: " << cls.name << ": "
-                 << item->bits << " bits of " << (item->pp ? "PP rows" : "pages")
-                 << " stream from HBM\n";
+                 << n - keepCount << " of " << n << " instances' PP rows ("
+                 << uint64_t(n - keepCount) * item->perInstance
+                 << " bits) stream from HBM, " << keepCount << " resident\n";
   }
   llvm::errs() << "foldsim-fold-static: state-scratch: " << stateScratchBits
                << " bits; fold stores " << scratchFoldBits << ", rows resident "
@@ -11043,10 +11084,14 @@ LogicalResult StaticFolder::planScratch() {
 
 void StaticFolder::ppPrefetches(const Class &cls, unsigned w,
                                 SmallVectorImpl<int> &at) const {
-  unsigned n = cls.threads();
-  SmallVector<unsigned> order(n);
-  for (unsigned i = 0; i < n; ++i)
-    order[i] = i;
+  // The streamed instances (all, unless partly resident), in state-pass
+  // order: instance k's slot's previous occupant is the streamed one w
+  // before it.
+  SmallVector<unsigned> order;
+  for (unsigned i = 0; i < cls.threads(); ++i)
+    if (cls.ppStreamed.empty() || cls.ppStreamed[i])
+      order.push_back(i);
+  unsigned n = order.size();
   llvm::sort(order, [&](unsigned x, unsigned y) {
     return cls.slot[kState][x] < cls.slot[kState][y];
   });
@@ -11055,7 +11100,7 @@ void StaticFolder::ppPrefetches(const Class &cls, unsigned w,
     int r = ((k % int(n)) + int(n)) % int(n);
     return cls.slot[kState][order[r]] + f * int(ii);
   };
-  at.assign(n, 0);
+  at.assign(cls.threads(), 0);
   for (unsigned k = 0; k < n; ++k)
     at[order[k]] = stateAt(int(k) - int(w));
 }
@@ -11069,7 +11114,31 @@ LogicalResult StaticFolder::chooseStreamWindows() {
   for (auto &cls : classes) {
     if (!cls.ppHbm)
       continue;
-    unsigned n = cls.threads(), P = cls.pp;
+    unsigned P = cls.pp;
+    // Partly resident: the streamed instances spread over the frame (the
+    // k-th of the copy's state passes streams when (k + 1) s / n passes an
+    // integer, s of n), so that HBM's traffic is spread too.
+    unsigned all = cls.threads();
+    cls.ppStreamed.assign(all, 1);
+    cls.residentSlot.assign(all, 0);
+    if (cls.ppResident) {
+      SmallVector<unsigned> byState(all);
+      for (unsigned i = 0; i < all; ++i)
+        byState[i] = i;
+      llvm::sort(byState, [&](unsigned x, unsigned y) {
+        return cls.slot[kState][x] < cls.slot[kState][y];
+      });
+      uint64_t s = all - cls.ppResident;
+      unsigned resident = 0;
+      for (unsigned k = 0; k < all; ++k) {
+        bool streams = (uint64_t(k + 1) * s) / all > (uint64_t(k) * s) / all;
+        cls.ppStreamed[byState[k]] = streams;
+        if (!streams)
+          cls.residentSlot[byState[k]] = resident++;
+      }
+    }
+    auto streams = [&](unsigned i) { return bool(cls.ppStreamed[i]); };
+    unsigned n = all - cls.ppResident;
     unsigned rowsPow = unsigned(llvm::PowerOf2Ceil(P));
     unsigned cap = stateStreamWindow ? stateStreamWindow
                                      : std::max(1u, 512u / rowsPow);
@@ -11085,7 +11154,9 @@ LogicalResult StaticFolder::chooseStreamWindows() {
       ppPrefetches(cls, w, pf);
       bool ok = true;
       int lead = INT_MAX;
-      for (unsigned i = 0; ok && i < n; ++i) {
+      for (unsigned i = 0; ok && i < all; ++i) {
+        if (!streams(i))
+          continue;
         int s = cls.slot[kState][i], r = s - int(cls.stages);
         // The prefetch pending before its first pass is decided, and the
         // next frame's after its last pass's write (registered once).
@@ -11110,16 +11181,20 @@ LogicalResult StaticFolder::chooseStreamWindows() {
                    << " slots fits the schedule (II " << ii
                    << "): its rows stay on chip\n";
       cls.ppHbm = false;
+      cls.ppResident = 0;
+      cls.ppStreamed.clear();
       continue;
     }
-    // The window's slots: in state-pass order, k mod w.
-    SmallVector<unsigned> order(n);
-    for (unsigned i = 0; i < n; ++i)
-      order[i] = i;
+    // The window's slots: the streamed instances in state-pass order, k
+    // mod w.
+    SmallVector<unsigned> order;
+    for (unsigned i = 0; i < all; ++i)
+      if (streams(i))
+        order.push_back(i);
     llvm::sort(order, [&](unsigned x, unsigned y) {
       return cls.slot[kState][x] < cls.slot[kState][y];
     });
-    cls.windowSlot.assign(n, 0);
+    cls.windowSlot.assign(all, 0);
     for (unsigned k = 0; k < n; ++k)
       cls.windowSlot[order[k]] = k % cls.pageWindow;
     // (The columns as planned; the packing may add a few.)
@@ -11135,7 +11210,8 @@ LogicalResult StaticFolder::chooseStreamWindows() {
     }
     hbmBits += bits;
     llvm::errs() << "foldsim-fold-static: state-stream: " << cls.name << ": P "
-                 << P << ", " << n << " instances, a window of "
+                 << P << ", " << n << " of " << all
+                 << " instances streamed, a window of "
                  << cls.pageWindow << " slots (" << cls.pageWindow * rowsPow
                  << " rows x " << columns << " columns), " << bits
                  << " HBM bits a frame\n";
@@ -11169,7 +11245,7 @@ void StaticFolder::ppStreamRows(const Class &cls,
   ppPrefetches(cls, cls.pageWindow, pf);
   auto wrap = [&](int pos) { return unsigned(((pos % int(ii)) + int(ii)) % int(ii)); };
   for (unsigned i = 0; i < cls.threads(); ++i)
-    for (unsigned j = 0; j < cls.pp; ++j) {
+    for (unsigned j = 0; j < cls.pp && cls.ppStreamed[i]; ++j) {
       unsigned pos = wrap(pf[i] + int(j));
       assert(!readRow[pos] && "two prefetch reads at a position");
       readRow[pos] = 1;
@@ -11254,6 +11330,12 @@ LogicalResult StaticFolder::buildPPStream(
   // (pprow3 is ceil(log2 P) bits, the rows' index rowBits.)
   if (unsigned have = unsigned(hw::getBitWidth(wrow0.getType())); have < rowBits)
     wrow0 = b.createOrFold<comb::ConcatOp>(constant(rowBits - have, 0), wrow0);
+  if (ports.streamed3) {
+    Value str0 = ports.streamed3;
+    for (unsigned d = 3; d-- > 0;)
+      str0 = reg(str0, "pps_wstr" + Twine(d));
+    wvalid0 = comb::AndOp::create(b, wvalid0, str0);
+  }
   Value wvalidQ = resetReg(wvalid0, "pps_wr_valid");
   Value winstQ = reg(instOf(winst0, wrow0), "pps_wr_inst");
   // The prefetch reads, three ahead: only within a prefetch that started
@@ -13251,7 +13333,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         row.push_back(zero1);
     // Each column's parts: per row, its registers' next-value bits there.
     struct Column {
-      seq::FirMemOp memory;
+      seq::FirMemOp memory, resident;
       Value out;
       SmallVector<SmallVector<std::pair<unsigned, Value>>> parts;
     };
@@ -13262,6 +13344,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     // Controls of a group of 16 columns.
     struct Group {
       Value readAddr, wValid, wAddr, wRow1;
+      /// Partly resident (Class::ppResident): the resident RAM's read and
+      /// write addresses, and whether the pass's instance streams, at the
+      /// read data (stage 1) and at the write (stage 0).
+      Value resRead, resWrite, str1, str0;
     };
     SmallVector<Group> groups;
     auto keepReg = [&](Value v, const Twine &name) -> Value {
@@ -13270,11 +13356,32 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     // Streamed: each pass's window slot (its instance's), three ahead.
     unsigned slotsPow = hbm ? unsigned(llvm::PowerOf2Ceil(cls.pageWindow)) : 0;
     Value ppSlot3 = hbm ? ppStreamSlot(cls, b, ppInst3) : Value();
+    // Partly resident: the resident instances' rows in RAMs of their own
+    // ({resident index, row}, as on chip), the streamed ones' in the window;
+    // the column's read data the pass's instance's, a host cycle before its
+    // output register.
+    bool partial = hbm && cls.ppResident;
+    unsigned resPow = partial ? unsigned(llvm::PowerOf2Ceil(cls.ppResident)) : 0;
+    Value res3, str3;
+    if (partial) {
+      SmallVector<uint64_t> resRows(entries, 0), strRows(entries, 0);
+      for (unsigned i = 0; i < threads; ++i) {
+        resRows[i] = cls.residentSlot[i];
+        strRows[i] = cls.ppStreamed[i];
+      }
+      res3 = table(b, ppInst3, resRows, std::max(1u, llvm::Log2_32_Ceil(resPow)));
+      str3 = table(b, ppInst3, strRows, 1);
+    }
     for (unsigned c = 0; c < columns; ++c) {
       if (c % 16 == 0) {
         Group g;
         std::string prefix = ("pp_g" + Twine(c / 16)).str();
         Value row2 = keepReg(ppRow3, prefix + "_rrow2");
+        if (partial) {
+          Value r2 = keepReg(res3, prefix + "_rres2");
+          g.resRead = resPow > 1 ? b.createOrFold<comb::ConcatOp>(r2, row2) : row2;
+          g.str1 = keepReg(keepReg(str3, prefix + "_rstr2"), prefix + "_rstr1");
+        }
         g.readAddr = row2;
         if (hbm && slotsPow > 1)
           g.readAddr = b.createOrFold<comb::ConcatOp>(
@@ -13294,6 +13401,16 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           g.wAddr = b.createOrFold<comb::ConcatOp>(
               keepReg(inst1, prefix + "_winst0"), g.wAddr);
         }
+        if (partial) {
+          Value r0 = keepReg(keepReg(keepReg(res3, prefix + "_wres2"),
+                                     prefix + "_wres1"),
+                             prefix + "_wres0");
+          Value wrow0 = keepReg(g.wRow1, prefix + "_wresrow0");
+          g.resWrite = resPow > 1 ? b.createOrFold<comb::ConcatOp>(r0, wrow0) : wrow0;
+          g.str0 = keepReg(keepReg(keepReg(str3, prefix + "_wstr2"),
+                                   prefix + "_wstr1"),
+                           prefix + "_wstr0");
+        }
         groups.push_back(g);
       }
       auto &col = cols[c];
@@ -13307,6 +13424,21 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       setRamStyle(col.memory, kind);
       Value data = seq::FirMemReadOp::create(b, col.memory, groups.back().readAddr,
                                              hostClock, one());
+      if (partial) {
+        auto resType = seq::FirMemType::get(
+            context, uint64_t(resPow) * rowsPow, 72,
+            masked ? std::optional<size_t>(lanes) : std::optional<size_t>(1));
+        col.resident = seq::FirMemOp::create(
+            b, resType, /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old,
+            seq::WUW::Undefined, b.getStringAttr("pp_res" + Twine(c)),
+            hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+        setRamStyle(col.resident,
+                    cls.sirStyle.empty() ? StringRef("block") : StringRef(cls.sirStyle));
+        Value resData = seq::FirMemReadOp::create(b, col.resident,
+                                                  groups.back().resRead, hostClock,
+                                                  one());
+        data = comb::MuxOp::create(b, groups.back().str1, data, resData);
+      }
       col.out = seq::FirRegOp::create(b, data, hostClock,
                                       b.getStringAttr("pp_col" + Twine(c) + "_out"));
     }
@@ -13376,8 +13508,16 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       Value mask = masked ? pick(masks) : Value();
       Value enable = g.wValid;
       if (hbm) {
-        // To HBM, from the pass: the column's data and lane enables.
+        // To HBM, from the pass: the column's data and lane enables; partly
+        // resident, a resident instance's into its RAM.
         streamWrites.push_back({data, mask});
+        if (partial)
+          seq::FirMemWriteOp::create(
+              b, col.resident, g.resWrite, hostClock,
+              comb::AndOp::create(
+                  b, enable,
+                  comb::XorOp::create(b, g.str0, hw::ConstantOp::create(b, i1, 1))),
+              data, mask);
         continue;
       }
       if (masked && lanes == 1) {
@@ -13392,7 +13532,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       for (auto &col : cols)
         memories.push_back(col.memory);
       PPStreamPorts ports{copy, body, hostClock, offChip3, ppValid3, ppInst3,
-                          ppRow3};
+                          ppRow3, str3};
       if (failed(buildPPStream(cls, b, ports, memories, streamWrites, lanes,
                                pageRequests)))
         return failure();
@@ -17126,6 +17266,8 @@ LogicalResult StaticFolder::buildSim() {
         // in (the pending bits are the slots').
         SmallVector<uint64_t> fetchRow(ii + 1, 0), fetchInst(ii + 1, 0);
         for (unsigned i = 0; i < threads; ++i) {
+          if (!cls.ppStreamed[i])
+            continue;
           int f = cls.slot[kState][i] - int(cls.stages);
           unsigned pos = unsigned(((f % int(ii)) + int(ii)) % int(ii));
           fetchRow[pos] = 1;
@@ -17860,6 +18002,7 @@ void FoldStaticPass::runOnOperation() {
   folder.ppAddressFanout = std::max(1u, unsigned(stateInRamPPFanout));
   folder.stateScratchBits = stateScratchBits;
   folder.stateStreamWindow = stateStreamWindow;
+  folder.stateScratchPartial = stateScratchPartial;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
   folder.linkHbmShift = linkHbmShift;
