@@ -1,0 +1,38 @@
+# REQUIRES: verilator
+# State in RAM with its memories' rows off chip (--state-in-ram <model>::<P>,
+# --storage <model>:sir-rows=hbm): the class's registers in on-chip page RAM
+# rows (P a register's row a pass), its memories made rows (memoriesAsRows) in
+# off-chip pages behind foldsim_vmem controllers, one page count and the
+# off-chip schedule for both (the on-chip pages fetched a lead before the state
+# pass, the off-chip ones from the state pass before; the state pass waits for
+# them). Against the target (Inputs/tb_pages.sv), from zero state, the leaves of
+# Driver/Inputs/sirrows: P 2 at response latency 1, at 1-60 with stalls and the
+# controllers out of room, P 3 in 32-bit columns (two virtual memories) with
+# bubbles and a modulo schedule, two copies, nested sequencers with a short lead.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/sirrows
+# RUN: foldsim --srcs top.f --top Top --out %t/p2 --static --state-in-ram Leaf::2 --storage Leaf:sir-rows=hbm Leaf > %t/p2.log 2>&1
+# RUN: FileCheck %s --check-prefix=P2 < %t/p2.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/p2 -Mdir %t/p2/obj %S/Inputs/tb_pages.sv top.sv %t/p2/foldsim_sim.sv > %t/p2/build.log 2>&1
+# RUN: %t/p2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/p2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/p3 --static --state-in-ram Leaf::3 --storage Leaf:sir-rows=hbm --page-hbm-column-bits 32 --bubbles --modulo Leaf > %t/p3.log 2>&1
+# RUN: FileCheck %s --check-prefix=P3 < %t/p3.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/p3 -DBUBBLES -DVM1 -Mdir %t/p3/obj %S/Inputs/tb_pages.sv top.sv %t/p3/foldsim_sim.sv > %t/p3/build.log 2>&1
+# RUN: %t/p3/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/c2 --static --state-in-ram Leaf::2 --storage Leaf:sir-rows=hbm --copies Leaf:2 --zero-latency-links --zero-latency-chains Leaf > %t/c2.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/c2 -DVM1 -Mdir %t/c2/obj %S/Inputs/tb_pages.sv top.sv %t/c2/foldsim_sim.sv > %t/c2/build.log 2>&1
+# RUN: %t/c2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=30 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --state-in-ram Leaf::4 --storage Leaf:sir-rows=hbm --nest --short-lead --bubbles Leaf > %t/nest.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/nest -DBUBBLES -Mdir %t/nest/obj %S/Inputs/tb_pages.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=1 +hi=20 +bubble=20 +stall=20 | FileCheck %s
+# Errors: sir-rows at P 1 (its rows are pages), sir-rows of another kind.
+# RUN: not foldsim --srcs top.f --top Top --out %t/e1 --static --state-in-ram Leaf::1 --storage Leaf:sir-rows=hbm Leaf 2>&1 | FileCheck %s --check-prefix=E1
+# RUN: not foldsim --srcs top.f --top Top --out %t/e2 --static --state-in-ram Leaf::2 --storage Leaf:sir-rows=ultra Leaf 2>&1 | FileCheck %s --check-prefix=E2
+# P2: state-in-ram: Leaf: memories' rows off chip (hbm), the registers on chip
+# P2: pages Leaf: p 2, 3 registers, 181 bits {{.*}}page RAMs 8 rows x {{[0-9]+}} bits in 1 columns
+# P2: pages Leaf: p 2, 17 registers, 136 bits (with 1 memories' rows, 128 bits){{.*}}off chip: 1 virtual memories of 8 rows
+# P3: off chip: 2 virtual memories
+# E1: sir-rows needs P > 1
+# E2: storage: sir-rows takes hbm, not 'ultra'
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL

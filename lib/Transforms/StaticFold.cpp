@@ -162,6 +162,13 @@ struct Class {
   /// is built as pages, `page` = P, with masks), and its RAM style.
   unsigned sir = 0;
   std::string sirStyle;
+  /// State in RAM with its memories' page rows off chip (`<model>:sir-rows=
+  /// hbm`): the registers in on-chip pages, the rows in off-chip pages, one
+  /// page count and schedule (the class is scheduled as off chip).
+  bool sirMixed = false;
+  /// The registers memoriesAsRows made of memories (their rows, read address
+  /// and read data registers).
+  DenseSet<Operation *> rowRegs;
   bool sirLogged = false;
   /// State in RAM: its RAM primitives a copy (RAMB36, URAM288), as planned.
   uint64_t sirBrams = 0, sirUrams = 0;
@@ -6593,6 +6600,7 @@ StaticFolder::memoriesAsRows(Class &cls, const DenseSet<Operation *> &ready,
       nexts.push_back(edges.get(rowType));
       rows.push_back(seq::FirRegOp::create(b, nexts.back(), clock,
                                            b.getStringAttr(name + "_row" + Twine(e))));
+      cls.rowRegs.insert(rows.back().getDefiningOp());
     }
     SmallVector<Value> next(rows.begin(), rows.end());
     // A registered read, as the target's: a memory reading old data
@@ -6617,12 +6625,14 @@ StaticFolder::memoriesAsRows(Class &cls, const DenseSet<Operation *> &ready,
           auto addrNext = edges.get(read.getAddress().getType());
           Value addr = seq::FirRegOp::create(b, addrNext, clock,
                                              b.getStringAttr(name + "_raddr"));
+          cls.rowRegs.insert(addr.getDefiningOp());
           outputs.push_back({read, addrNext, addr});
           data = rowAt(rows, addr);
         } else if (registered) {
           auto outNext = edges.get(rowType);
           data = seq::FirRegOp::create(b, outNext, clock,
                                        b.getStringAttr(name + "_rdata"));
+          cls.rowRegs.insert(data.getDefiningOp());
           outputs.push_back({read, outNext, data});
         } else {
           if (depth == 1) {
@@ -6835,6 +6845,9 @@ LogicalResult StaticFolder::planStateInRam() {
           << (style == "ultra" ? cls.sirUrams : cls.sirBrams)
           << (style == "ultra" ? " URAM288" : " RAMB36") << " a copy, "
           << threads * p << " host cycles a copy's passes)\n";
+    if (p == 1 && storageFor(cls, "sir-rows", /*reg=*/false, 0))
+      return netlist.emitError("state-in-ram: ")
+             << cls.name << ": sir-rows needs P > 1 (its rows are pages)";
     if (p > 1) {
       // Built as pages of the row's bits, on chip, with masks: every row read
       // into the capture registers (the fetch buffer) and the evaluation on
@@ -6842,6 +6855,12 @@ LogicalResult StaticFolder::planStateInRam() {
       // write-back registers' rows written one a host cycle through a P:1
       // select, about ceil(P / 4) LUTs a row bit.
       cls.page = p;
+      // `<model>:sir-rows=hbm`: its memories' page rows off chip.
+      if (auto *rows = storageFor(cls, "sir-rows", /*reg=*/false, 0)) {
+        cls.sirMixed = true;
+        log() << "memories' rows off chip (" << rows->kind
+              << "), the registers on chip\n";
+      }
       uint64_t select = rowBits * llvm::divideCeil(p, 4);
       log() << "0 hazard registers, " << bits << " capture bits, " << bits
             << " write-back bits, write select ~" << select << " LUTs\n";
@@ -6934,7 +6953,8 @@ void StaticFolder::chooseWindows() {
   for (auto &cls : classes) {
     cls.pageWindow = 0;
     cls.windowSlot.clear();
-    if (!cls.page || !cls.pagesOffChip || !pageHbmWindow || cls.threads() < 2)
+    if (!cls.page || !cls.pagesOffChip || !pageHbmWindow || cls.threads() < 2 ||
+        cls.sirMixed)
       continue;
     // The copy's state passes in order, and each instance's place in it.
     unsigned n = cls.threads();
@@ -6988,6 +7008,9 @@ LogicalResult StaticFolder::pagesOffChip() {
       if (rule.model == model && !rule.regs && rule.store == "pages" &&
           rule.kind == "hbm")
         cls.pagesOffChip = cls.page > 0 && !cls.sir;
+    // State in RAM with its rows off chip: scheduled as off chip.
+    if (cls.sirMixed)
+      cls.pagesOffChip = cls.page > 0;
   }
   return success();
 }
@@ -8552,9 +8575,12 @@ LogicalResult StaticFolder::parseStorage() {
       return netlist.emitError("storage: '")
              << spec << "' is not <model>:<store>=<kind>";
     // `hbm`: a paged model's page word kept off chip (`pages` only).
-    if (kind == "hbm" && store != "pages")
+    if (kind == "hbm" && store != "pages" && store != "sir-rows")
       return netlist.emitError("storage: 'hbm' is for a model's pages, not '")
-             << store << "'";
+             << store << "' (or a state-in-ram class's memory rows, sir-rows)";
+    if (store == "sir-rows" && kind != "hbm")
+      return netlist.emitError("storage: sir-rows takes hbm, not '") << kind
+                                                                     << "'";
     if (!llvm::is_contained({"registers", "distributed", "block", "ultra", "hbm"},
                             kind))
       return netlist.emitError("storage: '")
@@ -9491,7 +9517,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // With a window, the fetch from it too, by slot.
   unsigned windowWidth =
       cls.pageWindow > 1 ? llvm::Log2_32_Ceil(cls.pageWindow) : 1;
-  if (cls.page && !cls.pagesOffChip) {
+  if (cls.page && (!cls.pagesOffChip || cls.sirMixed)) {
     addPort("fetch3", IntegerType::get(context, 1), true);
     addPort("finst3", IntegerType::get(context, idxWidth), true);
   } else if (cls.page && cls.pageWindow) {
@@ -9573,7 +9599,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   Value inst3 = threads > 1 ? body->getArgument(2) : Value();
   bool offChip = cls.page && cls.pagesOffChip;
   bool window = offChip && cls.pageWindow;
-  bool fetches = cls.page && (!offChip || window);
+  bool fetches = cls.page && (!offChip || window || cls.sirMixed);
   Value fetch3 = fetches ? body->getArgument(3) : Value();
   Value finst3 = fetches ? body->getArgument(4) : Value();
   // Off chip: [read, instance, page, write, write page], three ahead.
@@ -10264,6 +10290,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     /// With page masks, the enable it is written under, registered at the
     /// state pass (null: written every state pass).
     Value enable;
+    /// A memory's row (Class::rowRegs): off chip in a mixed class.
+    bool row = false;
   };
   SmallVector<PagedReg> pagedRegs;
   // State in RAM, P = 1 (`state-in-ram`): each written register's value (a
@@ -10434,7 +10462,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         backNext.setValue(comb::MuxOp::create(b, deferLoad ? deferWen : region.state,
                                               next, back));
         pagedRegs.push_back({reg.getResult(), placeholder, unsigned(width),
-                             back, reg.getName().str(), enable});
+                             back, reg.getName().str(), enable, cls.rowRegs.contains(reg)});
         value = placeholder;
       } else {
         if (cls.page && !write.holds) {
@@ -10869,7 +10897,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   //   page j is written a host cycle + j after.
   // The schedule spaces a copy's state passes a page apart and fetches each
   // a page before it, so neither buffer is overwritten before it is used.
-  if (!pagedRegs.empty()) {
+  auto buildPages = [&](SmallVector<PagedReg> &pagedRegs,
+                        bool offChip) -> LogicalResult {
+    bool window = offChip && cls.pageWindow;
     unsigned p = cls.page;
     // `page-write-gate-pages`: the first n pages of a gated class gated.
     unsigned gatedPages = p;
@@ -11446,7 +11476,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                            : 0;
     os << "  pages " << cls.name << ": p " << p << ", " << pagedRegs.size()
        << " registers, " << pagedBits << " bits";
-    if (rowMemories.first)
+    if (rowMemories.first && (!cls.sirMixed || offChip))
       os << " (with " << rowMemories.first << " memories' rows, "
          << rowMemories.second << " bits)";
     if (masked)
@@ -11466,6 +11496,21 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
        << keptBits << " bits; state passes " << threads << " x " << p << " = "
        << threads * p << ", ports bound " << bound << "\n";
     pageReport += os.str();
+    return success();
+  };
+  if (!pagedRegs.empty()) {
+    if (cls.sirMixed) {
+      // Mixed: the registers on chip, the memories' rows off chip.
+      SmallVector<PagedReg> onChip, rows;
+      for (auto &reg : pagedRegs)
+        (reg.row ? rows : onChip).push_back(reg);
+      if (!onChip.empty() && failed(buildPages(onChip, false)))
+        return failure();
+      if (!rows.empty() && failed(buildPages(rows, true)))
+        return failure();
+    } else if (failed(buildPages(pagedRegs, offChip))) {
+      return failure();
+    }
   } else if (cls.page) {
     pageReport += "  pages " + cls.name + ": p " + std::to_string(cls.page) +
                   ", 0 registers; kept " + std::to_string(keptRegs) +
@@ -12256,7 +12301,7 @@ LogicalResult StaticFolder::buildSim() {
       ctl.inst = reg(ctl.inst1, prefix + "_inst0");
     }
     auto wrap = [&](int pos) { return unsigned(((pos % int(ii)) + int(ii)) % int(ii)); };
-    if (cls.page && !cls.pagesOffChip) {
+    if (cls.page && (!cls.pagesOffChip || cls.sirMixed)) {
       // Each state pass's page-in, a page before it in the position stream
       // (in the frame before for a slot within the page of the frame's start).
       SmallVector<uint64_t> fetchRow(ii + 1, 0), finstRow(ii + 1, 0);
@@ -12269,7 +12314,8 @@ LogicalResult StaticFolder::buildSim() {
       }
       ctl.fetch3 = table(b, at, fetchRow, 1);
       ctl.finst3 = table(b, at, finstRow, idxWidth);
-    } else if (cls.page) {
+    }
+    if (cls.page && cls.pagesOffChip) {
       // Off chip: page j of each state pass's instance read at the fetch's
       // j-th position, and written at the j-th after the state pass.
       unsigned pageBits = std::max(
@@ -12561,7 +12607,7 @@ LogicalResult StaticFolder::buildSim() {
     SmallVector<Value> operands{hostClock, controls[c].state3};
     if (cls.threads() > 1)
       operands.push_back(controls[c].inst3);
-    if (cls.page && (!cls.pagesOffChip || cls.pageWindow)) {
+    if (cls.page && (!cls.pagesOffChip || cls.pageWindow || cls.sirMixed)) {
       operands.push_back(controls[c].fetch3);
       operands.push_back(controls[c].finst3);
     }
