@@ -485,8 +485,6 @@ def frame_options(a):
         fold += ' csf-mailboxes'
         if getattr(a, 'csf_mailbox_latency', 1) != 1:
             fold += f' csf-mailbox-latency={a.csf_mailbox_latency}'
-    if getattr(a, 'csf_ready_copies', ''):
-        fold += f' csf-ready-copies={a.csf_ready_copies}'
     return fold
 
 
@@ -1508,9 +1506,6 @@ def build_parser():
                          '(foldsim-fold-static csf-mailboxes)')
     ap.add_argument('--csf-mailbox-latency', type=int, default=1, metavar='N',
                     help='with --csf-mailboxes: the host cycles a mailbox read takes past a register link\'s')
-    ap.add_argument('--csf-ready-copies', default='', metavar='MODEL:K,...',
-                    help='constant-shell fold, schedule only: ready passes on k ready-cone lanes '
-                         '(foldsim-fold-static csf-ready-copies)')
     ap.add_argument('--state-in-ram-h', type=int, default=0, metavar='N',
                     help='with --state-in-ram and P auto: the most host cycles a copy\'s passes take '
                          '(instances x P; foldsim-fold-static state-in-ram-h; 0: no bound)')
