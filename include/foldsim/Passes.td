@@ -1000,6 +1000,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "all of whose reads of a frame come before its producer writes "
            "the entry in that frame keeps one bank, not two; the others "
            "keep two (the schedule decides, link by link)">,
+    Option<"csfMailboxHbmLead", "csf-mailbox-hbm-lead", "unsigned", "112",
+           "With csf-mailbox-hbm: the most positions a mailbox stream's row "
+           "request precedes its landing (the HBM round trip at its worst, "
+           "80 host cycles, the decision lead and a margin); each stream "
+           "takes less where the schedule leaves its reader instances less "
+           "room (all but the tenth with the least), the others on chip. "
+           "Its landing slots are pow2(lead + 8), whatever the instances">,
     Option<"csfMailboxHbm", "csf-mailbox-hbm", "bool", "false",
            "Constant-shell fold: early links whose producer instances are "
            "each read by one reader instance (chain self-links aside) kept "

@@ -70,6 +70,20 @@
 # RUN: %t/h24/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 | FileCheck %s
 # RUN: %t/h24/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
 # RUN: %t/h24/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=1 +hi=60 | FileCheck %s
+# A stream member that carries some reader instances alone (the others at
+# the frame's wrap read an on-chip link of their own rows), one of whose
+# on-chip rests takes the producer's write in its slot or forwards it past
+# the read register (its hits masked to its own instances): linkhbm's
+# Unit/Reader with csf-mailbox-hbm, exact with latencies 1 to 80, stalls and
+# bubbles. (The masks are by construction: no false hit arises here, and
+# none in the synthetic designs tried.)
+# RUN: cd %S/../Driver/Inputs/linkhbm
+# RUN: foldsim --srcs top.f --top Top --out %t/pm --static --nest --modulo --compact-links --share-links --staged-links --zero-latency-links --zero-latency-chains --bubbles --csf-mailbox-hbm Unit Reader 2>&1 | FileCheck %s --check-prefix=PM
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/pm -DVM1 -DVM2 -DBUBBLES -Mdir %t/pm/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/pm/foldsim_sim.sv > %t/pm/build.log 2>&1
+# RUN: %t/pm/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/pm/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
+# RUN: %t/pm/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=5 +hi=80 +bubble=30 | FileCheck %s
+# PM: hbm 3 (3 of some reader instances, 1 with the rest's takes or forwards masked)
 # HBM: II = 40
 # HII: MATCH 196 cycles in 7966 host cycles, H 39.83
 # HBMS: link streams: 2 streams, 12 links, 80 bits

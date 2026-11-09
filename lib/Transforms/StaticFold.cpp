@@ -552,6 +552,10 @@ public:
   bool csfMailboxBuilder = false;
   /// `csf-mailbox-hbm`: reader-indexed mailboxes in HBM (layoutMailboxStreams).
   bool csfMailboxHbm = false;
+  /// `csf-mailbox-hbm-lead`: the most positions a csf-mailbox-hbm stream's
+  /// request precedes its landing (the HBM round trip at the worst latency
+  /// and a margin; less where the schedule leaves less room).
+  unsigned csfMailboxHbmLead = 112;
   /// The links `csf-mailbox-builder` offers (CsfMailboxes.h), keyed by
   /// (consumer, piece's low bit, producer, producer's low bit), and their
   /// plans.
@@ -4027,13 +4031,13 @@ void StaticFolder::keepStreamMembers(const std::vector<LinkUse> &uses,
     rooms.push_back({it, most, least, late, &use, imost, ileast, ilate});
   }
   for (auto &st : linkStreams) {
-    st.lead = linkHbmLead;
+    st.lead = st.twoSets ? csfMailboxHbmLead : linkHbmLead;
     st.kept = 0;
     st.dropped = 0;
     st.readRows = 0;
   }
   // A twoSets stream (csf-mailbox-hbm) keeps the reader instances with
-  // room, each member those alone: its lead is kLinkHbmLead or less, the
+  // room, each member those alone: its lead is csf-mailbox-hbm-lead or less, the
   // room of all but the tenth of its instances with the least (at least
   // linkHbmMinLead()).
   std::map<unsigned, SmallVector<int>> instRooms;
@@ -17344,7 +17348,7 @@ LogicalResult StaticFolder::buildSim() {
            lateReads = 0, forwardedLate = 0, compactReads = 0, stagedReads = 0,
            syncReads = 0, earlyReads = 0, pagedReads = 0, streamReads = 0,
            stagedDirectReads = 0, singleReads = 0, doubleReads = 0,
-           partialStreamReads = 0;
+           partialStreamReads = 0, partialMaskedReads = 0;
   uint64_t singleBits = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
@@ -18374,6 +18378,8 @@ LogicalResult StaticFolder::buildSim() {
         SmallVector<uint64_t> others(ph.mine.size());
         for (size_t i = 0; i < others.size(); ++i)
           others[i] = !ph.mine[i];
+        partialMaskedReads +=
+            bool(sourceNow[index].first) || !sourceAfter[index].empty();
         if (sourceNow[index].first)
           sourceNow[index].first = comb::AndOp::create(
               b, sourceNow[index].first, table(b, ctl.inst, others, 1));
@@ -18785,7 +18791,8 @@ LogicalResult StaticFolder::buildSim() {
     if (streamReads)
       os << "; hbm " << streamReads;
     if (partialStreamReads)
-      os << " (" << partialStreamReads << " of some reader instances)";
+      os << " (" << partialStreamReads << " of some reader instances, "
+         << partialMaskedReads << " with the rest's takes or forwards masked)";
     os << "\n";
     reportPageEngines(os);
     llvm::errs() << os.str();
@@ -20143,6 +20150,7 @@ void FoldStaticPass::runOnOperation() {
   folder.csfSingleBank = csfSingleBank;
   folder.csfMailboxBuilder = csfMailboxBuilder;
   folder.csfMailboxHbm = csfMailboxHbm;
+  folder.csfMailboxHbmLead = std::max(1u, unsigned(csfMailboxHbmLead));
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.stateInRamPP = stateInRamPP;
   folder.ppAddressFanout = std::max(1u, unsigned(stateInRamPPFanout));
