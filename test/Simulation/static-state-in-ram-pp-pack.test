@@ -30,7 +30,7 @@
 
 # PACK: state-in-ram-pp: Leaf{{.*}}: P {{[0-9]}}, {{.*}} deep registers ({{[1-9][0-9]*}} bits) stored; 3 hazard registers (with those; 88 bits)
 # PACK: state-in-ram-pp: Leaf{{.*}}: stored registers packed: 3 registers, 88 bits in 99 (9-bit lanes, 2 runs), 1 columns of 504 bits, block
-# IR: %region{{[0-9]+}}_sir = seq.firmem 1, 1, old, undefined {{.*}}block{{.*}}: <4 x 99, mask 11>
+# IR: %region{{[0-9]+}}_pp_sir = seq.firmem 1, 1, old, undefined {{.*}}block{{.*}}: <4 x 99, mask 11>
 # NOPACK-NOT: stored registers packed
 # NOPACKIR-NOT: _sir = seq.firmem
 # CHECK: {{^}}MATCH 196 cycles

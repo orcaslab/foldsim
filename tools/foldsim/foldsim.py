@@ -515,7 +515,8 @@ def frame_options(a):
     if scratch == 'auto':
         # The device's on-chip RAM at the placer's fill: the fold pass takes
         # the other memories it places off it (state-scratch-device-bits).
-        uram, bram = region_ram_bits(check_region(a)) if getattr(a, 'static', False) else (0, 0)
+        uram, bram = (region_ram_bits(check_region(a), getattr(a, 'state_scratch_fill', 0.85))
+                      if getattr(a, 'static', False) else (0, 0))
         if getattr(a, 'state_scratch_device', ''):
             uram, bram = (int(x) for x in a.state_scratch_device.split(','))
         if uram or bram:
@@ -881,18 +882,75 @@ def slr_region_sll_budget(path):
     return int(region.get('sll_margin', 1.0) * region.get('sll_per_boundary', 0))
 
 
-def region_ram_bits(path):
-    """A region's ultra and block RAM bits at the placer's fill: the fit
-    check's own limits (foldsim_sll_check.py: the region JSON's placement
-    `fill` of uram and bram), so that the scratch passes it by construction;
-    (0, 0) without a region."""
+def scratch_as_built(a, foldsim_opt, sim_input, pipeline, sim, out):
+    """The state scratch as built (foldsim_scratch_built.py): the netlist's
+    block and ultra RAM by kind, the scratch's and the others', against the
+    planner's (its state_scratch.json). Where the netlist is past a kind's
+    fill, or the planner missed a kind's built RAM by more than 5 % of its
+    device, the fold runs once more with the others as built
+    (state-scratch-built-others), so that its planner subtracts them and not
+    an estimate (no reserve). The table, both times,
+    in <out>/state_scratch.txt. Returns the pipeline built last."""
+    import foldsim_scratch_built as sb
+    lines = []
+
+    def look(tag):
+        b = sb.built(sim)
+        p = json.load(open(out('state_scratch.json')))
+        rows = sb.table(b, p)
+        lines.append(f'{tag}:')
+        lines.extend(rows)
+        for row in rows:
+            print(f'foldsim: {row}', file=sys.stderr)
+        return b, p
+    b, p = look('first fold')
+    # Refolded where the netlist is past a kind's fill, or the planner missed
+    # a kind's built RAM by more than 5 % of its device (either way), so that
+    # the planner's figures are the netlist's.
+    built_bits = {k: (b['scratch'][k] + b['other'][k]) * bits
+                  for k, bits in (('uram', sb.URAM_BITS), ('bram', sb.BRAM_BITS))}
+    over = [k for k in built_bits if built_bits[k] > p[k]['device']]
+    room = [k for k in built_bits if abs(p[k]['planned'] - built_bits[k]) > 0.05 * p[k]['device']]
+    miss = over + [k for k in room if k not in over]
+    if miss and not getattr(a, 'state_scratch_no_rebuild', False) and not p.get('as_built'):
+        # The others as built, and what the planner's own pricing missed of
+        # what it placed (its rows built larger than planned: more columns as
+        # packed), so that the refold leaves room for it.
+        eff = {}
+        for k, bits in (('uram', sb.URAM_BITS), ('bram', sb.BRAM_BITS)):
+            short = max(0, b['scratch'][k] * bits - p.get('placed', {}).get(k, b['scratch'][k] * bits))
+            eff[k] = int(b['other'][k] * bits + short)
+        others = f"{eff['uram']},{eff['bram']}"
+        why = ('past the fill in ' + ', '.join(over)) if over else \
+            ('the planner missed the built ' + ', '.join(room) + ' by more than 5 % of the device')
+        print(f'foldsim: state scratch: {why}: refolding with the others as built ({others} bits)',
+              file=sys.stderr)
+        pipeline = [re.sub(r'(foldsim-fold-static\{[^}]*)\}',
+                           lambda m: m.group(1) + f' state-scratch-built-others={others}}}', step, count=1)
+                    if step.startswith('foldsim-fold-static{') else step for step in pipeline]
+        run([foldsim_opt, sim_input, NO_OP_DUMP, f'--pass-pipeline=builtin.module({",".join(pipeline)})',
+             '-o', sim])
+        look('as built (refolded)')
+    with open(out('state_scratch.txt'), 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    return pipeline
+
+
+def region_ram_bits(path, target=None):
+    """A region's ultra and block RAM bits at a fill target (`target`, a
+    share of each kind: --state-scratch-fill), never past the fit check's own
+    limits (foldsim_sll_check.py: the region JSON's placement `fill` of uram
+    and bram); (0, 0) without a region."""
     if not path:
         return 0, 0
     region = json.load(open(path))
     fill = region.get('placement', {}).get('fill', {})
+    fu, fb = fill.get('uram', 1.0), fill.get('bram', 1.0)
+    if target is not None:
+        fu, fb = min(fu, target), min(fb, target)
     uram = sum(s.get('uram', 0) for s in region.get('slrs', [])) * 288 * 1024
     bram = sum(s.get('ramb36', 0) for s in region.get('slrs', [])) * 36 * 1024
-    return int(uram * fill.get('uram', 1.0)), int(bram * fill.get('bram', 1.0))
+    return int(uram * fu), int(bram * fb)
 
 
 def v80_region():
@@ -1586,6 +1644,13 @@ def build_parser():
                          'state-scratch-bits). auto (default): the region\'s block and ultra RAM at the placer\'s '
                          'fill, less the other memories the fold places on chip and state-scratch-reserve '
                          '(foldsim-fold-static state-scratch-device-bits); 250,000,000 without a region')
+    ap.add_argument('--state-scratch-fill', type=float, default=0.85, metavar='F',
+                    help='with --state-scratch-bits auto: the share of the region\'s ultra and block RAM the '
+                         'simulator may fill (default 0.85, for routing; never past the fit check\'s own limits)')
+    ap.add_argument('--state-scratch-no-rebuild', action='store_true',
+                    help='with --state-scratch-bits auto: no as-built rerun (the other memories measured on the '
+                         'first netlist; by default the fold reruns once when the planner missed them by more '
+                         'than 5 %% of a kind\'s device)')
     ap.add_argument('--state-scratch-device', default='', metavar='URAM,BRAM',
                     help='with --state-scratch-bits auto: the ultra and block RAM bits the scratch is taken from, '
                          'in place of the region\'s at the placer\'s fill (a smaller device, or a test)')
@@ -2130,6 +2195,11 @@ def main():
             if a.slr_groups:
                 fold += slr_options(a, foldsim_opt, out('models.mlir'), fold, out)
         sll_fold = fold
+        # (The fold's own planner report, not the SLR check's refold's.)
+        if 'state-scratch-device-bits=' in fold:
+            fold += f' state-scratch-report={out("state_scratch.json")}'
+            if os.path.exists(out('state_scratch.json')):
+                os.remove(out('state_scratch.json'))
         rc = f'loads={a.control_fanout}'
         if a.fanout:
             rc += f' fanout={a.fanout}' + (' fanout-logic' if a.fanout_logic else '')
@@ -2147,6 +2217,8 @@ def main():
     sim = out('foldsim_sim.mlir')
     run([foldsim_opt, sim_input, NO_OP_DUMP, f'--pass-pipeline=builtin.module({",".join(pipeline)})',
          '-o', sim])
+    if a.static and os.path.exists(out('state_scratch.json')):
+        pipeline = scratch_as_built(a, foldsim_opt, sim_input, pipeline, sim, out)
     split_plan = []
     if a.slr_split:
         if not a.static:

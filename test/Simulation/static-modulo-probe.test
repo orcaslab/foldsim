@@ -7,9 +7,10 @@
 # halving steps rest on); one that places is searched from the lower bound as
 # before. The schedule is the one the full search per choice finds (here:
 # 1,024 choices placed, 1,238 periods tried in all against 19,801 before),
-# and exact against the target.
+# and exact against the target. (One fold: no state scratch refold, whose
+# search log would count twice.)
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/pagewrap
-# RUN: env FOLDSIM_SEARCH_LOG=1 foldsim --srcs top.f --top Top --out %t/p --static --modulo --page Mid:1,Leaf:2 --copies Mid:8 --storage Mid:pages=hbm Mid Leaf > %t/p.log 2>&1
+# RUN: env FOLDSIM_SEARCH_LOG=1 foldsim --srcs top.f --top Top --out %t/p --static --modulo --page Mid:1,Leaf:2 --copies Mid:8 --storage Mid:pages=hbm --state-scratch-no-rebuild Mid Leaf > %t/p.log 2>&1
 # RUN: FileCheck %s --check-prefix=REPORT < %t/p/schedule.txt
 # RUN: grep -c 'modulo search lower' %t/p.log | FileCheck %s --check-prefix=PLACED
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/p -Mdir %t/p/obj %S/Inputs/tb_pages.sv top.sv %t/p/foldsim_sim.sv > %t/p/build.log 2>&1
