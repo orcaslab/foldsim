@@ -40,6 +40,10 @@
 # RUN: FileCheck %s --check-prefix=G1 < %t/g1/schedule.txt
 # RUN: foldsim --srcs top.f --top Top --out %t/g2 --static --slr-groups --slr-region v80 --slr-link-rams --link-kind-cost --link-kind-others 0,0,0 node lvl1 2> %t/g2.log > /dev/null
 # RUN: FileCheck %s --check-prefix=G2 < %t/g2.log
+# Without link-kind-group-others, the driver folds once more with what the
+# rest took of each group as built (foldsim_link_kinds.py --groups).
+# RUN: foldsim --srcs top.f --top Top --out %t/g3 --static --slr-groups --slr-region v80 --slr-link-rams --link-kind-cost node lvl1 2> %t/g3.log > /dev/null
+# RUN: FileCheck %s --check-prefix=G3 < %t/g3.log
 # Without it, the thresholds (none here: every link distributed).
 # RUN: foldsim --srcs top.f --top Top --out %t/n --static node lvl1 2> %t/n.log > /dev/null
 # RUN: FileCheck %s --check-prefix=DM < %t/n/foldsim_sim.mlir
@@ -50,11 +54,13 @@
 # BM: %node_q0_addr_to_lvl1_model_u0_q0_addr_0 = seq.firmem 1, 1, old, undefined {sv.attributes = [#sv.attribute<"ram_style" = "\22block\22">]} : <32 x 24, mask 1>
 # D: link-kind-cost: 5 link groups (72 links): ultra 0 (0 URAM288), block 0 (0.0 RAMB36), distributed 5 (747 LUTs)
 # DM: %node_q0_addr_to_lvl1_model_u0_q0_addr_0 = seq.firmem 0, 1, undefined, undefined : <32 x 24, mask 1>
-# M: link-kind-cost: 5 link groups (72 links): ultra 1 (4 URAM288), block 1 (12.5 RAMB36), distributed 3 (106 LUTs); with the rest: URAM288 20.0 % RAMB36 62.5 % LUTs 26.5 % of the budget
-# O: link-kind-cost: 5 link groups (72 links): ultra 0 (0 URAM288), block 2 (14.5 RAMB36), distributed 3 (181 LUTs); with the rest: URAM288 75.0 % RAMB36 36.2 % LUTs 22.7 % of the budget
+# M: link-kind-cost: 5 link groups (72 links): ultra 3 (7 URAM288), block 2 (13.0 RAMB36), distributed 0 (0 LUTs); fixed (forwarded or taken now) 24 links (208 LUTs); with the rest: URAM288 35.0 % RAMB36 65.0 % LUTs 52.0 % (links 7 URAM288, 13.0 RAMB36, 208 LUTs) of the budget
+# O: link-kind-cost: 5 link groups (72 links): ultra 0 (0 URAM288), block 3 (18.5 RAMB36), distributed 2 (31 LUTs); fixed (forwarded or taken now) 24 links (208 LUTs); with the rest: URAM288 75.0 % RAMB36 46.2 % LUTs 29.9 % (links 0 URAM288, 18.5 RAMB36, 239 LUTs) of the budget
 # V: link-kind-cost link-kind-device=1029,2052,1307904
 # AB: foldsim: link-kind-cost: the rest as built {{[0-9]+}},{{[0-9]+}},{{[0-9]+}} (links
 # G0: link kinds: distributed {{[0-9]+}} {{[0-9]+}} {{[0-9]+}}; block 0 0 0.0; ultra 0 0 0
 # G1: link kinds: distributed {{[0-9]+}} {{[0-9]+}} {{[0-9]+}}; block 50 33024 29.0; ultra 0 0 0
 # G2: link-kind-groups=421,828,495465;434,887,466166;173,336,182784
 # G2: link-kind-cost: 6 link groups (83 links): {{.*}} group 0: {{.*}}; group 1: {{.*}}; group 2:
+# G3: foldsim: link-kind-cost: the rest as built per group {{[0-9]+,[0-9]+,[0-9]+(;[0-9]+,[0-9]+,[0-9]+)*$}}
+# G3: link-kind-group-others=

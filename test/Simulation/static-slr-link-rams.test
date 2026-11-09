@@ -1,0 +1,45 @@
+# REQUIRES: verilator
+# Links between SLR groups in block RAM (`--slr-link-rams`): a crossing's write
+# (its data, enable, entry and bank) comes crossLatency host cycles late (1, or
+# k + 1 serialized by k), so a read is forwarded only where it comes as many
+# host cycles after a write as it would without the crossing; else the link's
+# memory is block or ultra RAM in the reader's group, read into its output
+# register (the only source) or a host cycle ahead (one of several). Exact
+# against the target at k = 1, 2 and 8, channels stalled or not, with bubbles.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/linkpage
+# k = 1: every crossing (Unit <-> Reader, Unit -> Top) in block RAM.
+# RUN: foldsim --srcs top.f --top Top --out %t/p1 --static --nest --modulo --slr-groups --slr-count 2 --slr-assign Unit:0,Reader:1,Top_model:1 --slr-serialize 1 --slr-link-rams --link-block-depth 2 Unit Reader > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=P1 < %t/p1/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/p1/obj %S/Inputs/tb_reset.sv top.sv %t/p1/foldsim_sim.sv > %t/p1/build.log 2>&1
+# RUN: %t/p1/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/p1/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
+# k = 2, bubbles: Unit -> Reader in block RAM; Reader -> Unit read the host
+# cycle its late write lands, so forwarded (distributed RAM, not sync).
+# RUN: foldsim --srcs top.f --top Top --out %t/p2 --static --nest --modulo --bubbles --slr-groups --slr-count 2 --slr-assign Unit:0,Reader:1,Top_model:1 --slr-serialize 2 --slr-link-rams --link-block-depth 2 Unit Reader > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=P2 < %t/p2/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/p2/obj %S/Inputs/tb_reset.sv top.sv %t/p2/foldsim_sim.sv > %t/p2/build.log 2>&1
+# RUN: %t/p2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +bubble=0 | FileCheck %s
+# RUN: %t/p2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +bubble=50 | FileCheck %s
+# RUN: %t/p2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +bubble=30 +stall=30 | FileCheck %s
+# k = 8, bubbles: the address units' operands (four sources into one input)
+# cross from Sm to Agu, read a host cycle ahead out of block RAM.
+# RUN: cd %S/../Driver/Inputs/stateless
+# RUN: foldsim --srcs top.f --top Top --out %t/s8 --static --nest --modulo --bubbles --compact-links --slr-groups --slr-count 2 --slr-assign Sm_model:0,Agu:1,Top_model:0 --slr-serialize 8 --slr-link-rams --link-block-depth 2 Sm Agu > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=S8 < %t/s8/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/s8/obj %S/Inputs/tb_reset.sv top.sv %t/s8/foldsim_sim.sv > %t/s8/build.log 2>&1
+# RUN: %t/s8/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +bubble=0 | FileCheck %s
+# RUN: %t/s8/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +bubble=50 +stall=30 | FileCheck %s
+# k = 2, stalls only.
+# RUN: foldsim --srcs top.f --top Top --out %t/s2 --static --nest --modulo --compact-links --slr-groups --slr-count 2 --slr-assign Sm_model:0,Agu:1,Top_model:0 --slr-serialize 2 --slr-link-rams --link-block-depth 2 Sm Agu > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/s2/obj %S/Inputs/tb_reset.sv top.sv %t/s2/foldsim_sim.sv > %t/s2/build.log 2>&1
+# RUN: %t/s2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +stall=0 | FileCheck %s
+# RUN: %t/s2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +stall=30 | FileCheck %s
+# P1: link kinds: distributed 0 0 0; block 7 832 3.5
+# P1: link use Reader Unit 32 8 4 block 1
+# P1: link use Unit Reader 32 8 4 block 1
+# P2: link kinds: distributed 1 256 19; block 6 576 3.0
+# P2: link use Reader Unit 32 8 4 distributed 0
+# P2: link use Unit Reader 32 8 4 block 1
+# S8: link use Sm_model Agu 16 4 2 block 1 {{[0-9]+ [0-9]+ [0-9]+ [0-9]+ [0-9]+}} 4
+# S8: block/ultra 18 (read ahead 12)
+# CHECK: {{^}}MATCH 196 cycles
