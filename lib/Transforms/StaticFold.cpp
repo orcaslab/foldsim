@@ -9891,6 +9891,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
             b.getStringAttr(readName), hw::InnerSymAttr{},
             seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
         keepShallowInFlops(buffer);
+        // A storage rule by the buffer's name (<model>:<memory>_rdata=<kind>):
+        // its style (it reads a host cycle early, so block or ultra RAM too).
+        if (auto *rule = storageFor(cls, readName, /*reg=*/false, vm.dataWidth))
+          setRamStyle(buffer, rule->kind);
         seq::FirMemWriteOp::create(b, buffer, rspInst, hostClock, rspValid,
                                    rspData, Value{});
         Value bufferData = seq::FirMemReadOp::create(b, buffer, region.inst2,
@@ -10659,6 +10663,16 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
               b.getStringAttr(readName), hw::InnerSymAttr{},
               seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
           keepShallowInFlops(buffer);
+          // A storage rule by the buffer's name (<model>:<memory>_rdata=
+          // <kind>): its style; block or ultra RAM only read synchronously
+          // (read-buffer-bits).
+          if (auto *rule = storageFor(cls, readName, /*reg=*/false, width)) {
+            if ((rule->kind == "block" || rule->kind == "ultra") && !syncRead)
+              return memory.emitError("storage: '")
+                     << rule->kind << "' RAM for '" << readName
+                     << "', read combinationally (needs read-buffer-bits)";
+            setRamStyle(buffer, rule->kind);
+          }
           Value readInst = seq::FirRegOp::create(
               b, region.inst, hostClock, b.getStringAttr(readName + "_inst"));
           seq::FirMemWriteOp::create(b, buffer, readInst, hostClock, capture,
