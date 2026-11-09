@@ -465,6 +465,9 @@ public:
   /// memory's read address is registered a stage early and replicated, a
   /// copy per bank of at most this many RAM primitives.
   unsigned ppAddressFanout = 96;
+  /// `state-in-ram-pp-pack`: a PP class's stored registers packed into
+  /// columns of an instance's row each.
+  bool ppPackStores = true;
   /// `state-scratch-bits` / `state-stream-window` (planScratch,
   /// chooseStreamWindows: state rows in HBM).
   uint64_t stateScratchBits = 250000000;
@@ -13757,6 +13760,16 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // With page masks, each enable's register, one per enable.
   DenseMap<std::pair<Value, unsigned>, Value> pagedEnableRegs;
   BackedgeBuilder pageEdges(b, model.getLoc());
+  // CSF PP: the registers its rows leave out, packed into 72-bit columns of
+  // an instance's row each (read at the instance two host cycles ahead,
+  // written a host cycle after the state pass, as state in RAM of P = 1),
+  // given the state gap of 4 that keeps a read clear of a write to its row;
+  // else each keeps a store of its own (distributed RAM).
+  bool packPP = cls.pp && ppPackStores && threads > 1 && cls.stateGap >= 4;
+  if (cls.pp && ppPackStores && threads > 1 && !packPP)
+    llvm::errs() << "foldsim-fold-static: state-in-ram-pp: " << cls.name
+                 << ": its stored registers not packed (state gap "
+                 << cls.stateGap << " < 4): a store each\n";
   unsigned keptRegs = 0;
   uint64_t keptBits = 0;
 
@@ -13823,8 +13836,11 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       if (!write.holds && !write.enable)
         write.data = next;
       // State in RAM, P = 1: packed with the copy's other written registers
-      // into the rows built below.
-      if (cls.sir == 1 && !write.holds && width && !readyRegs.contains(reg)) {
+      // into the rows built below. A PP class's registers left out of its
+      // rows (hazards, deep ones, the others kept: `state-in-ram-pp-pack`)
+      // too, an instance's row each, instead of a store each.
+      if ((cls.sir == 1 || packPP) && !write.holds && width &&
+          !readyRegs.contains(reg)) {
         auto placeholder = pageEdges.get(reg.getType());
         SmallVector<Value> held{asBits(b, write.data)};
         if (write.enable)
@@ -14188,7 +14204,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       return model.emitError("state-in-ram: '")
              << cls.name << "' needs a state gap of 4, not " << cls.stateGap;
     auto bits = [&](unsigned width) { return b.getIntegerType(width); };
-    StringRef kind = cls.sirStyle;
+    // (A PP class's packed stores: a row an instance, so block RAM up to
+    // 1,024 instances, else ultra RAM.)
+    StringRef kind = cls.pp ? StringRef(entries <= 1024 ? "block" : "ultra")
+                            : StringRef(cls.sirStyle);
     bool masked = llvm::any_of(sirRegs, [](auto &r) { return bool(r.enable); });
     unsigned grain = masked ? (kind == "ultra" ? 8 : 9) : 1;
     llvm::MapVector<Value, SmallVector<unsigned>> groups;
@@ -14330,8 +14349,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       reg.value.setValue(value);
     if (!cls.sirLogged) {
       cls.sirLogged = true;
-      llvm::errs() << "foldsim-fold-static: state-in-ram: " << cls.name
-                   << ": built " << sirRegs.size() << " registers, " << sirBits
+      llvm::errs() << "foldsim-fold-static: state-in-ram"
+                   << (cls.pp ? "-pp: " : ": ") << cls.name
+                   << (cls.pp ? ": stored registers packed: " : ": built ")
+                   << sirRegs.size() << " registers, " << sirBits
                    << " bits in " << layoutBits << " (" << grain
                    << "-bit lanes, " << runs.size() << " runs), " << columns
                    << " columns of " << colBits << " bits, " << kind << "\n";
@@ -20068,6 +20089,7 @@ void FoldStaticPass::runOnOperation() {
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.stateInRamPP = stateInRamPP;
   folder.ppAddressFanout = std::max(1u, unsigned(stateInRamPPFanout));
+  folder.ppPackStores = stateInRamPPPack;
   folder.stateScratchBits = stateScratchBits;
   folder.stateStreamWindow = stateStreamWindow;
   folder.stateScratchPartial = stateScratchPartial;

@@ -1,0 +1,36 @@
+# REQUIRES: verilator
+# CSF PP, the registers a class's rows leave out (foldsim-fold-static state-in-ram-pp-pack; cs_1109 A.9 item 3):
+# its hazards, deep registers (a product next value) and other kept registers are packed into 72-bit columns of
+# an instance's row each (block RAM up to 1,024 instances, else ultra), read at the instance two host cycles
+# ahead and written a host cycle after the state pass, as state in RAM of P = 1, instead of a combinationally
+# read store each (distributed RAM growing with the instances). Driver/Inputs/pp_pack: per leaf, a 160-bit
+# register on an enable (in the rows), a 48-bit product on another enable and a 32-bit product every cycle
+# (deep: packed, two runs of 9-bit lanes). Against the target from zero state (Inputs/tb_late.sv), channels
+# stalled: P 4 and P 2, two copies, and without packing (a store each) for reference.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/pp_pack
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/p4 --static --state-in-ram Leaf::4 --state-in-ram-pp Leaf > %t/p4.log 2>&1
+# RUN: FileCheck %s --check-prefix=PACK < %t/p4.log
+# RUN: FileCheck %s --check-prefix=IR < %t/p4/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/p4/obj %S/Inputs/tb_late.sv top.sv %t/p4/foldsim_sim.sv > %t/p4/build.log 2>&1
+# RUN: %t/p4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 | FileCheck %s
+# RUN: %t/p4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +stall=30 | FileCheck %s
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/p2 --static --state-in-ram Leaf::2 --state-in-ram-pp Leaf > %t/p2.log 2>&1
+# RUN: FileCheck %s --check-prefix=PACK < %t/p2.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/p2/obj %S/Inputs/tb_late.sv top.sv %t/p2/foldsim_sim.sv > %t/p2/build.log 2>&1
+# RUN: %t/p2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +stall=20 | FileCheck %s
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/c2 --static --state-in-ram Leaf::4 --state-in-ram-pp --copies Leaf:2 Leaf > %t/c2.log 2>&1
+# RUN: FileCheck %s --check-prefix=PACK < %t/c2.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/c2/obj %S/Inputs/tb_late.sv top.sv %t/c2/foldsim_sim.sv > %t/c2/build.log 2>&1
+# RUN: %t/c2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +stall=30 | FileCheck %s
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/np --static --state-in-ram Leaf::4 --state-in-ram-pp --state-in-ram-pp-no-pack Leaf > %t/np.log 2>&1
+# RUN: FileCheck %s --check-prefix=NOPACK < %t/np.log
+# RUN: FileCheck %s --check-prefix=NOPACKIR < %t/np/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/np/obj %S/Inputs/tb_late.sv top.sv %t/np/foldsim_sim.sv > %t/np/build.log 2>&1
+# RUN: %t/np/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 | FileCheck %s
+
+# PACK: state-in-ram-pp: Leaf{{.*}}: P {{[0-9]}}, {{.*}} deep registers ({{[1-9][0-9]*}} bits) stored; 3 hazard registers (with those; 88 bits)
+# PACK: state-in-ram-pp: Leaf{{.*}}: stored registers packed: 3 registers, 88 bits in 99 (9-bit lanes, 2 runs), 1 columns of 504 bits, block
+# IR: %region{{[0-9]+}}_sir = seq.firmem 1, 1, old, undefined {{.*}}block{{.*}}: <4 x 99, mask 11>
+# NOPACK-NOT: stored registers packed
+# NOPACKIR-NOT: _sir = seq.firmem
+# CHECK: {{^}}MATCH 196 cycles
