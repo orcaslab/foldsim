@@ -14,6 +14,7 @@
 //===----------------------------------------------------------------------===//
 
 #include <chrono>
+#include "CsfMailboxes.h"
 #include "CsfReadySplit.h"
 #include "SlotSequencer.h"
 #include "AffineSlots.h"
@@ -60,6 +61,12 @@ namespace foldsim {
 
 using namespace mlir;
 using namespace circt;
+using foldsim::isChainLink;
+using foldsim::layoutMailbox;
+using foldsim::MailboxLayout;
+using foldsim::MailboxLink;
+using foldsim::MailboxPlan;
+using foldsim::planMailboxes;
 
 namespace {
 
@@ -516,6 +523,45 @@ public:
   llvm::StringMap<std::string> csfConeOf;
   LogicalResult splitCsfReadyCones();
   unsigned csfMailboxLatency = 1;
+  /// `csf-single-bank`: an early link whose every read of a frame precedes
+  /// its producer's write of the entry in that frame keeps one bank.
+  bool csfSingleBank = false;
+  /// `csf-mailbox-builder`: links as lanes of reader-indexed mailboxes
+  /// (CsfMailboxes.h).
+  bool csfMailboxBuilder = false;
+  /// `csf-mailbox-hbm`: reader-indexed mailboxes in HBM (layoutMailboxStreams).
+  bool csfMailboxHbm = false;
+  /// The links `csf-mailbox-builder` offers (CsfMailboxes.h), keyed by
+  /// (consumer, piece's low bit, producer, producer's low bit), and their
+  /// plans.
+  void offerMailboxLinks(
+      std::map<std::tuple<unsigned, unsigned, int, unsigned>, unsigned> &linkOf,
+      SmallVectorImpl<MailboxLink> &links, SmallVectorImpl<MailboxPlan> &plans,
+      SmallVectorImpl<int> &planOf) const;
+  /// Whether every reader of producer `p`'s entry `rows[i]` (reader class `c`,
+  /// its instances `takes`) reads it at least `margin` host cycles before the
+  /// producer's state pass writes it, in the frame's positions.
+  bool readsBeforeWrite(unsigned p, unsigned c, ArrayRef<uint64_t> rows,
+                        ArrayRef<bool> takes, int margin) const {
+    auto &producer = producers[p];
+    if (producer.cls < 0 || producer.late)
+      return false;
+    auto &pcls = classes[producer.cls];
+    auto &cls = classes[c];
+    for (unsigned i = 0; i < cls.threads(); ++i) {
+      if (!takes[i])
+        continue;
+      int written = pcls.slot[kState][rows[i]] + int(splitDelayP(int(p))) +
+                    crossDelay(producer.cls, int(c));
+      int lastRead = cls.readSlot(kState, 0, i);
+      if (cls.hasReady)
+        for (unsigned l = 0; l < 1 + cls.laterReady.size(); ++l)
+          lastRead = std::max(lastRead, cls.readSlot(kReady, l, i));
+      if (lastRead + margin > written)
+        return false;
+    }
+    return true;
+  }
   SmallVector<unsigned> readyLanes, laneBase;
   unsigned numResources = 0;
   /// Per class: the slots a pass holds its mailbox read port (1: none).
@@ -1189,6 +1235,34 @@ private:
     /// `link-hbm-fit-slots`: the landing slots the placement needs (0: the
     /// most a lead takes, pow2(lead + 8)).
     unsigned slotCount = 0;
+    /// `csf-mailbox-hbm`: a reader-indexed mailbox (CsfMailboxes.h) in HBM.
+    /// Its rows are reader rows (`mbReaderRow`, by reader instance; -1:
+    /// none), `mbRows` of them; producer instance j writes the row
+    /// `mbWriteRow[j]`, byte-masked to the lanes (`runs`) of the domains it
+    /// is in (`runDomain`, `mbDomains[d][j]`). Each reader pass needs its
+    /// row alone.
+    bool mailbox = false;
+    /// `csf-mailbox-hbm`'s streams: one row a pass lands in two sets of
+    /// the members' read registers in turn (no spacing of the reader).
+    bool twoSets = false;
+    unsigned mbRows = 0;
+    SmallVector<uint64_t> mbWriteRow;
+    SmallVector<int64_t> mbReaderRow;
+    SmallVector<unsigned> runDomain;
+    SmallVector<SmallVector<bool>> mbDomains;
+    /// The index bits of a row: the reader row (a mailbox) or the producer
+    /// instance.
+    /// Whether producer instance j writes a mailbox's rows (a lane of its).
+    bool writes(size_t j) const {
+      for (unsigned d : runDomain)
+        if (mbDomains[d][j])
+          return true;
+      return false;
+    }
+    unsigned rowIndexBits(unsigned producerThreads) const {
+      unsigned n = mailbox ? mbRows : producerThreads;
+      return n > 1 ? llvm::Log2_32_Ceil(n) : 0;
+    }
     unsigned leadSlots() const { return llvm::PowerOf2Ceil(lead + 8); }
     unsigned slots() const { return slotCount ? slotCount : leadSlots(); }
   };
@@ -1207,6 +1281,10 @@ private:
   struct StreamMember {
     unsigned stream, offset;
     bool kept = false;
+    /// `csf-mailbox-hbm` (a twoSets stream): the reader instances whose
+    /// rows the stream carries, where the schedule leaves room for some
+    /// alone (the rest read an on-chip link of their own rows); empty: all.
+    SmallVector<bool> keepInst;
   };
   std::map<std::tuple<unsigned, unsigned, unsigned, unsigned, unsigned>,
            StreamMember>
@@ -1219,6 +1297,11 @@ private:
   SmallVector<unsigned> linkPageKinds;
   /// The streams' layouts and the ports they need (before the schedule).
   void layoutStreams();
+  /// `csf-mailbox-hbm`: the reader-indexed HBM mailboxes (LinkStream::
+  /// mailbox) of the early links no stream carries yet whose producer
+  /// instances are each read by one reader instance.
+  void layoutMailboxStreams(std::vector<LinkStream> &out,
+                            decltype(streamMembers) *members) const;
   /// Each class's link page: its `link-kinds` page, raised by the ports of
   /// the streams not excluded.
   void streamPages();
@@ -1230,6 +1313,8 @@ private:
     decltype(streamMembers)::iterator member;
     int most, least, late;
     const LinkUse *use;
+    /// The same, per reader instance of the use (as `use->readers`).
+    SmallVector<int> imost, ileast, ilate;
   };
   /// The members the schedule keeps (streamMembers' kept; each stream's
   /// lead, kept and dropped), from the laid-out needs; `uses` (linkUses')
@@ -1311,8 +1396,7 @@ private:
   LogicalResult assignPageEngines();
   void reportPageEngines(raw_ostream &os);
   unsigned streamRowBits(const LinkStream &s) const {
-    unsigned threads = classes[s.pcls].threads();
-    return 1 + (threads > 1 ? llvm::Log2_32_Ceil(threads) : 0) +
+    return 1 + s.rowIndexBits(classes[s.pcls].threads()) +
            (s.pages > 1 ? llvm::Log2_32_Ceil(s.pages) : 0);
   }
   /// The page of the links from producer `p` to class `reader` (0: none).
@@ -3550,10 +3634,13 @@ LogicalResult StaticFolder::parseLinkKinds() {
 }
 
 void StaticFolder::layoutStreams() {
-  if (!llvm::any_of(linkKinds, [](auto &k) { return k.second.kind == "hbm"; }))
+  if (!llvm::any_of(linkKinds, [](auto &k) { return k.second.kind == "hbm"; }) &&
+      !csfMailboxHbm)
     return;
   layoutStreamsOf([&](const LinkUse &use) { return linkHbmRule(use.producer, use.reader); },
                   linkStreams, &streamMembers);
+  if (csfMailboxHbm)
+    layoutMailboxStreams(linkStreams, &streamMembers);
   laidOutStreams = linkStreams;
   linkPageKinds.clear();
   for (auto &cls : classes)
@@ -3571,7 +3658,9 @@ void StaticFolder::streamPages() {
     if (s.excluded)
       continue;
     classes[s.pcls].linkPage = std::max(classes[s.pcls].linkPage, s.pages);
-    classes[s.rcls].linkPage = std::max(classes[s.rcls].linkPage, s.maxNeed + 2);
+    // (A mailbox of one row a pass lands in two sets in turn: no spacing.)
+    classes[s.rcls].linkPage = std::max(
+        classes[s.rcls].linkPage, s.twoSets && s.maxNeed == 1 ? 1u : s.maxNeed + 2);
   }
 }
 
@@ -3660,6 +3749,200 @@ void StaticFolder::layoutStreamsOf(function_ref<bool(const LinkUse &)> pick,
   }
 }
 
+void StaticFolder::layoutMailboxStreams(std::vector<LinkStream> &out,
+                                        decltype(streamMembers) *members) const {
+  if (!slrOf.empty() || shortLead)
+    return;
+  std::vector<LinkUse> uses;
+  linkUses(uses);
+  // The links offered: early, of a producer of several instances, more than
+  // one entry read, no stream's yet, no producer instance read by two
+  // reader instances.
+  // Per class pair and pass: whether every reader instance reads one
+  // producer row of it. Then a producer-indexed stream needs one landing a
+  // reader pass, as a mailbox does, in one stream rather than one a plan
+  // (a parent's outputs to its children): those links, and those that fan
+  // out, go to producer-indexed streams (layoutStreamsOf).
+  std::map<std::tuple<unsigned, unsigned, unsigned>,
+           std::map<unsigned, std::set<uint64_t>>>
+      rowsRead;
+  std::set<std::tuple<unsigned, unsigned, unsigned, unsigned, unsigned>>
+      byProducer;
+  auto keyOf = [](const LinkUse &use) {
+    return std::make_tuple(use.reader, use.port, use.at, use.producer,
+                           use.low);
+  };
+  SmallVector<std::pair<const LinkUse *, MailboxLink>> offered;
+  for (auto &use : uses) {
+    auto &producer = producers[use.producer];
+    if (producer.cls < 0 || producer.late || use.rows.size() < 2 ||
+        classes[producer.cls].threads() < 2)
+      continue;
+    if (members &&
+        members->count({use.reader, use.port, use.at, use.producer, use.low}))
+      continue;
+    MailboxLink link;
+    link.pcls = unsigned(producer.cls);
+    link.rcls = use.reader;
+    link.writeKey = producer.atReady ? 1 + producer.readyLevel : 0;
+    link.width = use.width;
+    link.readerOf.assign(classes[producer.cls].threads(), -1);
+    bool fanout = false;
+    for (auto [i, row] : llvm::zip(use.readers, use.readerRows)) {
+      int64_t &r = link.readerOf[row];
+      fanout |= r >= 0 && r != int64_t(i);
+      r = i;
+    }
+    if (!fanout && isChainLink(link))
+      continue;
+    auto &read = rowsRead[{link.pcls, link.rcls, link.writeKey}];
+    for (auto [i, row] : llvm::zip(use.readers, use.readerRows))
+      read[i].insert(row);
+    if (fanout)
+      byProducer.insert(keyOf(use));
+    else
+      offered.push_back({&use, std::move(link)});
+  }
+  SmallVector<MailboxLink> links;
+  SmallVector<const LinkUse *> useOf;
+  for (auto &[use, link] : offered) {
+    bool oneRow = true;
+    for (auto &[i, rows] : rowsRead[{link.pcls, link.rcls, link.writeKey}])
+      oneRow &= rows.size() == 1;
+    if (oneRow) {
+      byProducer.insert(keyOf(*use));
+      continue;
+    }
+    links.push_back(link);
+    useOf.push_back(use);
+  }
+  if (!byProducer.empty()) {
+    std::vector<LinkStream> more;
+    decltype(streamMembers) moreMembers;
+    layoutStreamsOf([&](const LinkUse &use) { return byProducer.count(keyOf(use)) > 0; },
+                    more, &moreMembers);
+    unsigned base = out.size();
+    for (auto &s : more) {
+      s.twoSets = true;
+      out.push_back(std::move(s));
+    }
+    if (members)
+      for (auto &[key, m] : moreMembers)
+        (*members)[key] = StreamMember{base + m.stream, m.offset, false};
+  }
+  SmallVector<MailboxPlan> plans;
+  SmallVector<int> planOf;
+  planMailboxes(links, 1, plans, planOf);
+  unsigned rowBits = std::max(8u, linkHbmRowBits / 8 * 8);
+  for (auto [k, plan] : llvm::enumerate(plans)) {
+    // Lanes: the plan's links of distinct producer bits and readers (a lane
+    // the links of equal ones share), by write domain.
+    std::map<std::tuple<unsigned, unsigned, unsigned, SmallVector<int64_t>>,
+             unsigned>
+        laneOf;
+    struct Lane {
+      unsigned producer, low, width, domain;
+      SmallVector<unsigned> links;
+    };
+    SmallVector<Lane> lanes;
+    std::map<SmallVector<bool>, unsigned> domainIds;
+    SmallVector<SmallVector<bool>> domains;
+    for (unsigned l : plan.links) {
+      auto *use = useOf[l];
+      auto [it, fresh] = laneOf.try_emplace(
+          {use->producer, use->low, use->width, links[l].readerOf},
+          lanes.size());
+      if (fresh) {
+        SmallVector<bool> members;
+        for (int64_t r : links[l].readerOf)
+          members.push_back(r >= 0);
+        auto [d, dfresh] = domainIds.try_emplace(members, domains.size());
+        if (dfresh)
+          domains.push_back(members);
+        lanes.push_back({use->producer, use->low, use->width, d->second, {}});
+      }
+      lanes[it->second].links.push_back(l);
+    }
+    llvm::stable_sort(lanes, [](const Lane &a, const Lane &b) {
+      return a.domain < b.domain;
+    });
+    // Streams of at most a row of `rowBits` (several pages only for a lane
+    // wider than that), lanes whole, each domain on bytes of its own.
+    SmallVector<SmallVector<unsigned>> groups;
+    SmallVector<unsigned> group;
+    unsigned used = 0;
+    int domain = -1;
+    for (auto [x, lane] : llvm::enumerate(lanes)) {
+      unsigned at = int(lane.domain) != domain ? (used + 7) / 8 * 8 : used;
+      if (!group.empty() && at + lane.width > rowBits) {
+        groups.push_back(group);
+        group.clear();
+        at = 0;
+      }
+      group.push_back(unsigned(x));
+      used = at + lane.width;
+      domain = int(lane.domain);
+    }
+    if (!group.empty())
+      groups.push_back(group);
+    for (auto &g : groups) {
+      LinkStream s;
+      s.pcls = plan.pcls;
+      s.rcls = plan.rcls;
+      s.atReady = plan.writeKey > 0;
+      s.level = plan.writeKey > 0 ? plan.writeKey - 1 : 0;
+      s.mailbox = true;
+      s.twoSets = true;
+      s.mbDomains = domains;
+      unsigned offset = 0;
+      int dom = -1;
+      unsigned rthreads = classes[s.rcls].threads();
+      SmallVector<bool> takes(rthreads, false);
+      for (unsigned x : g) {
+        auto &lane = lanes[x];
+        if (int(lane.domain) != dom)
+          offset = (offset + 7) / 8 * 8;
+        dom = int(lane.domain);
+        s.runs.push_back({lane.producer, lane.low, lane.width, offset});
+        s.runDomain.push_back(lane.domain);
+        for (unsigned l : lane.links) {
+          auto *use = useOf[l];
+          if (members)
+            (*members)[{use->reader, use->port, use->at, use->producer,
+                        use->low}] = StreamMember{unsigned(out.size()), offset,
+                                                  false};
+          for (unsigned i : use->readers)
+            takes[i] = true;
+        }
+        offset += lane.width;
+      }
+      s.wordBits = (offset + 7) / 8 * 8;
+      s.dw = std::min(rowBits, s.wordBits);
+      s.pages = (s.wordBits + s.dw - 1) / s.dw;
+      // Rows: the reader instances that take a lane, in order.
+      s.mbReaderRow.assign(rthreads, -1);
+      for (unsigned i = 0; i < rthreads; ++i)
+        if (takes[i])
+          s.mbReaderRow[i] = s.mbRows++;
+      s.mbWriteRow.assign(plan.rowOf.size(), 0);
+      for (auto [j, reader] : llvm::enumerate(plan.rowOf))
+        if (reader >= 0 && s.mbReaderRow[reader] >= 0)
+          s.mbWriteRow[j] = uint64_t(s.mbReaderRow[reader]);
+      s.needs.resize(rthreads);
+      for (unsigned i = 0; i < rthreads; ++i) {
+        if (s.mbReaderRow[i] < 0)
+          continue;
+        for (unsigned j = 0; j < s.pages; ++j)
+          s.needs[i].push_back({uint64_t(s.mbReaderRow[i]), j});
+        s.maxNeed = std::max<unsigned>(s.maxNeed, s.needs[i].size());
+        s.readRows += s.needs[i].size() * (1 + classes[s.rcls].readyLevels);
+        ++s.kept;
+      }
+      out.push_back(std::move(s));
+    }
+  }
+}
+
 SmallVector<int> StaticFolder::streamReadPasses(const Class &cls,
                                                 unsigned i) const {
   SmallVector<int> slots{cls.readSlot(kState, 0, i)};
@@ -3691,17 +3974,36 @@ void StaticFolder::keepStreamMembers(const std::vector<LinkUse> &uses,
     auto &pcls = classes[producer.cls];
     int most = std::numeric_limits<int>::max(), least = 0,
         late = std::numeric_limits<int>::min();
+    SmallVector<int> imost, ileast, ilate;
+    auto writeSlot = [&](uint64_t j) {
+      return producer.atReady ? pcls.readySlots(producer.readyLevel)[j]
+                              : pcls.slot[kState][j];
+    };
     for (auto [i, row] : llvm::zip(use.readers, use.readerRows)) {
-      int w = producer.atReady ? pcls.readySlots(producer.readyLevel)[row]
-                               : pcls.slot[kState][row];
+      int w = writeSlot(row);
+      // A mailbox's row is written by every producer instance of its lanes
+      // that feeds the reader: the next write of the row is their first.
+      int next = w;
+      if (st.mailbox)
+        for (auto [j, r] : llvm::enumerate(st.mbWriteRow))
+          if (r == uint64_t(st.mbReaderRow[i]) && st.writes(j))
+            next = std::min(next, writeSlot(j));
       int n = int(st.needs[i].size());
+      int m = std::numeric_limits<int>::max(), l = 0,
+          t = std::numeric_limits<int>::min();
       for (int s : streamReadPasses(classes[use.reader], i)) {
-        most = std::min(most, (s - n - 1) - (w + int(st.pages) + 4 - frame) - 1);
-        least = std::max(least, (s - 2) - (w + frame) + 1);
-        late = std::max(late, (s - 2) - (w + frame));
+        m = std::min(m, (s - n - 1) - (w + int(st.pages) + 4 - frame) - 1);
+        l = std::max(l, (s - 2) - (next + frame) + 1);
+        t = std::max(t, (s - 2) - (next + frame));
       }
+      imost.push_back(m);
+      ileast.push_back(l);
+      ilate.push_back(t);
+      most = std::min(most, m);
+      least = std::max(least, l);
+      late = std::max(late, t);
     }
-    rooms.push_back({it, most, least, late, &use});
+    rooms.push_back({it, most, least, late, &use, imost, ileast, ilate});
   }
   for (auto &st : linkStreams) {
     st.lead = linkHbmLead;
@@ -3709,22 +4011,65 @@ void StaticFolder::keepStreamMembers(const std::vector<LinkUse> &uses,
     st.dropped = 0;
     st.readRows = 0;
   }
-  for (auto &r : rooms)
-    if (r.most >= int(linkHbmMinLead()) && r.least <= r.most && r.late <= 0) {
-      auto &st = linkStreams[r.member->second.stream];
-      st.lead = std::min<unsigned>(st.lead, r.most);
+  // A twoSets stream (csf-mailbox-hbm) keeps the reader instances with
+  // room, each member those alone: its lead is kLinkHbmLead or less, the
+  // room of all but the tenth of its instances with the least (at least
+  // linkHbmMinLead()).
+  std::map<unsigned, SmallVector<int>> instRooms;
+  for (auto &r : rooms) {
+    auto &st = linkStreams[r.member->second.stream];
+    if (!st.twoSets) {
+      if (r.most >= int(linkHbmMinLead()) && r.least <= r.most && r.late <= 0)
+        st.lead = std::min<unsigned>(st.lead, r.most);
+      continue;
     }
+    for (size_t x = 0; x < r.imost.size(); ++x)
+      if (r.imost[x] >= int(linkHbmMinLead()) && r.ileast[x] <= r.imost[x] &&
+          r.ilate[x] <= 0)
+        instRooms[r.member->second.stream].push_back(r.imost[x]);
+  }
+  for (auto &[k, ms] : instRooms) {
+    llvm::sort(ms);
+    linkStreams[k].lead =
+        std::min<unsigned>(linkStreams[k].lead, unsigned(ms[ms.size() / 10]));
+  }
   // A member (a reader input's bits from a producer output) may stand for
   // several uses (other readers and rows of the same wiring): kept only if
   // every one of them is.
-  for (auto &r : rooms)
+  for (auto &r : rooms) {
     r.member->second.kept = true;
+    r.member->second.keepInst.clear();
+  }
+  std::map<decltype(streamMembers)::iterator::pointer, SmallVector<bool>> bad;
   for (auto &r : rooms) {
     auto &st = linkStreams[r.member->second.stream];
+    if (st.twoSets) {
+      auto &keep = r.member->second.keepInst;
+      auto &no = bad[&*r.member];
+      if (keep.empty()) {
+        keep.assign(classes[r.use->reader].threads(), false);
+        no.assign(keep.size(), false);
+      }
+      for (auto [x, i] : llvm::enumerate(r.use->readers))
+        if (r.imost[x] >= int(st.lead) && r.ileast[x] <= int(st.lead) &&
+            r.ilate[x] <= 0 && st.lead >= linkHbmMinLead() && !st.excluded)
+          keep[i] = true;
+        else
+          no[i] = true;
+      continue;
+    }
     bool ok = r.most >= int(st.lead) && r.least <= int(st.lead) &&
               r.late <= 0 && st.lead >= linkHbmMinLead() && !st.excluded;
     if (!ok)
       r.member->second.kept = false;
+  }
+  // A twoSets member: kept if any reader instance of its uses is; all of
+  // them kept is a whole member.
+  for (auto &[member, no] : bad) {
+    auto &keep = member->second.keepInst;
+    for (size_t i = 0; i < keep.size(); ++i)
+      keep[i] = keep[i] && !no[i];
+    member->second.kept = llvm::any_of(keep, [](bool k) { return k; });
   }
   std::set<decltype(streamMembers)::iterator::pointer> counted;
   for (auto &r : rooms)
@@ -3756,9 +4101,14 @@ LogicalResult StaticFolder::planStreams() {
         continue;
       unsigned k = r.member->second.stream, off = r.member->second.offset;
       auto &st = linkStreams[k];
+      // (A mailbox's reader needs its own row; a member of some reader
+      // instances alone, theirs.)
+      auto &keep = r.member->second.keepInst;
       for (auto [i, row] : llvm::zip(r.use->readers, r.use->readerRows))
-        for (unsigned j = off / st.dw; j <= (off + r.use->width - 1) / st.dw; ++j)
-          need[k][i].insert({row, j});
+        for (unsigned j = off / st.dw;
+             (keep.empty() || keep[i]) && j <= (off + r.use->width - 1) / st.dw; ++j)
+          need[k][i].insert(
+              {st.mailbox ? uint64_t(st.mbReaderRow[i]) : uint64_t(row), j});
     }
     for (auto [k, st] : llvm::enumerate(linkStreams)) {
       st.maxNeed = 0;
@@ -15144,6 +15494,77 @@ bool StaticFolder::hitsOnlyTakes(unsigned p, unsigned c, ArrayRef<bool> takes,
   return true;
 }
 
+void StaticFolder::offerMailboxLinks(
+    std::map<std::tuple<unsigned, unsigned, int, unsigned>, unsigned> &linkOf,
+    SmallVectorImpl<MailboxLink> &links, SmallVectorImpl<MailboxPlan> &plans,
+    SmallVectorImpl<int> &planOf) const {
+  // The pieces of each consumer as buildSim cuts them, and at each the
+  // producer sources the reader's instances take: a link each.
+  for (auto [k, consumer] : llvm::enumerate(consumers)) {
+    if (consumer.cls < 0)
+      continue;
+    unsigned c = consumer.cls;
+    unsigned threads = classes[c].threads();
+    if (threads < 2)
+      continue;
+    std::set<unsigned> cuts{consumer.width};
+    for (auto &pieces : consumer.pieces) {
+      unsigned at = 0;
+      for (auto &piece : pieces)
+        cuts.insert(at += piece.width);
+    }
+    unsigned at = 0;
+    for (unsigned end : cuts) {
+      if (end == at)
+        continue;
+      std::map<std::pair<int, unsigned>, MailboxLink> bySource;
+      std::set<std::pair<int, unsigned>> fanout;
+      for (unsigned i = 0; i < threads; ++i) {
+        const Piece *piece = nullptr;
+        unsigned base = 0, offset = 0;
+        for (auto &candidate : consumer.pieces[i]) {
+          if (at < base + candidate.width) {
+            piece = &candidate;
+            offset = at - base;
+            break;
+          }
+          base += candidate.width;
+        }
+        if (!piece || piece->producer < 0)
+          continue;
+        auto &producer = producers[piece->producer];
+        if (producer.cls < 0 || classes[producer.cls].threads() < 2)
+          continue;
+        std::pair<int, unsigned> key{piece->producer, piece->low + offset};
+        auto [it, fresh] = bySource.try_emplace(key);
+        auto &link = it->second;
+        if (fresh) {
+          link.pcls = unsigned(producer.cls);
+          link.rcls = c;
+          link.width = end - at;
+          // Written at the same pass, as late, the same host cycle on.
+          link.writeKey = (producer.atReady ? 1 + producer.readyLevel : 0) |
+                          (splitDelayP(piece->producer) << 8) |
+                          (unsigned(producer.late) << 16);
+          link.readerOf.assign(classes[producer.cls].threads(), -1);
+        }
+        int64_t &reader = link.readerOf[piece->inst];
+        if (reader >= 0 && reader != int64_t(i))
+          fanout.insert(key);
+        reader = i;
+      }
+      for (auto &[key, link] : bySource) {
+        if (fanout.count(key) || isChainLink(link))
+          continue;
+        linkOf[{unsigned(k), at, key.first, key.second}] = links.size();
+        links.push_back(std::move(link));
+      }
+      at = end;
+    }
+  }
+  planMailboxes(links, 2, plans, planOf);
+}
+
 LogicalResult StaticFolder::buildSim() {
   auto *context = top.getContext();
   auto i1 = IntegerType::get(context, 1);
@@ -15312,7 +15733,8 @@ LogicalResult StaticFolder::buildSim() {
     addPort(name + "wr_inst", iw, false);
     addPort(name + "wr_row", aw, false);
     addPort(name + "wr_data", dw, false);
-    addPort(name + "wr_mask", i1, false);
+    addPort(name + "wr_mask",
+            st.mailbox ? IntegerType::get(context, st.dw / 8) : i1, false);
   }
   // Each page engine's: {tag, instance 0} requests, {member, instance, row}
   // rows, byte masks.
@@ -16215,7 +16637,8 @@ LogicalResult StaticFolder::buildSim() {
                       bool late = false, bool forwardLate = false,
                       ArrayRef<uint64_t> compact = {},
                       StringRef syncStyle = {}, unsigned page = 0,
-                      const LinkGather *gather = nullptr) -> Value {
+                      const LinkGather *gather = nullptr,
+                      bool single = false) -> Value {
     assert((!page || (gather && !late && !now && !forward && !after)) &&
            "a paged link is never forwarded, taken now or written late");
     auto &producer = producers[p];
@@ -16224,6 +16647,9 @@ LogicalResult StaticFolder::buildSim() {
     unsigned threads =
         compact.empty() ? classes[c].threads() : unsigned(compact.size());
     bool banked = !producer.late;
+    // csf-single-bank: an early link read before its next write, one bank.
+    if (single)
+      banked = false;
     bool crossing = to >= 0 && !slrOf.empty() && slrOf[c] != to;
     assert(!(crossing && now) && "a link between SLR groups is never zero");
     // slr-serialize: the host cycles the crossing takes; every register of
@@ -16631,7 +17057,9 @@ LogicalResult StaticFolder::buildSim() {
   unsigned linkReads = 0, forwardedReads = 0, forwardedAfter = 0, nowReads = 0,
            lateReads = 0, forwardedLate = 0, compactReads = 0, stagedReads = 0,
            syncReads = 0, earlyReads = 0, pagedReads = 0, streamReads = 0,
-           stagedDirectReads = 0;
+           stagedDirectReads = 0, singleReads = 0, doubleReads = 0,
+           partialStreamReads = 0;
+  uint64_t singleBits = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
   SmallVector<unsigned> classReaders(producers.size(), 0);
@@ -16657,6 +17085,13 @@ LogicalResult StaticFolder::buildSim() {
   // run) takes no slot and loads zero, the link's content before any write.
   struct StreamBuilt {
     Value pop1, inst1, row1, page1, data, popPtr, pending;
+    /// A mailbox stream of one row a pass (pingPong): its landings alternate
+    /// between two sets of the members' registers, so that its reader's
+    /// passes need not be spaced. `popPar` the set a landing loads (at its
+    /// pop), `useSel` the set the pass at hand reads (its slot),
+    /// `useSelEarly` the set of the next pass (the host cycle before it).
+    bool pingPong = false;
+    Value popPar, useSel, useSelEarly;
     SmallVector<Value> outs;
   };
   std::vector<StreamBuilt> streamBuilt(linkStreams.size());
@@ -16671,7 +17106,8 @@ LogicalResult StaticFolder::buildSim() {
     unsigned rthreads = classes[st.rcls].threads();
     unsigned pthreads = classes[st.pcls].threads();
     unsigned rIdx = rthreads > 1 ? llvm::Log2_32_Ceil(rthreads) : 0;
-    unsigned pIdx = pthreads > 1 ? llvm::Log2_32_Ceil(pthreads) : 0;
+    // (A mailbox's rows are reader rows.)
+    unsigned pIdx = st.rowIndexBits(pthreads);
     unsigned pgBits = st.pages > 1 ? llvm::Log2_32_Ceil(st.pages) : 0;
     unsigned ib = st.instBits(), slots = st.slots();
     // A response's landing slot: its tag's low bits, above the instance bit
@@ -16760,6 +17196,28 @@ LogicalResult StaticFolder::buildSim() {
           b, comb::ICmpPredicate::ugt,
           reg(t1(cross, cb, "cross"), prefix + "_cross0"), ran);
     Value pop0 = resetReg(sb.pop1, prefix + "_pop0", 0);
+    if (st.twoSets && st.maxNeed == 1) {
+      // Ping-pong: a set per landing in turn, read by the passes in turn.
+      sb.pingPong = true;
+      auto popParNext = backedges.get(i1);
+      sb.popPar = resetReg(popParNext, prefix + "_poppar", 0);
+      popParNext.setValue(comb::XorOp::create(b, sb.popPar, pop0));
+      // A pass whose landing is in the frame before has none in the first
+      // frame: the passes start that many sets on (mod 2).
+      SmallVector<uint64_t> useValid(ii + 1, 0);
+      unsigned before = 0;
+      for (unsigned i = 0; i < rthreads; ++i)
+        if (!st.needs[i].empty())
+          for (int sl : streamReadPasses(rcls, i)) {
+            useValid[((sl % frame) + frame) % frame] = 1;
+            before += floorDiv(sl - 2) < floorDiv(sl);
+          }
+      Value use0 = chain3r(table(b, rctl.at3, useValid, 1), prefix + "_use");
+      auto useParNext = backedges.get(i1);
+      sb.useSel = resetReg(useParNext, prefix + "_usepar", before & 1);
+      useParNext.setValue(comb::XorOp::create(b, sb.useSel, use0));
+      sb.useSelEarly = comb::XorOp::create(b, sb.useSel, use0);
+    }
     Value take0 = comb::AndOp::create(b, pop0, notOf(skip0));
     auto popNext = backedges.get(b.getIntegerType(ib));
     sb.popPtr = resetReg(popNext, prefix + "_popptr", 0);
@@ -16809,15 +17267,54 @@ LogicalResult StaticFolder::buildSim() {
       wparity = comb::XorOp::create(
           b, wparity, reg(reg(pctl.tail2, prefix + "_tail1"), prefix + "_tail0"));
     SmallVector<Value> at{notOf(wparity)};
-    if (pIdx)
+    if (pIdx && st.mailbox)
+      at.push_back(reg(reg(table(b, pctl.inst2, st.mbWriteRow, pIdx),
+                           prefix + "_wrow1"),
+                       prefix + "_wrow0"));
+    else if (pIdx)
       at.push_back(reg(reg(pctl.inst2, prefix + "_winst1"), prefix + "_winst0"));
     SmallVector<Value> wordParts;
-    for (auto &run : llvm::reverse(st.runs))
+    // (A mailbox's lanes at their offsets, zeros between.)
+    unsigned top = st.wordBits;
+    for (auto &run : llvm::reverse(st.runs)) {
+      if (st.mailbox && run.offset + run.width < top)
+        wordParts.push_back(constant(top - run.offset - run.width, 0));
       wordParts.push_back(b.createOrFold<comb::ExtractOp>(
           b.getIntegerType(run.width),
           asBits(b, copies[st.pcls].getResult(producers[run.producer].port)),
           run.low));
+      top = run.offset;
+    }
+    if (st.mailbox && top)
+      wordParts.push_back(constant(top, 0));
     Value word = b.createOrFold<comb::ConcatOp>(wordParts);
+    // A mailbox's byte mask: each byte its lane's domain's membership of
+    // the pass's instance (none between lanes), held with the word.
+    Value heldMask;
+    if (st.mailbox) {
+      SmallVector<int> byteDomain(st.dw * st.pages / 8, -1);
+      for (auto [r, run] : llvm::enumerate(st.runs))
+        for (unsigned y = run.offset / 8; y <= (run.offset + run.width - 1) / 8; ++y)
+          byteDomain[y] = int(st.runDomain[r]);
+      std::map<int, Value> domainBit;
+      SmallVector<Value> maskBytes;
+      for (int d : llvm::reverse(byteDomain)) {
+        Value &bit = domainBit[d];
+        if (!bit)
+          bit = d < 0 ? constant(1, 0)
+                      : reg(reg(table(b, pctl.inst2,
+                                      SmallVector<uint64_t>(st.mbDomains[d].begin(),
+                                                            st.mbDomains[d].end()),
+                                      1),
+                                prefix + "_wdom" + Twine(d) + "_1"),
+                            prefix + "_wdom" + Twine(d) + "_0");
+        maskBytes.push_back(bit);
+      }
+      heldMask = seq::CompRegClockEnabledOp::create(
+          b, b.createOrFold<comb::ConcatOp>(maskBytes), hostClock, we0,
+          b.getStringAttr(prefix + "_mask"), Value(), Value(), Value(),
+          hw::InnerSymAttr());
+    }
     Value held = seq::CompRegClockEnabledOp::create(
         b, word, hostClock, we0, b.getStringAttr(prefix + "_word"), Value(),
         Value(), Value(), hw::InnerSymAttr());
@@ -16844,6 +17341,18 @@ LogicalResult StaticFolder::buildSim() {
     armNext.setValue(comb::MuxOp::create(
         b, we0, constant(1, 1), comb::MuxOp::create(b, lastW, constant(1, 0), armed)));
     Value we = comb::AndOp::create(b, wv0, armed);
+    // A mailbox: no write of a pass whose instance writes none of its lanes.
+    if (st.mailbox) {
+      SmallVector<uint64_t> writer(pthreads, 0);
+      for (unsigned j = 0; j < pthreads; ++j)
+        writer[j] = st.writes(j);
+      Value any = reg(reg(table(b, pctl.inst2, writer, 1), prefix + "_wany1"),
+                      prefix + "_wany0");
+      Value heldAny = seq::CompRegClockEnabledOp::create(
+          b, any, hostClock, we0, b.getStringAttr(prefix + "_any"), Value(),
+          Value(), Value(), hw::InnerSymAttr());
+      we = comb::AndOp::create(b, we, heldAny);
+    }
     Value wrRow = heldAt, wrData;
     unsigned padded = st.dw * st.pages;
     Value wide = padded > st.wordBits
@@ -16862,6 +17371,19 @@ LogicalResult StaticFolder::buildSim() {
     } else {
       wrData = wide;
     }
+    Value wrMask = constant(1, 1);
+    if (st.mailbox) {
+      unsigned mb = st.dw / 8;
+      wrMask = heldMask;
+      if (pgBits) {
+        SmallVector<Value> chunks;
+        for (unsigned j = 1u << pgBits; j-- > 0;)
+          chunks.push_back(j < st.pages ? b.createOrFold<comb::ExtractOp>(
+                                              b.getIntegerType(mb), heldMask, j * mb)
+                                        : constant(mb, 0));
+        wrMask = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), wp0);
+      }
+    }
     // Requests' {tag, instance}: a read's tag its slot, a write's the top
     // bit alone; instance 0.
     sb.outs = {req0,
@@ -16870,7 +17392,7 @@ LogicalResult StaticFolder::buildSim() {
                b.createOrFold<comb::ConcatOp>(rowBits), we,
                b.createOrFold<comb::ConcatOp>(
                    ValueRange{constant(1, 1), constant(ib, 0), constant(1, 0)}),
-               wrRow, wrData, constant(1, 1)};
+               wrRow, wrData, wrMask};
     return sb;
   };
 
@@ -16928,6 +17450,53 @@ LogicalResult StaticFolder::buildSim() {
     read = seq::FirMemReadOp::create(b, memory, readAt, hostClock,
                                      constant(1, 1));
     return read;
+  };
+
+  // csf-mailbox-builder (CsfMailboxes.h): the links offered (a reader input's
+  // piece from a producer of several instances, no producer instance read
+  // by two reader instances), by (consumer, piece, producer, low); their
+  // plans; and, as the inputs are built, each mailbox's lanes (a mailbox per
+  // plan, read timing and write register), built after the inputs.
+  std::map<std::tuple<unsigned, unsigned, int, unsigned>, unsigned>
+      mailboxLinkOf;
+  SmallVector<MailboxLink> mailboxLinks;
+  SmallVector<MailboxPlan> mailboxPlans;
+  SmallVector<int> mailboxPlanOf;
+  if (csfMailboxBuilder)
+    offerMailboxLinks(mailboxLinkOf, mailboxLinks, mailboxPlans,
+                      mailboxPlanOf);
+  struct MailboxLane {
+    unsigned link, producer, low, width;
+    bool single;
+    Backedge out;
+    /// Per producer instance: the reader instance that takes it here (the
+    /// plan's, less the reader instances an HBM stream carries), or -1.
+    SmallVector<int64_t> readerOf;
+  };
+  struct Mailbox {
+    unsigned plan;
+    bool sync, early, late;
+    int to;
+    std::string style;
+    SmallVector<MailboxLane> lanes;
+  };
+  SmallVector<Mailbox> mailboxes;
+  std::map<std::tuple<unsigned, bool, bool, bool, int>, unsigned> mailboxOf;
+  auto joinMailbox = [&](unsigned link, unsigned p, unsigned low,
+                         unsigned width, StringRef style, bool early,
+                         bool late, bool single, int to,
+                         ArrayRef<int64_t> readerOf) -> Value {
+    unsigned plan = unsigned(mailboxPlanOf[link]);
+    auto [it, fresh] = mailboxOf.try_emplace(
+        {plan, !style.empty(), early, late, to}, unsigned(mailboxes.size()));
+    if (fresh)
+      mailboxes.push_back({plan, !style.empty(), early, late, to,
+                           style.str(), {}});
+    auto &box = mailboxes[it->second];
+    box.lanes.push_back({link, p, low, width, single,
+                         backedges.get(b.getIntegerType(width)),
+                         SmallVector<int64_t>(readerOf.begin(), readerOf.end())});
+    return box.lanes.back().out;
   };
 
   // Each model input: its pieces at positions common to every instance; at
@@ -16997,6 +17566,14 @@ LogicalResult StaticFolder::buildSim() {
       SmallVector<std::pair<int, unsigned>> sourceOf(threads);
       SmallVector<uint64_t> producerInst(threads, 0);
       SmallVector<APInt> constants(threads);
+      // csf-mailbox-hbm: a source whose stream carries some reader
+      // instances alone: their value from the stream (set to the read
+      // register's timing or a host cycle ahead), chosen by instance.
+      struct PartialHbm {
+        Value atSlot, ahead;
+        SmallVector<uint64_t> mine;
+      };
+      std::map<unsigned, PartialHbm> partialHbm;
       bool frame = false;
       for (unsigned i = 0; i < threads; ++i) {
         auto [piece, offset] = pieceAt(i, at);
@@ -17094,6 +17671,121 @@ LogicalResult StaticFolder::buildSim() {
         SmallVector<uint64_t> rows;
         SmallVector<bool> takes;
         rowsOf(key, rows, takes);
+        // An HBM stream member's read registers, of the reader instances
+        // `mine` (two sets in turn for a twoSets stream: the set the slot's
+        // pass reads, and the next pass's a host cycle ahead).
+        auto hbmRegisters = [&](const StreamMember &sm, ArrayRef<bool> mine)
+            -> std::pair<Value, Value> {
+          auto &st = linkStreams[sm.stream];
+          auto &sb = streamFor(sm.stream);
+          unsigned off = sm.offset;
+          unsigned pIdx = st.rowIndexBits(pThreadsAll);
+          unsigned pgBits = st.pages > 1 ? llvm::Log2_32_Ceil(st.pages) : 0;
+          // (A mailbox's landing row is the reader's own.)
+          SmallVector<uint64_t> wantRows(rows.begin(), rows.end());
+          if (st.mailbox)
+            for (unsigned i = 0; i < threads; ++i)
+              wantRows[i] = st.mbReaderRow[i] >= 0 ? uint64_t(st.mbReaderRow[i]) : 0;
+          std::string name = (producer.name + "_to_" + consumer.name + "_" +
+                              Twine(at) + "_hbm")
+                                 .str();
+          Value mine1 = sb.pop1;
+          if (threads > 1) {
+            SmallVector<uint64_t> takeRow(threads, 0);
+            for (unsigned i = 0; i < threads; ++i)
+              takeRow[i] = mine[i];
+            mine1 = comb::AndOp::create(b, mine1, table(b, sb.inst1, takeRow, 1));
+          }
+          if (pIdx) {
+            Value want = threads > 1 ? table(b, sb.inst1, wantRows, pIdx)
+                                     : constant(pIdx, wantRows[0]);
+            mine1 = comb::AndOp::create(
+                b, mine1,
+                comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.row1, want));
+          }
+          SmallVector<Value> slices, early;
+          for (unsigned j = off / st.dw; j <= (off + width - 1) / st.dw; ++j) {
+            unsigned lo = std::max(off, j * st.dw);
+            unsigned hi = std::min(off + width, (j + 1) * st.dw);
+            Value en1 = mine1;
+            if (pgBits)
+              en1 = comb::AndOp::create(
+                  b, en1,
+                  comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.page1,
+                                       constant(pgBits, j)));
+            Value en0 = resetReg(en1, name + "_en" + Twine(j), 0);
+            Value bits = b.createOrFold<comb::ExtractOp>(
+                b.getIntegerType(hi - lo), sb.data, lo - j * st.dw);
+            if (sb.pingPong) {
+              // Two sets, loaded in turn, read in turn.
+              Value setA = seq::CompRegClockEnabledOp::create(
+                  b, bits, hostClock,
+                  comb::AndOp::create(b, en0, notOf(sb.popPar)),
+                  b.getStringAttr(name + Twine(j) + "_a"), Value(), Value(),
+                  Value(), hw::InnerSymAttr());
+              Value setB = seq::CompRegClockEnabledOp::create(
+                  b, bits, hostClock, comb::AndOp::create(b, en0, sb.popPar),
+                  b.getStringAttr(name + Twine(j) + "_b"), Value(), Value(),
+                  Value(), hw::InnerSymAttr());
+              slices.push_back(comb::MuxOp::create(b, sb.useSel, setB, setA));
+              early.push_back(comb::MuxOp::create(b, sb.useSelEarly, setB, setA));
+              continue;
+            }
+            Value r = seq::CompRegClockEnabledOp::create(
+                b, bits, hostClock, en0, b.getStringAttr(name + Twine(j)),
+                Value(), Value(), Value(), hw::InnerSymAttr());
+            slices.push_back(r);
+            early.push_back(r);
+          }
+          std::reverse(slices.begin(), slices.end());
+          std::reverse(early.begin(), early.end());
+          return {b.createOrFold<comb::ConcatOp>(slices),
+                  b.createOrFold<comb::ConcatOp>(early)};
+        };
+        // A twoSets member that carries some of the reader instances that
+        // take this source: the others take it as below (their own rows
+        // alone), where that needs no forward or take in its host cycle
+        // (else the whole source stays on chip).
+        bool hbmSkip = false;
+        {
+          auto pm = streamMembers.find(
+              {c, consumer.port, at, unsigned(key.first), key.second});
+          if (pm != streamMembers.end() && pm->second.kept &&
+              linkStreams[pm->second.stream].kept &&
+              linkStreams[pm->second.stream].twoSets &&
+              !pm->second.keepInst.empty()) {
+            auto &keep = pm->second.keepInst;
+            SmallVector<bool> rest(takes.begin(), takes.end()), mine(threads, false);
+            bool anyKept = false, anyRest = false;
+            for (unsigned i = 0; i < threads; ++i) {
+              if (!takes[i])
+                continue;
+              if (keep[i]) {
+                mine[i] = true;
+                rest[i] = false;
+                anyKept = true;
+              } else {
+                anyRest = true;
+              }
+            }
+            if (!anyKept) {
+              hbmSkip = true;
+            } else if (anyRest) {
+              hbmSkip = true;
+              auto [atSlot, ahead] = hbmRegisters(pm->second, mine);
+              auto &ph = partialHbm[index];
+              ph.atSlot = atSlot;
+              ph.ahead = ahead;
+              ph.mine.assign(mine.begin(), mine.end());
+              ++streamReads;
+              ++partialStreamReads;
+              takes.assign(rest.begin(), rest.end());
+              for (unsigned i = 0; i < threads; ++i)
+                if (!takes[i])
+                  rows[i] = 0;
+            }
+          }
+        }
         // A compact link: the producer instances taken, and each instance's
         // index among them for its address.
         SmallVector<uint64_t> kept;
@@ -17308,53 +18000,13 @@ LogicalResult StaticFolder::buildSim() {
         // the landings, page by page, each where its row lands.
         auto member = streamMembers.find(
             {c, consumer.port, at, unsigned(key.first), key.second});
-        if (member != streamMembers.end() && member->second.kept &&
+        if (!hbmSkip && member != streamMembers.end() && member->second.kept &&
             linkStreams[member->second.stream].kept) {
-          auto &st = linkStreams[member->second.stream];
-          auto &sb = streamFor(member->second.stream);
-          unsigned off = member->second.offset;
-          unsigned pIdx = pThreadsAll > 1 ? llvm::Log2_32_Ceil(pThreadsAll) : 0;
-          unsigned pgBits = st.pages > 1 ? llvm::Log2_32_Ceil(st.pages) : 0;
-          std::string name = (producer.name + "_to_" + consumer.name + "_" +
-                              Twine(at) + "_hbm")
-                                 .str();
-          Value mine1 = sb.pop1;
-          if (threads > 1) {
-            SmallVector<uint64_t> takeRow(threads, 0);
-            for (unsigned i = 0; i < threads; ++i)
-              takeRow[i] = takes[i];
-            mine1 = comb::AndOp::create(b, mine1, table(b, sb.inst1, takeRow, 1));
-          }
-          if (pIdx) {
-            Value want = threads > 1 ? table(b, sb.inst1, rows, pIdx)
-                                     : constant(pIdx, rows[0]);
-            mine1 = comb::AndOp::create(
-                b, mine1,
-                comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.row1, want));
-          }
-          SmallVector<Value> slices;
-          for (unsigned j = off / st.dw; j <= (off + width - 1) / st.dw; ++j) {
-            unsigned lo = std::max(off, j * st.dw);
-            unsigned hi = std::min(off + width, (j + 1) * st.dw);
-            Value en1 = mine1;
-            if (pgBits)
-              en1 = comb::AndOp::create(
-                  b, en1,
-                  comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.page1,
-                                       constant(pgBits, j)));
-            Value en0 = resetReg(en1, name + "_en" + Twine(j), 0);
-            slices.push_back(seq::CompRegClockEnabledOp::create(
-                b,
-                b.createOrFold<comb::ExtractOp>(b.getIntegerType(hi - lo),
-                                                sb.data, lo - j * st.dw),
-                hostClock, en0, b.getStringAttr(name + Twine(j)), Value(),
-                Value(), Value(), hw::InnerSymAttr()));
-          }
-          std::reverse(slices.begin(), slices.end());
-          sourceData[index] = b.createOrFold<comb::ConcatOp>(slices);
-          ++streamReads;
+          auto [atSlot, ahead] = hbmRegisters(member->second, takes);
           // The only source: the read register (valid from the host cycle
           // before the slot); one of several: as an early read's output.
+          sourceData[index] = sources.size() == 1 ? atSlot : ahead;
+          ++streamReads;
           if (sources.size() == 1)
             syncPart = true;
           continue;
@@ -17383,18 +18035,65 @@ LogicalResult StaticFolder::buildSim() {
               nullptr, false, nullptr, false, false, kept, style, page, &g);
           continue;
         }
+        // csf-single-bank: a memory link (several entries), never taken now
+        // or forwarded, all of whose reads come at least 3 host cycles (4
+        // from a shared write register) before its producer's write.
+        bool single = false;
+        if (csfSingleBank && !producer.late && pThreads > 1) {
+          single = !now && !forward && !crossing &&
+                   readsBeforeWrite(key.first, c, rows, takes, late ? 4 : 3);
+          (single ? singleReads : doubleReads) += 1;
+          if (single)
+            singleBits += uint64_t(width) * pThreads;
+        }
+        // csf-mailbox-builder: a lane of its class pair's mailbox, where
+        // planned; written and read as the link would be.
+        if (!mailboxLinkOf.empty() && !now && !forward && !crossing &&
+            !(late && forwardLate)) {
+          auto planned =
+              mailboxLinkOf.find({unsigned(k), at, key.first, key.second});
+          if (planned != mailboxLinkOf.end() &&
+              mailboxPlanOf[planned->second] >= 0) {
+            SmallVector<int64_t> readerOf(pThreadsAll, -1);
+            for (unsigned i = 0; i < threads; ++i)
+              if (takes[i])
+                readerOf[rows[i]] = i;
+            sourceData[index] =
+                joinMailbox(planned->second, unsigned(key.first), key.second,
+                            width, style, early, late, single, to, readerOf);
+            continue;
+          }
+        }
         sourceData[index] =
             early ? linkRead(key.first, key.second, width, address2, bank2,
                              producer.name + "_to_" + consumer.name + "_" +
                                  Twine(at),
                              to, nullptr, false, nullptr, late, false, kept,
-                             style)
+                             style, 0, nullptr, single)
                   : linkRead(key.first, key.second, width, address, bank,
                              producer.name + "_to_" + consumer.name + "_" +
                                  Twine(at),
                              to, now ? &sourceNow[index] : nullptr, forward,
                              after ? &sourceAfter[index] : nullptr, late,
-                             forwardLate, kept, style);
+                             forwardLate, kept, style, 0, nullptr, single);
+      }
+      // csf-mailbox-hbm: the stream's value for the instances it carries;
+      // the on-chip rest's takes in the slot and forwards past the read
+      // register (address compares) for its own instances alone.
+      for (auto &[index, ph] : partialHbm) {
+        Value pick = syncPart ? table(b, ctl.inst, ph.mine, 1)
+                              : table(b, ctl.inst1, ph.mine, 1);
+        sourceData[index] = comb::MuxOp::create(
+            b, pick, syncPart ? ph.atSlot : ph.ahead, sourceData[index]);
+        SmallVector<uint64_t> others(ph.mine.size());
+        for (size_t i = 0; i < others.size(); ++i)
+          others[i] = !ph.mine[i];
+        if (sourceNow[index].first)
+          sourceNow[index].first = comb::AndOp::create(
+              b, sourceNow[index].first, table(b, ctl.inst, others, 1));
+        for (auto &piece : sourceAfter[index])
+          piece.hit = comb::AndOp::create(b, piece.hit,
+                                          table(b, ctl.inst1, others, 1));
       }
       if (syncPart) {
         // Registered already: wired around the read register.
@@ -17549,16 +18248,242 @@ LogicalResult StaticFolder::buildSim() {
         b.createOrFold<hw::BitcastOp>(cls.inputTypes[consumer.port], value));
   }
 
+  // csf-mailbox-builder: each mailbox, its lanes laid out in a row of the
+  // reader instances that take any (`rows`; with two banks, the frame's
+  // parity above them), cut into pieces of at most `regionBits` bits. A
+  // piece: one memory, written at the producer's pass (as its links would
+  // be: the same enable, bank and delays) at the reader row its instance
+  // feeds, masked to the bytes of the lanes that instance writes (a piece of
+  // one write domain: its enable gated by the domain instead); read at the
+  // reader's slot at its instance's row (a host cycle ahead for a read
+  // ahead), as the links' reads.
+  std::string mailboxReport;
+  if (!mailboxes.empty()) {
+    uint64_t lanes = 0, pieces = 0, masked = 0, bits = 0, laneBits = 0,
+             banked = 0;
+    for (auto [m, box] : llvm::enumerate(mailboxes)) {
+      auto &plan = mailboxPlans[box.plan];
+      unsigned pc = plan.pcls, c = plan.rcls;
+      auto &producer = producers[box.lanes[0].producer];
+      auto &pctl = controls[pc];
+      auto &rctl = readCtl(c);
+      unsigned pThreads = classes[pc].threads(), rThreads = classes[c].threads();
+      Operation *mark = body->empty() ? nullptr : &body->back();
+      // Rows: the reader instances taking a lane, in order; each producer
+      // instance's row; the lanes' write domains.
+      SmallVector<int64_t> rowOfReader(rThreads, -1), rowOfProducer(pThreads, -1);
+      std::map<SmallVector<bool>, unsigned> domainIds;
+      SmallVector<unsigned> widths, domainOf;
+      SmallVector<SmallVector<bool>> domainMembers;
+      for (auto &lane : box.lanes) {
+        auto &link = lane;
+        SmallVector<bool> members;
+        for (auto [j, reader] : llvm::enumerate(link.readerOf)) {
+          members.push_back(reader >= 0);
+          if (reader >= 0)
+            rowOfReader[reader] = 0;
+        }
+        auto [d, fresh] = domainIds.try_emplace(members, domainIds.size());
+        if (fresh)
+          domainMembers.push_back(members);
+        domainOf.push_back(d->second);
+        widths.push_back(lane.width);
+      }
+      unsigned rows = 0;
+      for (auto &row : rowOfReader)
+        if (row >= 0)
+          row = rows++;
+      for (auto &lane : box.lanes)
+        for (auto [j, reader] : llvm::enumerate(lane.readerOf))
+          if (reader >= 0)
+            rowOfProducer[j] = rowOfReader[reader];
+      bool identity = rows == rThreads;
+      bool bank = !producer.late &&
+                  llvm::any_of(box.lanes, [](auto &l) { return !l.single; });
+      unsigned rowBits = rows > 1 ? llvm::Log2_32_Ceil(rows) : 0;
+      uint64_t depth = bank ? 2 * (uint64_t(1) << rowBits)
+                            : (rowBits ? rows : 2);
+      auto layout = layoutMailbox(widths, domainOf, std::min(512u, unsigned(regionBits)));
+      std::string base = (classes[pc].name + "_to_" + classes[c].name +
+                          "_mbox" + Twine(m))
+                             .str();
+      // The producers' bits (a lane's port; registered for a late write).
+      std::map<unsigned, Value> outBits;
+      auto bitsOf = [&](unsigned p) {
+        Value &v = outBits[p];
+        if (!v)
+          v = asBits(b, copies[pc].getResult(producers[p].port));
+        return v;
+      };
+      unsigned splitLate = splitDelayP(int(box.lanes[0].producer));
+      SmallVector<SmallVector<std::pair<unsigned, Value>>> laneParts(
+          box.lanes.size());
+      for (auto [k, piece] : llvm::enumerate(layout.pieces)) {
+        std::string name = base + "_" + std::to_string(k);
+        auto twice = [&](Value v, const std::string &n) {
+          v = copyReg(copyReg(v, name + n + "1"), name + n + "0");
+          for (unsigned j = 0; j < splitLate; ++j)
+            v = copyReg(v, name + n + "_split" + std::to_string(j + 1));
+          if (box.late)
+            v = copyReg(v, name + n + "_late");
+          return v;
+        };
+        // The write: enable, row, bank and mask (or domain), data.
+        Value pass = !producer.atReady ? pctl.state2
+                     : producer.readyLevel
+                         ? pctl.laterReady2[producer.readyLevel - 1]
+                         : pctl.ready2;
+        Value enable = twice(pass, "_we");
+        Value mask;
+        if (piece.masked) {
+          // A register pair per write domain of the piece, its bytes wired
+          // from it (high byte first).
+          std::map<unsigned, Value> domainBit;
+          for (unsigned d : piece.byteDomain)
+            if (!domainBit.count(d)) {
+              SmallVector<uint64_t> memberOf(domainMembers[d].begin(),
+                                             domainMembers[d].end());
+              domainBit[d] = twice(table(b, pctl.inst2, memberOf, 1),
+                                   "_mask" + std::to_string(d));
+            }
+          SmallVector<Value> bytes;
+          for (unsigned d : llvm::reverse(piece.byteDomain))
+            bytes.push_back(domainBit[d]);
+          mask = b.createOrFold<comb::ConcatOp>(bytes);
+        } else {
+          auto &members = domainMembers[piece.domain];
+          if (!llvm::all_of(members, [](bool v) { return v; })) {
+            SmallVector<uint64_t> memberOf(members.begin(), members.end());
+            enable = comb::AndOp::create(
+                b, enable, twice(table(b, pctl.inst2, memberOf, 1), "_member"));
+          }
+        }
+        SmallVector<Value> writeAddress, readAddress;
+        if (bank) {
+          Value parity = copyReg(par1, name + "_parity0");
+          if (pctl.tail2)
+            parity = comb::XorOp::create(
+                b, parity,
+                copyReg(copyReg(pctl.tail2, name + "_tail1"), name + "_tail0"));
+          Value writeBank = notOf(parity);
+          for (unsigned j = 0; j < splitLate; ++j)
+            writeBank = copyReg(writeBank, name + "_bank_split" + Twine(j + 1));
+          if (box.late)
+            writeBank = copyReg(writeBank, name + "_bank_late");
+          writeAddress.push_back(writeBank);
+          Value readBank = copyReg(box.early ? parD : par2, name + "_rparity");
+          if (Value tail = box.early ? rctl.tail3 : rctl.tail2)
+            readBank = comb::XorOp::create(b, readBank,
+                                           copyReg(tail, name + "_rtail"));
+          readAddress.push_back(readBank);
+        }
+        if (rowBits) {
+          SmallVector<uint64_t> rowOf(pThreads, 0);
+          for (unsigned j = 0; j < pThreads; ++j)
+            rowOf[j] = rowOfProducer[j] >= 0 ? uint64_t(rowOfProducer[j]) : 0;
+          writeAddress.push_back(twice(table(b, pctl.inst2, rowOf, rowBits), "_row"));
+          Value inst = box.early ? rctl.inst3 : rctl.inst2;
+          if (!identity) {
+            SmallVector<uint64_t> readRow(rThreads, 0);
+            for (unsigned i = 0; i < rThreads; ++i)
+              readRow[i] = rowOfReader[i] >= 0 ? uint64_t(rowOfReader[i]) : 0;
+            inst = table(b, inst, readRow, rowBits);
+          }
+          readAddress.push_back(copyReg(inst, name + "_rrow"));
+        }
+        if (writeAddress.empty()) {
+          writeAddress.push_back(constant(1, 0));
+          readAddress.push_back(constant(1, 0));
+        }
+        SmallVector<Value> data;   // high first
+        unsigned top = piece.width;
+        SmallVector<const MailboxLayout::Segment *> mine;
+        for (auto &s : layout.segments)
+          if (s.piece == k)
+            mine.push_back(&s);
+        llvm::sort(mine, [](auto *x, auto *y) { return x->offset > y->offset; });
+        for (auto *s : mine) {
+          if (s->offset + s->width < top)
+            data.push_back(constant(top - s->offset - s->width, 0));
+          auto &lane = box.lanes[s->lane];
+          Value bits = b.createOrFold<comb::ExtractOp>(
+              b.getIntegerType(s->width), bitsOf(lane.producer),
+              lane.low + s->laneLow);
+          if (box.late)
+            bits = writtenOf(lane.producer, lane.low + s->laneLow, bits);
+          data.push_back(bits);
+          top = s->offset;
+        }
+        if (top)
+          data.push_back(constant(top, 0));
+        auto memory = seq::FirMemOp::create(
+            b,
+            seq::FirMemType::get(context, depth, piece.width,
+                                 piece.masked ? piece.width / 8 : 1),
+            /*readLatency=*/box.sync ? 1 : 0, /*writeLatency=*/1,
+            box.sync ? seq::RUW::Old : seq::RUW::Undefined, seq::WUW::Undefined,
+            b.getStringAttr(name), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+            StringAttr{}, Attribute{});
+        if (box.sync) {
+          StringRef style = linkKinds.count({modelOf(pc).str(), modelOf(c).str()})
+                                ? StringRef(box.style)
+                                : syncLinkStyle(depth, piece.width);
+          setRamStyle(memory, style.empty() ? StringRef("distributed") : style);
+        }
+        seq::FirMemWriteOp::create(
+            b, memory, b.createOrFold<comb::ConcatOp>(writeAddress), hostClock,
+            enable, b.createOrFold<comb::ConcatOp>(data), mask);
+        Value read = seq::FirMemReadOp::create(
+            b, memory, b.createOrFold<comb::ConcatOp>(readAddress), hostClock,
+            constant(1, 1));
+        for (auto *s : mine)
+          laneParts[s->lane].push_back(
+              {s->laneLow, b.createOrFold<comb::ExtractOp>(
+                               b.getIntegerType(s->width), read, s->offset)});
+        ++pieces;
+        masked += piece.masked;
+        bits += depth * piece.width;
+      }
+      for (auto [l, lane] : llvm::enumerate(box.lanes)) {
+        auto &parts = laneParts[l];
+        llvm::sort(parts, [](auto &x, auto &y) { return x.first > y.first; });
+        SmallVector<Value> high;
+        for (auto &part : parts)
+          high.push_back(part.second);
+        lane.out.setValue(high.size() == 1 ? high[0]
+                                           : b.createOrFold<comb::ConcatOp>(high));
+        laneBits += uint64_t(lane.width) * pThreads;
+      }
+      lanes += box.lanes.size();
+      banked += bank;
+      if (box.to >= 0)
+        for (auto *op = mark ? mark->getNextNode() : &body->front(); op;
+             op = op->getNextNode())
+          if (!isa<hw::ConstantOp>(op))
+            tagGroup(op, box.to);
+    }
+    llvm::raw_string_ostream os(mailboxReport);
+    os << "  csf mailboxes: " << mailboxes.size() << " (" << banked
+       << " two banks) of " << mailboxPlans.size() << " plans, " << lanes
+       << " links as lanes (" << laneBits << " producer-entry bits), "
+       << pieces << " memories (" << masked << " masked), " << bits
+       << " bits\n";
+  }
+
   {
     std::string text;
     llvm::raw_string_ostream os(text);
     os << pageReport;
+    os << mailboxReport;
     os << "  link reads: " << linkReads << ", forwarded " << forwardedReads
        << " (past the read register " << forwardedAfter << "), taken now "
        << nowReads << "; written from a shared register " << lateReads
        << " (forwarded " << forwardedLate << ")";
     if (compactLinks)
       os << "; compact " << compactReads;
+    if (csfSingleBank)
+      os << "; csf single-bank " << singleReads << " (" << singleBits
+         << " bits in one bank), two banks " << doubleReads;
     if (stagedLinks)
       os << "; staged " << stagedReads;
     if (stagedLinkDirect)
@@ -17573,6 +18498,8 @@ LogicalResult StaticFolder::buildSim() {
       os << "; paged " << pagedReads;
     if (streamReads)
       os << "; hbm " << streamReads;
+    if (partialStreamReads)
+      os << " (" << partialStreamReads << " of some reader instances)";
     os << "\n";
     reportPageEngines(os);
     llvm::errs() << os.str();
@@ -18261,7 +19188,9 @@ LogicalResult StaticFolder::buildSim() {
                                                                   constant(1, 0))));
         wrRow.push_back(when(wv, rowOf(outs[5])));
         wrData.push_back(when(wv, zext(outs[6], dw)));
-        wrMask.push_back(when(wv, zext(constant((st.dw + 7) / 8, ~0ull), dw / 8)));
+        wrMask.push_back(when(wv, zext(st.mailbox ? outs[7]
+                                                  : constant((st.dw + 7) / 8, ~0ull),
+                                       dw / 8)));
       }
       auto any = [&](SmallVector<Value> &xs) -> Value {
         return xs.size() == 1 ? xs[0] : Value(comb::OrOp::create(b, xs, false));
@@ -18313,7 +19242,8 @@ LogicalResult StaticFolder::buildSim() {
         virtuals.push_back(b.getStringAttr(
             "link_" + modelOf(st.pcls) + "_" + modelOf(st.rcls) + ":__link" +
             Twine(v.k) + ":" + Twine(st.portInstBits()) + ":" +
-            Twine(streamRowBits(st)) + ":" + Twine(st.dw) + ":1:0:1:" +
+            Twine(streamRowBits(st)) + ":" + Twine(st.dw) + ":" +
+            Twine(st.mailbox ? st.dw / 8 : 1) + ":0:1:" +
             Twine(st.tagBits())));
         continue;
       }
@@ -18860,6 +19790,9 @@ void FoldStaticPass::runOnOperation() {
   folder.csfMailboxes = csfMailboxes;
   folder.csfReadyCones = csfReadyCones;
   folder.csfMailboxLatency = csfMailboxLatency;
+  folder.csfSingleBank = csfSingleBank;
+  folder.csfMailboxBuilder = csfMailboxBuilder;
+  folder.csfMailboxHbm = csfMailboxHbm;
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.stateInRamPP = stateInRamPP;
   folder.ppAddressFanout = std::max(1u, unsigned(stateInRamPPFanout));

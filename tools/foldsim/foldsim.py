@@ -524,6 +524,16 @@ def frame_options(a):
         fold += f' state-scratch-reserve={a.state_scratch_reserve}'
     if getattr(a, 'state_scratch_whole', False):
         fold += ' state-scratch-partial=false'
+    if getattr(a, 'csf_single_bank', False):
+        fold += ' csf-single-bank'
+    if getattr(a, 'csf_mailbox_builder', False):
+        fold += ' csf-mailbox-builder'
+    if getattr(a, 'csf_mailbox_hbm', False):
+        fold += ' csf-mailbox-hbm'
+    if getattr(a, 'csf_mailboxes', False):
+        fold += ' csf-mailboxes'
+        if getattr(a, 'csf_mailbox_latency', 1) != 1:
+            fold += f' csf-mailbox-latency={a.csf_mailbox_latency}'
     return fold
 
 
@@ -1581,6 +1591,24 @@ def build_parser():
     ap.add_argument('--state-in-ram-pp-fanout', type=int, default=0, metavar='N',
                     help='with --state-in-ram-pp: the most RAM primitives a combinationally read memory\'s '
                          'registered address copy drives (foldsim-fold-static state-in-ram-pp-fanout; 0: 96)')
+    ap.add_argument('--csf-mailbox-hbm', action='store_true',
+                    help='constant-shell fold: reader-indexed link mailboxes in HBM, as HBM link streams of reader '
+                         'rows (foldsim-fold-static csf-mailbox-hbm)')
+    ap.add_argument('--csf-mailbox-builder', action='store_true',
+                    help='constant-shell fold: the links of a producer class to a reader class as lanes of one '
+                         'reader-indexed mailbox, a row per reader instance (foldsim-fold-static csf-mailbox-builder)')
+    ap.add_argument('--csf-single-bank', action='store_true',
+                    help='constant-shell fold: an early link read before its producer\'s next write keeps one '
+                         'bank, the others two, as the schedule decides (foldsim-fold-static csf-single-bank)')
+    ap.add_argument('--csf-merge-links', type=int, default=0, metavar='BITS',
+                    help='constant-shell fold: link memories of equal ports (a producer and reader class '
+                         'pair) merged side by side into mailboxes of at most BITS bits '
+                         '(foldsim-merge-memories; 0: off)')
+    ap.add_argument('--csf-mailboxes', action='store_true',
+                    help='constant-shell fold, schedule only: links as reader-owned RAM mailboxes '
+                         '(foldsim-fold-static csf-mailboxes)')
+    ap.add_argument('--csf-mailbox-latency', type=int, default=1, metavar='N',
+                    help='with --csf-mailboxes: the host cycles a mailbox read takes past a register link\'s')
     ap.add_argument('--state-in-ram-h', type=int, default=0, metavar='N',
                     help='with --state-in-ram and P auto: the most host cycles a copy\'s passes take '
                          '(instances x P; foldsim-fold-static state-in-ram-h; 0: no bound)')
@@ -2090,7 +2118,9 @@ def main():
         if a.fanout:
             rc += f' fanout={a.fanout}' + (' fanout-logic' if a.fanout_logic else '')
         replicate = f'hw.module(foldsim-replicate-controls{{{rc}}})'
-        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}', SPLIT, replicate,
+        merge = ([f'hw.module(foldsim-merge-memories{{max-bits={a.csf_merge_links}}})']
+                 if getattr(a, 'csf_merge_links', 0) else [])
+        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}'] + merge + [SPLIT, replicate,
                                         'canonicalize', 'foldsim-sort', 'cse']
         if a.copies == 'auto' or a.slr_groups or region:
             sim_input = out('models.mlir')

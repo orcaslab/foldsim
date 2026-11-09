@@ -8,12 +8,14 @@ add_mlir_library(FoldsimTransforms
   FAME5.cpp
   FindPipelines.cpp
   MemoriesToRegisters.cpp
+  MergeMemories.cpp
   FuseModels.cpp
   LowerWideNegation.cpp
   CompressAddTrees.cpp
   CsfReadySplit.cpp
   SlotSequencer.cpp
   AffineSlots.cpp
+  CsfMailboxes.cpp
   Pipelines.cpp
   RemoveDeadState.cpp
   ReplicateControls.cpp

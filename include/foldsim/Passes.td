@@ -968,6 +968,28 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "With csf-mailboxes: the host cycles a mailbox read takes past a "
            "register link's (1: the RAM's output register; 2 with a cascade "
            "or a fabric register after it)">,
+    Option<"csfSingleBank", "csf-single-bank", "bool", "false",
+           "Constant-shell fold: an early link (a memory of several entries) "
+           "all of whose reads of a frame come before its producer writes "
+           "the entry in that frame keeps one bank, not two; the others "
+           "keep two (the schedule decides, link by link)">,
+    Option<"csfMailboxHbm", "csf-mailbox-hbm", "bool", "false",
+           "Constant-shell fold: early links whose producer instances are "
+           "each read by one reader instance (chain self-links aside) kept "
+           "in HBM as reader-indexed mailboxes: HBM link streams (link-kinds "
+           "hbm's machinery) whose rows are reader rows, written byte-masked "
+           "at the producer's pass at the row of the reader its instance "
+           "feeds, a row of at most link-hbm-row-bits a stream; each reader "
+           "pass's row lands in the stream's fixed landing slots. A link "
+           "whose room the schedule does not leave stays on chip">,
+    Option<"csfMailboxBuilder", "csf-mailbox-builder", "bool", "false",
+           "Constant-shell fold: the links from a producer class to a reader "
+           "class whose producer instances are each read by one reader "
+           "instance become lanes of one reader-indexed mailbox (a row per "
+           "reader instance, a lane per link, written masked at the "
+           "producer's pass, read whole at the reader's); links that fan "
+           "out, are taken now, forwarded, cross SLR groups, paged, staged "
+           "or streamed stay as they are">,
     Option<"csfMailboxes", "csf-mailboxes", "bool", "false",
            "Constant-shell fold (schedule only): links are rows of RAM "
            "mailboxes owned by their reader, one read port each: a link not "
@@ -1308,6 +1330,24 @@ def SplitMaskedMemories
     64 bits and 8 mask bits, each byte is one RAM byte lane and the parity
     bits stay unused: a few more RAMs and no merge logic.
   }];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect"];
+}
+
+def MergeMemories
+    : Pass<"foldsim-merge-memories", "::circt::hw::HWModuleOp"> {
+  let summary = "Merge memories of equal ports side by side";
+  let description = [{
+    Memories with one unmasked write port and one read port whose addresses,
+    enables and clocks are the same values up to copies (registers and logic
+    of one kind and attributes, names aside, over the same operands) take the
+    same entries at the same host cycles: laid side by side in one memory of
+    at most `max-bits` bits, they read and write as before, in fewer and
+    fuller RAM columns. The constant-shell fold's link mailboxes.
+  }];
+  let options = [
+    Option<"maxBits", "max-bits", "unsigned", "512",
+           "The widest merged memory, in bits">,
+  ];
   let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect"];
 }
 
