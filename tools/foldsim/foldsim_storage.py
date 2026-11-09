@@ -221,9 +221,10 @@ def vmem_cache_rows(vmems, choice, budget):
     frame, in slot order) has none, nor an HBM page stream's engine
     (`__pages<k>`: each page row written and read once a frame), nor a folded
     pipeline's store in HBM (`fold<k>_store`, fold-store-hbm: each row written
-    once and read once, depth frames later)."""
+    once and read once, depth frames later), nor a PP class's state rows in HBM
+    (`pps<k>_rows`, state-scratch-bits: each row read and written once a frame)."""
     caps = [0 if str(v.get('class', '')).startswith(('__link', '__pages')) or
-            re.fullmatch(r'fold\d+_store', str(v.get('memory', ''))) else
+            re.fullmatch(r'fold\d+_store|pps\d+_rows', str(v.get('memory', ''))) else
             pow2_floor(v['instances'] << v['row_width']) for v in vmems]
     if choice != 'auto':
         n = int(choice)

@@ -479,6 +479,10 @@ def frame_options(a):
             fold += ' state-in-ram-pp'
         if getattr(a, 'state_in_ram_pp_fanout', 0):
             fold += f' state-in-ram-pp-fanout={a.state_in_ram_pp_fanout}'
+    if getattr(a, 'state_scratch_bits', None) is not None:
+        fold += f' state-scratch-bits={a.state_scratch_bits}'
+    if getattr(a, 'state_stream_window', 0):
+        fold += f' state-stream-window={a.state_stream_window}'
     return fold
 
 
@@ -1485,6 +1489,14 @@ def build_parser():
                     help='with --state-in-ram: classes of P > 1 in the CSF pass-partitioned form: rows read '
                          'in place at their pass and written from the logic, staged with P stages, no capture '
                          'or write-back buffer (foldsim-fold-static state-in-ram-pp)')
+    ap.add_argument('--state-scratch-bits', type=int, default=None, metavar='N',
+                    help='with --static: the constant shell\'s on-chip state scratch in bits (folded pipelines\' '
+                         'HBM-eligible stores first, then state rows: whole classes, largest first, while they '
+                         'fit); the rest streams from HBM (foldsim-fold-static state-scratch-bits; default '
+                         '250,000,000)')
+    ap.add_argument('--state-stream-window', type=int, default=0, metavar='N',
+                    help='with --state-scratch-bits: a streamed PP class\'s landing window, in instance slots '
+                         '(foldsim-fold-static state-stream-window; 0: a RAMB36 deep, 512 / P)')
     ap.add_argument('--state-in-ram-pp-fanout', type=int, default=0, metavar='N',
                     help='with --state-in-ram-pp: the most RAM primitives a combinationally read memory\'s '
                          'registered address copy drives (foldsim-fold-static state-in-ram-pp-fanout; 0: 96)')

@@ -684,7 +684,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "landing buffer of an entry per instance, written as the results "
            "come back); its next pass waits in a bubble only if the row is "
            "late. A storage rule <model>:fold<k>_store=hbm puts one store in "
-           "HBM, another kind keeps it on chip. 0: none by size">,
+           "HBM, another kind keeps it on chip. A store by size goes to HBM "
+           "only past the state scratch (state-scratch-bits), which the "
+           "stores take first, in class order. 0: none by size">,
     Option<"foldStoreStyle", "fold-store-style", "std::string", "\"auto\"",
            "With fold-store-ram: the stores' RAM style, ultra, block, or auto "
            "(ultra where it takes fewer than half as many primitives as "
@@ -867,6 +869,19 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "With state-in-ram-pp: the most RAM primitives a combinationally "
            "read memory's address register drives (the memory is banked by "
            "width, a registered address copy per bank)">,
+    Option<"stateScratchBits", "state-scratch-bits", "uint64_t", "250000000",
+           "Constant shell: the on-chip state scratch, in bits, for every "
+           "class's state rows (state-in-ram-pp columns and on-chip pages, "
+           "all copies). Whole classes stay resident, largest first while "
+           "they fit; the others' rows stream from HBM (a PP class through a "
+           "fixed landing window, state-stream-window; a paged class as "
+           "pages=hbm). A class a storage rule keeps on chip is resident "
+           "whatever the budget">,
+    Option<"stateStreamWindow", "state-stream-window", "unsigned", "0",
+           "With state-in-ram-pp, a class streamed from HBM: the most "
+           "instance slots of its landing window (each instance's P rows "
+           "prefetched into a slot, read in place at its passes); 0: a "
+           "RAMB36's depth (512 / P rows)">,
     Option<"stateInRamZeroLinks", "state-in-ram-zero-links", "bool", "false",
            "With state-in-ram and zero-latency-links: links into a class of "
            "P > 1 may be taken in their producer's host cycle (default: from "

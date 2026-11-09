@@ -1,0 +1,68 @@
+# REQUIRES: verilator
+# State rows in HBM behind a fixed on-chip scratch (foldsim-fold-static state-scratch-bits; the constant shell,
+# cs_1109 INTERFACES.md section A). Whole classes stay resident while they fit in the scratch; a state-in-ram-pp
+# class past it streams its rows from HBM. Its columns are a landing window of a fixed number of instance slots
+# ({slot, row}, not {instance, row}). Each instance's P rows are prefetched into its slot at the state pass of the
+# slot's previous occupant: virtual memories of {instance, row} rows, a chunk of columns each. Its passes read them in
+# place as on chip and wait in a bubble while any row is pending. Each pass writes its row to HBM with its lanes as
+# byte enables. Against the target, from zero state (Inputs/tb_pages.sv: a controller model per virtual memory),
+# P = 2, 3 and 4 (Driver/Inputs/paged: a 160-bit register written on an enable, cut across rows), at response
+# latencies of 1-60 host cycles, stalled channels, controllers out of room and bubbles, with the leaves' RAM virtual
+# too. Folded pipelines (Driver/Inputs/fold_hbm) are tested with their stores in HBM as well. Small classes whose
+# passes leave no room for a prefetch stay on chip. Under the default scratch, nothing streams, and the folded
+# pipelines' stores take the scratch before HBM.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/paged
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/p2 --static --state-in-ram Leaf::2 --state-in-ram-pp --state-scratch-bits 0 Leaf > %t/p2.log 2>&1
+# RUN: FileCheck %s --check-prefix=P2LOG < %t/p2.log
+# RUN: FileCheck %s --check-prefix=P2VH < %t/p2/foldsim_sim.vh
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/p2 -Mdir %t/p2/obj %S/Inputs/tb_pages.sv top.sv %t/p2/foldsim_sim.sv > %t/p2/build.log 2>&1
+# RUN: %t/p2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/p2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/p3 --static --state-in-ram Leaf::3 --state-in-ram-pp --state-scratch-bits 0 Leaf > %t/p3.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/p3 -Mdir %t/p3/obj %S/Inputs/tb_pages.sv top.sv %t/p3/foldsim_sim.sv > %t/p3/build.log 2>&1
+# RUN: %t/p3/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=5 +hi=60 +stall=20 +full=30 | FileCheck %s
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/p4b --static --state-in-ram Leaf::4 --state-in-ram-pp --state-scratch-bits 0 --bubbles --modulo Leaf > %t/p4b.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/p4b -DBUBBLES -Mdir %t/p4b/obj %S/Inputs/tb_pages.sv top.sv %t/p4b/foldsim_sim.sv > %t/p4b/build.log 2>&1
+# RUN: %t/p4b/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/ram --static --state-in-ram Leaf::4 --state-in-ram-pp --state-scratch-bits 0 --virtual-memories ram Leaf > %t/ram.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/ram -DVM1 -Mdir %t/ram/obj %S/Inputs/tb_pages.sv top.sv %t/ram/foldsim_sim.sv > %t/ram/build.log 2>&1
+# RUN: %t/ram/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=40 +full=20 | FileCheck %s
+# Copies of two instances each: no window fits (a prefetch between two passes P apart), so the rows stay on chip.
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/c2 --static --state-in-ram Leaf::4 --state-in-ram-pp --state-scratch-bits 0 --copies Leaf:2 Leaf 2>&1 | FileCheck %s --check-prefix=C2
+# Default scratch: resident, as without it (no virtual memory).
+# RUN: foldsim --srcs top.f --top Top --out %t/on --static --state-in-ram Leaf::4 --state-in-ram-pp Leaf 2>&1 | FileCheck %s --check-prefix=ON
+# RUN: FileCheck %s --check-prefix=ONVH < %t/on/foldsim_sim.vh
+# Folded pipelines, their stores in HBM too (three virtual memories), and with bubbles.
+# RUN: cd %S/../Driver/Inputs/fold_hbm
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/fh --static --state-in-ram Leaf::2 --state-in-ram-pp --state-scratch-bits 0 --fold-store-hbm 1 Leaf > %t/fh.log 2>&1
+# RUN: FileCheck %s --check-prefix=FH < %t/fh.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/fh -DVM1 -DVM2 -Mdir %t/fh/obj %S/Inputs/tb_pages.sv top.sv %t/fh/foldsim_sim.sv > %t/fh/build.log 2>&1
+# RUN: %t/fh/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/fh/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | FileCheck %s
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/fhb --static --state-in-ram Leaf::3 --state-in-ram-pp --state-scratch-bits 0 --bubbles --modulo Leaf > %t/fhb.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/fhb -DBUBBLES -Mdir %t/fhb/obj %S/Inputs/tb_pages.sv top.sv %t/fhb/foldsim_sim.sv > %t/fhb/build.log 2>&1
+# RUN: %t/fhb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=20 +bubble=20 | FileCheck %s
+# The folded pipelines' stores take the scratch first: on chip under the default scratch, in HBM past it.
+# RUN: foldsim --srcs top.f --top Top --out %t/fs --static --fold-store-hbm 1 Leaf 2>&1 | FileCheck %s --check-prefix=FS
+# RUN: foldsim --srcs top.f --top Top --out %t/fs1 --static --fold-store-hbm 1 --state-scratch-bits 120 Leaf 2>&1 | FileCheck %s --check-prefix=FS1
+
+# P2LOG: state-scratch: Leaf: 1152 bits of PP rows stream from HBM
+# P2LOG: state-scratch: 0 bits; fold stores 0, rows resident 0 (0 kept on chip by rule or form), streamed 1152 in 1 classes
+# P2LOG: state-stream: Leaf: P 2, 4 instances, a window of 2 slots
+# P2LOG: state-stream: II_sched [[II:[0-9]+]], HBM state bits a frame {{[0-9]+}}, II_bw 1 (8 masters, 8192 b/hc usable): II [[II]]
+# P2LOG: state-stream: Leaf: {{[0-9]+}} columns in 1 virtual memories, a window of 2 slots x 2 rows
+# P2LOG: state-in-ram-pp: Leaf (rows in HBM, a window of 2 slots): built {{.*}} x 4 rows (block)
+# P2VH: `define FOLDSIM_VMEM_COUNT 1
+# P2VH: `define FOLDSIM_VMEM_0_IW 3
+# P2VH: `define FOLDSIM_VMEM_0_INSTANCES 8
+# C2: state-stream: Leaf: no landing window of at most 128 slots fits the schedule (II {{[0-9]+}}): its rows stay on chip
+# C2: state-stream: Leaf_copy1: no landing window
+# ON: state-scratch: 250000000 bits; fold stores 0, rows resident 1152 (0 kept on chip by rule or form), streamed 0 in 0 classes
+# ON-NOT: state-stream:
+# ONVH-NOT: FOLDSIM_VMEM_COUNT
+# FH: fold-store-hbm: Leaf: 2 stores, 224 bits in HBM
+# FS-NOT: fold-store-hbm:
+# FS: state-scratch: 250000000 bits; fold stores 224, rows resident 0
+# FS1: fold-store-hbm: Leaf: 1 stores, {{[0-9]+}} bits in HBM
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL

@@ -9,10 +9,11 @@
 # models of the kernel's controllers (Inputs/tb_vmem_multi.sv): responses 1
 # to 60 host cycles late, stalled channels, a controller out of room; two
 # copies with bubbles; one store by a storage rule (=hbm), the other kept on
-# chip by one. A write at the wrong row fails it (checked by hand).
+# chip by one. A write at the wrong row fails it (checked by hand). (The stores
+# take the state scratch first, state-scratch-bits: 0 here, so all go to HBM.)
 # REQUIRES: verilator
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/fold_hbm
-# RUN: foldsim --srcs top.f --top Top --out %t/all --static --fold-store-hbm 1 Leaf > %t/all.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/all --static --fold-store-hbm 1 --state-scratch-bits 0 Leaf > %t/all.log 2>&1
 # RUN: FileCheck %s --check-prefix=ALL < %t/all.log
 # RUN: FileCheck %s --check-prefix=IR < %t/all/foldsim_sim.mlir
 # RUN: FileCheck %s --check-prefix=JSON < %t/all/foldsim_sim.json
@@ -21,7 +22,7 @@
 # RUN: %t/all/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=FAST
 # RUN: %t/all/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | FileCheck %s
 # RUN: %t/all/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/cb --static --fold-store-hbm 1 --copies Leaf:2 --bubbles Leaf > %t/cb.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/cb --static --fold-store-hbm 1 --state-scratch-bits 0 --copies Leaf:2 --bubbles Leaf > %t/cb.log 2>&1
 # RUN: FileCheck %s --check-prefix=CB < %t/cb.log
 # RUN: python3 %S/Inputs/vmem_bind.py %t/cb/foldsim_sim.json %t/cb
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/cb --top-module tb -DBUBBLES -Mdir %t/cb/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/cb/foldsim_sim.sv > %t/cb/build.log 2>&1
@@ -32,7 +33,7 @@
 # RUN: python3 %S/Inputs/vmem_bind.py %t/rule/foldsim_sim.json %t/rule
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/rule --top-module tb -Mdir %t/rule/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/rule/foldsim_sim.sv > %t/rule/build.log 2>&1
 # RUN: %t/rule/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=1 +hi=30 +stall=20 | FileCheck %s
-# RUN: foldsim --srcs top.f --top Top --out %t/keep --static --fold-store-hbm 1 --storage Leaf:fold1_store=distributed Leaf > %t/keep.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/keep --static --fold-store-hbm 1 --state-scratch-bits 0 --storage Leaf:fold1_store=distributed Leaf > %t/keep.log 2>&1
 # RUN: FileCheck %s --check-prefix=KEEP < %t/keep.log
 # ALL: fold-store-hbm: Leaf: 2 stores, 224 bits in HBM; landing and read buffers 128 bits on chip
 # IR-DAG: %fold0_store_landing = seq.firmem 1, 1, old, undefined : <4 x 8
