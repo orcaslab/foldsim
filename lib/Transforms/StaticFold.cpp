@@ -611,6 +611,7 @@ private:
   void inlineNetlists();
   LogicalResult collect();
   void propagateConstants();
+  void zeroStartOutputs();
   LogicalResult resolveEnvironment();
   /// `fold-ports`: the netlist's port bundles. A bundle's outputs of a
   /// target cycle leave as one request record and its inputs come as one
@@ -919,6 +920,12 @@ private:
   unsigned sharedOutputs = 0;
   /// Outputs taken by their readers as constants (propagateConstants).
   unsigned constantOutputs = 0;
+  /// Early outputs XOR-encoded to start at 0 (zeroStartOutputs), and those
+  /// that start elsewhere but could not be.
+  unsigned zeroStarted = 0, zeroStartLate = 0;
+  /// Early outputs (model, output) written in their own frame instead
+  /// (zeroStartOutputs): late, for analyze.
+  DenseSet<std::pair<Operation *, unsigned>> startLate;
   /// One link memory (a read of a producer's bits by a class input, a run of
   /// bits with the same sources): the producer, its bits, and the producer
   /// instances the reader takes, sorted and distinct.
@@ -1803,6 +1810,7 @@ LogicalResult StaticFolder::collect() {
       return failure();
   }
   propagateConstants();
+  zeroStartOutputs();
   // Outputs of a model driven by the same value (a bus broadcast to several
   // children: a crossbar's data to each of its port arbiters) are one
   // producer: every reader of them takes the first, so they share links.
@@ -1980,6 +1988,234 @@ void StaticFolder::propagateConstants() {
       }
     }
   }
+}
+
+/// An early output is written into its link at the producer's state pass, for
+/// the next frame: nothing writes the first frame's entry, which reads as 0,
+/// while the target's output has the value of its initial state from its
+/// first cycle (an inverted flag, a register XOR a constant). An early output
+/// whose initial value is not 0 -- a function of the registers' initial
+/// values (preset, else 0), the static inputs and constants, the same in
+/// every instance -- is written XOR that value, and each model that reads it
+/// XORs it back at its input, so its links start at 0 and the reader sees
+/// the target's value in every frame. Where that cannot be -- the producer's
+/// instances start at different values, a reader's instances would need
+/// different masks, or the environment reads it -- the output is written as
+/// a late one instead, in its own frame from the state of that frame.
+void StaticFolder::zeroStartOutputs() {
+  // The value of `root` at the initial state: registers at their preset (or
+  // 0), the static inputs at `values`; none if it reads an input, a memory or
+  // an instance.
+  std::function<Attribute(Value, DenseMap<Value, Attribute> &)> initial =
+      [&](Value root, DenseMap<Value, Attribute> &values) -> Attribute {
+    SmallVector<std::pair<Value, bool>> stack{{root, false}};
+    while (!stack.empty()) {
+      auto [value, expanded] = stack.pop_back_val();
+      if (values.count(value))
+        continue;
+      auto *op = value.getDefiningOp();
+      if (auto reg = dyn_cast_or_null<seq::FirRegOp>(op)) {
+        auto type = dyn_cast<IntegerType>(reg.getType());
+        if (!type)
+          return {};
+        APInt init = APInt::getZero(type.getWidth());
+        if (auto preset = reg.getPresetAttr())
+          init = preset.getValue();
+        values[value] = IntegerAttr::get(type, init);
+        continue;
+      }
+      if (!op || op->getNumRegions() || !isMemoryEffectFree(op) ||
+          isa<seq::CompRegOp, seq::FirMemReadOp, hw::InstanceOp>(op))
+        return {};
+      if (!expanded) {
+        stack.push_back({value, true});
+        for (auto operand : op->getOperands())
+          if (!values.count(operand))
+            stack.push_back({operand, false});
+        continue;
+      }
+      SmallVector<Attribute> operands;
+      for (auto operand : op->getOperands()) {
+        auto attr = values.lookup(operand);
+        if (!attr)
+          return {};
+        operands.push_back(attr);
+      }
+      auto *clone = op->clone();
+      SmallVector<OpFoldResult> results;
+      bool folded = succeeded(clone->fold(operands, results)) &&
+                    results.size() == op->getNumResults();
+      SmallVector<Attribute> attrs;
+      if (folded)
+        for (auto result : results) {
+          Attribute attr;
+          if (auto a = dyn_cast<Attribute>(result))
+            attr = a;
+          else if (auto v = dyn_cast<Value>(result))
+            for (auto [k, operand] : llvm::enumerate(clone->getOperands()))
+              if (operand == v)
+                attr = operands[k];
+          if (!isa_and_nonnull<IntegerAttr>(attr)) {
+            folded = false;
+            break;
+          }
+          attrs.push_back(attr);
+        }
+      clone->destroy();
+      if (!folded)
+        return {};
+      for (auto [r, attr] : llvm::enumerate(attrs))
+        values[op->getResult(r)] = attr;
+    }
+    return values.lookup(root);
+  };
+  auto constantOf = [](const Pieces &pieces) -> std::optional<APInt> {
+    std::optional<APInt> value;
+    for (auto &piece : pieces) {
+      if (piece.producer >= 0)
+        return std::nullopt;
+      value = value ? piece.constant.concat(*value) : piece.constant;
+    }
+    return value;
+  };
+  // A value XOR a constant, as the value's type (one op per pair).
+  DenseMap<std::pair<Value, Attribute>, Value> xored;
+  auto xorWith = [&](OpBuilder &b, Location loc, Value value,
+                     const APInt &mask) -> Value {
+    auto key = std::make_pair(
+        value, Attribute(IntegerAttr::get(
+                   IntegerType::get(value.getContext(), mask.getBitWidth()),
+                   mask)));
+    if (Value known = xored.lookup(key))
+      return known;
+    Value bits = value;
+    auto bitsType = IntegerType::get(value.getContext(), mask.getBitWidth());
+    if (value.getType() != bitsType)
+      bits = hw::BitcastOp::create(b, loc, bitsType, value);
+    Value out = comb::XorOp::create(
+        b, loc, bits, hw::ConstantOp::create(b, loc, mask));
+    if (out.getType() != value.getType())
+      out = hw::BitcastOp::create(b, loc, value.getType(), out);
+    xored[key] = out;
+    return out;
+  };
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    auto *body = cls.model.getBodyBlock();
+    unsigned numInputs = cls.inputNames.size();
+    // Each instance's static inputs' values (as propagateConstants takes them).
+    SmallVector<SmallVector<std::optional<APInt>>> statics(
+        cls.threads(), SmallVector<std::optional<APInt>>(numInputs));
+    for (unsigned i = 0; i < numInputs; ++i) {
+      int k = cls.consumerOf[i];
+      if (k < 0 || !isa<IntegerType>(cls.inputTypes[i]))
+        continue;
+      SmallVector<std::optional<APInt>> each;
+      for (auto &pieces : consumers[k].pieces)
+        each.push_back(constantOf(pieces));
+      if (llvm::all_of(each, [](auto &v) { return v.has_value(); }))
+        for (auto [inst, v] : llvm::enumerate(each))
+          statics[inst][i] = v;
+    }
+    auto *output = body->getTerminator();
+    for (unsigned o = 0; o < output->getNumOperands(); ++o) {
+      Value value = output->getOperand(o);
+      unsigned p = cls.producerOf[o];
+      int64_t width = hw::getBitWidth(value.getType());
+      if (width <= 0)
+        continue;
+      // The output's initial value in every instance.
+      std::optional<APInt> start;
+      bool uniform = true, known = true;
+      for (unsigned inst = 0; inst < cls.threads() && known; ++inst) {
+        DenseMap<Value, Attribute> values;
+        for (unsigned i = 0; i < numInputs; ++i)
+          if (statics[inst][i])
+            values[body->getArgument(i)] =
+                IntegerAttr::get(cls.inputTypes[i], *statics[inst][i]);
+        Value bits = value;
+        if (!isa<IntegerType>(value.getType())) {
+          auto cast = value.getDefiningOp<hw::BitcastOp>();
+          if (!cast || !isa<IntegerType>(cast.getInput().getType())) {
+            known = false;
+            break;
+          }
+          bits = cast.getInput();
+        }
+        auto attr = initial(bits, values);
+        if (!attr) {
+          known = false;
+          break;
+        }
+        APInt v = cast<IntegerAttr>(attr).getValue();
+        if (start && *start != v)
+          uniform = false;
+        start = v;
+      }
+      if (!known || !start || start->isZero())
+        continue;
+      // Its readers: a mask per reading model's input, the same in each of
+      // the model's instances.
+      SmallVector<std::pair<unsigned, APInt>> masks;
+      bool ok = uniform;
+      for (auto [k, consumer] : llvm::enumerate(consumers)) {
+        if (!ok)
+          break;
+        std::optional<APInt> mask;
+        for (auto &pieces : consumer.pieces) {
+          APInt m = APInt::getZero(consumer.width);
+          bool reads = false;
+          unsigned at = 0;
+          for (auto &piece : pieces) {
+            if (piece.producer == int(p)) {
+              reads = true;
+              m.insertBits(start->extractBits(piece.width, piece.low), at);
+            }
+            at += piece.width;
+          }
+          if (reads && consumer.cls < 0) {
+            ok = false;  // the environment reads it
+            break;
+          }
+          if (mask && *mask != m) {
+            ok = false;
+            break;
+          }
+          mask = m;
+        }
+        if (ok && mask && !mask->isZero())
+          masks.push_back({unsigned(k), *mask});
+      }
+      if (!ok) {
+        startLate.insert({cls.model.getOperation(), o});
+        ++zeroStartLate;
+        continue;
+      }
+      if (masks.empty())
+        continue;
+      // The producer writes it XOR its initial value...
+      OpBuilder b(output);
+      output->setOperand(o, xorWith(b, output->getLoc(), value, *start));
+      // ... and each reader XORs it back at its input.
+      for (auto &[k, mask] : masks) {
+        auto &consumer = consumers[k];
+        auto &reader = classes[consumer.cls];
+        auto *rbody = reader.model.getBodyBlock();
+        Value arg = rbody->getArgument(consumer.port);
+        OpBuilder rb = OpBuilder::atBlockBegin(rbody);
+        SmallVector<OpOperand *> uses;
+        for (auto &use : arg.getUses())
+          uses.push_back(&use);
+        Value fixed = xorWith(rb, arg.getLoc(), arg, mask);
+        for (auto *use : uses)
+          use->set(fixed);
+      }
+      ++zeroStarted;
+    }
+  }
+  if (zeroStarted || zeroStartLate)
+    llvm::errs() << "foldsim-fold-static: zero-start: " << zeroStarted
+                 << " early outputs written XOR their initial value, "
+                 << zeroStartLate << " written late (in their own frame)\n";
 }
 
 LogicalResult StaticFolder::splitCopies() {
@@ -2266,10 +2502,11 @@ LogicalResult StaticFolder::analyze(Class &cls) {
     return info[root];
   };
   auto *output = body->getTerminator();
-  for (auto operand : output->getOperands()) {
+  for (auto [o, operand] : llvm::enumerate(output->getOperands())) {
     auto &deps = visit(operand);
     cls.deps.push_back(deps.inputs);
-    cls.late.push_back(deps.inputs.any() || deps.memory || deps.box);
+    cls.late.push_back(deps.inputs.any() || deps.memory || deps.box ||
+                       startLate.contains({cls.model.getOperation(), unsigned(o)}));
   }
   for (auto &op : *body)
     if (auto memory = dyn_cast<seq::FirMemOp>(op))
