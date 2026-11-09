@@ -1335,6 +1335,11 @@ def SlrSplit : Pass<"foldsim-slr-split", "::mlir::ModuleOp"> {
            "crossing=txrx: each output as late as its own value (no padding to "
            "`latency`), its lag written here as `<class> <output> <n>` lines: "
            "the fold's split-latency-file for the class">,
+    Option<"alignStyle", "align-style", "std::string", "\"register\"",
+           "crossing=txrx: the alignment chains (two stages or more) as "
+           "flops (register: srl_style=register, the default; flops are the "
+           "plentiful resource where LUTs bind), shift-register LUTs (srl: "
+           "srl_style=srl), or Vivado's choice (auto: no attribute)">,
     Option<"slack", "slack", "unsigned", "8",
            "crossing=txrx: host cycles a memory's writes may land later than "
            "its reads are taken (under the class's state gap)">,

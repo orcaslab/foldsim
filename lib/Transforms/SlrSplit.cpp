@@ -393,7 +393,8 @@ LogicalResult SlrSplitPass::registerCrossings(hw::HWModuleOp module,
   // Alignment registers: plain shift chains (no reset, no enable, one reader
   // a stage), marked for shift-register extraction: a chain of more than one
   // stage maps to a LUT's SRL instead of a flop per stage.
-  auto srl = sv::SVAttributeAttr::get(context, "srl_style", R"("srl")", false);
+  auto srl = sv::SVAttributeAttr::get(
+      context, "srl_style", "\"" + std::string(alignStyle) + "\"", false);
   auto nameOf = [&](Value v) -> std::string {
     if (auto arg = dyn_cast<BlockArgument>(v))
       return module.getInputName(arg.getArgNumber()).str();
@@ -445,7 +446,7 @@ LogicalResult SlrSplitPass::registerCrossings(hw::HWModuleOp module,
     }
     for (int k = 0; k < left; ++k) {
       auto *reg = newReg(cur, base + "_a" + std::to_string(k), to);
-      if (left > 1)
+      if (left > 1 && alignStyle != "auto")
         sv::addSVAttributes(reg, {srl});
       cur = reg->getResult(0);
       ++aligned;
