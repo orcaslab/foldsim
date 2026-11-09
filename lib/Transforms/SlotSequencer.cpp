@@ -459,6 +459,58 @@ Value decodeSlotTable(ImplicitLocOpBuilder &b, Value index,
                             : Value(comb::OrOp::create(b, masked, false));
 }
 
+bool factorThroughSequence(ArrayRef<uint64_t> rows, unsigned width,
+                           unsigned ii, ArrayRef<PassSequence> seqs,
+                           SequenceFactor &out) {
+  uint64_t mask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
+  auto row = [&](uint64_t p) { return p < rows.size() ? rows[p] & mask : 0; };
+  if (rows.size() != ii + 1 || row(ii) || ii == 0)
+    return false;
+  SmallVector<unsigned, 8> live;
+  for (unsigned p = 0; p < ii && live.size() < 8; ++p)
+    if (row(p))
+      live.push_back(p);
+  if (live.empty())
+    return false;
+  for (auto [si, seq] : llvm::enumerate(seqs)) {
+    if (seq.instAt.size() != ii)
+      continue;
+    for (unsigned q = 0; q < ii; ++q) {
+      if (seq.instAt[q] < 0)
+        continue;
+      // The first live row on this pass: offset = q - live[0].
+      unsigned o = (q + ii - live[0]) % ii;
+      bool ok = true;
+      for (unsigned p : live)
+        ok &= seq.instAt[(p + o) % ii] >= 0;
+      if (!ok)
+        continue;
+      SmallVector<uint64_t> f(seq.instances, 0);
+      SmallVector<bool> set(seq.instances, false);
+      for (unsigned p = 0; p < ii && ok; ++p) {
+        int i = seq.instAt[(p + o) % ii];
+        if (i < 0) {
+          ok = row(p) == 0;
+          continue;
+        }
+        if (!set[i]) {
+          set[i] = true;
+          f[i] = row(p);
+        } else {
+          ok = f[i] == row(p);
+        }
+      }
+      if (!ok)
+        continue;
+      out.seq = unsigned(si);
+      out.offset = o;
+      out.perInstance = std::move(f);
+      return true;
+    }
+  }
+  return false;
+}
+
 void countFallback(unsigned indexWidth, unsigned width, unsigned segments) {
   auto &stats = slotSequencerStats();
   ++stats.fallback;

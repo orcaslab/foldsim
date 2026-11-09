@@ -63,11 +63,33 @@ llvm::SmallVector<SlotSegment> slotSegments(llvm::ArrayRef<uint64_t> rows,
                                             unsigned width,
                                             unsigned maxSegments = 64);
 
+/// A class's pass sequence: instance i's pass at position `slots[i]` (mod
+/// the frame), as `instAt` (the instance at each position, -1 for none).
+struct PassSequence {
+  llvm::SmallVector<int> instAt;
+  unsigned instances = 0;
+};
+
+/// A position table (rows 0..ii, the last the idle position) through a pass
+/// sequence: rows[p] = (a pass of `seq` at p + offset) ? perInstance[its
+/// instance] : 0, for every p. Found by trying the offsets that put the
+/// table's first live rows on the sequence's passes, then checking every row
+/// (each instance one value).
+struct SequenceFactor {
+  unsigned seq = 0, offset = 0;
+  llvm::SmallVector<uint64_t> perInstance;
+};
+bool factorThroughSequence(llvm::ArrayRef<uint64_t> rows, unsigned width,
+                           unsigned ii, llvm::ArrayRef<PassSequence> seqs,
+                           SequenceFactor &out);
+
 /// Counts over a pass's run: tables decoded and left as constants, and their
 /// bits as constant arrays (2^index width x width).
 struct SlotSequencerStats {
   uint64_t decoded = 0, decodedBits = 0, segments = 0, maxSegments = 0;
   uint64_t fallback = 0, fallbackBits = 0, fallbackMaxSegments = 0;
+  /// Position tables read through a class's pass sequence.
+  uint64_t factored = 0, factoredBits = 0;
   void reset() { *this = SlotSequencerStats(); }
 };
 SlotSequencerStats &slotSequencerStats();

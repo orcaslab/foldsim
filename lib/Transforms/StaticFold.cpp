@@ -10081,6 +10081,12 @@ static uint64_t gMaxTableBits = 1000000;
 /// `slot-segments`: a slot table of at most this many affine segments is a
 /// decoder of its index (SlotSequencer.cpp), not a constant (0: tables).
 static unsigned gSlotSegments = 0;
+/// While the simulator is built: the classes' pass sequences (each pass
+/// kind of each class of several instances) and the frame, for position
+/// tables that do not decode to be read through one (slot-segments).
+static SmallVector<foldsim::PassSequence> gPassSeqs;
+static unsigned gPassII = 0;
+static bool gFactoring = false;
 
 /// The regions sharing a copy of the slot controls two host cycles ahead.
 static constexpr unsigned kRegionsPerGroup = 16;
@@ -15937,6 +15943,35 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     if (Value decoded =
             foldsim::decodeSlotTable(b, index, rows, width, gSlotSegments))
       return decoded;
+    // A position table through a class's pass sequence: the sequence's
+    // passes and instance at p + offset (position tables, the same for every
+    // table of that class and offset, so one after CSE) and the table's
+    // value per instance (an instance table). An HBM link stream's landing,
+    // request and use rows of a reader are such tables.
+    foldsim::SequenceFactor fac;
+    if (!gFactoring && gPassII && rows.size() == gPassII + 1 &&
+        foldsim::factorThroughSequence(rows, width, gPassII, gPassSeqs, fac)) {
+      gFactoring = true;
+      auto &seq = gPassSeqs[fac.seq];
+      unsigned ii = gPassII;
+      unsigned iw = std::max(1u, llvm::Log2_32_Ceil(std::max(seq.instances, 2u)));
+      SmallVector<uint64_t> valid(ii + 1, 0), inst(ii + 1, 0);
+      for (unsigned p = 0; p < ii; ++p) {
+        int i = seq.instAt[(p + fac.offset) % ii];
+        if (i >= 0) {
+          valid[p] = 1;
+          inst[p] = unsigned(i);
+        }
+      }
+      Value hit = table(b, index, valid, 1);
+      Value at = table(b, index, inst, iw);
+      Value v = table(b, at, fac.perInstance, width);
+      gFactoring = false;
+      auto &st = foldsim::slotSequencerStats();
+      ++st.factored;
+      st.factoredBits += (uint64_t(1) << indexWidth) * width;
+      return comb::MuxOp::create(b, hit, v, hw::ConstantOp::create(b, type, 0));
+    }
     auto segs = foldsim::slotSegments(rows, width);
     foldsim::countFallback(indexWidth, width, segs.size());
     if (getenv("FOLDSIM_AFFINE_LOG")) {
@@ -16219,6 +16254,30 @@ void StaticFolder::offerMailboxLinks(
 }
 
 LogicalResult StaticFolder::buildSim() {
+  // slot-segments: each class's pass sequences, for position tables that
+  // read through one (table()).
+  gPassSeqs.clear();
+  gPassII = gSlotSegments ? ii : 0;
+  llvm::scope_exit clearSeqs([&] {
+    gPassSeqs.clear();
+    gPassII = 0;
+  });
+  if (gPassII)
+    for (auto &cls : classes) {
+      if (cls.threads() < 2)
+        continue;
+      auto add = [&](ArrayRef<int> slots) {
+        foldsim::PassSequence seq;
+        seq.instAt.assign(ii, -1);
+        seq.instances = cls.threads();
+        for (unsigned i = 0; i < cls.threads(); ++i)
+          seq.instAt[unsigned(((slots[i] % int(ii)) + int(ii)) % int(ii))] = int(i);
+        gPassSeqs.push_back(std::move(seq));
+      };
+      add(cls.slot[kState]);
+      for (unsigned l = 0; l < cls.readyLevels; ++l)
+        add(cls.readySlots(l));
+    }
   auto *context = top.getContext();
   auto i1 = IntegerType::get(context, 1);
 
@@ -20643,6 +20702,8 @@ void FoldStaticPass::runOnOperation() {
                  << " table bits replaced), " << st.fallback
                  << " tables kept (" << st.fallbackBits
                  << " bits, at most " << st.fallbackMaxSegments
-                 << " segments)\n";
+                 << " segments), " << st.factored
+                 << " read through a class's passes (" << st.factoredBits
+                 << " bits)\n";
   }
 }
