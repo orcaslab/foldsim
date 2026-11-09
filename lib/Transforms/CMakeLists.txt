@@ -21,6 +21,7 @@ add_mlir_library(FoldsimTransforms
   Sort.cpp
   PassSplit.cpp
   StaticFold.cpp
+  VmemRings.cpp
 
   DEPENDS
   FoldsimPassesIncGen

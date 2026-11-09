@@ -402,6 +402,10 @@ def frame_options(a):
             fold += ' vmem-merge-lanes'
         if getattr(a, 'vmem_skip_held_reads', False):
             fold += ' vmem-skip-held-reads'
+    if getattr(a, 'vmem_auto_bits', 0):
+        fold += f' vmem-auto-bits={a.vmem_auto_bits}'
+    if getattr(a, 'vmem_rings', 0):
+        fold += f' vmem-rings={a.vmem_rings} vmem-ring-entries={a.vmem_ring_entries}'
     if a.unstaged_env:
         fold += ' staged-env=false'
     if getattr(a, 'register_state_entries', None) is not None:
@@ -1146,9 +1150,9 @@ def vmem_groups(vmems, choice, weights=None, kz_bits=0):
         # foldsim_vmem_group keeps one instance for a member's read and write
         # of a host cycle: an off-chip page column (a read of one instance's
         # page and a write of another's in one host cycle) has a controller
-        # of its own.
+        # of its own, as has a memory with tagged requests (its tags are its own).
         keys.setdefault((v['class'], v['instances'], v['inst_width'], v['row_bytes'],
-                         v['read_first'], k if v.get('pages') else -1), []).append(k)
+                         v['read_first'], k if v.get('pages') or v.get('tag_width') else -1), []).append(k)
     groups, offset = [], 0
     for ks in vmem_partition(vmems, list(keys.values()), choice, weights):
         first = vmems[ks[0]]
@@ -1373,6 +1377,16 @@ def build_parser():
                     help='with --virtual-memories: the arrays a front end split from one target RAM '
                          '(byte lanes, ways: the same read address and enable, the same write '
                          'address) are one virtual memory, each lane its own bytes of the row')
+    ap.add_argument('--vmem-auto-bits', type=int, default=0, metavar='N',
+                    help='with --static: every registered-read target memory (one read port, at most one write '
+                         'port) whose threaded image is at least N bits is a virtual memory too, whatever storage '
+                         'rule names it (foldsim-fold-static vmem-auto-bits; 0: none by size)')
+    ap.add_argument('--vmem-rings', type=int, default=0, metavar='LEAD',
+                    help="with virtual memories: each one's per-instance read buffer as a fixed ring, refilled "
+                         "from an image of the answers in HBM LEAD positions before each instance's first use "
+                         "(foldsim-fold-static vmem-rings; 0: none)")
+    ap.add_argument('--vmem-ring-entries', type=int, default=1024, metavar='N',
+                    help='with --vmem-rings: the most entries a ring may take (default 1024)')
     ap.add_argument('--vmem-skip-held-reads', action='store_true',
                     help='with --virtual-memories: a read whose address register holds (a registered '
                          'read address with its enable low) is not issued unless its row was written '
@@ -1988,8 +2002,8 @@ def main():
     if a.copies == 'auto' and not a.static:
         sys.exit('--copies auto needs --static')
     if a.vmem_cache_rows is not None:
-        if not a.virtual_memories and a.state != 'auto':
-            sys.exit('--vmem-cache-rows needs --virtual-memories (or --state auto)')
+        if not a.virtual_memories and a.state != 'auto' and not getattr(a, 'vmem_auto_bits', 0):
+            sys.exit('--vmem-cache-rows needs --virtual-memories (or --state auto, --vmem-auto-bits)')
         if a.vmem_cache_rows != 'auto' and not a.vmem_cache_rows.isdigit():
             sys.exit('--vmem-cache-rows: auto, 0 or a power of two of at least 2')
         vmem_cache_rows([], a.vmem_cache_rows, a.vmem_cache_budget)
@@ -2000,8 +2014,8 @@ def main():
     if a.page and not a.static:
         sys.exit('--page needs --static')
     if a.vmem_group is not None:
-        if not a.virtual_memories and a.state != 'auto':
-            sys.exit('--vmem-group needs --virtual-memories (or --state auto)')
+        if not a.virtual_memories and a.state != 'auto' and not getattr(a, 'vmem_auto_bits', 0):
+            sys.exit('--vmem-group needs --virtual-memories (or --state auto, --vmem-auto-bits)')
         if not (a.vmem_group == 'copy' or (a.vmem_group.isdigit() and int(a.vmem_group) >= 1)
                 or re.fullmatch(r'auto(:[1-9][0-9]*)?', a.vmem_group)):
             sys.exit('--vmem-group: copy, the memories per controller (at least 1), or auto[:M]')
