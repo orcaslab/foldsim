@@ -19222,10 +19222,10 @@ LogicalResult StaticFolder::buildSim() {
                                     constant(qb + 2, decisionLead() + 2)),
                 constant(qb + 2, kRingQueue)));
           }
-          Value uv = table(b, next, plan.useValid, 1);
-          Value entry = table(b, next, plan.useEntry, eb);
+          Value uv = atNext(plan.useValid, 1);
+          Value entry = atNext(plan.useEntry, eb);
           Value seen = comb::OrOp::create(b, rb.seen, eq(posD, ii - 1));
-          Value skip = comb::AndOp::create(b, table(b, next, plan.useCross, 1), notOf(seen));
+          Value skip = comb::AndOp::create(b, atNext(plan.useCross, 1), notOf(seen));
           Value landed = bitAt(rb.landed, plan.entries, entry, eb);
           terms.push_back(comb::OrOp::create(b, ValueRange{notOf(uv), skip, landed}, false));
           continue;
