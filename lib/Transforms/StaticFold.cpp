@@ -671,6 +671,12 @@ public:
   /// (linkCandidates while it collects).
   bool linkKindCost = false;
   double linkKindCap[3] = {1029, 2052, 1307904}, linkKindBase[3] = {0, 0, 0};
+  /// `link-kind-groups` / `link-kind-group-others`: with SLR groups, each
+  /// group's budget per kind and what the rest takes of it (a link's memory
+  /// is in its reader's group); empty: the device's.
+  SmallVector<std::array<double, 3>> linkKindGroupCap, linkKindGroupBase;
+  /// `slr-link-rams`: with SLR groups, links may be block or ultra RAM too.
+  bool slrLinkRams = false;
   struct LinkCandidate {
     std::tuple<unsigned, unsigned, uint64_t> key;
     /// Its rows and columns in block or ultra RAM (paged as built), and its
@@ -8547,19 +8553,33 @@ void StaticFolder::planLinkKinds(raw_ostream &os) {
     return std::min({share(c, 0), share(c, 1), share(c, 2)});
   };
   llvm::stable_sort(order, [&](auto &x, auto &y) { return least(x.second) > least(y.second); });
+  // The budgets: the device's, or with SLR groups and link-kind-groups each
+  // reader group's.
+  bool perGroup = !slrOf.empty() && !linkKindGroupCap.empty();
+  unsigned groups = perGroup ? linkKindGroupCap.size() : 1;
+  SmallVector<std::array<double, 3>> capOf(groups), baseOf(groups), usedOf(groups);
+  for (unsigned g = 0; g < groups; ++g)
+    for (unsigned k = 0; k < 3; ++k) {
+      capOf[g][k] = perGroup ? linkKindGroupCap[g][k] : linkKindCap[k];
+      baseOf[g][k] = perGroup ? (g < linkKindGroupBase.size() ? linkKindGroupBase[g][k] : 0)
+                              : linkKindBase[k];
+      usedOf[g][k] = 0;
+    }
   double used[3] = {0, 0, 0};
   unsigned count[3] = {0, 0, 0};
   for (auto &[key, cost] : order) {
+    unsigned g = perGroup ? std::min<unsigned>(slrOf[std::get<1>(key)], groups - 1) : 0;
+    auto &cap = capOf[g], &base = baseOf[g], &gused = usedOf[g];
     unsigned best = 2;
     double bestOver = 1e300, bestScore = 1e300, bestShare = 1e300;
     for (unsigned k = 0; k < 3; ++k) {
-      if (linkKindCap[k] <= 0)
+      if (cap[k] <= 0)
         continue;
       double score = 0, over = 0;
       for (unsigned j = 0; j < 3; ++j) {
-        if (linkKindCap[j] <= 0)
+        if (cap[j] <= 0)
           continue;
-        double u = (linkKindBase[j] + used[j] + (j == k ? cost[j] : 0)) / linkKindCap[j];
+        double u = (base[j] + gused[j] + (j == k ? cost[j] : 0)) / cap[j];
         over += std::max(0.0, u - 1.0);
         score += u * u;
       }
@@ -8575,6 +8595,7 @@ void StaticFolder::planLinkKinds(raw_ostream &os) {
       }
     }
     used[best] += cost[best];
+    gused[best] += cost[best];
     ++count[best];
     linkKindPlan[key] = kKinds[best];
   }
@@ -8585,10 +8606,14 @@ void StaticFolder::planLinkKinds(raw_ostream &os) {
      << llvm::format("%.0f", used[0]) << " URAM288), block " << count[1] << " ("
      << llvm::format("%.1f", used[1]) << " RAMB36), distributed " << count[2] << " ("
      << llvm::format("%.0f", used[2]) << " LUTs); with the rest:";
-  for (unsigned k = 0; k < 3; ++k)
-    ls << " " << kNames[k] << " "
-       << llvm::format("%.1f", 100.0 * (linkKindBase[k] + used[k]) / std::max(1.0, linkKindCap[k]))
-       << " %";
+  for (unsigned g = 0; g < groups; ++g) {
+    if (perGroup)
+      ls << (g ? ";" : "") << " group " << g << ":";
+    for (unsigned k = 0; k < 3; ++k)
+      ls << " " << kNames[k] << " "
+         << llvm::format("%.1f", 100.0 * (baseOf[g][k] + usedOf[g][k]) / std::max(1.0, capOf[g][k]))
+         << " %";
+  }
   ls << " of the budget\n";
   llvm::errs() << ls.str();
   os << ls.str();
@@ -8740,8 +8765,9 @@ void StaticFolder::reportLinks(raw_ostream &os) {
     } else {
       depth = linkDepth(entries, banked);
       StringRef style;
-      if (haveSchedule && entries != 1 && slrOf.empty() &&
+      if (haveSchedule && entries != 1 && (slrOf.empty() || slrLinkRams) &&
           (use.sources == 1 || !shortLead)) {
+        bool crossing = !slrOf.empty() && slrOf[producer.cls] != slrOf[use.reader];
         // As buildSim decides: never forwarded, taken now or forwarded
         // from a shared register.
         unsigned rthreads = classes[use.reader].threads();
@@ -8751,11 +8777,11 @@ void StaticFolder::reportLinks(raw_ostream &os) {
           takes[i] = true;
           rows[i] = r;
         }
-        bool forward =
-            oneCycleLinks && needsForward(use.producer, use.reader, takes, rows);
+        bool forward = oneCycleLinks &&
+                       (crossing || needsForward(use.producer, use.reader, takes, rows));
         bool now = zeroLink(use.producer, use.reader, use.port) &&
                    takesNow(use.producer, use.reader, takes, rows);
-        bool late = shareLinkWrites && classReaders[use.producer] > 1;
+        bool late = shareLinkWrites && slrOf.empty() && classReaders[use.producer] > 1;
         bool forwardLate =
             late && needsForward(use.producer, use.reader, takes, rows, 2);
         // The only source: read into the RAM's output register, which is
@@ -8764,7 +8790,7 @@ void StaticFolder::reportLinks(raw_ostream &os) {
         if (use.sources == 1 ? !forward && !now && !forwardLate
                              : !forward && !now &&
                                    !needsForward(use.producer, use.reader,
-                                                 takes, rows, 2) &&
+                                                 takes, rows, crossing ? 3 : 2) &&
                                    !(late && needsForward(use.producer,
                                                           use.reader, takes,
                                                           rows, 3)))
@@ -18569,8 +18595,9 @@ LogicalResult StaticFolder::buildSim() {
         // read register: a deep link in block or ultra RAM, whose output
         // register is the read register.
         StringRef style;
+        // (`slr-link-rams`: in an SLR group too, the memory in the reader's.)
         if (sources.size() == 1 && !now && !forward && !(late && forwardLate) &&
-            to < 0 && !(pThreads == 1 && !producer.late) &&
+            (to < 0 || slrLinkRams) && !(pThreads == 1 && !producer.late) &&
             !(pThreads == 1 && producer.late))
           style = linkStyle(key.first, c, linkDepth(pThreads, !producer.late),
                             width);
@@ -18599,9 +18626,10 @@ LogicalResult StaticFolder::buildSim() {
         // of an entry it reads lands in the two host cycles before its read
         // register loads (three for a write from a shared register).
         bool early = false;
+        // A link between groups lands a host cycle later: one more.
         if (style.empty() && sources.size() > 1 && !now && !forward &&
-            !shortLead && to < 0 && pThreads != 1 &&
-            !needsForward(key.first, c, takes, rows, 2) &&
+            !shortLead && (to < 0 || slrLinkRams) && pThreads != 1 &&
+            !needsForward(key.first, c, takes, rows, crossing ? 3 : 2) &&
             !(late && needsForward(key.first, c, takes, rows, 3))) {
           style = linkStyle(key.first, c, linkDepth(pThreads, !producer.late),
                             width);
@@ -20514,6 +20542,26 @@ void FoldStaticPass::runOnOperation() {
   }
   folder.readBufferBits = readBufferBits;
   folder.linkKindCost = linkKindCost;
+  folder.slrLinkRams = slrLinkRams;
+  for (auto [spec, out, name] :
+       {std::tuple{std::string(linkKindGroups), &folder.linkKindGroupCap, "link-kind-groups"},
+        std::tuple{std::string(linkKindGroupOthers), &folder.linkKindGroupBase,
+                   "link-kind-group-others"}}) {
+    SmallVector<StringRef> groupSpecs;
+    StringRef(spec).split(groupSpecs, ';', -1, false);
+    for (StringRef g : groupSpecs) {
+      SmallVector<StringRef> parts;
+      g.split(parts, ',');
+      std::array<double, 3> v{0, 0, 0};
+      if (parts.size() != 3 || parts[0].trim().getAsDouble(v[0]) ||
+          parts[1].trim().getAsDouble(v[1]) || parts[2].trim().getAsDouble(v[2])) {
+        getOperation().emitError(name) << ": '" << spec
+                                       << "' is not <uram>,<ramb36>,<luts>;... (a group each)";
+        return signalPassFailure();
+      }
+      out->push_back(v);
+    }
+  }
   for (auto [spec, out, name] :
        {std::tuple{std::string(linkKindDevice), folder.linkKindCap, "link-kind-device"},
         std::tuple{std::string(linkKindOthers), folder.linkKindBase, "link-kind-others"}}) {

@@ -497,6 +497,16 @@ def frame_options(a):
         fold += f' link-kind-cost link-kind-device={dev}'
         if getattr(a, 'link_kind_others', ''):
             fold += f' link-kind-others={a.link_kind_others}'
+        # With SLR groups (a region): each group's budget, the region's g-th
+        # SLR's at the fill target; and what the rest takes of each, if given.
+        if getattr(a, 'slr_groups', False) and getattr(a, 'slr_region', ''):
+            fold += ' link-kind-groups=' + ';'.join(
+                ','.join(str(x) for x in caps) for caps in region_group_capacity(
+                    a.slr_region, getattr(a, 'state_scratch_fill', 0.85)))
+            if getattr(a, 'link_kind_group_others', ''):
+                fold += f' link-kind-group-others={a.link_kind_group_others}'
+    if getattr(a, 'slr_link_rams', False):
+        fold += ' slr-link-rams'
     if getattr(a, 'registered_links', ''):
         fold += f' registered-links={a.registered_links}'
     if getattr(a, 'split_latency', ''):
@@ -952,6 +962,26 @@ def scratch_as_built(a, foldsim_opt, sim_input, pipeline, sim, out):
     return pipeline
 
 
+def link_kinds_as_built(a, foldsim_opt, sim_input, pipeline, sim):
+    """--link-kind-cost without --link-kind-others: the fold runs once more
+    with what the rest of the simulator took as built (foldsim_link_kinds.py:
+    its URAM288, RAMB36 and logic and LUTRAM LUTs less its links'), so that
+    links are priced against the room left, not the whole device. Returns the
+    pipeline built last."""
+    import foldsim_link_kinds as lk
+    (u, b, l), links, total = lk.others(sim)
+    others = f'{u:.0f},{b:.0f},{l:.0f}'
+    print(f'foldsim: link-kind-cost: the rest as built {others} (links {links["uram"]:.0f} URAM288, '
+          f'{links["bram"]:.1f} RAMB36, {links["lutram"]:,.0f} LUTRAM LUTs): refolding with link-kind-others',
+          file=sys.stderr)
+    pipeline = [re.sub(r'(foldsim-fold-static\{[^}]*)\}',
+                       lambda m: m.group(1) + f' link-kind-others={others}}}', step, count=1)
+                if step.startswith('foldsim-fold-static{') else step for step in pipeline]
+    run([foldsim_opt, sim_input, NO_OP_DUMP, f'--pass-pipeline=builtin.module({",".join(pipeline)})',
+         '-o', sim])
+    return pipeline
+
+
 def region_ram_bits(path, target=None):
     """A region's ultra and block RAM bits at a fill target (`target`, a
     share of each kind: --state-scratch-fill), never past the fit check's own
@@ -978,6 +1008,17 @@ def region_kind_capacity(path, target=0.85):
     return (int(total('uram') * min(fill.get('uram', 1.0), target)),
             int(total('ramb36') * min(fill.get('bram', 1.0), target)),
             int(total('luts') * min(region.get('placement', {}).get('region_fill', {}).get('lut', 1.0), target)))
+
+
+def region_group_capacity(path, target=0.85):
+    """Each SLR's URAM288, RAMB36 and LUTs at a fill target, in the region's
+    order (SLR group g is its g-th SLR)."""
+    region = json.load(open(v80_region() if path in ('', 'v80', 'auto') else path))
+    fill = region.get('placement', {}).get('fill', {})
+    return [(int(s.get('uram', 0) * min(fill.get('uram', 1.0), target)),
+             int(s.get('ramb36', 0) * min(fill.get('bram', 1.0), target)),
+             int(s.get('luts', 0) * min(fill.get('lut', 1.0), target)))
+            for s in region.get('slrs', [])]
 
 
 def v80_region():
@@ -1636,8 +1677,15 @@ def build_parser():
     ap.add_argument('--link-kind-device', default='', metavar='URAM,RAMB36,LUTS',
                     help='with --link-kind-cost: the budget per kind (default: the region\'s at --state-scratch-fill)')
     ap.add_argument('--link-kind-others', default='', metavar='URAM,RAMB36,LUTS',
-                    help='with --link-kind-cost: what the rest of the simulator takes of each, as a first fold built '
-                         'it (foldsim_link_kinds.py <gen dir>); default none')
+                    help='with --link-kind-cost: what the rest of the simulator takes of each (foldsim_link_kinds.py '
+                         '<gen dir>); default: as built by a first fold, refolded with it')
+    ap.add_argument('--link-kind-group-others', default='', metavar='U,B,L;...',
+                    help='with --link-kind-cost and --slr-groups: what the rest takes of each group\'s '
+                         '(foldsim_link_kinds.py <gen dir> --groups, from a first build)')
+    ap.add_argument('--slr-link-rams', action='store_true',
+                    help='with --slr-groups: links may be block or ultra RAM too, in their reader\'s group '
+                         '(foldsim-fold-static slr-link-rams); else every link of a grouped fold is distributed '
+                         'RAM or registers')
     ap.add_argument('--link-kinds', default='', metavar='P:R:KIND,...',
                     help='with --static: the RAM (distributed, block or ultra) of the links from model P '
                          'to model R that --link-block-depth\'s rules let block or ultra RAM hold, '
@@ -2264,6 +2312,8 @@ def main():
          '-o', sim])
     if a.static and os.path.exists(out('state_scratch.json')):
         pipeline = scratch_as_built(a, foldsim_opt, sim_input, pipeline, sim, out)
+    if a.static and getattr(a, 'link_kind_cost', False) and not getattr(a, 'link_kind_others', ''):
+        pipeline = link_kinds_as_built(a, foldsim_opt, sim_input, pipeline, sim)
     split_plan = []
     if a.slr_split:
         if not a.static:

@@ -27,6 +27,19 @@
 # LUTs at the placer's region fill, 0.80).
 # RUN: foldsim --srcs top.f --top Top --out %t/v --static --link-kind-cost node lvl1 2> %t/v.log > /dev/null
 # RUN: FileCheck %s --check-prefix=V < %t/v.log
+# Without --link-kind-others the driver folds once more with what the rest
+# took as built (foldsim_link_kinds.py), so the links are priced against it.
+# RUN: FileCheck %s --check-prefix=AB < %t/v.log
+# SLR groups (the V80 region's three): without slr-link-rams every link is
+# distributed RAM or registers; with it, links may be block RAM (here by a
+# block depth of 16) in their readers' groups; with link-kind-cost, each group
+# its own budget (link-kind-groups, the region's SLRs at the fill).
+# RUN: foldsim --srcs top.f --top Top --out %t/g0 --static --slr-groups --slr-region v80 --link-block-depth 16 node lvl1 > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=G0 < %t/g0/schedule.txt
+# RUN: foldsim --srcs top.f --top Top --out %t/g1 --static --slr-groups --slr-region v80 --slr-link-rams --link-block-depth 16 node lvl1 > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=G1 < %t/g1/schedule.txt
+# RUN: foldsim --srcs top.f --top Top --out %t/g2 --static --slr-groups --slr-region v80 --slr-link-rams --link-kind-cost --link-kind-others 0,0,0 node lvl1 2> %t/g2.log > /dev/null
+# RUN: FileCheck %s --check-prefix=G2 < %t/g2.log
 # Without it, the thresholds (none here: every link distributed).
 # RUN: foldsim --srcs top.f --top Top --out %t/n --static node lvl1 2> %t/n.log > /dev/null
 # RUN: FileCheck %s --check-prefix=DM < %t/n/foldsim_sim.mlir
@@ -40,3 +53,8 @@
 # M: link-kind-cost: 5 link groups (72 links): ultra 1 (4 URAM288), block 1 (12.5 RAMB36), distributed 3 (106 LUTs); with the rest: URAM288 20.0 % RAMB36 62.5 % LUTs 26.5 % of the budget
 # O: link-kind-cost: 5 link groups (72 links): ultra 0 (0 URAM288), block 2 (14.5 RAMB36), distributed 3 (181 LUTs); with the rest: URAM288 75.0 % RAMB36 36.2 % LUTs 22.7 % of the budget
 # V: link-kind-cost link-kind-device=1029,2052,1307904
+# AB: foldsim: link-kind-cost: the rest as built {{[0-9]+}},{{[0-9]+}},{{[0-9]+}} (links
+# G0: link kinds: distributed {{[0-9]+}} {{[0-9]+}} {{[0-9]+}}; block 0 0 0.0; ultra 0 0 0
+# G1: link kinds: distributed {{[0-9]+}} {{[0-9]+}} {{[0-9]+}}; block 50 33024 29.0; ultra 0 0 0
+# G2: link-kind-groups=421,828,495465;434,887,466166;173,336,182784
+# G2: link-kind-cost: 6 link groups (83 links): {{.*}} group 0: {{.*}}; group 1: {{.*}}; group 2:

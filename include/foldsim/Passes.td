@@ -629,6 +629,21 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "With link-kind-cost: the device's URAM288, RAMB36 and LUTs at the "
            "fill target, \"<uram>,<ramb36>,<luts>\" (default: the V80 "
            "region's at 0.85)">,
+    Option<"linkKindGroups", "link-kind-groups", "std::string", "\"\"",
+           "With link-kind-cost and SLR groups: each group's budget, "
+           "\"<uram>,<ramb36>,<luts>;...\" (group g the region's g-th SLR); a "
+           "link's memory is in its reader's group and priced against it. "
+           "Empty: the device's (link-kind-device)">,
+    Option<"linkKindGroupOthers", "link-kind-group-others", "std::string", "\"\"",
+           "With link-kind-groups: what the rest takes of each group's, "
+           "\"<uram>,<ramb36>,<luts>;...\" (missing groups: none)">,
+    Option<"slrLinkRams", "slr-link-rams", "bool", "false",
+           "With SLR groups: links may be block or ultra RAM too (by "
+           "link-block-depth / link-ultra-depth or link-kind-cost), the memory "
+           "in its reader's group, as without groups; a link read a host cycle "
+           "ahead between groups, whose write lands a host cycle later, only "
+           "where no write lands in the three host cycles before its read "
+           "(false: every link with groups distributed RAM or registers)">,
     Option<"linkKindOthers", "link-kind-others", "std::string", "\"0,0,0\"",
            "With link-kind-cost: what the rest of the simulator takes of each "
            "(\"<uram>,<ramb36>,<luts>\": URAM288, RAMB36, logic and other "

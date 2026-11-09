@@ -64,17 +64,24 @@ def links(path):
     return out
 
 
+def others(path):
+    """(uram, ramb36, luts) the rest of a built simulator takes (its total less
+    its link memories): link-kind-others."""
+    gen = os.path.dirname(path) if path.endswith('.mlir') else path
+    total = foldsim_fitdb.count(gen)['sim']
+    lk = links(path)
+    return (max(0.0, total.get('uram', 0) - lk['uram']),
+            max(0.0, total.get('bram', 0) - lk['bram']),
+            max(0.0, total.get('logic', 0) + total.get('lutram', 0) - lk['lutram'])), lk, total
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n\n')[0])
     ap.add_argument('path')
     ap.add_argument('--json', default='')
     a = ap.parse_args()
-    gen = os.path.dirname(os.path.dirname(a.path)) if a.path.endswith('.mlir') else a.path
-    total = foldsim_fitdb.count(gen)['sim']
-    lk = links(a.path)
-    others = (max(0.0, total.get('uram', 0) - lk['uram']),
-              max(0.0, total.get('bram', 0) - lk['bram']),
-              max(0.0, total.get('logic', 0) + total.get('lutram', 0) - lk['lutram']))
+    others_, lk, total = others(a.path)
+    others = others_
     print(f"links: {lk['memories']} memories, {lk['bits']:,} bits: {lk['uram']:.0f} URAM288, "
           f"{lk['bram']:.1f} RAMB36, {lk['lutram']:,.0f} LUTRAM LUTs")
     print(f"total: {total.get('uram', 0):.0f} URAM288, {total.get('bram', 0):.1f} RAMB36, "
