@@ -10482,13 +10482,30 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
     auto *op = value.getDefiningOp();
     return op && isa<hw::ConstantOp, hw::AggregateConstantOp>(op);
   };
-  // A class of one instance evaluated once a frame (no ready pass): its
-  // registers change only at the last stage and its inputs' read registers
-  // load once before the first, so both hold over the stages and, like a
-  // constant, cross no stage register; only the values its logic computes
-  // do. (A copy of several instances reads another instance's state and
-  // inputs at each slot; a ready pass reads the inputs again.)
-  bool stableLeaves = cls.threads() == 1 && !cls.hasReady;
+  // A class of one instance whose passes' stage windows do not overlap (one
+  // pass a frame, or ready passes well apart from the state pass): its
+  // registers change only at the state pass's last stage and its inputs'
+  // read registers load once before each pass's first, so both hold over a
+  // pass's stages and, like a constant, cross no stage register; only the
+  // values its logic computes do. (A copy of several instances reads another
+  // instance's state and inputs at each slot; overlapping windows would
+  // reload the inputs within one.)
+  bool stableLeaves = cls.threads() == 1;
+  if (stableLeaves && cls.hasReady) {
+    SmallVector<int> passes(cls.slot[kState].begin(), cls.slot[kState].end());
+    passes.append(cls.slot[kReady].begin(), cls.slot[kReady].end());
+    for (auto &later : cls.laterReady)
+      passes.append(later.begin(), later.end());
+    for (auto &p : passes)
+      p = ((p % int(ii)) + int(ii)) % int(ii);
+    llvm::sort(passes);
+    for (unsigned k = 0; k < passes.size() && stableLeaves; ++k) {
+      int gap = k + 1 < passes.size() ? passes[k + 1] - passes[k]
+                                      : passes[0] + int(ii) - passes[k];
+      if (passes.size() > 1 && gap <= int(stages) + 1)
+        stableLeaves = false;
+    }
+  }
   auto stableLeaf = [&](Value value) {
     if (!stableLeaves)
       return false;
