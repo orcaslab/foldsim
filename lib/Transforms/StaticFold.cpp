@@ -10082,12 +10082,18 @@ static uint64_t gMaxTableBits = 1000000;
 /// `slot-segments`: a slot table of at most this many affine segments is a
 /// decoder of its index (SlotSequencer.cpp), not a constant (0: tables).
 static unsigned gSlotSegments = 0;
+/// `rows[index]` as a slot-segments decoder (through the position counters
+/// where the index is the frame's position), or null if it does not decode.
+static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
+                            ArrayRef<uint64_t> rows, unsigned width);
 /// While the simulator is built: the classes' pass sequences (each pass
 /// kind of each class of several instances) and the frame, for position
 /// tables that do not decode to be read through one (slot-segments).
 static SmallVector<foldsim::PassSequence> gPassSeqs;
 static unsigned gPassII = 0;
 static bool gFactoring = false;
+/// A table built as a constant whatever slot-segments could make of it.
+static bool gTableRaw = false;
 
 /// The regions sharing a copy of the slot controls two host cycles ahead.
 static constexpr unsigned kRegionsPerGroup = 16;
@@ -15940,7 +15946,7 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     const char *env = getenv("FOLDSIM_SLOT_MIN_INDEX_BITS");  // a test hook
     return env ? atoi(env) : 7;
   }();
-  if (gSlotSegments && int(indexWidth) >= minIndexBits) {
+  if (gSlotSegments && !gTableRaw && int(indexWidth) >= minIndexBits) {
     auto *pc = foldsim::currentPosCounters();
     bool counted = pc && pc->knows(index);
     if (Value decoded = foldsim::decodeSlotTable(
@@ -16034,6 +16040,19 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     hi = lo;
   }
   return b.createOrFold<comb::ConcatOp>(parts);
+}
+
+static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
+                            ArrayRef<uint64_t> rows, unsigned width) {
+  if (!gSlotSegments)
+    return {};
+  auto *pc = foldsim::currentPosCounters();
+  bool counted = pc && pc->knows(index);
+  return foldsim::decodeSlotTable(
+      b, index, rows, width, gSlotSegments,
+      counted ? llvm::function_ref<std::pair<Value, Value>(unsigned)>(
+                    [&](unsigned d) { return pc->divmod(b, index, d); })
+              : nullptr);
 }
 
 void StaticFolder::buildFrameTable(bool stalls) {
@@ -16604,6 +16623,9 @@ LogicalResult StaticFolder::buildSim() {
   // (the table's), two, one, then now.
   struct Controls {
     Value inst3, state3;
+    /// The instance at each position (inst3's rows), for a table read at
+    /// inst3 to be composed into one read at the position.
+    SmallVector<uint64_t> instRow3;
     /// Paged: the instance whose pages are read, from three host cycles
     /// ahead (a page before its state pass). Off chip: each position's page
     /// read [valid, instance, page] and page write [valid, page].
@@ -16730,6 +16752,7 @@ LogicalResult StaticFolder::buildSim() {
     ctl.ready = reg(ready1, prefix + "_ready0");
     if (threads > 1) {
       ctl.inst3 = table(b, at, instRow, idxWidth);
+      ctl.instRow3.assign(instRow.begin(), instRow.end());
       ctl.inst2 = reg(ctl.inst3, prefix + "_inst2");
       ctl.inst1 = reg(ctl.inst2, prefix + "_inst1");
       ctl.inst = reg(ctl.inst1, prefix + "_inst0");
@@ -16824,6 +16847,7 @@ LogicalResult StaticFolder::buildSim() {
         rctl.pre3 = table(b, at, preRow, 1);
       if (threads > 1) {
         rctl.inst3 = table(b, at, rinstRow, idxWidth);
+        rctl.instRow3.assign(rinstRow.begin(), rinstRow.end());
         rctl.inst2 = reg(rctl.inst3, prefix + "_rinst2");
         rctl.inst1 = reg(rctl.inst2, prefix + "_rinst1");
         rctl.inst = reg(rctl.inst1, prefix + "_rinst0");
@@ -18581,6 +18605,24 @@ LogicalResult StaticFolder::buildSim() {
             return Value();
           if (threads == 1)
             return constant(w, entryRows[0]);
+          // Read at the position itself where that decodes (one decoder,
+          // not the instance's decoder into the rows' adder).
+          if (!ctl.instRow3.empty()) {
+            SmallVector<uint64_t> composed(ctl.instRow3.size());
+            for (auto [p, i] : llvm::enumerate(ctl.instRow3))
+              composed[p] = i < entryRows.size() ? entryRows[i] : 0;
+            if (Value v = tryDecodeTable(b, ctl.at3, composed, w))
+              return copyReg(v, consumer.name + "_addr2_" + Twine(at) + "_" +
+                                    Twine(addressCopies++));
+            // Not decoded: one table of the position, not the instance's
+            // table into a decoder's adder (one table's depth, as before
+            // the decoders).
+            gTableRaw = true;
+            Value v = table(b, ctl.at3, composed, w);
+            gTableRaw = false;
+            return copyReg(v, consumer.name + "_addr2_" + Twine(at) + "_" +
+                                  Twine(addressCopies++));
+          }
           return copyReg(table(b, ctl.inst3, entryRows, w),
                          consumer.name + "_addr2_" + Twine(at) + "_" +
                              Twine(addressCopies++));
