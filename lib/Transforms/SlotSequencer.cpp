@@ -76,12 +76,12 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
     uint64_t k = 0, last = 0, live = 0, liveAtLast = 0;
     for (;; ++k) {
       uint64_t base = seg.start + k * seg.stride;
-      if (base + seg.len > n || (k && !seg.stride))
+      if (base + (seg.len - 1) * seg.istride >= n || (k && !seg.stride))
         break;
       bool ok = true;
       uint64_t blockLive = 0;
       for (uint64_t j = 0; j < seg.len && ok; ++j) {
-        uint64_t p = base + j;
+        uint64_t p = base + j * seg.istride;
         ok = !covered[p] && row(p) == (seg.at(k, j) & mask);
         blockLive += row(p) != 0;
       }
@@ -129,9 +129,13 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
           consider(seg);
         }
         // Blocks: `len` consecutive rows of a step `inner` each stride.
-        if (stride >= 2) {
+        // (Rows `e` apart within the block, e a power of two below the
+        // stride: a stream's reads at a reader's passes, the reader's
+        // instances in a member set.) A block with e > 1 does not cross the
+        // stride's boundary.
+        for (uint64_t e = 1; stride >= 2 && e * 2 <= stride; e *= 2) {
           int64_t inner;
-          uint64_t c = (row(s + 1) - row(s)) & mask;
+          uint64_t c = (row(s + e) - row(s)) & mask;
           uint64_t negc = (~c + 1) & mask;
           if (c == 0)
             inner = 0;
@@ -140,21 +144,20 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
           else if (llvm::isPowerOf2_64(negc))
             inner = -int64_t(negc);
           else
-            goto noBlock;
-          {
-            uint64_t len = 1;
-            while (len < stride && s + len < n && !covered[s + len] &&
-                   row(s + len) == ((row(s) + uint64_t(inner) * len) & mask))
-              ++len;
-            if (len >= 2 && stepOk(d, width)) {
-              SlotSegment blk = seg;
-              blk.len = len;
-              blk.inner = inner;
-              blk.step = int64_t(d & mask);
-              consider(blk);
-            }
+            continue;
+          uint64_t r = s & (stride - 1), len = 1;
+          while ((len + 1) * e <= stride && s + len * e < n &&
+                 (e == 1 || r + len * e < stride) && !covered[s + len * e] &&
+                 row(s + len * e) == ((row(s) + uint64_t(inner) * len) & mask))
+            ++len;
+          if (len >= 2 && stepOk(d, width)) {
+            SlotSegment blk = seg;
+            blk.len = len;
+            blk.istride = e;
+            blk.inner = inner;
+            blk.step = int64_t(d & mask);
+            consider(blk);
           }
-        noBlock:;
         }
         // A digit of k: bits [shift, shift + bits) of k, the step from the
         // first k whose digit is 1 (stride 1, where no run is long).
@@ -178,7 +181,7 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
       best.stride = 0;
     for (uint64_t k = 0; k < best.count; ++k)
       for (uint64_t j = 0; j < best.len; ++j)
-        covered[best.start + k * best.stride + j] = true;
+        covered[best.start + k * best.stride + j * best.istride] = true;
     segments.push_back(best);
     if (segments.size() > maxSegments)
       break;
@@ -199,6 +202,7 @@ static bool decodesExactly(ArrayRef<SlotSegment> segments,
       unsigned a = seg.stride > 1 ? llvm::Log2_64(seg.stride) : 0;
       uint64_t r = a ? seg.start & (seg.stride - 1) : 0;
       bool wraps = seg.len > 1 && r + seg.len > seg.stride;
+      unsigned le = llvm::Log2_64(seg.istride);
       uint64_t offset = (idx - seg.start) & imask;
       bool hit;
       if (seg.count == 1 && seg.len == 1) {
@@ -209,7 +213,11 @@ static bool decodesExactly(ArrayRef<SlotSegment> segments,
           uint64_t lowMask = seg.stride - 1;
           if (seg.len == 1)
             hit &= (idx & lowMask) == r;
-          else if (seg.len < seg.stride) {
+          else if (seg.istride > 1) {
+            uint64_t low = idx & lowMask;
+            hit &= (low & (seg.istride - 1)) == (r & (seg.istride - 1)) &&
+                   (low >> le) >= (r >> le) && (low >> le) < (r >> le) + seg.len;
+          } else if (seg.len < seg.stride) {
             uint64_t low = wraps ? offset & lowMask : idx & lowMask;
             uint64_t lo = wraps ? 0 : r;
             hit &= low >= lo && low < lo + seg.len;
@@ -229,9 +237,9 @@ static bool decodesExactly(ArrayRef<SlotSegment> segments,
         if (direct) {
           if (plainK)
             c0 -= uint64_t(seg.step) * sa;
-          c0 -= uint64_t(seg.inner) * r;
+          c0 -= uint64_t(seg.inner) * (r >> le);
           kv = idx >> a;
-          jv = idx & ((uint64_t(1) << a) - 1);
+          jv = (idx & ((uint64_t(1) << a) - 1)) >> le;
         } else {
           kv = offset >> a;
           jv = offset & ((uint64_t(1) << a) - 1);
@@ -312,6 +320,7 @@ Value decodeSlotTable(ImplicitLocOpBuilder &b, Value index,
     // The block's rows within each stride: [r, r + len) of the index's low
     // bits, unless the block wraps past the stride's boundary.
     bool wraps = seg.len > 1 && r + seg.len > seg.stride;
+    unsigned le = llvm::Log2_64(seg.istride);
     SmallVector<Value> conds;
     Value offset;   // index - start, where needed
     auto offsetOf = [&]() {
@@ -337,6 +346,21 @@ Value decodeSlotTable(ImplicitLocOpBuilder &b, Value index,
           conds.push_back(comb::ICmpOp::create(
               b, comb::ICmpPredicate::eq, comb::ExtractOp::create(b, index, 0, a),
               constant(lowType, r)));
+        } else if (seg.istride > 1) {
+          // The rows' own low bits, then the block's [r, r + len) of the
+          // bits above them.
+          conds.push_back(comb::ICmpOp::create(
+              b, comb::ICmpPredicate::eq, comb::ExtractOp::create(b, index, 0, le),
+              constant(b.getIntegerType(le), r & (seg.istride - 1))));
+          auto midType = b.getIntegerType(a - le);
+          Value mid = comb::ExtractOp::create(b, index, le, a - le);
+          uint64_t lo = r >> le, hiExcl = lo + seg.len;
+          if (lo)
+            conds.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge, mid,
+                                                 constant(midType, lo)));
+          if (hiExcl < (uint64_t(1) << (a - le)))
+            conds.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::ult, mid,
+                                                 constant(midType, hiExcl)));
         } else if (seg.len < seg.stride) {
           Value low = wraps ? Value(comb::ExtractOp::create(b, offsetOf(), 0, a))
                             : Value(comb::ExtractOp::create(b, index, 0, a));
@@ -374,11 +398,11 @@ Value decodeSlotTable(ImplicitLocOpBuilder &b, Value index,
       if (direct) {
         if (plainK)
           c0 -= uint64_t(seg.step) * sa;
-        c0 -= uint64_t(seg.inner) * r;
+        c0 -= uint64_t(seg.inner) * (r >> le);
         if (a < w)
           kv = comb::ExtractOp::create(b, index, a, w - a);
-        if (a)
-          jv = comb::ExtractOp::create(b, index, 0, a);
+        if (a > le)
+          jv = comb::ExtractOp::create(b, index, le, a - le);
       } else {
         Value x = offsetOf();
         if (a < w)

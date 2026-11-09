@@ -553,7 +553,7 @@ public:
   }
   /// The classes whose slot rows (each pass kind's, the instance at each
   /// position, its PP passes') need more than `slotSegmentsK` segments.
-  SmallVector<unsigned> undecodedClasses() const;
+  SmallVector<unsigned> undecodedClasses();
   /// `csf-ready-cones`: csf-ready-copies built, each named model's late
   /// outputs split into a cone model (CsfReadySplit.cpp) of k copies. The
   /// split models' cone models, by model.
@@ -8797,14 +8797,37 @@ static void printSlots(raw_ostream &os, ArrayRef<int> slots) {
   }
 }
 
-SmallVector<unsigned> StaticFolder::undecodedClasses() const {
+SmallVector<unsigned> StaticFolder::undecodedClasses() {
   SmallVector<unsigned> out;
+  unsigned k = slotSegmentsK ? slotSegmentsK : 8;
+  uint64_t rowBits = uint64_t(llvm::PowerOf2Ceil(ii + 1));
+  // An HBM link stream's tables lie at its reader's read passes (landings,
+  // requests) and its producer's passes (writes): their kept bits count for
+  // those classes.
+  SmallVector<uint64_t> streamKept(classes.size(), 0);
+  if (!linkStreams.empty() && succeeded(planStreams()))
+    for (auto &st : linkStreams) {
+      if (st.excluded || !st.kept)
+        continue;
+      auto bitsOf = [&](ArrayRef<uint64_t> row, unsigned width) -> uint64_t {
+        return foldsim::slotSegments(row, std::max(width, 1u), k).size() > k
+                   ? rowBits * std::max(width, 1u)
+                   : 0;
+      };
+      unsigned rw = classes[st.rcls].threads() > 1
+                        ? llvm::Log2_32_Ceil(classes[st.rcls].threads())
+                        : 1;
+      streamKept[st.rcls] += bitsOf(st.popValid, 1) + bitsOf(st.reqValid, 1) +
+                             bitsOf(st.popInst, rw) + bitsOf(st.reqRow, 16);
+      streamKept[st.pcls] += bitsOf(st.writeValid, 1);
+    }
   for (auto [c, cls] : llvm::enumerate(classes)) {
     unsigned threads = cls.threads();
     if (threads < 2)
       continue;
     unsigned idxWidth = llvm::Log2_32_Ceil(threads);
     auto wrap = [&](int s) { return unsigned(((s % int(ii)) + int(ii)) % int(ii)); };
+    uint64_t kept = streamKept[c];
     SmallVector<uint64_t> inst(ii + 1, 0), rinst(ii + 1, 0), pinst(ii + 1, 0),
         prow(ii + 1, 0);
     SmallVector<SmallVector<uint64_t>> kinds;
@@ -8826,10 +8849,6 @@ SmallVector<unsigned> StaticFolder::undecodedClasses() const {
         pinst[pos] = i;
         prow[pos] = j;
       }
-    unsigned k = slotSegmentsK ? slotSegmentsK : 8;
-    // The bits of the rows that would stay constants (2^position bits each).
-    uint64_t rowBits = uint64_t(llvm::PowerOf2Ceil(ii + 1));
-    uint64_t kept = 0;
     auto check = [&](ArrayRef<uint64_t> row, unsigned width) {
       if (foldsim::slotSegments(row, width, k).size() > k)
         kept += rowBits * width;
@@ -8929,38 +8948,6 @@ LogicalResult StaticFolder::schedule() {
     }
   if (unpaged)
     return schedule();
-  // affine-auto: the classes whose rows do not decode, affine, and the frame
-  // scheduled again (until none is left, at most 4 rounds: each round's
-  // schedule may leave another class irregular).
-  if (affineAuto && affineAutoRounds < 4 && !affineSlots) {
-    ++affineAutoRounds;
-    auto undecoded = undecodedClasses();
-    if (!undecoded.empty()) {
-      affineClass.resize(classes.size(), false);
-      std::string names;
-      for (unsigned c : undecoded) {
-        affineClass[c] = true;
-        names += (names.empty() ? "" : ",") + classes[c].name;
-      }
-      llvm::errs() << "foldsim-fold-static: affine-auto: round "
-                   << affineAutoRounds << ": II " << ii << ", "
-                   << undecoded.size() << " more classes affine (" << names
-                   << "), scheduled again\n";
-      // A frame the affine classes cannot be placed in keeps them as they
-      // were: they are unmarked and the frame scheduled as before.
-      ++affineTrial;
-      bool placed = succeeded(schedule());
-      --affineTrial;
-      if (placed)
-        return success();
-      for (unsigned c : undecoded)
-        affineClass[c] = false;
-      affineAutoRounds = ~0u >> 1;
-      llvm::errs() << "foldsim-fold-static: affine-auto: no frame places "
-                   << names << " affine; scheduled as before\n";
-      return schedule();
-    }
-  }
   // An HBM link stream the schedule keeps no member of builds nothing (its
   // links are on chip), so the spacing its ports asked for is dropped: such
   // streams are excluded and the frame scheduled again without them. Once
@@ -8985,6 +8972,41 @@ LogicalResult StaticFolder::schedule() {
       }
     if (excluded) {
       streamPages();
+      return schedule();
+    }
+  }
+  // affine-auto: the classes whose rows do not decode, affine, and the frame
+  // scheduled again (until none is left, at most 4 rounds: each round's
+  // schedule may leave another class irregular).
+  if (affineAuto && affineAutoRounds < 4 && !affineSlots) {
+    ++affineAutoRounds;
+    auto undecoded = undecodedClasses();
+    // (A class already affine whose tables still do not decode is not
+    // marked again: another round would not change it.)
+    llvm::erase_if(undecoded, [&](unsigned c) { return affineOf(c); });
+    if (!undecoded.empty()) {
+      affineClass.resize(classes.size(), false);
+      std::string names;
+      for (unsigned c : undecoded) {
+        affineClass[c] = true;
+        names += (names.empty() ? "" : ",") + classes[c].name;
+      }
+      llvm::errs() << "foldsim-fold-static: affine-auto: round "
+                   << affineAutoRounds << ": II " << ii << ", "
+                   << undecoded.size() << " more classes affine (" << names
+                   << "), scheduled again\n";
+      // A frame the affine classes cannot be placed in keeps them as they
+      // were: they are unmarked and the frame scheduled as before.
+      ++affineTrial;
+      bool placed = succeeded(schedule());
+      --affineTrial;
+      if (placed)
+        return success();
+      for (unsigned c : undecoded)
+        affineClass[c] = false;
+      affineAutoRounds = ~0u >> 1;
+      llvm::errs() << "foldsim-fold-static: affine-auto: no frame places "
+                   << names << " affine; scheduled as before\n";
       return schedule();
     }
   }

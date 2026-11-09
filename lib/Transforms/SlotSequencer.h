@@ -22,7 +22,7 @@
 
 namespace foldsim {
 
-/// A run of a table's rows, in blocks: rows[start + k * stride + j] =
+/// A run of a table's rows, in blocks: rows[start + k * stride + j * istride] =
 /// value + step * f(k) + inner * j (modulo 2^width) for k < count, j < len;
 /// f(k) the `bits` bits of k from bit `shift` (k itself by default: an affine
 /// run; else a digit of k, as an instance's place among its parent's
@@ -33,6 +33,8 @@ namespace foldsim {
 /// of at most three signed powers of two; `inner` 0 or a signed power of two.
 struct SlotSegment {
   uint64_t start = 0, stride = 0, count = 0, len = 1;
+  /// A block's rows `istride` apart (a power of two; len * istride <= stride).
+  uint64_t istride = 1;
   uint64_t value = 0;
   int64_t step = 0, inner = 0;
   unsigned shift = 0, bits = 64;
@@ -42,7 +44,9 @@ struct SlotSegment {
       f &= (uint64_t(1) << bits) - 1;
     return value + uint64_t(step) * f + uint64_t(inner) * j;
   }
-  uint64_t end() const { return start + (count - 1) * stride + len - 1; }
+  uint64_t end() const {
+    return start + (count - 1) * stride + (len - 1) * istride;
+  }
 };
 
 /// `x` (`width` bits) as at most `maxTerms` signed powers of two (canonical
