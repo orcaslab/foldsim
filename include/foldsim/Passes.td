@@ -854,6 +854,10 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "Instance i's ready passes take lane i mod k; they no longer "
                "take the slots of the model's copies, whose state passes "
                "keep them">,
+    Option<"csfMailboxLatency", "csf-mailbox-latency", "unsigned", "1",
+           "With csf-mailboxes: the host cycles a mailbox read takes past a "
+           "register link's (1: the RAM's output register; 2 with a cascade "
+           "or a fabric register after it)">,
     Option<"csfMailboxes", "csf-mailboxes", "bool", "false",
            "Constant-shell fold (schedule only): links are rows of RAM "
            "mailboxes owned by their reader, one read port each: a link not "

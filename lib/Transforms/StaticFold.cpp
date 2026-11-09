@@ -404,6 +404,7 @@ public:
   /// copies first, then the lanes), and the resources in all.
   SmallVector<std::string> csfReadyCopySpecs;
   bool csfMailboxes = false;
+  unsigned csfMailboxLatency = 1;
   SmallVector<unsigned> readyLanes, laneBase;
   unsigned numResources = 0;
   /// Per class: the slots a pass holds its mailbox read port (1: none).
@@ -5083,8 +5084,13 @@ unsigned StaticFolder::placeModulo(
   };
   lastModuloPeriodFound = 0;
   llvm::scope_exit keepWhy([&] {
-    if (!lastModuloPeriodFound)
+    if (!lastModuloPeriodFound) {
+      if (!whyFailed.empty())
+        moduloBinding = "no period up to " + std::to_string(whyFailed.rbegin()->first) +
+                        " (the frame alone is used); it failed: " +
+                        whyFailed.rbegin()->second;
       return;
+    }
     auto it = whyFailed.lower_bound(lastModuloPeriodFound);
     moduloBinding = "period " + std::to_string(lastModuloPeriodFound) +
                     " found, lower bound " + std::to_string(moduloLower);
@@ -7122,7 +7128,7 @@ LogicalResult StaticFolder::planCsf() {
     return success();
   // A mailbox's row is a RAM's: read a host cycle on, from its output
   // register (a link taken in its producer's host cycle is forwarded).
-  linkLatency += 1;
+  linkLatency += int(csfMailboxLatency);
   // Each reader instance's rows of one producer class's mailbox: the
   // producer instances it reads. With b lanes (banks), row j in lane j mod b
   // or in lane j / ceil(n / b), the reads of an instance are one access if
@@ -15656,6 +15662,7 @@ void FoldStaticPass::runOnOperation() {
   folder.stateInRamH = stateInRamH;
   folder.csfReadyCopySpecs.assign(csfReadyCopies.begin(), csfReadyCopies.end());
   folder.csfMailboxes = csfMailboxes;
+  folder.csfMailboxLatency = csfMailboxLatency;
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
