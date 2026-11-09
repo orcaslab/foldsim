@@ -756,6 +756,7 @@ OUTS = None
 LOADS, LOADS_U, HIGH = {}, {}, []
 LINK_INSTS = set()
 CLUSTERS, PARTS = {}, {}
+DOWN = []
 OUTDIR = '.'
 
 
@@ -802,6 +803,9 @@ def analyse(g, rep, bcast, variant, k, caps, slr_names, a, sll_rest):
         wgt = max(1, nt.width)
         if variant in ('c', 'p') and nt.cls not in REGISTERED:
             wgt *= a.comb_penalty
+        if a.depth_weight and DOWN:
+            # A net that feeds deep logic: a crossing there puts the SLL in front of that logic.
+            wgt *= 1 + max((DOWN[u] for u in nt.users), default=0) / a.depth_weight
         edges.append(sorted(pins))
         ew.append(int(wgt))
         enets.append(v)
@@ -982,6 +986,24 @@ def path_latency(g, P, cost, io=False):
     return max(0, max((hop(n, v) for n in sinks for v in g.ins[n]), default=0))
 
 
+def down_levels(g):
+    """Per node, the most logic ops (LUT cost > 0) on a combinational path from its output to a sink, the node
+    itself included: the depth a crossing into it puts the super long line in front of."""
+    order = topo(g)
+    down = [0] * len(g.kind)
+    users = defaultdict(set)
+    for v, nt in g.nets.items():
+        for u in nt.users:
+            if not is_source(g, u) and g.kind[u] not in ('out',) and (g.kind[u] != 'mem' or v in g.rd_ins.get(u, ())):
+                users[nt.driver].add(u)
+    for n in reversed(order):
+        if is_source(g, n) or g.kind[n] == 'out':
+            continue
+        here = 1 if g.res[n]['lut'] > 0 else 0
+        down[n] = here + max((down[u] for u in users[n]), default=0)
+    return down
+
+
 def loads(g):
     """Estimated LUT loads per bit of each net: a narrow (control) bit drives every LUT of a user, a data bit its
     share; a memory's address bits every LUTRAM of it."""
@@ -1008,7 +1030,7 @@ def fmtres(x):
 
 
 def main():
-    global OUTS, OUTDIR, LOADS, LOADS_U, HIGH, LINK_INSTS
+    global OUTS, OUTDIR, LOADS, LOADS_U, HIGH, LINK_INSTS, DOWN
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('gen')
     ap.add_argument('--copy', required=True, help='the class copy (its module <copy>_static)')
@@ -1028,6 +1050,9 @@ def main():
                                        'SLLs per boundary added to the cut')
     ap.add_argument('--variants', default='a,b,c')
     ap.add_argument('--top-fanout', type=int, default=12)
+    ap.add_argument('--depth-weight', type=float, default=0,
+                    help='a net\'s cut weight times 1 + (the logic ops after it on a path) / this (0: off): keeps '
+                         'deep cones with their source (Beacon: crossings in front of 8-10 levels)')
     ap.add_argument('--apply-map', metavar='FILE',
                     help='write the map foldsim-slr-split applies (the --variants variant at the first --parts count; '
                          'word level, --chunk 0): one part per op of the copy\'s body, -1 replicated')
@@ -1103,6 +1128,8 @@ def main():
     lines.append(f'  broadcasts (registered, >= {a.broadcast} pins, not replicable): {len(bcast)} nets, '
                  f'{sum(g.nets[v].width for v in bcast):,} bits')
     LOADS, LOADS_U = loads(g)
+    if a.depth_weight:
+        DOWN = down_levels(g)
     HIGH = sorted(LOADS, key=lambda v: -LOADS[v])[:a.top_fanout]
     lines.append('  highest-load nets (estimated LUT loads a bit; pins; class; R replicable): ' + '; '.join(
         f'{g.nets[v].name[1:][-70:]} {LOADS[v]:,.0f} ({len(g.nets[v].users)} pins, {g.nets[v].width}b, '
