@@ -14,6 +14,7 @@ add_mlir_library(FoldsimTransforms
   Pipelines.cpp
   RemoveDeadState.cpp
   ReplicateControls.cpp
+  SlrSplit.cpp
   Sort.cpp
   PassSplit.cpp
   StaticFold.cpp

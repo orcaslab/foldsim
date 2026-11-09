@@ -107,6 +107,8 @@ class Graph:
         self.mports = defaultdict(list)   # memory node -> [('r', result, [address, enable]) | ('w', data, [ctl])]
         self.memw = {}          # memory node -> its word width
         self.cval = {}          # constant value -> int
+        self.defnode = {}       # value (and memory) -> the node defining it
+        self.body = []          # the module body's op lines, in order (foldsim-slr-split's map order)
 
     def node(self, kind, name, op=''):
         self.kind.append(kind)
@@ -120,6 +122,7 @@ class Graph:
         n = Net()
         n.name, n.width, n.driver, n.users, n.cls, n.readaddr = v, w, driver, [], None, False
         self.nets[v] = n
+        self.defnode[v] = driver
         return n
 
 
@@ -199,6 +202,8 @@ def build(texts, top, region, model=False):
     child_cost = {}
     for raw in lines[1:]:
         s = raw.strip()
+        if s and not s.startswith('hw.output') and not s.startswith('}'):
+            g.body.append(s)
         if s.startswith('hw.output'):
             for i, v in enumerate(SSA.findall(s.split(' : ')[0])):
                 mod.uses[v] += 1
@@ -275,6 +280,7 @@ def build(texts, top, region, model=False):
                    st.group(1) if st else None, int(mk.group(1)) if mk else 1, bool(nm)]
             n = g.node('mem', rec[0], op)
             mems[res[0]] = (n, rec)
+            g.defnode[res[0]] = n
             g.memlat[n] = rec[5]
             g.memw[n] = rec[2]
             continue
@@ -365,6 +371,22 @@ def build(texts, top, region, model=False):
     for n in g.rd_ins:
         g.rd_ins[n] = [v for v in g.rd_ins[n] if v in g.nets]
     return g
+
+
+def op_map(g, P):
+    """Per op of the module's body, in order: its part (P of the node defining it), or -1 (constants, clocks and the
+    replicated nodes, which P leaves at -1)."""
+    out = []
+    for s in g.body:
+        if s.startswith('seq.firmem.write_port') or s.startswith('seq.firmem.read_write_port'):
+            v = re.search(r'(%[\w.$-]+)\[', s).group(1)
+        elif ' = ' in s and s.startswith('%'):
+            v = SSA.findall(s.split(' = ', 1)[0])[0]
+        else:
+            v = None
+        n = g.defnode.get(v)
+        out.append(P[n] if n is not None else -1)
+    return out
 
 
 def deps(g, n):
@@ -733,13 +755,14 @@ _MTK = None
 OUTS = None
 LOADS, LOADS_U, HIGH = {}, {}, []
 LINK_INSTS = set()
+CLUSTERS, PARTS = {}, {}
 OUTDIR = '.'
 
 
 def analyse(g, rep, bcast, variant, k, caps, slr_names, a, sll_rest):
     """Partition one variant; returns its report dict."""
     N = len(g.kind)
-    use_rep = variant in ('b', 'c')
+    use_rep = variant in ('b', 'c', 'r', 'p')
     # Graph nodes: every node, except (b, c) the replicable ones.
     in_graph = [not (use_rep and rep[n]) for n in range(N)]
     idx = {}
@@ -760,7 +783,7 @@ def analyse(g, rep, bcast, variant, k, caps, slr_names, a, sll_rest):
     share = [sum(c[r] / capsum[r] for r in RES if capsum[r]) for c in caps]
     targets = [W * s / sum(share) * (1 + a.imbalance) for s in share]
     edges, ew, enets = [], [], []
-    bset = set(bcast) if use_rep else set()
+    bset = set(bcast) if use_rep and variant != 'r' else set()
     merged = {}   # broadcast register's next-value net -> extra users (the broadcast's)
     for v in bset:
         nx = g.reg_next.get(g.nets[v].driver)
@@ -777,17 +800,57 @@ def analyse(g, rep, bcast, variant, k, caps, slr_names, a, sll_rest):
         if len(pins) < 2:
             continue
         wgt = max(1, nt.width)
-        if variant == 'c' and nt.cls not in REGISTERED:
+        if variant in ('c', 'p') and nt.cls not in REGISTERED:
             wgt *= a.comb_penalty
         edges.append(sorted(pins))
         ew.append(int(wgt))
         enets.append(v)
     t0 = time.time()
-    part = partition(nodes, w, edges, ew, k, targets, True, a.threads, a.seed)
+    if variant in ('r', 'p'):
+        # r: registered cuts only, every net that is neither registered nor a port uncuttable (its pins one
+        # cluster: the cut adds no register). p: what foldsim-slr-split applies, a memory-read net uncuttable (a
+        # combinational read stays with its memory), other combinational nets at the penalty (the pass copies their
+        # logic into the reading part).
+        par = list(range(len(nodes)))
+
+        def find(x):
+            while par[x] != x:
+                par[x] = par[par[x]]
+                x = par[x]
+            return x
+        for v, nt in g.nets.items():
+            if nt.cls in REGISTERED or v in bset or not in_graph[nt.driver] or (variant == 'p' and nt.cls == 'comb'):
+                continue
+            pins = [idx[u] for u in nt.users if in_graph[u]] + [idx[nt.driver]]
+            r0 = find(pins[0])
+            for q in pins[1:]:
+                rq = find(q)
+                if rq != r0:
+                    par[rq] = r0
+        roots = sorted({find(i) for i in range(len(nodes))})
+        cid = {r: j for j, r in enumerate(roots)}
+        cw = [0] * len(roots)
+        for i in range(len(nodes)):
+            cw[cid[find(i)]] += w[i]
+        cedges, cew = [], []
+        for e, x in zip(edges, ew):
+            pins = sorted({cid[find(i)] for i in e})
+            if len(pins) > 1:
+                cedges.append(pins)
+                cew.append(x)
+        # The largest cluster must fit a part: the targets widened to it.
+        big = max(cw)
+        ctargets = [max(t, big * (1 + a.imbalance)) for t in targets]
+        cpart = partition(list(range(len(roots))), cw, cedges, cew, k, ctargets, True, a.threads, a.seed)
+        part = [cpart[cid[find(i)]] for i in range(len(nodes))]
+        CLUSTERS['r'] = (len(roots), big / max(1, sum(cw)))
+    else:
+        part = partition(nodes, w, edges, ew, k, targets, True, a.threads, a.seed)
     dt = time.time() - t0
     P = [-1] * N
     for i, n in enumerate(nodes):
         P[n] = part[i]
+    PARTS[variant, k] = P
     # Replicable nodes: each part holds those its nodes read, transitively.
     added = dict.fromkeys(RES, 0.0)
     partres = [dict.fromkeys(RES, 0.0) for _ in range(k)]
@@ -965,6 +1028,9 @@ def main():
                                        'SLLs per boundary added to the cut')
     ap.add_argument('--variants', default='a,b,c')
     ap.add_argument('--top-fanout', type=int, default=12)
+    ap.add_argument('--apply-map', metavar='FILE',
+                    help='write the map foldsim-slr-split applies (the --variants variant at the first --parts count; '
+                         'word level, --chunk 0): one part per op of the copy\'s body, -1 replicated')
     ap.add_argument('--chunk', type=int, default=32, help='bits a chunk of a value (0: word level: every value and '
                                                            'op whole)')
     ap.add_argument('--threads', type=int, default=8)
@@ -1084,6 +1150,18 @@ def main():
             lines.append('    widest cuts: ' + '; '.join(f'{n[1:][-50:]} {w}b {c2} F{f}'
                                                          for n, w, c2, f in r['widest_cuts'][:6]))
             print('\n'.join(lines[-(len(r['part_res']) + 4 + len(r['boundaries'])):]), flush=True)
+    if a.apply_map:
+        if a.chunk:
+            sys.exit('--apply-map needs --chunk 0 (the pass splits whole ops)')
+        var, k = a.variants.split(',')[0], int(a.parts.split(',')[0])
+        m = op_map(g, PARTS[var, k])
+        with open(a.apply_map, 'w') as f:
+            f.write('\n'.join(str(x) for x in m) + '\n')
+        lines.append(f'  map: {a.apply_map} ({var}, {k} parts): {len(m):,} ops, '
+                     + ', '.join(f'part {p} {sum(1 for x in m if x == p):,}' for p in range(-1, k)))
+    if 'r' in CLUSTERS:
+        lines.append(f'  registered-only clusters: {CLUSTERS["r"][0]:,}, the largest {100 * CLUSTERS["r"][1]:.1f} % '
+                     f'of the copy\'s weight')
     rep_path = os.path.join(OUTDIR, f'{a.copy}.split.txt')
     open(rep_path, 'w').write('\n'.join(lines) + '\n')
     print('\n'.join(lines[:12]))

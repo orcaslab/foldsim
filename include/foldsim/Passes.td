@@ -1282,6 +1282,50 @@ def FoldZeroWidth : Pass<"foldsim-fold-zero-width", "::circt::hw::HWModuleOp"> {
   let dependentDialects = ["circt::hw::HWDialect"];
 }
 
+def SlrSplit : Pass<"foldsim-slr-split", "::mlir::ModuleOp"> {
+  let summary = "Split a module into parts, one per SLR, cut at registers";
+  let description = [{
+    The module `module` (a class copy of a folded simulator, too large for
+    one SLR) becomes `parts` modules `<module>_p<k>`, each instantiated in
+    its place as `<prefix><module>_p<k>`, so that a floorplan can hold each
+    part in an SLR of its own. The map (`map`, a file: one integer per op of
+    the module's body in order, its part, or -1 for an op copied into every
+    part that reads it; foldsim_slr_split.py --apply-map writes it from a
+    min-cut of the netlist) gives the parts. Constants are copied into every
+    part. A memory's ports must be in its part.
+
+    Every value that crosses from one part to another leaves its part from
+    a register: a flop, a memory's registered read, or an instance's output.
+    The split changes no cycle and no schedule: no register is added, and
+    the crossing is a flop's output driving a super long line (the folded
+    pipeline's registers, its read registers and stage registers, are the
+    cut). Logic of another part that a part reads (`copy-logic`, default) is
+    copied into it, up to registers; a combinational memory read across
+    parts is an error (its memory would have to move), as is any
+    combinational crossing without `copy-logic`. A register or memory the
+    map replicates (-1) is copied whole, with its logic, into every part
+    that reads it: the fold's counters and their decodes, which each part
+    then keeps in lockstep from the same inputs.
+  }];
+  let options = [
+    Option<"moduleName", "module", "std::string", "\"\"",
+           "The module to split">,
+    Option<"mapPath", "map", "std::string", "\"\"",
+           "The map: one part (or -1) per op of the module's body, in order">,
+    Option<"parts", "parts", "unsigned", "2", "The parts">,
+    Option<"prefix", "prefix", "std::string", "\"fs_split_\"",
+           "The parts' instance names' prefix (the floorplan finds them)">,
+    Option<"copyLogic", "copy-logic", "bool", "true",
+           "Copy another part's logic a part reads into it (else an error)">,
+  ];
+  let statistics = [
+    Statistic<"numCutValues", "cut-values", "Values crossing between parts">,
+    Statistic<"numCutBits", "cut-bits", "Bits crossing between parts">,
+    Statistic<"numCopiedLogic", "copied-logic", "Logic ops copied into a reading part">,
+  ];
+  let dependentDialects = ["circt::hw::HWDialect", "circt::seq::SeqDialect"];
+}
+
 def RemoveDeadState : Pass<"foldsim-remove-dead-state", "::circt::hw::HWModuleOp"> {
   let summary = "Remove registers and memories that no output observes";
   let description = [{
