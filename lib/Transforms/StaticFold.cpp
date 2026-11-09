@@ -18,6 +18,7 @@
 #include "CsfReadySplit.h"
 #include "SlotSequencer.h"
 #include "AffineSlots.h"
+#include "PosCounters.h"
 #include "FAME5.h"
 #include "PassSplit.h"
 #include "Pipelines.h"
@@ -15940,8 +15941,13 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     return env ? atoi(env) : 7;
   }();
   if (gSlotSegments && int(indexWidth) >= minIndexBits) {
-    if (Value decoded =
-            foldsim::decodeSlotTable(b, index, rows, width, gSlotSegments))
+    auto *pc = foldsim::currentPosCounters();
+    bool counted = pc && pc->knows(index);
+    if (Value decoded = foldsim::decodeSlotTable(
+            b, index, rows, width, gSlotSegments,
+            counted ? llvm::function_ref<std::pair<Value, Value>(unsigned)>(
+                          [&](unsigned d) { return pc->divmod(b, index, d); })
+                    : nullptr))
       return decoded;
     // A position table through a class's pass sequence: the sequence's
     // passes and instance at p + offset (position tables, the same for every
@@ -16526,13 +16532,29 @@ LogicalResult StaticFolder::buildSim() {
   }
   // A position's next: the next slot, or at the frame's end the next frame's
   // first if it starts, else `ii`; with bubbles, itself when not advancing.
+  // slot-segments: the position's quotient and remainder of a period, as
+  // counters beside its registers (PosCounters), for runs of any period.
+  foldsim::PosCounters posCounters;
+  // (`go` and `advance` may be backedges set later: the counters read them
+  // through ops made now, whose operands are replaced when they are set.)
+  if (gSlotSegments) {
+    auto stable = [&](Value v) -> Value {
+      return v ? Value(comb::OrOp::create(b, v, constant(1, 0))) : v;
+    };
+    posCounters.begin(ii, posWidth, hostClock, hostReset, stable(go),
+                      stable(advance));
+  }
+  foldsim::currentPosCounters() = gSlotSegments ? &posCounters : nullptr;
+  llvm::scope_exit dropCounters([&] { foldsim::currentPosCounters() = nullptr; });
   auto nextPosition = [&](Value pos) -> Value {
     Value end = comb::OrOp::create(b, eq(pos, ii - 1), eq(pos, ii));
     Value next = comb::MuxOp::create(
         b, end,
         comb::MuxOp::create(b, go, constant(posWidth, 0), constant(posWidth, ii)),
         comb::AddOp::create(b, pos, constant(posWidth, 1)));
-    return advance ? comb::MuxOp::create(b, advance, next, pos) : next;
+    Value r = advance ? comb::MuxOp::create(b, advance, next, pos) : next;
+    posCounters.addNext(r, pos);
+    return r;
   };
   // The position the slot tables read: `ii` in a bubble. With a short lead
   // the tables read a position as it is decided, so a bubble is this host
@@ -16541,8 +16563,11 @@ LogicalResult StaticFolder::buildSim() {
     return shortLead ? notOf(advance) : resetReg(notOf(advance), regName, 0);
   };
   auto shown = [&](Value pos, Value bubble) -> Value {
-    return advance ? comb::MuxOp::create(b, bubble, constant(posWidth, ii), pos)
-                   : pos;
+    if (!advance)
+      return pos;
+    Value r = comb::MuxOp::create(b, bubble, constant(posWidth, ii), pos);
+    posCounters.addShown(r, pos, bubble);
+    return r;
   };
   // With a short lead the frame is decided a host cycle later, on the
   // position two host cycles ahead: the one three ahead is its next, which
@@ -16555,6 +16580,7 @@ LogicalResult StaticFolder::buildSim() {
     starting = comb::AndOp::create(b, starting, advance);
   Value posDN = nextPosition(posD);
   posDNext.setValue(posDN);
+  posCounters.addReg(posD, posDN);
   auto parDNext = backedges.get(i1);
   Value parD = resetReg(parDNext, shortLead ? "parity2" : "parity3", 1);
   Value parDN = comb::MuxOp::create(b, starting, notOf(parD), parD);
@@ -16566,9 +16592,13 @@ LogicalResult StaticFolder::buildSim() {
   // With bubbles and a short lead, the decision's register is not the
   // position shown a host cycle before: in a bubble it holds.
   Value pos2 = shortLead && !advance ? posD : resetReg(pos3, "pos2", ii);
+  if (pos2 != posD)
+    posCounters.addReg(pos2, pos3);
   Value par2 = shortLead ? parD : reg(parD, "parity2");
   Value pos1 = resetReg(pos2, "pos1", ii), par1 = reg(par2, "parity1");
   Value pos0 = resetReg(pos1, "pos0", ii);
+  posCounters.addReg(pos1, pos2);
+  posCounters.addReg(pos0, pos1);
 
   // Each class's slot table, its instance and passes three host cycles ahead
   // (the table's), two, one, then now.
@@ -16634,6 +16664,7 @@ LogicalResult StaticFolder::buildSim() {
           b, load, hostClock, b.getStringAttr(cls.name + "_seq"), hostReset,
           hw::ConstantOp::create(b, type, ii), hw::InnerSymAttr{},
           /*isAsync=*/false, b.getIntegerAttr(type, ii)));
+      posCounters.addReg(sequencer[c], load);
     }
   }
   // Overlapped frames: a slot past the frame runs in the next frame's, for
@@ -19538,6 +19569,7 @@ LogicalResult StaticFolder::buildSim() {
     Value next = comb::MuxOp::create(
         b, end, constant(posWidth, 0),
         comb::AddOp::create(b, posD, constant(posWidth, 1)));
+    posCounters.addNextFree(next, posD);
     // A table at `next`, read from a register loaded a host cycle before
     // (the lookahead): the readiness a decision waits on no longer chains the
     // position's increment and the table's decoder before the pending bit's
