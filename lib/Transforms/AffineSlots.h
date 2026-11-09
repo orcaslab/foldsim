@@ -34,8 +34,9 @@ struct AffineGroup {
   unsigned resource = 0, count = 0, minStride = 1;
 };
 
-/// The groups' strides: per resource, the power of two at least its groups'
-/// count and their least strides (so a resource's groups interleave).
+/// The groups' strides: each the power of two at least its resource's group
+/// count and its own least stride (a resource's groups interleave; a paged
+/// state pass's page does not hold its ready passes apart).
 llvm::SmallVector<unsigned> affineStrides(llvm::ArrayRef<AffineGroup> groups);
 
 /// Places every group at o_g (node at o_g + index * stride_g), each node at

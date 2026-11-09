@@ -44,3 +44,30 @@
 # RUN: FileCheck %s --check-prefix=LOG < %t/aff.log
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DCOPIES2 -DIW=1 -Mdir %t/aff/obj %S/Inputs/tb_vmem.sv top.sv %t/aff/foldsim_sim.sv > %t/aff/build.log 2>&1
 # RUN: %t/aff/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=40 +bubble=60 +burst=8 +stall=20 +full=20 | FileCheck %s
+# Negative: a table needing more segments than K (here K = 1) stays a
+# constant, counted, and the simulator stays exact.
+# RUN: cd %S/../Driver/Inputs/vmem
+# RUN: foldsim --srcs top.f --top Top --out %t/neg --static --modulo --min-ii 160 --virtual-memories ram --copies Leaf:2 --slot-segments 1 Leaf > %t/neg.log 2>&1
+# RUN: FileCheck %s --check-prefix=NEG < %t/neg.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DCOPIES2 -DIW=1 -Mdir %t/neg/obj %S/Inputs/tb_vmem.sv top.sv %t/neg/foldsim_sim.sv > %t/neg/build.log 2>&1
+# RUN: %t/neg/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +lo=1 +hi=40 +stall=20 | FileCheck %s
+# NEG: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), {{[1-9][0-9]*}} tables kept
+# --affine-auto (bits 0, K 1): a class whose slot rows do not decode within
+# K is placed affine and the frame scheduled again (lanes_late: Leaf, with
+# bubbles and ready lanes); exact. Where no frame places it affine (tree-arb:
+# the slice tree's levels in one class), it is scheduled as before; exact.
+# RUN: cd %S/../Driver/Inputs/lanes_late
+# RUN: foldsim --srcs top.f --top Top --out %t/auto --static --nest --modulo --min-ii 100 --bubbles --csf-ready-copies Leaf:2 --csf-ready-cones --slot-segments 1 --affine-auto --affine-auto-bits 0 Leaf > %t/auto.log 2>&1
+# RUN: FileCheck %s --check-prefix=AUTO < %t/auto.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/auto/obj %S/Inputs/tb_late.sv top.sv %t/auto/foldsim_sim.sv > %t/auto/build.log 2>&1
+# RUN: %t/auto/obj/Vtb +verilator+rand+reset+0 +verilator+seed+12 +stall=20 +bubble=40 | FileCheck %s --check-prefix=LATE
+# RUN: cd %S/../Driver/Inputs/tree-arb
+# RUN: foldsim --srcs top.f --top Top --out %t/back --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --min-ii 100 --compact-links --staged-links --share-links --zero-latency-links --zero-latency-chains --class-at 'sl@*.slice' --class-at 'root@inner:arb' --slot-segments 2 --affine-auto --affine-auto-bits 0 > %t/back.log 2>&1
+# RUN: FileCheck %s --check-prefix=BACK < %t/back.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/back/obj %S/Inputs/tb_reset.sv top.sv %t/back/foldsim_sim.sv > %t/back/build.log 2>&1
+# RUN: %t/back/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=60 | FileCheck %s --check-prefix=LATE
+# AUTO: foldsim-fold-static: affine-auto: round 1: II {{[0-9]+}}, 1 more classes affine (Leaf)
+# AUTO-NOT: no frame places
+# BACK: foldsim-fold-static: affine-auto: no frame places sl affine; scheduled as before
+# LATE-NOT: MISMATCH
+# LATE: {{^}}MATCH

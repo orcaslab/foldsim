@@ -22,22 +22,33 @@
 
 namespace foldsim {
 
-/// A run of a table's rows: rows[start + j * stride] = value + step * f(j)
-/// (modulo 2^width) for j < count, f(j) the `bits` bits of j from bit
-/// `shift` (j itself by default: an affine run; else a digit of j, as an
-/// instance's place among its parent's children, or its parent).
+/// A run of a table's rows, in blocks: rows[start + k * stride + j] =
+/// value + step * f(k) + inner * j (modulo 2^width) for k < count, j < len;
+/// f(k) the `bits` bits of k from bit `shift` (k itself by default: an affine
+/// run; else a digit of k, as an instance's place among its parent's
+/// children, or its parent). `len` 1 is a plain run; a block of len > 1 is a
+/// copy's consecutive passes (a PP evaluation's rows), or the instances of
+/// one parent less the ones placed elsewhere (`rank with holes`: 3k + j).
+/// The stride is a power of two (or 0 for a single row); `step` any constant
+/// of at most three signed powers of two; `inner` 0 or a signed power of two.
 struct SlotSegment {
-  uint64_t start = 0, stride = 0, count = 0;
+  uint64_t start = 0, stride = 0, count = 0, len = 1;
   uint64_t value = 0;
-  int64_t step = 0;
+  int64_t step = 0, inner = 0;
   unsigned shift = 0, bits = 64;
-  uint64_t at(uint64_t j) const {
-    uint64_t f = j >> shift;
+  uint64_t at(uint64_t k, uint64_t j = 0) const {
+    uint64_t f = k >> shift;
     if (bits < 64)
       f &= (uint64_t(1) << bits) - 1;
-    return value + uint64_t(step) * f;
+    return value + uint64_t(step) * f + uint64_t(inner) * j;
   }
+  uint64_t end() const { return start + (count - 1) * stride + len - 1; }
 };
+
+/// `x` (`width` bits) as at most `maxTerms` signed powers of two (canonical
+/// signed digits), as (negative, shift) pairs; false if it takes more.
+bool csdTerms(uint64_t x, unsigned width, unsigned maxTerms,
+              llvm::SmallVectorImpl<std::pair<bool, unsigned>> &terms);
 
 /// The table's nonzero rows (indices past `rows` are zero) as segments a
 /// decoder takes: strides and steps zero or powers of two (a step may be

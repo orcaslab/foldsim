@@ -37,18 +37,17 @@ using namespace llvm;
 namespace foldsim {
 
 SmallVector<unsigned> affineStrides(ArrayRef<AffineGroup> groups) {
-  DenseMap<unsigned, unsigned> need;
-  for (auto &g : groups) {
-    auto &n = need[g.resource];
-    n = std::max(n, g.minStride);
-  }
+  // Each group its own stride: the resource's group count (so its kinds of
+  // passes interleave) or its own spacing, whichever is more. A paged
+  // copy's state passes keep their page apart; its ready passes, which take
+  // no page port, are not held to it (one sweep of the frame, not two).
   DenseMap<unsigned, unsigned> count;
   for (auto &g : groups)
     ++count[g.resource];
   SmallVector<unsigned> strides;
   for (auto &g : groups)
     strides.push_back(unsigned(
-        PowerOf2Ceil(std::max({1u, need[g.resource], count[g.resource]}))));
+        PowerOf2Ceil(std::max({1u, g.minStride, count[g.resource]}))));
   return strides;
 }
 
@@ -74,6 +73,8 @@ bool placeAffine(unsigned period, ArrayRef<AffineNode> nodes,
     lower[node.group] = std::max(
         lower[node.group], long(node.earliest) - long(node.index) * strides[node.group]);
   std::map<std::pair<unsigned, unsigned>, long> bound;
+  // The ranks of the dependence that sets each pair's bound (the log's).
+  std::map<std::pair<unsigned, unsigned>, std::pair<unsigned, unsigned>> why_;
   for (auto [n, node] : llvm::enumerate(nodes))
     for (auto [p, latency] : preds[n]) {
       auto &pred = nodes[p];
@@ -91,10 +92,10 @@ bool placeAffine(unsigned period, ArrayRef<AffineNode> nodes,
       }
       auto key = std::make_pair(pred.group, node.group);
       auto it = bound.find(key);
-      if (it == bound.end())
-        bound.emplace(key, need);
-      else
-        it->second = std::max(it->second, need);
+      if (it == bound.end() || need > it->second) {
+        bound[key] = need;
+        why_[key] = {pred.index, node.index};
+      }
     }
   SmallVector<std::tuple<unsigned, unsigned, long>> edges;
   for (auto &[key, w] : bound)
@@ -181,7 +182,11 @@ bool placeAffine(unsigned period, ArrayRef<AffineNode> nodes,
                      << " x" << members[g].size() << " stride " << strides[g]
                      << " at " << at[g] << " (bound "
                      << (from < 0 ? std::string("none")
-                                  : std::to_string(best) + " from " + groupName(from))
+                                  : std::to_string(best) + " from " + groupName(from) +
+                                        " (ranks " +
+                                        std::to_string(why_[{unsigned(from), g}].first) +
+                                        " -> " +
+                                        std::to_string(why_[{unsigned(from), g}].second) + ")")
                      << ")\n";
       }
     }

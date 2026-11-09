@@ -368,6 +368,10 @@ def frame_options(a):
         fold += f' min-ii={a.min_ii}'
     if getattr(a, 'affine_slots', False):
         fold += ' affine-slots'
+    if getattr(a, 'affine_auto', False):
+        fold += ' affine-auto'
+    if getattr(a, 'affine_auto_bits', None) is not None:
+        fold += f' affine-auto-bits={a.affine_auto_bits}'
     if getattr(a, 'slot_segments', 0):
         fold += f' slot-segments={a.slot_segments}'
     if getattr(a, 'modulo_linear', None) is not None:
@@ -1336,6 +1340,12 @@ def build_parser():
     ap.add_argument('--min-ii', type=int, default=0, metavar='N',
                     help='with --static --modulo: the shortest frame in host cycles (foldsim-fold-static '
                          'min-ii); positions past the schedule\'s own stay idle, a longer prefetch distance')
+    ap.add_argument('--affine-auto-bits', type=int, default=None, metavar='BITS',
+                    help='with --affine-auto: only classes whose undecoded slot rows hold at least BITS bits '
+                         '(foldsim-fold-static affine-auto-bits, default 262144)')
+    ap.add_argument('--affine-auto', action='store_true',
+                    help='with --static --modulo --slot-segments: only the classes whose slot rows do not decode '
+                         'placed affine, the frame scheduled again (foldsim-fold-static affine-auto)')
     ap.add_argument('--affine-slots', action='store_true',
                     help='with --static --modulo: each copy\'s passes of a kind placed as one affine run over its '
                          'instances (foldsim-fold-static affine-slots): slot tables of a segment a pass')
