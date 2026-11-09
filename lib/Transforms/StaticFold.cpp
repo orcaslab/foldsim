@@ -434,6 +434,33 @@ public:
   llvm::StringMap<std::string> csfConeOf;
   LogicalResult splitCsfReadyCones();
   unsigned csfMailboxLatency = 1;
+  /// `csf-single-bank`: an early link whose every read of a frame precedes
+  /// its producer's write of the entry in that frame keeps one bank.
+  bool csfSingleBank = false;
+  /// Whether every reader of producer `p`'s entry `rows[i]` (reader class `c`,
+  /// its instances `takes`) reads it at least `margin` host cycles before the
+  /// producer's state pass writes it, in the frame's positions.
+  bool readsBeforeWrite(unsigned p, unsigned c, ArrayRef<uint64_t> rows,
+                        ArrayRef<bool> takes, int margin) const {
+    auto &producer = producers[p];
+    if (producer.cls < 0 || producer.late)
+      return false;
+    auto &pcls = classes[producer.cls];
+    auto &cls = classes[c];
+    for (unsigned i = 0; i < cls.threads(); ++i) {
+      if (!takes[i])
+        continue;
+      int written = pcls.slot[kState][rows[i]] + int(splitDelayP(int(p))) +
+                    crossDelay(producer.cls, int(c));
+      int lastRead = cls.readSlot(kState, 0, i);
+      if (cls.hasReady)
+        for (unsigned l = 0; l < 1 + cls.laterReady.size(); ++l)
+          lastRead = std::max(lastRead, cls.readSlot(kReady, l, i));
+      if (lastRead + margin > written)
+        return false;
+    }
+    return true;
+  }
   SmallVector<unsigned> readyLanes, laneBase;
   unsigned numResources = 0;
   /// Per class: the slots a pass holds its mailbox read port (1: none).
@@ -14803,7 +14830,8 @@ LogicalResult StaticFolder::buildSim() {
                       bool late = false, bool forwardLate = false,
                       ArrayRef<uint64_t> compact = {},
                       StringRef syncStyle = {}, unsigned page = 0,
-                      const LinkGather *gather = nullptr) -> Value {
+                      const LinkGather *gather = nullptr,
+                      bool single = false) -> Value {
     assert((!page || (gather && !late && !now && !forward && !after)) &&
            "a paged link is never forwarded, taken now or written late");
     auto &producer = producers[p];
@@ -14812,6 +14840,9 @@ LogicalResult StaticFolder::buildSim() {
     unsigned threads =
         compact.empty() ? classes[c].threads() : unsigned(compact.size());
     bool banked = !producer.late;
+    // csf-single-bank: an early link read before its next write, one bank.
+    if (single)
+      banked = false;
     bool crossing = to >= 0 && !slrOf.empty() && slrOf[c] != to;
     assert(!(crossing && now) && "a link between SLR groups is never zero");
     // slr-serialize: the host cycles the crossing takes; every register of
@@ -15219,7 +15250,8 @@ LogicalResult StaticFolder::buildSim() {
   unsigned linkReads = 0, forwardedReads = 0, forwardedAfter = 0, nowReads = 0,
            lateReads = 0, forwardedLate = 0, compactReads = 0, stagedReads = 0,
            syncReads = 0, earlyReads = 0, pagedReads = 0, streamReads = 0,
-           stagedDirectReads = 0;
+           stagedDirectReads = 0, singleReads = 0, doubleReads = 0;
+  uint64_t singleBits = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
   SmallVector<unsigned> classReaders(producers.size(), 0);
@@ -15971,18 +16003,29 @@ LogicalResult StaticFolder::buildSim() {
               nullptr, false, nullptr, false, false, kept, style, page, &g);
           continue;
         }
+        // csf-single-bank: a memory link (several entries), never taken now
+        // or forwarded, all of whose reads come at least 3 host cycles (4
+        // from a shared write register) before its producer's write.
+        bool single = false;
+        if (csfSingleBank && !producer.late && pThreads > 1) {
+          single = !now && !forward && !crossing &&
+                   readsBeforeWrite(key.first, c, rows, takes, late ? 4 : 3);
+          (single ? singleReads : doubleReads) += 1;
+          if (single)
+            singleBits += uint64_t(width) * pThreads;
+        }
         sourceData[index] =
             early ? linkRead(key.first, key.second, width, address2, bank2,
                              producer.name + "_to_" + consumer.name + "_" +
                                  Twine(at),
                              to, nullptr, false, nullptr, late, false, kept,
-                             style)
+                             style, 0, nullptr, single)
                   : linkRead(key.first, key.second, width, address, bank,
                              producer.name + "_to_" + consumer.name + "_" +
                                  Twine(at),
                              to, now ? &sourceNow[index] : nullptr, forward,
                              after ? &sourceAfter[index] : nullptr, late,
-                             forwardLate, kept, style);
+                             forwardLate, kept, style, 0, nullptr, single);
       }
       if (syncPart) {
         // Registered already: wired around the read register.
@@ -16147,6 +16190,9 @@ LogicalResult StaticFolder::buildSim() {
        << " (forwarded " << forwardedLate << ")";
     if (compactLinks)
       os << "; compact " << compactReads;
+    if (csfSingleBank)
+      os << "; csf single-bank " << singleReads << " (" << singleBits
+         << " bits in one bank), two banks " << doubleReads;
     if (stagedLinks)
       os << "; staged " << stagedReads;
     if (stagedLinkDirect)
@@ -17235,6 +17281,7 @@ void FoldStaticPass::runOnOperation() {
   folder.csfMailboxes = csfMailboxes;
   folder.csfReadyCones = csfReadyCones;
   folder.csfMailboxLatency = csfMailboxLatency;
+  folder.csfSingleBank = csfSingleBank;
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.stateInRamPP = stateInRamPP;
   folder.ppAddressFanout = std::max(1u, unsigned(stateInRamPPFanout));
