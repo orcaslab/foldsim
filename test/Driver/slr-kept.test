@@ -1,14 +1,15 @@
 # slr-kept: with --slr-groups, the SLR group assignments with the fewest link
 # bits between groups are kept (default 8) and each scheduled in turn, a line
-# each; the shortest frame is chosen, and the first whose frame is the modulo
-# search's lower bound is chosen at once (none can beat it). The synthetic
+# each; the shortest frame is chosen, and with modulo the first whose frame is
+# the ungrouped schedule's modulo lower bound is chosen at once (none can beat
+# it; the ungrouped frame found is no bound: a grouped one may be shorter). The synthetic
 # design of link-kind-cost.test, in the V80 region's three SLR groups.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/linkkind
-# With modulo, the first assignment reaches the lower bound: no other is
-# scheduled.
+# With modulo, the first assignment reaches the ungrouped lower bound: no other
+# is scheduled.
 # RUN: foldsim --srcs top.f --top Top --out %t/m --static --modulo --slr-groups --slr-region v80 node lvl1 2> %t/m.log > /dev/null
 # RUN: FileCheck %s --check-prefix=STOP < %t/m.log
-# Without modulo, no bound: every kept assignment is scheduled (3 here).
+# Without modulo there is no such bound: every kept assignment is scheduled.
 # RUN: foldsim --srcs top.f --top Top --out %t/k --static --slr-groups --slr-region v80 --slr-kept 3 node lvl1 2> %t/k.log > /dev/null
 # RUN: FileCheck %s --check-prefix=ALL < %t/k.log
 # No assignment: the message says which constraint pruned the candidates, a
@@ -18,10 +19,22 @@
 # RUN: not foldsim-opt %t/m/models.mlir --mlir-print-op-on-diagnostic=false '--pass-pipeline=builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim modulo slr-groups=3 slr-capacities=1000,1000,1000 slr-sites=node:50000,lvl1_model:50000,Top_model:1000})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CAP
 # SLL: error: slr-groups: no assignment of the classes to 3 groups of at most 100000,100000,100000 sites (the largest class copy: 50000 sites) with at most 10 link bits over each SLR boundary: 0 placements past a group's sites, 1 past a boundary's link bits (the least overflow 1294 link bits, boundary 0-1)
 # CAP: error: slr-groups: no assignment of the classes to 3 groups of at most 1000,1000,1000 sites (the largest class copy: 50000 sites): 3 placements past a group's sites
-# STOP: slr-groups: assignment 1 of 8: 0 link bits between groups, II 16 = the lower bound: chosen
+# The kept assignments are ranked by the frame's bound from serialized
+# crossings (k x the producer's instances, at least the ungrouped lower bound), then
+# by link wires: two groups that cannot hold all three classes, node (16
+# instances) serialized by 64. Its crossings are the fewest wires (336) but bound
+# the frame at 1024 (II 1029); ranked by wires alone that assignment came first
+# (and its own modulo bound, which counts the crossings, stopped the search).
+# RUN: foldsim-opt %t/m/models.mlir --mlir-print-op-on-diagnostic=false '--pass-pipeline=builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim modulo schedule-only slr-groups=2 slr-capacities=60000,60000 slr-sites=node:50000,lvl1_model:10000,Top_model:10000 slr-serialize=node:64 slr-kept=2})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=RANK
+# slr-serialize auto: each class the largest k (at most 8) whose passes, k
+# apart, fit the ungrouped lower bound (16): node, 16 instances, stays at 1.
+# RUN: foldsim-opt %t/m/models.mlir --mlir-print-op-on-diagnostic=false '--pass-pipeline=builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim modulo schedule-only slr-groups=2 slr-capacities=60000,60000 slr-sites=node:50000,lvl1_model:10000,Top_model:10000 slr-serialize=auto})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=AUTO
+# RANK: slr-groups: assignment 1 of 2: 374 link wires between groups, serialized bound 0, II 16 = the ungrouped lower bound: chosen
+# RANK: foldsim-fold-static: II = 16
+# AUTO: slr-serialize auto: ungrouped lower bound 16 (II 16); Top_model 8 lvl1_model 8 node 1
+# STOP: slr-groups: assignment 1 of 8: 0 link bits between groups, serialized bound 0, II 16 = the ungrouped lower bound: chosen
 # STOP-NOT: slr-groups: assignment 2 of
 # STOP: foldsim-fold-static: II = 16
-# ALL: slr-groups: assignment 1 of 3: {{[0-9]+}} link bits between groups, II 17
-# ALL-NEXT: {{.*}}slr-groups: assignment 2 of 3:
-# ALL-NEXT: {{.*}}slr-groups: assignment 3 of 3:
+# ALL: slr-groups: assignment 1 of 3: {{[0-9]+}} link bits between groups, serialized bound 0, II 17{{$}}
+# ALL: slr-groups: assignment 3 of 3: {{[0-9]+}} link bits between groups, serialized bound 0, II 17{{$}}
 # ALL: foldsim-fold-static: II = 17
