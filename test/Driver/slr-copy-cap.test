@@ -73,9 +73,14 @@
 
 # The driver runs the check on the netlist it generated (<out>/sll/sll.txt;
 # the region of --slr-region when no --region): a copy that fits no SLR whole
-# fails the SLR rule (slr-rule.test), --sll-check or not.
-# RUN: not foldsim --srcs top.f --top Top --out %t/d --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --storage 'Leaf:mem=ultra' --slr-region %S/Inputs/slr-copy-cap/region-place.json --sll-check Leaf 2>&1 | FileCheck %s --check-prefix=DRV
-# DRV: foldsim: SLL check: d: REFUSE: Leaf fits no SLR whole
-# DRV: foldsim: error: SLR rule: no class copy may cross an SLR boundary
+# is cut under --slr-policy guide (the default: a GUIDE warning, its SLLs
+# projected, within the budget here) and fails the 11-08 rule under strict
+# (slr-rule.test), --sll-check or not.
+# RUN: foldsim --srcs top.f --top Top --out %t/d --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --storage 'Leaf:mem=ultra' --slr-region %S/Inputs/slr-copy-cap/region-place.json --sll-check Leaf 2>&1 | FileCheck %s --check-prefix=DRV
+# DRV: foldsim: SLL check: d: WARN: {{[0-9,]+}} SLLs projected over SLR1-SLR0 (budget 30); Leaf cut over SLRs
+# DRV: GUIDE: Leaf straddles
 # RUN: FileCheck %s --check-prefix=DRVR < %t/d/sll/sll.txt
-# DRVR: d: REFUSE: Leaf fits no SLR whole
+# DRVR: (past every SLR: Leaf left out, spread over the room the others leave)
+# RUN: not foldsim --srcs top.f --top Top --out %t/ds --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --storage 'Leaf:mem=ultra' --slr-region %S/Inputs/slr-copy-cap/region-place.json --sll-check --slr-policy strict Leaf 2>&1 | FileCheck %s --check-prefix=DRVS
+# DRVS: foldsim: SLL check: ds: REFUSE: Leaf fits no SLR whole
+# DRVS: foldsim: error: SLR rule: no class copy may cross an SLR boundary

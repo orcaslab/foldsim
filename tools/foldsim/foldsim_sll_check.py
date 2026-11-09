@@ -39,7 +39,11 @@ netlist's (an older or newer compiler checks another netlist: REFUSE). Then, in 
 Exits 0 (OK, or WARN), 1 if a check refuses, 2 on error. Report in <out>/sll.txt (the estimate) and on stdout;
 `--json` writes the copies' resources, the wires between them, the assignment, each copy's shares of the SLRs, the
 copies that fit no SLR whole (`over`), the cut ones (`cuts`) and each SLR's capacity (`caps`, logic times `margin`).
-A WARN with a copy cut is still a straddle: the driver's SLR rule (foldsim --region) and fit_gate.sh fail on it.
+--slr-policy guide (the default since 11-08 evening): a copy past every SLR (with the default --copy-cap any) is not
+a refusal but a cut copy (step 3), its SLLs projected: a straddle is a WARN or OK with the copy in `cuts`, a guide
+(the driver and fit_gate.sh print it with the suggested assignment), never a refusal; the region's fill, the
+memories and the SLLs past a boundary still refuse. --slr-policy strict: the 11-08 hard rule (a copy past every SLR
+refuses; the driver's --slr-policy strict and fit_gate.sh FIT_SLR_POLICY=strict fail on any cut).
 """
 import argparse, json, math, os, re, shlex, subprocess, sys
 from itertools import takewhile
@@ -377,6 +381,12 @@ def main():
                                            'needs --models')
     ap.add_argument('--json', help='write the copies\' resources, wires and assignment here (calibration)')
     ap.add_argument('--register-state-entries', type=int, default=None)
+    ap.add_argument('--slr-policy', choices=('guide', 'strict'), default='guide',
+                    help='guide (default, 11-08): a copy past every SLR (with --copy-cap any) is cut by the placer like '
+                         'a copy left out of the assignment, its SLLs projected: a straddle is a warning with the '
+                         'suggested assignment, never a refusal; the design past the placement fill, the memories '
+                         'past the region\'s and the SLLs past a boundary still refuse. strict: a copy past every SLR '
+                         'refuses (the 11-08 hard SLR rule)')
     a = ap.parse_args()
     gen = os.path.abspath(a.gen.rstrip('/'))
     gdir = os.path.join(gen, 'gen') if os.path.isdir(os.path.join(gen, 'gen')) else gen
@@ -554,6 +564,10 @@ def main():
     # and spread over the room the others leave.
     cuts = []
     by_logic = sorted(res, key=lambda c: -max(res[c][r] / room0[0][r] for r in LOGIC if room0[0][r] > 0))
+    # Guide (--slr-policy guide, any SLR): a copy past every SLR is cut by the placer, as a copy left out of the
+    # assignment is (its own cut by Rent's rule, its links over the boundary): left out from the start.
+    guide = a.slr_policy == 'guide' and a.copy_cap == 'any'
+    forced = [c for c, _, _ in over] if guide and mode == 'netlist' else []
     # The other copies within the SLRs' balanced share (the placer balances the SLRs' fill: each SLR at most the
     # region's fill of the whole design plus model['balance_slack']), the cut copies filling the room left.
     tot_full = {r: sum(c[r] for c in full) for r in RESOURCES}
@@ -561,8 +575,14 @@ def main():
          for r in RESOURCES}
     balanced = [{r: min(room0[g][r], (u[r] + model.get('balance_slack', 0.05)) * full[g][r] - top_spread[g][r])
                  for r in RESOURCES} for g in range(len(full))]
-    while groups is None and mode == 'netlist' and not over and len(cuts) < model.get('cut_copies', 2):
-        cuts.append(by_logic[len(cuts)])
+    if forced:
+        cuts = list(forced)
+        _, sec2, _, groups = estimate(dict(res, **{c: new_acc() for c in cuts}), balanced, memories=False)
+        sec += ['    (past every SLR: ' + ', '.join(cuts) + ' left out, spread over the room the others leave)'] \
+            + sec2[1:]
+    while groups is None and mode == 'netlist' and (not over or guide) and \
+            len(cuts) < len(forced) + model.get('cut_copies', 2):
+        cuts.append(next(c for c in by_logic if c not in cuts))
         _, sec2, _, groups = estimate(dict(res, **{c: new_acc() for c in cuts}), balanced, memories=False)
         sec += ['    (no whole assignment: ' + ', '.join(cuts) + ' left out, spread over the room the others leave)'] \
             + sec2[1:]
@@ -623,7 +643,7 @@ def main():
     if mode != 'netlist':
         finish(lines, 'ESTIMATE (schedule resources, not a verdict): '
                       + ('an assignment within the SLRs' if groups is not None else 'no assignment'))
-    if over:
+    if over and not guide:
         verdict = 'REFUSE: ' + '; '.join(f'{c} fits no SLR whole (the nearest, {s}: over its {"/".join(r)})'
                                          for c, s, r in over) + \
             ' (a copy past its SLR is cut by the placer, its SLLs unknown: r16c failed so)'
