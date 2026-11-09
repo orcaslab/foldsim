@@ -1,0 +1,20 @@
+# The SLL check of a generation folded into SLR groups (--slr-groups, copies pinned with --slr-assign, the links
+# between groups serialized with --slr-serialize) is made on the netlist as built: the generation's own fold options
+# refold it (the groups change the schedule: a link between groups is registered and taken k + 1 host cycles later,
+# so a refold without them reproduces another II and the check refused "the check's refold has II ..."), its groups
+# are the assignment (no search, no copy cut), and each boundary's links are the generation's serialized link wires
+# (one SLL a wire). A group past its SLR's room is refused. Three leaves, the first pinned apart from the other two,
+# the link between them serialized over 4 host cycles (region-split.json: two SLRs of 300 LUTs).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/three
+# RUN: foldsim --srcs top.f --top Top --out %t/g --static --copies Leaf:3 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1 --slr-serialize 4 Leaf 2> %t/g.log
+# RUN: FileCheck %s --check-prefix=GEN < %t/g.log
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --slr-region %S/Inputs/slr-copy-cap/region-split.json --foldsim-opt foldsim-opt --copy-cap none --out %t/c | FileCheck %s
+# GEN: slr links serialized: 2 wires for 8 bits
+# GEN: Leaf -> Leaf_copy1: 1 links, 8 bits, 4 host cycles on 2 wires
+# CHECK: as built (slr-groups: the generation's groups and serialized link wires)
+# CHECK: slr0 ({{[0-9]+}} sites): Leaf
+# CHECK-NEXT: slr1 ({{[0-9]+}} sites): Top_model Leaf_copy1 Leaf_copy2
+# CHECK-NOT: refold has II
+# CHECK-NOT: cut over the SLRs
+# CHECK: boundary SLR1-SLR0: {{[0-9,]+}} SLLs projected (links 2, cut copies 0, simulator level and kernel {{[0-9,]+}})
+# CHECK: g: OK

@@ -653,6 +653,11 @@ def main():
             else:
                 run([a.foldsim_opt, flat, '--mlir-print-op-on-diagnostic=false',
                      f'--pass-pipeline=builtin.module({",".join(passes[:fi])})', '-o', models])
+    # A generation folded into SLR groups (slr-groups: its copies pinned to SLRs, links between groups registered or
+    # serialized) is checked as built: its own options refold it (the groups change the schedule: a refold without
+    # them is another netlist), its groups are the assignment, its boundaries' link wires (serialized) the links.
+    fold_gen = ' '.join(o for o in shlex.split(fold) if not re.match(r'(report|schedule-only|sll-estimate)\b', o))
+    grouped = any(re.match(r'slr-groups=', o) for o in shlex.split(fold_gen))
     # Options this check sets itself, or that would write the generation's outputs.
     fold = ' '.join(o for o in shlex.split(fold) if not re.match(
         r'(report|slr-groups|slr-capacity|slr-capacities|slr-sites|slr-assign|slr-sll-budget|sll-estimate|schedule-only)\b',
@@ -779,7 +784,40 @@ def main():
                 groups.append(mm.group(1).split() if mm else [])
         return text, sec, wires, groups
 
-    text, sec, wires, groups = estimate(res_est, room0)
+    def as_built():
+        if os.path.exists(report):
+            os.remove(report)
+        run([a.foldsim_opt, models, f'--pass-pipeline=builtin.module(foldsim-fold-static{{{fold_gen} schedule-only '
+             f'report={report}}})', '-o', os.devnull])
+        text = open(report).read()
+        start = text.index('  slr groups:')
+        sec = [text[start:].split('\n')[0]] + list(takewhile(lambda l: l.startswith('    ') or l.startswith('  slr '),
+                                                               text[start:].split('\n')[1:]))
+        groups = []
+        for g in range(len(room0)):
+            mm = re.search(rf'^    slr{g} \(\d+ sites\):(.*)$', '\n'.join(sec), re.M)
+            groups.append(mm.group(1).split() if mm else [])
+        # Each boundary's link wires: the links between groups (`A -> B: n links, b bits[, k host cycles on w
+        # wires]`, w a serialized pair's wires, else its bits) over every boundary between their groups.
+        gof = {c: g for g, cs in enumerate(groups) for c in cs}
+        bwires = [0] * (len(room0) - 1)
+        for m in re.finditer(r'^\s+(\S+) -> (\S+): \d+ links, (\d+) bits(?:, \d+ host cycles on (\d+) wires)?', text,
+                             re.M):
+            x, y = gof.get(m.group(1)), gof.get(m.group(2))
+            if x is None or y is None or x == y:
+                continue
+            w = int(m.group(4) or m.group(3))
+            for b in range(min(x, y), max(x, y)):
+                bwires[b] += w
+        return text, sec, groups, bwires
+
+    bwires = None
+    if grouped:
+        text, sec, groups, bwires = as_built()
+        wires = {}
+        sec = ['  as built (slr-groups: the generation\'s groups and serialized link wires)'] + sec
+    else:
+        text, sec, wires, groups = estimate(res_est, room0)
     # The refold must be the generation's schedule: a compiler that does not take the generation's options the same
     # way (an older one without staging: e8, 11-07, refolded to II 2,748 for 2,931) checks another netlist.
     rii = schedule_ii(text)
@@ -794,7 +832,7 @@ def main():
     # Guide (--slr-policy guide, any SLR): a copy past every SLR is cut by the placer, as a copy left out of the
     # assignment is (its own cut by Rent's rule, its links over the boundary): left out from the start.
     guide = a.slr_policy == 'guide' and a.copy_cap == 'any'
-    forced = [c for c, _, _ in over] if guide and mode == 'netlist' else []
+    forced = [c for c, _, _ in over] if guide and mode == 'netlist' and not grouped else []
     # The other copies within the SLRs' balanced share (the placer balances the SLRs' fill: each SLR at most the
     # region's fill of the whole design plus model['balance_slack']), the cut copies filling the room left.
     tot_full = {r: sum(c[r] for c in full) for r in RESOURCES}
@@ -820,6 +858,7 @@ def main():
         f'{s["name"]} {100 * max(res[largest][r] / s[r] if s[r] else 0 for r in RESOURCES):.0f} %' for s in caps)
         + ' of the SLR\'s capacity (its binding resource)')
     shares = slls = failed = None
+    group_over = []
     # Memories go apart (a copy's primitives where there is room): within the region's, at the fill.
     mem_over = [r for r in ('uram', 'bram') if sum(x[r] for x in res.values()) > sum(x[r] for x in room_whole) + 1e-9]
     # The whole design against the region at the placer's fill (the placed builds: 66-74 % of its LUTs).
@@ -844,6 +883,9 @@ def main():
             shares[c] = {r: [sum(sp['frac'][r][k] for k, h in enumerate(sp['slr']) if h == g)
                              for g in range(len(groups))] for r in RESOURCES}
         failed = None
+        # As built (slr-groups): every group within its SLR's room (the fold placed them by its own estimate).
+        group_over = [(names[g], r) for g in range(len(groups)) for r in RESOURCES if room[g][r] < -1e-9] \
+            if grouped else []
         for c in cuts:
             home = next(g for g, cs in enumerate(groups) if c in cs)
             use = [{r: roomr[g][r] - room[g][r] + top_spread[g][r] for r in RESOURCES} for g in range(len(groups))]
@@ -862,7 +904,10 @@ def main():
                     f'{s["name"]} {100 * x:.0f} %' for s, x in zip(full, shares[c]['lut'])) + ' of its logic')
             if model:
                 slls = boundary_slls(shares, res, wires, top_spread, model, vmem_bits(gdir), splits,
-                                     port_links(stext))
+                                     None if grouped else port_links(stext))
+                if grouped:
+                    # The generation's own link wires over each boundary (serialized links a k-th): one SLL a wire.
+                    slls = [(float(bwires[b]) if b < len(bwires) else 0.0, ct, sm) for b, (_, ct, sm) in enumerate(slls)]
                 for b, (lk, ct, sm) in enumerate(slls):
                     lines.append(f'    boundary {names[b]}-{names[b + 1]}: {lk + ct + sm:,.0f} SLLs projected '
                                  f'(links {lk:,.0f}, cut copies {ct:,.0f}{" and split crossings" if splits else ""}, '
@@ -909,6 +954,9 @@ def main():
         verdict = f'REFUSE: the copies\' {"/".join(mem_over)} past the region\'s at the placement fill'
     elif groups is None:
         verdict = 'REFUSE: no assignment of the copies within the SLRs\' fill, even with the largest cut'
+    elif grouped and group_over:
+        verdict = 'REFUSE: the generation\'s SLR groups past their SLRs\' room: ' + ', '.join(
+            f'{n} {r}' for n, r in group_over)
     elif failed is not None:
         verdict = f'REFUSE: {failed} does not fit the room the other copies leave in the SLRs'
     elif slls is None:
