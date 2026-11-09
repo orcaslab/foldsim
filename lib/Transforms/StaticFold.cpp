@@ -889,6 +889,10 @@ private:
   /// takes, its bits sent a k-th at a time (1: unserialized).
   SmallVector<unsigned> serialK;
   bool slrSerialize = false;
+  /// `slr-serialize auto[:kmax]`: kmax (0: not auto); chooseGroups gives each
+  /// class the largest k <= kmax whose passes, k apart, fit the ungrouped
+  /// frame (k x instances <= it).
+  unsigned serialAuto = 0;
   LogicalResult parseSerialize();
   unsigned serialOf(int c) const {
     return c >= 0 && unsigned(c) < serialK.size() ? serialK[c] : 1;
@@ -3644,7 +3648,18 @@ LogicalResult StaticFolder::parseSplitLatency() {
 
 LogicalResult StaticFolder::parseSerialize() {
   serialK.assign(classes.size(), 1);
+  serialAuto = 0;
   for (auto &spec : slrSerializeSpecs) {
+    // `auto` / `auto:<kmax>`: each crossing producer's k chosen by chooseGroups.
+    if (StringRef(spec) == "auto" || StringRef(spec).starts_with("auto:")) {
+      unsigned k = 8;
+      if (StringRef(spec).size() > 4 &&
+          (StringRef(spec).drop_front(5).getAsInteger(10, k) || k < 1 || k > 64))
+        return netlist.emitError("slr-serialize: '")
+               << spec << "' is not auto or auto:<k>, k from 1 to 64";
+      serialAuto = k;
+      continue;
+    }
     auto [pattern, count] = StringRef(spec).rsplit(':');
     if (count.empty())
       std::swap(pattern, count);
@@ -3666,7 +3681,7 @@ LogicalResult StaticFolder::parseSerialize() {
     if (!any)
       return netlist.emitError("slr-serialize: no class matches '") << spec << "'";
   }
-  slrSerialize = llvm::any_of(serialK, [](unsigned k) { return k > 1; });
+  slrSerialize = serialAuto > 1 || llvm::any_of(serialK, [](unsigned k) { return k > 1; });
   return success();
 }
 
@@ -7581,6 +7596,39 @@ LogicalResult StaticFolder::chooseGroups() {
   SmallVector<SmallVector<unsigned>> links;
   linkBits(bits, links);
 
+  // The ungrouped schedule's modulo lower bound: no assignment's frame is
+  // shorter (groups only add the crossings' latencies and spacing; the
+  // ungrouped frame found is not a bound: a grouped schedule may beat it), so a
+  // candidate reaching it is chosen at once; and `slr-serialize auto`'s bound
+  // on each class's k.
+  slrOf.clear();
+  Choice plain = searchReady();
+  unsigned ungrouped = plain.lower ? plain.lower : 0;
+  if (serialAuto) {
+    std::string line;
+    llvm::raw_string_ostream ls(line);
+    ls << "foldsim-fold-static: slr-serialize auto: ungrouped lower bound " << ungrouped
+       << " (II " << plain.length << ");";
+    unsigned shown = 0;
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      unsigned k = serialAuto;
+      while (k > 1 && uint64_t(k) * std::max(1u, cls.threads()) > ungrouped)
+        --k;
+      serialK[c] = k;
+      if (shown++ < 24)
+        ls << " " << cls.name << " " << k;
+    }
+    if (shown > 24)
+      ls << " ...";
+    llvm::errs() << ls.str() << "\n";
+    slrSerialize = llvm::any_of(serialK, [](unsigned k) { return k > 1; });
+  }
+  // A class whose links cross groups keeps its passes of a kind k apart:
+  // the frame at least k x its instances.
+  auto serialBound = [&](unsigned c) -> uint64_t {
+    return serialOf(c) > 1 ? uint64_t(serialOf(c)) * classes[c].threads() : 0;
+  };
+
   // The assignments within the capacity with the fewest bits between groups,
   // by branch and bound over the classes, the largest first; a group is
   // opened in order (the groups are alike) unless some class is pinned or
@@ -7611,18 +7659,30 @@ LogicalResult StaticFolder::chooseGroups() {
   uint64_t prunedCapacity = 0, prunedBudget = 0;
   uint64_t leastOver = std::numeric_limits<uint64_t>::max();
   unsigned leastOverAt = 0;
-  std::function<void(unsigned, unsigned, uint64_t)> visit =
-      [&](unsigned k, unsigned opened, uint64_t cut) {
+  // Ranked by (the frame's bound from serialized crossings, at least the
+  // ungrouped frame; then the bits between groups), both only growing as
+  // classes are placed.
+  auto rank = [&](uint64_t bound, uint64_t cut) {
+    return std::make_pair(std::max<uint64_t>(bound, ungrouped), cut);
+  };
+  SmallVector<uint64_t> keptBound;
+  std::function<void(unsigned, unsigned, uint64_t, uint64_t)> visit =
+      [&](unsigned k, unsigned opened, uint64_t cut, uint64_t bound) {
         if (++visited > 20'000'000 ||
-            (kept.size() >= kKept && cut >= kept.back().first))
+            (kept.size() >= kKept &&
+             rank(bound, cut) >= rank(keptBound.back(), kept.back().first)))
           return;
         if (k == n) {
-          auto at = llvm::upper_bound(kept, cut, [](uint64_t v, auto &e) {
-            return v < e.first;
-          });
-          kept.insert(at, {cut, group});
-          if (kept.size() > kKept)
+          unsigned at = 0;
+          while (at < kept.size() &&
+                 rank(keptBound[at], kept[at].first) <= rank(bound, cut))
+            ++at;
+          kept.insert(kept.begin() + at, {cut, group});
+          keptBound.insert(keptBound.begin() + at, bound);
+          if (kept.size() > kKept) {
             kept.pop_back();
+            keptBound.pop_back();
+          }
           return;
         }
         unsigned c = order[k];
@@ -7639,11 +7699,16 @@ LogicalResult StaticFolder::chooseGroups() {
           auto wires = [&](unsigned x, unsigned y) {
             return serialWires(x, bits[x][y]) + serialWires(y, bits[y][x]);
           };
-          uint64_t more = 0;
+          uint64_t more = 0, bound2 = bound;
           for (unsigned j = 0; j < k; ++j) {
             unsigned d = order[j];
-            if (group[d] != int(g))
+            if (group[d] != int(g)) {
               more += wires(c, d);
+              if (bits[c][d])
+                bound2 = std::max(bound2, serialBound(c));
+              if (bits[d][c])
+                bound2 = std::max(bound2, serialBound(d));
+            }
           }
           SmallVector<uint64_t> added(boundary.size(), 0);
           if (budgeted) {
@@ -7679,14 +7744,14 @@ LogicalResult StaticFolder::chooseGroups() {
           }
           group[c] = g;
           used[g] += slrSites[c];
-          visit(k + 1, std::max(opened, g + 1), cut + more);
+          visit(k + 1, std::max(opened, g + 1), cut + more, bound2);
           used[g] -= slrSites[c];
           group[c] = -1;
           for (unsigned b = 0; b < boundary.size(); ++b)
             boundary[b] -= added[b];
         }
       };
-  visit(0, 0, 0);
+  visit(0, 0, 0, 0);
   if (kept.empty()) {
     std::string caps = std::to_string(slrCapacity);
     if (!slrCapacitySpecs.empty()) {
@@ -7725,11 +7790,14 @@ LogicalResult StaticFolder::chooseGroups() {
     slrOf = entry.second;
     Choice choice = searchReady();
     unsigned length = choice.length;
-    bool bound = length && choice.lower && length <= choice.lower;
+    // The ungrouped lower bound bounds every assignment's frame (not the
+    // candidate's own modulo bound, which counts its serialized crossings).
+    bool bound = length && ungrouped && length <= ungrouped;
     llvm::errs() << "foldsim-fold-static: slr-groups: assignment " << i + 1 << " of "
-                 << kept.size() << ": " << entry.first << " link bits between groups, II "
-                 << length << (length ? "" : " (no schedule)")
-                 << (bound ? " = the lower bound: chosen" : "") << "\n";
+                 << kept.size() << ": " << entry.first << " link "
+                 << (slrSerialize ? "wires" : "bits") << " between groups, serialized bound "
+                 << keptBound[i] << ", II " << length << (length ? "" : " (no schedule)")
+                 << (bound ? " = the ungrouped lower bound: chosen" : "") << "\n";
     if (length && (!bestLength || length < bestLength)) {
       bestLength = length;
       best = entry.second;
