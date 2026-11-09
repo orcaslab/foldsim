@@ -1923,8 +1923,8 @@ def main():
     if a.copies == 'auto' and not a.static:
         sys.exit('--copies auto needs --static')
     if a.vmem_cache_rows is not None:
-        if not a.virtual_memories and a.state != 'auto':
-            sys.exit('--vmem-cache-rows needs --virtual-memories (or --state auto)')
+        if not a.virtual_memories and a.state != 'auto' and not getattr(a, 'vmem_auto_bits', 0):
+            sys.exit('--vmem-cache-rows needs --virtual-memories (or --state auto, --vmem-auto-bits)')
         if a.vmem_cache_rows != 'auto' and not a.vmem_cache_rows.isdigit():
             sys.exit('--vmem-cache-rows: auto, 0 or a power of two of at least 2')
         vmem_cache_rows([], a.vmem_cache_rows, a.vmem_cache_budget)
@@ -1935,8 +1935,8 @@ def main():
     if a.page and not a.static:
         sys.exit('--page needs --static')
     if a.vmem_group is not None:
-        if not a.virtual_memories and a.state != 'auto':
-            sys.exit('--vmem-group needs --virtual-memories (or --state auto)')
+        if not a.virtual_memories and a.state != 'auto' and not getattr(a, 'vmem_auto_bits', 0):
+            sys.exit('--vmem-group needs --virtual-memories (or --state auto, --vmem-auto-bits)')
         if not (a.vmem_group == 'copy' or (a.vmem_group.isdigit() and int(a.vmem_group) >= 1)
                 or re.fullmatch(r'auto(:[1-9][0-9]*)?', a.vmem_group)):
             sys.exit('--vmem-group: copy, the memories per controller (at least 1), or auto[:M]')
