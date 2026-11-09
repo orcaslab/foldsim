@@ -468,6 +468,8 @@ public:
   /// `state-in-ram-pp-pack`: a PP class's stored registers packed into
   /// columns of an instance's row each.
   bool ppPackStores = true;
+  /// `state-in-ram-pp-replicas` (0: off).
+  unsigned ppReplicaDepth = 0;
   /// `state-scratch-bits` / `state-stream-window` (planScratch,
   /// chooseStreamWindows: state rows in HBM).
   uint64_t stateScratchBits = 250000000;
@@ -14531,6 +14533,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     struct Column {
       seq::FirMemOp memory, resident;
       Value out;
+      /// The read data the output register takes (state-in-ram-pp-replicas:
+      /// its replicas take it too).
+      Value data;
       SmallVector<SmallVector<std::pair<unsigned, Value>>> parts;
     };
     std::vector<Column> cols(columns);
@@ -14650,9 +14655,60 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                                   one());
         data = comb::MuxOp::create(b, groups.back().str1, data, resData);
       }
+      col.data = data;
       col.out = seq::FirRegOp::create(b, data, hostClock,
                                       b.getStringAttr("pp_col" + Twine(c) + "_out"));
     }
+    // `state-in-ram-pp-replicas` (D components): a column's output register
+    // replicated per subtree of the registers it holds (their names' first D
+    // path components), each replica over the bits that subtree's registers
+    // take in the column (any row), so that a column's fan-out splits by the
+    // logic its registers belong to. The replicas are kept apart.
+    std::map<std::pair<unsigned, std::string>, std::pair<unsigned, unsigned>> replicaSpan;
+    std::map<std::pair<unsigned, std::string>, Value> replicaOf;
+    auto subtreeOf = [&](const std::string &name) {
+      SmallVector<StringRef> parts;
+      StringRef(name).split(parts, '/');
+      std::string key;
+      for (unsigned i = 0; i < std::min<size_t>(ppReplicaDepth, parts.size()); ++i)
+        key += (i ? "/" : "") + parts[i].str();
+      return key;
+    };
+    if (ppReplicaDepth) {
+      for (auto [k, reg] : llvm::enumerate(ppRegs))
+        for (unsigned lo = 0; lo < reg.width;) {
+          uint64_t g = bitAt[k] + lo;
+          unsigned c = unsigned(g / 72), offset = unsigned(g % 72);
+          unsigned n = std::min(reg.width - lo, 72 - offset);
+          auto [it, fresh] = replicaSpan.try_emplace({c, subtreeOf(reg.name)},
+                                                     offset, offset + n);
+          if (!fresh) {
+            it->second.first = std::min(it->second.first, offset);
+            it->second.second = std::max(it->second.second, offset + n);
+          }
+          lo += n;
+        }
+      unsigned made = 0;
+      for (auto &[key, span] : replicaSpan) {
+        auto [c, subtree] = key;
+        auto [lo, hi] = span;
+        auto reg = seq::FirRegOp::create(
+            b, b.createOrFold<comb::ExtractOp>(bits(hi - lo), cols[c].data, lo),
+            hostClock, b.getStringAttr("pp_col" + Twine(c) + "_out_r" + Twine(made++)));
+        sv::addSVAttributes(reg, {sv::SVAttributeAttr::get(context, "keep", R"("true")",
+                                                           /*emitAsComment=*/false)});
+        replicaOf[key] = reg;
+      }
+    }
+    // A register's bits of a column's output (its subtree's replica's).
+    auto outBits = [&](unsigned c, unsigned offset, unsigned n,
+                       const std::string &name) -> Value {
+      if (!ppReplicaDepth)
+        return b.createOrFold<comb::ExtractOp>(bits(n), cols[c].out, offset);
+      auto key = std::make_pair(c, subtreeOf(name));
+      return b.createOrFold<comb::ExtractOp>(bits(n), replicaOf[key],
+                                             offset - replicaSpan[key].first);
+    };
     for (auto [k, reg] : llvm::enumerate(ppRegs)) {
       SmallVector<Value> parts;
       Value next = asBits(b, rowValues[2 * k]);
@@ -14660,7 +14716,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         uint64_t g = bitAt[k] + lo;
         unsigned c = unsigned(g / 72), offset = unsigned(g % 72);
         unsigned n = std::min(reg.width - lo, 72 - offset);
-        parts.push_back(b.createOrFold<comb::ExtractOp>(bits(n), cols[c].out, offset));
+        parts.push_back(outBits(c, offset, n, reg.name));
         cols[c].parts[reg.row].push_back(
             {offset, b.createOrFold<comb::ExtractOp>(bits(n), next, lo)});
         lo += n;
@@ -20198,6 +20254,7 @@ void FoldStaticPass::runOnOperation() {
   folder.stateInRamPP = stateInRamPP;
   folder.ppAddressFanout = std::max(1u, unsigned(stateInRamPPFanout));
   folder.ppPackStores = stateInRamPPPack;
+  folder.ppReplicaDepth = stateInRamPPReplicas;
   folder.stateScratchBits = stateScratchBits;
   folder.stateStreamWindow = stateStreamWindow;
   folder.stateScratchPartial = stateScratchPartial;

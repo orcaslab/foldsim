@@ -198,6 +198,21 @@ def assign_rowwise(regs, grain):
     return place, cols, None
 
 
+def replica_metrics(regs, place, readers, depth, rdepth):
+    """state-in-ram-pp-replicas=rdepth: per output register (a column's replica per subtree of the registers it
+    holds), its registers, their readers (cones) and the readers' clusters at `depth`."""
+    outs = collections.defaultdict(lambda: dict(w=set(), r=set()))
+    for i, r in enumerate(regs):
+        row, bit = place[i]
+        for c in columns_of(bit, r['width']):
+            key = (c, cluster_of(r['name'], rdepth))
+            outs[key]['w'].add(r['name'])
+            outs[key]['r'] |= readers.get(r['name'], set())
+    return [dict(col=k, writers=len(v['w']), wclust=len({cluster_of(n, depth) for n in v['w']}),
+                 readers=len(v['r']), rclust=len({cluster_of(n, depth) for n in v['r']}))
+            for k, v in outs.items()]
+
+
 def summary(ms, key):
     xs = [m[key] for m in ms]
     xs.sort()
@@ -211,6 +226,9 @@ def main():
     ap.add_argument('pp_cols')
     ap.add_argument('--depth', type=int, action='append')
     ap.add_argument('--cluster-columns', type=int, action='append')
+    ap.add_argument('--replicas', type=int, action='append',
+                    help='also today\'s layout with state-in-ram-pp-replicas=D: per output register (its column '
+                         'count is the replicas\')')
     a = ap.parse_args()
     regs, readers, grain = load(a.pp_dump, a.pp_cols)
     depths = a.depth or [3, 4, 5]
@@ -233,6 +251,10 @@ def main():
         for name, place, cols, nclust in variants:
             ms = metrics(regs, place, readers, depth)
             print(f'  {name:14s} {cols:8d} {str(nclust or "-"):>8s} | {summary(ms, "writers")} | '
+                  f'{summary(ms, "wclust")} | {summary(ms, "readers")} | {summary(ms, "rclust")}')
+        for rd in a.replicas or []:
+            ms = replica_metrics(regs, today, readers, depth, rd)
+            print(f'  {"replicas d=" + str(rd):14s} {len(ms):8d} {"(regs)":>8s} | {summary(ms, "writers")} | '
                   f'{summary(ms, "wclust")} | {summary(ms, "readers")} | {summary(ms, "rclust")}')
 
 
