@@ -793,6 +793,17 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "page, link page or serialized spacing), only the offsets chosen: "
            "a class's slot tables are then a segment a pass (slot-segments), "
            "whatever its instances, and the frame grows instead">,
+    Option<"affineAuto", "affine-auto", "bool", "false",
+           "With modulo and slot-segments: schedule, then place affine "
+           "(affine-slots) only the classes whose own slot rows (each pass "
+           "kind's positions, the instance at each position, the PP passes') "
+           "need more than slot-segments segments, the others as single "
+           "evaluations, and schedule again: their slot tables then decode, "
+           "at a smaller cost in the frame than affine-slots">,
+    Option<"affineAutoBits", "affine-auto-bits", "uint64_t", "262144",
+           "With affine-auto: only a class whose undecoded slot rows hold at "
+           "least this many table bits is made affine (the frame's cost paid "
+           "where the tables are large)">,
     Option<"slotSegments", "slot-segments", "unsigned", "0",
            "Slot tables (constants read by the frame's position or an "
            "instance) of at most this many affine segments of nonzero rows "

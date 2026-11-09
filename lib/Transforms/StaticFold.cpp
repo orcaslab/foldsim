@@ -537,6 +537,26 @@ public:
   /// `affine-slots`: each copy's (or ready lane's) passes of a kind placed as
   /// one affine run over its instances (AffineSlots.cpp).
   bool affineSlots = false;
+  /// `affine-auto`: after a schedule, the classes whose own slot rows do not
+  /// decode within `slot-segments` segments are placed affine and the frame
+  /// scheduled again; the others as single evaluations (affineClass).
+  bool affineAuto = false;
+  /// `affine-auto-bits`: only a class whose undecoded rows hold at least
+  /// this many bits is made affine.
+  uint64_t affineAutoBits = 0;
+  unsigned affineAutoRounds = 0;
+  unsigned affineTrial = 0;   // nesting of affine-auto's trial schedules
+  unsigned slotSegmentsK = 0;
+  SmallVector<bool> affineClass;
+  bool affineOn() const {
+    return affineSlots || llvm::is_contained(affineClass, true);
+  }
+  bool affineOf(unsigned c) const {
+    return affineSlots || (c < affineClass.size() && affineClass[c]);
+  }
+  /// The classes whose slot rows (each pass kind's, the instance at each
+  /// position, its PP passes') need more than `slotSegmentsK` segments.
+  SmallVector<unsigned> undecodedClasses();
   /// `csf-ready-cones`: csf-ready-copies built, each named model's late
   /// outputs split into a cone model (CsfReadySplit.cpp) of k copies. The
   /// split models' cone models, by model.
@@ -5809,16 +5829,16 @@ unsigned StaticFolder::place(ArrayRef<bool> ready,
     // affine).
     unsigned period =
         placeModulo(nodes, preds, succs, height, writes, overlapped,
-                    affineSlots ? (below ? below : UINT_MAX / 4)
+                    affineOn() ? (below ? below : UINT_MAX / 4)
                     : below ? std::min<unsigned>(below, length) : length);
-    if (period && (period < unsigned(length) || affineSlots)) {
+    if (period && (period < unsigned(length) || affineOn())) {
       slots = std::move(overlapped);
       return period;
     }
     outputSlot = aloneSlot;
     outputEarly = aloneEarly;
     // affine-slots: no affine frame below `below` places this choice.
-    if (affineSlots)
+    if (affineOn())
       return 0;
   }
   // `min-ii`: the frame alone, its positions past the schedule's idle.
@@ -6121,13 +6141,15 @@ unsigned StaticFolder::placeModulo(
     bool fits = true;
     // affine-slots: the groups placed whole (AffineSlots.cpp), not the list
     // schedule below, nor its moves toward the readers.
-    if (affineSlots) {
-      std::map<std::tuple<unsigned, unsigned, unsigned>, unsigned> groupOf;
+    if (affineOn()) {
+      std::map<std::tuple<unsigned, unsigned, unsigned, unsigned>, unsigned> groupOf;
       SmallVector<foldsim::AffineGroup> groups;
       SmallVector<SmallVector<unsigned>> members;
       SmallVector<foldsim::AffineNode> anodes(nodes.size());
       for (auto [n, node] : llvm::enumerate(nodes)) {
-        auto key = std::make_tuple(resourceOf(node), unsigned(node.pass), node.level);
+        // affine-auto: a class not made affine places each evaluation alone.
+        auto key = std::make_tuple(resourceOf(node), unsigned(node.pass), node.level,
+                                   affineOf(node.cls) ? ~0u : unsigned(n));
         auto [it, fresh] = groupOf.try_emplace(key, groups.size());
         if (fresh) {
           groups.push_back({std::get<0>(key), 0, 1});
@@ -6144,6 +6166,26 @@ unsigned StaticFolder::placeModulo(
       }
       for (auto &m : members) {
         llvm::stable_sort(m, [&](unsigned a, unsigned b) { return nodes[a].inst < nodes[b].inst; });
+        // affine-auto: the run starts at the instance the schedule before
+        // placed first (its order rotated, still a run that wraps once):
+        // an instance that waits for the frame's reduction (the one a
+        // parent reads first) is then not the first of the run.
+        if (m.size() > 1 && !affineSlots) {
+          auto &node0 = nodes[m[0]];
+          auto &cls = classes[node0.cls];
+          ArrayRef<int> prev = node0.pass == kState ? ArrayRef<int>(cls.slot[kState])
+                                                    : cls.readyLevels > node0.level
+                                                          ? cls.readySlots(node0.level)
+                                                          : ArrayRef<int>();
+          unsigned first = 0;
+          int best = INT_MAX;
+          for (auto [k, n] : llvm::enumerate(m))
+            if (nodes[n].inst < prev.size() && prev[nodes[n].inst] < best) {
+              best = prev[nodes[n].inst];
+              first = unsigned(k);
+            }
+          std::rotate(m.begin(), m.begin() + first, m.end());
+        }
         for (auto [k, n] : llvm::enumerate(m))
           anodes[n].index = unsigned(k);
       }
@@ -6231,7 +6273,7 @@ unsigned StaticFolder::placeModulo(
     llvm::stable_sort(byStart,
                       [&](unsigned a, unsigned b) { return slotOf[a] > slotOf[b]; });
     for (auto n : byStart) {
-      if (affineSlots)
+      if (affineOn())
         break;
       auto &node = nodes[n];
       if (node.pass == kState &&
@@ -8762,6 +8804,76 @@ static void printSlots(raw_ostream &os, ArrayRef<int> slots) {
   }
 }
 
+SmallVector<unsigned> StaticFolder::undecodedClasses() {
+  SmallVector<unsigned> out;
+  unsigned k = slotSegmentsK ? slotSegmentsK : 8;
+  uint64_t rowBits = uint64_t(llvm::PowerOf2Ceil(ii + 1));
+  // An HBM link stream's tables lie at its reader's read passes (landings,
+  // requests) and its producer's passes (writes): their kept bits count for
+  // those classes.
+  SmallVector<uint64_t> streamKept(classes.size(), 0);
+  if (!linkStreams.empty() && succeeded(planStreams()))
+    for (auto &st : linkStreams) {
+      if (st.excluded || !st.kept)
+        continue;
+      auto bitsOf = [&](ArrayRef<uint64_t> row, unsigned width) -> uint64_t {
+        return foldsim::slotSegments(row, std::max(width, 1u), k).size() > k
+                   ? rowBits * std::max(width, 1u)
+                   : 0;
+      };
+      unsigned rw = classes[st.rcls].threads() > 1
+                        ? llvm::Log2_32_Ceil(classes[st.rcls].threads())
+                        : 1;
+      streamKept[st.rcls] += bitsOf(st.popValid, 1) + bitsOf(st.reqValid, 1) +
+                             bitsOf(st.popInst, rw) + bitsOf(st.reqRow, 16);
+      streamKept[st.pcls] += bitsOf(st.writeValid, 1);
+    }
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    unsigned threads = cls.threads();
+    if (threads < 2)
+      continue;
+    unsigned idxWidth = llvm::Log2_32_Ceil(threads);
+    auto wrap = [&](int s) { return unsigned(((s % int(ii)) + int(ii)) % int(ii)); };
+    uint64_t kept = streamKept[c];
+    SmallVector<uint64_t> inst(ii + 1, 0), rinst(ii + 1, 0), pinst(ii + 1, 0),
+        prow(ii + 1, 0);
+    SmallVector<SmallVector<uint64_t>> kinds;
+    auto kind = [&](ArrayRef<int> slots, int shift) {
+      SmallVector<uint64_t> row(ii + 1, 0);
+      for (unsigned i = 0; i < threads; ++i) {
+        row[wrap(slots[i] - shift)] = 1;
+        inst[wrap(slots[i])] = i;
+        rinst[wrap(slots[i] - shift)] = i;
+      }
+      kinds.push_back(std::move(row));
+    };
+    kind(cls.slot[kState], int(cls.stages));
+    for (unsigned l = 0; l < cls.readyLevels; ++l)
+      kind(cls.readySlots(l), int(cls.stages));
+    for (unsigned i = 0; cls.pp && i < threads; ++i)
+      for (unsigned j = 0; j < cls.pp; ++j) {
+        unsigned pos = wrap(cls.slot[kState][i] - int(cls.stages) + int(j));
+        pinst[pos] = i;
+        prow[pos] = j;
+      }
+    auto check = [&](ArrayRef<uint64_t> row, unsigned width) {
+      if (foldsim::slotSegments(row, width, k).size() > k)
+        kept += rowBits * width;
+    };
+    check(inst, idxWidth);
+    check(rinst, idxWidth);
+    if (cls.pp) {
+      check(pinst, idxWidth);
+      check(prow, std::max(1u, llvm::Log2_32_Ceil(cls.pp)));
+    }
+    for (auto &row : kinds)
+      check(row, 1);
+    if (kept && kept >= affineAutoBits)
+      out.push_back(unsigned(c));
+  }
+  return out;
+}
+
 LogicalResult StaticFolder::schedule() {
   chainCuts();
   auto late = [](const Class &cls) {
@@ -8791,6 +8903,8 @@ LogicalResult StaticFolder::schedule() {
     moduloLower = best.lower;
     moduloTried = best.tried;
   }
+  if (!best.length && affineTrial)
+    return failure();   // affine-auto falls back (no diagnostic)
   if (!best.length) {
     // Named for the choice that writes the most outputs at ready passes:
     // every model with late outputs given one.
@@ -8865,6 +8979,41 @@ LogicalResult StaticFolder::schedule() {
       }
     if (excluded) {
       streamPages();
+      return schedule();
+    }
+  }
+  // affine-auto: the classes whose rows do not decode, affine, and the frame
+  // scheduled again (until none is left, at most 4 rounds: each round's
+  // schedule may leave another class irregular).
+  if (affineAuto && affineAutoRounds < 4 && !affineSlots) {
+    ++affineAutoRounds;
+    auto undecoded = undecodedClasses();
+    // (A class already affine whose tables still do not decode is not
+    // marked again: another round would not change it.)
+    llvm::erase_if(undecoded, [&](unsigned c) { return affineOf(c); });
+    if (!undecoded.empty()) {
+      affineClass.resize(classes.size(), false);
+      std::string names;
+      for (unsigned c : undecoded) {
+        affineClass[c] = true;
+        names += (names.empty() ? "" : ",") + classes[c].name;
+      }
+      llvm::errs() << "foldsim-fold-static: affine-auto: round "
+                   << affineAutoRounds << ": II " << ii << ", "
+                   << undecoded.size() << " more classes affine (" << names
+                   << "), scheduled again\n";
+      // A frame the affine classes cannot be placed in keeps them as they
+      // were: they are unmarked and the frame scheduled as before.
+      ++affineTrial;
+      bool placed = succeeded(schedule());
+      --affineTrial;
+      if (placed)
+        return success();
+      for (unsigned c : undecoded)
+        affineClass[c] = false;
+      affineAutoRounds = ~0u >> 1;
+      llvm::errs() << "foldsim-fold-static: affine-auto: no frame places "
+                   << names << " affine; scheduled as before\n";
       return schedule();
     }
   }
@@ -9742,7 +9891,7 @@ static LogicalResult foldPipelines(
 
 /// A slot table: `rows[index]` (`width` bits; zero past the rows).
 static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
-                   unsigned width);
+                   unsigned width, unsigned site = __builtin_LINE());
 /// `max-table-bits`: the largest table constant, in bits (Vivado's variable
 /// limit); a larger one is cut into column slices.
 static uint64_t gMaxTableBits = 1000000;
@@ -15589,7 +15738,7 @@ LogicalResult StaticFolder::checkMulticycle(Class &cls) {
 
 /// A table indexed by `index`, of constants of `width` bits.
 static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
-                   unsigned width) {
+                   unsigned width, unsigned site) {
   auto type = b.getIntegerType(std::max(width, 1u));
   bool uniform = llvm::all_of(rows, [&](uint64_t v) { return v == rows[0]; });
   if (rows.empty() || uniform)
@@ -15608,7 +15757,7 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     auto segs = foldsim::slotSegments(rows, width);
     foldsim::countFallback(indexWidth, width, segs.size());
     if (getenv("FOLDSIM_AFFINE_LOG")) {
-      llvm::errs() << "slot-sequencer: kept a table of " << rows.size()
+      llvm::errs() << "slot-sequencer: kept a table (line " << site << ") of " << rows.size()
                    << " x " << width << " bits, " << segs.size()
                    << " segments:";
       for (auto &sg : ArrayRef(segs).take_front(12))
@@ -20247,6 +20396,9 @@ void FoldStaticPass::runOnOperation() {
   folder.dropDeadInputs = dropDeadInputs;
   folder.lookaheadTables = lookaheadTables;
   folder.affineSlots = affineSlots;
+  folder.affineAuto = affineAuto;
+  folder.affineAutoBits = affineAutoBits;
+  folder.slotSegmentsK = slotSegments;
   gMaxTableBits = std::max<uint64_t>(1, maxTableBits);
   gSlotSegments = slotSegments;
   // FOLDSIM_SLOT_SEGMENTS: the default for runs that leave it 0 (a test
