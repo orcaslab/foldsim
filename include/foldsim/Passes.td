@@ -1050,6 +1050,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "all of whose reads of a frame come before its producer writes "
            "the entry in that frame keeps one bank, not two; the others "
            "keep two (the schedule decides, link by link)">,
+    Option<"csfMailboxHbmRowBits", "csf-mailbox-hbm-row-bits", "unsigned",
+           "4096",
+           "With csf-mailbox-hbm: the most bits of a mailbox stream's row (8 "
+           "to 4096): a reader's lanes, or a reader group's slice of a "
+           "producer's word (the bits several groups read at the same offset "
+           "in every slice), so that a reader pass lands one row">,
     Option<"csfMailboxHbmLead", "csf-mailbox-hbm-lead", "unsigned", "112",
            "With csf-mailbox-hbm: the most positions a mailbox stream's row "
            "request precedes its landing (the HBM round trip at its worst, "

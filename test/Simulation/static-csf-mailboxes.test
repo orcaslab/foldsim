@@ -44,7 +44,8 @@
 # RUN: %t/tz/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=60 | FileCheck %s
 # `--csf-mailbox-hbm`: the mailboxes in HBM, a stream of reader rows each
 # (Src -> Sink: two Sink rows of four lanes, a reader-indexed mailbox; Sink ->
-# Src, where each Src reads one Sink row: a producer-indexed stream, its
+# Src, where each Src reads one Sink row: a producer-indexed stream sliced by
+# reader (four pages, a Src group's ready bit each), its
 # readiness lanes fanning out), written byte-masked at the producer's pass, a row landing for
 # each reader pass in the stream's landing slots, two sets of read registers
 # in turn (no spacing of the reader's passes). Against the controllers'
@@ -59,13 +60,14 @@
 # RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 # RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
 # RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 | FileCheck %s
-# A fixed HBM latency below the streams' leads (28 and 33 at II 40) is hidden:
-# H is the frame's (II 40), at latency 1 as at 20 (the landings decided and
-# not yet run alone are waited for, not the next ones of a sparse stream).
+# A fixed HBM latency below the streams' leads (25 and 33 at II 40, less the
+# decision lead and a landing's margin) is hidden: H is the frame's (II 40),
+# at latency 1 as at 18 (the landings decided and not yet run alone are
+# waited for, not the next ones of a sparse stream).
 # RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=1 +hi=1 | FileCheck %s --check-prefix=HII
-# RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=20 +hi=20 | FileCheck %s --check-prefix=HII
+# RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=18 +hi=18 | FileCheck %s --check-prefix=HII
 # RUN: foldsim --srcs top.f --top Top --out %t/h24 --static --nest --modulo --min-ii 24 --compact-links --share-links --staged-links --csf-single-bank --csf-mailbox-builder --csf-mailbox-hbm --bubbles Src Sink > %t/h24.log 2>&1
-# RUN: FileCheck %s --check-prefix=HBMS < %t/h24/schedule.txt
+# RUN: FileCheck %s --check-prefix=H24 < %t/h24/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/h24 -DVM1 -DBUBBLES -Mdir %t/h24/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/h24/foldsim_sim.sv > %t/h24/build.log 2>&1
 # RUN: %t/h24/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 | FileCheck %s
 # RUN: %t/h24/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
@@ -84,12 +86,31 @@
 # RUN: %t/pm/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
 # RUN: %t/pm/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=5 +hi=80 +bubble=30 | FileCheck %s
 # PM: hbm 3 (3 of some reader instances, 1 with the rest's takes or forwards masked)
+# Rows of 8 bits (--csf-mailbox-hbm-row-bits 8): a mailbox lane of 32 bits
+# wider than a row (Unit -> Reader) would take four landings a reader pass
+# and space the reader's passes, so it stays on chip (one landing a pass:
+# only its 8-bit lane streams); a producer word of 32 bits wider than a row
+# whose reader takes it whole (Reader -> Unit) is a stream of 32-bit rows (as
+# layoutStreamsOf lays it out); exact.
+# RUN: foldsim --srcs top.f --top Top --out %t/rb8 --static --nest --modulo --min-ii 48 --compact-links --share-links --staged-links --bubbles --csf-mailbox-hbm --csf-mailbox-hbm-row-bits 8 Unit Reader > %t/rb8.log 2>&1
+# RUN: FileCheck %s --check-prefix=RB8 < %t/rb8/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/rb8 -DVM1 -DBUBBLES -Mdir %t/rb8/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/rb8/foldsim_sim.sv > %t/rb8/build.log 2>&1
+# RUN: %t/rb8/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/rb8/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
+# RUN: %t/rb8/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=5 +hi=80 +bubble=30 | FileCheck %s
+# RB8: link streams: 2 streams, 2 links
+# RB8: link stream Reader Unit 1 0 32 32 1
+# RB8-NOT: link stream Unit Reader 1 0 32
+# RB8: link stream Unit Reader 1 0 8 8 1
 # HBM: II = 40
 # HII: MATCH 196 cycles in 7966 host cycles, H 39.83
 # HBMS: link streams: 2 streams, 12 links, 80 bits
-# HBMS: link stream Sink Src 4 0 4 4 1 2 8 1
+# HBMS: link stream Sink Src 4 0 32 8 4 8 8 1
 # HBMS: link stream Src Sink 8 0 32 32 1 8 2 1
-# HBMVH: FOLDSIM_VMEM_0_DW 4
+# H24: link streams: 2 streams, 11 links, 76 bits
+# H24: link stream Sink Src 3 1 32 8 4 8 6 1
+# H24: link stream Src Sink 8 0 32 32 1 8 2 1
+# HBMVH: FOLDSIM_VMEM_0_DW 8
 # HBMVH-NEXT: FOLDSIM_VMEM_0_MW 1
 # HBMVH: FOLDSIM_VMEM_1_DW 32
 # HBMVH-NEXT: FOLDSIM_VMEM_1_MW 4

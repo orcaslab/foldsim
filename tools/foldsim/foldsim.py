@@ -564,6 +564,8 @@ def frame_options(a):
         fold += ' csf-mailbox-builder'
     if getattr(a, 'csf_mailbox_hbm', False):
         fold += ' csf-mailbox-hbm'
+    if getattr(a, 'csf_mailbox_hbm_row_bits', 0):
+        fold += f' csf-mailbox-hbm-row-bits={a.csf_mailbox_hbm_row_bits}'
     if getattr(a, 'csf_mailbox_hbm_lead', 0):
         fold += f' csf-mailbox-hbm-lead={a.csf_mailbox_hbm_lead}'
     if getattr(a, 'csf_mailboxes', False):
@@ -1768,6 +1770,9 @@ def build_parser():
     ap.add_argument('--state-in-ram-pp-fanout', type=int, default=0, metavar='N',
                     help='with --state-in-ram-pp: the most RAM primitives a combinationally read memory\'s '
                          'registered address copy drives (foldsim-fold-static state-in-ram-pp-fanout; 0: 96)')
+    ap.add_argument('--csf-mailbox-hbm-row-bits', type=int, default=0, metavar='N',
+                    help='with --csf-mailbox-hbm: the most bits of a mailbox stream\'s row (foldsim-fold-static '
+                         'csf-mailbox-hbm-row-bits; 0: its default, 4096)')
     ap.add_argument('--csf-mailbox-hbm-lead', type=int, default=0, metavar='N',
                     help='with --csf-mailbox-hbm: the most positions a mailbox stream\'s request precedes its landing '
                          '(foldsim-fold-static csf-mailbox-hbm-lead; 0: its default, 112)')

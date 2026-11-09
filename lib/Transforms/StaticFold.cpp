@@ -576,6 +576,10 @@ public:
   /// request precedes its landing (the HBM round trip at the worst latency
   /// and a margin; less where the schedule leaves less room).
   unsigned csfMailboxHbmLead = 112;
+  /// `csf-mailbox-hbm-row-bits`: the most bits of a mailbox stream's row (a
+  /// reader's lanes, or a reader group's slice of a producer's word): one
+  /// landing a reader pass where they fit.
+  unsigned csfMailboxHbmRowBits = 4096;
   /// The links `csf-mailbox-builder` offers (CsfMailboxes.h), keyed by
   /// (consumer, piece's low bit, producer, producer's low bit), and their
   /// plans.
@@ -1324,6 +1328,13 @@ private:
     unsigned mbRows = 0;
     SmallVector<uint64_t> mbWriteRow;
     SmallVector<int64_t> mbReaderRow;
+    /// `csf-mailbox-hbm`, producer-indexed: a sliced stream. Its pages are
+    /// the producer's word cut by reader: page g the bits the readers of
+    /// group g take (the bits several groups take at the same offset in
+    /// each page, then the group's own), so a reader pass lands one page,
+    /// `readerPage[i]` (-1: none); a member's offset is in the page.
+    bool sliced = false;
+    SmallVector<int64_t> readerPage;
     SmallVector<unsigned> runDomain;
     SmallVector<SmallVector<bool>> mbDomains;
     /// The index bits of a row: the reader row (a mailbox) or the producer
@@ -3835,6 +3846,7 @@ void StaticFolder::layoutMailboxStreams(std::vector<LinkStream> &out,
                                         decltype(streamMembers) *members) const {
   if (!slrOf.empty() || shortLead)
     return;
+  size_t first = out.size();
   std::vector<LinkUse> uses;
   linkUses(uses);
   // The links offered: early, of a producer of several instances, more than
@@ -3898,6 +3910,115 @@ void StaticFolder::layoutMailboxStreams(std::vector<LinkStream> &out,
     links.push_back(link);
     useOf.push_back(use);
   }
+  // The producer-indexed ones: a stream per class pair and pass, sliced by
+  // reader (one page a reader pass) where a reader's bits fit a row of
+  // csfMailboxHbmRowBits; else as layoutStreamsOf lays them out.
+  unsigned sliceBits = std::max(8u, csfMailboxHbmRowBits / 8 * 8);
+  {
+    std::map<std::tuple<unsigned, unsigned, unsigned>, SmallVector<const LinkUse *>>
+        byPair;
+    for (auto &use : uses)
+      if (byProducer.count(keyOf(use))) {
+        auto &producer = producers[use.producer];
+        byPair[{unsigned(producer.cls), use.reader,
+                producer.atReady ? 1 + producer.readyLevel : 0}]
+            .push_back(&use);
+      }
+    for (auto &[pair, pairUses] : byPair) {
+      auto [pcls, rcls, wk] = pair;
+      unsigned rthreads = classes[rcls].threads();
+      // Members (a use's key), each reader instance's members, and the
+      // groups of reader instances that take the same members.
+      std::map<std::tuple<unsigned, unsigned, unsigned, unsigned, unsigned>,
+               unsigned>
+          memberOf;
+      SmallVector<const LinkUse *> memberUse;
+      SmallVector<std::set<unsigned>> taken(rthreads);
+      SmallVector<std::set<uint64_t>> rowsOfReader(rthreads);
+      for (auto *use : pairUses) {
+        auto [it, fresh] = memberOf.try_emplace(keyOf(*use), memberUse.size());
+        if (fresh)
+          memberUse.push_back(use);
+        for (auto [i, row] : llvm::zip(use->readers, use->readerRows)) {
+          taken[i].insert(it->second);
+          rowsOfReader[i].insert(row);
+        }
+      }
+      std::map<std::set<unsigned>, unsigned> groupOf;
+      SmallVector<std::set<unsigned>> groups;
+      SmallVector<int64_t> readerPage(rthreads, -1);
+      bool oneRow = true;
+      for (unsigned i = 0; i < rthreads; ++i) {
+        if (taken[i].empty())
+          continue;
+        oneRow &= rowsOfReader[i].size() == 1;
+        auto [g, fresh] = groupOf.try_emplace(taken[i], groups.size());
+        if (fresh)
+          groups.push_back(taken[i]);
+        readerPage[i] = g->second;
+      }
+      // Shared members (of several groups) first, at the same offset in
+      // every page; then each group's own.
+      SmallVector<unsigned> groupsOf(memberUse.size(), 0);
+      for (auto &g : groups)
+        for (unsigned m : g)
+          ++groupsOf[m];
+      SmallVector<unsigned> offset(memberUse.size(), 0);
+      unsigned shared = 0, page = 0;
+      for (unsigned m = 0; m < memberUse.size(); ++m)
+        if (groupsOf[m] > 1) {
+          offset[m] = shared;
+          shared += memberUse[m]->width;
+        }
+      for (auto &g : groups) {
+        unsigned at = shared;
+        for (unsigned m : g)
+          if (groupsOf[m] == 1) {
+            offset[m] = at;
+            at += memberUse[m]->width;
+          }
+        page = std::max(page, at);
+      }
+      page = std::max(8u, (page + 7) / 8 * 8);
+      if (!oneRow || page > sliceBits || groups.empty())
+        continue;  // (layoutStreamsOf's, below)
+      LinkStream st;
+      st.pcls = pcls;
+      st.rcls = rcls;
+      st.atReady = wk > 0;
+      st.level = wk > 0 ? wk - 1 : 0;
+      st.twoSets = true;
+      st.sliced = true;
+      st.readerPage = readerPage;
+      st.dw = page;
+      st.pages = groups.size();
+      st.wordBits = page * st.pages;
+      for (auto [g, members] : llvm::enumerate(groups))
+        for (unsigned m : members)
+          st.runs.push_back({memberUse[m]->producer, memberUse[m]->low,
+                             memberUse[m]->width,
+                             unsigned(g) * page + offset[m]});
+      llvm::sort(st.runs, [](const StreamRun &a, const StreamRun &b) {
+        return a.offset < b.offset;
+      });
+      st.needs.resize(rthreads);
+      for (unsigned i = 0; i < rthreads; ++i) {
+        if (readerPage[i] < 0)
+          continue;
+        st.needs[i].push_back({*rowsOfReader[i].begin(), unsigned(readerPage[i])});
+        st.maxNeed = 1;
+        st.readRows += 1 + classes[rcls].readyLevels;
+        ++st.kept;
+      }
+      if (members)
+        for (unsigned m = 0; m < memberUse.size(); ++m)
+          (*members)[keyOf(*memberUse[m])] =
+              StreamMember{unsigned(out.size()), offset[m], false};
+      for (auto *use : pairUses)
+        byProducer.erase(keyOf(*use));
+      out.push_back(std::move(st));
+    }
+  }
   if (!byProducer.empty()) {
     std::vector<LinkStream> more;
     decltype(streamMembers) moreMembers;
@@ -3915,7 +4036,7 @@ void StaticFolder::layoutMailboxStreams(std::vector<LinkStream> &out,
   SmallVector<MailboxPlan> plans;
   SmallVector<int> planOf;
   planMailboxes(links, 1, plans, planOf);
-  unsigned rowBits = std::max(8u, linkHbmRowBits / 8 * 8);
+  unsigned rowBits = sliceBits;
   for (auto [k, plan] : llvm::enumerate(plans)) {
     // Lanes: the plan's links of distinct producer bits and readers (a lane
     // the links of equal ones share), by write domain.
@@ -4023,6 +4144,32 @@ void StaticFolder::layoutMailboxStreams(std::vector<LinkStream> &out,
       out.push_back(std::move(s));
     }
   }
+  // One landing a reader pass: a stream whose reader passes need several
+  // rows (a lane wider than a row; a crossbar's links, whose readers take
+  // several producer rows that also fan out) would space them (needs + 2
+  // positions apart, on every reader instance), so its links stay on chip.
+  SmallVector<int> renumber(out.size() - first, -1);
+  std::vector<LinkStream> keep;
+  for (size_t k = first; k < out.size(); ++k)
+    if (out[k].maxNeed <= 1) {
+      renumber[k - first] = int(first + keep.size());
+      keep.push_back(std::move(out[k]));
+    }
+  out.resize(first);
+  for (auto &s : keep)
+    out.push_back(std::move(s));
+  if (members)
+    for (auto it = members->begin(); it != members->end();) {
+      if (it->second.stream >= first) {
+        int k = renumber[it->second.stream - first];
+        if (k < 0) {
+          it = members->erase(it);
+          continue;
+        }
+        it->second.stream = unsigned(k);
+      }
+      ++it;
+    }
 }
 
 SmallVector<int> StaticFolder::streamReadPasses(const Class &cls,
@@ -4184,13 +4331,19 @@ LogicalResult StaticFolder::planStreams() {
       unsigned k = r.member->second.stream, off = r.member->second.offset;
       auto &st = linkStreams[k];
       // (A mailbox's reader needs its own row; a member of some reader
-      // instances alone, theirs.)
+      // instances alone, theirs; a sliced stream's reader, its page.)
       auto &keep = r.member->second.keepInst;
-      for (auto [i, row] : llvm::zip(r.use->readers, r.use->readerRows))
-        for (unsigned j = off / st.dw;
-             (keep.empty() || keep[i]) && j <= (off + r.use->width - 1) / st.dw; ++j)
+      for (auto [i, row] : llvm::zip(r.use->readers, r.use->readerRows)) {
+        if (!(keep.empty() || keep[i]))
+          continue;
+        if (st.sliced) {
+          need[k][i].insert({uint64_t(row), unsigned(st.readerPage[i])});
+          continue;
+        }
+        for (unsigned j = off / st.dw; j <= (off + r.use->width - 1) / st.dw; ++j)
           need[k][i].insert(
               {st.mailbox ? uint64_t(st.mbReaderRow[i]) : uint64_t(row), j});
+      }
     }
     for (auto [k, st] : llvm::enumerate(linkStreams)) {
       st.maxNeed = 0;
@@ -4253,6 +4406,11 @@ LogicalResult StaticFolder::planStreams() {
         writes.push_back(w + 1 + int(j));
     bool collide = false;
     setStreamTables(st, requests, writes, collide);
+    // A csf-mailbox-hbm stream's landing slots: the fewest its landings
+    // need (fitSlots: those landing within its lead, not pow2(lead + 8)
+    // for a reader whose passes are apart).
+    if (st.twoSets && !linkHbmFitSlots)
+      st.slotCount = fitSlots(st, requests);
     if (collide)
       return netlist.emitError("link streams: ")
              << modelOf(st.pcls) << " -> " << modelOf(st.rcls)
@@ -4507,7 +4665,8 @@ LogicalResult StaticFolder::assignPageEngines() {
     SmallVector<int> requests, writes;
     for (auto &l : st.landings)
       requests.push_back(l.q - int(st.lead));
-    unsigned own = linkHbmFitSlots ? fitSlots(st, requests) : st.leadSlots();
+    bool fit = linkHbmFitSlots || st.twoSets;
+    unsigned own = fit ? fitSlots(st, requests) : st.leadSlots();
     unsigned slots = own;
     unsigned e = 0;
     for (; e < pageEngines.size(); ++e)
@@ -4536,7 +4695,7 @@ LogicalResult StaticFolder::assignPageEngines() {
     }
     bool collide = false;
     setStreamTables(st, requests, writes, collide);
-    st.slotCount = linkHbmFitSlots ? slots : 0;
+    st.slotCount = fit ? slots : 0;
     auto &eng = pageEngines[e];
     for (unsigned q = 0; q < ii; ++q) {
       eng.reads[q] |= st.reqValid[q];
@@ -17932,7 +18091,7 @@ LogicalResult StaticFolder::buildSim() {
     // (A mailbox's lanes at their offsets, zeros between.)
     unsigned top = st.wordBits;
     for (auto &run : llvm::reverse(st.runs)) {
-      if (st.mailbox && run.offset + run.width < top)
+      if ((st.mailbox || st.sliced) && run.offset + run.width < top)
         wordParts.push_back(constant(top - run.offset - run.width, 0));
       wordParts.push_back(b.createOrFold<comb::ExtractOp>(
           b.getIntegerType(run.width),
@@ -17940,7 +18099,7 @@ LogicalResult StaticFolder::buildSim() {
           run.low));
       top = run.offset;
     }
-    if (st.mailbox && top)
+    if ((st.mailbox || st.sliced) && top)
       wordParts.push_back(constant(top, 0));
     Value word = b.createOrFold<comb::ConcatOp>(wordParts);
     // A mailbox's byte mask: each byte its lane's domain's membership of
@@ -18363,7 +18522,8 @@ LogicalResult StaticFolder::buildSim() {
             unsigned lo = std::max(off, j * st.dw);
             unsigned hi = std::min(off + width, (j + 1) * st.dw);
             Value en1 = mine1;
-            if (pgBits)
+            // (A sliced stream lands the reader's own page alone.)
+            if (pgBits && !st.sliced)
               en1 = comb::AndOp::create(
                   b, en1,
                   comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.page1,
@@ -19160,6 +19320,14 @@ LogicalResult StaticFolder::buildSim() {
     if (partialStreamReads)
       os << " (" << partialStreamReads << " of some reader instances, "
          << partialMaskedReads << " with the rest's takes or forwards masked)";
+    if (streamReads) {
+      // The streams' landing slots on chip (slots x row each).
+      uint64_t landingBits = 0;
+      for (auto &st : linkStreams)
+        if (st.kept)
+          landingBits += uint64_t(st.slots()) * st.dw;
+      os << "; landing slots " << landingBits << " bits";
+    }
     os << "\n";
     reportPageEngines(os);
     llvm::errs() << os.str();
@@ -20522,6 +20690,7 @@ void FoldStaticPass::runOnOperation() {
   folder.csfMailboxBuilder = csfMailboxBuilder;
   folder.csfMailboxHbm = csfMailboxHbm;
   folder.csfMailboxHbmLead = std::max(1u, unsigned(csfMailboxHbmLead));
+  folder.csfMailboxHbmRowBits = std::clamp(unsigned(csfMailboxHbmRowBits), 8u, 4096u);
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.stateInRamPP = stateInRamPP;
   folder.ppAddressFanout = std::max(1u, unsigned(stateInRamPPFanout));
