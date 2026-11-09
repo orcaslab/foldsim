@@ -74,8 +74,8 @@ struct RingPlan {
 /// can, at least `minGap` positions after the issue (the pending bit set by the
 /// issue seen by the prefetch's decision) and at least one before the first
 /// use; one prefetch a position; a prefetch's entry its rank in the frame's
-/// prefetches mod R, R the fewest (at least the window) with which no two live
-/// prefetches share an entry, at most `maxEntries`.
+/// prefetches mod R, R the smallest power of two (at least the window) with
+/// which no two live prefetches share an entry, at most `maxEntries`.
 RingPlan planRing(llvm::ArrayRef<RingInstance> instances, unsigned ii,
                   unsigned lead, unsigned minGap, unsigned maxEntries);
 

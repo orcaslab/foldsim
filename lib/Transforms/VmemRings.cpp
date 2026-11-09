@@ -120,14 +120,17 @@ RingPlan foldsim::planRing(llvm::ArrayRef<RingInstance> instances, unsigned ii,
     plan.window = std::max(plan.window, live);
   }
   // Entries by rank in the frame's prefetches: consecutive prefetches take
-  // consecutive entries, so R a little over the window suffices, but where a
+  // consecutive entries, so R the window's power of two suffices, but where a
   // frame's wrap meets R.
   SmallVector<unsigned> byAt(n);
   std::iota(byAt.begin(), byAt.end(), 0u);
   llvm::stable_sort(byAt, [&](unsigned x, unsigned y) {
     return wrap(groups[x].at) < wrap(groups[y].at);
   });
-  for (unsigned r = std::max(2u, plan.window); r <= std::max(2u, std::min(n, maxEntries)); ++r) {
+  // R a power of two: an entry is then a digit of the rank, which a slot
+  // decoder (slot-segments) reads off the position without a table.
+  for (unsigned r = std::max(2u, unsigned(llvm::PowerOf2Ceil(plan.window)));
+       r <= std::max(2u, unsigned(llvm::PowerOf2Ceil(std::min(n, maxEntries)))); r *= 2) {
     bool clash = false;
     for (unsigned a = 0; a < n && !clash; ++a)
       for (unsigned c = a + r; c < n && !clash; c += r)
