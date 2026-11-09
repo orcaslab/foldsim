@@ -908,6 +908,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "stays in a store (a hazard register). A combinationally read memory "
            "of the class is read a stage after its address, from replicated "
            "address registers (state-in-ram-pp-fanout)">,
+    Option<"stateInRamPPPack", "state-in-ram-pp-pack", "bool", "true",
+           "With state-in-ram-pp: the registers a class's rows leave out "
+           "(hazards, deep ones, the others kept) packed into 72-bit columns "
+           "of an instance's row each (block RAM up to 1,024 instances, else "
+           "ultra), read at the instance two host cycles ahead and written a "
+           "host cycle after the state pass, as state-in-ram P = 1's rows; "
+           "given a state gap of 4, else (or false) a store each">,
     Option<"stateInRamPPFanout", "state-in-ram-pp-fanout", "unsigned", "96",
            "With state-in-ram-pp: the most RAM primitives a combinationally "
            "read memory's address register drives (the memory is banked by "
