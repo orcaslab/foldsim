@@ -264,6 +264,7 @@ struct Scan {
   /// The lane at index / bit `x` of a gather's source, -1 if none.
   int laneAt(Value src, uint64_t x);
   bool fullPack(ArrayRef<Value> values, int &pack);
+  bool splitRegisters();
 };
 
 static StringRef nameOf(Operation *op) {
@@ -912,17 +913,20 @@ void Scan::classify() {
     for (auto &op : *body) {
       if (isa<hw::OutputOp>(op))
         continue;
-      if (auto add = dyn_cast<comb::AddOp>(op)) {
+      if (isa<comb::AddOp, comb::SubOp>(op)) {
         bool carry = false;
-        if (add.getInputs().size() == 2) {
-          auto &a = get(add.getInputs()[0]), &b = get(add.getInputs()[1]);
+        if (op.getNumOperands() == 2) {
+          Value x = op.getOperand(0), y = op.getOperand(1);
+          auto &a = get(x), &b = get(y);
           APInt c;
+          auto layout = [](const Info &p, const Info &q) {
+            return p.w == q.w && p.base == q.base && p.stride == q.stride;
+          };
           if (a.kind == Kind::Vec &&
-              ((b.kind == Kind::Vec && a == b) ||
-               (b.kind == Kind::Scalar && isConstant(add.getInputs()[1], c))))
+              ((b.kind == Kind::Vec && layout(a, b)) ||
+               (b.kind == Kind::Scalar && isConstant(y, c))))
             carry = true;
-          if (b.kind == Kind::Vec && a.kind == Kind::Scalar &&
-              isConstant(add.getInputs()[0], c))
+          if (b.kind == Kind::Vec && a.kind == Kind::Scalar && isConstant(x, c))
             carry = true;
         }
         if (carry != carries.count(&op)) {
@@ -1922,6 +1926,203 @@ bool Scan::matchRotated(comb::MuxOp root) {
   return true;
 }
 
+
+/// Registers that hold a lane vector beside parent bits (a buffer of
+/// {onehot over the lanes, index, tag}) are split at the vector's ends, so
+/// that the vector part is per-lane state the cell keeps. Each bit's lane:
+/// what the register's next value puts there, through muxes on parent
+/// conditions and the registers themselves.
+bool Scan::splitRegisters() {
+  auto *body = parent.getBodyBlock();
+  SmallVector<seq::FirRegOp> regs;
+  for (auto reg : body->getOps<seq::FirRegOp>())
+    if (isa<IntegerType>(reg.getType()) && widthOf(reg.getResult()) > int64_t(F) &&
+        get(reg.getResult()).kind == Kind::Scalar && !reg.getPresetAttr())
+      regs.push_back(reg);
+  if (regs.empty())
+    return false;
+  // Lane of each bit (-1 a parent bit, -2 mixed), to a fixed point over the
+  // registers (initially parent bits).
+  DenseMap<Value, std::vector<int>> laneBits;
+  for (auto r : regs)
+    laneBits[r.getResult()] = std::vector<int>(widthOf(r.getResult()), -1);
+  std::function<bool(Value, std::vector<int> &, int)> bitLanes =
+      [&](Value v, std::vector<int> &out, int depth) -> bool {
+    int64_t w = widthOf(v);
+    if (w <= 0 || depth > 16)
+      return false;
+    if (auto it = laneBits.find(v); it != laneBits.end()) {
+      out = it->second;
+      return true;
+    }
+    if (auto m = v.getDefiningOp<comb::MuxOp>();
+        m && get(m.getCond()).kind == Kind::Scalar) {
+      std::vector<int> a, b2;
+      if (!bitLanes(m.getTrueValue(), a, depth + 1) ||
+          !bitLanes(m.getFalseValue(), b2, depth + 1))
+        return false;
+      out.resize(w);
+      for (int64_t k = 0; k < w; ++k)
+        out[k] = a[k] == -1 ? b2[k] : b2[k] == -1 ? a[k] : a[k] == b2[k] ? a[k] : -2;
+      return true;
+    }
+    std::vector<BitSrc> bs;
+    if (!bitsOf(v, bs))
+      return false;
+    out.resize(w);
+    for (int64_t k = 0; k < w; ++k)
+      out[k] = bs[k].k == BitSrc::Lane ? bs[k].lane
+               : bs[k].k == BitSrc::Opaque ? -2 : -1;
+    return true;
+  };
+  for (int iter = 0; iter < 8; ++iter) {
+    bool changed = false;
+    for (auto r : regs) {
+      std::vector<int> nb;
+      if (!bitLanes(r.getNext(), nb, 0))
+        continue;
+      auto &cur = laneBits[r.getResult()];
+      if (nb != cur) {
+        cur = nb;
+        changed = true;
+      }
+    }
+    if (!changed)
+      break;
+  }
+  if (getenv("FOLDSIM_LANE_SPLIT"))
+    for (auto r : regs) {
+      auto &lb = laneBits[r.getResult()];
+      int nl = 0, nm = 0;
+      for (int x : lb) {
+        nl += x >= 0;
+        nm += x == -2;
+      }
+      if (nl || nm)
+        llvm::errs() << "lane-split " << callee << " " << r.getNameAttr()
+                     << " w " << lb.size() << " lane bits " << nl
+                     << " mixed " << nm << "\n";
+    }
+  // A register to split: one run of slices of one width, lane j's the j-th
+  // (up or down), the other bits parent bits.
+  struct Cut {
+    int64_t lo, hi; // the lane run
+  };
+  DenseMap<Value, Cut> cuts;
+  for (auto r : regs) {
+    auto &lb = laneBits[r.getResult()];
+    int64_t w = lb.size(), lo = -1, hi = -1;
+    bool ok = true;
+    // (Mixed bits, a reduction's result say, may sit outside the run: they
+    // stay the parent's.)
+    for (int64_t k = 0; k < w && ok; ++k) {
+      if (lb[k] >= 0) {
+        if (lo < 0)
+          lo = k;
+        else if (hi != k - 1)
+          ok = false;
+        hi = k;
+      }
+    }
+    if (!ok || lo < 0)
+      continue;
+    int64_t n = hi - lo + 1;
+    if (n % F || (lo == 0 && hi == w - 1))
+      continue;
+    int64_t sw = n / F;
+    bool up = true, down = true;
+    for (int64_t k = lo; k <= hi; ++k) {
+      up &= lb[k] == (k - lo) / sw;
+      down &= lb[k] == int(F) - 1 - (k - lo) / sw;
+    }
+    if (up || down)
+      cuts[r.getResult()] = {lo, hi + 1};
+  }
+  if (cuts.empty())
+    return false;
+  // Split: each register into its segments; a value's slice pushed through
+  // muxes and concats onto the segments of the registers split alike.
+  OpBuilder b(parent.getBodyBlock(), parent.getBodyBlock()->begin());
+  auto loc = parent.getLoc();
+  DenseMap<Value, SmallVector<std::pair<int64_t, Value>>> segOf; // reg -> (lo, seg)
+  SmallVector<std::pair<seq::FirRegOp, SmallVector<int64_t>>> todo;
+  for (auto r : regs) {
+    auto it = cuts.find(r.getResult());
+    if (it == cuts.end())
+      continue;
+    int64_t w = widthOf(r.getResult());
+    SmallVector<int64_t> bounds{0};
+    if (it->second.lo > 0)
+      bounds.push_back(it->second.lo);
+    if (it->second.hi < w)
+      bounds.push_back(it->second.hi);
+    bounds.push_back(w);
+    todo.push_back({r, bounds});
+  }
+  // The new registers first (their next values after, as they read each
+  // other).
+  for (auto &[r, bounds] : todo) {
+    b.setInsertionPoint(r);
+    for (unsigned k = 0; k + 1 < bounds.size(); ++k) {
+      int64_t lo = bounds[k], len = bounds[k + 1] - lo;
+      Value rv;
+      Value next = hw::ConstantOp::create(b, loc, APInt(len, 0));
+      if (r.hasReset()) {
+        Value rvs = comb::ExtractOp::create(b, loc, r.getResetValue(), lo, len);
+        rv = seq::FirRegOp::create(b, loc, next, r.getClk(), r.getNameAttr(),
+                                   r.getReset(), rvs, hw::InnerSymAttr(),
+                                   r.getIsAsync());
+      } else {
+        rv = seq::FirRegOp::create(b, loc, next, r.getClk(), r.getNameAttr());
+      }
+      segOf[r.getResult()].push_back({lo, rv});
+    }
+  }
+  std::function<Value(Value, int64_t, int64_t, int)> slice =
+      [&](Value v, int64_t lo, int64_t len, int depth) -> Value {
+    if (auto it = segOf.find(v); it != segOf.end())
+      for (auto &[slo, seg] : it->second)
+        if (slo == lo && widthOf(seg) == len)
+          return seg;
+    if (depth < 16) {
+      if (auto m = v.getDefiningOp<comb::MuxOp>()) {
+        OpBuilder mb(m);
+        Value t = slice(m.getTrueValue(), lo, len, depth + 1);
+        Value f = slice(m.getFalseValue(), lo, len, depth + 1);
+        return comb::MuxOp::create(mb, m.getLoc(), m.getCond(), t, f,
+                                   m.getTwoState());
+      }
+    }
+    OpBuilder eb(parent.getBodyBlock()->getTerminator());
+    if (auto *d = v.getDefiningOp())
+      eb.setInsertionPointAfter(d);
+    else
+      eb.setInsertionPointToStart(parent.getBodyBlock());
+    if (lo == 0 && len == widthOf(v))
+      return v;
+    return comb::ExtractOp::create(eb, loc, v, lo, len);
+  };
+  for (auto &[r, bounds] : todo) {
+    auto &segs = segOf[r.getResult()];
+    for (auto &[lo, seg] : segs) {
+      auto reg = seg.getDefiningOp<seq::FirRegOp>();
+      Value n = slice(r.getNext(), lo, widthOf(seg), 0);
+      reg.getNextMutable().assign(n);
+    }
+  }
+  for (auto &[r, bounds] : todo) {
+    auto &segs = segOf[r.getResult()];
+    SmallVector<Value> parts;
+    for (auto &[lo, seg] : llvm::reverse(segs))
+      parts.push_back(seg);
+    OpBuilder cb(r);
+    Value whole = comb::ConcatOp::create(cb, loc, parts);
+    r.getResult().replaceAllUsesWith(whole);
+    r.erase();
+  }
+  return true;
+}
+
 void LaneScanPass::runOnOperation() {
   auto top = getOperation();
   auto parent = top.lookupSymbol<hw::HWModuleOp>(module);
@@ -1989,6 +2190,12 @@ void LaneScanPass::runOnOperation() {
     s.F = insts.size();
     for (auto [j, inst] : llvm::enumerate(insts))
       s.laneOf[inst] = j;
+    // Registers holding a lane vector beside parent bits: split first.
+    s.classify();
+    if (s.splitRegisters()) {
+      s.info.clear();
+      s.red.clear();
+    }
     // Rounds: classify, group into packs, recognize reductions (whose
     // results are parent values from then on), until nothing new.
     for (int round = 0; round < 32; ++round) {
@@ -2685,15 +2892,20 @@ void LaneScanPass::runOnOperation() {
         } else if (s.carries.count(&op)) {
           // The carry chain: {cout, sum} = a + b + cin, a lane at a time
           // from the lowest bits.
-          auto add = cast<comb::AddOp>(op);
+          // (a - b is a + ~b with a carry of 1 into the lowest lane.)
+          bool sub = isa<comb::SubOp>(op);
           SmallVector<Value> terms;
-          for (Value o : add.getInputs())
+          for (Value o : op.getOperands())
             terms.push_back(s.get(o).kind == Kind::Vec ? cellValue(o)
                                                        : laneSlices(o, i));
+          if (sub)
+            terms[1] = comb::XorOp::create(
+                b, terms[1], hw::ConstantOp::create(b, APInt::getAllOnes(i.w)),
+                false);
           int c = chains.size();
           chains.push_back({b.getI1Type(),
                             hw::ConstantOp::create(pb, parent.getLoc(),
-                                                   APInt(1, 0)),
+                                                   APInt(1, sub ? 1 : 0)),
                             i.stride < 0});
           Value cin = cbody->addArgument(b.getI1Type(), parent.getLoc());
           ins.push_back({"ch" + std::to_string(c) + "_in", b.getI1Type(), {}});
