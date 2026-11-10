@@ -463,6 +463,12 @@ bool Scan::bitsOf(Value v, std::vector<BitSrc> &out) {
       out.push_back({BitSrc::Lane, i.lane, v, unsigned(b)});
     return true;
   case Kind::Vec:
+    // An assembled vector: its bits as assembled (constants where a lane is
+    // left out).
+    if (auto it = bits.find(v); it != bits.end()) {
+      out = it->second;
+      return true;
+    }
     out.resize(w);
     for (unsigned j = 0; j < F; ++j)
       for (int64_t b = 0; b < i.w; ++b)
@@ -604,6 +610,7 @@ Info Scan::assemble(Operation *op, Value res) {
     return Info::multi(); // constants: the canonicalizer's, not ours
   if (lane >= 0) {
     assembled[res] = pieces(out);
+    bits[res] = std::move(out); // its constant bits stay known
     return Info::elem(lane);
   }
   // A full lane vector: slices of one width in lane order (up or down), each
