@@ -462,6 +462,8 @@ def frame_options(a):
         fold += f' link-ultra-depth={a.link_ultra_depth}'
     if getattr(a, 'link_hbm_lead', 0):
         fold += f' link-hbm-lead={a.link_hbm_lead}'
+    if getattr(a, 'link_hbm_beat_bits', 0):
+        fold += f' link-hbm-beat-bits={a.link_hbm_beat_bits}'
     if getattr(a, 'link_hbm_row_bits', 0):
         fold += f' link-hbm-row-bits={a.link_hbm_row_bits}'
     if getattr(a, 'link_hbm_min_lead', 0):
@@ -1667,6 +1669,10 @@ def build_parser():
                     help='with --static and hbm link kinds: the most positions a stream row\'s request '
                          'precedes its landing, the memory\'s round trip in host cycles and a margin '
                          '(foldsim-fold-static; 0: its default, 48)')
+    ap.add_argument('--link-hbm-beat-bits', type=int, default=0, metavar='N',
+                    help='with --static and hbm link kinds: a stream row wider than N bits moves as beats of '
+                         'a controller N bits wide where the positions allow (foldsim-fold-static '
+                         'link-hbm-beat-bits; 0: whole rows)')
     ap.add_argument('--link-hbm-row-bits', type=int, default=0, metavar='N',
                     help='with --static and hbm link kinds: the most bits of a stream row, its controller\'s '
                          'data width (8 to 4096; foldsim-fold-static; 0: its default, 512). A wider word is cut '

@@ -682,6 +682,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "row's request precedes its landing (the memory's round trip in "
            "host cycles and a margin; less where a stream's writes come "
            "later)">,
+    Option<"linkHbmBeatBits", "link-hbm-beat-bits", "unsigned", "0",
+           "HBM link streams on their own controllers: a row wider than this "
+           "many bits moves as beats (at most 8) of a controller this wide, "
+           "requested at the positions before its landing's request and "
+           "written at those after its page's write, the landing slot written "
+           "beat by beat (no pass spaced: only where the landings and the "
+           "producer's passes leave the positions, else whole rows). A "
+           "controller costs its width (0: whole rows)">,
     Option<"linkHbmRowBits", "link-hbm-row-bits", "unsigned", "512",
            "HBM link streams: the most bits of a stream's row (its "
            "controller's data width, 8 to 4096): a wider word is cut into "

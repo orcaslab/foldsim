@@ -876,6 +876,7 @@ public:
   /// `link-hbm-row-bits`: the most bits of an HBM link stream's row (its
   /// controller's DW): a wider word is cut into rows (pages) of this many.
   unsigned linkHbmRowBits = 512;
+  unsigned linkHbmBeatBits = 0;
   /// `min-ii` (with modulo): the shortest frame the search starts from; the
   /// positions beyond the schedule's own stay idle. A longer frame is a
   /// longer prefetch distance for every request a pass issues (for studies
@@ -1415,6 +1416,20 @@ private:
     /// (producer instance, page, the frame's flip for the bank).
     SmallVector<uint64_t> popValid, popInst, popRow, popPage;
     SmallVector<uint64_t> reqValid, reqRow, reqPage, reqFlip;
+    /// `link-hbm-beat-bits`: a row moves as `beats` requests and writes of
+    /// `beatWidth()` bits each (its controller that wide), at consecutive
+    /// positions: a landing's beats from beats - 1 positions before its
+    /// request position, a page's from its write position (pages `beats`
+    /// apart); the landing slot written beat by beat. The tables hold each
+    /// row's first beat alone (the stream's own tables, shifted); counters
+    /// step the beats.
+    unsigned beats = 1;
+    unsigned beatBits() const { return beats > 1 ? llvm::Log2_32_Ceil(beats) : 0; }
+    unsigned beatWidth() const {
+      return beats > 1 ? unsigned(llvm::alignTo(llvm::divideCeil(dw, beats), 8)) : dw;
+    }
+    /// The controller's data width: a beat's.
+    unsigned portDW() const { return beatWidth(); }
     uint64_t readRows = 0;
     /// The simulator's virtual memory serving it (port vm<k>), once built;
     /// or, carried by a page engine (`page-engines`), that engine and its
@@ -1454,7 +1469,7 @@ private:
     /// landing slot, a write's has the top bit set, so no write ever carries
     /// the tag of an outstanding read (the controller's guarantees hold per
     /// tag and instance). The port's width is both.
-    unsigned tagBits() const { return instBits() + 1; }
+    unsigned tagBits() const { return instBits() + beatBits() + 1; }
     unsigned portInstBits() const { return tagBits() + 1; }
     /// `link-hbm-fit-slots`: the landing slots the placement needs (0: the
     /// most a lead takes, pow2(lead + 8)).
@@ -1628,8 +1643,11 @@ private:
   void reportPageEngines(raw_ostream &os);
   unsigned streamRowBits(const LinkStream &s) const {
     return 1 + s.rowIndexBits(classes[s.pcls].threads()) +
-           (s.pages > 1 ? llvm::Log2_32_Ceil(s.pages) : 0);
+           (s.pages > 1 ? llvm::Log2_32_Ceil(s.pages) : 0) + s.beatBits();
   }
+  /// `link-hbm-beat-bits`: the beats a stream's rows may take where its
+  /// positions leave room (planStreams), else 1.
+  unsigned streamBeats(const LinkStream &st) const;
   /// The page of the links from producer `p` to class `reader` (0: none).
   unsigned linkPageRule(unsigned p, unsigned reader) const {
     if (linkKinds.empty())
@@ -4875,18 +4893,75 @@ LogicalResult StaticFolder::planStreams() {
       for (unsigned j = 0; j < st.pages; ++j)
         writes.push_back(w + 1 + int(j));
     bool collide = false;
+    st.beats = 1;
     setStreamTables(st, requests, writes, collide);
+    // `link-hbm-beat-bits`: a wide row as beats where the positions allow
+    // (a stream carried by its own controller).
+    if (unsigned k = streamBeats(st); k > 1 && !collide) {
+      st.beats = k;
+      setStreamTables(st, requests, writes, collide);
+    }
     // A csf-mailbox-hbm stream's landing slots: the fewest its landings
     // need (fitSlots: those landing within its lead, not pow2(lead + 8)
-    // for a reader whose passes are apart).
-    if (st.twoSets && !linkHbmFitSlots)
-      st.slotCount = fitSlots(st, requests);
+    // for a reader whose passes are apart); a beat's request is up to
+    // beats - 1 positions earlier.
+    if (st.twoSets && !linkHbmFitSlots) {
+      SmallVector<int> earliest(requests.begin(), requests.end());
+      for (int &t : earliest)
+        t -= int(st.beats) - 1;
+      st.slotCount = fitSlots(st, earliest);
+    }
     if (collide)
       return netlist.emitError("link streams: ")
              << modelOf(st.pcls) << " -> " << modelOf(st.rcls)
              << ": two landings in one position (the reader's link port)";
   }
   return success();
+}
+
+unsigned StaticFolder::streamBeats(const LinkStream &st) const {
+  if (!linkHbmBeatBits || st.dw <= linkHbmBeatBits || st.landings.empty() ||
+      st.writePasses.empty() || pageEngineCap)
+    return 1;
+  unsigned k = std::min(8u, unsigned(llvm::divideCeil(st.dw, linkHbmBeatBits)));
+  static const bool log = getenv("FOLDSIM_BEAT_LOG");
+  auto no = [&](const char *why) -> unsigned {
+    if (log)
+      llvm::errs() << "link-hbm-beat-bits: " << modelOf(st.pcls) << " -> " << modelOf(st.rcls)
+                   << " " << st.dw << " bits: whole rows (" << why << ")\n";
+    return 1;
+  };
+  int frame = int(ii);
+  auto mod = [&](int x) { return ((x % frame) + frame) % frame; };
+  // A landing's beats requested at its request position and the k - 1
+  // before it: the landings at least k positions apart (no two requests at
+  // a position).
+  SmallVector<int> at;
+  for (auto &l : st.landings)
+    at.push_back(mod(l.q));
+  llvm::sort(at);
+  for (size_t x = 0; x < at.size(); ++x) {
+    int next = x + 1 < at.size() ? at[x + 1] : at[0] + frame;
+    if (next - at[x] < int(k))
+      return no("landings closer than the beats");
+  }
+  // A pass's pages written beat by beat after it, all before the next pass
+  // (the held word is the pass's until then).
+  auto &w = st.writePasses;
+  for (size_t x = 0; x < w.size(); ++x) {
+    int next = x + 1 < w.size() ? w[x + 1] : w[0] + frame;
+    if (next - w[x] < int(st.pages * k))
+      return no("producer passes closer than the beats");
+  }
+  // A request moved k - 1 earlier and a write pages (k - 1) later keep the
+  // read after the frame before's write (the stream's room past its lead).
+  if ((k - 1) * (1 + st.pages) > st.room - st.lead)
+    return no("no room past the lead");
+  // The earliest beat after its slot's previous landing (its 8-position
+  // margin at the lead).
+  if (k - 1 >= 8)
+    return 1;
+  return k;
 }
 
 void StaticFolder::setStreamTables(LinkStream &st, ArrayRef<int> requests,
@@ -4901,6 +4976,10 @@ void StaticFolder::setStreamTables(LinkStream &st, ArrayRef<int> requests,
                   &st.writeValid, &st.writePage})
     v->assign(ii + 1, 0);
   st.shift = 0;
+  // (With beats: a landing's beat b requested beats - 1 - b positions
+  // before its request position, the last there; a page's beat b written
+  // b positions after its first, the pages beats apart.)
+  int k = int(st.beats);
   for (auto [l, t] : llvm::zip(st.landings, requests)) {
     unsigned pos = mod(l.q);
     if (st.popValid[pos])
@@ -4909,13 +4988,16 @@ void StaticFolder::setStreamTables(LinkStream &st, ArrayRef<int> requests,
     st.popInst[pos] = l.inst;
     st.popRow[pos] = l.row;
     st.popPage[pos] = l.page;
-    st.popLead[pos] = unsigned(l.q - t);
+    st.popLead[pos] = unsigned(l.q - t + k - 1);
     st.shift = std::max(st.shift, unsigned(l.q - t) - st.lead);
-    unsigned tpos = mod(t);
+    int tb = t - (k - 1);
+    unsigned tpos = mod(tb);
+    if (k > 1 && st.reqValid[tpos])
+      collide = true;
     st.reqValid[tpos] = 1;
     st.reqRow[tpos] = l.row;
     st.reqPage[tpos] = l.page;
-    st.reqFlip[tpos] = floorDiv(t) & 1;
+    st.reqFlip[tpos] = floorDiv(tb) & 1;
   }
   unsigned x = 0;
   st.writeShift = 0;
@@ -4923,7 +5005,9 @@ void StaticFolder::setStreamTables(LinkStream &st, ArrayRef<int> requests,
     for (unsigned j = 0; j < st.pages; ++j) {
       st.writeShift = std::max(
           st.writeShift, unsigned(writes[x] - (st.writePasses[p] + 1 + int(j))));
-      unsigned pos = mod(writes[x++]);
+      int w0 = k > 1 ? st.writePasses[p] + 1 + int(j) * k : writes[x];
+      ++x;
+      unsigned pos = mod(w0);
       st.writeValid[pos] = 1;
       st.writePage[pos] = j;
     }
@@ -18434,7 +18518,7 @@ LogicalResult StaticFolder::buildSim() {
     simVirtuals.push_back({unsigned(k), unsigned(k), unsigned(numIn), true});
     auto iw = IntegerType::get(context, st.portInstBits());
     auto aw = IntegerType::get(context, streamRowBits(st));
-    auto dw = IntegerType::get(context, st.dw);
+    auto dw = IntegerType::get(context, st.portDW());
     addPort(name + "rsp_valid", i1, true);
     addPort(name + "rsp_inst", iw, true);
     addPort(name + "rsp_data", dw, true);
@@ -18447,7 +18531,7 @@ LogicalResult StaticFolder::buildSim() {
     addPort(name + "wr_row", aw, false);
     addPort(name + "wr_data", dw, false);
     addPort(name + "wr_mask",
-            st.mailbox ? IntegerType::get(context, st.dw / 8) : i1, false);
+            st.mailbox ? IntegerType::get(context, st.portDW() / 8) : i1, false);
   }
   // Each page engine's: {tag, instance 0} requests, {member, instance, row}
   // rows, byte masks.
@@ -20209,11 +20293,16 @@ LogicalResult StaticFolder::buildSim() {
     // A response's landing slot: its tag's low bits, above the instance bit
     // (carried by a page engine: the engine's answer whose member is this
     // stream, the slot its member tag's low bits).
-    Value rsp, rspInst, rspData;
+    Value rsp, rspInst, rspData, rspBeat;
     if (st.engine < 0) {
       rsp = body->getArgument(simVirtuals[st.vm].firstInput);
       rspInst = b.createOrFold<comb::ExtractOp>(
           b.getIntegerType(ib), body->getArgument(simVirtuals[st.vm].firstInput + 1), 1);
+      // (Beats: the beat in the tag above the slot.)
+      if (st.beats > 1)
+        rspBeat = b.createOrFold<comb::ExtractOp>(
+            b.getIntegerType(st.beatBits()), body->getArgument(simVirtuals[st.vm].firstInput + 1),
+            1 + ib);
       rspData = body->getArgument(simVirtuals[st.vm].firstInput + 2);
     } else {
       auto &eng = pageEngines[st.engine];
@@ -20318,14 +20407,30 @@ LogicalResult StaticFolder::buildSim() {
     sb.popPtr = resetReg(popNext, prefix + "_popptr", 0);
     popNext.setValue(comb::AddOp::create(
         b, sb.popPtr, b.createOrFold<comb::ConcatOp>(constant(ib - 1, 0), take0)));
+    // (Beats: the slot written a beat at a time, its mask the beat's.)
+    unsigned kb = st.beats, bw = st.beatWidth(), bb = st.beatBits();
+    unsigned landW = kb > 1 ? kb * bw : st.dw;
     auto landing = seq::FirMemOp::create(
-        b, seq::FirMemType::get(context, slots, st.dw, 1), /*readLatency=*/0,
+        b, seq::FirMemType::get(context, slots, landW, kb > 1 ? std::optional<uint32_t>(kb) : 1),
+        /*readLatency=*/0,
         /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
         b.getStringAttr(prefix + "_landing"), hw::InnerSymAttr{},
         seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
-    seq::FirMemWriteOp::create(b, landing, rspInst, hostClock, rsp, rspData, Value{});
+    if (kb > 1) {
+      SmallVector<Value> copiesOf(kb, rspData);
+      Value one = b.createOrFold<comb::ConcatOp>(constant(kb - 1, 0), constant(1, 1));
+      Value mask = comb::ShlOp::create(
+          b, one, bb < kb ? Value(b.createOrFold<comb::ConcatOp>(constant(kb - bb, 0), rspBeat))
+                          : rspBeat);
+      seq::FirMemWriteOp::create(b, landing, rspInst, hostClock, rsp,
+                                 b.createOrFold<comb::ConcatOp>(copiesOf), mask);
+    } else {
+      seq::FirMemWriteOp::create(b, landing, rspInst, hostClock, rsp, rspData, Value{});
+    }
     Value read = seq::FirMemReadOp::create(b, landing, sb.popPtr, hostClock,
                                           constant(1, 1));
+    if (landW != st.dw)
+      read = b.createOrFold<comb::ExtractOp>(b.getIntegerType(st.dw), read, 0);
     sb.data = comb::MuxOp::create(b, skip0, constant(st.dw, 0), read);
     sb.raw = read;
     sb.skip = skip0;
@@ -20338,21 +20443,65 @@ LogicalResult StaticFolder::buildSim() {
       rowBits.push_back(chain3(table(b, rctl.at3, st.reqRow, pIdx), prefix + "_rrow"));
     if (pgBits)
       rowBits.push_back(chain3(table(b, rctl.at3, st.reqPage, pgBits), prefix + "_rpage"));
+    // (Beats: the table's request a landing's first beat; the next beats
+    // at the reader's next positions (a real one each: not a bubble's `ii`),
+    // the row held from the first, the beat the row's low bits; the slot
+    // pointer steps at the last.)
+    Value rbeat0, reqStep = req0;
+    if (kb > 1) {
+      SmallVector<uint64_t> real(ii + 1, 1);
+      real[ii] = 0;
+      Value ev0 = chain3r(table(b, rctl.at3, real, 1), prefix + "_rev");
+      auto beatNext = backedges.get(b.getIntegerType(bb));
+      auto actNext = backedges.get(i1);
+      Value beatR = resetReg(beatNext, prefix + "_rbeat", 0);
+      Value actR = resetReg(actNext, prefix + "_ract", 0);
+      Value start = req0;
+      Value issue = comb::OrOp::create(b, start, comb::AndOp::create(b, actR, ev0));
+      rbeat0 = comb::MuxOp::create(b, start, constant(bb, 0), beatR);
+      Value lastBeat = eq(rbeat0, kb - 1);
+      beatNext.setValue(comb::MuxOp::create(
+          b, issue, comb::AddOp::create(b, rbeat0, constant(bb, 1)), beatR));
+      actNext.setValue(comb::MuxOp::create(b, issue, notOf(lastBeat), actR));
+      Value rowNow = b.createOrFold<comb::ConcatOp>(rowBits);
+      auto rowNext = backedges.get(rowNow.getType());
+      Value rowR = reg(rowNext, prefix + "_rrowheld");
+      Value rowAt = comb::MuxOp::create(b, start, rowNow, rowR);
+      rowNext.setValue(rowAt);
+      rowBits.assign({rowAt, rbeat0});
+      req0 = issue;
+      reqStep = comb::AndOp::create(b, issue, lastBeat);
+    }
     auto reqNext = backedges.get(b.getIntegerType(ib));
     Value reqPtr = resetReg(reqNext, prefix + "_reqptr", 0);
     reqNext.setValue(comb::AddOp::create(
-        b, reqPtr, b.createOrFold<comb::ConcatOp>(constant(ib - 1, 0), req0)));
-    // Pending slots: set by a request, cleared by its response.
-    auto pendNext = backedges.get(b.getIntegerType(slots));
-    sb.pending = resetReg(pendNext, prefix + "_pending", 0);
+        b, reqPtr, b.createOrFold<comb::ConcatOp>(constant(ib - 1, 0), reqStep)));
+    // Pending slots: set by a request, cleared by its response (beats: a
+    // bit a slot's beat, the slot pending while any is).
+    unsigned pbits = slots * kb, pb = ib + bb;
+    auto pendNext = backedges.get(b.getIntegerType(pbits));
+    Value pendAll = resetReg(pendNext, prefix + "_pending", 0);
     auto bitAt = [&](Value on, Value at) -> Value {
-      Value one = b.createOrFold<comb::ConcatOp>(constant(slots - 1, 0), on);
+      Value one = b.createOrFold<comb::ConcatOp>(constant(pbits - 1, 0), on);
       return comb::ShlOp::create(
-          b, one, b.createOrFold<comb::ConcatOp>(constant(slots - ib, 0), at));
+          b, one, b.createOrFold<comb::ConcatOp>(constant(pbits - pb, 0), at));
     };
-    Value set = comb::OrOp::create(b, sb.pending, bitAt(req0, reqPtr));
+    Value reqAt = kb > 1 ? b.createOrFold<comb::ConcatOp>(reqPtr, rbeat0) : reqPtr;
+    Value rspAt = kb > 1 ? b.createOrFold<comb::ConcatOp>(rspInst, rspBeat) : rspInst;
+    Value set = comb::OrOp::create(b, pendAll, bitAt(req0, reqAt));
     pendNext.setValue(comb::AndOp::create(
-        b, set, comb::XorOp::create(b, bitAt(rsp, rspInst), constant(slots, ~0ull))));
+        b, set, comb::XorOp::create(b, bitAt(rsp, rspAt), hw::ConstantOp::create(b, APInt::getAllOnes(pbits)))));
+    if (kb > 1) {
+      SmallVector<Value> slotBits;
+      for (unsigned sl = slots; sl-- > 0;)
+        slotBits.push_back(comb::ICmpOp::create(
+            b, comb::ICmpPredicate::ne,
+            b.createOrFold<comb::ExtractOp>(b.getIntegerType(kb), pendAll, sl * kb),
+            constant(kb, 0)));
+      sb.pending = b.createOrFold<comb::ConcatOp>(slotBits);
+    } else {
+      sb.pending = pendAll;
+    }
     // The writes: the word held at the producer's pass, a row a host cycle
     // over the pages after it, at {bank, instance, page}.
     Value pass2 = !st.atReady ? pctl.state2
@@ -20435,6 +20584,38 @@ LogicalResult StaticFolder::buildSim() {
                                comb::ICmpOp::create(b, comb::ICmpPredicate::eq, wp0,
                                                     constant(pgBits, st.pages - 1))))
                          : wv0;
+    // (Beats: the table's write a page's first beat, the next beats at the
+    // producer's next real positions, the page held from the first; the
+    // pass's last write its last page's last beat.)
+    Value wb0;
+    if (kb > 1) {
+      SmallVector<uint64_t> real(ii + 1, 1);
+      real[ii] = 0;
+      Value ev0 = chain3r(table(b, pctl.at3, real, 1), prefix + "_wev");
+      auto beatNext = backedges.get(b.getIntegerType(bb));
+      auto actNext = backedges.get(i1);
+      Value beatR = resetReg(beatNext, prefix + "_wbeat", 0);
+      Value actR = resetReg(actNext, prefix + "_wact", 0);
+      Value start = wv0;
+      Value issue = comb::OrOp::create(b, start, comb::AndOp::create(b, actR, ev0));
+      wb0 = comb::MuxOp::create(b, start, constant(bb, 0), beatR);
+      Value lastBeat = eq(wb0, kb - 1);
+      beatNext.setValue(comb::MuxOp::create(
+          b, issue, comb::AddOp::create(b, wb0, constant(bb, 1)), beatR));
+      actNext.setValue(comb::MuxOp::create(b, issue, notOf(lastBeat), actR));
+      if (pgBits) {
+        auto pageNext = backedges.get(b.getIntegerType(pgBits));
+        Value pageR = reg(pageNext, prefix + "_wpageheld");
+        wp0 = comb::MuxOp::create(b, start, wp0, pageR);
+        pageNext.setValue(wp0);
+        lastW = comb::AndOp::create(
+            b, issue, eq(wp0, st.pages - 1));
+      } else {
+        lastW = issue;
+      }
+      lastW = comb::AndOp::create(b, lastW, lastBeat);
+      wv0 = issue;
+    }
     armNext.setValue(comb::MuxOp::create(
         b, we0, constant(1, 1), comb::MuxOp::create(b, lastW, constant(1, 0), armed)));
     Value we = comb::AndOp::create(b, wv0, armed);
@@ -20456,7 +20637,33 @@ LogicalResult StaticFolder::buildSim() {
                      ? b.createOrFold<comb::ConcatOp>(
                            constant(padded - st.wordBits, 0), held)
                      : held;
-    if (pgBits) {
+    // (Beats: page j's beat b the bits [b bw, (b + 1) bw) of its dw, zero
+    // past them; the row {held at, page, beat}.)
+    auto slice = [&](Value v, unsigned lo, unsigned n, unsigned w) -> Value {
+      unsigned have = hw::getBitWidth(v.getType());
+      unsigned take = lo >= have ? 0 : std::min(n, have - lo);
+      if (!take)
+        return constant(w, 0);
+      Value x = b.createOrFold<comb::ExtractOp>(b.getIntegerType(take), v, lo);
+      return take < w ? b.createOrFold<comb::ConcatOp>(constant(w - take, 0), x) : x;
+    };
+    if (kb > 1) {
+      SmallVector<Value> chunks, index;
+      unsigned ib2 = pgBits + bb;
+      for (unsigned x = 1u << ib2; x-- > 0;) {
+        unsigned j = x >> bb, bt = x & ((1u << bb) - 1);
+        chunks.push_back(j < st.pages && bt < kb
+                             ? slice(wide, j * st.dw + bt * bw, std::min(bw, st.dw - std::min(st.dw, bt * bw)), bw)
+                             : constant(bw, 0));
+      }
+      Value at = pgBits ? b.createOrFold<comb::ConcatOp>(wp0, wb0) : wb0;
+      wrData = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), at);
+      SmallVector<Value> rowParts{heldAt};
+      if (pgBits)
+        rowParts.push_back(wp0);
+      rowParts.push_back(wb0);
+      wrRow = b.createOrFold<comb::ConcatOp>(rowParts);
+    } else if (pgBits) {
       Value index = wp0;
       SmallVector<Value> chunks;
       for (unsigned j = 1u << pgBits; j-- > 0;)
@@ -20469,7 +20676,19 @@ LogicalResult StaticFolder::buildSim() {
       wrData = wide;
     }
     Value wrMask = constant(1, 1);
-    if (st.mailbox) {
+    if (st.mailbox && kb > 1) {
+      unsigned mb = st.dw / 8, bmb = bw / 8;
+      SmallVector<Value> chunks;
+      unsigned ib2 = pgBits + bb;
+      for (unsigned x = 1u << ib2; x-- > 0;) {
+        unsigned j = x >> bb, bt = x & ((1u << bb) - 1);
+        chunks.push_back(j < st.pages && bt < kb
+                             ? slice(heldMask, j * mb + bt * bmb, std::min(bmb, mb - std::min(mb, bt * bmb)), bmb)
+                             : constant(bmb, 0));
+      }
+      Value at = pgBits ? b.createOrFold<comb::ConcatOp>(wp0, wb0) : wb0;
+      wrMask = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), at);
+    } else if (st.mailbox) {
       unsigned mb = st.dw / 8;
       wrMask = heldMask;
       if (pgBits) {
@@ -20483,12 +20702,13 @@ LogicalResult StaticFolder::buildSim() {
     }
     // Requests' {tag, instance}: a read's tag its slot, a write's the top
     // bit alone; instance 0.
-    sb.outs = {req0,
-               b.createOrFold<comb::ConcatOp>(
-                   ValueRange{constant(1, 0), reqPtr, constant(1, 0)}),
+    // (Beats: a read's tag {beat, slot}.)
+    Value readTag = kb > 1 ? b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 0), rbeat0, reqPtr, constant(1, 0)})
+                           : b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 0), reqPtr, constant(1, 0)});
+    sb.outs = {req0, readTag,
                b.createOrFold<comb::ConcatOp>(rowBits), we,
                b.createOrFold<comb::ConcatOp>(
-                   ValueRange{constant(1, 1), constant(ib, 0), constant(1, 0)}),
+                   ValueRange{constant(1, 1), constant(ib + bb, 0), constant(1, 0)}),
                wrRow, wrData, wrMask};
     return sb;
   };
@@ -23094,8 +23314,8 @@ LogicalResult StaticFolder::buildSim() {
         virtuals.push_back(b.getStringAttr(
             "link_" + modelOf(st.pcls) + "_" + modelOf(st.rcls) + ":__link" +
             Twine(v.k) + ":" + Twine(st.portInstBits()) + ":" +
-            Twine(streamRowBits(st)) + ":" + Twine(st.dw) + ":" +
-            Twine(st.mailbox ? st.dw / 8 : 1) + ":0:1:" +
+            Twine(streamRowBits(st)) + ":" + Twine(st.portDW()) + ":" +
+            Twine(st.mailbox ? st.portDW() / 8 : 1) + ":0:1:" +
             Twine(st.tagBits())));
         continue;
       }
@@ -23806,6 +24026,7 @@ void FoldStaticPass::runOnOperation() {
     return signalPassFailure();
   }
   folder.linkHbmRowBits = linkHbmRowBits;
+  folder.linkHbmBeatBits = linkHbmBeatBits;
   folder.minII = minII;
   folder.slrSerializeSpecs.assign(slrSerialize.begin(), slrSerialize.end());
   folder.readyChoice = readyChoice;
