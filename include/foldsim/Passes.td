@@ -45,7 +45,12 @@ def ExtractModels : Pass<"foldsim-extract-models", "::mlir::ModuleOp"> {
     them, with the `foldsim.netlist` attribute. Instances of the parent elsewhere
     stay valid, so a netlist can be cut out of its own parent in turn. A model
     output the parent's logic does not read then has no input on it, and a
-    model input only constants drive is connected to them.
+    model input only constants drive is connected to them. With
+    `direct-outputs` too, an output of the parent that is only wiring of
+    models' outputs, inputs of the parent and constants is connected to them
+    in the netlist, as a model input is: the parent's model does not pass it
+    on (a port bundle of a child wired straight out of the top stays the
+    child's).
 
     With `absorb-logic=N`, an input of a model that the parent drives with
     logic of at most N ops over models' outputs, inputs of the parent and the
@@ -92,6 +97,11 @@ def ExtractModels : Pass<"foldsim-extract-models", "::mlir::ModuleOp"> {
                "The modules simulated as separate models">,
     Option<"netlist", "netlist", "bool", "false",
            "Keep the parent as a netlist of its logic and the models">,
+    Option<"directOutputs", "direct-outputs", "bool", "false",
+           "With netlist: an output of the parent wired from models' outputs, "
+           "inputs of the parent and constants only (no logic) is wired so in "
+           "the netlist, not passed through the parent's model (whose output "
+           "is then a constant no one reads)">,
     ListOption<"inputBits", "input-bits", "std::string",
                "The inputs to take for the outputs of the models, as "
                "<instance>_<port>:<hi>:<lo>, to match an existing interface; "

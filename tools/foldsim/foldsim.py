@@ -1439,6 +1439,10 @@ def build_parser():
                          "alone, the rest as inputs: a per-port select in front of a per-port "
                          "class is then one copy in the class (foldsim-extract-models "
                          "absorb-exclusive)")
+    ap.add_argument('--direct-outputs', action='store_true',
+                    help='an output of a module that only wires out its classes\' outputs, its inputs and constants (a '
+                         'port bundle of a child passed straight out of the top) is wired so in the netlist, not passed '
+                         'through the module\'s own model (foldsim-extract-models direct-outputs)')
     ap.add_argument('--absorb-registers', action='store_true',
                     help="with --absorb-exclusive: the logic a model input alone reads may pass "
                          "through registers (a per-port pipeline register and the select in front "
@@ -2158,7 +2162,8 @@ def main():
             exclusive += ' absorb-registers'
             if a.absorb_register_logic:
                 exclusive += f' absorb-register-logic={a.absorb_register_logic}'
-        passes.append(f'foldsim-extract-models{{module={m}{models} netlist absorb-logic={ABSORB_LOGIC}{exclusive}}}')
+        direct = ' direct-outputs' if getattr(a, 'direct_outputs', False) else ''
+        passes.append(f'foldsim-extract-models{{module={m}{models} netlist absorb-logic={ABSORB_LOGIC}{exclusive}{direct}}}')
         fused = [g for g in groups if set(g) <= children[m]]
         if fused:
             passes.append(f'foldsim-fuse-models{{module={m} groups={",".join("+".join(g) for g in fused)}}}')
