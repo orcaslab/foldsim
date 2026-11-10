@@ -682,6 +682,10 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "row's request precedes its landing (the memory's round trip in "
            "host cycles and a margin; less where a stream's writes come "
            "later)">,
+    Option<"pageEnginesPP", "page-engines-pp", "bool", "false",
+           "With page-engines and state-in-ram-pp's streamed rows: a PP class's "
+           "row chunks ride the page engines (members at their own read and "
+           "write positions) instead of a controller each">,
     Option<"linkHbmBeatBits", "link-hbm-beat-bits", "unsigned", "0",
            "HBM link streams on their own controllers: a row wider than this "
            "many bits moves as beats (at most 8) of a controller this wide, "

@@ -880,6 +880,7 @@ public:
   /// controller's DW): a wider word is cut into rows (pages) of this many.
   unsigned linkHbmRowBits = 512;
   unsigned linkHbmBeatBits = 0;
+  bool pageEnginesPP = false;
   /// `min-ii` (with modulo): the shortest frame the search starts from; the
   /// positions beyond the schedule's own stay idle. A longer frame is a
   /// longer prefetch distance for every request a pass issues (for studies
@@ -5226,6 +5227,55 @@ LogicalResult StaticFolder::assignPageEngines() {
     pageEngines.back().writes.assign(ii + 1, 0);
     return pageEngines.back();
   };
+  // `page-engines-pp`: a streamed PP class's row chunks (a controller
+  // each otherwise) ride engines too, first (the link streams fill the
+  // positions they leave): each chunk at its class's own positions, its
+  // prefetch reads (ppStreamRows) and its passes' writes (row j of a
+  // streamed instance at its pass, the write a host cycle later), on the
+  // first engine where they are free (a class's chunks, at the same
+  // positions, so on distinct engines).
+  if (pageEnginesPP)
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      if (!cls.pp || !cls.ppHbm)
+        continue;
+      SmallVector<uint64_t> readRow, instRow, rowRow;
+      ppStreamRows(cls, readRow, instRow, rowRow);
+      SmallVector<unsigned> rq, wr;
+      for (unsigned q = 0; q < ii; ++q)
+        if (readRow[q])
+          rq.push_back(q);
+      for (unsigned i = 0; i < cls.threads(); ++i) {
+        if (!cls.ppStreamed.empty() && !cls.ppStreamed[i])
+          continue;
+        for (unsigned j = 0; j < cls.pp; ++j)
+          wr.push_back(wrap(cls.slot[kState][i] - int(cls.stages) + int(j) + 1));
+      }
+      for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
+        if (!vm.pages || !StringRef(vm.name).starts_with("pps"))
+          continue;
+        unsigned e = 0;
+        for (; e < pageEngines.size(); ++e)
+          if (llvm::none_of(rq, [&](unsigned q) { return pageEngines[e].reads[q]; }) &&
+              llvm::none_of(wr, [&](unsigned q) { return pageEngines[e].writes[q]; }))
+            break;
+        if (e == pageEngines.size()) {
+          if (e >= pageEngineCap)
+            return netlist.emitError("page engines: ")
+                   << pageEngineCap << " engines cannot carry the PP rows of " << cls.name;
+          newEngine();
+        }
+        auto &eng = pageEngines[e];
+        for (unsigned q : rq)
+          eng.reads[q] = 1;
+        for (unsigned q : wr)
+          eng.writes[q] = 1;
+        eng.members.push_back({unsigned(c), unsigned(k)});
+        eng.dataWidth = std::max(eng.dataWidth, vm.dataWidth);
+        eng.instWidth = std::max(eng.instWidth, vm.instWidth);
+        eng.addrWidth = std::max(eng.addrWidth, vm.instWidth + vm.rowWidth);
+        eng.readFirst = true;
+      }
+    }
   for (auto [k, st] : llvm::enumerate(linkStreams)) {
     if (!st.kept)
       continue;
@@ -24255,6 +24305,7 @@ void FoldStaticPass::runOnOperation() {
   }
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.linkHbmBeatBits = linkHbmBeatBits;
+  folder.pageEnginesPP = pageEnginesPP;
   folder.minII = minII;
   folder.slrSerializeSpecs.assign(slrSerialize.begin(), slrSerialize.end());
   folder.readyChoice = readyChoice;
