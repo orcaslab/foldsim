@@ -20227,18 +20227,18 @@ LogicalResult StaticFolder::buildSim() {
     auto firstNext = backedges.get(i1);
     Value firstFrame = resetReg(firstNext, "ports_send_first", 1);
     firstNext.setValue(comb::AndOp::create(b, firstFrame, notOf(wrap)));
-    // Frames decided and not all sent; a frame is decided with at most two.
-    // (Counted a host cycle after the decision, off its logic: the next
-    // decision is at least 4 host cycles on.)
+    // Frames started and not all sent; a frame is decided with at most two.
+    // A frame is decided at least 4 host cycles before its first slot, so
+    // the one before has started (loaded) then: counting at the loads (off
+    // the decision's logic) counts every frame decided before.
     if (ii < 4)
       return netlist.emitError("fold-ports-rows: needs a frame of at least 4 "
                                "host cycles (II ")
              << ii << ")";
-    Value decided = resetReg(starting, "ports_decided", 0);
     auto outNext = backedges.get(b.getIntegerType(3));
     Value outstanding = resetReg(outNext, "ports_frames_out", 0);
     Value outPlus = comb::MuxOp::create(
-        b, decided, comb::AddOp::create(b, outstanding, constant(3, 1)), outstanding);
+        b, load, comb::AddOp::create(b, outstanding, constant(3, 1)), outstanding);
     outNext.setValue(comb::MuxOp::create(
         b, wrap, comb::SubOp::create(b, outPlus, constant(3, 1)), outPlus));
     roomTerms.push_back(
