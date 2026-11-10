@@ -20014,20 +20014,22 @@ LogicalResult StaticFolder::buildSim() {
       bool uniform = llvm::all_of(row, [&](uint64_t v) { return v == row[0]; });
       if (row.empty() || uniform)
         return table(b, next, row, width);
-      SmallVector<uint64_t> hold(ii + 1, 0), step(ii + 1, 0);
-      for (unsigned p = 0; p <= ii; ++p) {
-        hold[p] = row[nx(p)];           // posD stays
+      SmallVector<uint64_t> step(ii + 1, 0);
+      for (unsigned p = 0; p <= ii; ++p)
         step[p] = row[nx(nx(p))];       // posD + 1 within the frame
-      }
       Value onStep = comb::MuxOp::create(
           b, end, comb::MuxOp::create(b, go, constant(width, row[nx(0)]),
                                       constant(width, row[nx(ii)])),
           table(b, posD, step, width));
-      Value nextValue = comb::MuxOp::create(b, advance, onStep,
-                                            table(b, posD, hold, width));
+      // posD stays without an advance: so does its `next`, and the register
+      // already holds the table there (no second table of the position).
+      auto self = backedges.get(b.getIntegerType(width));
+      Value nextValue = comb::MuxOp::create(b, advance, onStep, self);
       // posD resets to `ii`: the register to the table at nx(ii).
-      return resetReg(nextValue, "vready_ahead" + Twine(aheadCount++),
-                      row[nx(ii)]);
+      Value r = resetReg(nextValue, "vready_ahead" + Twine(aheadCount++),
+                         row[nx(ii)]);
+      self.setValue(r);
+      return r;
     };
     SmallVector<Value> terms;
     for (auto [c, cls] : llvm::enumerate(classes)) {

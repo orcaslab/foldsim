@@ -11,11 +11,15 @@
 // the next position has its read back) reads its slot tables from registers
 // loaded a host cycle before (lookahead-tables, default on), not through the
 // position's increment and the tables' decoders in the decision's cycle.
+// Without an advance the position stays, and so does the register (its own
+// value, not a second table of the position).
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top virtual-memories=mem})' | FileCheck %s --check-prefix=AHEAD
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top virtual-memories=mem lookahead-tables=false})' | FileCheck %s --check-prefix=NOAHEAD
 // AHEAD-LABEL: hw.module @foldsim_sim(
 // AHEAD-DAG: %vready_ahead0 = seq.firreg {{%[^ ]+}} clock %hostClock reset sync %hostReset, {{%[^ ]+}} preset 1 : i1
 // AHEAD-DAG: %vready_ahead1 = seq.firreg {{%[^ ]+}} clock %hostClock reset sync %hostReset, {{%[^ ]+}} preset 0 : i2
+// AHEAD-DAG: = comb.mux {{%[^,]+}}, {{%[^,]+}}, %vready_ahead0 : i1
+// AHEAD-DAG: = comb.mux {{%[^,]+}}, {{%[^,]+}}, %vready_ahead1 : i2
 // NOAHEAD-LABEL: hw.module @foldsim_sim(
 // NOAHEAD-NOT: vready_ahead
 // CHECK-LABEL: hw.module @Leaf_static(

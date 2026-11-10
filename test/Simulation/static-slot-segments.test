@@ -45,11 +45,13 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DCOPIES2 -DIW=1 -Mdir %t/aff/obj %S/Inputs/tb_vmem.sv top.sv %t/aff/foldsim_sim.sv > %t/aff/build.log 2>&1
 # RUN: %t/aff/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=40 +bubble=60 +burst=8 +stall=20 +full=20 | FileCheck %s
 # Negative: a table needing more segments than K (here K = 1) stays a
-# constant, counted, and the simulator stays exact.
+# constant, counted, and the simulator stays exact. (One copy: with Leaf:2 the
+# table that needed two segments was a lookahead register's hold table, which
+# the register's own value now replaces.)
 # RUN: cd %S/../Driver/Inputs/vmem
-# RUN: foldsim --srcs top.f --top Top --out %t/neg --static --modulo --min-ii 160 --virtual-memories ram --copies Leaf:2 --slot-segments 1 Leaf > %t/neg.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/neg --static --modulo --min-ii 160 --virtual-memories ram --slot-segments 1 Leaf > %t/neg.log 2>&1
 # RUN: FileCheck %s --check-prefix=NEG < %t/neg.log
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DCOPIES2 -DIW=1 -Mdir %t/neg/obj %S/Inputs/tb_vmem.sv top.sv %t/neg/foldsim_sim.sv > %t/neg/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/neg/obj %S/Inputs/tb_vmem.sv top.sv %t/neg/foldsim_sim.sv > %t/neg/build.log 2>&1
 # RUN: %t/neg/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +lo=1 +hi=40 +stall=20 | FileCheck %s
 # NEG: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), {{[1-9][0-9]*}} tables kept
 # --affine-auto (bits 0, K 1): a class whose slot rows do not decode within
