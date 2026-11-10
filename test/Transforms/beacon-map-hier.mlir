@@ -1,8 +1,8 @@
-// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-screen-map,foldsim-estimate-timing{output=- report= top=Top arrivals=%t.json})' -o /dev/null | FileCheck %s --check-prefix=ONE
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-beacon-map{carry-block-size=8},foldsim-estimate-timing{output=- report= top=Top arrivals=%t.json})' -o /dev/null | FileCheck %s --check-prefix=ONE
 // RUN: FileCheck %s --check-prefix=JSON < %t.json
-// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-screen-map{arrivals=%t.json},foldsim-estimate-timing{output=- report= top=Top})' -o /dev/null | FileCheck %s --check-prefix=TWO
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-beacon-map{carry-block-size=8 arrivals=%t.json},foldsim-estimate-timing{output=- report= top=Top})' -o /dev/null | FileCheck %s --check-prefix=TWO
 
-// The probe of screen-map-arrival.mlir across module boundaries: a 33-bit
+// The probe of beacon-map-arrival.mlir across module boundaries: a 33-bit
 // carry (level 6) selects between two 216-input parities (three levels
 // each). In `Pick` the carry is an input port, computed in `Top`; in `Top`
 // the selected carry is the output of `Carry`. Mapped apart, each module
