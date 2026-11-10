@@ -224,6 +224,11 @@ struct Class {
   /// tables of the simulator, not tables of the pass's instance, which would
   /// chain a second decoder after the instance's).
   bool ppPartial() const { return ppHbm && ppResident; }
+  /// A streamed PP class's window slot of the pass (`ppslot3`, a position
+  /// table of the simulator), its bits.
+  unsigned ppSlotBits() const {
+    return pageWindow > 1 ? llvm::Log2_32_Ceil(pageWindow) : 1;
+  }
   unsigned ppResBits() const {
     return std::max(1u, llvm::Log2_32_Ceil(
                             unsigned(llvm::PowerOf2Ceil(std::max(ppResident, ppCapacity)))));
@@ -13921,6 +13926,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       addPort("ppres3", IntegerType::get(context, cls.ppResBits()), true);
       addPort("ppstr3", IntegerType::get(context, 1), true);
     }
+    if (cls.ppHbm)
+      addPort("ppslot3", IntegerType::get(context, cls.ppSlotBits()), true);
   }
   SmallVector<unsigned> inputArg(cls.inputNames.size(), 0);
   for (auto [i, name] : llvm::enumerate(cls.inputNames)) {
@@ -14074,17 +14081,20 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   BackedgeBuilder ppEdges(b, model.getLoc());
   SmallVector<PPReg> ppRegs;
   Operation *ppHeld = nullptr;
-  Value ppValid3, ppInst3, ppRow3, ppRinst0, ppRes3, ppStr3;
+  Value ppValid3, ppInst3, ppRow3, ppRinst0, ppRes3, ppStr3, ppSlotIn3;
   if (cls.pp) {
     ppValid3 = body->getArgument(ppArg);
     if (threads > 1)
       ppInst3 = body->getArgument(ppArg + 1);
     unsigned rowArg = ppArg + (threads > 1 ? 2 : 1);
     ppRow3 = body->getArgument(rowArg);
+    unsigned next = rowArg + 1;
     if (cls.ppPartial()) {
-      ppRes3 = body->getArgument(rowArg + 1);
-      ppStr3 = body->getArgument(rowArg + 2);
+      ppRes3 = body->getArgument(next++);
+      ppStr3 = body->getArgument(next++);
     }
+    if (cls.ppHbm)
+      ppSlotIn3 = body->getArgument(next++);
   }
   if (cls.stages) {
     auto chain = [&](Value value, unsigned regs, const Twine &name) {
@@ -15506,7 +15516,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     };
     // Streamed: each pass's window slot (its instance's), three ahead.
     unsigned slotsPow = hbm ? unsigned(llvm::PowerOf2Ceil(cls.pageWindow)) : 0;
-    Value ppSlot3 = hbm ? ppStreamSlot(cls, b, ppInst3) : Value();
+    // (The simulator's position table, an input beside the pass's instance.)
+    Value ppSlot3 = hbm ? ppSlotIn3 : Value();
     // Partly resident: the resident instances' rows in RAMs of their own
     // ({resident index, row}, as on chip), the streamed ones' in the window;
     // the column's read data the pass's instance's, a host cycle before its
@@ -17397,7 +17408,7 @@ LogicalResult StaticFolder::buildSim() {
     Value live3, pre3;
     /// CSF PP (state-in-ram-pp): whether the position three host cycles
     /// ahead is a pass of a state evaluation, its instance and its row.
-    Value ppValid3, ppInst3, ppRow3, ppRes3, ppStr3;
+    Value ppValid3, ppInst3, ppRow3, ppRes3, ppStr3, ppSlot3;
   };
   SmallVector<Controls, 0> controls(classes.size());
   // Staged classes: what each reads at a position, its stages before each
@@ -17648,6 +17659,16 @@ LogicalResult StaticFolder::buildSim() {
           }
         ctl.ppRes3 = table(b, at, presRow, cls.ppResBits());
         ctl.ppStr3 = table(b, at, pstrRow, 1);
+      }
+      if (cls.ppHbm) {
+        // Streamed: each pass's window slot (of its instance).
+        SmallVector<uint64_t> pslotRow(ii + 1, 0);
+        for (unsigned i = 0; i < threads; ++i)
+          for (unsigned j = 0; j < cls.pp; ++j) {
+            int r = cls.slot[kState][i] - int(cls.stages) + int(j);
+            pslotRow[unsigned(r) % ii] = cls.windowSlot[i];
+          }
+        ctl.ppSlot3 = table(b, at, pslotRow, cls.ppSlotBits());
       }
     }
   }
@@ -17980,6 +18001,8 @@ LogicalResult StaticFolder::buildSim() {
         operands.push_back(controls[c].ppRes3);
         operands.push_back(controls[c].ppStr3);
       }
+      if (cls.ppHbm)
+        operands.push_back(controls[c].ppSlot3);
     }
     for (auto [i, type] : llvm::enumerate(cls.inputTypes)) {
       if (int(i) == cls.clockInput)
