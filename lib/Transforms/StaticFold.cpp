@@ -17104,10 +17104,17 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     const char *env = getenv("FOLDSIM_SLOT_MIN_INDEX_BITS");  // a test hook
     return env ? atoi(env) : 7;
   }();
+  // (FOLDSIM_TABLE_SITES, a debug hook: every table built, by line.)
+  if (getenv("FOLDSIM_TABLE_SITES"))
+    llvm::errs() << "table-site " << site << " " << rows.size() << " " << width << "\n";
   if (gSlotSegments && !gTableRaw && int(indexWidth) >= minIndexBits) {
     auto *pc = foldsim::currentPosCounters();
     bool counted = pc && pc->knows(index);
+    uint64_t segsBefore = foldsim::slotSequencerStats().segments;
     if (Value decoded = tryDecodeTable(b, index, rows, width)) {
+      if (getenv("FOLDSIM_TABLE_SITES"))
+        llvm::errs() << "table-dec " << site << " " << rows.size() << " " << width << " "
+                     << foldsim::slotSequencerStats().segments - segsBefore << "\n";
       // (FOLDSIM_SLOT_CHECK, a debug hook: the table built beside its
       // decoder, and a simulation stops where they differ.)
       if (getenv("FOLDSIM_SLOT_CHECK")) {
@@ -20093,19 +20100,30 @@ LogicalResult StaticFolder::buildSim() {
           std::string name = (producer.name + "_to_" + consumer.name + "_" +
                               Twine(at) + "_hbm")
                                  .str();
-          Value mine1 = sb.pop1;
-          if (threads > 1) {
-            SmallVector<uint64_t> takeRow(threads, 0);
-            for (unsigned i = 0; i < threads; ++i)
-              takeRow[i] = mine[i];
-            mine1 = comb::AndOp::create(b, mine1, table(b, sb.inst1, takeRow, 1));
-          }
-          if (pIdx) {
-            Value want = threads > 1 ? table(b, sb.inst1, wantRows, pIdx)
-                                     : constant(pIdx, wantRows[0]);
-            mine1 = comb::AndOp::create(
-                b, mine1,
-                comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.row1, want));
+          // A landing is this member's where its reader instance takes it
+          // and the row landed is the one that reader wants: both fixed by
+          // the landing's position (its reader instance and row are position
+          // tables), so one table of the position, registered as the
+          // landing's controls are, not tables of the reader instance (the
+          // connectivity: a reader's producer row, as many segments as the
+          // groups of a ring that is not a power of two).
+          Value mine1;
+          {
+            auto &rctl = controls[st.rcls];
+            SmallVector<uint64_t> mineRows(st.popValid.size(), 0);
+            for (unsigned p = 0; p < st.popValid.size(); ++p) {
+              if (!st.popValid[p])
+                continue;
+              unsigned i = threads > 1 ? unsigned(st.popInst[p]) : 0;
+              if (i >= threads || (threads > 1 && !mine[i]))
+                continue;
+              uint64_t rowMask = pIdx >= 64 ? ~uint64_t(0) : (uint64_t(1) << pIdx) - 1;
+              if (pIdx && (st.popRow[p] & rowMask) != (wantRows[i] & rowMask))
+                continue;
+              mineRows[p] = 1;
+            }
+            mine1 = resetReg(resetReg(table(b, rctl.at3, mineRows, 1), name + "_mine2", 0),
+                             name + "_mine1", 0);
           }
           SmallVector<Value> slices, early;
           for (unsigned j = off / st.dw; j <= (off + width - 1) / st.dw; ++j) {
