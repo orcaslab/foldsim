@@ -1655,6 +1655,7 @@ private:
   /// `link-hbm-beat-bits`: the beats a stream's rows may take where its
   /// positions leave room (planStreams), else 1.
   unsigned streamBeats(const LinkStream &st) const;
+  bool streamBeatsFit(const LinkStream &st, unsigned k, bool say) const;
   /// The page of the links from producer `p` to class `reader` (0: none).
   unsigned linkPageRule(unsigned p, unsigned reader) const {
     if (linkKinds.empty())
@@ -4930,13 +4931,22 @@ unsigned StaticFolder::streamBeats(const LinkStream &st) const {
   if (!linkHbmBeatBits || st.dw <= linkHbmBeatBits || st.landings.empty() ||
       st.writePasses.empty())
     return 1;
-  unsigned k = std::min(8u, unsigned(llvm::divideCeil(st.dw, linkHbmBeatBits)));
+  // The most beats the positions allow, up to those that make the rows
+  // linkHbmBeatBits wide (at most 8): fewer, wider beats where they are
+  // dense.
+  for (unsigned k = std::min(8u, unsigned(llvm::divideCeil(st.dw, linkHbmBeatBits))); k > 1; --k)
+    if (streamBeatsFit(st, k, k == 2))
+      return k;
+  return 1;
+}
+
+bool StaticFolder::streamBeatsFit(const LinkStream &st, unsigned k, bool say) const {
   static const bool log = getenv("FOLDSIM_BEAT_LOG");
-  auto no = [&](const char *why) -> unsigned {
-    if (log)
+  auto no = [&](const char *why) -> bool {
+    if (log && say)
       llvm::errs() << "link-hbm-beat-bits: " << modelOf(st.pcls) << " -> " << modelOf(st.rcls)
                    << " " << st.dw << " bits: whole rows (" << why << ")\n";
-    return 1;
+    return false;
   };
   int frame = int(ii);
   auto mod = [&](int x) { return ((x % frame) + frame) % frame; };
@@ -4967,8 +4977,8 @@ unsigned StaticFolder::streamBeats(const LinkStream &st) const {
   // The earliest beat after its slot's previous landing (its 8-position
   // margin at the lead).
   if (k - 1 >= 8)
-    return 1;
-  return k;
+    return false;
+  return true;
 }
 
 void StaticFolder::setStreamTables(LinkStream &st, ArrayRef<int> requests,
