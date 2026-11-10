@@ -171,6 +171,9 @@ struct Class {
   /// Its staged evaluation's levels (stage-levels, or its class's
   /// stage-levels-class), 0: not staged.
   unsigned stageLevels = 0;
+  /// A PP class's stage levels (its passes are its stages): each pass's
+  /// logic kept within them where its value is needed only at a later pass.
+  unsigned ppPassLevels = 0;
   /// Multicycle (`multicycle`): host cycles from the capture registers to
   /// the end registers, the stages less one (0: none, or stage registers).
   unsigned multicycle = 0;
@@ -3411,6 +3414,9 @@ LogicalResult StaticFolder::chooseStages() {
         return cls.model.emitError("state-in-ram-pp: ")
                << cls.name << ": not with pages or pass-split";
       cls.stages = cls.pp;
+      // (Its passes' logic within the levels, by moving deep logic a pass
+      // later where its value is needed later: buildPP.)
+      cls.ppPassLevels = cls.stageLevels;
       cls.stageLevels = 0;
     }
   if (!anyStaged) {
@@ -12137,6 +12143,9 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
     }
   }
   DenseMap<Value, int> stageOfValue;
+  // Ops moved to a later pass than their operands' (a pass's logic past the
+  // class's stage levels, its value needed only later).
+  DenseMap<Operation *, int> laterStage;
   auto leafStage = [&](Value value) -> int {
     if (auto it = stageOfValue.find(value); it != stageOfValue.end())
       return it->second;
@@ -12161,6 +12170,8 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
         stage = std::max(stage, leafStage(operand));
       if (isa<seq::FirMemReadOp>(op))
         stage = std::max(stage, 0) + (isEarly(op) ? 1 : 0);
+      if (auto it = laterStage.find(op); it != laterStage.end())
+        stage = std::max(stage, it->second);
       for (auto result : op->getResults())
         stageOfValue[result] = stage;
     }
@@ -12182,6 +12193,68 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
       }
     if (!more)
       break;
+  }
+  // A pass's logic deeper than the class's stage levels (its estimated
+  // levels from the pass's own reads and the captures of earlier passes'
+  // values), where its value is needed only at a later pass (no row written
+  // in this pass reads it, nor a ready pass's output): the deep op moves to
+  // the next pass, the logic before it captured at this one, so each pass's
+  // logic stays within the levels (a pass a host cycle, as a stage). Until
+  // none moves, a few rounds at most.
+  if (cls.ppPassLevels && !getenv("FOLDSIM_PP_NO_DEPTH")) {
+    int budget = 2 * int(cls.ppPassLevels);
+    DenseSet<Operation *> inTopo(topo.begin(), topo.end());
+    unsigned moved = 0;
+    for (int round = 0; round < 16; ++round) {
+      // The earliest pass each op's value is needed at: a row's write at
+      // its row; any other user (a store, an output, the state pass's
+      // writes) the state pass; an op's users' needs.
+      DenseMap<Operation *, int> need;
+      for (unsigned k = 0; k < cand.size(); ++k) {
+        if (hazards.contains(k))
+          continue;
+        auto &write = writes[cand[k]];
+        for (Value v : {write.data, write.enable})
+          if (auto *d = v ? v.getDefiningOp() : nullptr)
+            need[d] = std::min(need.count(d) ? need[d] : int(last), rowOf[k]);
+      }
+      for (auto *op : llvm::reverse(topo)) {
+        int n = need.count(op) ? need[op] : int(last);
+        for (auto *user : op->getUsers())
+          if (inTopo.contains(user))
+            n = std::min(n, need.count(user) ? need[user] : int(last));
+        need[op] = n;
+      }
+      DenseMap<Operation *, int> depth;
+      bool changed = false;
+      for (auto *op : topo) {
+        int st = stageOfValue.lookup(op->getResult(0));
+        int d = 0;
+        bool afterMove = false;
+        for (auto operand : op->getOperands())
+          if (auto *def = operand.getDefiningOp(); def && inTopo.contains(def) &&
+                                                  stageOfValue.lookup(operand) == st) {
+            d = std::max(d, depth.lookup(def));
+            afterMove |= laterStage.lookup(def) > st;
+          }
+        d += stageOpLevels(op);
+        depth[op] = d;
+        if (d > budget && !afterMove && st >= 0 && st + 1 <= int(last) &&
+            need.lookup(op) > st && !lateCone.contains(op) && !isEarly(op) &&
+            op->getDialect() && op->getDialect()->getNamespace() == "comb") {
+          laterStage[op] = st + 1;
+          depth[op] = 0;
+          changed = true;
+          ++moved;
+        }
+      }
+      if (!changed)
+        break;
+      computeStages();
+    }
+    if (moved && getenv("FOLDSIM_AFFINE_LOG"))
+      llvm::errs() << "foldsim-fold-static: state-in-ram-pp: " << cls.name << ": " << moved
+                   << " ops a pass later (pass logic within " << cls.ppPassLevels << " levels)\n";
   }
   for (auto *op : topo)
     if (isEarly(op) && stageOfValue.lookup(op->getResult(0)) > int(last))
