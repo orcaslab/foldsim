@@ -412,6 +412,8 @@ def frame_options(a):
         fold += f' vmem-auto-instance-bits={a.vmem_auto_instance_bits}'
     if getattr(a, 'vmem_rings', 0):
         fold += f' vmem-rings={a.vmem_rings} vmem-ring-entries={a.vmem_ring_entries}'
+        if a.vmem_ring_image_each:
+            fold += ' vmem-ring-image-each=true'
     if a.unstaged_env:
         fold += ' staged-env=false'
     if getattr(a, 'register_state_entries', None) is not None:
@@ -1584,6 +1586,10 @@ def build_parser():
                          "(foldsim-fold-static vmem-rings; 0: none)")
     ap.add_argument('--vmem-ring-entries', type=int, default=1024, metavar='N',
                     help='with --vmem-rings: the most entries a ring may take (default 1024)')
+    ap.add_argument('--vmem-ring-image-each', action='store_true',
+                    help='with --vmem-rings: each ring its own image and controller (default: a class\'s rings '
+                         'share one image, the ring in the tag: one controller a class; foldsim-fold-static '
+                         'vmem-ring-image-each)')
     ap.add_argument('--vmem-skip-held-reads', action='store_true',
                     help='with --virtual-memories: a read whose address register holds (a registered '
                          'read address with its enable low) is not issued unless its row was written '
