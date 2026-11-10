@@ -64,9 +64,9 @@
 # A32: state-stream: Leaf: P 8, 2 of 32 instances streamed
 # A32SV: {{pp(_res)?}}_1024x72 pp_res0_ext (
 # S64: state-scratch: fixed: Leaf: a share of 64 instances (36864 bits); 60 of 64 resident (15 of each 16), 4 stream from HBM
-# S128: state-scratch: fixed: Leaf: a share of 64 instances (36864 bits); 64 of 128 resident (8 of each 16), 64 stream from HBM
+# S128: state-scratch: fixed: Leaf: a share of 64 instances (36864 bits); 64 of 128 resident (2 of each 4), 64 stream from HBM
 # SSV: {{pp(_res)?}}_512x72 pp_res0_ext (
-# Z64: state-scratch: fixed: Leaf: a share of 0 instances (0 bits); 0 of 64 resident (0 of each 16), 64 stream from HBM
+# Z64: state-scratch: fixed: Leaf: a share of 0 instances (0 bits); 0 of 64 resident (0 of each 4), 64 stream from HBM
 # U64: state-scratch: fixed: Leaf: a share of 512 instances (294912 bits); 60 of 64 resident (15 of each 16), 4 stream from HBM
 # U64SV: {{pp(_res)?}}_4096x72 pp_res0_ext (
 # P32: state-scratch: fixed: Leaf: pages resident, a share of 2048 instances (589824 bits) for 32

@@ -12679,7 +12679,7 @@ LogicalResult StaticFolder::planScratchFixed() {
     // A PP class: of each B instances the first r resident (in RAMs of its
     // share's depth), the others stream; at least one in 16 streams, so that
     // the landing windows and the HBM path are there at every count.
-    if (n < 32) {
+    if (n < 4) {
       // (Few instances: resident whole while its share holds them.)
       allocated += costOf(item, cap);
       if (n <= cap) {
@@ -12692,13 +12692,18 @@ LogicalResult StaticFolder::planScratchFixed() {
       streamed += uint64_t(n) * item.perInstance;
       continue;
     }
-    // The block B (a power of two, 16 to 1,024 and at most n) and r that
+    // The block B (a power of two, 4 to 1,024 and at most n) and r that
     // keep the most of the share resident, r of at most three signed powers
-    // of two (the resident index's step: a decoder's shift-add).
-    unsigned B = 16, blocks = n / 16, r = 0;
-    for (unsigned b = 16; b <= std::min(n, 1024u); b *= 2) {
+    // of two (the resident index's step: a decoder's shift-add). At least
+    // one instance in 16 streams, and two in all (a landing window of one
+    // slot between two prefetches): a class of a few instances (a cluster
+    // level at 64 SMs) has its window and HBM path at every count too.
+    unsigned B = 4, blocks = n / 4, r = 0;
+    for (unsigned b = 4; b <= std::min(n, 1024u); b *= 2) {
       unsigned k = n / b;
-      unsigned rr = unsigned(std::min<uint64_t>(b - b / 16, cap / k));
+      unsigned rr = unsigned(std::min<uint64_t>(b - std::max(1u, b / 16), cap / k));
+      while (rr && uint64_t(n) - uint64_t(k) * rr < 2)
+        --rr;
       // (The streamed instances a multiple of 8, or of half their count
       // when fewer, so that a landing window of 8 slots divides them.)
       auto streamsOk = [&](unsigned x) {
