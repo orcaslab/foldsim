@@ -14488,18 +14488,24 @@ LogicalResult StaticFolder::buildPPStream(
       auto [lo, hi] = ppChunk(columns.size(), cls.ppChunkSpread, k, true);
       cols = std::max(cols, hi - lo);
     }
+    // (Fewer, wider beats where the positions do not hold that many: the
+    // most that fit.)
     unsigned most = std::max(1u, ppBeatBits / 72);
-    unsigned k = unsigned(llvm::PowerOf2Ceil(llvm::divideCeil(cols, most)));
+    unsigned want = unsigned(llvm::PowerOf2Ceil(llvm::divideCeil(cols, most)));
+    want = std::min(want, 1u << kPPBeatPortBits);
     SmallVector<int> readAt, drainAt;
     int maxR = 0, maxW = 0;
-    if (k > 1 && k <= (1u << kPPBeatPortBits) &&
-        ppBeatWindows(cls, k, readAt, drainAt, maxR, maxW)) {
-      cls.ppBeats = k;
-      cls.ppBeatCols = unsigned(llvm::divideCeil(cols, k));
-    } else if (k > 1) {
-      llvm::errs() << "foldsim-fold-static: pp-beat-bits: " << cls.name << ": " << k
-                   << " beats a row do not fit its positions: whole rows\n";
-    }
+    for (unsigned k = want; k > 1 && cls.ppBeats == 1; k /= 2)
+      if (ppBeatWindows(cls, k, readAt, drainAt, maxR, maxW)) {
+        cls.ppBeats = k;
+        cls.ppBeatCols = unsigned(llvm::divideCeil(cols, k));
+      }
+    if (want > 1 && cls.ppBeats < want)
+      llvm::errs() << "foldsim-fold-static: pp-beat-bits: " << cls.name << ": " << want
+                   << " beats a row do not fit its positions: "
+                   << (cls.ppBeats > 1 ? std::to_string(cls.ppBeats) + " beats"
+                                       : std::string("whole rows"))
+                   << "\n";
   }
   bool beats = !ports.beat3.empty() && cls.ppBeats > 1;
   unsigned K = beats ? cls.ppBeats : 1;
