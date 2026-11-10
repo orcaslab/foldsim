@@ -103,6 +103,12 @@ struct Fold {
   /// instance, written as the results come back), requested at the
   /// instance's next state pass.
   bool hbm = false;
+  /// `fold-store-stream`: the model's write is the issue's own (this edge's
+  /// slot and enable); the copy's landing ring delays it (and the read) by
+  /// the class's `foldLandL` state passes, its entry `landingCnt` (the pass
+  /// count mod L at the issue; null: the landing by instance).
+  bool landingRing = false;
+  Value landingCnt;
   seq::FirMemOp landing;
   unsigned depth = 0, outAt = 0;
   /// `fold-stage-levels`: the host cycles its stage registers add to the
@@ -290,6 +296,12 @@ struct Class {
   SmallVector<VirtualMemory> virtualMemories;
   /// `vmem-rings`: the class's ring plan, if any of its memories take one.
   std::shared_ptr<foldsim::RingPlan> ring;
+  /// `fold-store-stream`: the state passes its folded stores' landing ring
+  /// delays their writes and reads by (0: a landing entry per instance, the
+  /// reads at the pass), and each instance's delayed request's position, at
+  /// the latest (the ring plan's issue; empty: its state pass).
+  unsigned foldLandL = 0;
+  SmallVector<int> foldIssue;
   /// With virtual memories, the copy's host reset input (their pending reads
   /// clear with the controllers').
   unsigned resetInput = 0;
@@ -742,6 +754,8 @@ public:
   /// Plans a class's rings (`vmem-rings`): marks its virtual memories that
   /// take one, or none if the schedule leaves no room (the reason reported).
   void planClassRing(Class &cls, function_ref<bool(const Class::VirtualMemory &)> eligible);
+  /// `fold-store-stream`: plans a class's landing ring (foldLandL, foldIssue).
+  void planFoldLanding(Class &cls);
   /// `fold-store-ram` / `fold-store-style`: folded pipelines' stores of at
   /// least this many bits read through a register (block or ultra RAM);
   /// 0: none.
@@ -755,6 +769,9 @@ public:
   /// `fold-store-hbm`: folded pipelines' stores of at least this many bits
   /// in HBM (0: by storage rule only).
   uint64_t foldStoreHbm = 0;
+  /// `fold-store-stream`: every store of depth >= 2 in HBM, out of the
+  /// scratch, its writes (and reads) from a landing ring (planFoldLanding).
+  bool foldStoreStream = false;
   unsigned foldStoreLead = 2;
   /// `staged-link-direct`: see stagedDirect.
   bool stagedLinkDirect = false;
@@ -9792,7 +9809,8 @@ static bool inCone(Operation *op) {
 static LogicalResult foldPipelines(
     hw::HWModuleOp model, unsigned threads, uint64_t aheadBits,
     unsigned stageLevels, std::unique_ptr<Folding> &out,
-    function_ref<bool(unsigned, uint64_t, unsigned)> inHbm = {}) {
+    function_ref<bool(unsigned, uint64_t, unsigned)> inHbm = {},
+    bool landingRing = false) {
   auto *body = model.getBodyBlock();
   ImplicitLocOpBuilder b(model.getLoc(), body->getTerminator());
   foldsim::PipelineAnalysis analysis(model);
@@ -9953,7 +9971,14 @@ static LogicalResult foldPipelines(
         : hbm ? nextSlot
               : slot,
         modelClock, hw::ConstantOp::create(b, i1, 1));
-    if (hbm) {
+    if (hbm && landingRing) {
+      // `fold-store-stream`: this edge's issue's row and enable; the copy's
+      // landing ring holds them with the results until the write leaves.
+      seq::FirMemWriteOp::create(
+          b, store, slot, modelClock,
+          p.enable ? p.enable : Value(hw::ConstantOp::create(b, i1, 1)),
+          hw::ConstantOp::create(b, b.getIntegerType(width), 0), Value{});
+    } else if (hbm) {
       // The row the last edge's issue writes, and whether it issued: target
       // state, so that the next pass requests that row's write (its data
       // from the copy's landing buffer).
@@ -10291,6 +10316,7 @@ static LogicalResult foldPipelines(
     fold.data = data;
     fold.ahead = ahead;
     fold.hbm = hbm;
+    fold.landingRing = hbm && landingRing;
     fold.depth = depth;
     fold.outAt = outAt;
     fold.staged = staged;
@@ -13232,6 +13258,25 @@ LogicalResult StaticFolder::chooseStreamWindows() {
     if (cls.page && cls.pagesOffChip)
       hbmBits += 2 * uint64_t(cls.threads()) * cls.page *
                  llvm::divideCeil(std::max(cls.rowStateBits, cls.pageStateBits), cls.page);
+  // `fold-store-stream`: each streamed store's rows, an instance's read and
+  // write a frame, and (with vmem-rings) its answer's image row written and
+  // read back: 4 whole power-of-two rows of bytes, the most.
+  uint64_t foldBits = 0;
+  if (foldStoreStream)
+    for (auto &cls : classes)
+      if (auto *folding = cls.folding.get())
+        for (auto &fold : folding->folds)
+          if (fold.landingRing) {
+            uint64_t row = 8 * llvm::PowerOf2Ceil(std::max<uint64_t>(
+                                   1, llvm::divideCeil(fold.store.getType().getWidth(), 8)));
+            uint64_t bits = (vmemRingLead ? 4 : 2) * uint64_t(cls.threads()) * row;
+            masterBits[nextMaster++ % kStreamMasters] += bits;
+            foldBits += bits;
+          }
+  if (foldBits)
+    llvm::errs() << "foldsim-fold-static: fold-store-stream: " << foldBits
+                 << " HBM bits a frame (in the state stream's II_bw)\n";
+  hbmBits += foldBits;
   if (hbmBits) {
     // The busiest master bounds it too (a master's share of the usable).
     uint64_t perMaster = kStreamBitsPerCycle / kStreamMasters;
@@ -13503,6 +13548,88 @@ LogicalResult StaticFolder::buildPPStream(
   return success();
 }
 
+/// `fold-store-stream`: the landing ring's delay L, in state passes. The
+/// copy counts its state passes; an issue's {instance, rows, enables} and,
+/// as they come back, its results take entry (count mod L), and the L-th
+/// state pass after it sends the entry's write and read. L is the fewest
+/// passes with
+/// - the results landed: every pass's L-th next at least outAt + 3
+///   positions on (they land outAt + 1 host cycles after the issue, are
+///   written a host cycle later and read registered a host cycle early;
+///   positions are at most host cycles);
+/// - the read pending in time: the (L + t)-th next pass still a decision
+///   lead + 1 before the instance's next evaluation (cls.stateGap from its
+///   state pass), t the tail slots (past the frame), whose first frame does
+///   not run and so does not count, so that frame's requests leave up to t
+///   passes later.
+/// Each instance's request then leaves (L + t passes at the latest) after
+/// its pass: the ring plan's issue. No such L (a slot before the frame, or
+/// passes too close for the gaps): a landing entry per instance, and the
+/// reads at the passes, as without the ring.
+void StaticFolder::planFoldLanding(Class &cls) {
+  cls.foldLandL = 0;
+  cls.foldIssue.clear();
+  auto *folding = cls.folding.get();
+  if (!folding)
+    return;
+  unsigned outAt = 0;
+  bool any = false;
+  for (auto &fold : folding->folds)
+    if (fold.landingRing) {
+      any = true;
+      outAt = std::max(outAt, fold.outAt);
+    }
+  if (!any)
+    return;
+  unsigned n = cls.threads();
+  auto refuse = [&](const Twine &why) {
+    llvm::errs() << "foldsim-fold-static: fold-store-stream: " << cls.name
+                 << ": a landing entry per instance (" << why << ")\n";
+  };
+  SmallVector<std::pair<int, unsigned>> order;
+  unsigned tails = 0;
+  for (unsigned i = 0; i < n; ++i) {
+    int s = cls.slot[kState][i];
+    if (s < 0)
+      return refuse("a slot before the frame");
+    if (s >= int(ii))
+      ++tails;
+    order.push_back({s % int(ii), i});
+  }
+  llvm::sort(order);
+  // Positions from the j-th pass (in the frame's order) to the k-th after it.
+  auto gap = [&](unsigned j, unsigned k) -> int {
+    unsigned at = j + k;
+    return order[at % n].first + int(ii) * int(at / n) - order[j].first;
+  };
+  int need = decisionLead() + 1;
+  for (unsigned l = 1; l + tails < n; ++l) {
+    bool landed = true;
+    for (unsigned j = 0; j < n && landed; ++j)
+      landed = gap(j, l) >= int(outAt) + 3;
+    if (!landed)
+      continue;
+    for (unsigned j = 0; j < n; ++j)
+      if (cls.stateGap - gap(j, l + tails) < need)
+        return refuse("the " + Twine(l + tails) +
+                      "-th next pass is too close to the next evaluation (state gap " +
+                      Twine(cls.stateGap) + ", outAt " + Twine(outAt) + ")");
+    cls.foldLandL = l;
+    cls.foldIssue.assign(n, 0);
+    for (unsigned j = 0; j < n; ++j) {
+      unsigned i = order[j].second;
+      cls.foldIssue[i] = cls.slot[kState][i] + gap(j, l + tails);
+    }
+    llvm::errs() << "foldsim-fold-static: fold-store-stream: " << cls.name
+                 << ": landing ring of " << l << " entries (" << n
+                 << " instances, outAt " << outAt << ", " << tails
+                 << " tail slots, II " << ii << ")\n";
+    return;
+  }
+  refuse("no delay lands the results before the next pass of the instance (outAt " +
+         Twine(outAt) + ", " + Twine(n) + " instances, II " + Twine(ii) + ")");
+}
+
 void StaticFolder::planClassRing(
     Class &cls, function_ref<bool(const Class::VirtualMemory &)> eligible) {
   if (!llvm::any_of(cls.virtualMemories, eligible))
@@ -13523,7 +13650,10 @@ void StaticFolder::planClassRing(
     return refuse("a slot before the frame");
   SmallVector<foldsim::RingInstance> insts(cls.threads());
   for (unsigned i = 0; i < cls.threads(); ++i) {
-    insts[i].issue = cls.slot[kState][i];
+    // (`fold-store-stream`: its folded stores' requests leave later.)
+    insts[i].issue = cls.foldIssue.empty()
+                         ? cls.slot[kState][i]
+                         : std::max(cls.slot[kState][i], cls.foldIssue[i]);
     // Its evaluations of the next frame read at their read positions.
     insts[i].uses.push_back(cls.readSlot(kState, 0, i) + int(ii));
     if (cls.hasReady)
@@ -13832,7 +13962,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     // requests carry.
     // The skip's request leaves a host cycle later: the pending bit it sets
     // must still be there for the decision on the instance's next evaluation.
-    if (skipHeldReads && cls.stateGap >= decisionLead() + 2) {
+    if (skipHeldReads && cls.stateGap >= decisionLead() + 2 &&
+        !(hbmFold(memory) && hbmFold(memory)->landingRing)) {
       vm.heldRow = heldReadRow(portsOf(memory).first);
       vm.delayed = bool(vm.heldRow);
     }
@@ -13845,9 +13976,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                  << cls.virtualMemories.size() << " virtual memories; "
                  << autoKept << " kept on chip (" << autoKeptBits
                  << " bits: read combinationally, more ports or a short state gap)\n";
+  if (foldStoreStream)
+    planFoldLanding(cls);
   if (vmemRingLead && threads > 1)
     planClassRing(cls, [&](const Class::VirtualMemory &vm) {
-      return !vm.pages && !vm.delayed && !hbmFold(vm.lanes.front());
+      Fold *fold = hbmFold(vm.lanes.front());
+      return !vm.pages && !vm.delayed && (!fold || fold->landingRing);
     });
 
   // Paged register state: the registers a ready pass reads (the cone of an
@@ -14294,8 +14428,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // read is pending, set as it is issued and cleared as its response comes.
   SmallVector<Operation *> virtualPorts(cls.virtualMemories.size(), nullptr);
   struct HbmStats {
-    unsigned stores = 0;
-    uint64_t bits = 0, landing = 0;
+    unsigned stores = 0, rings = 0;
+    uint64_t bits = 0, landing = 0, traffic = 0;
   } hbmStats;
   auto buildVirtualMemory = [&](seq::FirMemOp memory,
                                 unsigned k) -> SmallVector<Value> {
@@ -14491,7 +14625,118 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       read.getData().replaceAllUsesWith(data);
       read.erase();
     }
-    if (Fold *fold = hbmFold(memory)) {
+    if (Fold *fold = hbmFold(memory); fold && fold->landingRing) {
+      // `fold-store-stream`: the model's write is this pass's issue's (its
+      // slot and enable). Its {instance, read and write rows and enables}
+      // wait in a landing ring with the issue's results (the copy writes
+      // them as they come back, below), and leave at a later state pass:
+      // - L > 0 (planFoldLanding): the ring has L entries, the state passes'
+      //   count mod L; the L-th pass after an issue sends its write and its
+      //   read together (the instance's, as at a pass; its next pass's read
+      //   so leaves L passes later, still in time); the first L passes
+      //   send nothing (`primed`);
+      // - L = 0: an entry per instance, written at its pass and read at its
+      //   next (a valid bit each, cleared by the reset); the read stays at
+      //   the pass, the write leaves with it, as with fold-store-hbm.
+      // Both RAMs read registered a host cycle early: at the count the next
+      // host cycle has (the instance a host cycle ahead), which an entry's
+      // writes (at its pass, at its landing) are at least two before.
+      unsigned L = cls.foldLandL;
+      unsigned n = L ? L : entries;
+      unsigned cw = std::max(1u, llvm::Log2_32_Ceil(n));
+      Value hostReset = body->getArgument(cls.resetInput);
+      auto resetReg = [&](Value next, const Twine &name) -> Value {
+        auto type = next.getType();
+        return seq::FirRegOp::create(
+            b, next, hostClock, b.getStringAttr(name), hostReset,
+            hw::ConstantOp::create(b, type, 0), hw::InnerSymAttr{},
+            /*isAsync=*/false, b.getIntegerAttr(type, 0));
+      };
+      Value state = region.state;
+      unsigned iw = hw::getBitWidth(inst.getType());
+      SmallVector<Value> fields;
+      if (L)
+        fields = {rdValid, rdRow, inst};
+      fields.append({wrValid, wrRow});
+      Value meta = b.createOrFold<comb::ConcatOp>(fields);
+      unsigned mw = hw::getBitWidth(meta.getType());
+      auto ram = [&](unsigned width, const Twine &name) {
+        return seq::FirMemOp::create(
+            b, seq::FirMemType::get(context, n, width, 1), /*readLatency=*/1,
+            /*writeLatency=*/1, seq::RUW::Old, seq::WUW::Undefined,
+            b.getStringAttr(name), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+            StringAttr{}, Attribute{});
+      };
+      auto metaRam = ram(mw, vm.name + "_lmeta");
+      auto landing = ram(vm.dataWidth, vm.name + "_landing");
+      Value at, readAt, popValid;
+      if (L) {
+        auto cntNext = edges.get(intType(cw));
+        Value cnt = resetReg(cntNext, vm.name + "_lcnt");
+        Value last = comb::ICmpOp::create(b, comb::ICmpPredicate::eq, cnt,
+                                          hw::ConstantOp::create(b, intType(cw), n - 1));
+        Value step = comb::MuxOp::create(
+            b, last, zero(cw),
+            comb::AddOp::create(b, cnt, hw::ConstantOp::create(b, intType(cw), 1)));
+        readAt = comb::MuxOp::create(b, state, step, cnt);
+        cntNext.setValue(readAt);
+        auto primedNext = edges.get(intType(1));
+        Value primed = resetReg(primedNext, vm.name + "_lprimed");
+        primedNext.setValue(comb::OrOp::create(
+            b, primed, comb::AndOp::create(b, state, last)));
+        at = cnt;
+        popValid = primed;
+        fold->landingCnt = cnt;
+      } else {
+        // The instance a host cycle ahead (the region's next).
+        readAt = region.inst.getDefiningOp<seq::FirRegOp>().getNext();
+        at = inst;
+        auto validNext = edges.get(intType(entries));
+        Value valid = resetReg(validNext, vm.name + "_lvalid");
+        validNext.setValue(comb::MuxOp::create(
+            b, state, comb::OrOp::create(
+                      b, valid,
+                      comb::ShlOp::create(
+                          b, hw::ConstantOp::create(b, intType(entries), 1),
+                          widen(inst, entries))), valid));
+        popValid = b.createOrFold<comb::ExtractOp>(
+            intType(1),
+            comb::ShrUOp::create(b, valid, widen(inst, entries)), 0);
+      }
+      seq::FirMemWriteOp::create(b, metaRam, at, hostClock, state, meta, Value{});
+      Value q = seq::FirMemReadOp::create(b, metaRam, readAt, hostClock, one());
+      wrData = seq::FirMemReadOp::create(b, landing, readAt, hostClock, one());
+      Value go = comb::AndOp::create(b, state, popValid);
+      unsigned lo = 0;
+      auto field = [&](unsigned width) -> Value {
+        Value v = b.createOrFold<comb::ExtractOp>(intType(width), q, mw - lo - width);
+        lo += width;
+        return v;
+      };
+      if (L) {
+        rdValid = comb::AndOp::create(b, go, field(1));
+        rdRow = field(vm.rowWidth);
+        inst = field(iw);
+      }
+      wrValid = comb::AndOp::create(b, go, field(1));
+      wrRow = field(vm.rowWidth);
+      fold->landing = landing;
+      ++hbmStats.stores;
+      hbmStats.bits += uint64_t(memory.getType().getDepth()) * entries *
+                       vm.dataWidth;
+      hbmStats.landing += uint64_t(n) * (vm.dataWidth + mw) +
+                          (vm.ring ? 0 : uint64_t(entries) * vm.dataWidth);
+      if (!L)
+        hbmStats.landing += entries;
+      if (L)
+        ++hbmStats.rings;
+      // HBM bits a frame: an instance's row read and written (each a whole
+      // power-of-two row of bytes, as the controller moves it), and with a
+      // ring the answer's image row written and read again.
+      uint64_t rowBits =
+          8 * llvm::PowerOf2Ceil(std::max<uint64_t>(1, llvm::divideCeil(vm.dataWidth, 8)));
+      hbmStats.traffic += uint64_t(threads) * rowBits * (vm.ring ? 4 : 2);
+    } else if (Fold *fold = hbmFold(memory)) {
       // `fold-store-hbm`: the write's data, the results of the instance's
       // last issue, from a landing buffer of an entry per instance: written
       // as they come back (outAt + 1 host cycles after the issue, the
@@ -16501,8 +16746,20 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                                             b.getStringAttr("fold_inst")));
     for (auto &fold : folding->folds) {
       if (fold.hbm) {
-        // In HBM: the results into the landing buffer, at their instance.
-        seq::FirMemWriteOp::create(b, fold.landing, fold.thread, hostClock,
+        // In HBM: the results into the landing buffer, at their instance;
+        // `fold-store-stream`'s ring: at the issue's pass count, carried
+        // with the tags (the count at the issue's state pass, which is this
+        // `state`'s host cycle).
+        Value at = fold.thread;
+        if (fold.landingCnt) {
+          at = fold.landingCnt;
+          for (unsigned k = 1; k <= fold.outAt + 1; ++k)
+            at = seq::FirRegOp::create(
+                b, at, hostClock,
+                b.getStringAttr(fold.landing.getName().value_or("fold") +
+                                "_cnt" + Twine(k)));
+        }
+        seq::FirMemWriteOp::create(b, fold.landing, at, hostClock,
                                    fold.valid, fold.data, Value{});
         continue;
       }
@@ -16515,7 +16772,17 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       llvm::errs() << "fold-store-hbm: " << cls.name << ": " << hbmStats.stores
                    << " stores, " << hbmStats.bits << " bits in HBM; landing and "
                    << "read buffers " << hbmStats.landing
-                   << " bits on chip (II " << ii << ")\n";
+                   << " bits on chip (II " << ii << ")"
+                   << (foldStoreStream
+                           ? "; landing rings " + std::to_string(hbmStats.rings) +
+                                 " of " + std::to_string(cls.foldLandL) +
+                                 " entries; HBM " + std::to_string(hbmStats.traffic) +
+                                 " bits a frame (II_bw " +
+                                 std::to_string(llvm::divideCeil(hbmStats.traffic,
+                                                                 kStreamBitsPerCycle)) +
+                                 " alone)"
+                           : std::string())
+                   << "\n";
     if (aheadStats.stores)
       llvm::errs() << "fold-store-ram: " << cls.name << ": "
                    << aheadStats.stores << " stores, " << aheadStats.bits
@@ -21377,7 +21644,7 @@ LogicalResult StaticFolder::run() {
     }
     // `fold-store-hbm`: by size, unless a storage rule names the store
     // (<model>:fold<k>_store=<kind>: hbm, or on chip).
-    auto inHbm = [&](unsigned k, uint64_t bits, unsigned) {
+    auto inHbm = [&](unsigned k, uint64_t bits, unsigned depth) {
       std::string store = "fold" + std::to_string(k) + "_store";
       std::optional<bool> ruled;
       for (auto &spec : storageSpecs) {
@@ -21388,6 +21655,10 @@ LogicalResult StaticFolder::run() {
       }
       if (ruled)
         return *ruled;
+      // `fold-store-stream`: every store that can (a depth of 2 or more),
+      // whatever its size, and none in the scratch.
+      if (foldStoreStream)
+        return depth >= 2;
       if (!foldStoreHbm || bits < foldStoreHbm)
         return false;
       // The state scratch first (state-scratch-bits): in HBM only past it.
@@ -21401,7 +21672,7 @@ LogicalResult StaticFolder::run() {
     };
     if (cls.threads() > 1 &&
         failed(foldPipelines(cls.model, cls.threads(), foldStoreRam, levels,
-                             cls.folding, inHbm)))
+                             cls.folding, inHbm, foldStoreStream)))
       return failure();
   }
   for (auto [k, spec] : llvm::enumerate(foldStageLevelClassSpecs))
@@ -21609,6 +21880,7 @@ void FoldStaticPass::runOnOperation() {
   folder.foldStoreRam = foldStoreRam;
   folder.foldStoreStyle = foldStoreStyle;
   folder.foldStoreHbm = foldStoreHbm;
+  folder.foldStoreStream = foldStoreStream;
   folder.foldStoreLead = foldStoreLead;
   folder.foldStageLevels = foldStageLevels;
   folder.foldStageLevelClassSpecs.assign(foldStageLevelsClass.begin(),

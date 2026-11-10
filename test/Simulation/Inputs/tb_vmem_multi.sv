@@ -19,39 +19,46 @@
 // a read of a member's instance whose read is outstanding, or overflows a
 // FIFO (it issued without the room its free showed).
 module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1},
-                          parameter int MDW [N] = '{default: 64}, parameter int RF [N] = '{default: 1}) (
+                          parameter int MDW [N] = '{default: 64}, parameter int RF [N] = '{default: 1},
+                          parameter int MIW [N] = '{default: 4}, parameter int TW [N] = '{default: 0}) (
     input logic clk, rst,
     input int cyc, lo, hi, full,
-    input logic rd_valid [N], input logic [3:0] rd_inst [N], input logic [7:0] rd_row [N],
-    input logic wr_valid [N], input logic [3:0] wr_inst [N], input logic [7:0] wr_row [N],
-    input logic [63:0] wr_data [N], input logic [7:0] wr_mask [N],
-    output logic rsp_valid [N], output logic [3:0] rsp_inst, output logic [63:0] rsp_data,
+    input logic rd_valid [N], input logic [7:0] rd_inst [N], input logic [7:0] rd_row [N],
+    input logic wr_valid [N], input logic [7:0] wr_inst [N], input logic [7:0] wr_row [N],
+    input logic [1023:0] wr_data [N], input logic [127:0] wr_mask [N],
+    output logic rsp_valid [N], output logic [7:0] rsp_inst, output logic [1023:0] rsp_data,
     output logic [15:0] free [N],
     output bit ok);
   localparam DEPTH = 8;
-  typedef struct packed { logic rd, wr; logic [3:0] inst; logic [7:0] rrow, wrow; logic [63:0] data; logic [7:0] mask; } ent_t;
-  logic [63:0] mem [N][16][256];
+  typedef struct packed { logic rd, wr; logic [7:0] inst, winst; logic [7:0] rrow, wrow; logic [1023:0] data; logic [127:0] mask; } ent_t;
+  // Rows of up to 1024 bits; instances (the address's) below 256, rows below 64.
+  logic [1023:0] mem [N][256][64];
   ent_t fifo [N][DEPTH];
   int head [N], cnt [N];
-  bit outstanding [N][16], answered [N][16];
-  int due [N][16];
-  logic [63:0] data [N][16];
+  bit outstanding [N][256], answered [N][256];
+  int due [N][256];
+  logic [1023:0] data [N][256];
   int last;
   initial begin
     ok = 1; last = 0;
     for (int m = 0; m < N; m++) begin
       head[m] = 0; cnt[m] = 0;
-      for (int i = 0; i < 16; i++) begin
+      for (int i = 0; i < 256; i++) begin
         outstanding[m][i] = 0; answered[m][i] = 0;
-        for (int r = 0; r < 256; r++) mem[m][i][r] = 0;
+        for (int r = 0; r < 64; r++) mem[m][i][r] = 0;
       end
     end
   end
-  function automatic logic [63:0] masked(int m, logic [63:0] old, logic [63:0] d, logic [7:0] mask);
-    logic [63:0] v = old;
-    for (int b = 0; b < 8; b++)
+  // A member with TW tag bits (a vmem-rings image, foldsim_vmem TAGW): its
+  // instance index the low MIW - TW bits, the tag above it naming the request.
+  function automatic int addr(int m, logic [7:0] i);
+    return TW[m] != 0 ? int'(i) & ((1 << (MIW[m] - TW[m])) - 1) : int'(i);
+  endfunction
+  function automatic logic [1023:0] masked(int m, logic [1023:0] old, logic [1023:0] d, logic [127:0] mask);
+    logic [1023:0] v = old;
+    for (int b = 0; b < 128; b++)
       if (MMW[m] == 1 || (b < MMW[m] && mask[b])) v[b*8 +: 8] = d[b*8 +: 8];
-    return v & ((64'd1 << MDW[m]) - 1);
+    return v & ((1024'd1 << MDW[m]) - 1);
   endfunction
   always @(negedge clk) begin
     automatic bit any = 0;
@@ -61,9 +68,9 @@ module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1}
     end
     // One due answer a host cycle for the group.
     for (int m = 0; m < N; m++)
-      for (int i = 0; i < 16; i++)
+      for (int i = 0; i < 256; i++)
         if (!any && answered[m][i] && cyc >= due[m][i]) begin
-          any = 1; rsp_valid[m] = 1; rsp_inst = 4'(i); rsp_data = data[m][i];
+          any = 1; rsp_valid[m] = 1; rsp_inst = 8'(i); rsp_data = data[m][i];
         end
   end
   always @(posedge clk) if (!rst) begin
@@ -76,9 +83,9 @@ module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1}
         if (cnt[m] != 0) begin
           automatic ent_t e = fifo[m][head[m]];
           head[m] = (head[m] + 1) % DEPTH; cnt[m]--; last = m;
-          if (e.rd && RF[m] != 0) data[m][e.inst] = mem[m][e.inst][e.rrow];
-          if (e.wr) mem[m][e.inst][e.wrow] = masked(m, mem[m][e.inst][e.wrow], e.data, e.mask);
-          if (e.rd && RF[m] == 0) data[m][e.inst] = mem[m][e.inst][e.rrow];
+          if (e.rd && RF[m] != 0) data[m][e.inst] = mem[m][addr(m, e.inst)][e.rrow];
+          if (e.wr) mem[m][addr(m, e.winst)][e.wrow] = masked(m, mem[m][addr(m, e.winst)][e.wrow], e.data, e.mask);
+          if (e.rd && RF[m] == 0) data[m][e.inst] = mem[m][addr(m, e.inst)][e.rrow];
           if (e.rd) begin answered[m][e.inst] = 1; due[m][e.inst] = cyc + lo + int'($urandom % (hi - lo + 1)); end
           break;
         end
@@ -88,7 +95,7 @@ module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1}
     for (int m = 0; m < N; m++)
       if (rd_valid[m] || wr_valid[m]) begin
         automatic ent_t e;
-        e.rd = rd_valid[m]; e.wr = wr_valid[m]; e.inst = wr_valid[m] ? wr_inst[m] : rd_inst[m];
+        e.rd = rd_valid[m]; e.wr = wr_valid[m]; e.inst = rd_inst[m]; e.winst = wr_inst[m];
         e.rrow = rd_row[m]; e.wrow = wr_row[m]; e.data = wr_data[m]; e.mask = wr_mask[m];
         if (cnt[m] == DEPTH) begin
           if (ok) $display("PROTOCOL: member %0d's FIFO overflows at host cycle %0d", m, cyc);
