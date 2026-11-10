@@ -17369,11 +17369,13 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
   // quotient through F's decoder, its remainder through a table of the
   // period's rows (G), as large at any count of parents. A power of two
   // splits the index's bits; another period takes the position counters'
-  // quotient and remainder.
+  // quotient and remainder. (Also a position table that repeats a period of
+  // the schedule, F zero or the instances a period further: G that period's
+  // rows, up to 1,024.)
   foldsim::Separable sp;
   unsigned iwidth = hw::getBitWidth(index.getType());
   if (width >= 2 && !gTableRaw &&
-      foldsim::findSeparable(rows, width, counted, 512, sp)) {
+      foldsim::findSeparable(rows, width, counted, 1024, sp)) {
     auto itype = index.getType();
     auto cst = [&](Type t, uint64_t v) -> Value { return hw::ConstantOp::create(b, t, v); };
     Value q, r;
