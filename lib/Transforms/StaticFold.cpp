@@ -218,6 +218,16 @@ struct Class {
   /// instances; 0: the class's own count).
   unsigned ppCapacity = 0, ppFixedR = 0, ppFixedB = 16, pageCapacity = 0;
   bool ppFixed = false;
+  /// Partly resident PP rows: the resident index's bits (its RAMs' rows,
+  /// a power of two of instances), and whether the copy takes the pass's
+  /// resident index and stream bit as inputs (`ppres3`, `ppstr3`: position
+  /// tables of the simulator, not tables of the pass's instance, which would
+  /// chain a second decoder after the instance's).
+  bool ppPartial() const { return ppHbm && ppResident; }
+  unsigned ppResBits() const {
+    return std::max(1u, llvm::Log2_32_Ceil(
+                            unsigned(llvm::PowerOf2Ceil(std::max(ppResident, ppCapacity)))));
+  }
   /// The PP build's counts (rows, columns, captures, holds, hazards).
   std::string ppReport;
   /// State in RAM with its memories' page rows off chip (`<model>:sir-rows=
@@ -13907,6 +13917,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     addPort("pprow3",
             IntegerType::get(context, std::max(1u, llvm::Log2_32_Ceil(cls.pp))),
             true);
+    if (cls.ppPartial()) {
+      addPort("ppres3", IntegerType::get(context, cls.ppResBits()), true);
+      addPort("ppstr3", IntegerType::get(context, 1), true);
+    }
   }
   SmallVector<unsigned> inputArg(cls.inputNames.size(), 0);
   for (auto [i, name] : llvm::enumerate(cls.inputNames)) {
@@ -14060,12 +14074,17 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   BackedgeBuilder ppEdges(b, model.getLoc());
   SmallVector<PPReg> ppRegs;
   Operation *ppHeld = nullptr;
-  Value ppValid3, ppInst3, ppRow3, ppRinst0;
+  Value ppValid3, ppInst3, ppRow3, ppRinst0, ppRes3, ppStr3;
   if (cls.pp) {
     ppValid3 = body->getArgument(ppArg);
     if (threads > 1)
       ppInst3 = body->getArgument(ppArg + 1);
-    ppRow3 = body->getArgument(ppArg + (threads > 1 ? 2 : 1));
+    unsigned rowArg = ppArg + (threads > 1 ? 2 : 1);
+    ppRow3 = body->getArgument(rowArg);
+    if (cls.ppPartial()) {
+      ppRes3 = body->getArgument(rowArg + 1);
+      ppStr3 = body->getArgument(rowArg + 2);
+    }
   }
   if (cls.stages) {
     auto chain = [&](Value value, unsigned regs, const Twine &name) {
@@ -15503,16 +15522,13 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     // the same at every instance count.)
     unsigned resCount = std::max(cls.ppResident, cls.ppCapacity);
     unsigned resPow = partial ? unsigned(llvm::PowerOf2Ceil(resCount)) : 0;
-    Value res3, str3;
-    if (partial) {
-      SmallVector<uint64_t> resRows(entries, 0), strRows(entries, 0);
-      for (unsigned i = 0; i < threads; ++i) {
-        resRows[i] = cls.residentSlot[i];
-        strRows[i] = cls.ppStreamed[i];
-      }
-      res3 = table(b, ppInst3, resRows, std::max(1u, llvm::Log2_32_Ceil(resPow)));
-      str3 = table(b, ppInst3, strRows, 1);
-    }
+    // (The pass's resident index and stream bit: the simulator's position
+    // tables, inputs beside the pass's instance.)
+    Value res3 = ppRes3, str3 = ppStr3;
+    assert((!partial || (res3 && str3 &&
+                         hw::getBitWidth(res3.getType()) ==
+                             std::max(1u, llvm::Log2_32_Ceil(resPow)))) &&
+           "a partly resident PP class without its resident index input");
     for (unsigned c = 0; c < columns; ++c) {
       if (c % 16 == 0) {
         Group g;
@@ -17381,7 +17397,7 @@ LogicalResult StaticFolder::buildSim() {
     Value live3, pre3;
     /// CSF PP (state-in-ram-pp): whether the position three host cycles
     /// ahead is a pass of a state evaluation, its instance and its row.
-    Value ppValid3, ppInst3, ppRow3;
+    Value ppValid3, ppInst3, ppRow3, ppRes3, ppStr3;
   };
   SmallVector<Controls, 0> controls(classes.size());
   // Staged classes: what each reads at a position, its stages before each
@@ -17619,6 +17635,20 @@ LogicalResult StaticFolder::buildSim() {
       if (threads > 1)
         ctl.ppInst3 = table(b, at, pinstRow, idxWidth);
       ctl.ppRow3 = table(b, at, prowRow, rowWidth);
+      if (cls.ppPartial()) {
+        // Partly resident: each pass's resident index and stream bit (of its
+        // instance), read at the position.
+        SmallVector<uint64_t> presRow(ii + 1, 0), pstrRow(ii + 1, 0);
+        for (unsigned i = 0; i < threads; ++i)
+          for (unsigned j = 0; j < cls.pp; ++j) {
+            int r = cls.slot[kState][i] - int(cls.stages) + int(j);
+            unsigned pos = unsigned(r) % ii;
+            presRow[pos] = cls.ppStreamed[i] ? 0 : cls.residentSlot[i];
+            pstrRow[pos] = cls.ppStreamed[i];
+          }
+        ctl.ppRes3 = table(b, at, presRow, cls.ppResBits());
+        ctl.ppStr3 = table(b, at, pstrRow, 1);
+      }
     }
   }
 
@@ -17946,6 +17976,10 @@ LogicalResult StaticFolder::buildSim() {
       if (cls.threads() > 1)
         operands.push_back(controls[c].ppInst3);
       operands.push_back(controls[c].ppRow3);
+      if (cls.ppPartial()) {
+        operands.push_back(controls[c].ppRes3);
+        operands.push_back(controls[c].ppStr3);
+      }
     }
     for (auto [i, type] : llvm::enumerate(cls.inputTypes)) {
       if (int(i) == cls.clockInput)
@@ -20678,9 +20712,26 @@ LogicalResult StaticFolder::buildSim() {
         for (unsigned d = 0; d < window && d < ii; ++d)
           inflight[q] += st.popValid[(q + ii - d) % ii];
       unsigned cw = llvm::Log2_32_Ceil(window + 1);
-      // (Where the count does not decode: the sum of the window's landings,
-      // each the landing table a position before, when every one decodes.)
-      Value count = tryDecodeTable(b, next, inflight, cw);
+      // The count through the lookahead registers (atNext: the position's
+      // increment and the decoders do not chain into the advance), as the
+      // sum of the window's landings, each the landing table a position
+      // before: one-bit tables, which decode where the count's rows do not.
+      // Without lookahead tables: the count, or that sum, read at `next`.
+      Value count;
+      if (lookaheadTables) {
+        SmallVector<Value> parts;
+        for (unsigned d = 0; d < window && d < ii; ++d) {
+          SmallVector<uint64_t> landed(ii + 1, 0);
+          for (unsigned q = 0; q < ii; ++q)
+            landed[q] = st.popValid[(q + ii - d) % ii];
+          Value bit = atNext(landed, 1);
+          parts.push_back(cw > 1 ? b.createOrFold<comb::ConcatOp>(constant(cw - 1, 0), bit)
+                                 : bit);
+        }
+        count = parts.size() == 1 ? parts[0] : Value(comb::AddOp::create(b, parts, false));
+      } else {
+        count = tryDecodeTable(b, next, inflight, cw);
+      }
       if (!count) {
         SmallVector<Value> parts;
         for (unsigned d = 0; d < window && d < ii; ++d) {
