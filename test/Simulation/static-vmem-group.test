@@ -52,3 +52,21 @@
 # RUN: %t/eight/obj/Vtb +verilator+rand+reset+0 +verilator+seed+13 +lo=20 +hi=60 +full=80 +stall=20 | FileCheck %s
 # FAST: {{^}}MATCH 196 cycles in 2000 host cycles, H 10.00
 # CHECK: {{^}}MATCH
+# vmem-rings: a class's rings share an image (a controller) as their one read
+# and write a host cycle allow: 8 rings of lead 16 in a frame of 160, one
+# image (the ring in the tag and the row); of lead 4, two rings an image. Exact.
+# RUN: foldsim --srcs top.f --top Top --out %t/ring16 --static --modulo --min-ii 160 --virtual-memories 'Leaf:.*' --vmem-rings 16 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=RING16 < %t/ring16/foldsim_sim.mlir
+# RING16-COUNT-1: _img:Leaf:7:5:26:1:1:1:6
+# RING16-NOT: _img:
+# RUN: python3 %S/Inputs/vmem_bind.py %t/ring16/foldsim_sim.json %t/ring16
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/ring16 --top-module tb -Mdir %t/ring16/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/ring16/foldsim_sim.sv > %t/ring16/build.log 2>&1
+# RUN: %t/ring16/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
+# RUN: %t/ring16/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: %t/ring16/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=20 +hi=200 +full=50 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/ring4 --static --modulo --min-ii 160 --virtual-memories 'Leaf:.*' --vmem-rings 4 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=RING4 < %t/ring4/foldsim_sim.mlir
+# RING4-COUNT-4: _img:Leaf:5:3:
+# RUN: python3 %S/Inputs/vmem_bind.py %t/ring4/foldsim_sim.json %t/ring4
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/ring4 --top-module tb -Mdir %t/ring4/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/ring4/foldsim_sim.sv > %t/ring4/build.log 2>&1
+# RUN: %t/ring4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
