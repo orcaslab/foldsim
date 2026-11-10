@@ -193,6 +193,8 @@ struct Scan {
   DenseMap<Operation *, Pattern> patterns;
   // Packs: Elem values grouped by refined signature.
   DenseMap<Value, int> packOf;
+  // Parent values made lane values because one lane alone reads them.
+  DenseSet<Value> backward;
   std::vector<std::vector<Value>> packMembers; // pack -> lane -> member
   std::vector<bool> packComplete;
   // Carry chains: comb.add ops whose result is a Vec.
@@ -881,8 +883,11 @@ void Scan::classify() {
       }
     }
   }
-  for (auto [v, l] : only)
+  backward.clear();
+  for (auto [v, l] : only) {
     info[v] = Info::elem(l);
+    backward.insert(v);
+  }
 }
 
 /// A value's operand descriptor for the local signature.
@@ -1316,7 +1321,7 @@ bool Scan::finishPrio(Pattern &p, ArrayRef<int> order) {
         int c = packOf.lookup(p.conds[j]);
         ok &= pc < 0 || c == pc;
         pc = c;
-        if (isElem(p.vals[j])) {
+        if (isElem(p.vals[j]) && !backward.count(p.vals[j])) {
           int v = packOf.lookup(p.vals[j]);
           ok &= pv < 0 || v == pv;
           pv = v;
@@ -1896,7 +1901,8 @@ void LaneScanPass::runOnOperation() {
       case PatKind::Prio:
         for (unsigned j = 0; j < F; ++j)
           if (p.conds[j]) {
-            ok &= valueIn(p.conds[j]) && valueIn(p.vals[j]);
+            ok &= valueIn(p.conds[j]) &&
+                  (s.backward.count(p.vals[j]) || valueIn(p.vals[j]));
           }
         break;
       }
@@ -2528,7 +2534,7 @@ void LaneScanPass::runOnOperation() {
           en.push_back(p->conds[j] ? 1 : 0);
         Value enable = laneConst(b.getI1Type(), en);
         Value v;
-        if (s.isElem(p->vals[lane0])) {
+        if (s.isElem(p->vals[lane0]) && !s.backward.count(p->vals[lane0])) {
           v = cellValue(s.packMembers[s.packOf.lookup(p->vals[lane0])][0]);
         } else {
           // Constants: a disabled lane's value is free; it continues the
@@ -2800,6 +2806,20 @@ void LaneScanPass::runOnOperation() {
             llvm::errs() << "SEVAM"[int(oi.kind)];
             if (auto *d = o.getDefiningOp())
               llvm::errs() << ":" << nameOf(d);
+            if (auto ex = o.getDefiningOp<comb::ExtractOp>()) {
+              std::vector<BitSrc> bs;
+              if (s.bitsOf(ex.getInput(), bs)) {
+                auto &bb = bs[ex.getLowBit()];
+                llvm::errs() << "[k" << int(bb.k);
+                if (bb.src)
+                  llvm::errs() << " "
+                               << (bb.src.getDefiningOp()
+                                       ? nameOf(bb.src.getDefiningOp())
+                                       : StringRef("arg"))
+                               << " i" << widthOf(bb.src) << "@" << bb.bit;
+                llvm::errs() << "]";
+              }
+            }
             llvm::errs() << ":i" << widthOf(o) << " ";
           }
           llvm::errs() << ")\n";
