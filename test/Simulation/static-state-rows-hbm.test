@@ -19,6 +19,14 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/p2 -Mdir %t/p2/obj %S/Inputs/tb_pages.sv top.sv %t/p2/foldsim_sim.sv > %t/p2/build.log 2>&1
 # RUN: %t/p2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
 # RUN: %t/p2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+# page-engines-pp: the PP row chunk rides a page engine (a member at its own
+# read and write positions, its requests tagged); exact.
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/ppe --static --state-in-ram Leaf::4 --state-in-ram-pp --state-scratch-bits 0 --page-engines 4 --page-engines-pp Leaf > %t/ppe.log 2>&1
+# RUN: FileCheck %s --check-prefix=PPE < %t/ppe/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/ppe -Mdir %t/ppe/obj %S/Inputs/tb_pages.sv top.sv %t/ppe/foldsim_sim.sv > %t/ppe/build.log 2>&1
+# RUN: %t/ppe/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/ppe/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+# PPE: page engine 0 216 bits, tag {{[0-9]+}}, row {{[0-9]+}}: Leaf:pps0_rows
 # RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/p3 --static --state-in-ram Leaf::3 --state-in-ram-pp --state-scratch-bits 0 Leaf > %t/p3.log 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/p3 -Mdir %t/p3/obj %S/Inputs/tb_pages.sv top.sv %t/p3/foldsim_sim.sv > %t/p3/build.log 2>&1
 # RUN: %t/p3/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=5 +hi=60 +stall=20 +full=30 | FileCheck %s
