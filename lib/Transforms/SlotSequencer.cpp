@@ -680,6 +680,61 @@ bool factorThroughSequence(ArrayRef<uint64_t> rows, unsigned width,
   return false;
 }
 
+bool findSeparable(ArrayRef<uint64_t> rows, unsigned width, bool anyPeriod,
+                   unsigned maxPeriod, Separable &out) {
+  uint64_t mask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
+  size_t n = rows.size();
+  auto row = [&](uint64_t k) { return k < n ? rows[k] & mask : 0; };
+  uint64_t first = 0, end = 0;
+  while (first < n && !row(first))
+    ++first;
+  for (uint64_t k = n; k > first; --k)
+    if (row(k - 1)) {
+      end = k;
+      break;
+    }
+  if (end <= first + 4)
+    return false;
+  SmallVector<uint64_t, 2> starts{0};
+  if (first)
+    starts.push_back(first);
+  for (uint64_t start : starts)
+    for (uint64_t d = 2; d <= maxPeriod && d * 2 <= end - start; ++d) {
+      if (!anyPeriod && !llvm::isPowerOf2_64(d))
+        continue;
+      for (bool isXor : {true, false}) {
+        auto op = [&](uint64_t f, uint64_t g) { return (isXor ? f ^ g : f + g) & mask; };
+        uint64_t g0 = row(start);
+        uint64_t nq = (end - start + d - 1) / d;
+        SmallVector<uint64_t> f(nq), g(d);
+        for (uint64_t r = 0; r < d; ++r)
+          g[r] = row(start + r);
+        bool ok = true;
+        for (uint64_t q = 0; q < nq && ok; ++q) {
+          uint64_t base = row(start + q * d);
+          f[q] = isXor ? (base ^ g0) & mask : (base - g0) & mask;
+          for (uint64_t r = 0; r < d && ok; ++r) {
+            uint64_t k = start + q * d + r;
+            if (k >= end)
+              break;
+            ok = row(k) == op(f[q], g[r]);
+          }
+        }
+        // F: the parent's number, a segment or two (not a table of its own).
+        if (!ok || slotSegments(f, width, 2).size() > 2)
+          continue;
+        out.start = start;
+        out.end = end;
+        out.period = d;
+        out.isXor = isXor;
+        out.f = std::move(f);
+        out.g = std::move(g);
+        return true;
+      }
+    }
+  return false;
+}
+
 void countFallback(unsigned indexWidth, unsigned width, unsigned segments) {
   auto &stats = slotSequencerStats();
   ++stats.fallback;

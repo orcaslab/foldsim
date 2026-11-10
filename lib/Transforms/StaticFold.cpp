@@ -17364,6 +17364,69 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
   if (Value decoded =
           foldsim::decodeSlotTable(b, index, rows, width, gSlotSegments, divmod))
     return decoded;
+  // A table separable in a period of its index (a hierarchical identifier:
+  // a parent's number joined with a child's constant): the period's
+  // quotient through F's decoder, its remainder through a table of the
+  // period's rows (G), as large at any count of parents. A power of two
+  // splits the index's bits; another period takes the position counters'
+  // quotient and remainder.
+  foldsim::Separable sp;
+  unsigned iwidth = hw::getBitWidth(index.getType());
+  if (width >= 2 && !gTableRaw &&
+      foldsim::findSeparable(rows, width, counted, 512, sp)) {
+    auto itype = index.getType();
+    auto cst = [&](Type t, uint64_t v) -> Value { return hw::ConstantOp::create(b, t, v); };
+    Value q, r;
+    uint64_t d = sp.period;
+    if (llvm::isPowerOf2_64(d)) {
+      unsigned k = llvm::Log2_64(d);
+      Value off = sp.start ? Value(comb::SubOp::create(b, index, cst(itype, sp.start))) : index;
+      q = comb::ExtractOp::create(b, off, k, iwidth - k);
+      r = comb::ExtractOp::create(b, off, 0, k);
+    } else {
+      // The counters' quotient and remainder of the index; the remainder's
+      // table rotated by the start's, the quotient less the start's and a
+      // borrow where the remainder is below the start's.
+      auto [pq, pr] = pc->divmod(b, index, unsigned(d));
+      uint64_t sq = sp.start / d, sr = sp.start % d;
+      SmallVector<uint64_t> rot(d);
+      for (uint64_t x = 0; x < d; ++x)
+        rot[x] = sp.g[(x + d - sr) % d];
+      sp.g = std::move(rot);
+      r = pr;
+      q = pq;
+      unsigned qw = hw::getBitWidth(pq.getType());
+      if (sq)
+        q = comb::SubOp::create(b, q, cst(pq.getType(), sq));
+      if (sr) {
+        Value borrow = comb::ICmpOp::create(b, comb::ICmpPredicate::ult, pr,
+                                            cst(pr.getType(), sr));
+        q = comb::SubOp::create(
+            b, q, b.createOrFold<comb::ConcatOp>(cst(b.getIntegerType(qw - 1), 0), borrow));
+      }
+    }
+    Value fv = table(b, q, sp.f, width);
+    Value gv = table(b, r, sp.g, width);
+    Value v = sp.isXor ? Value(comb::XorOp::create(b, fv, gv))
+                       : Value(comb::AddOp::create(b, fv, gv));
+    SmallVector<Value> in;
+    if (sp.start)
+      in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge, index, cst(itype, sp.start)));
+    if (sp.end < (uint64_t(1) << iwidth))
+      in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::ult, index, cst(itype, sp.end)));
+    if (!in.empty()) {
+      Value hit = in.size() == 1 ? in[0] : Value(comb::AndOp::create(b, in, false));
+      v = comb::MuxOp::create(b, hit, v, cst(b.getIntegerType(width), 0));
+    }
+    auto &st = foldsim::slotSequencerStats();
+    ++st.decoded;
+    st.decodedBits += (uint64_t(1) << iwidth) * width;
+    if (getenv("FOLDSIM_AFFINE_LOG"))
+      llvm::errs() << "slot-sequencer: separable table of " << rows.size() << " x " << width
+                   << " bits: period " << d << (sp.isXor ? " xor" : " sum") << " from " << sp.start
+                   << " to " << sp.end << "\n";
+    return v;
+  }
   // A one-bit table whose zero rows are the fewer segments (a set of nearly
   // every position: a copy's passes but a few holes): its complement
   // decoded and inverted, zero past the rows.
@@ -20264,12 +20327,54 @@ LogicalResult StaticFolder::buildSim() {
           // Each instance's constant, by instance: a table of up to 64 bits
           // a slice, the slices joined (high first).
           SmallVector<Value> slices;
+          // (A class whose passes are one a position, instance i at p0 + i:
+          // a table the instance's index neither decodes nor splits into a
+          // power of two's digits is read at the position instead, two host
+          // cycles before, whose counters give any period's digits.)
+          unsigned p0 = ~0u;
+          if (threads > 64 && gSlotSegments && ctl.at3 && ctl.instRow3.size() == ii + 1) {
+            unsigned lo = ~0u, hi = 0, passes = 0;
+            SmallVector<uint8_t> isPass(ii, 0);
+            // (The positions the table is read at: staged, each pass's read,
+            // its stages before.)
+            auto mark = [&](int s) { isPass[unsigned(((s % int(ii)) + int(ii)) % int(ii))] = 1; };
+            for (unsigned i = 0; i < threads; ++i) {
+              for (unsigned l = 0; l < cls.readyLevels && cls.hasReady; ++l)
+                mark(cls.stages ? cls.readSlot(kReady, l, i) : int(cls.readySlots(l)[i]));
+              mark(cls.slot[kState][i] - int(cls.stages));
+            }
+            for (unsigned p = 0; p < ii; ++p)
+              if (isPass[p]) {
+                lo = std::min(lo, p);
+                hi = std::max(hi, p);
+                ++passes;
+              }
+            bool contiguous = passes == threads && hi - lo + 1 == threads;
+            for (unsigned p = lo; contiguous && p <= hi; ++p)
+              contiguous = ctl.instRow3[p] == p - lo;
+            if (contiguous)
+              p0 = lo;
+          }
           for (unsigned lo = 0; lo < width; lo += 64) {
             unsigned w = std::min(64u, width - lo);
             SmallVector<uint64_t> rows(threads, 0);
             for (unsigned i = 0; i < threads; ++i)
               if (sourceOf[i] == key)
                 rows[i] = constants[i].extractBits(w, lo).getZExtValue();
+            if (p0 != ~0u) {
+              foldsim::Separable sp;
+              bool byInstance =
+                  foldsim::slotSegments(rows, w, gSlotSegments).size() <= gSlotSegments ||
+                  foldsim::findSeparable(rows, w, false, 512, sp);
+              if (!byInstance) {
+                SmallVector<uint64_t> posRows(ii + 1, 0);
+                for (unsigned i = 0; i < threads; ++i)
+                  posRows[p0 + i] = rows[i];
+                slices.push_back(reg(reg(table(b, ctl.at3, posRows, w), cls.name + "_cpos2"),
+                                     cls.name + "_cpos1"));
+                continue;
+              }
+            }
             slices.push_back(threads > 1 ? table(b, ctl.inst1, rows, w)
                                          : hw::ConstantOp::create(
                                                b, b.getIntegerType(w), rows[0]));

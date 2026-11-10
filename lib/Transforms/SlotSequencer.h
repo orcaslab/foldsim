@@ -110,6 +110,22 @@ mlir::Value decodeSlotTable(
         nullptr);
 void countFallback(unsigned indexWidth, unsigned width, unsigned segments);
 
+/// A table separable in a period D of its index: rows[k] = F(q) op G(r) for
+/// k in [start, end), q and r the quotient and remainder of k - start by D,
+/// op XOR or a sum (mod 2^width), zero elsewhere. F is affine (a segment or
+/// two: the parent's number), G a table of D rows (a child's constant): a
+/// hierarchical identifier (a parent's id with a child's constant joined), as
+/// large at any count of parents.
+struct Separable {
+  uint64_t start = 0, end = 0, period = 0;
+  bool isXor = true;
+  llvm::SmallVector<uint64_t> f, g;
+};
+/// The smallest such period (powers of two up to `maxPeriod`, any period with
+/// `anyPeriod`), or false.
+bool findSeparable(llvm::ArrayRef<uint64_t> rows, unsigned width,
+                   bool anyPeriod, unsigned maxPeriod, Separable &out);
+
 } // namespace foldsim
 
 #endif // FOLDSIM_SLOTSEQUENCER_H

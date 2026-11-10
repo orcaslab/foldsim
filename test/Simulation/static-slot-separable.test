@@ -1,0 +1,27 @@
+# REQUIRES: verilator
+# --slot-segments: a per-instance constant (an identifier: a parent's number
+# joined with a child's constant, Driver/Inputs/ids) is a table of the
+# instance that no run of segments decodes; separable in a period of its
+# index (rows[k] = F(k / D) op G(k % D), F affine, G D rows), it is F's
+# decoder of the quotient and G's table of the remainder, as large at any
+# count of parents. A power of two splits the instance's bits (128 leaves, 8
+# parents of 16); a class of one pass a position (120 leaves, 12 parents of
+# 10) reads it at the position, whose counters give the period's quotient and
+# remainder. No table kept; exact against the target (FOLDSIM_SLOT_CHECK: each
+# decoded table beside its decoder), stalled channels.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/ids
+# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_AFFINE_LOG=1 foldsim --srcs top128.f --top Top --out %t/p2 --static --modulo --slot-segments 4 Leaf > %t/p2.log 2>&1
+# RUN: FileCheck %s --check-prefix=P2 < %t/p2.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/p2/obj %S/Inputs/tb_nest.sv leaf.sv top128.sv %t/p2/foldsim_sim.sv > %t/p2/build.log 2>&1
+# RUN: %t/p2/obj/Vtb +stall=0 | FileCheck %s
+# RUN: %t/p2/obj/Vtb +stall=30 | FileCheck %s
+# P2: slot-sequencer: separable table of 128 x 16 bits: period 16 xor from 0 to 128
+# P2: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), 0 tables kept
+# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_AFFINE_LOG=1 foldsim --srcs top120.f --top Top --out %t/p10 --static --modulo --slot-segments 4 Leaf > %t/p10.log 2>&1
+# RUN: FileCheck %s --check-prefix=P10 < %t/p10.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/p10/obj %S/Inputs/tb_nest.sv leaf.sv top120.sv %t/p10/foldsim_sim.sv > %t/p10/build.log 2>&1
+# RUN: %t/p10/obj/Vtb +stall=0 | FileCheck %s
+# RUN: %t/p10/obj/Vtb +stall=30 | FileCheck %s
+# P10: slot-sequencer: separable table of {{[0-9]+}} x 16 bits: period 10 xor
+# P10: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), 0 tables kept
+# CHECK: {{^}}MATCH
