@@ -63,10 +63,13 @@ bool stepOk(uint64_t x, unsigned width) {
 
 SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
                                       unsigned maxSegments, bool anyStride,
-                                      bool wrapAny) {
+                                      bool wrapAny, ArrayRef<uint8_t> care) {
   uint64_t mask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
   size_t n = rows.size();
   auto row = [&](uint64_t k) { return k < n ? rows[k] & mask : 0; };
+  // A row nothing reads (`care` low): any value fits it, and it is never
+  // covered (several runs may give it a value).
+  auto cares = [&](uint64_t k) { return care.empty() || (k < care.size() && care[k]); };
   std::vector<bool> covered(n, false);
   SmallVector<SlotSegment> segments;
   // The blocks of `seg` (start, stride, len, value, step, inner, digit set)
@@ -83,6 +86,8 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
       uint64_t blockLive = 0;
       for (uint64_t j = 0; j < seg.len && ok; ++j) {
         uint64_t p = base + j * seg.istride;
+        if (!cares(p))
+          continue;
         ok = !covered[p] && row(p) == (seg.at(k, j) & mask);
         blockLive += row(p) != 0;
       }
@@ -98,7 +103,7 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
     return liveAtLast;
   };
   for (size_t k0 = 0; k0 < n; ++k0) {
-    if (covered[k0] || !row(k0))
+    if (covered[k0] || !row(k0) || !cares(k0))
       continue;
     SlotSegment best;
     best.start = k0;
@@ -226,8 +231,11 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
     if (best.count == 1 && best.len == 1)
       best.stride = 0;
     for (uint64_t k = 0; k < best.count; ++k)
-      for (uint64_t j = 0; j < best.len; ++j)
-        covered[best.start + k * best.stride + j * best.istride] = true;
+      for (uint64_t j = 0; j < best.len; ++j) {
+        uint64_t p = best.start + k * best.stride + j * best.istride;
+        if (cares(p))
+          covered[p] = true;
+      }
     segments.push_back(best);
     if (segments.size() > maxSegments)
       break;
@@ -242,7 +250,8 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
 /// The value the decoder built from `segments` gives at each index of `w`
 /// bits, computed as the hardware computes it, compared with the rows.
 static bool decodesExactly(ArrayRef<SlotSegment> segments,
-                           ArrayRef<uint64_t> rows, unsigned width, unsigned w) {
+                           ArrayRef<uint64_t> rows, unsigned width, unsigned w,
+                           ArrayRef<uint8_t> care = {}) {
   uint64_t mask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
   uint64_t imask = (uint64_t(1) << w) - 1;
   uint64_t top = imask;
@@ -329,6 +338,8 @@ static bool decodesExactly(ArrayRef<SlotSegment> segments,
       got |= value & mask;
     }
     uint64_t want = idx < rows.size() ? rows[idx] & mask : 0;
+    if (!care.empty() && !(idx < care.size() && care[idx]))
+      continue;
     if (got != want) {
       if (getenv("FOLDSIM_AFFINE_LOG")) {
         llvm::errs() << "slot-sequencer: mismatch at " << idx << " (of " << rows.size()
@@ -349,18 +360,18 @@ static bool decodesExactly(ArrayRef<SlotSegment> segments,
 Value decodeSlotTable(
     ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
     unsigned width, unsigned maxSegments,
-    function_ref<std::pair<Value, Value>(unsigned)> divmod) {
+    function_ref<std::pair<Value, Value>(unsigned)> divmod, ArrayRef<uint8_t> care) {
   unsigned w = hw::getBitWidth(index.getType());
   if (w == 0 || w > 63 || width == 0 || width > 64)
     return {};
-  auto segments = slotSegments(rows, width, maxSegments, bool(divmod));
+  auto segments = slotSegments(rows, width, maxSegments, bool(divmod), false, care);
   // (Runs of any period are tried greedily, longest first: where that cuts
   // the rest into more segments than the powers of two alone, those; and
   // with blocks of a constant wrapping a period's end, where fewer.)
   if (divmod) {
     for (bool any : {false, true}) {
       auto other = slotSegments(rows, width, std::min<unsigned>(maxSegments, segments.size()),
-                                any, any);
+                                any, any, care);
       if (other.size() < segments.size())
         segments = std::move(other);
     }
@@ -370,7 +381,7 @@ Value decodeSlotTable(
   // The decoder's own arithmetic, at every index, against the rows: a
   // segment model or lowering slip keeps the table a constant (counted)
   // instead of building a wrong decoder.
-  if (!decodesExactly(segments, rows, width, w)) {
+  if (!decodesExactly(segments, rows, width, w, care)) {
     if (getenv("FOLDSIM_AFFINE_LOG"))
       llvm::errs() << "slot-sequencer: a decoder of " << segments.size()
                    << " segments disagrees with its table; table kept\n";

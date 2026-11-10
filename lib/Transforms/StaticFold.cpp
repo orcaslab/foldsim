@@ -10668,7 +10668,11 @@ static unsigned gSlotSegments = 0;
 /// `rows[index]` as a slot-segments decoder (through the position counters
 /// where the index is the frame's position), or null if it does not decode.
 static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
-                            ArrayRef<uint64_t> rows, unsigned width);
+                            ArrayRef<uint64_t> rows, unsigned width,
+                            ArrayRef<uint8_t> care = {});
+/// The rows the next table() reads (empty: all; a valid bit beside the
+/// table low elsewhere): set by tableCare for one call.
+static ArrayRef<uint8_t> gCare;
 /// While the simulator is built: the classes' pass sequences (each pass
 /// kind of each class of several instances) and the frame, for position
 /// tables that do not decode to be read through one (slot-segments).
@@ -17195,6 +17199,8 @@ LogicalResult StaticFolder::checkMulticycle(Class &cls) {
 /// A table indexed by `index`, of constants of `width` bits.
 static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                    unsigned width, unsigned site) {
+  ArrayRef<uint8_t> care = gCare;
+  gCare = {};
   auto type = b.getIntegerType(std::max(width, 1u));
   bool uniform = llvm::all_of(rows, [&](uint64_t v) { return v == rows[0]; });
   if (rows.empty() || uniform)
@@ -17213,7 +17219,7 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     auto *pc = foldsim::currentPosCounters();
     bool counted = pc && pc->knows(index);
     uint64_t segsBefore = foldsim::slotSequencerStats().segments;
-    if (Value decoded = tryDecodeTable(b, index, rows, width)) {
+    if (Value decoded = tryDecodeTable(b, index, rows, width, care)) {
       if (getenv("FOLDSIM_TABLE_SITES"))
         llvm::errs() << "table-dec " << site << " " << rows.size() << " " << width << " "
                      << foldsim::slotSequencerStats().segments - segsBefore << "\n";
@@ -17237,6 +17243,14 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
               clk = hm.getBodyBlock()->getArgument(k);
         if (clk) {
           Value ne = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, decoded, raw);
+          // (Where the rows are read: a row nothing reads may differ.)
+          if (!care.empty()) {
+            SmallVector<uint64_t> careRows(care.begin(), care.end());
+            gTableRaw = true;
+            Value read = table(b, index, careRows, 1, site);
+            gTableRaw = false;
+            ne = comb::AndOp::create(b, ne, read);
+          }
           Value clock = seq::FromClockOp::create(b, clk);
           std::string what = ("foldsim: slot-sequencer: decoder differs from its table (line " + Twine(site) + ", " +
                               Twine(rows.size()) + " x " + Twine(width) + ")").str();
@@ -17352,7 +17366,8 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
 }
 
 static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
-                            ArrayRef<uint64_t> rows, unsigned width) {
+                            ArrayRef<uint64_t> rows, unsigned width,
+                            ArrayRef<uint8_t> care) {
   if (!gSlotSegments)
     return {};
   auto *pc = foldsim::currentPosCounters();
@@ -17362,7 +17377,7 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
   if (counted)
     divmod = byCounters;
   if (Value decoded =
-          foldsim::decodeSlotTable(b, index, rows, width, gSlotSegments, divmod))
+          foldsim::decodeSlotTable(b, index, rows, width, gSlotSegments, divmod, care))
     return decoded;
   // A table separable in a period of its index (a hierarchical identifier:
   // a parent's number joined with a child's constant): the period's
@@ -17438,7 +17453,7 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
   for (auto [k, r] : llvm::enumerate(rows))
     inverse[k] = (r & 1) ^ 1;
   Value decoded =
-      foldsim::decodeSlotTable(b, index, inverse, 1, gSlotSegments, divmod);
+      foldsim::decodeSlotTable(b, index, inverse, 1, gSlotSegments, divmod, care);
   if (!decoded)
     return {};
   unsigned indexWidth = hw::getBitWidth(index.getType());
@@ -17449,6 +17464,18 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
         b, v,
         comb::ICmpOp::create(b, comb::ICmpPredicate::ult, index,
                              hw::ConstantOp::create(b, index.getType(), rows.size())));
+  return v;
+}
+
+/// table() of a value read only where `care` (a valid bit beside it): the
+/// other rows take whatever value decodes in the fewest segments.
+static Value tableCare(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+                       ArrayRef<uint8_t> care, unsigned width,
+                       unsigned site = __builtin_LINE()) {
+  if (!getenv("FOLDSIM_NO_CARE"))
+    gCare = care;
+  Value v = table(b, index, rows, width, site);
+  gCare = {};
   return v;
 }
 
@@ -18399,8 +18426,12 @@ LogicalResult StaticFolder::buildSim() {
           1u, llvm::Log2_32_Ceil(unsigned(llvm::PowerOf2Ceil(cls.pp))));
       SmallVector<uint64_t> readRow, instRow, rowRow;
       ppStreamRows(cls, readRow, instRow, rowRow);
-      ctl.offChip3 = {table(b, at, readRow, 1), table(b, at, instRow, idxWidth),
-                      table(b, at, rowRow, rowBits), constant(1, 0),
+      // (The read's instance and row are read with the read alone.)
+      SmallVector<uint8_t> reads(readRow.size());
+      for (auto [k, r] : llvm::enumerate(readRow))
+        reads[k] = r != 0;
+      ctl.offChip3 = {table(b, at, readRow, 1), tableCare(b, at, instRow, reads, idxWidth),
+                      tableCare(b, at, rowRow, reads, rowBits), constant(1, 0),
                       constant(rowBits, 0)};
     }
     for (auto [l, row] : llvm::enumerate(laterRows)) {
@@ -18493,8 +18524,8 @@ LogicalResult StaticFolder::buildSim() {
         // counters cost more than a decoder of a few segments.)
         auto plainSegs = [&] {
           unsigned lim = gSlotSegments + 1;
-          return std::min(foldsim::slotSegments(rows, width, lim, true).size(),
-                          foldsim::slotSegments(rows, width, lim, false).size());
+          return std::min(foldsim::slotSegments(rows, width, lim, true, false, valid).size(),
+                          foldsim::slotSegments(rows, width, lim, false, false, valid).size());
         };
         if (!getenv("FOLDSIM_NO_RANK") && posCtrs && posCtrs->knows(at) && gSlotSegments &&
             plainSegs() > gSlotSegments) {
@@ -18522,7 +18553,8 @@ LogicalResult StaticFolder::buildSim() {
             llvm::errs() << "slot-sequencer: a pass value not by rank (" << rows.size() << " x "
                          << width << ")\n";
         }
-        return table(b, at, rows, width);
+        // (Read at the class's passes alone: elsewhere any value.)
+        return tableCare(b, at, rows, valid, width);
       };
       // The instances in the order of their last passes (mod the frame), and
       // the set of those positions.
@@ -18978,7 +19010,13 @@ LogicalResult StaticFolder::buildSim() {
     auto seenNext = backedges.get(b.getI1Type());
     rb.seen = resetReg(seenNext, prefix + "_seen", 0);
     seenNext.setValue(comb::OrOp::create(b, rb.seen, eq(at, ii - 1)));
-    Value uentry2 = reg(table(b, at, plan.useEntry, eb), prefix + "_uentry2");
+    // (The entries and instances are read with their valid bits alone.)
+    SmallVector<uint8_t> useRows(ii + 1, 0), prefRows(ii + 1, 0);
+    for (unsigned p = 0; p < ii; ++p) {
+      useRows[p] = plan.useValid[p] != 0;
+      prefRows[p] = plan.prefValid[p] != 0;
+    }
+    Value uentry2 = reg(tableCare(b, at, plan.useEntry, useRows, eb), prefix + "_uentry2");
     Value skip2 = reg(comb::AndOp::create(b, table(b, at, plan.useCross, 1), notOf(rb.seen)),
                       prefix + "_skip2");
     Value skip1 = reg(skip2, prefix + "_skip1");
@@ -18989,9 +19027,9 @@ LogicalResult StaticFolder::buildSim() {
     rb.pref0 = resetReg(resetReg(resetReg(table(b, at, plan.prefValid, 1), prefix + "_pref2", 0),
                                  prefix + "_pref1", 0),
                         prefix + "_pref0", 0);
-    rb.pinst0 = idxWidth ? chain3(table(b, at, plan.prefInst, idxWidth), prefix + "_pinst")
+    rb.pinst0 = idxWidth ? chain3(tableCare(b, at, plan.prefInst, prefRows, idxWidth), prefix + "_pinst")
                          : constant(1, 0);
-    rb.pentry0 = chain3(table(b, at, plan.prefEntry, eb), prefix + "_pentry");
+    rb.pentry0 = chain3(tableCare(b, at, plan.prefEntry, prefRows, eb), prefix + "_pentry");
     Value irspValid = body->getArgument(image.firstInput);
     Value irspEntry = b.createOrFold<comb::ExtractOp>(
         b.getIntegerType(eb), body->getArgument(image.firstInput + 1), 1);

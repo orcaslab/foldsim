@@ -64,7 +64,8 @@ llvm::SmallVector<SlotSegment> slotSegments(llvm::ArrayRef<uint64_t> rows,
                                             unsigned width,
                                             unsigned maxSegments = 64,
                                             bool anyStride = false,
-                                            bool wrapAny = false);
+                                            bool wrapAny = false,
+                                            llvm::ArrayRef<uint8_t> care = {});
 
 /// A class's pass sequence: instance i's pass at position `slots[i]` (mod
 /// the frame), as `instAt` (the instance at each position, -1 for none).
@@ -100,6 +101,8 @@ SlotSequencerStats &slotSequencerStats();
 /// `rows[index]` (`width` bits, zero past the rows) as a decoder of at most
 /// `maxSegments` segments, or null if the rows need more (the caller then
 /// builds the constant table, and counts it with `countFallback`).
+/// `care` (empty: every row): the rows whose value is read; elsewhere (a
+/// valid bit beside the table low there) any value may come.
 /// `divmod`, where the index is the frame's position: its quotient and
 /// remainder of a period (PosCounters), for runs whose stride is not a power
 /// of two.
@@ -107,7 +110,8 @@ mlir::Value decodeSlotTable(
     mlir::ImplicitLocOpBuilder &b, mlir::Value index,
     llvm::ArrayRef<uint64_t> rows, unsigned width, unsigned maxSegments,
     llvm::function_ref<std::pair<mlir::Value, mlir::Value>(unsigned)> divmod =
-        nullptr);
+        nullptr,
+    llvm::ArrayRef<uint8_t> care = {});
 void countFallback(unsigned indexWidth, unsigned width, unsigned segments);
 
 /// A table separable in a period D of its index: rows[k] = F(q) op G(r) for
