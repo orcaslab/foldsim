@@ -19339,6 +19339,9 @@ LogicalResult StaticFolder::buildSim() {
     Value issValid, issInst, issEntry, queued;
     /// The answers' image write leaving now: valid, instance, data.
     Value wissValid, wissInst, wissData;
+    /// A shared image's read and write grants of this ring (registered,
+    /// one-hot over the image's rings); null when the image is its own.
+    Value issGrant, wissGrant;
   };
   std::map<std::pair<unsigned, unsigned>, RingBuilt> ringBuilt;
   auto buildRing = [&](unsigned c, unsigned k) -> Value {
@@ -22371,11 +22374,16 @@ LogicalResult StaticFolder::buildSim() {
     // A ring image's room and grants (vmem-rings), by image.
     struct ImageShare {
       bool built = false;
+      unsigned rings = 1;
       Backedge sentNext, anyWrite;
+      /// Shared (rings > 1): an image's read and write grant this host cycle
+      /// (registered: the grants are decided a host cycle ahead).
+      Backedge readGranted, writeGranted;
       Value enough, enough2;
       std::string prefix;
       SmallVector<Value> readCands, writeCands, reads, writes;
       SmallVector<Backedge> readGrants, writeGrants;
+      SmallVector<std::pair<unsigned, unsigned>> keys;
     };
     std::map<unsigned, ImageShare> imageShare;
     for (auto [c, cls] : llvm::enumerate(classes)) {
@@ -22543,17 +22551,39 @@ LogicalResult StaticFolder::buildSim() {
               SmallVector<Value> lag{resetReg(share.sentNext, fp + "_sent1", 0)};
               for (unsigned l = 2; l <= kRingFreeLag; ++l)
                 lag.push_back(resetReg(lag.back(), fp + "_sent" + Twine(l), 0));
+              // The room, registered: a host cycle late, `free` misses the
+              // requests of one host cycle more, the last (sent1) taken at
+              // use. Flag k: free - 2 x (the requests of sent1..sentL) >= k,
+              // seen a host cycle later; then the room for a request (2 of
+              // free) is flag 2 + 2 x sent1, for two flag 4 + 2 x sent1 (the
+              // adders and compares off the requests' path).
               Value recent = constant(fw, 0);
               for (Value x : lag)
                 recent = comb::AddOp::create(b, recent, b.createOrFold<comb::ConcatOp>(constant(fw - 2, 0), x));
               Value used = comb::ShlOp::create(b, recent, constant(fw, 1));
               Value credit = comb::SubOp::create(b, freeImg, used);
-              share.enough = comb::AndOp::create(
-                  b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used),
-                  comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit, constant(fw, 2)));
-              share.enough2 = comb::AndOp::create(
-                  b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used),
-                  comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit, constant(fw, 4)));
+              Value covers = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used);
+              SmallVector<Value> flag;
+              for (unsigned k = 2; k <= 8; k += 2)
+                flag.push_back(resetReg(
+                    comb::AndOp::create(b, covers,
+                                        comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit,
+                                                             constant(fw, k))),
+                    fp + "_room" + Twine(k), 0));
+              Value s1 = lag.front();
+              auto room = [&](unsigned at) -> Value {
+                return comb::MuxOp::create(
+                    b, eq(s1, 0), flag[at],
+                    comb::MuxOp::create(b, eq(s1, 1), flag[at + 1], flag[at + 2]));
+              };
+              share.enough = room(0);
+              share.enough2 = room(1);
+              unsigned img = imageOf.at({unsigned(c), vk});
+              share.rings = imageMembers.count(img) ? imageMembers[img].size() : 1;
+              if (share.rings > 1) {
+                share.readGranted = backedges.get(i1);
+                share.writeGranted = backedges.get(i1);
+              }
               share.anyWrite = backedges.get(i1);
               share.prefix = fp;
             }
@@ -22588,12 +22618,17 @@ LogicalResult StaticFolder::buildSim() {
             rb.wissValid = wgo;
             rb.wissInst = wtopInst;
             rb.wissData = b.createOrFold<comb::ExtractOp>(b.getIntegerType(dw), wtop, 0);
+            // (Shared: room for two while the image's write grant is held,
+            // whether or not its ring writes.)
             Value rcand = comb::AndOp::create(
                 b, ValueRange{any, notOf(busy),
-                              comb::MuxOp::create(b, share.anyWrite, share.enough2, enough)},
+                              comb::MuxOp::create(b, share.rings > 1 ? Value(share.writeGranted)
+                                                                     : Value(share.anyWrite),
+                                                  share.enough2, enough)},
                 false);
             auto rgrant = backedges.get(i1);
             rb.issValid = comb::AndOp::create(b, rcand, rgrant);
+            share.keys.push_back({unsigned(c), vk});
             share.readCands.push_back(rcand);
             share.readGrants.push_back(rgrant);
             share.reads.push_back(rb.issValid);
@@ -22651,49 +22686,71 @@ LogicalResult StaticFolder::buildSim() {
     }
     // Each image's grants: a read and a write a host cycle, to the first
     // ring asking at or after a pointer that turns every host cycle (each
-    // ring's turn comes within as many host cycles as rings).
+    // ring's turn comes within as many host cycles as rings). Decided a host
+    // cycle ahead from the candidates registered (two host cycles old): a
+    // ring granted issues if it still asks; the grant and the image's room
+    // never wait on the requests' own logic. The room counts every grant as
+    // a request (at most one more than went).
     for (auto &[img, share] : imageShare) {
       if (!share.built)
         continue;
-      auto pick = [&](ArrayRef<Value> cands, const Twine &n) -> SmallVector<Value> {
-        unsigned r = cands.size();
-        if (r == 1)
-          return {constant(1, 1)};
+      if (share.rings == 1) {
+        for (auto &g : share.readGrants)
+          g.setValue(constant(1, 1));
+        for (auto &g : share.writeGrants)
+          g.setValue(constant(1, 1));
+        Value anyRead = comb::OrOp::create(b, share.reads, false);
+        Value anyWrite = comb::OrOp::create(b, share.writes, false);
+        share.anyWrite.setValue(anyWrite);
+        share.sentNext.setValue(comb::AddOp::create(
+            b, b.createOrFold<comb::ConcatOp>(constant(1, 0), anyWrite),
+            b.createOrFold<comb::ConcatOp>(constant(1, 0), anyRead)));
+        continue;
+      }
+      auto pick = [&](ArrayRef<Value> live, const Twine &n) -> std::pair<SmallVector<Value>, Value> {
+        unsigned r = live.size();
+        SmallVector<Value> cands;
+        for (auto [j, x] : llvm::enumerate(live))
+          cands.push_back(resetReg(x, share.prefix + n + "_cand" + Twine(j), 0));
         unsigned pb = llvm::Log2_32_Ceil(r);
         auto ptrNext = backedges.get(b.getIntegerType(pb));
         Value ptr = resetReg(ptrNext, share.prefix + n + "_turn", 0);
         ptrNext.setValue(comb::MuxOp::create(
             b, eq(ptr, r - 1), constant(pb, 0), comb::AddOp::create(b, ptr, constant(pb, 1))));
+        // The first asking at or after the pointer, else the first asking:
+        // two priority picks, one chosen.
         SmallVector<Value> hi;
         for (unsigned j = 0; j < r; ++j)
           hi.push_back(comb::AndOp::create(
               b, cands[j], comb::ICmpOp::create(b, comb::ICmpPredicate::ule, ptr, constant(pb, j))));
         Value anyHi = comb::OrOp::create(b, hi, false);
-        SmallVector<Value> sel, grants;
+        auto first = [&](ArrayRef<Value> xs, unsigned j) -> Value {
+          if (!j)
+            return xs[0];
+          return comb::AndOp::create(b, xs[j], notOf(comb::OrOp::create(b, xs.take_front(j), false)));
+        };
+        SmallVector<Value> grants;
         for (unsigned j = 0; j < r; ++j)
-          sel.push_back(comb::MuxOp::create(b, anyHi, hi[j], cands[j]));
-        for (unsigned j = 0; j < r; ++j) {
-          if (!j) {
-            grants.push_back(sel[0]);
-            continue;
-          }
-          SmallVector<Value> before(sel.begin(), sel.begin() + j);
-          grants.push_back(comb::AndOp::create(
-              b, sel[j], notOf(comb::OrOp::create(b, before, false))));
-        }
-        return grants;
+          grants.push_back(resetReg(comb::MuxOp::create(b, anyHi, first(hi, j), first(cands, j)),
+                                    share.prefix + n + "_grant" + Twine(j), 0));
+        Value granted = resetReg(comb::OrOp::create(b, cands, false), share.prefix + n + "_granted", 0);
+        return {grants, granted};
       };
-      auto rg = pick(share.readCands, "_rd"), wg = pick(share.writeCands, "_wr");
-      for (unsigned j = 0; j < rg.size(); ++j)
+      auto [rg, rAny] = pick(share.readCands, "_rd");
+      auto [wg, wAny] = pick(share.writeCands, "_wr");
+      for (unsigned j = 0; j < rg.size(); ++j) {
         share.readGrants[j].setValue(rg[j]);
-      for (unsigned j = 0; j < wg.size(); ++j)
         share.writeGrants[j].setValue(wg[j]);
-      Value anyRead = comb::OrOp::create(b, share.reads, false);
-      Value anyWrite = comb::OrOp::create(b, share.writes, false);
-      share.anyWrite.setValue(anyWrite);
+        auto &rb = ringBuilt.at(share.keys[j]);
+        rb.issGrant = rg[j];
+        rb.wissGrant = wg[j];
+      }
+      share.readGranted.setValue(rAny);
+      share.writeGranted.setValue(wAny);
+      share.anyWrite.setValue(wAny);
       share.sentNext.setValue(comb::AddOp::create(
-          b, b.createOrFold<comb::ConcatOp>(constant(1, 0), anyWrite),
-          b.createOrFold<comb::ConcatOp>(constant(1, 0), anyRead)));
+          b, b.createOrFold<comb::ConcatOp>(constant(1, 0), wAny),
+          b.createOrFold<comb::ConcatOp>(constant(1, 0), rAny)));
     }
     for (auto &v : simVirtuals) {
       // `vmem-rings`: an image's requests (its queued prefetches and its
@@ -22918,17 +22975,21 @@ LogicalResult StaticFolder::buildSim() {
         auto when = [&](Value on, Value x) -> Value {
           return comb::MuxOp::create(b, on, x, constant(hw::getBitWidth(x.getType()), 0));
         };
+        // (Shared: the fields by the ring's grant, one-hot and registered,
+        // the valid bits alone by the requests.)
+        Value rsel = rb.issGrant ? rb.issGrant : rb.issValid;
+        Value wsel = rb.wissGrant ? rb.wissGrant : rb.wissValid;
         rdV.push_back(rb.issValid);
-        rdTag.push_back(when(rb.issValid,
+        rdTag.push_back(when(rsel,
                              b.createOrFold<comb::ConcatOp>(ValueRange{
                                  constant(1, 0), withRing(zext(rb.issEntry, eb), j), constant(1, 0)})));
-        rdRow.push_back(when(rb.issValid, withRing(zext(rb.issInst, ib), j)));
+        rdRow.push_back(when(rsel, withRing(zext(rb.issInst, ib), j)));
         wrV.push_back(rb.wissValid);
-        wrTag.push_back(when(rb.wissValid,
+        wrTag.push_back(when(wsel,
                              b.createOrFold<comb::ConcatOp>(ValueRange{
                                  constant(1, 1), withRing(constant(eb, 0), j), constant(1, 0)})));
-        wrRow.push_back(when(rb.wissValid, withRing(zext(rb.wissInst, ib), j)));
-        wrData.push_back(when(rb.wissValid, zext(rb.wissData, dw)));
+        wrRow.push_back(when(wsel, withRing(zext(rb.wissInst, ib), j)));
+        wrData.push_back(when(wsel, zext(rb.wissData, dw)));
       }
       auto any = [&](SmallVector<Value> &xs) -> Value {
         return xs.size() == 1 ? xs[0] : Value(comb::OrOp::create(b, xs, false));
