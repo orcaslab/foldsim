@@ -2279,7 +2279,7 @@ void LaneScanPass::runOnOperation() {
             // Each lane's slice gathered from the same bits of the same pack
             // (or lane vector) as lane 0's.
             auto &bs = s.bits[v];
-            ok = true;
+            ok = int64_t(bs.size()) == int64_t(F) * i.w;
             for (int64_t k = 0; k < i.w && ok; ++k) {
               // The reference: the first lane whose bit k is a lane bit.
               const BitSrc *a = nullptr;
@@ -2709,6 +2709,15 @@ void LaneScanPass::runOnOperation() {
       return e;
     };
     auto define = [&](Value key, Value cellV) {
+      // Another value's placeholder (a piece that is all of a value made
+      // later): held by an op of its own, so the map never keeps a
+      // placeholder the backedge replaces.
+      if (cellV.getDefiningOp<UnrealizedConversionCastOp>()) {
+        if (isa<IntegerType>(cellV.getType()))
+          cellV = comb::ExtractOp::create(b, cellV, 0, widthOf(cellV));
+        else
+          cellV = hw::BitcastOp::create(b, cellV.getType(), cellV);
+      }
       cellOf[key] = cellV;
       auto pit = pending.find(key);
       if (pit != pending.end()) {
@@ -3327,14 +3336,24 @@ void LaneScanPass::runOnOperation() {
       SmallVector<Value> ms(s.packMembers[p].begin(), s.packMembers[p].end());
       for (int j = 0; j < s.packFirst[p]; ++j)
         ms[j] = Value(); // the parent's own
-      outs.push_back({"out" + std::to_string(outs.size()), cv, ms});
+      outs.push_back({"out" + std::to_string(outs.size()), cv, ms, -1,
+                      s.tmpl(p)});
     }
     for (Value v : exportVecs)
-      outs.push_back({"vec" + std::to_string(outs.size()), cellValue(v), {v}});
+      outs.push_back(
+          {"vec" + std::to_string(outs.size()), cellValue(v), {v}, -1, v});
 
+    for (auto &o : outs)
+      if (o.key)
+        o.cell = cellValue(o.key);
     if (!pending.empty()) {
-      parent.emitError("lane-scan: a cell value was never defined");
-      return signalPassFailure();
+      // A value the cell would need but does not make: leave this group
+      // as it is (correct, unfolded) and say so.
+      llvm::errs() << "lane-scan: " << module << " lanes " << tag
+                   << ": a cell value is not made; group left unfolded\n";
+      backedges.abandon();
+      cell.erase();
+      continue;
     }
 
     // Report. The residual: live parent ops over several lanes that no scan
@@ -3410,9 +3429,6 @@ void LaneScanPass::runOnOperation() {
     // The cell's ports and terminator.
     for (auto &in : ins)
       addPort(in.name, in.type, true);
-    for (auto &o : outs)
-      if (o.key)
-        o.cell = cellValue(o.key);
     SmallVector<Value> outVals;
     for (auto &o : outs) {
       addPort(o.name, o.cell.getType(), false);
