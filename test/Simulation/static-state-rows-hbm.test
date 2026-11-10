@@ -36,6 +36,24 @@
 # RUN: FileCheck %s --check-prefix=PPEZ < %t/ppe/foldsim_sim.mlir
 # PPEZ: %pps0_wr_data = seq.firreg {{.*}} reset sync
 # PPEZ: hw.output {{.*}}%Leaf_copy.vm0_wr_data, %Leaf_copy.vm0_wr_mask :
+# pp-beat-bits: the rows move as beats of whole columns (3 columns, beats of at most 144 bits: 2 beats of 2 columns),
+# each pass's row into a buffer, drained a beat a position after its last row's pass. 16 leaves (Inputs/paged16),
+# half of them streamed behind a scratch of 4,000 bits: their passes 10 positions apart, room for 8 beats each.
+# On the 4 leaves above the beats do not fit (each prefetch's 8 beats past the first pass's decision): whole rows.
+# RUN: cd %S/../Driver/Inputs/paged16 && env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/bt --static --nest --modulo --state-in-ram Leaf::4 --state-scratch-bits 4000 --state-in-ram-pp --page-engines 4 --page-engines-pp --pp-beat-bits 144 Leaf > %t/bt.log 2>&1
+# RUN: FileCheck %s --check-prefix=BT < %t/bt.log
+# RUN: FileCheck %s --check-prefix=BTVH < %t/bt/foldsim_sim.vh
+# RUN: cd %S/../Driver/Inputs/paged16 && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/bt -Mdir %t/bt/obj %S/Inputs/tb_pages.sv top.sv %t/bt/foldsim_sim.sv > %t/bt/build.log 2>&1
+# RUN: %t/bt/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/bt/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=90 +stall=30 +full=30 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/paged16 && env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/btb --static --nest --modulo --bubbles --state-in-ram Leaf::4 --state-scratch-bits 4000 --state-in-ram-pp --page-engines 4 --page-engines-pp --pp-beat-bits 144 Leaf > %t/btb.log 2>&1
+# RUN: cd %S/../Driver/Inputs/paged16 && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/btb -DBUBBLES -Mdir %t/btb/obj %S/Inputs/tb_pages.sv top.sv %t/btb/foldsim_sim.sv > %t/btb/build.log 2>&1
+# RUN: %t/btb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=80 +bubble=50 +stall=30 +full=30 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/paged && env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/btno --static --nest --modulo --state-in-ram Leaf::8 --state-scratch-bits 2000 --state-in-ram-pp --page-engines 4 --page-engines-pp --pp-beat-bits 144 Leaf 2>&1 | FileCheck %s --check-prefix=BTNO
+# BT: state-stream: Leaf: 3 columns in 1 virtual memories, a window of 4 slots x 4 rows, 2 beats a row (reads +0, drains +0 positions)
+# BT: page engine 0 144 bits, tag {{[0-9]+}}, row {{[0-9]+}}: Leaf:pps0_rows
+# BTVH: `define FOLDSIM_VMEM_0_DW 144
+# BTNO: pp-beat-bits: Leaf: 2 beats a row do not fit its positions: whole rows
 # RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/p3 --static --state-in-ram Leaf::3 --state-in-ram-pp --state-scratch-bits 0 Leaf > %t/p3.log 2>&1
 # A column's write select over the rows that hold its bits (2 of the 4).
 # RUN: FileCheck %s --check-prefix=P3LOG < %t/p3.log

@@ -218,6 +218,11 @@ struct Class {
   /// master while a chunk keeps a beat's columns): only where the frame's
   /// HBM bandwidth needs it (chooseStreamWindows), each chunk a controller.
   bool ppChunkSpread = false;
+  /// `pp-beat-bits` (PPBeats): its rows as `ppBeats` beats of `ppBeatCols`
+  /// columns each (1: whole rows), its reads and drains moved by these many
+  /// positions on their engine.
+  unsigned ppBeats = 1, ppBeatCols = 0;
+  int ppReadShift = 0, ppDrainShift = 0;
   uint64_t rowStateBits = 0;
   /// A paged class's register bits an instance pages (planScratch, for the
   /// HBM bits a frame of its pages streamed).
@@ -584,6 +589,28 @@ public:
   void ppStreamRows(const Class &cls, SmallVectorImpl<uint64_t> &readRow,
                     SmallVectorImpl<uint64_t> &instRow,
                     SmallVectorImpl<uint64_t> &rowRow) const;
+  /// `pp-beat-bits`: a streamed PP class's rows as `k` beats a row. Each
+  /// streamed instance's first beat read (its prefetch position, `readAt`)
+  /// and first drain (`drainAt`: the position after its last row's pass,
+  /// a host cycle on, the buffer read the host cycle before), by instance
+  /// (kNoBeats: not streamed), and the most each may move later (`maxR`: the last
+  /// beat still a lead before the pass that reads its row, 0 at the least;
+  /// `maxW`: the last drain before the next streamed instance's pass writes
+  /// the row). False where a class's own beats would share positions or the
+  /// drains cannot end in time (the rows stay whole).
+  bool ppBeatWindows(const Class &cls, unsigned k, SmallVectorImpl<int> &readAt,
+                     SmallVectorImpl<int> &drainAt, int &maxR, int &maxW) const;
+  /// Whether a class's copy takes the beat ports (PPStreamPorts::beat3).
+  bool ppBeatPorts(const Class &cls) const {
+    return cls.ppHbm && ppBeatBits && pageEnginesPP;
+  }
+  /// Its reads' and drains' tables by position (ii + 1 each) at its shifts:
+  /// valid, instance, row, beat.
+  void ppBeatTables(const Class &cls, SmallVectorImpl<uint64_t> &rValid,
+                    SmallVectorImpl<uint64_t> &rInst, SmallVectorImpl<uint64_t> &rRow,
+                    SmallVectorImpl<uint64_t> &rBeat, SmallVectorImpl<uint64_t> &dValid,
+                    SmallVectorImpl<uint64_t> &dInst, SmallVectorImpl<uint64_t> &dRow,
+                    SmallVectorImpl<uint64_t> &dBeat) const;
   /// Each instance's prefetch position (its window slot's previous
   /// occupant's state pass; negative: the frame before), for window `w`.
   void ppPrefetches(const Class &cls, unsigned w, SmallVectorImpl<int> &at) const;
@@ -602,6 +629,9 @@ public:
     Value streamed3;
     /// The prefetch's window slot by position (`ppfslot3`, three ahead).
     Value prefSlot3;
+    /// `pp-beat-bits`: [read beat, drain, drain instance, drain row, drain
+    /// beat], three ahead (empty: whole rows).
+    ArrayRef<Value> beat3;
   };
   /// Builds a streamed PP class's HBM rows: a virtual memory a chunk of
   /// columns (at most 4,096 bits), the prefetches' responses written into
@@ -884,6 +914,8 @@ public:
   unsigned linkHbmRowBits = 512;
   unsigned linkHbmBeatBits = 0;
   bool pageEnginesPP = false;
+  /// `pp-beat-bits`: see PPBeats.
+  unsigned ppBeatBits = 0;
   /// `min-ii` (with modulo): the shortest frame the search starts from; the
   /// positions beyond the schedule's own stay idle. A longer frame is a
   /// longer prefetch distance for every request a pass issues (for studies
@@ -3391,6 +3423,11 @@ static int sinkStage(Value value, int extra, int limit,
   return s.stage + (s.levels > 0 && s.levels + extra > limit ? 1 : 0);
 }
 
+/// `pp-beat-bits`: the copy's beat ports' width (at most 2^8 beats a row).
+static constexpr unsigned kPPBeatPortBits = 8;
+/// ppBeatWindows' position of an instance that does not stream.
+static constexpr int kNoBeats = INT_MIN;
+
 /// The carry block (bits) Beacon's fold screen times adders and compares by
 /// on an FPGA (ci/beacon.py's `screen` preset: --carry-block-size 8).
 static constexpr unsigned kBeaconCarryBlock = 8;
@@ -5260,9 +5297,95 @@ LogicalResult StaticFolder::assignPageEngines() {
   // streamed instance at its pass, the write a host cycle later), on the
   // first engine where they are free (a class's chunks, at the same
   // positions, so on distinct engines).
+  // `pp-beat-bits`: a class of beats first, most positions first, each on
+  // the first engine where its reads and its drains, each moved later by a
+  // constant within their windows (ppBeatWindows), take free positions
+  // (the least moves), its chunks (spread: the same positions) on distinct
+  // engines; else on new ones, unmoved.
+  if (pageEnginesPP && ppBeatBits) {
+    SmallVector<unsigned> order;
+    for (auto [c, cls] : llvm::enumerate(classes))
+      if (cls.pp && cls.ppHbm && cls.ppBeats > 1)
+        order.push_back(unsigned(c));
+    auto taken = [&](unsigned c) {
+      unsigned s = 0;
+      for (unsigned i = 0; i < classes[c].threads(); ++i)
+        s += classes[c].ppStreamed.empty() || classes[c].ppStreamed[i];
+      return uint64_t(s) * classes[c].pp * classes[c].ppBeats;
+    };
+    llvm::stable_sort(order, [&](unsigned x, unsigned y) { return taken(x) > taken(y); });
+    for (unsigned c : order) {
+      auto &cls = classes[c];
+      unsigned k = cls.ppBeats, run = cls.pp * k;
+      SmallVector<int> readAt, drainAt;
+      int maxR = 0, maxW = 0;
+      if (!ppBeatWindows(cls, k, readAt, drainAt, maxR, maxW))
+        return netlist.emitError("pp-beat-bits: ") << cls.name << "'s beats left their windows";
+      SmallVector<unsigned> members;
+      for (auto [x, vm] : llvm::enumerate(cls.virtualMemories))
+        if (vm.pages && StringRef(vm.name).starts_with("pps"))
+          members.push_back(unsigned(x));
+      auto fits = [&](ArrayRef<uint64_t> row, ArrayRef<int> at, int shift) {
+        for (int a : at)
+          if (a != kNoBeats)
+            for (unsigned t = 0; t < run; ++t)
+              if (row[wrap(a + shift + int(t))])
+                return false;
+        return true;
+      };
+      // The shifts: the first engine (in order) where they fit, the least.
+      int sr = 0, sw = 0;
+      bool found = false;
+      for (unsigned e = 0; e < pageEngines.size() && !found; ++e) {
+        int r = 0, w = 0;
+        while (r <= maxR && !fits(pageEngines[e].reads, readAt, r))
+          ++r;
+        while (w <= maxW && !fits(pageEngines[e].writes, drainAt, w))
+          ++w;
+        if (r <= maxR && w <= maxW) {
+          sr = r;
+          sw = w;
+          found = true;
+        }
+      }
+      cls.ppReadShift = sr;
+      cls.ppDrainShift = sw;
+      for (unsigned x : members) {
+        auto &vm = cls.virtualMemories[x];
+        unsigned e = 0;
+        for (; e < pageEngines.size(); ++e)
+          if (fits(pageEngines[e].reads, readAt, sr) && fits(pageEngines[e].writes, drainAt, sw))
+            break;
+        if (e == pageEngines.size()) {
+          if (e >= pageEngineCap)
+            return netlist.emitError("page engines: ")
+                   << pageEngineCap << " engines cannot carry the PP beats of " << cls.name;
+          newEngine();
+        }
+        auto &eng = pageEngines[e];
+        for (int a : readAt)
+          if (a != kNoBeats)
+            for (unsigned t = 0; t < run; ++t)
+              eng.reads[wrap(a + sr + int(t))] = 1;
+        for (int a : drainAt)
+          if (a != kNoBeats)
+            for (unsigned t = 0; t < run; ++t)
+              eng.writes[wrap(a + sw + int(t))] = 1;
+        eng.members.push_back({c, x});
+        eng.dataWidth = std::max(eng.dataWidth, vm.dataWidth);
+        eng.instWidth = std::max(eng.instWidth, vm.instWidth);
+        eng.addrWidth = std::max(eng.addrWidth, vm.instWidth + vm.rowWidth);
+        eng.readFirst = true;
+      }
+      if (getenv("FOLDSIM_PPE_LOG"))
+        llvm::errs() << "ppe: " << cls.name << ": " << members.size() << " members of "
+                     << k << " beats, " << run << " positions an instance, reads +" << sr
+                     << " (of " << maxR << "), drains +" << sw << " (of " << maxW << ")\n";
+    }
+  }
   if (pageEnginesPP)
     for (auto [c, cls] : llvm::enumerate(classes)) {
-      if (!cls.pp || !cls.ppHbm)
+      if (!cls.pp || !cls.ppHbm || (ppBeatBits && cls.ppBeats > 1))
         continue;
       SmallVector<uint64_t> readRow, instRow, rowRow;
       ppStreamRows(cls, readRow, instRow, rowRow);
@@ -13226,13 +13349,16 @@ static constexpr unsigned kStreamMasters = 8;
 /// over the masters. A controller costs its data width and itself (Y's
 /// calibrated ctl_cost), so chunks are as few as the bandwidth allows. Chunk k
 /// takes columns [lo, hi).
-static unsigned ppChunks(unsigned columns, bool spread) {
-  unsigned least = unsigned(llvm::divideCeil(columns, 56));
+static unsigned ppChunks(unsigned columns, bool spread, bool beats = false) {
+  // (Beats: a row moves beat by beat, so the columns of a controller are
+  // not bounded: one chunk, unless spread.)
+  unsigned least = beats ? 1u : unsigned(llvm::divideCeil(columns, 56));
   unsigned masters = spread ? std::min(kStreamMasters, unsigned(llvm::divideCeil(columns, 7))) : 1u;
   return std::max({1u, least, masters});
 }
-static std::pair<unsigned, unsigned> ppChunk(unsigned columns, bool spread, unsigned k) {
-  unsigned chunks = ppChunks(columns, spread);
+static std::pair<unsigned, unsigned> ppChunk(unsigned columns, bool spread, unsigned k,
+                                             bool beats = false) {
+  unsigned chunks = ppChunks(columns, spread, beats);
   return {k * columns / chunks, (k + 1) * columns / chunks};
 }
 /// A chunk's data width (its controller's): its columns' bits, whole bytes.
@@ -14204,6 +14330,121 @@ void StaticFolder::ppStreamRows(const Class &cls,
     }
 }
 
+bool StaticFolder::ppBeatWindows(const Class &cls, unsigned k,
+                                 SmallVectorImpl<int> &readAt,
+                                 SmallVectorImpl<int> &drainAt, int &maxR,
+                                 int &maxW) const {
+  unsigned n = cls.threads(), P = cls.pp;
+  int frame = int(ii), run = int(P * k), stages = int(cls.stages);
+  readAt.assign(n, kNoBeats);
+  drainAt.assign(n, kNoBeats);
+  SmallVector<int> pf;
+  ppPrefetches(cls, cls.pageWindow, pf);
+  SmallVector<unsigned> order;
+  for (unsigned i = 0; i < n; ++i)
+    if (cls.ppStreamed.empty() || cls.ppStreamed[i])
+      order.push_back(i);
+  if (order.empty() || run > frame)
+    return false;
+  llvm::sort(order, [&](unsigned x, unsigned y) {
+    return cls.slot[kState][x] < cls.slot[kState][y];
+  });
+  maxR = maxW = kLinkHbmMaxOffset;
+  int hard = kLinkHbmMaxOffset;
+  for (auto [x, i] : llvm::enumerate(order)) {
+    // Row j's pass at the state pass less the stages, plus j.
+    int pass = cls.slot[kState][i] - stages;
+    readAt[i] = pf[i];
+    drainAt[i] = pass + int(P) + 1;
+    // The next streamed instance (the frame after's first, past the last):
+    // its prefetch and its passes, which write the buffer's rows again.
+    unsigned nx = order[(x + 1) % order.size()];
+    int wrapped = x + 1 == order.size() ? frame : 0;
+    int nextPass = cls.slot[kState][nx] - stages + wrapped;
+    int nextRead = pf[nx] + wrapped;
+    // A class's own beats never share a position: each run of P k reads
+    // (drains) before the next one's.
+    if (nextRead - pf[i] < run || nextPass - pass < run) {
+      if (getenv("FOLDSIM_PPE_LOG"))
+        llvm::errs() << "ppe: " << cls.name << ": " << k << " beats: instance " << i
+                     << "'s reads " << nextRead - pf[i] << " / passes " << nextPass - pass
+                     << " positions before the next's, < " << run << "\n";
+      return false;
+    }
+    // Every beat requested before the decision on the instance's first
+    // pass, which waits until its rows are in (positions do not advance
+    // while it waits: a later beat would never leave).
+    hard = std::min(hard, pass - int(decisionLead()) - 3 - (pf[i] + run - 1));
+    for (unsigned j = 0; j < P; ++j) {
+      int last = int(j * k + k - 1);
+      // Row j's last beat landed a lead before the pass that reads it.
+      maxR = std::min(maxR, pass + int(j) - (pf[i] + last) - int(linkHbmLead));
+      // Row j's last drain reads the buffer (a host cycle before its
+      // request) before the next instance's pass writes the row again, and
+      // leaves before the instance's own next prefetch reads the row (the
+      // frame after's, unmoved at the least).
+      maxW = std::min(maxW, nextPass + int(j) - (drainAt[i] + last));
+      maxW = std::min(maxW, pf[i] + frame + int(j * k) - (drainAt[i] + last) - 1);
+    }
+  }
+  if (getenv("FOLDSIM_PPE_LOG") && maxW < 0)
+    llvm::errs() << "ppe: " << cls.name << ": " << k << " beats: drains may move " << maxW
+                 << "\n";
+  // (The reads move only where their beats still land a lead before the
+  // passes; where even unmoved they do not, as whole rows: the passes wait.)
+  if (getenv("FOLDSIM_PPE_LOG")) {
+    llvm::errs() << "ppe: " << cls.name << ": " << k << " beats, frame " << frame
+                 << ": instance pass/read/drain:";
+    for (unsigned i : order)
+      llvm::errs() << " " << i << ":" << cls.slot[kState][i] - stages << "/" << readAt[i]
+                   << "/" << drainAt[i];
+    llvm::errs() << "\n";
+  }
+  if (getenv("FOLDSIM_PPE_LOG") && hard < 0)
+    llvm::errs() << "ppe: " << cls.name << ": " << k << " beats: the last read " << -hard
+                 << " positions past the first pass's decision\n";
+  maxR = std::max(0, std::min(maxR, hard));
+  return maxW >= 0 && hard >= 0;
+}
+
+void StaticFolder::ppBeatTables(const Class &cls, SmallVectorImpl<uint64_t> &rValid,
+                                SmallVectorImpl<uint64_t> &rInst,
+                                SmallVectorImpl<uint64_t> &rRow,
+                                SmallVectorImpl<uint64_t> &rBeat,
+                                SmallVectorImpl<uint64_t> &dValid,
+                                SmallVectorImpl<uint64_t> &dInst,
+                                SmallVectorImpl<uint64_t> &dRow,
+                                SmallVectorImpl<uint64_t> &dBeat) const {
+  for (auto *row : {&rValid, &rInst, &rRow, &rBeat, &dValid, &dInst, &dRow, &dBeat})
+    row->assign(ii + 1, 0);
+  unsigned k = cls.ppBeats;
+  SmallVector<int> readAt, drainAt;
+  int maxR = 0, maxW = 0;
+  bool ok = ppBeatWindows(cls, k, readAt, drainAt, maxR, maxW);
+  assert(ok && cls.ppReadShift <= maxR && cls.ppDrainShift <= maxW &&
+         "PP beats past their windows");
+  (void)ok;
+  auto wrap = [&](int pos) { return unsigned(((pos % int(ii)) + int(ii)) % int(ii)); };
+  for (unsigned i = 0; i < cls.threads(); ++i) {
+    if (readAt[i] == kNoBeats)
+      continue;
+    for (unsigned t = 0; t < cls.pp * k; ++t) {
+      unsigned q = wrap(readAt[i] + cls.ppReadShift + int(t));
+      assert(!rValid[q] && "two PP beat reads at a position");
+      rValid[q] = 1;
+      rInst[q] = i;
+      rRow[q] = t / k;
+      rBeat[q] = t % k;
+      unsigned d = wrap(drainAt[i] + cls.ppDrainShift + int(t));
+      assert(!dValid[d] && "two PP beat drains at a position");
+      dValid[d] = 1;
+      dInst[d] = i;
+      dRow[d] = t / k;
+      dBeat[d] = t % k;
+    }
+  }
+}
+
 Value StaticFolder::ppStreamSlot(const Class &cls, ImplicitLocOpBuilder &b,
                                  Value inst) const {
   unsigned width = cls.pageWindow > 1 ? llvm::Log2_32_Ceil(cls.pageWindow) : 1;
@@ -14235,6 +14476,34 @@ LogicalResult StaticFolder::buildPPStream(
   unsigned rowBits = std::max(1u, llvm::Log2_32_Ceil(rowsPow));
   unsigned slotsPow = unsigned(llvm::PowerOf2Ceil(cls.pageWindow));
   unsigned slotBits = slotsPow > 1 ? llvm::Log2_32_Ceil(slotsPow) : 0;
+  // `pp-beat-bits`: rows of K beats (PPBeats), a beat index of beatBits:
+  // the fewest (a power of two) whose beats hold at most ppBeatBits of
+  // whole columns, where the class's beats and drains fit its positions
+  // (ppBeatWindows); else whole rows.
+  cls.ppBeats = 1;
+  cls.ppBeatCols = 0;
+  if (!ports.beat3.empty()) {
+    unsigned cols = 0;
+    for (unsigned k = 0, e = ppChunks(columns.size(), cls.ppChunkSpread, true); k < e; ++k) {
+      auto [lo, hi] = ppChunk(columns.size(), cls.ppChunkSpread, k, true);
+      cols = std::max(cols, hi - lo);
+    }
+    unsigned most = std::max(1u, ppBeatBits / 72);
+    unsigned k = unsigned(llvm::PowerOf2Ceil(llvm::divideCeil(cols, most)));
+    SmallVector<int> readAt, drainAt;
+    int maxR = 0, maxW = 0;
+    if (k > 1 && k <= (1u << kPPBeatPortBits) &&
+        ppBeatWindows(cls, k, readAt, drainAt, maxR, maxW)) {
+      cls.ppBeats = k;
+      cls.ppBeatCols = unsigned(llvm::divideCeil(cols, k));
+    } else if (k > 1) {
+      llvm::errs() << "foldsim-fold-static: pp-beat-bits: " << cls.name << ": " << k
+                   << " beats a row do not fit its positions: whole rows\n";
+    }
+  }
+  bool beats = !ports.beat3.empty() && cls.ppBeats > 1;
+  unsigned K = beats ? cls.ppBeats : 1;
+  unsigned beatBits = beats ? llvm::Log2_32(K) : 0;
   BackedgeBuilder edges(b, b.getLoc());
   if (cls.virtualMemories.empty()) {
     auto [name, arg] = copy.appendInput("hostReset", i1);
@@ -14267,6 +14536,10 @@ LogicalResult StaticFolder::buildPPStream(
   auto instOf = [&](Value inst, Value row) -> Value {
     return idxWidth ? b.createOrFold<comb::ConcatOp>(inst, row) : row;
   };
+  auto isBeat = [&](Value beat, unsigned x) -> Value {
+    return comb::ICmpOp::create(b, comb::ICmpPredicate::eq, beat,
+                                constant(beatBits, x));
+  };
   auto &offChip3 = ports.offChip3;
   // Each pass's write, from the pass's host cycle (the columns' write
   // controls), registered once into the requests.
@@ -14295,17 +14568,70 @@ LogicalResult StaticFolder::buildPPStream(
   Value active = resetReg(activeNext, "pps_fetching");
   Value first3 = comb::AndOp::create(b, offChip3[0], isRow(offChip3[2], 0));
   Value last3 = comb::AndOp::create(b, offChip3[0], isRow(offChip3[2], P - 1));
+  Value beat3 = beats ? low(ports.beat3[0], beatBits) : Value();
+  if (beats) {
+    // (A prefetch's first read is row 0's first beat, its last row P - 1's
+    // last.)
+    first3 = comb::AndOp::create(b, first3, isBeat(beat3, 0));
+    last3 = comb::AndOp::create(b, last3, isBeat(beat3, K - 1));
+  }
   activeNext.setValue(comb::MuxOp::create(
       b, last3, constant(1, 0), comb::OrOp::create(b, first3, active)));
   Value read0 = comb::AndOp::create(b, offChip3[0],
                                     comb::OrOp::create(b, first3, active));
-  Value rinst0 = offChip3[1], rrow0 = offChip3[2];
+  Value rinst0 = offChip3[1], rrow0 = offChip3[2], rbeat0 = beat3;
   for (unsigned d = 3; d-- > 0;) {
     read0 = resetReg(read0, "pps_rd_valid" + Twine(d));
     rinst0 = reg(rinst0, "pps_rd_inst" + Twine(d));
     rrow0 = reg(rrow0, "pps_rd_row" + Twine(d));
+    if (beats)
+      rbeat0 = reg(rbeat0, "pps_rd_beat" + Twine(d));
   }
-  Value rdInst = instOf(rinst0, rrow0);
+  // (A beat's row {instance, row, beat}.)
+  Value rdInst = instOf(rinst0, beats ? b.createOrFold<comb::ConcatOp>(rrow0, rbeat0) : rrow0);
+  // The drains (beats): the buffer's row and beat a host cycle ahead, each
+  // drain only where its row holds a pass's write not yet drained (the
+  // frame before's last passes leave none in the first frame).
+  Value dvalid1, dinst1, drow1, dbeat1;
+  SmallVector<Value> armed;
+  if (beats) {
+    dvalid1 = ports.beat3[1];
+    dinst1 = ports.beat3[2];
+    drow1 = ports.beat3[3];
+    dbeat1 = low(ports.beat3[4], beatBits);
+    if (unsigned have = unsigned(hw::getBitWidth(drow1.getType())); have < rowBits)
+      drow1 = b.createOrFold<comb::ConcatOp>(constant(rowBits - have, 0), drow1);
+    for (unsigned d = 3; d-- > 1;) {
+      dvalid1 = resetReg(dvalid1, "pps_dr_valid" + Twine(d));
+      if (idxWidth)
+        dinst1 = reg(dinst1, "pps_dr_inst" + Twine(d));
+      drow1 = reg(drow1, "pps_dr_row" + Twine(d));
+      dbeat1 = reg(dbeat1, "pps_dr_beat" + Twine(d));
+    }
+    Value lastBeat = comb::AndOp::create(b, dvalid1, isBeat(dbeat1, K - 1));
+    for (unsigned j = 0; j < P; ++j) {
+      auto next = edges.get(i1);
+      Value r = resetReg(next, "pps_armed" + Twine(j));
+      Value set = comb::AndOp::create(b, wvalid0, isRow(wrow0, j));
+      Value clear = comb::AndOp::create(b, lastBeat, isRow(drow1, j));
+      next.setValue(comb::MuxOp::create(b, set, constant(1, 1),
+                                        comb::MuxOp::create(b, clear, constant(1, 0), r)));
+      armed.push_back(r);
+    }
+    for (unsigned j = P; j < rowsPow; ++j)
+      armed.push_back(constant(1, 0));
+    Value armedRow = rowsPow > 1 ? Value(hw::ArrayGetOp::create(
+                                       b, hw::ArrayCreateOp::create(
+                                              b, SmallVector<Value>(armed.rbegin(), armed.rend())),
+                                       low(drow1, rowBits)))
+                                 : armed[0];
+    dvalid1 = comb::AndOp::create(b, dvalid1, armedRow);
+  }
+  Value dvalidQ = beats ? resetReg(dvalid1, "pps_dr_valid0") : Value();
+  Value dinstQ = beats ? reg(instOf(idxWidth ? dinst1 : Value(),
+                                    b.createOrFold<comb::ConcatOp>(drow1, dbeat1)),
+                             "pps_dr_inst0")
+                       : Value();
   // The slot whose prefetch starts (three ahead) and its bit: the pending
   // bits are the window's slots' (a port as wide as the window).
   // (Registered: the slot table after the position tables, a host cycle
@@ -14349,14 +14675,16 @@ LogicalResult StaticFolder::buildPPStream(
   Value all = hw::ConstantOp::create(b, APInt::getAllOnes(slotsPow));
 
   // A chunk of at most 56 columns (4,032 bits): a virtual memory each.
-  unsigned chunks = ppChunks(columns.size(), cls.ppChunkSpread);
-  unsigned cw = llvm::Log2_32_Ceil(P + 1);
+  unsigned chunks = ppChunks(columns.size(), cls.ppChunkSpread, beats);
+  unsigned cw = llvm::Log2_32_Ceil(P * K + 1);
   Value one = constant(1, 1);
   for (unsigned k = 0; k < chunks; ++k) {
-    auto [lo, hi] = ppChunk(columns.size(), cls.ppChunkSpread, k);
+    auto [lo, hi] = ppChunk(columns.size(), cls.ppChunkSpread, k, beats);
     unsigned n = hi - lo;
     unsigned width = n * 72;
-    unsigned dw = ppChunkBits(n);
+    // (Beats: a beat of cpb columns, cpb * 72 bits.)
+    unsigned cpb = beats ? unsigned(llvm::divideCeil(n, K)) : n;
+    unsigned dw = ppChunkBits(cpb);
     std::string prefix = ("pps" + Twine(k)).str();
     Class::VirtualMemory vm;
     vm.name = prefix + "_rows";
@@ -14365,8 +14693,8 @@ LogicalResult StaticFolder::buildPPStream(
     vm.maskWidth = dw / 8;
     vm.readFirst = true;
     vm.pages = true;
-    vm.instWidth = idxWidth + rowBits;
-    vm.instances = entries * rowsPow;
+    vm.instWidth = idxWidth + rowBits + beatBits;
+    vm.instances = entries * rowsPow * K;
     std::string vmName = ("vm" + Twine(cls.virtualMemories.size()) + "_").str();
     auto rspValid = copy.appendInput(vmName + "rsp_valid", i1).second;
     vm.firstInput = rspValid.getArgNumber();
@@ -14377,9 +14705,10 @@ LogicalResult StaticFolder::buildPPStream(
     Value rspAt = reg(rspInst, prefix + "_rsp_inst");
     Value data = seq::FirRegOp::create(b, rspData, hostClock,
                                        b.getStringAttr(prefix + "_rsp_data"));
-    Value rspRow = low(rspAt, rowBits);
+    Value rspBeat = beats ? low(rspAt, beatBits) : Value();
+    Value rspRow = b.createOrFold<comb::ExtractOp>(bits(rowBits), rspAt, beatBits);
     Value rspInstance =
-        idxWidth ? b.createOrFold<comb::ExtractOp>(bits(idxWidth), rspAt, rowBits)
+        idxWidth ? b.createOrFold<comb::ExtractOp>(bits(idxWidth), rspAt, rowBits + beatBits)
                  : Value();
     Value rspSlot;
     if (!slotInst.empty()) {
@@ -14399,12 +14728,15 @@ LogicalResult StaticFolder::buildPPStream(
     for (unsigned c = 0; c < n; ++c) {
       auto memory = columns[lo + c];
       auto type = memory.getType();
-      Value word = b.createOrFold<comb::ExtractOp>(bits(72), data, c * 72);
+      // (Beats: column c in beat c / cpb, at its place in the beat.)
+      Value word = b.createOrFold<comb::ExtractOp>(bits(72), data, (c % cpb) * 72);
       Value mask;
       if (type.getMaskWidth() && *type.getMaskWidth() > 1)
         mask = hw::ConstantOp::create(
             b, APInt::getAllOnes(unsigned(*type.getMaskWidth())));
-      seq::FirMemWriteOp::create(b, memory, writeAt, hostClock, valid, word, mask);
+      Value enable = beats ? Value(comb::AndOp::create(b, valid, isBeat(rspBeat, c / cpb)))
+                           : valid;
+      seq::FirMemWriteOp::create(b, memory, writeAt, hostClock, enable, word, mask);
     }
     // Rows in, counted by slot from its prefetch's start: the last clears
     // the instance's pending bit.
@@ -14423,7 +14755,7 @@ LogicalResult StaticFolder::buildPPStream(
       doneOf.push_back(comb::AndOp::create(
           b, mineIn,
           comb::ICmpOp::create(b, comb::ICmpPredicate::eq, count,
-                               constant(cw, P - 1))));
+                               constant(cw, P * K - 1))));
       countNext.setValue(comb::MuxOp::create(
           b, mineStart, constant(cw, 0),
           comb::MuxOp::create(b, mineIn,
@@ -14471,17 +14803,69 @@ LogicalResult StaticFolder::buildPPStream(
           hw::ConstantOp::create(b, type, 0), hw::InnerSymAttr{},
           /*isAsync=*/false));
     };
-    Value wrData = zeroReg(pack(words, width, dw), prefix + "_wr_data");
     bool wholeRows = llvm::all_of(masks, [](Value m) {
       auto c = m.getDefiningOp<hw::ConstantOp>();
       return c && c.getValue().isAllOnes();
     });
-    Value wrMask = wholeRows && dw / 8 == n * 9
-                       ? b.createOrFold<comb::ReplicateOp>(bits(dw / 8), wvalidQ)
-                       : zeroReg(pack(masks, n * 9, dw / 8), prefix + "_wr_mask");
+    Value wrData, wrMask, wv = wvalidQ, wi = winstQ;
+    if (!beats) {
+      wrData = zeroReg(pack(words, width, dw), prefix + "_wr_data");
+      wrMask = wholeRows && dw / 8 == n * 9
+                   ? b.createOrFold<comb::ReplicateOp>(bits(dw / 8), wvalidQ)
+                   : zeroReg(pack(masks, n * 9, dw / 8), prefix + "_wr_mask");
+    } else {
+      // Beats: each pass's row into the buffer (its row), drained a beat a
+      // position: the buffer's row a host cycle ahead, its beat's columns
+      // (padded to the beat), registered (zero while no drain leaves).
+      unsigned rowW = n * 72 + (wholeRows ? 0 : n * 9);
+      auto buffer = seq::FirMemOp::create(
+          b, seq::FirMemType::get(context, rowsPow, rowW, 1), /*readLatency=*/0,
+          /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
+          b.getStringAttr(prefix + "_wbuf"), hw::InnerSymAttr{},
+          seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+      SmallVector<Value> parts(masks.begin(), masks.end());
+      Value rowIn = pack(words, width, width);
+      if (!wholeRows)
+        rowIn = b.createOrFold<comb::ConcatOp>(pack(parts, n * 9, n * 9), rowIn);
+      seq::FirMemWriteOp::create(b, buffer, low(wrow0, rowBits), hostClock, wvalid0,
+                                 rowIn, Value{});
+      Value rowOut = seq::FirMemReadOp::create(b, buffer, low(drow1, rowBits), hostClock,
+                                               constant(1, 1));
+      auto slice = [&](unsigned lo2, unsigned len, unsigned w) -> Value {
+        unsigned take = lo2 >= rowW ? 0 : std::min(len, rowW - lo2);
+        if (!take)
+          return constant(w, 0);
+        Value x = b.createOrFold<comb::ExtractOp>(bits(take), rowOut, lo2);
+        return take < w ? b.createOrFold<comb::ConcatOp>(constant(w - take, 0), x) : x;
+      };
+      SmallVector<Value> dataBeats, maskBeats;
+      for (unsigned x = K; x-- > 0;) {
+        unsigned c0 = std::min(n, x * cpb), c1 = std::min(n, (x + 1) * cpb);
+        dataBeats.push_back(slice(c0 * 72, (c1 - c0) * 72, dw));
+        if (!wholeRows)
+          maskBeats.push_back(slice(width + c0 * 9, (c1 - c0) * 9, dw / 8));
+      }
+      Value idleD = comb::OrOp::create(
+          b, hostReset, comb::XorOp::create(b, dvalid1, constant(1, 1)));
+      auto zeroRegD = [&](Value v, const Twine &name) -> Value {
+        auto type = v.getType();
+        return keep(seq::FirRegOp::create(
+            b, v, hostClock, b.getStringAttr(name), idleD,
+            hw::ConstantOp::create(b, type, 0), hw::InnerSymAttr{},
+            /*isAsync=*/false));
+      };
+      wrData = zeroRegD(hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, dataBeats), dbeat1),
+                        prefix + "_wr_data");
+      wrMask = wholeRows
+                   ? b.createOrFold<comb::ReplicateOp>(bits(dw / 8), dvalidQ)
+                   : zeroRegD(hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, maskBeats), dbeat1),
+                              prefix + "_wr_mask");
+      wv = dvalidQ;
+      wi = dinstQ;
+    }
     vm.idleZero = true;
     Value zero1 = constant(1, 0);
-    SmallVector<Value> values{read0,  rdInst, zero1,  wvalidQ, winstQ,
+    SmallVector<Value> values{read0,  rdInst, zero1,  wv, wi,
                               zero1,  wrData, wrMask, pending};
     auto builder = OpBuilder::atBlockEnd(ports.body);
     requests.push_back({unsigned(cls.virtualMemories.size()),
@@ -14493,7 +14877,11 @@ LogicalResult StaticFolder::buildPPStream(
   llvm::errs() << "foldsim-fold-static: state-stream: " << cls.name << ": "
                << columns.size() << " columns in " << chunks
                << " virtual memories, a window of " << cls.pageWindow
-               << " slots x " << rowsPow << " rows\n";
+               << " slots x " << rowsPow << " rows";
+  if (beats)
+    llvm::errs() << ", " << K << " beats a row (reads +" << cls.ppReadShift
+                 << ", drains +" << cls.ppDrainShift << " positions)";
+  llvm::errs() << "\n";
   return success();
 }
 
@@ -15000,6 +15388,17 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     addPort("pwrite3", IntegerType::get(context, 1), true);
     addPort("pwpage3", IntegerType::get(context, pageBits), true);
   }
+  // `pp-beat-bits`: a prefetch read's beat, and the drains' [valid,
+  // instance, row, beat], three ahead.
+  unsigned ppBeatArg = 0;
+  if (ppBeatPorts(cls)) {
+    ppBeatArg = numIn;
+    addPort("pbeat3", IntegerType::get(context, kPPBeatPortBits), true);
+    addPort("pdrain3", IntegerType::get(context, 1), true);
+    addPort("pdinst3", IntegerType::get(context, idxWidth), true);
+    addPort("pdrow3", IntegerType::get(context, pageBits), true);
+    addPort("pdbeat3", IntegerType::get(context, kPPBeatPortBits), true);
+  }
   // Staged: the instance whose evaluation reads at the position three host
   // cycles ahead (its state pass the stages on), and whether that position
   // is one (not idle): the stages step with the positions.
@@ -15095,6 +15494,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   if (offChip || cls.ppHbm)
     for (unsigned k = 0; k < 5; ++k)
       offChip3.push_back(body->getArgument((fetches ? 5 : 3) + k));
+  SmallVector<Value> beat3;
+  if (ppBeatPorts(cls))
+    for (unsigned k = 0; k < 5; ++k)
+      beat3.push_back(body->getArgument(ppBeatArg + k));
   unsigned pages = cls.page ? unsigned(llvm::PowerOf2Ceil(cls.page)) : 0;
   unsigned pageWidth = pages > 1 ? llvm::Log2_32_Ceil(pages) : 0;
   // The copy's outputs are held as the operands of placeholder ops until its
@@ -17013,7 +17416,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         if (colHbm(c))
           memories.push_back(col.memory);
       PPStreamPorts ports{copy, body, hostClock, offChip3, ppValid3, ppInst3,
-                          ppRow3, str3, ppPrefSlot3};
+                          ppRow3, str3, ppPrefSlot3, beat3};
       if (failed(buildPPStream(cls, b, ports, memories, streamWrites, lanes,
                                pageRequests)))
         return failure();
@@ -19036,6 +19439,8 @@ LogicalResult StaticFolder::buildSim() {
     /// read [valid, instance, page] and page write [valid, page].
     Value fetch3, finst3;
     SmallVector<Value> offChip3;
+    /// `pp-beat-bits`: the copy's beat ports (PPStreamPorts::beat3).
+    SmallVector<Value> beat3;
     /// The frame's position three host cycles ahead, as the tables read it.
     Value at3;
     Value inst2, state2, ready2, tail2;
@@ -19257,6 +19662,34 @@ LogicalResult StaticFolder::buildSim() {
       }
       ctl.offChip3 = {read3, inst3, row3, constant(1, 0), constant(rowBits, 0)};
     }
+    if (ppBeatPorts(cls)) {
+      if (cls.ppBeats > 1) {
+        // Beats: the reads' and drains' tables (each read or drain alone
+        // reads its instance, row and beat).
+        unsigned rowBits = std::max(
+            1u, llvm::Log2_32_Ceil(unsigned(llvm::PowerOf2Ceil(cls.pp))));
+        SmallVector<uint64_t> rv, ri, rr, rb, dv, di, dr, db;
+        ppBeatTables(cls, rv, ri, rr, rb, dv, di, dr, db);
+        SmallVector<uint8_t> reads(rv.size()), drains(dv.size());
+        for (size_t q = 0; q < rv.size(); ++q) {
+          reads[q] = rv[q] != 0;
+          drains[q] = dv[q] != 0;
+        }
+        ctl.offChip3 = {table(b, at, rv, 1), tableCare(b, at, ri, reads, idxWidth),
+                        tableCare(b, at, rr, reads, rowBits), constant(1, 0),
+                        constant(rowBits, 0)};
+        ctl.beat3 = {tableCare(b, at, rb, reads, kPPBeatPortBits), table(b, at, dv, 1),
+                     tableCare(b, at, di, drains, idxWidth),
+                     tableCare(b, at, dr, drains, rowBits),
+                     tableCare(b, at, db, drains, kPPBeatPortBits)};
+      } else {
+        unsigned rowBits = std::max(
+            1u, llvm::Log2_32_Ceil(unsigned(llvm::PowerOf2Ceil(cls.pp))));
+        ctl.beat3 = {constant(kPPBeatPortBits, 0), constant(1, 0),
+                     constant(idxWidth, 0), constant(rowBits, 0),
+                     constant(kPPBeatPortBits, 0)};
+      }
+    }
     for (auto [l, row] : llvm::enumerate(laterRows)) {
       Value later3 = table(b, at, row, 1);
       if (overlapped)
@@ -19451,15 +19884,18 @@ LogicalResult StaticFolder::buildSim() {
         SmallVector<uint64_t> pfSlotRow(ii + 1, 0), pfSet(ii + 1, 0);
         SmallVector<uint8_t> pfValid(ii + 1, 0);
         SmallVector<std::pair<unsigned, unsigned>> pfOrder;
+        // (Beats: the prefetch's P K reads, moved as the class's reads.)
+        bool beatReads = ppBeatPorts(cls) && cls.ppBeats > 1;
+        unsigned reads = beatReads ? cls.pp * cls.ppBeats : cls.pp;
         for (unsigned i = 0; i < threads; ++i) {
           if (!cls.ppStreamed[i])
             continue;
-          for (unsigned j = 0; j < cls.pp; ++j) {
-            int pos = pf[i] + int(j);
+          for (unsigned j = 0; j < reads; ++j) {
+            int pos = pf[i] + (beatReads ? cls.ppReadShift : 0) + int(j);
             unsigned q = unsigned(((pos % int(ii)) + int(ii)) % int(ii));
             pfSlotRow[q] = cls.windowSlot[i];
             pfValid[q] = 1;
-            if (j + 1 == cls.pp) {
+            if (j + 1 == reads) {
               pfSet[q] = 1;
               pfOrder.push_back({q, i});
             }
@@ -19914,6 +20350,8 @@ LogicalResult StaticFolder::buildSim() {
     }
     if ((cls.page && cls.pagesOffChip) || cls.ppHbm)
       operands.append(controls[c].offChip3.begin(), controls[c].offChip3.end());
+    if (ppBeatPorts(cls))
+      operands.append(controls[c].beat3.begin(), controls[c].beat3.end());
     if (cls.stages) {
       if (cls.threads() > 1)
         operands.push_back(readControls[c].inst3);
@@ -24433,6 +24871,7 @@ void FoldStaticPass::runOnOperation() {
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.linkHbmBeatBits = linkHbmBeatBits;
   folder.pageEnginesPP = pageEnginesPP;
+  folder.ppBeatBits = ppBeatBits;
   folder.minII = minII;
   folder.slrSerializeSpecs.assign(slrSerialize.begin(), slrSerialize.end());
   folder.readyChoice = readyChoice;
