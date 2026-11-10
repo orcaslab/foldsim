@@ -12746,7 +12746,7 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
   DenseMap<std::pair<Value, unsigned>, Value> piped;
   Value live;
   unsigned onLive = 512, liveMade = 0;
-  uint64_t pipeBits = 0, captureBits = 0, holdBits = 0, rawBits = 0;
+  uint64_t pipeBits = 0, captureBits = 0, holdBits = 0, rawBits = 0, constantLead = 0;
   // (The captures by what first needed them, and by their pass.)
   std::map<std::string, uint64_t> whyBits;
   SmallVector<uint64_t> fromBits(P + 1, 0);
@@ -12782,10 +12782,29 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
     return staged;
   };
   DenseMap<Value, Value> captured;
-  auto capture = [&](Value value, bool hold) -> Value {
+  std::function<Value(Value, bool)> capture;
+  capture = [&](Value value, bool hold) -> Value {
+    Value &known0 = captured[value];
+    if (known0)
+      return known0;
+    // A concatenation led by constant bits (a zero extension, say): its
+    // other bits captured, the constant joined after (a shift amount
+    // extended to the shift's width then carries its own bits alone, and
+    // what reads it sees the constant).
+    if (auto concat = value.getDefiningOp<comb::ConcatOp>();
+        concat && concat.getNumOperands() > 1 &&
+        isa_and_nonnull<hw::ConstantOp>(concat.getOperand(0).getDefiningOp())) {
+      SmallVector<Value> rest(concat.getOperands().drop_front());
+      Value tail = rest.size() == 1 ? rest[0] : b.createOrFold<comb::ConcatOp>(rest);
+      if (tail != rest[0] || rest.size() > 1)
+        stageOfValue[tail] = stageAt(value);
+      Value held = capture(tail, hold);
+      constantLead += hw::getBitWidth(concat.getOperand(0).getType());
+      Value joined = b.createOrFold<comb::ConcatOp>(concat.getOperand(0), held);
+      stageOfValue[joined] = -1;
+      return captured[value] = joined;
+    }
     Value &known = captured[value];
-    if (known)
-      return known;
     int from = stageAt(value);
     Value bits = asBits(b, value);
     (hold ? holdBits : captureBits) += hw::getBitWidth(bits.getType());
@@ -13120,7 +13139,8 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
        << hazards.size() << " hazard registers (with those; "
        << hazardBits << " bits) and " << keptRegs - hazards.size()
        << " other stored registers (" << keptBits - hazardBits
-       << " bits) kept; " << captureBits << " capture bits, " << holdBits
+       << " bits) kept; " << captureBits << " capture bits (" << constantLead
+       << " constant leading bits left out), " << holdBits
        << " hold bits (" << rawBits << " of them a row's register values), " << pipeBits << " stage register bits (ready cone, "
        << lateCone.size() << " ops); " << bankedReads << " banked reads, "
        << bankCount << " bank address copies; captures by need:";
