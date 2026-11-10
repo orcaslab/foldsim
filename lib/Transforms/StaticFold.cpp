@@ -72,6 +72,9 @@ using foldsim::MailboxLink;
 using foldsim::MailboxPlan;
 using foldsim::planMailboxes;
 
+/// A value's place in staged evaluation (below).
+struct Staging;
+
 namespace {
 
 struct FoldStaticPass : public foldsim::impl::FoldStaticBase<FoldStaticPass> {
@@ -487,10 +490,13 @@ public:
   /// `stage-levels-mapped`: the Beacon target whose mapped depth sizes the
   /// stages (empty: the estimate alone), and each model's mapped depth.
   std::string stageLevelsMapped;
-  DenseMap<Operation *, int> mappedDepth;
+  std::map<std::pair<Operation *, unsigned>, int> mappedDepth;
+  /// The models whose stage count stage-levels-mapped timed (soonest cut).
+  DenseSet<Operation *> mappedStageCut;
   /// The deepest end point of `model`'s logic mapped to that target's cells
   /// (-1 if it cannot be mapped or timed).
-  int mappedDepthOf(hw::HWModuleOp model);
+  int mappedDepthOf(hw::HWModuleOp model, unsigned entryBits,
+                    const DenseMap<Value, ::Staging> *stages = nullptr);
   /// `split-latency`: <glob>:<n>, host cycles a class's results take more
   /// (a copy split over SLRs, its crossings registered: slr-split).
   SmallVector<std::string> splitLatencySpecs;
@@ -3345,9 +3351,12 @@ static int sinkStage(Value value, int extra, int limit,
   return s.stage + (s.levels > 0 && s.levels + extra > limit ? 1 : 0);
 }
 
-int StaticFolder::mappedDepthOf(hw::HWModuleOp model) {
-  if (auto it = mappedDepth.find(model.getOperation()); it != mappedDepth.end())
-    return it->second;
+int StaticFolder::mappedDepthOf(hw::HWModuleOp model, unsigned entryBits,
+                                const DenseMap<Value, ::Staging> *stages) {
+  auto key = std::make_pair(model.getOperation(), entryBits);
+  if (!stages)
+    if (auto it = mappedDepth.find(key); it != mappedDepth.end())
+      return it->second;
   int depth = -1;
   if (const auto *target = foldsim::lookupBeaconTarget(stageLevelsMapped)) {
     // One instance of the model, alone, mapped as foldsim-beacon-map maps a
@@ -3355,8 +3364,49 @@ int StaticFolder::mappedDepthOf(hw::HWModuleOp model) {
     OwningOpRef<ModuleOp> design = ModuleOp::create(model.getLoc());
     OpBuilder b(model.getContext());
     b.setInsertionPointToEnd(design->getBody());
-    auto copy = cast<hw::HWModuleOp>(b.clone(*model.getOperation()));
+    IRMapping mapping;
+    auto copy = cast<hw::HWModuleOp>(b.clone(*model.getOperation(), mapping));
     SymbolTable::setSymbolVisibility(copy, SymbolTable::Visibility::Public);
+    // The copy keeps a row of each memory per instance (2^entryBits of
+    // them): its combinational reads are that much deeper.
+    if (entryBits)
+      copy.walk([&](seq::FirMemOp memory) {
+        memory->setAttr("foldsim.instance_rows",
+                        b.getI64IntegerAttr(int64_t(1) << entryBits));
+      });
+    // With `stages` (each value's stage): a register on every operand of the
+    // logic taken from an earlier stage, as the stage registers cut it.
+    if (stages) {
+      Value clock;
+      for (auto arg : copy.getBodyBlock()->getArguments())
+        if (isa<seq::ClockType>(arg.getType()))
+          clock = arg;
+      if (!clock)
+        return -1;
+      for (auto &op : *model.getBodyBlock()) {
+        if (op.getNumResults() == 0 ||
+            isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp,
+                seq::FirMemOp, hw::ConstantOp, hw::AggregateConstantOp>(op))
+          continue;
+        auto self = stages->find(op.getResult(0));
+        if (self == stages->end() || self->second.stage <= 0)
+          continue;
+        Operation *cloned = mapping.lookupOrNull(&op);
+        if (!cloned)
+          continue;
+        for (auto [i, operand] : llvm::enumerate(op.getOperands())) {
+          auto from = stages->find(operand);
+          if (from == stages->end() || from->second.stage < 0 ||
+              from->second.stage >= self->second.stage ||
+              isa<seq::ClockType, seq::FirMemType>(operand.getType()))
+            continue;
+          b.setInsertionPoint(cloned);
+          cloned->setOperand(
+              i, seq::CompRegOp::create(b, cloned->getLoc(),
+                                        cloned->getOperand(i), clock));
+        }
+      }
+    }
     std::string name = copy.getSymName().str();
     PassManager pm(model.getContext(), ModuleOp::getOperationName());
     if (succeeded(parsePassPipeline(foldsim::beaconMapPipeline(*target, false), pm)) &&
@@ -3364,7 +3414,8 @@ int StaticFolder::mappedDepthOf(hw::HWModuleOp model) {
       if (auto d = foldsim::beaconDeepestLevels(*design, name, *target); succeeded(d))
         depth = *d;
   }
-  mappedDepth[model.getOperation()] = depth;
+  if (!stages)
+    mappedDepth[key] = depth;
   return depth;
 }
 
@@ -3550,56 +3601,101 @@ LogicalResult StaticFolder::chooseStages() {
     // a memory's write or registered read, an early output's next value
     // (its logic over the registers' next values, stages of it more), and a
     // late output's value (over the state and inputs, as read).
-    DenseMap<Value, Staging> memo;
-    int limit = 2 * int(stageLevels), next = 0, last = 0;
     // (Its memories' stores keep a row per instance: 2^eb instances.)
     unsigned eb = cls.threads() > 1 ? llvm::Log2_32_Ceil(cls.threads()) : 0;
-    for (auto &op : *body) {
-      if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
-        int add = reg.getReset() ? 1 : 0;
-        next = std::max({next, sinkStage(reg.getNext(), 2 * add, limit, memo, eb),
-                         sinkStage(reg.getReset(), 2 * add, limit, memo, eb)});
-      } else if (isa<seq::FirMemWriteOp>(op)) {
-        for (auto operand : op.getOperands())
-          if (statePort(operand))
-            last = std::max(last, sinkStage(operand, 0, limit, memo, eb));
-      } else if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
-        auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
-        if (memory && memory.getReadLatency() > 0)
-          last = std::max({last, sinkStage(read.getAddress(), 0, limit, memo, eb),
-                           sinkStage(read.getEnable(), 0, limit, memo, eb)});
+    auto lastAt = [&](int limit, DenseMap<Value, Staging> &memo) {
+      int next = 0, last = 0;
+      for (auto &op : *body) {
+        if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
+          int add = reg.getReset() ? 1 : 0;
+          next = std::max({next, sinkStage(reg.getNext(), 2 * add, limit, memo, eb),
+                           sinkStage(reg.getReset(), 2 * add, limit, memo, eb)});
+        } else if (isa<seq::FirMemWriteOp>(op)) {
+          for (auto operand : op.getOperands())
+            if (statePort(operand))
+              last = std::max(last, sinkStage(operand, 0, limit, memo, eb));
+        } else if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+          auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+          if (memory && memory.getReadLatency() > 0)
+            last = std::max({last, sinkStage(read.getAddress(), 0, limit, memo, eb),
+                             sinkStage(read.getEnable(), 0, limit, memo, eb)});
+        }
       }
-    }
-    last = std::max(last, next);
-    auto *output = body->getTerminator();
-    for (auto [o, out] : llvm::enumerate(cls.outputDepth))
-      last = std::max(last, cls.late[o]
-                                ? sinkStage(output->getOperand(o), 0, limit, memo, eb)
-                                : next + (out + limit - 1) / limit);
-    cls.stages = unsigned(last);
-    // stage-levels-mapped: no more stages than the mapped depth needs (the
-    // estimate counts a chain of narrow ops level by level, where the
-    // mapping balances it into a tree and packs it into LUTs; a cone of
-    // constant-masked bit slices as deep as its word-level chain).
+      last = std::max(last, next);
+      auto *output = body->getTerminator();
+      for (auto [o, out] : llvm::enumerate(cls.outputDepth))
+        last = std::max(last, cls.late[o]
+                                  ? sinkStage(output->getOperand(o), 0, limit, memo, eb)
+                                  : next + (out + limit - 1) / limit);
+      return last;
+    };
+    DenseMap<Value, Staging> memo;
+    int limit = 2 * int(stageLevels);
+    cls.stages = unsigned(lastAt(limit, memo));
+    // stage-levels-mapped: the stages the mapped logic needs (the estimate
+    // counts a chain of narrow ops level by level, where the mapping
+    // balances it into a tree and packs it into LUTs, and a few ops between
+    // carry chains a half level each, where each takes a LUT). From the
+    // mapped depth's count up, each count's cut (the estimate's soonest at
+    // the least limit that fits it, as the stage builder cuts it) is mapped
+    // and timed with registers at its stage boundaries; the first whose
+    // deepest stage fits stage-levels is taken, else the estimate's.
     if (!stageLevelsMapped.empty() && cls.stages) {
-      int depth = mappedDepthOf(cls.model);
+      unsigned est = cls.stages;
+      int depth = mappedDepthOf(cls.model, eb);
       if (depth < 0) {
         llvm::errs() << "foldsim-fold-static: " << cls.name
                      << ": stage-levels-mapped: cannot map it for "
                      << stageLevelsMapped << ": staged by the estimate\n";
       } else {
-        unsigned want =
-            depth <= int(stageLevels)
-                ? 0u
-                : unsigned((depth + int(stageLevels) - 1) / int(stageLevels)) - 1;
+        int sl = int(stageLevels);
+        unsigned want = depth <= sl ? 0u : unsigned((depth + sl - 1) / sl) - 1;
         llvm::errs() << "foldsim-fold-static: " << cls.name << ": mapped depth "
-                     << depth << " levels at " << stageLevels << " a stage: ";
-        if (want < cls.stages)
-          llvm::errs() << want << " stages, not the estimate's " << cls.stages
-                       << "\n";
-        else
-          llvm::errs() << "the estimate's " << cls.stages << " stages\n";
-        cls.stages = std::min(cls.stages, want);
+                     << depth << " levels at " << sl << " a stage";
+        unsigned chosen = est;
+        if (want == 0) {
+          chosen = 0;
+        } else {
+          for (unsigned t = want; t < est;) {
+            // The least limit whose soonest cut takes at most t stages.
+            int lo = 2 * sl, hi = lo;
+            {
+              DenseMap<Value, Staging> m;
+              while (lastAt(hi, m) > int(t)) {
+                lo = hi + 1;
+                hi *= 2;
+                m.clear();
+              }
+            }
+            while (lo < hi) {
+              int mid = lo + (hi - lo) / 2;
+              DenseMap<Value, Staging> m;
+              if (lastAt(mid, m) <= int(t))
+                hi = mid;
+              else
+                lo = mid + 1;
+            }
+            DenseMap<Value, Staging> cut;
+            lastAt(hi, cut);
+            for (auto &op : *body)
+              for (auto result : op.getResults())
+                if (!cut.count(result))
+                  stageOf(result, hi, cut, eb);
+            int d = mappedDepthOf(cls.model, eb, &cut);
+            llvm::errs() << "; " << t << " stages: " << d;
+            if (d >= 0 && d <= sl) {
+              chosen = t;
+              break;
+            }
+            if (d < 0)
+              break;
+            // The next count to try, as deep as this one ran over.
+            t = std::max(t + 1, unsigned(((t + 1) * d + sl - 1) / sl) - 1);
+          }
+        }
+        llvm::errs() << ": " << chosen << " stages (estimate " << est << ")\n";
+        cls.stages = std::min(est, chosen);
+        mappedStageCut.insert(cls.model.getOperation());
       }
     }
     auto traced = [&] {
@@ -11545,6 +11641,9 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
   if (lateLast <= int(stages)) {
     uint64_t early = crossing(soonest), lateBits = crossing(latest);
     useLate = lateBits < early;
+    // stage-levels-mapped timed the soonest cut: that one.
+    if (mappedStageCut.contains(cls.model.getOperation()))
+      useLate = false;
     // (FOLDSIM_STAGE_CUT=soonest|latest forces one, for the tests.)
     if (const char *force = getenv("FOLDSIM_STAGE_CUT"))
       useLate = StringRef(force) == "latest";

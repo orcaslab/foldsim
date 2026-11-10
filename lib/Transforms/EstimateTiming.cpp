@@ -630,6 +630,12 @@ void Timing::operands(unsigned id, SmallVectorImpl<Edge> &edges) {
     auto read = cast<seq::FirMemReadOp>(op);
     auto type = read.getMemory().getType();
     uint64_t depth = type.getDepth();
+    // A memory a folded copy keeps a row of per instance
+    // (`foldsim.instance_rows`, set by foldsim-fold-static's
+    // stage-levels-mapped on the model it times): that many times deeper.
+    if (auto memory = read.getMemory().getDefiningOp())
+      if (auto rows = memory->getAttrOfType<IntegerAttr>("foldsim.instance_rows"))
+        depth *= std::max<uint64_t>(1, rows.getValue().getZExtValue());
     int levels = device.asic
                      ? 1 + (int)llvm::Log2_64_Ceil(depth)
                      : 1 + std::max(0, (int)llvm::Log2_64_Ceil(depth) - 6);
