@@ -62,15 +62,19 @@ const BeaconTarget kTargets[] = {
 /// rest of the design, module by module.
 } // namespace
 
-std::string foldsim::beaconMapPipeline(const BeaconTarget &target, bool area) {
+std::string foldsim::beaconMapPipeline(const BeaconTarget &target, bool area,
+                                       unsigned carryBlockSize, llvm::StringRef arrivals) {
   // Cells pack across small modules on a critical path; area keeps every
   // module, so each instance's resources stay its own.
   std::string pipeline =
       area ? "hw.module(hw-bypass-inner-symbols,canonicalize,cse,"
            : "hw-flatten-modules{hw-inline-all=false hw-inline-small "
-             "hw-inline-with-state hw-small-threshold=300},"
-             "hw.module(hw-bypass-inner-symbols,canonicalize,cse,"
-             "comb-balance-mux,";
+             "hw-inline-with-state hw-small-threshold=300},";
+  if (!area && !arrivals.empty())
+    pipeline += "foldsim-boundary-arrivals{file=" + arrivals.str() + "},";
+  if (!area)
+    pipeline += "hw.module(hw-bypass-inner-symbols,canonicalize,cse,"
+                "comb-balance-mux,";
   pipeline += "foldsim-lower-equality,foldsim-lower-constant-division,"
               "hw-aggregate-to-comb,cse,foldsim-fold-zero-width,"
               "convert-comb-to-synth{additional-legal-ops=comb.add,comb.sub,"
@@ -84,15 +88,19 @@ std::string foldsim::beaconMapPipeline(const BeaconTarget &target, bool area) {
                 "canonicalize,synth-maximum-and-cover,"
                 "synth-lower-variadic{timing-aware},synth-structural-hash,"
                 "synth-sop-balancing{strategy=timing},synth-structural-hash,";
-  return pipeline + "synth-generic-lut-mapper{max-lut-size=" +
-         std::to_string(target.cutSize) + " strategy=" +
-         (area ? "area" : "timing") + "},cse)";
+  pipeline += "synth-generic-lut-mapper{max-lut-size=" +
+              std::to_string(target.cutSize) + " strategy=" +
+              (area ? "area" : "timing");
+  if (!area && carryBlockSize)
+    pipeline += " carry-block-size=" + std::to_string(carryBlockSize);
+  return pipeline + "},cse)";
 }
 
 namespace {
 
-std::string mapPipeline(const BeaconTarget &target, bool area) {
-  return foldsim::beaconMapPipeline(target, area);
+std::string mapPipeline(const BeaconTarget &target, bool area,
+                        unsigned carryBlockSize, llvm::StringRef arrivals) {
+  return foldsim::beaconMapPipeline(target, area, carryBlockSize, arrivals);
 }
 
 struct BeaconMapPass : public foldsim::impl::BeaconMapBase<BeaconMapPass> {
@@ -101,7 +109,7 @@ struct BeaconMapPass : public foldsim::impl::BeaconMapBase<BeaconMapPass> {
   void getDependentDialects(DialectRegistry &registry) const override {
     OpPassManager pm(ModuleOp::getOperationName());
     if (const BeaconTarget *t = foldsim::lookupBeaconTarget(target))
-      if (succeeded(parsePassPipeline(mapPipeline(*t, area), pm)))
+      if (succeeded(parsePassPipeline(mapPipeline(*t, area, carryBlockSize, arrivals), pm)))
         pm.getDependentDialects(registry);
   }
 
@@ -112,7 +120,7 @@ struct BeaconMapPass : public foldsim::impl::BeaconMapBase<BeaconMapPass> {
       return signalPassFailure();
     }
     OpPassManager pm(ModuleOp::getOperationName());
-    if (failed(parsePassPipeline(mapPipeline(*t, area), pm)) ||
+    if (failed(parsePassPipeline(mapPipeline(*t, area, carryBlockSize, arrivals), pm)) ||
         failed(runPipeline(pm, getOperation())))
       signalPassFailure();
   }

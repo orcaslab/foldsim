@@ -65,7 +65,9 @@ void emitUnknownBeaconTarget(mlir::Operation *op, llvm::StringRef name);
 
 /// The pass pipeline (on a builtin.module) of `foldsim-beacon-map` for
 /// `target`: for depth, or for area.
-std::string beaconMapPipeline(const BeaconTarget &target, bool area);
+std::string beaconMapPipeline(const BeaconTarget &target, bool area,
+                              unsigned carryBlockSize = 0,
+                              llvm::StringRef arrivals = {});
 
 /// The levels of the deepest end point of the design `top` elaborates in
 /// `design`, a design mapped by `beaconMapPipeline(target, false)`, as
