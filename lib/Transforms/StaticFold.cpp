@@ -660,6 +660,9 @@ public:
   /// `fold-ports` / `fold-ports-reset`: the port bundles folded into record
   /// streams (empty: none).
   std::string foldPortsSpec, foldPortsReset = "reset";
+  /// `fold-ports-rows`: the folded bundles' response tokens as rows of one
+  /// memory (bundle, frame mod 4), not registers per bundle and field.
+  bool foldPortsRows = false;
   /// `link-hbm-fit-slots`: a stream on the page engines takes the fewest
   /// landing slots its requests need.
   bool linkHbmFitSlots = false;
@@ -707,6 +710,16 @@ public:
   unsigned readBufferBits = 0;
   /// `vmem-auto-bits` / `vmem-rings` / `vmem-ring-entries` (VmemRings.h).
   uint64_t vmemAutoBits = 0;
+  /// `vmem-auto-instance-bits`: by one instance's image instead.
+  uint64_t vmemAutoInstanceBits = 0;
+  /// A memory of `depth` x `width` in a class of `threads` instances is a
+  /// virtual memory by size (vmem-auto-bits / vmem-auto-instance-bits).
+  bool vmemBySize(uint64_t depth, uint64_t width, unsigned threads) const {
+    if (threads < 2)
+      return false;
+    return (vmemAutoBits && depth * threads * width >= vmemAutoBits) ||
+           (vmemAutoInstanceBits && depth * width >= vmemAutoInstanceBits);
+  }
   unsigned vmemRingLead = 0, vmemRingEntries = 1024;
   /// Plans a class's rings (`vmem-rings`): marks its virtual memories that
   /// take one, or none if the schedule leaves no room (the reason reported).
@@ -8645,7 +8658,7 @@ int StaticFolder::minStateGap(const Class &cls) const {
   if (cls.deferSpan)
     gap = std::max(gap, int(cls.deferSpan) + 4 +
                             (cls.page ? 2 * int(cls.page) + int(cls.pageLead()) : 0));
-  if (!virtualMemoryPattern.empty() || vmemAutoBits) {
+  if (!virtualMemoryPattern.empty() || vmemAutoBits || vmemAutoInstanceBits) {
     llvm::Regex pattern(virtualMemoryPattern);
     StringRef model = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
                                          : StringRef(cls.name);
@@ -8654,8 +8667,8 @@ int StaticFolder::minStateGap(const Class &cls) const {
     // queueing and from that to the first use's decision (VmemRings.h).
     auto bySize = [&](seq::FirMemOp memory) {
       auto type = memory.getType();
-      return vmemAutoBits && cls.threads() > 1 && memory.getReadLatency() == 1 &&
-             uint64_t(type.getDepth()) * cls.threads() * type.getWidth() >= vmemAutoBits;
+      return memory.getReadLatency() == 1 &&
+             vmemBySize(type.getDepth(), type.getWidth(), cls.threads());
     };
     auto *folding = cls.folding.get();
     // As buildCopy finds its virtual memories: by name or <class model>:<name>.
@@ -9653,7 +9666,8 @@ LogicalResult StaticFolder::schedule() {
       os << "\n";
     }
   }
-  buildFrameTable(bubbles || !virtualMemoryPattern.empty() || vmemAutoBits);
+  buildFrameTable(bubbles || !virtualMemoryPattern.empty() || vmemAutoBits ||
+                  vmemAutoInstanceBits);
   if (linkKindCost)
     planLinkKinds(os);
   reportLinks(os);
@@ -12427,9 +12441,8 @@ void StaticFolder::autoScratch() {
       if (!virtualMemoryPattern.empty() &&
           (pattern.match(name) || pattern.match((model + ":" + name).str())))
         continue;
-      if (vmemAutoBits && cls.threads() > 1 &&
-          uint64_t(memory.getType().getDepth()) * cls.threads() *
-                  memory.getType().getWidth() >= vmemAutoBits &&
+      if (vmemBySize(memory.getType().getDepth(), memory.getType().getWidth(),
+                     cls.threads()) &&
           autoVirtualForm(memory))
         continue;
       uint64_t bits = entries * memory.getType().getDepth() *
@@ -13364,7 +13377,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   };
   unsigned autoKept = 0;
   uint64_t autoKeptBits = 0;
-  if (!virtualMemoryPattern.empty() || anyHbmFold || vmemAutoBits) {
+  if (!virtualMemoryPattern.empty() || anyHbmFold || vmemAutoBits ||
+      vmemAutoInstanceBits) {
     llvm::Regex pattern(virtualMemoryPattern);
     StringRef model =
         cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name) : cls.name;
@@ -13386,11 +13400,9 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       } else if (virtualMemoryPattern.empty() ||
                  (!pattern.match(memName) &&
                   !pattern.match((model + ":" + memName).str()))) {
-        if (!vmemAutoBits || threads < 2)
-          continue;
         auto type = memory.getType();
         uint64_t image = uint64_t(type.getDepth()) * threads * type.getWidth();
-        if (image < vmemAutoBits)
+        if (!vmemBySize(type.getDepth(), type.getWidth(), threads))
           continue;
         if (!autoVirtual(memory, cls)) {
           ++autoKept;
@@ -13518,7 +13530,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       virtualOf[lane] = cls.virtualMemories.size();
     cls.virtualMemories.push_back(std::move(vm));
   }
-  if (vmemAutoBits && (autoKept || !cls.virtualMemories.empty()))
+  if ((vmemAutoBits || vmemAutoInstanceBits) &&
+      (autoKept || !cls.virtualMemories.empty()))
     llvm::errs() << "foldsim-fold-static: vmem-auto-bits: " << cls.name << ": "
                  << cls.virtualMemories.size() << " virtual memories; "
                  << autoKept << " kept on chip (" << autoKeptBits
@@ -17304,7 +17317,88 @@ LogicalResult StaticFolder::buildSim() {
   SmallVector<Backedge> rspReady;
   SmallVector<Value> rspFor;
   SmallVector<SmallVector<Value>> rspSpace;
-  if (pf.on && pf.rspWidth) {
+  // `fold-ports-rows`: the response records are rows of one memory, a row per
+  // bundle and frame mod 4 (the frame being decided, the one loaded and the
+  // one before, which a class reading a pass late may still read). Each
+  // bundle gives one token a frame, so the token taken is always the next
+  // frame's (its row the loaded frame's + 1) and a bundle holds at most that
+  // one: a held bit per bundle, set as its record is taken and cleared at the
+  // load (every bundle holds its token then). The frame's inputs are all in
+  // when the bundles holding (a counter) and the one taken now are all.
+  bool portRows = pf.on && pf.rspWidth && foldPortsRows;
+  Value rowsFrame, rowsFrameNext;
+  SmallVector<seq::FirMemOp> rowsMems;
+  unsigned rowsAddrWidth = 0;
+  if (portRows) {
+    if (holdDepth != 1)
+      return netlist.emitError("fold-ports-rows: needs a frame of at least 4 "
+                               "host cycles (II ")
+             << ii << ")";
+    for (unsigned port = 0; port < pf.ports; ++port)
+      for (unsigned p : pf.rspOf[port])
+        if (specOf[p] >= 0)
+          return netlist.emitError("fold-ports-rows: input '")
+                 << producers[p].name << "' is in a spec group";
+    unsigned cw = pf.chanWidth;
+    rowsAddrWidth = cw + 2;
+    Value chan = body->getArgument(rspPort + 1);
+    Value offered = body->getArgument(rspPort);
+    // The loaded frame mod 4 (3 out of reset: the first load makes it 0).
+    auto frNext = backedges.get(b.getIntegerType(2));
+    rowsFrame = resetReg(frNext, "ports_rows_frame", 3);
+    rowsFrameNext = comb::MuxOp::create(
+        b, load, comb::AddOp::create(b, rowsFrame, constant(2, 1)), rowsFrame);
+    frNext.setValue(rowsFrameNext);
+    // Held bits, read at the record's bundle.
+    SmallVector<Backedge> heldNext;
+    SmallVector<Value> held;
+    for (unsigned port = 0; port < pf.ports; ++port) {
+      heldNext.push_back(backedges.get(i1));
+      held.push_back(resetReg(heldNext.back(), "ports_held" + Twine(port), 0));
+    }
+    SmallVector<Value> elems;
+    for (unsigned j = (1u << cw); j-- > 0;)
+      elems.push_back(j < pf.ports ? held[j] : constant(1, 1));
+    Value heldSel =
+        hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elems), chan);
+    Value take = comb::AndOp::create(b, offered, notOf(heldSel));
+    rspReadyOut = notOf(heldSel);
+    for (unsigned port = 0; port < pf.ports; ++port) {
+      Value mine = comb::AndOp::create(
+          b, take, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, chan,
+                                        constant(cw, port)));
+      heldNext[port].setValue(comb::MuxOp::create(
+          b, mine, constant(1, 1),
+          comb::MuxOp::create(b, load, constant(1, 0), held[port])));
+    }
+    // The bundles holding their token, as a count.
+    unsigned nw = llvm::Log2_32_Ceil(pf.ports + 1);
+    auto countNext = backedges.get(b.getIntegerType(nw));
+    Value count = resetReg(countNext, "ports_held_count", 0);
+    Value plus = comb::AddOp::create(
+        b, count, b.createOrFold<comb::ConcatOp>(constant(nw - 1, 0), take));
+    countNext.setValue(
+        comb::MuxOp::create(b, load, constant(nw, 0), plus));
+    inputValid.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::eq, plus,
+                                              constant(nw, pf.ports)));
+    // The rows, a memory per field: written at {bundle, loaded frame + 1}.
+    Value waddr = b.createOrFold<comb::ConcatOp>(
+        chan, comb::AddOp::create(b, rowsFrame, constant(2, 1)));
+    for (auto &field : pf.rsp) {
+      auto mem = seq::FirMemOp::create(
+          b, seq::FirMemType::get(context, (1u << rowsAddrWidth), field.width, 1),
+          /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined,
+          seq::WUW::Undefined, b.getStringAttr("ports_rows_" + field.name),
+          hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+      seq::FirMemWriteOp::create(
+          b, mem, waddr, hostClock, take,
+          b.createOrFold<comb::ExtractOp>(b.getIntegerType(field.width),
+                                          body->getArgument(rspPort + 2), field.lo),
+          Value{});
+      rowsMems.push_back(mem);
+    }
+  }
+  if (pf.on && pf.rspWidth && !portRows) {
     Value chan = body->getArgument(rspPort + 1);
     for (unsigned port = 0; port < pf.ports; ++port) {
       rspReady.push_back(backedges.get(i1));
@@ -17319,6 +17413,9 @@ LogicalResult StaticFolder::buildSim() {
   }
   for (auto [p, producer] : llvm::enumerate(producers)) {
     if (producer.cls >= 0)
+      continue;
+    // fold-ports-rows: read from the rows where the frame reads it.
+    if (portRows && folded(p))
       continue;
     Value valid, bits;
     if (folded(p)) {
@@ -17413,7 +17510,7 @@ LogicalResult StaticFolder::buildSim() {
   }
   // A bundle's record taken when all its fields have room; the stream's
   // ready that of the bundle it names.
-  if (pf.on && pf.rspWidth) {
+  if (pf.on && pf.rspWidth && !portRows) {
     SmallVector<std::pair<unsigned, Value>> kept;
     for (auto &[p, ready] : inputReady) {
       if (folded(p))
@@ -17437,7 +17534,32 @@ LogicalResult StaticFolder::buildSim() {
   // in a slot past the frame, the frame before's.
   std::map<std::pair<unsigned, int>, Value> prevFrameInputNext;
   DenseMap<unsigned, Value> classTail1;
+  // fold-ports-rows: input `p`'s field in the row of bundle `port` (a
+  // value) and frame `row` (mod 4).
+  auto rowsRead = [&](unsigned p, Value port, Value row) -> Value {
+    Value addr = b.createOrFold<comb::ConcatOp>(port, row);
+    return seq::FirMemReadOp::create(b, rowsMems[pf.producerField[p]], addr,
+                                     hostClock, constant(1, 1));
+  };
+  auto rowsTail1 = [&](unsigned c) -> Value {
+    Value &tail1 = classTail1[c];
+    if (!tail1)
+      tail1 = reg(readCtl(c).tail2, classes[c].name + "_tail1");
+    return tail1;
+  };
+  // The row a class's evaluation a host cycle ahead reads: the frame loaded
+  // then, or in a slot past the frame the one before.
+  auto rowsRowFor = [&](unsigned c) -> Value {
+    if (!readCtl(c).tail2)
+      return rowsFrameNext;
+    return comb::MuxOp::create(
+        b, rowsTail1(c),
+        comb::SubOp::create(b, rowsFrameNext, constant(2, 1)), rowsFrameNext);
+  };
   auto frameInputFor = [&](unsigned p, unsigned c) -> Value {
+    if (portRows && folded(p))
+      return rowsRead(p, constant(pf.chanWidth, pf.producerPort[p]),
+                      rowsRowFor(c));
     if (!readCtl(c).tail2)
       return frameInputNext[p];
     // One per SLR group, in the group.
@@ -18744,6 +18866,18 @@ LogicalResult StaticFolder::buildSim() {
           continue;
         }
       }
+      // fold-ports-rows: every instance reads the same field and bits of a
+      // folded bundle, each its own: one read of the rows, at the instance's
+      // bundle (a table, registered as a select of the sources would be).
+      bool rowsPart = portRows && sources.size() > 1 &&
+                      llvm::all_of(sources, [&](auto &entry) {
+                        auto &key = entry.first;
+                        auto &first = sources.begin()->first;
+                        return key.first >= 0 && folded(key.first) &&
+                               pf.producerField[key.first] ==
+                                   pf.producerField[first.first] &&
+                               key.second == first.second;
+                      });
       SmallVector<Value> sourceData(sources.size());
       bool syncPart = false;
       SmallVector<std::pair<Value, Value>> sourceNow(sources.size());
@@ -18798,6 +18932,10 @@ LogicalResult StaticFolder::buildSim() {
         }
         auto &producer = producers[key.first];
         if (producer.cls < 0) {
+          if (rowsPart) {
+            sourceData[index] = constant(width, 0);
+            continue;
+          }
           // The frame's input as the read register will hold it: the token
           // being taken before the frame's first slot.
           sourceData[index] = b.createOrFold<comb::ExtractOp>(
@@ -19304,7 +19442,18 @@ LogicalResult StaticFolder::buildSim() {
       }
       takenAt.push_back(taken);
       Value data = sourceData[0];
-      if (sources.size() > 1) {
+      if (rowsPart) {
+        auto first = sources.begin()->first;
+        SmallVector<uint64_t> rows(threads, 0);
+        for (unsigned i = 0; i < threads; ++i)
+          rows[i] = pf.producerPort[sourceOf[i].first];
+        Value bundle = copyReg(table(b, ctl.inst2, rows, pf.chanWidth),
+                               consumer.name + "_bundle" + Twine(at));
+        data = b.createOrFold<comb::ExtractOp>(
+            b.getIntegerType(width),
+            rowsRead(first.first, bundle, rowsRowFor(c)),
+            first.second);
+      } else if (sources.size() > 1) {
         SmallVector<uint64_t> rows(threads, 0);
         for (unsigned i = 0; i < threads; ++i)
           rows[i] = sources[sourceOf[i]];
@@ -19704,8 +19853,13 @@ LogicalResult StaticFolder::buildSim() {
   std::map<unsigned, FoldOut> foldOut;
   for (unsigned port = 0; pf.on && port < pf.ports; ++port)
     reqSent.push_back(backedges.get(i1));
+  // `fold-ports-rows`: the bundles' outputs are built below, a field at a
+  // time (one link read per producer at the pushing bundle's instance).
+  bool portRowsReq = pf.on && foldPortsRows;
   for (auto [k, consumer] : llvm::enumerate(consumers)) {
     if (consumer.cls >= 0)
+      continue;
+    if (portRowsReq && foldedOut(k))
       continue;
     SmallVector<Value> bits;
     for (auto &piece : consumer.pieces[0]) {
@@ -19715,9 +19869,14 @@ LogicalResult StaticFolder::buildSim() {
       }
       auto &producer = producers[piece.producer];
       if (producer.cls < 0) {
+        Value in = portRows && folded(piece.producer)
+                       ? rowsRead(piece.producer,
+                                  constant(pf.chanWidth,
+                                           pf.producerPort[piece.producer]),
+                                  rowsFrame)
+                       : frameInput[piece.producer];
         bits.push_back(b.createOrFold<comb::ExtractOp>(
-            b.getIntegerType(piece.width), frameInput[piece.producer],
-            piece.low));
+            b.getIntegerType(piece.width), in, piece.low));
         continue;
       }
       unsigned pThreads = classes[producer.cls].threads();
@@ -19837,7 +19996,7 @@ LogicalResult StaticFolder::buildSim() {
   // field's first token (the queue's from reset) zero, and the frame's reset
   // token stored beside the record at a late field's push.
   Value reqValidOut, reqChanOut, reqTresetOut, reqBitsOut;
-  if (pf.on) {
+  if (pf.on && !portRowsReq) {
     unsigned P = pf.ports, cw = pf.chanWidth;
     unsigned cap = 2;
     for (auto &[k, fo] : foldOut)
@@ -19968,6 +20127,241 @@ LogicalResult StaticFolder::buildSim() {
     }
     reqValidOut = any;
     reqChanOut = chan;
+    reqTresetOut = resetBits;
+    reqBitsOut = b.createOrFold<comb::ConcatOp>(
+        SmallVector<Value>(fieldBits.rbegin(), fieldBits.rend()));
+  }
+  // `fold-ports-rows`: the request records in bundle order. Each field is
+  // one memory of a row per bundle and frame mod 4, written at the field's
+  // pushes (one bundle a host cycle) with one link read per producer, at the
+  // instance of the bundle pushing then (position tables), not a read and a
+  // queue per bundle and field. A bundle's record is complete at its last
+  // late push; those come in bundle order, so the records leave in bundle
+  // order, frame after frame: a count of the complete ones not sent, the
+  // bundle and frame to send, and the frames decided and not all sent (a
+  // frame is decided only with at most two such, so no push overwrites a
+  // row not sent: an early field's push of a frame writes the next frame's
+  // row). Per bundle no register, and the read/write logic is the same at
+  // any number of bundles but for the tables and the address widths.
+  if (portRowsReq) {
+    unsigned P = pf.ports, cw = pf.chanWidth;
+    unsigned nf = pf.req.size();
+    SmallVector<bool> early(nf);
+    for (unsigned f = 0; f < nf; ++f) {
+      early[f] = outputEarly[pf.reqOf[0][f]];
+      for (unsigned port = 1; port < P; ++port)
+        if (bool(outputEarly[pf.reqOf[port][f]]) != early[f])
+          return netlist.emitError("fold-ports-rows: field '")
+                 << pf.req[f].name << "' is early in some bundles only";
+    }
+    int resetField = -1;
+    for (unsigned f = 0; f < nf && resetField < 0; ++f)
+      if (!early[f])
+        resetField = f;
+    if (resetField < 0)
+      return netlist.emitError("fold-ports: the bundles have no late output to "
+                               "carry the frame's reset token");
+    SmallVector<uint64_t> completeRows(ii + 1, 0);
+    int prevLast = -1;
+    for (unsigned port = 0; port < P; ++port) {
+      int last = -1;
+      for (unsigned f = 0; f < nf; ++f) {
+        int s = outputSlot[pf.reqOf[port][f]];
+        if (s < 0 || s >= int(ii))
+          return netlist.emitError("fold-ports-rows: output '")
+                 << consumers[pf.reqOf[port][f]].name << "' pushed at " << s
+                 << ", outside the frame of " << ii;
+        if (!early[f])
+          last = std::max(last, s);
+      }
+      if (last <= prevLast)
+        return netlist.emitError("fold-ports-rows: bundle ")
+               << port << "'s record is complete at " << last
+               << ", not after bundle " << port - 1 << "'s";
+      completeRows[last] = 1;
+      prevLast = last;
+    }
+    // A position table read three host cycles ahead (as the classes' slot
+    // tables are) and registered to the position now (pos0).
+    auto atSlot = [&](ArrayRef<uint64_t> rows, unsigned width,
+                      const Twine &name) -> Value {
+      std::string n = name.str();
+      Value t = table(b, pos3, rows, width);
+      // (Reset to zero: no push or completion out of reset.)
+      return resetReg(resetReg(resetReg(t, n + "2", 0), n + "1", 0), n + "0", 0);
+    };
+    // The frame of the position now, mod 4.
+    Value frame0 = rowsFrame;
+    if (!frame0) {
+      auto next = backedges.get(b.getIntegerType(2));
+      frame0 = resetReg(next, "ports_req_frame", 3);
+      next.setValue(comb::MuxOp::create(
+          b, load, comb::AddOp::create(b, frame0, constant(2, 1)), frame0));
+    }
+    Value frameEarly = comb::AddOp::create(b, frame0, constant(2, 1));
+    // The send side: the bundle and frame of the next record.
+    Value reqReady = body->getArgument(reqPort);
+    auto pendNext = backedges.get(b.getIntegerType(cw + 3));
+    Value pending = resetReg(pendNext, "ports_complete", 0);
+    Value any = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, pending,
+                                     constant(cw + 3, 0));
+    Value sent = comb::AndOp::create(b, any, reqReady);
+    Value complete = atSlot(completeRows, 1, "ports_completes");
+    Value pendPlus = comb::AddOp::create(
+        b, pending, b.createOrFold<comb::ConcatOp>(constant(cw + 2, 0), complete));
+    pendNext.setValue(comb::MuxOp::create(
+        b, sent, comb::SubOp::create(b, pendPlus, constant(cw + 3, 1)), pendPlus));
+    auto sbNext = backedges.get(b.getIntegerType(cw));
+    Value sendBundle = resetReg(sbNext, "ports_send_bundle", 0);
+    Value wrap = comb::AndOp::create(b, sent, eq(sendBundle, P - 1));
+    sbNext.setValue(comb::MuxOp::create(
+        b, sent,
+        comb::MuxOp::create(b, wrap, constant(cw, 0),
+                            comb::AddOp::create(b, sendBundle, constant(cw, 1))),
+        sendBundle));
+    auto sfNext = backedges.get(b.getIntegerType(2));
+    Value sendFrame = resetReg(sfNext, "ports_send_frame", 0);
+    sfNext.setValue(comb::MuxOp::create(
+        b, wrap, comb::AddOp::create(b, sendFrame, constant(2, 1)), sendFrame));
+    // The first frame's records: an early field's token is the reset's (zero).
+    auto firstNext = backedges.get(i1);
+    Value firstFrame = resetReg(firstNext, "ports_send_first", 1);
+    firstNext.setValue(comb::AndOp::create(b, firstFrame, notOf(wrap)));
+    // Frames decided and not all sent; a frame is decided with at most two.
+    // (Counted a host cycle after the decision, off its logic: the next
+    // decision is at least 4 host cycles on.)
+    if (ii < 4)
+      return netlist.emitError("fold-ports-rows: needs a frame of at least 4 "
+                               "host cycles (II ")
+             << ii << ")";
+    Value decided = resetReg(starting, "ports_decided", 0);
+    auto outNext = backedges.get(b.getIntegerType(3));
+    Value outstanding = resetReg(outNext, "ports_frames_out", 0);
+    Value outPlus = comb::MuxOp::create(
+        b, decided, comb::AddOp::create(b, outstanding, constant(3, 1)), outstanding);
+    outNext.setValue(comb::MuxOp::create(
+        b, wrap, comb::SubOp::create(b, outPlus, constant(3, 1)), outPlus));
+    roomTerms.push_back(
+        comb::ICmpOp::create(b, comb::ICmpPredicate::ult, outstanding, constant(3, 3)));
+    for (auto &e : reqSent)
+      e.setValue(constant(1, 0));
+    Value readAddr = b.createOrFold<comb::ConcatOp>(sendBundle, sendFrame);
+    unsigned depth = (1u << cw) * 4;
+    auto memory = [&](const Twine &name, unsigned width, Value en, Value addr,
+                      Value data) -> Value {
+      auto mem = seq::FirMemOp::create(
+          b, seq::FirMemType::get(context, depth, width, 1), /*readLatency=*/0,
+          /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
+          b.getStringAttr(name), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+          StringAttr{}, Attribute{});
+      seq::FirMemWriteOp::create(b, mem, addr, hostClock, en, data, Value{});
+      return seq::FirMemReadOp::create(b, mem, readAddr, hostClock, constant(1, 1));
+    };
+    SmallVector<Value> fieldBits;
+    Value resetBits;
+    for (unsigned f = 0; f < nf; ++f) {
+      auto &field = pf.req[f];
+      std::string prefix = "ports_" + field.name;
+      SmallVector<uint64_t> pushRows(ii + 1, 0), bundleRows(ii + 1, 0);
+      for (unsigned port = 0; port < P; ++port) {
+        unsigned s = outputSlot[pf.reqOf[port][f]];
+        pushRows[s] = 1;
+        bundleRows[s] = port;
+      }
+      Value en = atSlot(pushRows, 1, prefix + "_push");
+      Value bundle = atSlot(bundleRows, cw, prefix + "_bundle");
+      // The field's bits at its push: piece by piece, the same pieces in
+      // every bundle, each from one link read per producer (at the pushing
+      // bundle's instance) or a constant of the bundle.
+      auto &pieces0 = consumers[pf.reqOf[0][f]].pieces[0];
+      SmallVector<Value> parts;
+      for (unsigned j = 0; j < pieces0.size(); ++j) {
+        unsigned w = pieces0[j].width;
+        // Producer (and low bit) -> its index among the piece's sources.
+        std::map<std::pair<int, unsigned>, unsigned> sources;
+        // By bundle (the field's pushing bundle at the position, `bundle`):
+        // each source's instance, the source, the constant.
+        SmallVector<SmallVector<uint64_t>> instRows;
+        SmallVector<uint64_t> sourceRows(P, 0), constRows(P, 0);
+        bool constants = false;
+        for (unsigned port = 0; port < P; ++port) {
+          unsigned k = pf.reqOf[port][f];
+          auto &pcs = consumers[k].pieces[0];
+          if (pcs.size() != pieces0.size() || pcs[j].width != w)
+            return netlist.emitError("fold-ports-rows: output '")
+                   << consumers[k].name << "' is not made of the same pieces as '"
+                   << consumers[pf.reqOf[0][f]].name << "'";
+          auto &pc = pcs[j];
+          unsigned s = port;
+          if (pc.producer < 0) {
+            constants = true;
+            if (w > 64)
+              return netlist.emitError("fold-ports-rows: output '")
+                     << consumers[k].name << "' has a constant piece over 64 bits";
+            constRows[s] = pc.constant.getZExtValue();
+            continue;
+          }
+          if (producers[pc.producer].cls < 0)
+            return netlist.emitError("fold-ports-rows: output '")
+                   << consumers[k].name << "' passes a netlist input on";
+          auto [it, fresh] = sources.try_emplace({pc.producer, pc.low}, sources.size());
+          if (fresh)
+            instRows.emplace_back(P, 0);
+          instRows[it->second][s] = pc.inst;
+          sourceRows[s] = it->second;
+        }
+        if (constants && !sources.empty())
+          return netlist.emitError("fold-ports-rows: field '")
+                 << field.name << "' mixes constants and links in a piece";
+        if (constants) {
+          parts.push_back(table(b, bundle, constRows, w));
+          continue;
+        }
+        SmallVector<Value> reads(sources.size());
+        for (auto &[key, index] : sources) {
+          auto &producer = producers[key.first];
+          unsigned pThreads = classes[producer.cls].threads();
+          std::string name = (producer.name + "_to_" + prefix + "_" + Twine(j)).str();
+          unsigned idx = index;
+          auto address = [&]() -> Value {
+            if (pThreads <= 1)
+              return Value();
+            return table(b, bundle, instRows[idx], llvm::Log2_32_Ceil(pThreads));
+          };
+          unsigned bankCopies = 0;
+          auto bank = [&]() -> Value {
+            return notOf(copyReg(par1, name + "_parity0_" + Twine(bankCopies++)));
+          };
+          reads[index] = linkRead(key.first, key.second, w, address, bank, name,
+                                  /*to=*/-1);
+        }
+        if (reads.size() == 1) {
+          parts.push_back(reads[0]);
+        } else {
+          unsigned sw = llvm::Log2_32_Ceil(reads.size());
+          Value sel = table(b, bundle, sourceRows, sw);
+          SmallVector<Value> elems;
+          for (uint64_t x = (uint64_t(1) << sw); x-- > 0;)
+            elems.push_back(reads[std::min<uint64_t>(x, reads.size() - 1)]);
+          parts.push_back(
+              hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, elems), sel));
+        }
+      }
+      Value data = parts.empty() ? constant(field.width, 0)
+                   : parts.size() == 1
+                       ? parts[0]
+                       : b.createOrFold<comb::ConcatOp>(
+                             SmallVector<Value>(parts.rbegin(), parts.rend()));
+      Value addr = b.createOrFold<comb::ConcatOp>(bundle, early[f] ? frameEarly : frame0);
+      Value got = memory(prefix, field.width, en, addr, data);
+      if (early[f])
+        got = comb::MuxOp::create(b, firstFrame, constant(field.width, 0), got);
+      fieldBits.push_back(got);
+      if (int(f) == resetField)
+        resetBits = memory("ports_treset", 1, en, addr, frameInput[pf.reset]);
+    }
+    reqValidOut = any;
+    reqChanOut = sendBundle;
     reqTresetOut = resetBits;
     reqBitsOut = b.createOrFold<comb::ConcatOp>(
         SmallVector<Value>(fieldBits.rbegin(), fieldBits.rend()));
@@ -21058,6 +21452,7 @@ void FoldStaticPass::runOnOperation() {
   folder.linkHbmShift = linkHbmShift;
   folder.foldPortsSpec = foldPorts;
   folder.foldPortsReset = foldPortsReset;
+  folder.foldPortsRows = foldPortsRows;
   folder.linkHbmFitSlots = linkHbmFitSlots;
   folder.pageWriteGate = pageWriteGate;
   for (StringRef spec : llvm::split(StringRef(pageWriteGatePages), ',')) {
@@ -21111,6 +21506,7 @@ void FoldStaticPass::runOnOperation() {
       parts[k].trim().getAsDouble(out[k]);
   }
   folder.vmemAutoBits = vmemAutoBits;
+  folder.vmemAutoInstanceBits = vmemAutoInstanceBits;
   folder.vmemRingLead = vmemRings;
   folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));
   folder.foldStoreRam = foldStoreRam;

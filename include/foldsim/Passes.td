@@ -420,6 +420,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "that cannot be one (read combinationally, more ports, too short a "
            "state gap) stays on chip and is counted in the report. 0: none by "
            "size">,
+    Option<"vmemAutoInstanceBits", "vmem-auto-instance-bits", "uint64_t", "0",
+           "As vmem-auto-bits, by the image of one instance (rows x width) "
+           "at least N bits, not the threaded image: the same memories are "
+           "virtual at every instance count, so the virtual memories (and "
+           "their controllers) do not change with N (0: none)">,
     Option<"vmemRings", "vmem-rings", "unsigned", "0",
            "With virtual memories, each one's per-instance read buffer as a "
            "fixed ring (VmemRings.h): a read's answer is written to the "
@@ -707,6 +712,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"foldPortsReset", "fold-ports-reset", "std::string", "\"reset\"",
            "With fold-ports: the netlist input whose frame token rides on "
            "each request record (req_treset)">,
+    Option<"foldPortsRows", "fold-ports-rows", "bool", "false",
+           "With fold-ports: the bundles' response tokens are rows of one "
+           "memory indexed by bundle and frame (four frames), written as the "
+           "records come and read where the frame reads them: a class input "
+           "whose instances read one field of different bundles is one read "
+           "at the instance's bundle. A bundle's token held is one bit (no "
+           "token, frame and previous-frame registers per field), the frame's "
+           "inputs all in is one counter of bundles. Needs II >= 4 and no "
+           "spec group over a bundle's inputs">,
     Option<"readBufferBits", "read-buffer-bits", "unsigned", "0",
            "A threaded memory read through a register keeps each instance's "
            "read register in a buffer of an entry per instance, read at the "

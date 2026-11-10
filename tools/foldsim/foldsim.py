@@ -408,6 +408,8 @@ def frame_options(a):
             fold += ' vmem-skip-held-reads'
     if getattr(a, 'vmem_auto_bits', 0):
         fold += f' vmem-auto-bits={a.vmem_auto_bits}'
+    if getattr(a, 'vmem_auto_instance_bits', 0):
+        fold += f' vmem-auto-instance-bits={a.vmem_auto_instance_bits}'
     if getattr(a, 'vmem_rings', 0):
         fold += f' vmem-rings={a.vmem_rings} vmem-ring-entries={a.vmem_ring_entries}'
     if a.unstaged_env:
@@ -485,6 +487,8 @@ def frame_options(a):
         fold += f' fold-ports={a.fold_ports}'
         if a.fold_ports_reset != 'reset':
             fold += f' fold-ports-reset={a.fold_ports_reset}'
+        if getattr(a, 'fold_ports_rows', False):
+            fold += ' fold-ports-rows'
     if getattr(a, 'link_kinds', ''):
         fold += f' link-kinds={a.link_kinds}'
     if getattr(a, 'link_kind_cost', False):
@@ -1550,6 +1554,9 @@ def build_parser():
                     help='with --virtual-memories: the arrays a front end split from one target RAM '
                          '(byte lanes, ways: the same read address and enable, the same write '
                          'address) are one virtual memory, each lane its own bytes of the row')
+    ap.add_argument('--vmem-auto-instance-bits', type=int, default=0, metavar='N',
+                    help='as --vmem-auto-bits, by one instance\'s image (rows x width) at least N bits: the same '
+                         'memories are virtual at every instance count (foldsim-fold-static vmem-auto-instance-bits)')
     ap.add_argument('--vmem-auto-bits', type=int, default=0, metavar='N',
                     help='with --static: every registered-read target memory (one read port, at most one write '
                          'port) whose threaded image is at least N bits is a virtual memory too, whatever storage '
@@ -1690,6 +1697,10 @@ def build_parser():
                          'the regex\'s first capture the bundle index, its second the field, e.g. '
                          '\'m_axi_mem_([0-9]+)_(.*)\' (POSIX extended), or without a group a prefix: '
                          'm_axi_mem_ for m_axi_mem_<bundle>_<field> (foldsim-fold-static; foldsim_sim.vh FOLDSIM_PORTS_*)')
+    ap.add_argument('--fold-ports-rows', action='store_true',
+                    help='with --fold-ports: the bundles\' response tokens as rows of one memory (bundle, frame), read '
+                         'at the reading instance\'s bundle; a held bit per bundle and one counter instead of token, '
+                         'frame and previous-frame registers per bundle and field (foldsim-fold-static fold-ports-rows)')
     ap.add_argument('--fold-ports-reset', default='reset', metavar='INPUT',
                     help='with --fold-ports: the netlist input whose frame token rides on each request record')
     ap.add_argument('--link-kind-cost', action='store_true',
@@ -2239,7 +2250,7 @@ def main():
     if a.copies == 'auto' and not a.static:
         sys.exit('--copies auto needs --static')
     if a.vmem_cache_rows is not None:
-        if not a.virtual_memories and a.state != 'auto' and not getattr(a, 'vmem_auto_bits', 0):
+        if not a.virtual_memories and a.state != 'auto' and not getattr(a, 'vmem_auto_bits', 0) and not getattr(a, 'vmem_auto_instance_bits', 0):
             sys.exit('--vmem-cache-rows needs --virtual-memories (or --state auto, --vmem-auto-bits)')
         if a.vmem_cache_rows != 'auto' and not a.vmem_cache_rows.isdigit():
             sys.exit('--vmem-cache-rows: auto, 0 or a power of two of at least 2')
@@ -2251,7 +2262,7 @@ def main():
     if a.page and not a.static:
         sys.exit('--page needs --static')
     if a.vmem_group is not None:
-        if not a.virtual_memories and a.state != 'auto' and not getattr(a, 'vmem_auto_bits', 0):
+        if not a.virtual_memories and a.state != 'auto' and not getattr(a, 'vmem_auto_bits', 0) and not getattr(a, 'vmem_auto_instance_bits', 0):
             sys.exit('--vmem-group needs --virtual-memories (or --state auto, --vmem-auto-bits)')
         if not (a.vmem_group == 'copy' or (a.vmem_group.isdigit() and int(a.vmem_group) >= 1)
                 or re.fullmatch(r'auto(:[1-9][0-9]*)?', a.vmem_group)):
