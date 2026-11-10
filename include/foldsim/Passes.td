@@ -1791,12 +1791,28 @@ def BeaconMap : Pass<"foldsim-beacon-map", "::mlir::ModuleOp"> {
     shared, each cone covered by the fewest LUTs, as Vivado maps the logic
     off its critical paths. A depth-oriented mapping duplicates logic to save
     levels, so its cells are no measure of area.
+
+    For depth, `carry-block-size` makes the mapper time the bits of adders,
+    comparators and distributed-RAM reads as the carry blocks of that many
+    bits deliver them, so a late carry is not buried under a deep cone as
+    Vivado would not bury it (0: every input bit arrives at 0). Each module
+    left after inlining (a fold's models) is mapped apart, its input ports and
+    its instances' outputs arriving at 0 unless `arrivals` gives them:
+    `foldsim-estimate-timing`'s `arrivals` over a first mapping, so a second
+    one times them as the whole hierarchy delivers them (as Vivado maps the
+    flattened design; `foldsim-boundary-arrivals`).
   }];
   let options = [
     Option<"target", "target", "std::string", "\"versal\"",
            "The Beacon target to map to">,
     Option<"area", "area", "bool", "false",
            "Map for area (foldsim-estimate-area) instead of depth">,
+    Option<"carryBlockSize", "carry-block-size", "unsigned", "0",
+           "Bits per carry block the depth mapping times adders and "
+           "comparators with (0: their input bits arrive at 0)">,
+    Option<"arrivals", "arrivals", "std::string", "\"\"",
+           "Arrival times at the modules' ports, from foldsim-estimate-timing's "
+           "`arrivals` over a first mapping (JSON); none: they arrive at 0">,
   ];
 }
 
