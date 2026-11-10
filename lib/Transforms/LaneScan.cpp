@@ -123,6 +123,8 @@ struct Pattern {
   // that stay in the parent.
   SmallVector<int> packs;
   SmallVector<Value> rest;
+  // AC over the bits of lane vectors of one bit a lane (gathered whole).
+  SmallVector<Value> vecs;
   // VecRed: the vector, and how to finish (and / or / xor, invert).
   Value vec;
   StringRef red;
@@ -180,6 +182,11 @@ struct Scan {
   void computePacks();
   bool matchPatterns();
   bool matchRotated(comb::MuxOp root);
+  /// A gather of one lane's bit or element: hw.array_get of a lane array,
+  /// or bit `x` of a lane vector of one bit a lane (shru + extract 0).
+  bool gather(Value v, Value &src, Value &index);
+  /// The lane at index / bit `x` of a gather's source, -1 if none.
+  int laneAt(Value src, uint64_t x);
   bool fullPack(ArrayRef<Value> values, int &pack);
 };
 
@@ -706,10 +713,33 @@ bool Scan::matchPatterns() {
     red.insert(v);
     any = true;
   };
+  // Rotated chains first: the gathers they read are theirs.
+  DenseSet<Value> rotGathers;
+  for (auto &op : *body) {
+    auto mux = dyn_cast<comb::MuxOp>(op);
+    if (!mux || patterns.count(&op) || get(mux.getResult()).kind != Kind::Multi)
+      continue;
+    bool inner = llvm::any_of(mux.getResult().getUsers(), [&](Operation *u) {
+      auto m = dyn_cast<comb::MuxOp>(u);
+      return m && m.getFalseValue() == mux.getResult();
+    });
+    if (!inner && matchRotated(mux))
+      any = true;
+  }
+  for (auto &[root, p] : patterns)
+    if (p.kind == PatKind::Rot)
+      for (Value cur = root->getResult(0); auto m = cur.getDefiningOp<comb::MuxOp>();
+           cur = m.getFalseValue()) {
+        if (cur == p.terminal)
+          break;
+        rotGathers.insert(m.getCond());
+      }
   for (auto &op : *body) {
     if (op.getNumResults() != 1 || patterns.count(&op))
       continue;
     Value res = op.getResult(0);
+    if (rotGathers.count(res))
+      continue;
     if (get(res).kind != Kind::Multi)
       continue;
     // ac
@@ -722,16 +752,15 @@ bool Scan::matchPatterns() {
       // of the one free index variable they read each lane once, they are
       // the array's lanes (the op is commutative).
       llvm::MapVector<Value, SmallVector<Value>> gathers;
+      SmallVector<Value> vecTerms;
       for (Value v : op.getOperands()) {
         auto &i = get(v);
         if (i.kind == Kind::Elem)
           byPack[packOf.lookup(v)].push_back(v);
         else if (i.kind == Kind::Scalar)
           rest.push_back(v);
-        else if (auto g = v.getDefiningOp<hw::ArrayGetOp>();
-                 g && get(g.getInput()).kind == Kind::Arr &&
-                 get(g.getIndex()).kind == Kind::Scalar)
-          gathers[g.getInput()].push_back(g.getIndex());
+        else if (Value src, x; gather(v, src, x))
+          gathers[src].push_back(x);
         else
           ok = false;
       }
@@ -754,24 +783,25 @@ bool Scan::matchPatterns() {
           SmallVector<bool> hit(F, false);
           for (Value x : idxs) {
             APInt xv;
-            if (!evalAt(x, free, APInt(pw, pv), memo, xv) ||
-                xv.getActiveBits() > 32 || xv.getZExtValue() >= F ||
-                hit[xv.getZExtValue()]) {
+            int l = -1;
+            if (evalAt(x, free, APInt(pw, pv), memo, xv) &&
+                xv.getActiveBits() <= 32)
+              l = laneAt(arr, xv.getZExtValue());
+            if (l < 0 || hit[l]) {
               ok = false;
               break;
             }
-            hit[xv.getZExtValue()] = true;
+            hit[l] = true;
           }
         }
         if (!ok)
           break;
-        auto create = arr.getDefiningOp<hw::ArrayCreateOp>();
-        if (!create) {
-          ok = false;
-          break;
+        if (auto create = arr.getDefiningOp<hw::ArrayCreateOp>()) {
+          for (Value m : create.getInputs())
+            byPack[packOf.lookup(m)].push_back(m);
+        } else {
+          vecTerms.push_back(arr);
         }
-        for (Value m : create.getInputs())
-          byPack[packOf.lookup(m)].push_back(m);
       }
       Pattern p{PatKind::AC, &op};
       for (auto &[pk, vs] : byPack) {
@@ -780,8 +810,9 @@ bool Scan::matchPatterns() {
           ok = false;
         p.packs.push_back(pk);
       }
-      if (ok && !p.packs.empty()) {
+      if (ok && (!p.packs.empty() || !vecTerms.empty())) {
         p.rest = rest;
+        p.vecs = vecTerms;
         add(std::move(p));
       }
       continue;
@@ -824,13 +855,7 @@ bool Scan::matchPatterns() {
       auto &a = get(aget.getInput());
       if (a.kind != Kind::Arr || get(aget.getIndex()).kind != Kind::Scalar)
         continue;
-      // A condition of a mux chain is left to the rotated chain's scan.
-      bool cond = llvm::any_of(res.getUsers(), [&](Operation *u) {
-        auto m = dyn_cast<comb::MuxOp>(u);
-        return m && m.getCond() == res;
-      });
-      if (cond)
-        continue;
+
       auto create = aget.getInput().getDefiningOp<hw::ArrayCreateOp>();
       if (!create)
         continue;
@@ -896,11 +921,8 @@ bool Scan::matchPatterns() {
         order.push_back(c.lane);
         cur = m.getFalseValue();
       }
-      if (order.size() < 2) {
-        if (matchRotated(mux))
-          any = true;
+      if (order.size() < 2)
         continue;
-      }
       bool up = true, down = true;
       for (unsigned k = 1; k < order.size(); ++k) {
         up &= order[k] > order[k - 1];
@@ -939,6 +961,40 @@ bool Scan::matchPatterns() {
   return any;
 }
 
+bool Scan::gather(Value v, Value &src, Value &index) {
+  if (auto g = v.getDefiningOp<hw::ArrayGetOp>()) {
+    if (get(g.getInput()).kind != Kind::Arr ||
+        get(g.getIndex()).kind != Kind::Scalar)
+      return false;
+    src = g.getInput();
+    index = g.getIndex();
+    return true;
+  }
+  if (auto ex = v.getDefiningOp<comb::ExtractOp>()) {
+    auto shr = ex.getInput().getDefiningOp<comb::ShrUOp>();
+    if (!shr || ex.getLowBit() != 0 || widthOf(ex.getResult()) != 1)
+      return false;
+    auto &vi = get(shr.getLhs());
+    if (vi.kind != Kind::Vec || vi.w != 1 ||
+        get(shr.getRhs()).kind != Kind::Scalar)
+      return false;
+    src = shr.getLhs();
+    index = shr.getRhs();
+    return true;
+  }
+  return false;
+}
+
+int Scan::laneAt(Value src, uint64_t x) {
+  auto &i = get(src);
+  if (i.kind == Kind::Arr)
+    return x < i.arr.size() ? i.arr[x] : -1;
+  for (unsigned j = 0; j < F; ++j)
+    if (uint64_t(i.lo(j)) == x)
+      return j;
+  return -1;
+}
+
 /// A priority mux chain whose level i reads `A[x_i(p)]` and yields v_i(p),
 /// A an array of one pack (a lane each), p one parent value: when the lanes
 /// the levels visit are, for every p, a rotation of the lanes from s(p) =
@@ -948,29 +1004,29 @@ bool Scan::matchRotated(comb::MuxOp root) {
   SmallVector<Value> xs, vs;
   Value arr, cur = root.getResult();
   while (auto m = cur.getDefiningOp<comb::MuxOp>()) {
-    auto aget = m.getCond().getDefiningOp<hw::ArrayGetOp>();
-    if (!aget || get(aget.getInput()).kind != Kind::Arr ||
-        (arr && aget.getInput() != arr))
+    Value src, x;
+    if (!gather(m.getCond(), src, x) || (arr && src != arr))
       break;
     if (get(m.getTrueValue()).kind != Kind::Scalar)
       break;
     if (m != root && !m.getResult().hasOneUse())
       break;
-    arr = aget.getInput();
-    xs.push_back(aget.getIndex());
+    arr = src;
+    xs.push_back(x);
     vs.push_back(m.getTrueValue());
     cur = m.getFalseValue();
   }
   if (xs.size() != F || F < 2)
     return false;
-  auto create = arr.getDefiningOp<hw::ArrayCreateOp>();
-  if (!create)
+  SmallVector<Value> members;
+  if (auto create = arr.getDefiningOp<hw::ArrayCreateOp>()) {
+    members.assign(create.getInputs().begin(), create.getInputs().end());
+    int pack;
+    if (!fullPack(members, pack))
+      return false;
+  } else if (get(arr).kind != Kind::Vec) {
     return false;
-  SmallVector<Value> members(create.getInputs().begin(),
-                             create.getInputs().end());
-  int pack;
-  if (!fullPack(members, pack))
-    return false;
+  }
   // The one free value.
   Value free;
   DenseSet<Value> seen;
@@ -980,7 +1036,6 @@ bool Scan::matchRotated(comb::MuxOp root) {
   if (!free || get(free).kind != Kind::Scalar || widthOf(free) == 0 ||
       widthOf(free) > 12)
     return false;
-  auto &a = get(arr);
   unsigned pw = widthOf(free), rw = widthOf(vs[0]);
   int64_t dir = 0, e = 0, a0 = 0;
   SmallVector<std::optional<APInt>> V(F);
@@ -992,9 +1047,11 @@ bool Scan::matchRotated(comb::MuxOp root) {
       APInt x, v;
       if (!evalAt(xs[i], free, p, memo, x) || !evalAt(vs[i], free, p, memo, v))
         return false;
-      if (x.getActiveBits() > 32 || x.getZExtValue() >= F)
+      if (x.getActiveBits() > 32)
         return false;
-      lane[i] = a.arr[x.getZExtValue()];
+      lane[i] = laneAt(arr, x.getZExtValue());
+      if (lane[i] < 0)
+        return false;
       if (V[lane[i]] && *V[lane[i]] != v)
         return false;
       V[lane[i]] = v;
@@ -1024,6 +1081,7 @@ bool Scan::matchRotated(comb::MuxOp root) {
   p.rotE = e;
   p.rotDir = dir;
   p.elems = members;
+  p.vec = members.empty() ? arr : Value();
   for (auto &v : V)
     p.rotVals.push_back(v ? *v : APInt(rw, 0));
   patterns[root] = std::move(p);
@@ -1143,14 +1201,19 @@ void LaneScanPass::runOnOperation() {
       case PatKind::AC:
         for (int pk : p.packs)
           ok &= cellPack[pk];
+        for (Value v : p.vecs)
+          ok &= cellVec.count(v) != 0;
         break;
       case PatKind::VecRed:
       case PatKind::BitSel:
         ok = cellVec.count(p.vec) != 0;
         break;
       case PatKind::Select:
-      case PatKind::Rot:
         ok = cellPack[s.packOf.lookup(p.elems[0])];
+        break;
+      case PatKind::Rot:
+        ok = p.vec ? cellVec.count(p.vec) != 0
+                   : bool(cellPack[s.packOf.lookup(p.elems[0])]);
         break;
       case PatKind::Prio:
         for (unsigned j = 0; j < F; ++j)
@@ -1258,71 +1321,153 @@ void LaneScanPass::runOnOperation() {
       broadcast[v] = arg;
       return arg;
     };
+    // The parent's builder (constants, slices, the scans' starts and ends).
+    OpBuilder pb(body, body->getTerminator()->getIterator());
+    pb.setInsertionPoint(body->getTerminator());
+    // The lane's index: one input of constants, j for lane j (a per-instance
+    // constant, the instance index).
+    unsigned laneBits = std::max(1u, llvm::Log2_64_Ceil(F));
+    Value laneArg;
+    auto laneIndex = [&]() -> Value {
+      if (laneArg)
+        return laneArg;
+      SmallVector<Value> vs;
+      for (unsigned j = 0; j < F; ++j)
+        vs.push_back(hw::ConstantOp::create(pb, parent.getLoc(),
+                                            APInt(laneBits, j)));
+      laneArg = newInput("lane", b.getIntegerType(laneBits), vs);
+      return laneArg;
+    };
+    // The lane index as a w-bit value.
+    auto laneAs = [&](unsigned w) -> Value {
+      Value l = laneIndex();
+      if (w == laneBits)
+        return l;
+      if (w < laneBits)
+        return comb::ExtractOp::create(b, l, 0, w);
+      return comb::ConcatOp::create(
+          b, hw::ConstantOp::create(b, APInt(w - laneBits, 0)), l);
+    };
+    // Per-lane constants: one constant when all equal, a + b * lane when
+    // affine in the lane, else a per-lane input of constants.
+    auto laneConstAP = [&](ArrayRef<APInt> values) -> Value {
+      unsigned w = values[0].getBitWidth();
+      if (llvm::all_of(values, [&](const APInt &v) { return v == values[0]; }))
+        return hw::ConstantOp::create(b, values[0]);
+      if (w == 1) {
+        // One run of ones: a range of lanes.
+        int lo = -1, hi = -1;
+        bool run = true;
+        for (unsigned j = 0; j < F; ++j)
+          if (values[j].isOne()) {
+            if (lo < 0)
+              lo = j;
+            else if (hi != int(j) - 1)
+              run = false;
+            hi = j;
+          }
+        if (run && lo >= 0) {
+          unsigned lw = laneBits + 1;
+          Value l = laneAs(lw);
+          Value ge = comb::ICmpOp::create(
+              b, comb::ICmpPredicate::uge, l,
+              hw::ConstantOp::create(b, APInt(lw, lo)));
+          Value le = comb::ICmpOp::create(
+              b, comb::ICmpPredicate::ule, l,
+              hw::ConstantOp::create(b, APInt(lw, hi)));
+          return comb::AndOp::create(b, ge, le, false);
+        }
+      }
+      APInt a = values[0], step = values[1] - values[0];
+      bool affine = true;
+      for (unsigned j = 0; j < F && affine; ++j)
+        affine = values[j] == a + step * APInt(w, j, false, true);
+      if (affine) {
+        Value l = laneAs(w);
+        Value t = l;
+        if (step.isAllOnes())
+          t = comb::SubOp::create(b, hw::ConstantOp::create(b, APInt(w, 0)), l,
+                                  false);
+        else if (!step.isOne())
+          t = comb::MulOp::create(b, l, hw::ConstantOp::create(b, step), false);
+        if (a.isZero())
+          return t;
+        return comb::AddOp::create(b, t, hw::ConstantOp::create(b, a), false);
+      }
+      SmallVector<Value> vs;
+      for (auto &v : values)
+        vs.push_back(hw::ConstantOp::create(pb, parent.getLoc(), v));
+      return newInput("pl" + Twine(ins.size()), vs[0].getType(), vs);
+    };
+    auto laneConst = [&](Type type, ArrayRef<int64_t> values) -> Value {
+      unsigned w = type.getIntOrFloatBitWidth();
+      SmallVector<APInt> vs;
+      for (int64_t v : values)
+        vs.push_back(APInt(w, v, false, true));
+      return laneConstAP(vs);
+    };
+    // Lane j's bits [lo(j), lo(j) + w) of a parent value, lo affine in the
+    // lane: the value broadcast, shifted by the lane's offset in the cell.
+    auto dynSlice = [&](Value scalar, int64_t lo0, int64_t stride,
+                        unsigned w) -> Value {
+      unsigned sw = widthOf(scalar);
+      Value s = bcast(scalar);
+      SmallVector<APInt> offs;
+      for (unsigned j = 0; j < F; ++j)
+        offs.push_back(APInt(sw, lo0 + stride * int64_t(j), false, true));
+      Value off = laneConstAP(offs);
+      Value sh = comb::ShrUOp::create(b, s, off, false);
+      return comb::ExtractOp::create(b, sh, 0, w);
+    };
     // Lane j's values of one operand position: the same value everywhere
-    // (broadcast or constant), or a per-lane input.
+    // (broadcast or constant), per-lane constants, slices of one parent value
+    // at offsets affine in the lane, or a per-lane input.
     auto perLane = [&](ArrayRef<Value> values) -> Value {
-      bool same = llvm::all_equal(values);
-      if (same)
+      if (llvm::all_equal(values))
         return bcast(values[0]);
-      // Constants of one value are the same too.
-      APInt c0;
-      bool consts = true, equal = true;
+      SmallVector<APInt> cs;
       for (Value v : values) {
         APInt c;
-        if (!isConstant(v, c)) {
-          consts = false;
+        if (!isConstant(v, c))
           break;
-        }
-        if (v == values[0])
-          c0 = c;
-        equal &= c == c0;
+        cs.push_back(c);
       }
-      if (consts) {
-        isConstant(values[0], c0);
-        bool allEqual = llvm::all_of(values, [&](Value v) {
-          APInt c;
-          isConstant(v, c);
-          return c == c0;
-        });
-        if (allEqual)
-          return hw::ConstantOp::create(b, c0);
+      if (cs.size() == values.size())
+        return laneConstAP(cs);
+      // Slices of one value.
+      Value src;
+      SmallVector<int64_t> los;
+      unsigned w = widthOf(values[0]);
+      for (Value v : values) {
+        auto ex = v.getDefiningOp<comb::ExtractOp>();
+        if (!ex || (src && ex.getInput() != src))
+          break;
+        src = ex.getInput();
+        los.push_back(ex.getLowBit());
       }
-      (void)equal;
+      if (los.size() == values.size() && w > 0) {
+        int64_t stride = F > 1 ? los[1] - los[0] : 0;
+        bool affine = true;
+        for (unsigned j = 0; j < F; ++j)
+          affine &= los[j] == los[0] + stride * int64_t(j);
+        if (affine)
+          return dynSlice(src, los[0], stride, w);
+      }
       return newInput("pl" + Twine(ins.size()), values[0].getType(),
                       SmallVector<Value>(values.begin(), values.end()));
     };
-    // Per-lane constant input (or one constant when all equal).
-    auto laneConst = [&](Type type, ArrayRef<int64_t> values) -> Value {
-      unsigned w = type.getIntOrFloatBitWidth();
-      if (llvm::all_equal(values))
-        return hw::ConstantOp::create(b, APInt(w, values[0]));
-      OpBuilder pb(body, body->getTerminator()->getIterator());
-      SmallVector<Value> vs;
-      for (int64_t v : values)
-        vs.push_back(hw::ConstantOp::create(pb, parent.getLoc(),
-                                            APInt(w, v)));
-      return newInput("pl" + Twine(ins.size()), type, vs);
-    };
     // A slice of a parent scalar for each lane's bits of a vector.
-    OpBuilder pb(body, body->getTerminator()->getIterator());
-    pb.setInsertionPoint(body->getTerminator());
     auto laneSlices = [&](Value scalar, const Info &layout) -> Value {
       APInt c;
       if (isConstant(scalar, c)) {
-        SmallVector<int64_t> vals;
-        bool fits = layout.w <= 64;
-        if (fits) {
-          for (unsigned j = 0; j < F; ++j)
-            vals.push_back(c.extractBitsAsZExtValue(layout.w, layout.lo(j)));
-          return laneConst(b.getIntegerType(layout.w), vals);
-        }
+        SmallVector<APInt> vals;
+        for (unsigned j = 0; j < F; ++j)
+          vals.push_back(c.extractBits(layout.w, layout.lo(j)));
+        return laneConstAP(vals);
       }
-      SmallVector<Value> vs;
-      for (unsigned j = 0; j < F; ++j)
-        vs.push_back(comb::ExtractOp::create(pb, parent.getLoc(), scalar,
-                                             layout.lo(j), layout.w));
-      return perLane(vs);
+      return dynSlice(scalar, layout.lo(0), layout.stride, layout.w);
     };
+
 
     // The cell's value of a parent value (lane 0's member for packs).
     // Aliases: a vector of one pack's members is that pack's value, a whole
@@ -1538,6 +1683,13 @@ void LaneScanPass::runOnOperation() {
         SmallVector<Value> operands{in};
         for (int pk : p->packs)
           operands.push_back(cellValue(s.packMembers[pk][0]));
+        for (Value v : p->vecs) {
+          Value bit = cellValue(v);
+          if (rw > 1)
+            bit = comb::ConcatOp::create(
+                b, hw::ConstantOp::create(b, APInt(rw - 1, 0)), bit);
+          operands.push_back(bit);
+        }
         OperationState st(root->getLoc(), root->getName());
         st.addOperands(operands);
         st.addTypes(rt);
@@ -1619,11 +1771,38 @@ void LaneScanPass::runOnOperation() {
         if (s.isElem(p->vals[lane0])) {
           v = cellValue(s.packMembers[s.packOf.lookup(p->vals[lane0])][0]);
         } else {
-          SmallVector<Value> vs;
+          // Constants: a disabled lane's value is free; it continues the
+          // enabled lanes' line where they are affine in the lane.
+          SmallVector<APInt> cs(F, APInt(rw, 0));
+          SmallVector<int> on;
+          bool consts = true;
           for (unsigned j = 0; j < F; ++j)
-            vs.push_back(p->conds[j] ? p->vals[j]
-                                     : pconst(rt, APInt(rw, 0)));
-          v = perLane(vs);
+            if (p->conds[j]) {
+              consts &= isConstant(p->vals[j], cs[j]);
+              on.push_back(j);
+            }
+          if (consts && on.size() >= 2) {
+            APInt d = cs[on[1]] - cs[on[0]];
+            int64_t dj = on[1] - on[0];
+            bool line = dj == 1;
+            for (unsigned k = 0; k < on.size() && line; ++k)
+              line = cs[on[k]] ==
+                     cs[on[0]] + d * APInt(rw, on[k] - on[0], false, true);
+            if (line)
+              for (unsigned j = 0; j < F; ++j)
+                if (!p->conds[j])
+                  cs[j] = cs[on[0]] + d * APInt(rw, int64_t(j) - on[0], true,
+                                                true);
+          }
+          if (consts) {
+            v = laneConstAP(cs);
+          } else {
+            SmallVector<Value> vs;
+            for (unsigned j = 0; j < F; ++j)
+              vs.push_back(p->conds[j] ? p->vals[j]
+                                       : pconst(rt, APInt(rw, 0)));
+            v = perLane(vs);
+          }
         }
         Value hit = comb::AndOp::create(b, cond, enable, false);
         Value take = hit;
@@ -1658,7 +1837,9 @@ void LaneScanPass::runOnOperation() {
         Value lf = comb::ExtractOp::create(b, in, rw, 1);
         Value hv = comb::ExtractOp::create(b, in, rw + 1, rw);
         Value hf = comb::ExtractOp::create(b, in, 2 * rw + 1, 1);
-        Value cond = cellValue(s.packMembers[s.packOf.lookup(p->elems[0])][0]);
+        Value cond =
+            p->vec ? cellValue(p->vec)
+                   : cellValue(s.packMembers[s.packOf.lookup(p->elems[0])][0]);
         unsigned K = llvm::Log2_64_Ceil(F) + 1;
         SmallVector<int64_t> idx;
         for (unsigned j = 0; j < F; ++j)
@@ -1697,16 +1878,8 @@ void LaneScanPass::runOnOperation() {
         bool same = true;
         for (unsigned j = 0; j < F; ++j)
           same &= p->rotVals[j] == p->rotVals[0];
-        Value v;
-        if (same) {
-          v = hw::ConstantOp::create(b, p->rotVals[0]);
-        } else {
-          OpBuilder cb(body, body->getTerminator()->getIterator());
-          SmallVector<Value> vs;
-          for (unsigned j = 0; j < F; ++j)
-            vs.push_back(hw::ConstantOp::create(cb, loc, p->rotVals[j]));
-          v = newInput("pl" + Twine(ins.size()), vs[0].getType(), vs);
-        }
+        (void)same;
+        Value v = laneConstAP(p->rotVals);
         Value hitH = comb::AndOp::create(b, cond, inHi, false);
         Value hitL = comb::AndOp::create(b, cond, notHi, false);
         Value takeH = hitH, takeL = hitL;

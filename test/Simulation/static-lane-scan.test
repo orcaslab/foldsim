@@ -1,0 +1,42 @@
+# REQUIRES: verilator
+# `--lane-scan` (foldsim-lane-scan): the unfolded top's glue over its eight
+# Leaf instances (Driver/Inputs/lane-glue) becomes a lane cell class, one
+# instance a Leaf, and its reductions scans through those instances: every
+# form once or more (ac: an XOR of the lanes' data, a popcount, a one-hot
+# AND-OR mux, an OR of rotated gathers; vec: AND / OR / parity of packed lane
+# vectors, one of them per-lane state; prio: a lowest-set encoder loop; carry: `m - 1` of a packed lane
+# vector; rot: a round-robin grant `(ptr + i) % N`; select: the granted lane's
+# data; bitsel: a lane vector's bit at the pointer), and the per-lane grant
+# decode of the same-cycle grant read back by each Leaf. The top keeps fixed
+# logic only. Exact against the target, channels stalled or not:
+# - zl: zero-latency links and chains;
+# - cp: the cell in two copies (the chains cross copies), bubbles, shared
+#   links, chains cut every two hops.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/lane-glue
+# RUN: foldsim --srcs top.f --top Top --out %t/zl --static --nest --modulo --compact-links --zero-latency-links --zero-latency-chains --lane-scan Leaf 2>&1 | FileCheck %s --check-prefix=SCAN
+# RUN: FileCheck %s --check-prefix=TOP < %t/zl/flat.mlir
+# RUN: FileCheck %s --check-prefix=SCHED < %t/zl/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/zl/obj %S/Inputs/tb_reset.sv top.sv %t/zl/foldsim_sim.sv > %t/zl/build.log 2>&1
+# RUN: %t/zl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/zl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=40 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/cp --static --nest --modulo --compact-links --bubbles --share-links --zero-latency-links --zero-latency-chains --zero-chain-hops 2 --copies Top_lane_Leaf:2 --lane-scan Leaf 2>&1 | FileCheck %s --check-prefix=SCAN
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/cp/obj %S/Inputs/tb_reset.sv top.sv %t/cp/foldsim_sim.sv > %t/cp/build.log 2>&1
+# RUN: %t/cp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 +bubble=0 | FileCheck %s
+# RUN: %t/cp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=40 +bubble=30 | FileCheck %s
+
+# SCAN: lane-scan: cell Top_lane_Leaf
+# SCAN: lane-scan: Top lanes Leaf x8: {{.*}}; scans ac 4 bitsel 1 carry 1 prio 1 rot 1 select 1 vec 5 (14 chains
+
+# The top: the eight Leafs and their eight cells, no array of the lanes'
+# values, no per-lane select left.
+# TOP-LABEL: hw.module @Top(
+# TOP-NOT: hw.array_create
+# TOP-NOT: hw.array_get
+# TOP-COUNT-8: hw.instance "g_leaf_{{[0-7]}}.u" @Leaf(
+# TOP-COUNT-8: hw.instance "lane_Leaf_{{[0-7]}}" @Top_lane_Leaf(
+# TOP-NOT: hw.array_get
+# TOP: hw.output
+
+# SCHED: Top_lane_Leaf x8
+
+# CHECK: MATCH
