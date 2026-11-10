@@ -806,7 +806,6 @@ public:
            (vmemAutoInstanceBits && depth * width >= vmemAutoInstanceBits);
   }
   unsigned vmemRingLead = 0, vmemRingEntries = 1024;
-  bool vmemRingImageEach = false;
   /// Plans a class's rings (`vmem-rings`): marks its virtual memories that
   /// take one, or none if the schedule leaves no room (the reason reported).
   void planClassRing(Class &cls, function_ref<bool(const Class::VirtualMemory &)> eligible);
@@ -18063,55 +18062,17 @@ LogicalResult StaticFolder::buildSim() {
   // `vmem-rings`: each ring's image, a row per instance (row 0 of each),
   // written with the memory's answers, read by the ring's prefetches.
   std::map<std::pair<unsigned, unsigned>, unsigned> imageOf;
-  // (A class's rings share images by default: as many rings an image as
-  // its one read and one write a host cycle serve in a frame (each ring's
-  // prefetches and answers, at most a frame's instances or prefetch groups
-  // each, within half the frame) and, the rings' prefetches at the same
-  // positions, in half the ring's lead: ring j of an image at rows {j, instance},
-  // j in the tag. The images are as many at every instance count, the
-  // frame growing with the instances. `imageMembers` an image's rings,
-  // `ringIndex` j.)
-  std::map<unsigned, SmallVector<unsigned>> imageMembers;
-  std::map<std::pair<unsigned, unsigned>, unsigned> ringIndex;
-  auto memberBits = [&](unsigned img) -> unsigned {
-    unsigned n = imageMembers.count(img) ? imageMembers[img].size() : 1;
-    return n < 2 ? 0 : llvm::Log2_32_Ceil(n);
-  };
-  for (auto [c, cls] : llvm::enumerate(classes)) {
-    SmallVector<unsigned> rings;
-    for (auto [k, vm] : llvm::enumerate(cls.virtualMemories))
-      if (vm.ring && simOf.count({unsigned(c), unsigned(k)}))
-        rings.push_back(unsigned(k));
-    if (rings.empty())
-      continue;
-    // (A class's rings prefetch at the same positions: an image's rings'
-    // reads of a position leave one a host cycle, the last as many host
-    // cycles later as the image's rings, within half the ring's lead.)
-    uint64_t load = std::max<uint64_t>({1, cls.ring->prefetches, cls.threads()});
-    uint64_t per64 = std::min<uint64_t>((ii / 2) / load, vmemRingLead / 2);
-    unsigned per = vmemRingImageEach ? 1 : unsigned(std::max<uint64_t>(1, per64));
-    for (unsigned g = 0; g < rings.size(); g += per) {
-      unsigned img = simVirtuals.size();
-      SmallVector<unsigned> members(rings.begin() + g,
-                                    rings.begin() + std::min<size_t>(rings.size(), g + per));
-      for (auto [j, k] : llvm::enumerate(members)) {
-        imageOf[{unsigned(c), k}] = img;
-        ringIndex[{unsigned(c), k}] = unsigned(j);
-      }
-      imageMembers[img] = members;
-      unsigned k = members.front();
-      auto &vm = cls.virtualMemories[k];
+  for (auto [c, cls] : llvm::enumerate(classes))
+    for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
+      if (!vm.ring || !simOf.count({unsigned(c), unsigned(k)}))
+        continue;
+      imageOf[{unsigned(c), unsigned(k)}] = simVirtuals.size();
       std::string name = ("vm" + Twine(simVirtuals.size()) + "_").str();
-      // {write, ring, entry, instance 0} (a read's tag its ring and entry;
-      // foldsim_vmem TAGW), the row {ring, instance}.
-      unsigned kb = members.size() < 2 ? 0 : llvm::Log2_32_Ceil(members.size());
-      unsigned dataWidth = 0;
-      for (unsigned r : members)
-        dataWidth = std::max(dataWidth, cls.virtualMemories[r].dataWidth);
-      auto iw = IntegerType::get(context, llvm::Log2_32_Ceil(cls.ring->entries) + kb + 2);
-      auto aw = IntegerType::get(context, std::max(llvm::Log2_32_Ceil(cls.threads()), 1u) + kb);
-      auto dw = IntegerType::get(context, dataWidth);
-      (void)vm;
+      // {write, entry, instance 0} (a read's tag its entry; foldsim_vmem
+      // TAGW), the row the instance.
+      auto iw = IntegerType::get(context, llvm::Log2_32_Ceil(cls.ring->entries) + 2);
+      auto aw = IntegerType::get(context, std::max(llvm::Log2_32_Ceil(cls.threads()), 1u));
+      auto dw = IntegerType::get(context, vm.dataWidth);
       simVirtuals.push_back({unsigned(c), unsigned(k), unsigned(numIn)});
       simVirtuals.back().image = true;
       addPort(name + "rsp_valid", i1, true);
@@ -18127,7 +18088,6 @@ LogicalResult StaticFolder::buildSim() {
       addPort(name + "wr_data", dw, false);
       addPort(name + "wr_mask", i1, false);
     }
-  }
   // Each HBM link stream's: its rows a single address (instances 1), the
   // request's tag a landing slot.
   for (auto [k, st] : llvm::enumerate(linkStreams)) {
@@ -19129,17 +19089,9 @@ LogicalResult StaticFolder::buildSim() {
                          : constant(1, 0);
     rb.pentry0 = chain3(tableCare(b, at, plan.prefEntry, prefRows, eb), prefix + "_pentry");
     Value irspValid = body->getArgument(image.firstInput);
-    Value irspTag = body->getArgument(image.firstInput + 1);
-    Value irspEntry = b.createOrFold<comb::ExtractOp>(b.getIntegerType(eb), irspTag, 1);
-    // (A shared image: the answers of this ring's reads, by the tag's ring.)
-    if (unsigned kb = memberBits(imageOf.at({c, k})))
-      irspValid = comb::AndOp::create(
-          b, irspValid,
-          comb::ICmpOp::create(b, comb::ICmpPredicate::eq,
-                               b.createOrFold<comb::ExtractOp>(b.getIntegerType(kb), irspTag, 1 + eb),
-                               constant(kb, ringIndex.at({c, k}))));
-    Value irspData = b.createOrFold<comb::ExtractOp>(
-        b.getIntegerType(vm.dataWidth), body->getArgument(image.firstInput + 2), 0);
+    Value irspEntry = b.createOrFold<comb::ExtractOp>(
+        b.getIntegerType(eb), body->getArgument(image.firstInput + 1), 1);
+    Value irspData = body->getArgument(image.firstInput + 2);
     auto ring = seq::FirMemOp::create(
         b, seq::FirMemType::get(context, plan.entries, vm.dataWidth, 1),
         /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old, seq::WUW::Undefined,
@@ -22110,16 +22062,6 @@ LogicalResult StaticFolder::buildSim() {
       return r;
     };
     SmallVector<Value> terms;
-    // A ring image's room and grants (vmem-rings), by image.
-    struct ImageShare {
-      bool built = false;
-      Backedge sentNext, anyWrite;
-      Value enough, enough2;
-      std::string prefix;
-      SmallVector<Value> readCands, writeCands, reads, writes;
-      SmallVector<Backedge> readGrants, writeGrants;
-    };
-    std::map<unsigned, ImageShare> imageShare;
     for (auto [c, cls] : llvm::enumerate(classes)) {
       if (cls.virtualMemories.empty())
         continue;
@@ -22274,32 +22216,22 @@ LogicalResult StaticFolder::buildSim() {
             // the `free` seen yet. The answers' writes first (a queue of
             // kRingReads, as many as the reads in flight), then a prefetch.
             unsigned fw = kVirtualFreeWidth;
-            unsigned vk = unsigned(&vm - cls.virtualMemories.data());
-            // (The image's room, shared by the class's rings when they share
-            // it: a read and a write a host cycle at most, granted in turn.)
-            auto &share = imageShare[imageOf.at({unsigned(c), vk})];
-            if (!share.built) {
-              share.built = true;
-              Value freeImg = body->getArgument(simVirtuals[imageOf.at({unsigned(c), vk})].firstInput + 3);
-              share.sentNext = backedges.get(b.getIntegerType(2));
-              SmallVector<Value> lag{resetReg(share.sentNext, fp + "_sent1", 0)};
-              for (unsigned l = 2; l <= kRingFreeLag; ++l)
-                lag.push_back(resetReg(lag.back(), fp + "_sent" + Twine(l), 0));
-              Value recent = constant(fw, 0);
-              for (Value x : lag)
-                recent = comb::AddOp::create(b, recent, b.createOrFold<comb::ConcatOp>(constant(fw - 2, 0), x));
-              Value used = comb::ShlOp::create(b, recent, constant(fw, 1));
-              Value credit = comb::SubOp::create(b, freeImg, used);
-              share.enough = comb::AndOp::create(
-                  b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used),
-                  comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit, constant(fw, 2)));
-              share.enough2 = comb::AndOp::create(
-                  b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used),
-                  comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit, constant(fw, 4)));
-              share.anyWrite = backedges.get(i1);
-              share.prefix = fp;
-            }
-            Value enough = share.enough;
+            Value freeImg = body->getArgument(simVirtuals[imageOf.at({unsigned(c), unsigned(&vm - cls.virtualMemories.data())})].firstInput + 3);
+            auto sentNext = backedges.get(b.getIntegerType(2));
+            SmallVector<Value> lag{resetReg(sentNext, fp + "_sent1", 0)};
+            for (unsigned l = 2; l <= kRingFreeLag; ++l)
+              lag.push_back(resetReg(lag.back(), fp + "_sent" + Twine(l), 0));
+            Value recent = constant(fw, 0);
+            for (Value x : lag)
+              recent = comb::AddOp::create(b, recent, b.createOrFold<comb::ConcatOp>(constant(fw - 2, 0), x));
+            Value used = comb::ShlOp::create(b, recent, constant(fw, 1));
+            Value credit = comb::SubOp::create(b, freeImg, used);
+            Value enough = comb::AndOp::create(
+                b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used),
+                comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit, constant(fw, 2)));
+            Value enough2 = comb::AndOp::create(
+                b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used),
+                comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit, constant(fw, 4)));
             // The answers' writes: {instance, data}, queued a host cycle after
             // the answer (rb.wv).
             unsigned dw = vm.dataWidth, wb = llvm::Log2_32_Ceil(kRingReads);
@@ -22318,27 +22250,18 @@ LogicalResult StaticFolder::buildSim() {
                                        b.createOrFold<comb::ConcatOp>(rb.winst, rb.wdata), Value{});
             Value wtop = seq::FirMemReadOp::create(b, wq, whead, hostClock, constant(1, 1));
             Value wany = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, wcount, constant(wb + 1, 0));
-            Value wcand = comb::AndOp::create(b, wany, enough);
-            auto wgrant = backedges.get(i1);
-            Value wgo = comb::AndOp::create(b, wcand, wgrant);
-            share.writeCands.push_back(wcand);
-            share.writeGrants.push_back(wgrant);
-            share.writes.push_back(wgo);
+            Value wgo = comb::AndOp::create(b, wany, enough);
             wissNext.setValue(wgo);
             Value wtopInst = b.createOrFold<comb::ExtractOp>(b.getIntegerType(iw), wtop, dw);
             wissInstNext.setValue(wtopInst);
             rb.wissValid = wgo;
             rb.wissInst = wtopInst;
             rb.wissData = b.createOrFold<comb::ExtractOp>(b.getIntegerType(dw), wtop, 0);
-            Value rcand = comb::AndOp::create(
-                b, ValueRange{any, notOf(busy),
-                              comb::MuxOp::create(b, share.anyWrite, share.enough2, enough)},
-                false);
-            auto rgrant = backedges.get(i1);
-            rb.issValid = comb::AndOp::create(b, rcand, rgrant);
-            share.readCands.push_back(rcand);
-            share.readGrants.push_back(rgrant);
-            share.reads.push_back(rb.issValid);
+            rb.issValid = comb::AndOp::create(
+                b, ValueRange{any, notOf(busy), comb::MuxOp::create(b, wgo, enough2, enough)}, false);
+            sentNext.setValue(comb::AddOp::create(
+                b, b.createOrFold<comb::ConcatOp>(constant(1, 0), wgo),
+                b.createOrFold<comb::ConcatOp>(constant(1, 0), rb.issValid)));
             auto wstep = [&](Value v, Value on) -> Value {
               return comb::AddOp::create(
                   b, v, b.createOrFold<comb::ConcatOp>(constant(hw::getBitWidth(v.getType()) - 1, 0), on));
@@ -22390,52 +22313,6 @@ LogicalResult StaticFolder::buildSim() {
         }
         terms.push_back(comb::OrOp::create(b, notOf(used), notOf(bit)));
       }
-    }
-    // Each image's grants: a read and a write a host cycle, to the first
-    // ring asking at or after a pointer that turns every host cycle (each
-    // ring's turn comes within as many host cycles as rings).
-    for (auto &[img, share] : imageShare) {
-      if (!share.built)
-        continue;
-      auto pick = [&](ArrayRef<Value> cands, const Twine &n) -> SmallVector<Value> {
-        unsigned r = cands.size();
-        if (r == 1)
-          return {constant(1, 1)};
-        unsigned pb = llvm::Log2_32_Ceil(r);
-        auto ptrNext = backedges.get(b.getIntegerType(pb));
-        Value ptr = resetReg(ptrNext, share.prefix + n + "_turn", 0);
-        ptrNext.setValue(comb::MuxOp::create(
-            b, eq(ptr, r - 1), constant(pb, 0), comb::AddOp::create(b, ptr, constant(pb, 1))));
-        SmallVector<Value> hi;
-        for (unsigned j = 0; j < r; ++j)
-          hi.push_back(comb::AndOp::create(
-              b, cands[j], comb::ICmpOp::create(b, comb::ICmpPredicate::ule, ptr, constant(pb, j))));
-        Value anyHi = comb::OrOp::create(b, hi, false);
-        SmallVector<Value> sel, grants;
-        for (unsigned j = 0; j < r; ++j)
-          sel.push_back(comb::MuxOp::create(b, anyHi, hi[j], cands[j]));
-        for (unsigned j = 0; j < r; ++j) {
-          if (!j) {
-            grants.push_back(sel[0]);
-            continue;
-          }
-          SmallVector<Value> before(sel.begin(), sel.begin() + j);
-          grants.push_back(comb::AndOp::create(
-              b, sel[j], notOf(comb::OrOp::create(b, before, false))));
-        }
-        return grants;
-      };
-      auto rg = pick(share.readCands, "_rd"), wg = pick(share.writeCands, "_wr");
-      for (unsigned j = 0; j < rg.size(); ++j)
-        share.readGrants[j].setValue(rg[j]);
-      for (unsigned j = 0; j < wg.size(); ++j)
-        share.writeGrants[j].setValue(wg[j]);
-      Value anyRead = comb::OrOp::create(b, share.reads, false);
-      Value anyWrite = comb::OrOp::create(b, share.writes, false);
-      share.anyWrite.setValue(anyWrite);
-      share.sentNext.setValue(comb::AddOp::create(
-          b, b.createOrFold<comb::ConcatOp>(constant(1, 0), anyWrite),
-          b.createOrFold<comb::ConcatOp>(constant(1, 0), anyRead)));
     }
     for (auto &v : simVirtuals) {
       // `vmem-rings`: an image's requests (its queued prefetches and its
@@ -22639,46 +22516,15 @@ LogicalResult StaticFolder::buildSim() {
     }
     if (v.image) {
       // `vmem-rings`: the prefetches' reads (row 0 of each instance) and the
-      // answers' writes; a shared image's of every ring of the class, one of
-      // each granted a host cycle, the ring in the tag and the row.
-      auto &cls = classes[v.cls];
-      unsigned eb = llvm::Log2_32_Ceil(cls.ring->entries);
-      unsigned img = unsigned(&v - simVirtuals.data());
-      unsigned kb = memberBits(img);
-      SmallVector<unsigned> rings(imageMembers[img].begin(), imageMembers[img].end());
-      unsigned dw = 0;
-      for (unsigned r : rings)
-        dw = std::max(dw, cls.virtualMemories[r].dataWidth);
-      auto withRing = [&](Value low, unsigned j) -> Value {
-        return kb ? b.createOrFold<comb::ConcatOp>(constant(kb, j), low) : low;
-      };
-      auto zext = [&](Value x, unsigned w) -> Value {
-        unsigned xw = hw::getBitWidth(x.getType());
-        return xw == w ? x : b.createOrFold<comb::ConcatOp>(constant(w - xw, 0), x);
-      };
-      SmallVector<Value> rdV, rdTag, rdRow, wrV, wrTag, wrRow, wrData;
-      for (auto [j, r] : llvm::enumerate(rings)) {
-        auto &rb = ringBuilt.at({v.cls, r});
-        auto when = [&](Value on, Value x) -> Value {
-          return comb::MuxOp::create(b, on, x, constant(hw::getBitWidth(x.getType()), 0));
-        };
-        rdV.push_back(rb.issValid);
-        rdTag.push_back(when(rb.issValid,
-                             b.createOrFold<comb::ConcatOp>(ValueRange{
-                                 constant(1, 0), withRing(rb.issEntry, j), constant(1, 0)})));
-        rdRow.push_back(when(rb.issValid, withRing(rb.issInst, j)));
-        wrV.push_back(rb.wissValid);
-        wrTag.push_back(when(rb.wissValid,
-                             b.createOrFold<comb::ConcatOp>(ValueRange{
-                                 constant(1, 1), withRing(constant(eb, 0), j), constant(1, 0)})));
-        wrRow.push_back(when(rb.wissValid, withRing(rb.wissInst, j)));
-        wrData.push_back(when(rb.wissValid, zext(rb.wissData, dw)));
-      }
-      auto any = [&](SmallVector<Value> &xs) -> Value {
-        return xs.size() == 1 ? xs[0] : Value(comb::OrOp::create(b, xs, false));
-      };
-      results.append({any(rdV), any(rdTag), any(rdRow), any(wrV), any(wrTag), any(wrRow),
-                      any(wrData), constant(1, 1)});
+      // answers' writes.
+      auto &rb = ringBuilt.at({v.cls, v.k});
+      unsigned eb = llvm::Log2_32_Ceil(classes[v.cls].ring->entries);
+      results.append(
+          {rb.issValid,
+           b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 0), rb.issEntry, constant(1, 0)}),
+           rb.issInst, rb.wissValid,
+           b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 1), constant(eb, 0), constant(1, 0)}),
+           rb.wissInst, rb.wissData, constant(1, 1)});
       continue;
     }
     auto &vm = classes[v.cls].virtualMemories[v.k];
@@ -22719,18 +22565,13 @@ LogicalResult StaticFolder::buildSim() {
       auto &cls = classes[v.cls];
       auto &vm = cls.virtualMemories[v.k];
       if (v.image) {
-        // A ring's image (or a class's rings' shared one: a row per ring and
-        // instance). {write, ring, entry} tags over instance 0.
-        unsigned img = unsigned(&v - simVirtuals.data());
-        unsigned kb = memberBits(img);
-        unsigned tags = llvm::Log2_32_Ceil(cls.ring->entries) + 1 + kb;
-        unsigned dw = 0;
-        for (unsigned r : imageMembers[img])
-          dw = std::max(dw, cls.virtualMemories[r].dataWidth);
+        // A ring's image: a row per instance (instances x 1 row).
+        // {write, entry} tags over instance 0, a row per instance.
+        unsigned tags = llvm::Log2_32_Ceil(cls.ring->entries) + 1;
         virtuals.push_back(b.getStringAttr(
             vm.name + "_img:" + cls.name + ":" + Twine(tags + 1) + ":" +
-            Twine(std::max(llvm::Log2_32_Ceil(cls.threads()), 1u) + kb) + ":" +
-            Twine(dw) + ":1:1:1:" + Twine(tags)));
+            Twine(std::max(llvm::Log2_32_Ceil(cls.threads()), 1u)) + ":" +
+            Twine(vm.dataWidth) + ":1:1:1:" + Twine(tags)));
         continue;
       }
       unsigned instWidth =
@@ -23397,7 +23238,6 @@ void FoldStaticPass::runOnOperation() {
   folder.vmemAutoInstanceBits = vmemAutoInstanceBits;
   folder.vmemRingLead = vmemRings;
   folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));
-  folder.vmemRingImageEach = vmemRingImageEach;
   folder.foldStoreRam = foldStoreRam;
   folder.foldStoreStyle = foldStoreStyle;
   folder.foldStoreHbm = foldStoreHbm;
