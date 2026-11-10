@@ -15,6 +15,7 @@
 # RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/p2 --static --state-in-ram Leaf::2 --state-in-ram-pp --state-scratch-bits 0 Leaf > %t/p2.log 2>&1
 # RUN: FileCheck %s --check-prefix=P2LOG < %t/p2.log
 # RUN: FileCheck %s --check-prefix=P2VH < %t/p2/foldsim_sim.vh
+# RUN: FileCheck %s --check-prefix=P2DW < %t/p2/foldsim_sim.vh
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/p2 -Mdir %t/p2/obj %S/Inputs/tb_pages.sv top.sv %t/p2/foldsim_sim.sv > %t/p2/build.log 2>&1
 # RUN: %t/p2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
 # RUN: %t/p2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
@@ -59,6 +60,8 @@
 # P2LOG: state-stream: II_sched [[II:[0-9]+]], HBM state bits a frame [[B:[0-9]+]] (busiest master [[B]]), II_bw {{[0-9]+}} (8 masters, 8192 b/hc usable): II [[II]]
 # P2LOG: state-stream: Leaf: {{[0-9]+}} columns in 1 virtual memories, a window of 2 slots x 2 rows
 # P2LOG: state-in-ram-pp: Leaf (rows in HBM, a window of 2 slots): built {{.*}} x 4 rows (block)
+# A chunk's controller is as wide as its columns (3 x 72 bits), not a power of two.
+# P2DW: `define FOLDSIM_VMEM_0_DW 216
 # P2VH: `define FOLDSIM_VMEM_COUNT 1
 # P2VH: `define FOLDSIM_VMEM_0_IW 3
 # P2VH: `define FOLDSIM_VMEM_0_INSTANCES 8

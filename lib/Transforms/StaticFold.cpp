@@ -214,6 +214,10 @@ struct Class {
   /// (`windowSlot`); and the register bits an instance keeps in rows
   /// (planStateInRam, for the scratch's placement).
   bool ppHbm = false;
+  /// A streamed PP class's chunks spread over the kernel's masters (one a
+  /// master while a chunk keeps a beat's columns): only where the frame's
+  /// HBM bandwidth needs it (chooseStreamWindows), each chunk a controller.
+  bool ppChunkSpread = false;
   uint64_t rowStateBits = 0;
   /// A paged class's register bits an instance pages (planScratch, for the
   /// HBM bits a frame of its pages streamed).
@@ -12891,19 +12895,25 @@ static constexpr unsigned kStreamLead = 64;
 static constexpr unsigned kStreamMasters = 8;
 
 /// A streamed PP class's chunks of `columns` 72-bit columns, each a virtual
-/// memory: at least ceil(columns / 56) (4,032 bits, a row of 8 beats), and
-/// one a master while a chunk keeps a beat's columns (7), so that its rows
-/// spread over the masters. Chunk k takes columns [lo, hi).
-static unsigned ppChunks(unsigned columns) {
+/// memory (a kernel controller): ceil(columns / 56) (4,032 bits, a row of 8
+/// beats), or with `spread` (the frame's HBM bandwidth needs the masters) one
+/// a master while a chunk keeps a beat's columns (7), so that its rows spread
+/// over the masters. A controller costs its data width and itself (Y's
+/// calibrated ctl_cost), so chunks are as few as the bandwidth allows. Chunk k
+/// takes columns [lo, hi).
+static unsigned ppChunks(unsigned columns, bool spread) {
   unsigned least = unsigned(llvm::divideCeil(columns, 56));
-  unsigned spread = std::min(kStreamMasters, unsigned(llvm::divideCeil(columns, 7)));
-  return std::max({1u, least, spread});
+  unsigned masters = spread ? std::min(kStreamMasters, unsigned(llvm::divideCeil(columns, 7))) : 1u;
+  return std::max({1u, least, masters});
 }
-static std::pair<unsigned, unsigned> ppChunk(unsigned columns, unsigned k) {
-  unsigned chunks = ppChunks(columns);
+static std::pair<unsigned, unsigned> ppChunk(unsigned columns, bool spread, unsigned k) {
+  unsigned chunks = ppChunks(columns, spread);
   return {k * columns / chunks, (k + 1) * columns / chunks};
 }
-static unsigned ppChunkBits(unsigned n) {
+/// A chunk's data width (its controller's): its columns' bits, whole bytes.
+static unsigned ppChunkBits(unsigned n) { return std::max(32u, n * 72); }
+/// The bytes a chunk's row moves in device memory: a power of two.
+static unsigned ppChunkMoveBits(unsigned n) {
   return std::max(32u, unsigned(llvm::PowerOf2Ceil(n * 72)));
 }
 
@@ -13608,6 +13618,12 @@ LogicalResult StaticFolder::chooseStreamWindows() {
   // numbers the controllers, approximately: other virtual memories share).
   SmallVector<uint64_t> masterBits(kStreamMasters, 0);
   unsigned nextMaster = 0;
+  // The chunks as few as can be (a controller each) and spread over the
+  // masters, priced side by side: spread only where the few would make the
+  // busiest master bound the frame.
+  SmallVector<uint64_t> spreadBits(kStreamMasters, 0);
+  unsigned nextSpread = 0;
+  uint64_t hbmSpread = 0;
   for (auto &cls : classes) {
     if (!cls.ppHbm)
       continue;
@@ -13717,12 +13733,18 @@ LogicalResult StaticFolder::chooseStreamWindows() {
       columns = unsigned(llvm::divideCeil(uint64_t(columns) * 112, 100));
     columns -= std::min(columns - 1, cls.ppResidentColumns);
     uint64_t bits = 0;
-    for (unsigned k = 0, e = ppChunks(columns); k < e; ++k) {
-      auto [lo, hi] = ppChunk(columns, k);
+    for (unsigned k = 0, e = ppChunks(columns, false); k < e; ++k) {
+      auto [lo, hi] = ppChunk(columns, false, k);
       // A row of the chunk moves its whole power-of-two bytes.
-      uint64_t chunk = 2 * uint64_t(n) * P * ppChunkBits(hi - lo);
+      uint64_t chunk = 2 * uint64_t(n) * P * ppChunkMoveBits(hi - lo);
       masterBits[nextMaster++ % kStreamMasters] += chunk;
       bits += chunk;
+    }
+    for (unsigned k = 0, e = ppChunks(columns, true); k < e; ++k) {
+      auto [lo, hi] = ppChunk(columns, true, k);
+      uint64_t chunk = 2 * uint64_t(n) * P * ppChunkMoveBits(hi - lo);
+      spreadBits[nextSpread++ % kStreamMasters] += chunk;
+      hbmSpread += chunk;
     }
     hbmBits += bits;
     llvm::errs() << "foldsim-fold-static: state-stream: " << cls.name << ": P "
@@ -13749,18 +13771,36 @@ LogicalResult StaticFolder::chooseStreamWindows() {
                                    1, llvm::divideCeil(fold.store.getType().getWidth(), 8)));
             uint64_t bits = (vmemRingLead ? 4 : 2) * uint64_t(cls.threads()) * row;
             masterBits[nextMaster++ % kStreamMasters] += bits;
+            spreadBits[nextSpread++ % kStreamMasters] += bits;
             foldBits += bits;
           }
   if (foldBits)
     llvm::errs() << "foldsim-fold-static: fold-store-stream: " << foldBits
                  << " HBM bits a frame (in the state stream's II_bw)\n";
   hbmBits += foldBits;
+  hbmSpread += foldBits;
   if (hbmBits) {
     // The busiest master bounds it too (a master's share of the usable).
     uint64_t perMaster = kStreamBitsPerCycle / kStreamMasters;
+    auto bwOf = [&](uint64_t total, ArrayRef<uint64_t> masters) {
+      return std::max(llvm::divideCeil(total, kStreamBitsPerCycle),
+                      llvm::divideCeil(*llvm::max_element(masters), perMaster));
+    };
+    // The chunks spread over the masters only where the few would bound
+    // the frame and spreading lowers that bound.
+    bool spread = bwOf(hbmBits, masterBits) > ii &&
+                  bwOf(hbmSpread, spreadBits) < bwOf(hbmBits, masterBits);
+    for (auto &cls : classes)
+      if (cls.ppHbm)
+        cls.ppChunkSpread = spread;
+    if (spread) {
+      masterBits = spreadBits;
+      hbmBits = hbmSpread;
+    }
     uint64_t busiest = *llvm::max_element(masterBits);
-    uint64_t bw = std::max(llvm::divideCeil(hbmBits, kStreamBitsPerCycle),
-                           llvm::divideCeil(busiest, perMaster));
+    uint64_t bw = bwOf(hbmBits, masterBits);
+    if (spread)
+      llvm::errs() << "foldsim-fold-static: state-stream: chunks spread over the masters\n";
     llvm::errs() << "foldsim-fold-static: state-stream: II_sched " << ii
                  << ", HBM state bits a frame " << hbmBits
                  << " (busiest master " << busiest << "), II_bw " << bw << " ("
@@ -13934,11 +13974,11 @@ LogicalResult StaticFolder::buildPPStream(
   Value all = hw::ConstantOp::create(b, APInt::getAllOnes(slotsPow));
 
   // A chunk of at most 56 columns (4,032 bits): a virtual memory each.
-  unsigned chunks = ppChunks(columns.size());
+  unsigned chunks = ppChunks(columns.size(), cls.ppChunkSpread);
   unsigned cw = llvm::Log2_32_Ceil(P + 1);
   Value one = constant(1, 1);
   for (unsigned k = 0; k < chunks; ++k) {
-    auto [lo, hi] = ppChunk(columns.size(), k);
+    auto [lo, hi] = ppChunk(columns.size(), cls.ppChunkSpread, k);
     unsigned n = hi - lo;
     unsigned width = n * 72;
     unsigned dw = ppChunkBits(n);
