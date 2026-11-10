@@ -17271,7 +17271,7 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     // request and use rows of a reader are such tables.
     foldsim::SequenceFactor fac;
     if (!gFactoring && gPassII && rows.size() == gPassII + 1 &&
-        foldsim::factorThroughSequence(rows, width, gPassII, gPassSeqs, fac)) {
+        foldsim::factorThroughSequence(rows, width, gPassII, gPassSeqs, fac, care)) {
       gFactoring = true;
       auto &seq = gPassSeqs[fac.seq];
       unsigned ii = gPassII;
@@ -17925,6 +17925,23 @@ LogicalResult StaticFolder::buildSim() {
       add(cls.slot[kState]);
       for (unsigned l = 0; l < cls.readyLevels; ++l)
         add(cls.readySlots(l));
+      // A PP class's passes, each instance's P of them (its rows' reads and
+      // their prefetches, a lead before, are at them).
+      if (cls.pp > 1) {
+        foldsim::PassSequence seq;
+        seq.instAt.assign(ii, -1);
+        seq.instances = cls.threads();
+        bool clash = false;
+        for (unsigned i = 0; i < cls.threads(); ++i)
+          for (unsigned j = 0; j < cls.pp; ++j) {
+            int r = cls.slot[kState][i] - int(cls.stages) + int(j);
+            unsigned q = unsigned(((r % int(ii)) + int(ii)) % int(ii));
+            clash |= seq.instAt[q] >= 0;
+            seq.instAt[q] = int(i);
+          }
+        if (!clash)
+          gPassSeqs.push_back(std::move(seq));
+      }
     }
   auto *context = top.getContext();
   auto i1 = IntegerType::get(context, 1);
@@ -18430,9 +18447,50 @@ LogicalResult StaticFolder::buildSim() {
       SmallVector<uint8_t> reads(readRow.size());
       for (auto [k, r] : llvm::enumerate(readRow))
         reads[k] = r != 0;
-      ctl.offChip3 = {table(b, at, readRow, 1), tableCare(b, at, instRow, reads, idxWidth),
-                      tableCare(b, at, rowRow, reads, rowBits), constant(1, 0),
-                      constant(rowBits, 0)};
+      Value read3 = table(b, at, readRow, 1);
+      Value row3 = tableCare(b, at, rowRow, reads, rowBits);
+      // The read's instance: its prefetch a fixed lead before its state
+      // pass, the instance of the state pass that lead ahead of the read's
+      // first row (the class's state passes' instance pattern, shifted by
+      // the lead: one row an instance), held over the instance's next P - 1
+      // reads (at the positions after it). Not a table of the reads, whose holes and
+      // displacements cut its runs as the instances grow; else that table.
+      SmallVector<int> pf;
+      ppPrefetches(cls, cls.pageWindow, pf);
+      int lead = 0;
+      bool fixedLead = threads > 1 && !getenv("FOLDSIM_NO_AHEAD"), firstSeen = false;
+      for (unsigned i = 0; i < threads && fixedLead; ++i) {
+        if (!cls.ppStreamed[i])
+          continue;
+        int d = cls.slot[kState][i] - pf[i];
+        if (firstSeen)
+          fixedLead = d == lead;
+        lead = d;
+        firstSeen = true;
+      }
+      Value inst3;
+      if (fixedLead && firstSeen && lead >= 0) {
+        // (The table of the position whose instance's state pass is the
+        // lead after it: the position's own counters decode it.)
+        SmallVector<uint64_t> aheadRow(ii + 1, 0);
+        SmallVector<uint8_t> aheadCare(ii + 1, 0);
+        for (unsigned i = 0; i < threads; ++i) {
+          if (!cls.ppStreamed[i])
+            continue;
+          unsigned q = wrap(cls.slot[kState][i] - lead);
+          aheadRow[q] = i;
+          aheadCare[q] = 1;
+        }
+        Value first = tableCare(b, at, aheadRow, aheadCare, idxWidth);
+        Value row0 = comb::ICmpOp::create(b, comb::ICmpPredicate::eq, row3, constant(rowBits, 0));
+        auto heldNext = backedges.get(b.getIntegerType(idxWidth));
+        Value held = reg(heldNext, prefix + "_pps_inst_held");
+        heldNext.setValue(comb::MuxOp::create(b, comb::AndOp::create(b, read3, row0), first, held));
+        inst3 = comb::MuxOp::create(b, row0, first, held);
+      } else {
+        inst3 = tableCare(b, at, instRow, reads, idxWidth);
+      }
+      ctl.offChip3 = {read3, inst3, row3, constant(1, 0), constant(rowBits, 0)};
     }
     for (auto [l, row] : llvm::enumerate(laterRows)) {
       Value later3 = table(b, at, row, 1);

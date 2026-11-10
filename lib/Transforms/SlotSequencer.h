@@ -85,7 +85,7 @@ struct SequenceFactor {
 };
 bool factorThroughSequence(llvm::ArrayRef<uint64_t> rows, unsigned width,
                            unsigned ii, llvm::ArrayRef<PassSequence> seqs,
-                           SequenceFactor &out);
+                           SequenceFactor &out, llvm::ArrayRef<uint8_t> care = {});
 
 /// Counts over a pass's run: tables decoded and left as constants, and their
 /// bits as constant arrays (2^index width x width).
