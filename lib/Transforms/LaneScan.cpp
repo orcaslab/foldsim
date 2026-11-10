@@ -277,6 +277,12 @@ static int64_t widthOf(Value v) {
   return 0;
 }
 
+/// The bits of any value wiring passes on (integers, arrays, structs).
+static int64_t bitWidthOf(Value v) {
+  int64_t w = hw::getBitWidth(v.getType());
+  return w > 0 ? w : 0;
+}
+
 static bool isConstant(Value v, APInt &value) {
   if (auto c = v.getDefiningOp<hw::ConstantOp>()) {
     value = c.getValue();
@@ -405,7 +411,7 @@ static bool freeValue(Value v, Value &free, DenseSet<Value> &seen,
 }
 
 bool Scan::bitsOf(Value v, std::vector<BitSrc> &out) {
-  int64_t w = widthOf(v);
+  int64_t w = bitWidthOf(v);
   if (w <= 0 || w > 16384)
     return false;
   out.clear();
@@ -512,7 +518,7 @@ SmallVector<Piece> Scan::pieces(ArrayRef<BitSrc> bs) {
 }
 
 Info Scan::assemble(Operation *op, Value res) {
-  int64_t w = widthOf(res);
+  int64_t w = bitWidthOf(res);
   if (w <= 0 || w > 16384)
     return Info::multi();
   std::vector<BitSrc> out;
@@ -523,9 +529,34 @@ Info Scan::assemble(Operation *op, Value res) {
       return Info::multi();
   }
   BitSrc zero{BitSrc::Zero}, one{BitSrc::One};
-  if (isa<comb::ConcatOp>(op)) {
+  if (isa<comb::ConcatOp, hw::ArrayCreateOp, hw::StructCreateOp>(op)) {
     for (auto &v : llvm::reverse(in))
       out.insert(out.end(), v.begin(), v.end());
+  } else if (isa<hw::BitcastOp>(op)) {
+    out = in[0];
+  } else if (auto g = dyn_cast<hw::ArrayGetOp>(op)) {
+    APInt k;
+    if (!isConstant(g.getIndex(), k))
+      return Info::multi();
+    uint64_t at = k.getZExtValue() * w;
+    if (at + w > in[0].size())
+      return Info::multi();
+    out.assign(in[0].begin() + at, in[0].begin() + at + w);
+  } else if (auto se = dyn_cast<hw::StructExtractOp>(op)) {
+    auto st = cast<hw::StructType>(se.getInput().getType());
+    int64_t at = 0;
+    bool after = false;
+    auto fields = st.getElements();
+    for (int i = int(fields.size()) - 1; i >= 0; --i) {
+      if (fields[i].name == se.getFieldNameAttr()) {
+        after = true;
+        break;
+      }
+      at += hw::getBitWidth(fields[i].type);
+    }
+    if (!after || at + w > int64_t(in[0].size()))
+      return Info::multi();
+    out.assign(in[0].begin() + at, in[0].begin() + at + w);
   } else if (auto ex = dyn_cast<comb::ExtractOp>(op)) {
     out.assign(in[0].begin() + ex.getLowBit(),
                in[0].begin() + ex.getLowBit() + w);
@@ -606,8 +637,27 @@ Info Scan::assemble(Operation *op, Value res) {
     bits[res] = std::move(out);
     return Info::multi();
   }
-  if (scalarOnly)
-    return Info::multi(); // constants: the canonicalizer's, not ours
+  if (scalarOnly) {
+    // Every bit a constant (an index array's leaf picked out of a packed
+    // array, say): the constant itself.
+    if (isa<IntegerType>(res.getType()) &&
+        llvm::all_of(out, [](const BitSrc &b) {
+          return b.k == BitSrc::Zero || b.k == BitSrc::One;
+        })) {
+      APInt c(w, 0);
+      for (int64_t b = 0; b < w; ++b)
+        if (out[b].k == BitSrc::One)
+          c.setBit(b);
+      OpBuilder cb(op);
+      res.replaceAllUsesWith(hw::ConstantOp::create(cb, op->getLoc(), c));
+      return Info::scalar();
+    }
+    return Info::multi(); // a parent value: the canonicalizer's, not ours
+  }
+  if (lane >= 0 && !isa<IntegerType>(res.getType())) {
+    bits[res] = std::move(out);
+    return Info::multi(); // an aggregate of one lane's bits: kept as bits
+  }
   if (lane >= 0) {
     assembled[res] = pieces(out);
     bits[res] = std::move(out); // its constant bits stay known
@@ -651,7 +701,8 @@ Info Scan::transfer(Operation *op, unsigned result) {
   Value res = op->getResult(result);
   bool wiring = isa<comb::ConcatOp, comb::ExtractOp, comb::AndOp, comb::OrOp,
                     comb::XorOp, comb::ReplicateOp, comb::ShlOp, comb::ShrUOp,
-                    comb::MuxOp>(op);
+                    comb::MuxOp, hw::BitcastOp, hw::ArrayGetOp,
+                    hw::StructExtractOp, hw::StructCreateOp>(op);
   if (r.kind == Kind::Multi && wiring)
     return assemble(op, res);
   // Two neighbors' pieces put side by side (an OR of disjoint shifted
@@ -780,6 +831,13 @@ Info Scan::transferBase(Operation *op, unsigned result) {
   }
   if (auto aget = dyn_cast<hw::ArrayGetOp>(op)) {
     auto &a = get(aget.getInput());
+    // An element of one lane's array (a bundle of ports): that lane's.
+    if ((a.kind == Kind::Elem || a.kind == Kind::Pfx) &&
+        get(aget.getIndex()).kind == Kind::Scalar)
+      return a.kind == Kind::Elem ? a : Info::multi();
+    if (a.kind == Kind::Elem && get(aget.getIndex()).kind == Kind::Elem &&
+        get(aget.getIndex()).lane == a.lane)
+      return a;
     APInt idx;
     if (a.kind == Kind::Arr && isConstant(aget.getIndex(), idx) &&
         idx.getZExtValue() < a.arr.size())
@@ -986,7 +1044,44 @@ static void describe(Scan &s, Value v, raw_ostream &os, int at = -1) {
       os << "A" << ac.getInput().getAsOpaquePointer() << v.getType();
       return;
     }
-  os << "S" << v.getAsOpaquePointer();
+  // A parent value each lane computes alike from its own sources (another
+  // class's instance's port, a constant index): by its form, so the lanes'
+  // ops pack; the cell then takes each lane's value as a per-lane input.
+  std::function<void(Value, int)> form = [&](Value x, int depth) {
+    if (x.getDefiningOp<hw::ConstantOp>()) {
+      os << "C" << x.getType();
+      return;
+    }
+    auto *d = x.getDefiningOp();
+    if (!d) {
+      os << "S" << x.getAsOpaquePointer();
+      return;
+    }
+    if (auto inst = dyn_cast<hw::InstanceOp>(d)) {
+      os << "I" << inst.getModuleName() << ":"
+         << cast<OpResult>(x).getResultNumber();
+      return;
+    }
+    if (depth >= 4 || d->getNumRegions() ||
+        !(isa<comb::CombDialect>(d->getDialect()) ||
+          isa<hw::BitcastOp, hw::ArrayGetOp, hw::StructExtractOp,
+              hw::ArrayCreateOp>(d))) {
+      os << "S" << x.getAsOpaquePointer();
+      return;
+    }
+    os << nameOf(d) << ":" << x.getType() << "(";
+    for (Value o : d->getOperands()) {
+      if (s.get(o).kind != Kind::Scalar) {
+        os << "M" << o.getAsOpaquePointer();
+      } else {
+        form(o, depth + 1);
+      }
+      os << ",";
+    }
+    os << ")";
+  };
+  os << "F";
+  form(v, 0);
 }
 
 static bool skipAttr(StringRef name) {
@@ -1842,9 +1937,51 @@ void LaneScanPass::runOnOperation() {
   for (auto &l : lanes)
     wanted.insert(l);
   auto *ctx = &getContext();
+  // Each group twice: in instance order, then reversed (a chain whose lane j
+  // reads lane j + 1 is a prefix chain of the reversed lanes), the second a
+  // cell of its own over what the first left.
+  // The order that leaves less in the parent goes first: both are probed
+  // (built and dropped), then run.
+  struct Work {
+    StringRef callee;
+    SmallVector<hw::InstanceOp> insts;
+    bool rev, probe;
+  };
+  std::vector<Work> work;
+  std::map<std::pair<StringRef, bool>, unsigned> probeScore;
   for (auto &[callee, insts] : groups) {
     if (insts.size() < minLanes || (!wanted.empty() && !wanted.count(callee)))
       continue;
+    SmallVector<hw::InstanceOp> r(insts.rbegin(), insts.rend());
+    work.push_back({callee, insts, false, true});
+    work.push_back({callee, r, true, true});
+  }
+  for (size_t wi = 0; wi <= work.size(); ++wi) {
+    // After a group's two probes: its two runs, the better order first.
+    if (wi > 0 && work[wi - 1].probe && work[wi - 1].rev) {
+      auto &pw = work[wi - 1];
+      unsigned fwd = probeScore.count({pw.callee, false})
+                         ? probeScore[{pw.callee, false}]
+                         : UINT_MAX;
+      unsigned bwd = probeScore.count({pw.callee, true})
+                         ? probeScore[{pw.callee, true}]
+                         : UINT_MAX;
+      SmallVector<hw::InstanceOp> fi(pw.insts.rbegin(), pw.insts.rend());
+      Work a{pw.callee, fi, false, false}, bw{pw.callee, pw.insts, true, false};
+      bool revFirst = bwd < fwd;
+      if (const char *f = getenv("FOLDSIM_LANE_FORCE"))
+        revFirst = StringRef(f) == "rev";
+      if (getenv("FOLDSIM_LANE_PROBE"))
+        llvm::errs() << "lane-probe " << pw.callee << " fwd " << int(fwd)
+                     << " rev " << int(bwd) << "\n";
+      work.insert(work.begin() + wi, {revFirst ? bw : a, revFirst ? a : bw});
+    }
+    if (wi == work.size())
+      break;
+    auto &w = work[wi];
+    StringRef callee = w.callee;
+    auto &insts = w.insts;
+    std::string tag = (callee + (w.rev ? "_r" : "")).str();
     Scan s;
     s.parent = parent;
     s.callee = callee;
@@ -2102,7 +2239,7 @@ void LaneScanPass::runOnOperation() {
 
     // ------------------------------------------------------------------
     // The cell module.
-    std::string cellName = (module + "_lane_" + callee).str();
+    std::string cellName = module + "_lane_" + tag;
     SmallVector<hw::PortInfo> ports;
     unsigned numIn = 0, numOut = 0;
     auto addPort = [&](const Twine &name, Type type, bool input) {
@@ -2372,6 +2509,13 @@ void LaneScanPass::runOnOperation() {
         pending.erase(pit);
       }
     };
+    // An aggregate's bits as an integer.
+    auto asInt = [&](Value x) -> Value {
+      if (isa<IntegerType>(x.getType()))
+        return x;
+      return hw::BitcastOp::create(
+          b, b.getIntegerType(hw::getBitWidth(x.getType())), x);
+    };
     // A value of lane 0 made of bits: its pieces, from the low bits up.
     auto fromPieces = [&](ArrayRef<Piece> ps) -> Value {
       SmallVector<Value> parts; // low first
@@ -2385,7 +2529,7 @@ void LaneScanPass::runOnOperation() {
           part = hw::ConstantOp::create(b, APInt::getAllOnes(pc.len));
           break;
         case BitSrc::Scalar: {
-          Value x = bcast(pc.src);
+          Value x = asInt(bcast(pc.src));
           part = widthOf(x) == pc.len
                      ? x
                      : comb::ExtractOp::create(b, x, pc.bit, pc.len).getResult();
@@ -2395,7 +2539,7 @@ void LaneScanPass::runOnOperation() {
           part = hw::ConstantOp::create(b, APInt(pc.len, 0));
           break;
         case BitSrc::Lane: {
-          Value x = cellValue(pc.src);
+          Value x = asInt(cellValue(pc.src));
           part = widthOf(x) == pc.len
                      ? x
                      : comb::ExtractOp::create(b, x, pc.bit, pc.len).getResult();
@@ -2976,13 +3120,6 @@ void LaneScanPass::runOnOperation() {
     for (Value v : exportVecs)
       outs.push_back({"vec" + std::to_string(outs.size()), cellValue(v), {v}});
 
-    if (dryRun) {
-      backedges.abandon();
-      cell.erase();
-      llvm::errs() << "lane-scan: " << module << " lanes " << callee << " x"
-                   << F << " (dry run)\n";
-      continue;
-    }
     if (!pending.empty()) {
       parent.emitError("lane-scan: a cell value was never defined");
       return signalPassFailure();
@@ -3037,17 +3174,27 @@ void LaneScanPass::runOnOperation() {
       if (in.chain < 0 && in.values.size() == F &&
           !StringRef(in.name).starts_with("in_")) {
         ++params;
-        paramBits += in.type.getIntOrFloatBitWidth();
+        paramBits += hw::getBitWidth(in.type);
       }
     unsigned exportBits = 0, exports = 0;
     for (auto &o : outs)
       if (o.chain < 0) {
         ++exports;
-        exportBits += widthOf(o.cell);
+        exportBits += hw::getBitWidth(o.cell.getType());
       }
     unsigned chainBits = 0;
     for (auto &c : chains)
-      chainBits += c.type.getIntOrFloatBitWidth();
+      chainBits += hw::getBitWidth(c.type);
+    if (dryRun || w.probe) {
+      backedges.abandon();
+      cell.erase();
+      if (w.probe)
+        probeScore[{callee, w.rev}] = residualOps;
+      else
+        llvm::errs() << "lane-scan: " << module << " lanes " << tag << " x"
+                     << F << " (dry run)\n";
+      continue;
+    }
     // The cell's ports and terminator.
     for (auto &in : ins)
       addPort(in.name, in.type, true);
@@ -3093,7 +3240,7 @@ void LaneScanPass::runOnOperation() {
       }
       cells[j] = hw::InstanceOp::create(
           pb, parent.getLoc(), cell,
-          StringAttr::get(ctx, "lane_" + callee + "_" + std::to_string(j)),
+          StringAttr::get(ctx, "lane_" + tag + "_" + std::to_string(j)),
           operands);
     }
     // Roots replaced by their chains' ends.
@@ -3189,7 +3336,7 @@ void LaneScanPass::runOnOperation() {
       op->erase();
 
     llvm::errs() << "lane-scan: cell " << cellName << "\n";
-    llvm::errs() << "lane-scan: " << module << " lanes " << callee << " x" << F
+    llvm::errs() << "lane-scan: " << module << " lanes " << tag << " x" << F
                  << ": " << movedPacks << " packs (" << movedOps
                  << " ops moved), " << movedVecs << " lane vectors; scans";
     for (auto &[k, n] : kinds)
