@@ -566,6 +566,8 @@ def frame_options(a):
         fold += ' csf-mailbox-hbm-chains'
     if getattr(a, 'csf_mailbox_hbm_split', False):
         fold += ' csf-mailbox-hbm-split'
+    if getattr(a, 'csf_mailbox_hbm_share', False):
+        fold += ' csf-mailbox-hbm-share'
     if getattr(a, 'link_rings', 0):
         fold += f' link-rings={a.link_rings}'
     if getattr(a, 'csf_mailbox_builder', False):
@@ -1815,6 +1817,9 @@ def build_parser():
     ap.add_argument('--csf-mailbox-hbm-split', action='store_true',
                     help='with --csf-mailbox-hbm: a stream sliced by reader whose reader page is wider than a row is '
                          'split into streams of a row each (foldsim-fold-static csf-mailbox-hbm-split)')
+    ap.add_argument('--csf-mailbox-hbm-share', action='store_true',
+                    help='with --csf-mailbox-hbm: the sources of a reader input that are members of one stream at one '
+                         'offset share one set of read registers (foldsim-fold-static csf-mailbox-hbm-share)')
     ap.add_argument('--link-rings', type=int, default=0, metavar='K',
                     help='constant-shell fold: a link memory whose entries are each live for a short window of the '
                          'frame keeps at most K entries (a power of two), the entry index mod K, where the schedule '

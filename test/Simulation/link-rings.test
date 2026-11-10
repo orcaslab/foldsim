@@ -57,6 +57,18 @@
 # RUN: %t/sp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=5 +hi=80 +bubble=30 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/nsp --static --nest --modulo --min-ii 96 --compact-links --share-links --bubbles --csf-mailbox-hbm --csf-mailbox-hbm-chains --csf-mailbox-hbm-row-bits 8 Kid Par > %t/nsp.log 2>&1
 # RUN: FileCheck %s --check-prefix=NSP < %t/nsp/schedule.txt
+# `--csf-mailbox-hbm-share` (splitpage, rows of 4,096 bits: one sliced stream,
+# each Kid's i at offset 0 of its page): Kid's input i, eight sources (a Par
+# port per child), lands in one set of read registers (10 landing registers
+# for 24), exact.
+# RUN: foldsim --srcs top.f --top Top --out %t/sh --static --nest --modulo --min-ii 96 --compact-links --share-links --bubbles --csf-mailbox-hbm --csf-mailbox-hbm-chains --csf-mailbox-hbm-share Kid Par 2>&1 | FileCheck %s --check-prefix=SH
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/sh -DVM1 -DVM2 -DBUBBLES -Mdir %t/sh/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/sh/foldsim_sim.sv > %t/sh/build.log 2>&1
+# RUN: %t/sh/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/sh/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
+# RUN: %t/sh/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=5 +hi=80 +bubble=30 | FileCheck %s
+# RUN: grep -c '_hbm[0-9]*_[ab] = ' %t/sh/foldsim_sim.mlir | FileCheck %s --check-prefix=SHN
+# SH: hbm shared 1
+# SHN: {{^}}10{{$}}
 # SP: link streams: 5 streams, 12 links
 # SP: link stream Par_model Kid 8 0 64 8 8 32
 # SP-NEXT: link stream Par_model Kid 1 0 8 8 1 4

@@ -609,6 +609,9 @@ public:
   /// `csf-mailbox-hbm-split`: a class pair's sliced stream whose reader page
   /// is wider than a row is split into streams of a row's page each.
   bool csfMailboxHbmSplit = false;
+  /// `csf-mailbox-hbm-share`: the sources of a reader input that are members
+  /// of one stream at one offset share one set of read registers.
+  bool csfMailboxHbmShare = false;
   /// `csf-mailbox-hbm-lead`: the most positions a csf-mailbox-hbm stream's
   /// request precedes its landing (the HBM round trip at the worst latency
   /// and a margin; less where the schedule leaves less room).
@@ -18571,7 +18574,7 @@ LogicalResult StaticFolder::buildSim() {
            syncReads = 0, earlyReads = 0, pagedReads = 0, streamReads = 0,
            stagedDirectReads = 0, singleReads = 0, doubleReads = 0,
            partialStreamReads = 0, partialMaskedReads = 0, ringReads = 0,
-           ringHeld = 0;
+           ringHeld = 0, sharedReads = 0;
   uint64_t singleBits = 0, ringBits = 0, ringFullBits = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
@@ -19139,6 +19142,42 @@ LogicalResult StaticFolder::buildSim() {
       // Forwarded past the read register only where no source is taken in
       // its producer's host cycle: a taken write is chosen there too, and the
       // late value then passes one choice, not two.
+      // csf-mailbox-hbm-share: every source of the piece a kept member of
+      // one twoSets stream at one offset (a parent's ports, one a child, to
+      // one input of its children: each reader takes one of them): one set
+      // of read registers for all of them, loaded at every reader pass's
+      // landing, and no choice of source.
+      const StreamMember *sharedMember = nullptr;
+      Value sharedValue;
+      if (csfMailboxHbmShare && sources.size() > 1) {
+        for (auto &[key, index] : sources) {
+          const StreamMember *sm = nullptr;
+          if (key.first >= 0 && producers[key.first].cls >= 0) {
+            auto pm = streamMembers.find(
+                {c, consumer.port, at, unsigned(key.first), key.second});
+            // (A member that carries every reader instance taking it: no
+            // on-chip rest.)
+            auto all = [&](const StreamMember &m) {
+              if (m.keepInst.empty())
+                return true;
+              for (unsigned i = 0; i < threads; ++i)
+                if (sourceOf[i] == key && (i >= m.keepInst.size() || !m.keepInst[i]))
+                  return false;
+              return true;
+            };
+            if (pm != streamMembers.end() && pm->second.kept &&
+                all(pm->second) && linkStreams[pm->second.stream].kept &&
+                linkStreams[pm->second.stream].twoSets)
+              sm = &pm->second;
+          }
+          if (!sm || (sharedMember && (sm->stream != sharedMember->stream ||
+                                       sm->offset != sharedMember->offset))) {
+            sharedMember = nullptr;
+            break;
+          }
+          sharedMember = sm;
+        }
+      }
       bool after = afterForward;
       for (auto &[key, index] : sources) {
         if (!after || key.first < 0 || producers[key.first].cls < 0)
@@ -19256,6 +19295,19 @@ LogicalResult StaticFolder::buildSim() {
           return {b.createOrFold<comb::ConcatOp>(slices),
                   b.createOrFold<comb::ConcatOp>(early)};
         };
+        if (sharedMember) {
+          if (!sharedValue) {
+            // Each reader instance's own producer instance, every reader.
+            rows.assign(producerInst.begin(), producerInst.end());
+            SmallVector<bool> every(threads, true);
+            sharedValue = hbmRegisters(*sharedMember, every).first;
+            ++streamReads;
+            ++sharedReads;
+          }
+          sourceData[index] = sharedValue;
+          syncPart = true;
+          continue;
+        }
         // A twoSets member that carries some of the reader instances that
         // take this source: the others take it as below (their own rows
         // alone), where that needs no forward or take in its host cycle
@@ -20051,6 +20103,8 @@ LogicalResult StaticFolder::buildSim() {
     if (csfSingleBank)
       os << "; csf single-bank " << singleReads << " (" << singleBits
          << " bits in one bank), two banks " << doubleReads;
+    if (csfMailboxHbmShare)
+      os << "; hbm shared " << sharedReads;
     if (linkRings)
       os << "; rings " << ringReads << " (" << ringBits << " bits, "
          << ringFullBits << " as instance memories, " << ringHeld
@@ -21445,6 +21499,7 @@ void FoldStaticPass::runOnOperation() {
   folder.csfMailboxHbm = csfMailboxHbm;
   folder.csfMailboxHbmChains = csfMailboxHbmChains;
   folder.csfMailboxHbmSplit = csfMailboxHbmSplit;
+  folder.csfMailboxHbmShare = csfMailboxHbmShare;
   folder.csfMailboxHbmLead = std::max(1u, unsigned(csfMailboxHbmLead));
   folder.csfMailboxHbmRowBits = std::clamp(unsigned(csfMailboxHbmRowBits), 8u, 4096u);
   folder.stateInRamZeroLinks = stateInRamZeroLinks;

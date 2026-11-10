@@ -1069,6 +1069,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "a parent's wide outputs to one child) is split into streams whose "
            "pages each fit a row, a reader pass landing a row of each, rather "
            "than left to on-chip memories">,
+    Option<"csfMailboxHbmShare", "csf-mailbox-hbm-share", "bool", "false",
+           "With csf-mailbox-hbm: where every source of a reader input's bits "
+           "is a member of one stream at one offset (a parent's ports, one a "
+           "child, to one input of its children), the sources share one set "
+           "of read registers, loaded at each reader pass's landing, and the "
+           "reader chooses no source (constant registers and selects)">,
     Option<"linkRings", "link-rings", "unsigned", "0",
            "Constant-shell fold: a link memory whose entries are each live "
            "for a short window of the frame (from the write a read takes to "
