@@ -473,6 +473,8 @@ def frame_options(a):
     fold += f' fold-store-ram={getattr(a, "fold_store_ram", 32768)}'
     if getattr(a, 'fold_store_hbm', 0):
         fold += f' fold-store-hbm={a.fold_store_hbm}'
+    if getattr(a, 'fold_store_stream', False):
+        fold += ' fold-store-stream'
     if getattr(a, 'fold_stage_levels', 0):
         fold += f' fold-stage-levels={a.fold_stage_levels}'
     if getattr(a, 'fold_stage_levels_class', ''):
@@ -1653,6 +1655,11 @@ def build_parser():
                          'as virtual memories, a row read a frame ahead and written from a landing buffer at each '
                          'state pass (foldsim-fold-static fold-store-hbm; a storage rule <model>:fold<k>_store=hbm '
                          'names one, another kind keeps one on chip); 0: none by size')
+    ap.add_argument('--fold-store-stream', action='store_true',
+                    help="with --static: every folded pipeline's store of depth 2 or more streams from HBM "
+                         '(not the state scratch), its writes and reads from a landing ring of a fixed number of '
+                         'entries, the reads answered into the vmem ring with --vmem-rings (foldsim-fold-static '
+                         'fold-store-stream)')
     ap.add_argument('--fold-store-ram', type=int, default=32768, metavar='N',
                     help="with --static: folded pipelines' result stores of at least N bits read through a "
                          'register, a host cycle or two ahead, in block or ultra RAM (their slot counters '

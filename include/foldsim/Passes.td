@@ -748,6 +748,20 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "HBM, another kind keeps it on chip. A store by size goes to HBM "
            "only past the state scratch (state-scratch-bits), which the "
            "stores take first, in class order. 0: none by size">,
+    Option<"foldStoreStream", "fold-store-stream", "bool", "false",
+           "Constant-shell fold: every folded pipeline's result store of a "
+           "depth of 2 or more streams from HBM, whatever its size and the "
+           "state scratch (a store row saves 2/depth bits of traffic a frame "
+           "per resident bit, a state row 2: the scratch is the rows'). Its "
+           "results go out from a landing ring of a fixed number of entries "
+           "(L, by the schedule, not the instance count): each issue's "
+           "{instance, row} and results wait there L state passes, then that "
+           "pass writes the row and reads the row the instance's next pass "
+           "reads, so that an instance's read and write still leave together; "
+           "the read's answers go to the class's vmem ring (vmem-rings) where "
+           "it has one. A class whose schedule leaves no such L keeps a "
+           "landing entry per instance (reported). Storage rules naming a "
+           "store (<model>:fold<k>_store=<kind>) still apply">,
     Option<"foldStoreStyle", "fold-store-style", "std::string", "\"auto\"",
            "With fold-store-ram: the stores' RAM style, ultra, block, or auto "
            "(ultra where it takes fewer than half as many primitives as "

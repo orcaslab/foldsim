@@ -1,0 +1,71 @@
+# Folded pipelines' stores streamed (foldsim-fold-static fold-store-stream; the
+# constant-shell fold's fold stores, audit item C): every store of a depth of 2
+# or more is a virtual memory in HBM, whatever its size and the state scratch,
+# and its on-chip side is fixed: a landing ring of L entries (the schedule's,
+# not the instance count's) holds each issue's {instance, rows, enables} and
+# results, and the L-th state pass after the issue sends its write with the
+# instance's read of the row its next pass reads; with vmem-rings the answers
+# go to the class's ring (an image row per instance in HBM, prefetched a lead
+# ahead), so no buffer has an entry per instance. Driver/Inputs/fold_stream:
+# sixteen leaves, stores of 48 bits (1-bit pipeline), 512 and 384 bits (8-bit
+# ones) and 38,400 bits (600 bits wide), against models of the kernel's
+# controllers (Inputs/tb_vmem_multi.sv; the ring's image with its tag bits):
+# responses 1 to 60 host cycles late, stalled channels, controllers out of
+# room, two copies with bubbles. A class whose passes leave no such L (passes
+# too close, or a few instances: Driver/Inputs/fold_hbm) keeps a landing entry
+# per instance, the reads at the passes, as fold-store-hbm.
+# REQUIRES: verilator
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/fold_stream
+# Packed passes (II 22): a ring of 8 entries; the read buffers per instance.
+# RUN: foldsim --srcs top.f --top Top --out %t/all --static --fold-store-stream Leaf > %t/all.log 2>&1
+# RUN: FileCheck %s --check-prefix=ALL < %t/all.log
+# RUN: FileCheck %s --check-prefix=IR < %t/all/foldsim_sim.mlir
+# RUN: python3 %S/Inputs/vmem_bind.py %t/all/foldsim_sim.json %t/all
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/all --top-module tb -Mdir %t/all/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/all/foldsim_sim.sv > %t/all/build.log 2>&1
+# RUN: %t/all/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=FAST
+# RUN: %t/all/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: %t/all/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | FileCheck %s
+# Spread passes (state in RAM, II 67) and vmem rings: rings of 2 entries, no
+# entry per instance anywhere.
+# RUN: foldsim --srcs top.f --top Top --out %t/ring --static --state-in-ram Leaf::4 --fold-store-stream --vmem-rings 4 Leaf > %t/ring.log 2>&1
+# RUN: FileCheck %s --check-prefix=RING < %t/ring.log
+# RUN: FileCheck %s --check-prefix=RIR < %t/ring/foldsim_sim.mlir
+# RUN: python3 %S/Inputs/vmem_bind.py %t/ring/foldsim_sim.json %t/ring
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/ring --top-module tb -Mdir %t/ring/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/ring/foldsim_sim.sv > %t/ring/build.log 2>&1
+# RUN: %t/ring/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 | FileCheck %s
+# RUN: %t/ring/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: %t/ring/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=5 +hi=60 +full=30 | FileCheck %s
+# Two copies of 8 instances with bubbles (a landing entry per instance), rings.
+# RUN: foldsim --srcs top.f --top Top --out %t/cb --static --modulo --min-ii 64 --fold-store-stream --vmem-rings 4 --copies Leaf:2 --bubbles Leaf > %t/cb.log 2>&1
+# RUN: FileCheck %s --check-prefix=CB < %t/cb.log
+# RUN: python3 %S/Inputs/vmem_bind.py %t/cb/foldsim_sim.json %t/cb
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/cb --top-module tb -DBUBBLES -Mdir %t/cb/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/cb/foldsim_sim.sv > %t/cb/build.log 2>&1
+# RUN: %t/cb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=40 +stall=20 +bubble=20 | FileCheck %s
+# RUN: %t/cb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=3 +hi=20 +full=20 +bubble=10 | FileCheck %s
+# Four instances (Driver/Inputs/fold_hbm): no L, an entry per instance.
+# RUN: cd %S/../Driver/Inputs/fold_hbm
+# RUN: foldsim --srcs top.f --top Top --out %t/few --static --fold-store-stream Leaf > %t/few.log 2>&1
+# RUN: FileCheck %s --check-prefix=FEW < %t/few.log
+# RUN: python3 %S/Inputs/vmem_bind.py %t/few/foldsim_sim.json %t/few
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/few --top-module tb -Mdir %t/few/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/few/foldsim_sim.sv > %t/few/build.log 2>&1
+# RUN: %t/few/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: %t/few/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +lo=5 +hi=60 +full=30 | FileCheck %s
+# ALL: fold-store-stream: Leaf: landing ring of 8 entries (16 instances
+# ALL: fold-store-hbm: Leaf: 4 stores, 39344 bits in HBM; {{.*}}landing rings 4 of 8 entries
+# IR-DAG: %fold3_store_landing = seq.firmem 1, 1, old, undefined : <8 x 600
+# IR-DAG: %fold2_store_landing = seq.firmem 1, 1, old, undefined : <8 x 1
+# IR-DAG: %fold3_store_lmeta = seq.firmem 1, 1, old, undefined : <8 x
+# RING: fold-store-stream: Leaf: landing ring of 2 entries (16 instances
+# RING: vmem-rings: Leaf: 4 read buffers as rings of 2 entries
+# RING: fold-store-hbm: Leaf: 4 stores, 39344 bits in HBM; landing and read buffers 1314 bits on chip {{.*}}landing rings 4 of 2 entries
+# RIR-NOT: _rdata = seq.firmem
+# RIR-NOT: _lvalid
+# RIR-DAG: %fold3_store_landing = seq.firmem 1, 1, old, undefined : <2 x 600
+# RIR-DAG: %fold3_store_ring = seq.firmem 1, 1, old, undefined : <2 x 600
+# CB: fold-store-stream: Leaf: a landing entry per instance
+# CB: vmem-rings: Leaf: 4 read buffers as rings of
+# CB: fold-store-stream: Leaf_copy1: a landing entry per instance
+# FEW: fold-store-stream: Leaf: a landing entry per instance
+# FEW: fold-store-hbm: Leaf: 2 stores, 224 bits in HBM
+# FAST: {{^}}MATCH 196 cycles in 4400 host cycles
+# CHECK: {{^}}MATCH
