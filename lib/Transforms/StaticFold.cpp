@@ -13640,7 +13640,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   if (vmemRingLead && threads > 1)
     planClassRing(cls, [&](const Class::VirtualMemory &vm) {
       Fold *fold = hbmFold(vm.lanes.front());
-      return !vm.pages && !vm.delayed && (!fold || fold->landingRing));
+      return !vm.pages && !vm.delayed && (!fold || fold->landingRing);
     });
 
   // Paged register state: the registers a ready pass reads (the cone of an
@@ -14074,7 +14074,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   SmallVector<Operation *> virtualPorts(cls.virtualMemories.size(), nullptr);
   struct HbmStats {
     unsigned stores = 0, rings = 0;
-    uint64_t bits = 0, landing = 0;
+    uint64_t bits = 0, landing = 0, traffic = 0;
   } hbmStats;
   auto buildVirtualMemory = [&](seq::FirMemOp memory,
                                 unsigned k) -> SmallVector<Value> {
@@ -14375,6 +14375,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         hbmStats.landing += entries;
       if (L)
         ++hbmStats.rings;
+      // HBM bits a frame: an instance's row read and written (each a whole
+      // power-of-two row of bytes, as the controller moves it), and with a
+      // ring the answer's image row written and read again.
+      uint64_t rowBits =
+          8 * llvm::PowerOf2Ceil(std::max<uint64_t>(1, llvm::divideCeil(vm.dataWidth, 8)));
+      hbmStats.traffic += uint64_t(threads) * rowBits * (vm.ring ? 4 : 2);
     } else if (Fold *fold = hbmFold(memory)) {
       // `fold-store-hbm`: the write's data, the results of the instance's
       // last issue, from a landing buffer of an entry per instance: written
@@ -16393,7 +16399,11 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                    << (foldStoreStream
                            ? "; landing rings " + std::to_string(hbmStats.rings) +
                                  " of " + std::to_string(cls.foldLandL) +
-                                 " entries"
+                                 " entries; HBM " + std::to_string(hbmStats.traffic) +
+                                 " bits a frame (II_bw " +
+                                 std::to_string(llvm::divideCeil(hbmStats.traffic,
+                                                                 kStreamBitsPerCycle)) +
+                                 " alone)"
                            : std::string())
                    << "\n";
     if (aheadStats.stores)
