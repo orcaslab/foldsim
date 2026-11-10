@@ -20311,7 +20311,11 @@ LogicalResult StaticFolder::buildSim() {
         for (unsigned d = 0; d < window && d < ii; ++d)
           inflight[q] += st.popValid[(q + ii - d) % ii];
       unsigned cw = llvm::Log2_32_Ceil(window + 1);
-      Value count = table(b, next, inflight, cw);
+      // (Through the lookahead register like the virtual memories' tables:
+      // read at `next` directly, the position's increment and the table's
+      // decoder chained into every stage's advance, 17 levels on a 64-SM
+      // synthetic shell; a32_1109 P/S11 Beacon.)
+      Value count = atNext(inflight, cw);
       SmallVector<Value> clear;
       for (unsigned d = 0; d < window; ++d) {
         Value at = comb::AddOp::create(b, sb.popPtr, constant(ib, d));

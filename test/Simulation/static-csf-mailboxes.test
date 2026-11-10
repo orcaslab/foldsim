@@ -56,6 +56,10 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/h40 --static --nest --modulo --min-ii 40 --compact-links --csf-mailbox-hbm --bubbles Src Sink 2>&1 | FileCheck %s --check-prefix=HBM
 # RUN: FileCheck %s --check-prefix=HBMS < %t/h40/schedule.txt
 # RUN: FileCheck %s --check-prefix=HBMVH < %t/h40/foldsim_sim.vh
+# Each stream's landings-in-flight count (a table of the position) is read
+# through a lookahead register loaded a host cycle before, like the virtual
+# memories' tables: not decoded from the position in the advance's cone.
+# RUN: FileCheck %s --check-prefix=HBMAHEAD < %t/h40/foldsim_sim.mlir
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/h40 -DVM1 -DBUBBLES -Mdir %t/h40/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/h40/foldsim_sim.sv > %t/h40/build.log 2>&1
 # RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
 # RUN: %t/h40/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
@@ -110,6 +114,7 @@
 # H24: link streams: 2 streams, 11 links, 76 bits
 # H24: link stream Sink Src 3 1 32 8 4 8 6 1
 # H24: link stream Src Sink 8 0 32 32 1 8 2 1
+# HBMAHEAD-COUNT-2: %vready_ahead{{[0-9]+}} = seq.firreg {{%[^ ]+}} clock %hostClock reset sync %hostReset, {{%[^ ]+}} preset {{[0-9]+}} : i3
 # HBMVH: FOLDSIM_VMEM_0_DW 8
 # HBMVH-NEXT: FOLDSIM_VMEM_0_MW 1
 # HBMVH: FOLDSIM_VMEM_1_DW 32
