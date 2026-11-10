@@ -20137,9 +20137,6 @@ LogicalResult StaticFolder::buildSim() {
   // run) takes no slot and loads zero, the link's content before any write.
   struct StreamBuilt {
     Value pop1, data, popPtr, pending;
-    /// The pending bits of the slots popPtr + d, d below the decision's
-    /// window, registered (empty: read from `pending` at the decision).
-    SmallVector<Value> ahead;
     /// The landing read as is, and whether it is a skipped one (zero): a
     /// member's registers load zero there by their reset, taken with their
     /// enable, not through a mux of the whole word.
@@ -20316,40 +20313,6 @@ LogicalResult StaticFolder::buildSim() {
     Value set = comb::OrOp::create(b, sb.pending, bitAt(req0, reqPtr));
     pendNext.setValue(comb::AndOp::create(
         b, set, comb::XorOp::create(b, bitAt(rsp, rspInst), constant(slots, ~0ull))));
-    // The decision's window of slots from popPtr (VirtualReady below), kept
-    // as registers updated as pending is (set by a request, cleared by a
-    // response, at their offsets from popPtr) and shifted by a pop: one
-    // select of the slot entering the window, not one a slot of it.
-    {
-      unsigned window = unsigned(decisionLead()) + 3;
-      if (window < slots && slots == (1u << ib)) {
-        Value rq = comb::SubOp::create(b, reqPtr, sb.popPtr);
-        Value rs = comb::SubOp::create(b, rspInst, sb.popPtr);
-        Value far = b.createOrFold<comb::ExtractOp>(
-            i1,
-            comb::ShrUOp::create(
-                b, sb.pending,
-                b.createOrFold<comb::ConcatOp>(
-                    constant(slots - ib, 0),
-                    comb::AddOp::create(b, sb.popPtr, constant(ib, window)))),
-            0);
-        SmallVector<Backedge> nexts;
-        for (unsigned d = 0; d < window; ++d) {
-          nexts.push_back(backedges.get(i1));
-          sb.ahead.push_back(resetReg(nexts.back(), prefix + "_ahead" + Twine(d), 0));
-        }
-        for (unsigned d = 0; d < window; ++d) {
-          Value src = comb::MuxOp::create(b, take0, d + 1 < window ? sb.ahead[d + 1] : far,
-                                          sb.ahead[d]);
-          Value setHit = comb::AndOp::create(
-              b, req0, comb::MuxOp::create(b, take0, eq(rq, d + 1), eq(rq, d)));
-          Value clrHit = comb::AndOp::create(
-              b, rsp, comb::MuxOp::create(b, take0, eq(rs, d + 1), eq(rs, d)));
-          nexts[d].setValue(comb::AndOp::create(
-              b, comb::OrOp::create(b, src, setHit), notOf(clrHit)));
-        }
-      }
-    }
     // The writes: the word held at the producer's pass, a row a host cycle
     // over the pages after it, at {bank, instance, page}.
     Value pass2 = !st.atReady ? pctl.state2
@@ -22890,18 +22853,13 @@ LogicalResult StaticFolder::buildSim() {
         count = table(b, next, inflight, cw);
       SmallVector<Value> clear;
       for (unsigned d = 0; d < window; ++d) {
-        Value bit;
-        if (d < sb.ahead.size()) {
-          bit = sb.ahead[d];
-        } else {
-          Value at = comb::AddOp::create(b, sb.popPtr, constant(ib, d));
-          bit = b.createOrFold<comb::ExtractOp>(
-              i1,
-              comb::ShrUOp::create(
-                  b, sb.pending,
-                  b.createOrFold<comb::ConcatOp>(constant(slots - ib, 0), at)),
-              0);
-        }
+        Value at = comb::AddOp::create(b, sb.popPtr, constant(ib, d));
+        Value bit = b.createOrFold<comb::ExtractOp>(
+            i1,
+            comb::ShrUOp::create(
+                b, sb.pending,
+                b.createOrFold<comb::ConcatOp>(constant(slots - ib, 0), at)),
+            0);
         // (Slot d is one of them where d < the count.)
         Value beyond = comb::ICmpOp::create(b, comb::ICmpPredicate::uge,
                                             constant(cw, d), count);
