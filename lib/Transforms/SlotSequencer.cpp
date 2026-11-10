@@ -203,6 +203,10 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
     segments.push_back(best);
     if (segments.size() > maxSegments)
       break;
+    // A run started a row early (on k0 - 1) whose rows skip k0 (a block
+    // of rows 2^e apart): k0 again, now on its own.
+    if (!covered[k0])
+      --k0;
   }
   return segments;
 }
@@ -295,8 +299,19 @@ static bool decodesExactly(ArrayRef<SlotSegment> segments,
       got |= value & mask;
     }
     uint64_t want = idx < rows.size() ? rows[idx] & mask : 0;
-    if (got != want)
+    if (got != want) {
+      if (getenv("FOLDSIM_AFFINE_LOG")) {
+        llvm::errs() << "slot-sequencer: mismatch at " << idx << " (of " << rows.size()
+                     << "): got " << got << ", want " << want << "; segments:";
+        for (auto &seg : segments)
+          llvm::errs() << " [s" << seg.start << " st" << seg.stride << " n" << seg.count
+                       << " len" << seg.len << " is" << seg.istride << " v" << seg.value
+                       << " step" << seg.step << " in" << seg.inner << " sh" << seg.shift
+                       << " b" << seg.bits << " end" << seg.end() << "]";
+        llvm::errs() << "\n";
+      }
       return false;
+    }
   }
   return true;
 }
@@ -309,6 +324,10 @@ Value decodeSlotTable(
   if (w == 0 || w > 63 || width == 0 || width > 64)
     return {};
   auto segments = slotSegments(rows, width, maxSegments, bool(divmod));
+  // (Runs of any period are tried greedily, longest first: where that cuts
+  // the rest into more segments than the powers of two alone, those.)
+  if (segments.size() > maxSegments && divmod)
+    segments = slotSegments(rows, width, maxSegments, false);
   if (segments.size() > maxSegments)
     return {};
   // The decoder's own arithmetic, at every index, against the rows: a
@@ -375,9 +394,13 @@ Value decodeSlotTable(
         if (rs)
           conds.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge, rr,
                                                constant(rType, rs)));
-        conds.push_back(comb::ICmpOp::create(
-            b, comb::ICmpPredicate::ult, rr,
-            constant(rType, rs + seg.len * seg.istride)));
+        // (The block's last row is below the period, so past it the bound is
+        // the remainder's own: none. A bound of the period or more would
+        // not fit the remainder's bits and wrap.)
+        if (rs + seg.len * seg.istride < d)
+          conds.push_back(comb::ICmpOp::create(
+              b, comb::ICmpPredicate::ult, rr,
+              constant(rType, rs + seg.len * seg.istride)));
         if (le)
           conds.push_back(comb::ICmpOp::create(
               b, comb::ICmpPredicate::eq, comb::ExtractOp::create(b, rr, 0, le),
