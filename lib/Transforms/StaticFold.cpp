@@ -22799,13 +22799,31 @@ LogicalResult StaticFolder::buildSim() {
       // before: one-bit tables, which decode where the count's rows do not.
       // Without lookahead tables: the count, or that sum, read at `next`.
       Value count;
+      Value landsNext = atNext(st.popValid, 1);
       if (lookaheadTables) {
+        // The landing table at `next` - d is the one at `next` d steps of
+        // `next` before (`next` steps by one, wrapping from ii - 1 to 0, and
+        // holds through the gap between frames): one lookahead table, d - 1
+        // registers after it shifted as `next` steps, not a table each.
+        // (`next` steps on an advance unless at the frame's end with no
+        // frame starting; posD resets to `ii`, `next` 0: each register
+        // resets to its table there.)
         SmallVector<Value> parts;
+        Value prev;
+        Value steps = comb::OrOp::create(b, notOf(end), go);
+        if (advance)
+          steps = comb::AndOp::create(b, advance, steps);
         for (unsigned d = 0; d < window && d < ii; ++d) {
-          SmallVector<uint64_t> landed(ii + 1, 0);
-          for (unsigned q = 0; q < ii; ++q)
-            landed[q] = st.popValid[(q + ii - d) % ii];
-          Value bit = atNext(landed, 1);
+          Value bit;
+          if (!d) {
+            bit = landsNext;
+          } else {
+            auto self = backedges.get(i1);
+            bit = resetReg(self, "landed_ahead" + Twine(aheadCount++),
+                           st.popValid[(ii - d) % ii]);
+            self.setValue(comb::MuxOp::create(b, steps, prev, bit));
+          }
+          prev = bit;
           parts.push_back(cw > 1 ? b.createOrFold<comb::ConcatOp>(constant(cw - 1, 0), bit)
                                  : bit);
         }
@@ -22848,7 +22866,7 @@ LogicalResult StaticFolder::buildSim() {
         clear.push_back(comb::OrOp::create(b, notOf(bit), beyond));
       }
       terms.push_back(comb::OrOp::create(
-          b, notOf(atNext(st.popValid, 1)),
+          b, notOf(landsNext),
           comb::AndOp::create(b, clear, false)));
     }
     virtualReady.setValue(comb::AndOp::create(b, terms, false));
