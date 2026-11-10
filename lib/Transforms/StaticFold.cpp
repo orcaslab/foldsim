@@ -13075,8 +13075,27 @@ void StaticFolder::ppPrefetches(const Class &cls, unsigned w,
     return cls.slot[kState][order[r]] + f * int(ii);
   };
   at.assign(cls.threads(), 0);
+  // Each prefetch a fixed lead L before its own instance's state pass, L the
+  // least gap to the state pass w before (so after its slot's previous
+  // occupant's): the prefetches' instance by position is then the state
+  // passes' sequence shifted, a table that decodes as theirs does (at the
+  // previous occupant's own pass it is a w-th successor by position: the
+  // resident instances between make it irregular). Where two prefetches
+  // would share a position, at the previous occupant's pass as before.
+  int lead = INT_MAX;
   for (unsigned k = 0; k < n; ++k)
-    at[order[k]] = stateAt(int(k) - int(w));
+    lead = std::min(lead, stateAt(int(k)) - stateAt(int(k) - int(w)));
+  SmallVector<uint8_t> taken(ii, 0);
+  bool clash = lead <= 0;
+  for (unsigned k = 0; k < n && !clash; ++k)
+    for (unsigned j = 0; j < cls.pp && !clash; ++j) {
+      int pos = stateAt(int(k)) - lead + int(j);
+      unsigned q = unsigned(((pos % int(ii)) + int(ii)) % int(ii));
+      clash = taken[q];
+      taken[q] = 1;
+    }
+  for (unsigned k = 0; k < n; ++k)
+    at[order[k]] = clash ? stateAt(int(k) - int(w)) : stateAt(int(k)) - lead;
 }
 
 LogicalResult StaticFolder::chooseStreamWindows() {
