@@ -924,6 +924,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "The schedule places such a pass at least the stages into the "
            "frame, its inputs' links the stages earlier, and its state gap "
            "from the read. 0: none">,
+    Option<"stageLevelsMapped", "stage-levels-mapped", "std::string", "\"\"",
+           "With stage-levels: size each class's stages from the depth of its "
+           "logic mapped to this Beacon target's cells (foldsim-beacon-map + "
+           "foldsim-estimate-timing on one instance of the class's model), "
+           "not from the estimate alone: a class whose mapped depth fits "
+           "stage-levels is not staged; a deeper one takes ceil(depth / "
+           "stage-levels) - 1 stages at most, its cuts placed by the estimate "
+           "balanced over them. Empty: the estimate alone">,
     ListOption<"stageLevelsClass", "stage-levels-class", "std::string",
                "Per class over stage-levels: <glob>:<N> stages a class (globs "
                "on the model's name; a copy goes by its class's) at N levels, "

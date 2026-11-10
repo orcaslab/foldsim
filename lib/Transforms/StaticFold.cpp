@@ -30,7 +30,10 @@
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
+#include "foldsim/Beacon.h"
 #include "foldsim/Passes.h"
+#include "mlir/Pass/PassManager.h"
+#include "mlir/Pass/PassRegistry.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -74,6 +77,16 @@ namespace {
 struct FoldStaticPass : public foldsim::impl::FoldStaticBase<FoldStaticPass> {
   using FoldStaticBase::FoldStaticBase;
   void runOnOperation() override;
+  void getDependentDialects(DialectRegistry &registry) const override {
+    FoldStaticBase::getDependentDialects(registry);
+    // stage-levels-mapped maps class models with Beacon's pipeline.
+    if (stageLevelsMapped.empty())
+      return;
+    OpPassManager pm(ModuleOp::getOperationName());
+    if (const auto *t = foldsim::lookupBeaconTarget(stageLevelsMapped))
+      if (succeeded(parsePassPipeline(foldsim::beaconMapPipeline(*t, false), pm)))
+        pm.getDependentDialects(registry);
+  }
 };
 
 /// Bits of a consumer's port: bits of one instance's output, a netlist input,
@@ -471,6 +484,13 @@ public:
   SmallVector<std::string> stateInRamSpecs;
   /// `stage-levels-class`: <glob>:<N|off> per class over `stage-levels`.
   SmallVector<std::string> stageLevelClassSpecs;
+  /// `stage-levels-mapped`: the Beacon target whose mapped depth sizes the
+  /// stages (empty: the estimate alone), and each model's mapped depth.
+  std::string stageLevelsMapped;
+  DenseMap<Operation *, int> mappedDepth;
+  /// The deepest end point of `model`'s logic mapped to that target's cells
+  /// (-1 if it cannot be mapped or timed).
+  int mappedDepthOf(hw::HWModuleOp model);
   /// `split-latency`: <glob>:<n>, host cycles a class's results take more
   /// (a copy split over SLRs, its crossings registered: slr-split).
   SmallVector<std::string> splitLatencySpecs;
@@ -3325,6 +3345,29 @@ static int sinkStage(Value value, int extra, int limit,
   return s.stage + (s.levels > 0 && s.levels + extra > limit ? 1 : 0);
 }
 
+int StaticFolder::mappedDepthOf(hw::HWModuleOp model) {
+  if (auto it = mappedDepth.find(model.getOperation()); it != mappedDepth.end())
+    return it->second;
+  int depth = -1;
+  if (const auto *target = foldsim::lookupBeaconTarget(stageLevelsMapped)) {
+    // One instance of the model, alone, mapped as foldsim-beacon-map maps a
+    // design for depth and timed as foldsim-estimate-timing times it.
+    OwningOpRef<ModuleOp> design = ModuleOp::create(model.getLoc());
+    OpBuilder b(model.getContext());
+    b.setInsertionPointToEnd(design->getBody());
+    auto copy = cast<hw::HWModuleOp>(b.clone(*model.getOperation()));
+    SymbolTable::setSymbolVisibility(copy, SymbolTable::Visibility::Public);
+    std::string name = copy.getSymName().str();
+    PassManager pm(model.getContext(), ModuleOp::getOperationName());
+    if (succeeded(parsePassPipeline(foldsim::beaconMapPipeline(*target, false), pm)) &&
+        succeeded(pm.run(*design)))
+      if (auto d = foldsim::beaconDeepestLevels(*design, name, *target); succeeded(d))
+        depth = *d;
+  }
+  mappedDepth[model.getOperation()] = depth;
+  return depth;
+}
+
 LogicalResult StaticFolder::chooseStages() {
   std::optional<llvm::Regex> pattern;
   if (!virtualMemoryPattern.empty())
@@ -3534,6 +3577,83 @@ LogicalResult StaticFolder::chooseStages() {
                                 ? sinkStage(output->getOperand(o), 0, limit, memo, eb)
                                 : next + (out + limit - 1) / limit);
     cls.stages = unsigned(last);
+    // stage-levels-mapped: no more stages than the mapped depth needs (the
+    // estimate counts a chain of narrow ops level by level, where the
+    // mapping balances it into a tree and packs it into LUTs; a cone of
+    // constant-masked bit slices as deep as its word-level chain).
+    if (!stageLevelsMapped.empty() && cls.stages) {
+      int depth = mappedDepthOf(cls.model);
+      if (depth < 0) {
+        llvm::errs() << "foldsim-fold-static: " << cls.name
+                     << ": stage-levels-mapped: cannot map it for "
+                     << stageLevelsMapped << ": staged by the estimate\n";
+      } else {
+        unsigned want =
+            depth <= int(stageLevels)
+                ? 0u
+                : unsigned((depth + int(stageLevels) - 1) / int(stageLevels)) - 1;
+        llvm::errs() << "foldsim-fold-static: " << cls.name << ": mapped depth "
+                     << depth << " levels at " << stageLevels << " a stage: ";
+        if (want < cls.stages)
+          llvm::errs() << want << " stages, not the estimate's " << cls.stages
+                       << "\n";
+        else
+          llvm::errs() << "the estimate's " << cls.stages << " stages\n";
+        cls.stages = std::min(cls.stages, want);
+      }
+    }
+    auto traced = [&] {
+      const char *t = getenv("FOLDSIM_STAGE_TRACE");
+      if (!t)
+        return false;
+      auto glob = llvm::GlobPattern::create(t);
+      if (!glob) {
+        llvm::consumeError(glob.takeError());
+        return false;
+      }
+      return glob->match(baseName);
+    };
+    if (traced()) {
+      // The deepest estimated cone, unlimited: its ops by kind.
+      DenseMap<Value, Staging> full;
+      const int inf = 1 << 28;
+      Value deepest;
+      int depth = -1;
+      for (auto &op : *body)
+        for (auto operand : op.getOperands())
+          if (isa<seq::FirRegOp, seq::FirMemWriteOp, hw::OutputOp>(op) &&
+              statePort(operand)) {
+            auto s = stageOf(operand, inf, full, eb);
+            if (s.levels > depth)
+              depth = s.levels, deepest = operand;
+          }
+      llvm::errs() << "stage-trace " << cls.name << ": " << depth
+                   << " half levels\n";
+      std::map<std::string, std::pair<int, int>> kinds;
+      SmallVector<std::pair<Value, int>> edges;
+      for (Value v = deepest; v;) {
+        edges.clear();
+        depthEdges(v, edges, eb);
+        Value nextV;
+        int at = full.lookup(v).levels;
+        for (auto [operand, add] : edges)
+          if (full.lookup(operand).levels + add == at) {
+            nextV = operand;
+            if (auto *op = v.getDefiningOp()) {
+              std::string k = op->getName().getStringRef().str() + "/" +
+                              std::to_string(add) + "/w" +
+                              std::to_string(hw::getBitWidth(v.getType()));
+              kinds[k].first += 1;
+              kinds[k].second += add;
+            }
+            break;
+          }
+        v = nextV;
+      }
+      for (auto &[k, n] : kinds)
+        llvm::errs() << "  " << k << " x" << n.first << " = " << n.second
+                     << "\n";
+    }
 
     // Multicycle: the cone's depth over the levels a host cycle, as host
     // cycles from the capture registers to the end registers (at least 1);
@@ -22649,6 +22769,12 @@ void FoldStaticPass::runOnOperation() {
   folder.splitLatencyFile = splitLatencyFile;
   folder.stageLevelClassSpecs.assign(stageLevelsClass.begin(),
                                      stageLevelsClass.end());
+  if (!stageLevelsMapped.empty() &&
+      !foldsim::lookupBeaconTarget(stageLevelsMapped)) {
+    foldsim::emitUnknownBeaconTarget(getOperation(), stageLevelsMapped);
+    return signalPassFailure();
+  }
+  folder.stageLevelsMapped = stageLevelsMapped;
   folder.stateInRamReadBits = stateInRamReadBits;
   folder.stateInRamH = stateInRamH;
   folder.csfReadyCopySpecs.assign(csfReadyCopies.begin(), csfReadyCopies.end());

@@ -20,6 +20,9 @@
 #define FOLDSIM_BEACON_H
 
 #include "llvm/ADT/StringRef.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/Support/LLVM.h"
+#include <string>
 
 namespace mlir {
 class Operation;
@@ -59,6 +62,17 @@ const BeaconTarget *lookupBeaconTarget(llvm::StringRef name);
 
 /// Reports on `op` that `name` is no target, listing the targets.
 void emitUnknownBeaconTarget(mlir::Operation *op, llvm::StringRef name);
+
+/// The pass pipeline (on a builtin.module) of `foldsim-beacon-map` for
+/// `target`: for depth, or for area.
+std::string beaconMapPipeline(const BeaconTarget &target, bool area);
+
+/// The levels of the deepest end point of the design `top` elaborates in
+/// `design`, a design mapped by `beaconMapPipeline(target, false)`, as
+/// `foldsim-estimate-timing` counts them; failure if it cannot time it.
+mlir::FailureOr<int> beaconDeepestLevels(mlir::ModuleOp design,
+                                         llvm::StringRef top,
+                                         const BeaconTarget &target);
 
 } // namespace foldsim
 

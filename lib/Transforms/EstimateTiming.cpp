@@ -224,6 +224,13 @@ public:
   }
 
   LogicalResult run(hw::HWModuleOp top, unsigned retimeLevels);
+  /// The levels of the deepest end point (after run).
+  int deepest() const {
+    int levels = 0;
+    for (auto &end : endPoints)
+      levels = std::max(levels, int(end.levels));
+    return levels;
+  }
   void writeEndPoints(raw_ostream &os, unsigned minLevels);
   void writeInstances(raw_ostream &os);
   void writePorts(raw_ostream &os, ArrayRef<std::string> modules);
@@ -1874,6 +1881,17 @@ void BoundaryArrivalsPass::runOnOperation() {
       inst->setAttr("synth.output_arrival_times", out);
   });
   markAllAnalysesPreserved();
+}
+
+FailureOr<int> foldsim::beaconDeepestLevels(ModuleOp design, StringRef top,
+                                            const BeaconTarget &target) {
+  auto module = design.lookupSymbol<hw::HWModuleOp>(top);
+  if (!module)
+    return failure();
+  Timing timing(design, {}, target);
+  if (failed(timing.run(module, 0)))
+    return failure();
+  return timing.deepest();
 }
 
 void EstimateTimingPass::runOnOperation() {
