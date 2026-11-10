@@ -19729,7 +19729,7 @@ LogicalResult StaticFolder::buildSim() {
   // the first frame (a frame not run: `cross` frames before, more than have
   // run) takes no slot and loads zero, the link's content before any write.
   struct StreamBuilt {
-    Value pop1, inst1, row1, page1, data, popPtr, pending;
+    Value pop1, data, popPtr, pending;
     /// The landing read as is, and whether it is a skipped one (zero): a
     /// member's registers load zero there by their reset, taken with their
     /// enable, not through a mux of the whole word.
@@ -19834,9 +19834,8 @@ LogicalResult StaticFolder::buildSim() {
     };
     sb.pop1 = resetReg(resetReg(table(b, rctl.at3, st.popValid, 1), prefix + "_pop2", 0),
                        prefix + "_pop1", 0);
-    sb.inst1 = t1(st.popInst, rIdx, "inst");
-    sb.row1 = t1(st.popRow, pIdx, "row");
-    sb.page1 = t1(st.popPage, pgBits, "page");
+    // (A landing's instance, row and page are not read here: its slot is
+    // the pop pointer's, and the members' enables are their own tables.)
     // Missing: requested in a frame before the first (cross > the frames
     // run, which `ran` counts as the landing's host cycle runs).
     Value skip0 = constant(1, 0);
@@ -22528,6 +22527,42 @@ LogicalResult StaticFolder::buildSim() {
           Twine(cls.passSplit) + ":" + Twine(cls.passHoldBits)));
   if (!splits.empty())
     sim->setAttr("foldsim.pass_split", b.getArrayAttr(splits));
+  // Registers nothing reads (and the logic only they read): built for a
+  // value no user took. Erased here, as synthesis would, so that the counts
+  // and screens see the simulator's own logic.
+  {
+    SmallVector<Operation *> work;
+    auto dead = [](Operation *op) {
+      if (!op->use_empty())
+        return false;
+      if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(op))
+        return !op->hasAttr("inner_sym");
+      // (Logic alone: not the builder's placeholders, resolved later.)
+      StringRef ns = op->getDialect() ? op->getDialect()->getNamespace() : "";
+      return (ns == "comb" || ns == "hw") && mlir::isOpTriviallyDead(op);
+    };
+    for (auto &op : *body)
+      if (dead(&op))
+        work.push_back(&op);
+    unsigned erased = 0;
+    while (!work.empty()) {
+      Operation *op = work.pop_back_val();
+      if (!op->getBlock() || !dead(op))
+        continue;
+      SmallVector<Operation *> feeds;
+      for (Value v : op->getOperands())
+        if (auto *d = v.getDefiningOp())
+          if (d->getBlock() == body)
+            feeds.push_back(d);
+      op->erase();
+      ++erased;
+      for (auto *d : feeds)
+        if (dead(d))
+          work.push_back(d);
+    }
+    if (erased && getenv("FOLDSIM_AFFINE_LOG"))
+      llvm::errs() << "foldsim-fold-static: " << erased << " unread ops erased\n";
+  }
   simModule = sim;
   return success();
 }
