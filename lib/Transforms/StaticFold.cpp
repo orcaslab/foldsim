@@ -312,6 +312,9 @@ struct Class {
     /// `vmem-rings`: its read buffer a ring (the class's `ring` plan), its
     /// answers written to an image read back a lead before each use.
     bool ring = false;
+    /// Its write data and mask outputs are zero while its write valid is
+    /// low (registers reset by it): a page engine ORs them without a select.
+    bool idleZero = false;
   };
   SmallVector<VirtualMemory> virtualMemories;
   /// `vmem-rings`: the class's ring plan, if any of its memories take one.
@@ -3388,6 +3391,10 @@ static int sinkStage(Value value, int extra, int limit,
   return s.stage + (s.levels > 0 && s.levels + extra > limit ? 1 : 0);
 }
 
+/// The carry block (bits) Beacon's fold screen times adders and compares by
+/// on an FPGA (ci/beacon.py's `screen` preset: --carry-block-size 8).
+static constexpr unsigned kBeaconCarryBlock = 8;
+
 int StaticFolder::mappedDepthOf(hw::HWModuleOp model, unsigned entryBits,
                                 const DenseMap<Value, ::Staging> *stages) {
   auto key = std::make_pair(model.getOperation(), entryBits);
@@ -3411,6 +3418,22 @@ int StaticFolder::mappedDepthOf(hw::HWModuleOp model, unsigned entryBits,
         memory->setAttr("foldsim.instance_rows",
                         b.getI64IntegerAttr(int64_t(1) << entryBits));
       });
+    // The copy updates a register at its instance's pass alone, its next
+    // value held otherwise (a select of the next value and the register,
+    // which Beacon maps as logic on the register's input): every register
+    // of the clone takes that select, by an enable of its own input.
+    {
+      auto *body = copy.getBodyBlock();
+      Value enable;
+      SmallVector<seq::FirRegOp> regs(body->getOps<seq::FirRegOp>());
+      for (auto reg : regs) {
+        if (!enable)
+          enable = copy.appendInput("fsmapped_pass", b.getI1Type()).second;
+        b.setInsertionPoint(reg);
+        reg.getNextMutable().assign(comb::MuxOp::create(
+            b, reg.getLoc(), enable, reg.getNext(), reg.getResult()));
+      }
+    }
     // With `stages` (each value's stage): a register on every operand of the
     // logic taken from an earlier stage, as the stage registers cut it.
     if (stages) {
@@ -3456,7 +3479,10 @@ int StaticFolder::mappedDepthOf(hw::HWModuleOp model, unsigned entryBits,
         design->print(os);
     }
     PassManager pm(model.getContext(), ModuleOp::getOperationName());
-    if (succeeded(parsePassPipeline(foldsim::beaconMapPipeline(*target, false), pm)) &&
+    // (Mapped as Beacon screens a fold: adders and compares timed by carry
+    // block on an FPGA.)
+    unsigned carryBlock = target->asic ? 0 : kBeaconCarryBlock;
+    if (succeeded(parsePassPipeline(foldsim::beaconMapPipeline(*target, false, carryBlock), pm)) &&
         succeeded(pm.run(*design)))
       if (auto d = foldsim::beaconDeepestLevels(*design, name, *target); succeeded(d))
         depth = *d;
@@ -5258,6 +5284,16 @@ LogicalResult StaticFolder::assignPageEngines() {
           if (llvm::none_of(rq, [&](unsigned q) { return pageEngines[e].reads[q]; }) &&
               llvm::none_of(wr, [&](unsigned q) { return pageEngines[e].writes[q]; }))
             break;
+        if (getenv("FOLDSIM_PPE_LOG")) {
+          llvm::errs() << "ppe: " << cls.name << ":" << vm.name << " reads " << rq.size()
+                       << " writes " << wr.size() << " -> engine " << e << "; blocked:";
+          for (unsigned x = 0; x < e; ++x) {
+            unsigned nr = llvm::count_if(rq, [&](unsigned q) { return pageEngines[x].reads[q] != 0; });
+            unsigned nw = llvm::count_if(wr, [&](unsigned q) { return pageEngines[x].writes[q] != 0; });
+            llvm::errs() << " e" << x << "(r" << nr << ",w" << nw << ")";
+          }
+          llvm::errs() << "\n";
+        }
         if (e == pageEngines.size()) {
           if (e >= pageEngineCap)
             return netlist.emitError("page engines: ")
@@ -14422,8 +14458,28 @@ LogicalResult StaticFolder::buildPPStream(
       return b.createOrFold<comb::ConcatOp>(
           SmallVector<Value>(parts.rbegin(), parts.rend()));
     };
-    Value wrData = reg(pack(words, width, dw), prefix + "_wr_data");
-    Value wrMask = reg(pack(masks, n * 9, dw / 8), prefix + "_wr_mask");
+    // (Zero while no write leaves: a register reset by the write valid's
+    // input, a flop's synchronous reset, so that a page engine merges its
+    // members' writes with an OR, without a select a member. A mask of
+    // whole rows is the write valid itself.)
+    Value idle = comb::OrOp::create(
+        b, hostReset, comb::XorOp::create(b, wvalid0, constant(1, 1)));
+    auto zeroReg = [&](Value v, const Twine &name) -> Value {
+      auto type = v.getType();
+      return keep(seq::FirRegOp::create(
+          b, v, hostClock, b.getStringAttr(name), idle,
+          hw::ConstantOp::create(b, type, 0), hw::InnerSymAttr{},
+          /*isAsync=*/false));
+    };
+    Value wrData = zeroReg(pack(words, width, dw), prefix + "_wr_data");
+    bool wholeRows = llvm::all_of(masks, [](Value m) {
+      auto c = m.getDefiningOp<hw::ConstantOp>();
+      return c && c.getValue().isAllOnes();
+    });
+    Value wrMask = wholeRows && dw / 8 == n * 9
+                       ? b.createOrFold<comb::ReplicateOp>(bits(dw / 8), wvalidQ)
+                       : zeroReg(pack(masks, n * 9, dw / 8), prefix + "_wr_mask");
+    vm.idleZero = true;
     Value zero1 = constant(1, 0);
     SmallVector<Value> values{read0,  rdInst, zero1,  wvalidQ, winstQ,
                               zero1,  wrData, wrMask, pending};
@@ -23540,8 +23596,10 @@ LogicalResult StaticFolder::buildSim() {
         wrInst.push_back(when(wv, b.createOrFold<comb::ConcatOp>(
                                       tagOf(out(4)), constant(1, 0))));
         wrRow.push_back(when(wv, rowOf(out(4), out(5))));
-        wrData.push_back(when(wv, zext(out(6), dw)));
-        wrMask.push_back(when(wv, zext(out(7), dw / 8)));
+        // (A member whose idle write fields are zero: ORed as they are.)
+        wrData.push_back(vm.idleZero ? zext(out(6), dw) : when(wv, zext(out(6), dw)));
+        wrMask.push_back(vm.idleZero ? zext(out(7), dw / 8)
+                                     : when(wv, zext(out(7), dw / 8)));
       }
       // Its link streams': a read's member tag its slot, a write's the top
       // bit (the stream's own {tag, instance} without the instance bit); its
