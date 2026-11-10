@@ -63,7 +63,8 @@ bool csdTerms(uint64_t x, unsigned width, unsigned maxTerms,
 llvm::SmallVector<SlotSegment> slotSegments(llvm::ArrayRef<uint64_t> rows,
                                             unsigned width,
                                             unsigned maxSegments = 64,
-                                            bool anyStride = false);
+                                            bool anyStride = false,
+                                            bool wrapAny = false);
 
 /// A class's pass sequence: instance i's pass at position `slots[i]` (mod
 /// the frame), as `instAt` (the instance at each position, -1 for none).

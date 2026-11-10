@@ -62,7 +62,8 @@ bool stepOk(uint64_t x, unsigned width) {
 } // namespace
 
 SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
-                                      unsigned maxSegments, bool anyStride) {
+                                      unsigned maxSegments, bool anyStride,
+                                      bool wrapAny) {
   uint64_t mask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
   size_t n = rows.size();
   auto row = [&](uint64_t k) { return k < n ? rows[k] & mask : 0; };
@@ -106,6 +107,11 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
     uint64_t bestLive = 1;
     auto consider = [&](SlotSegment seg) {
       uint64_t live = extend(seg);
+      // (A period not a power of two takes counters of its own beside the
+      // position's: worth them for a run of blocks, not for two or three
+      // rows a compare each would take.)
+      if (seg.stride > 1 && !llvm::isPowerOf2_64(seg.stride) && seg.count < 4)
+        return;
       if (seg.count && live > bestLive) {
         best = seg;
         bestLive = live;
@@ -129,6 +135,24 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
           ++seen;
           if (!llvm::isPowerOf2_64(p - k0))
             strides.push_back(p - k0);
+        }
+      // And the distances to the next runs' starts (a live row after a zero
+      // one), and between them: the period of blocks of consecutive rows
+      // (319 live rows every 320, a position table of a pass every 320
+      // positions less one, the first block cut short).
+      seen = 0;
+      uint64_t prevStart = k0;
+      auto addStride = [&](uint64_t d) {
+        if (d > 1 && !llvm::isPowerOf2_64(d) && !llvm::is_contained(strides, d))
+          strides.push_back(d);
+      };
+      for (uint64_t p = k0 + 1; p < n && seen < 8; ++p)
+        if (row(p) && !row(p - 1)) {
+          ++seen;
+          addStride(p - k0);
+          if (seen > 1)
+            addStride(p - prevStart);
+          prevStart = p;
         }
     }
     for (uint64_t s : starts)
@@ -163,9 +187,13 @@ SmallVector<SlotSegment> slotSegments(ArrayRef<uint64_t> rows, unsigned width,
             inner = -int64_t(negc);
           else
             continue;
+          // (A block of consecutive rows may wrap past the stride's boundary:
+          // with a power-of-two stride any block, with another period one of
+          // a constant value, the period's remainder tested on both sides.)
+          bool wrapOk = e == 1 && (p2 || (wrapAny && inner == 0 && (d & mask) == 0));
           uint64_t r = s % stride, len = 1;
           while ((len + 1) * e <= stride && s + len * e < n &&
-                 ((e == 1 && p2) || r + len * e < stride) && !covered[s + len * e] &&
+                 (wrapOk || r + len * e < stride) && !covered[s + len * e] &&
                  row(s + len * e) == ((row(s) + uint64_t(inner) * len) & mask))
             ++len;
           if (len >= 2 && stepOk(d, width)) {
@@ -229,6 +257,8 @@ static bool decodesExactly(ArrayRef<SlotSegment> segments,
         bool hit = idx >= seg.start && idx <= seg.end();
         if (seg.len == 1)
           hit &= rr == rs;
+        else if (rs + (seg.len - 1) * seg.istride >= d)   // a constant block wrapping
+          hit &= rr >= rs || rr < rs + seg.len - d;
         else
           hit &= rr >= rs && rr < rs + seg.len * seg.istride &&
                  (rr & (seg.istride - 1)) == (rs & (seg.istride - 1));
@@ -325,9 +355,16 @@ Value decodeSlotTable(
     return {};
   auto segments = slotSegments(rows, width, maxSegments, bool(divmod));
   // (Runs of any period are tried greedily, longest first: where that cuts
-  // the rest into more segments than the powers of two alone, those.)
-  if (segments.size() > maxSegments && divmod)
-    segments = slotSegments(rows, width, maxSegments, false);
+  // the rest into more segments than the powers of two alone, those; and
+  // with blocks of a constant wrapping a period's end, where fewer.)
+  if (divmod) {
+    for (bool any : {false, true}) {
+      auto other = slotSegments(rows, width, std::min<unsigned>(maxSegments, segments.size()),
+                                any, any);
+      if (other.size() < segments.size())
+        segments = std::move(other);
+    }
+  }
   if (segments.size() > maxSegments)
     return {};
   // The decoder's own arithmetic, at every index, against the rows: a
@@ -390,6 +427,14 @@ Value decodeSlotTable(
       if (seg.len == 1) {
         conds.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::eq, rr,
                                              constant(rType, rs)));
+      } else if (rs + (seg.len - 1) * seg.istride >= d) {
+        // A block of a constant wrapping past the period's end: the
+        // remainder at or past its start, or below its wrapped end.
+        conds.push_back(comb::OrOp::create(
+            b,
+            comb::ICmpOp::create(b, comb::ICmpPredicate::uge, rr, constant(rType, rs)),
+            comb::ICmpOp::create(b, comb::ICmpPredicate::ult, rr,
+                                 constant(rType, rs + seg.len - d))));
       } else {
         if (rs)
           conds.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge, rr,

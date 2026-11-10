@@ -54,15 +54,33 @@
 # NEG: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), 0 tables kept
 # Negative: a table needing more segments than K (a copy's passes 9 positions
 # apart, cut at the period: Driver/Inputs/fixedscratch, 128 leaves in a chain,
-# their rows streamed) stays a constant, counted, and the simulator stays
+# their rows streamed; K 4) stays a constant, counted, and the simulator stays
 # exact. FOLDSIM_SLOT_CHECK builds each decoded table beside its decoder: the
 # simulation stops where they differ.
 # RUN: cd %S/../Driver/Inputs/fixedscratch
-# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_PP_ROWS=balanced foldsim --srcs top128.f --top Top --out %t/neg2 --static --nest --modulo --bubbles --slot-segments 8 --state-in-ram Leaf::8 --state-in-ram-pp --storage Leaf:sir=block --state-scratch-bits 40000 --state-scratch-fixed Leaf > %t/neg2.log 2>&1
+# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_PP_ROWS=balanced foldsim --srcs top128.f --top Top --out %t/neg2 --static --nest --modulo --bubbles --slot-segments 4 --state-in-ram Leaf::8 --state-in-ram-pp --storage Leaf:sir=block --state-scratch-bits 40000 --state-scratch-fixed Leaf > %t/neg2.log 2>&1
 # RUN: FileCheck %s --check-prefix=NEG2 < %t/neg2.log
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/neg2 -DBUBBLES -Mdir %t/neg2/obj %S/Inputs/tb_pages.sv leaf.sv top128.sv %t/neg2/foldsim_sim.sv > %t/neg2/build.log 2>&1
 # RUN: %t/neg2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
 # NEG2: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), {{[1-9][0-9]*}} tables kept
+# The same at K 8: every table decodes, a block of consecutive rows each
+# period of the position counters (the run starts' distance, not a power of
+# two; a block of a constant wrapping the period's end).
+# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_PP_ROWS=balanced foldsim --srcs top128.f --top Top --out %t/per --static --nest --modulo --bubbles --slot-segments 8 --state-in-ram Leaf::8 --state-in-ram-pp --storage Leaf:sir=block --state-scratch-bits 40000 --state-scratch-fixed Leaf > %t/per.log 2>&1
+# RUN: FileCheck %s --check-prefix=PER < %t/per.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/per -DBUBBLES -Mdir %t/per/obj %S/Inputs/tb_pages.sv leaf.sv top128.sv %t/per/foldsim_sim.sv > %t/per/build.log 2>&1
+# RUN: %t/per/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# PER: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), 0 tables kept
+# And at K 2: a streamed PP class's pass values (resident index, stream bit,
+# window slot) the position's tables would keep are read through the
+# instance's rank in the frame (a counter beside the position registers,
+# posrank) and a table of the rank. Exact (two seeds).
+# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_PP_ROWS=balanced foldsim --srcs top128.f --top Top --out %t/rank --static --nest --modulo --bubbles --slot-segments 2 --state-in-ram Leaf::8 --state-in-ram-pp --storage Leaf:sir=block --state-scratch-bits 40000 --state-scratch-fixed Leaf > %t/rank.log 2>&1
+# RUN: FileCheck %s --check-prefix=RANK < %t/rank/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/rank -DBUBBLES -Mdir %t/rank/obj %S/Inputs/tb_pages.sv leaf.sv top128.sv %t/rank/foldsim_sim.sv > %t/rank/build.log 2>&1
+# RUN: %t/rank/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# RUN: %t/rank/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# RANK: %posrank{{[0-9]+}} = seq.firreg
 # --affine-auto (bits 0, K 1): a class whose slot rows do not decode within
 # K is placed affine and the frame scheduled again (lanes_late: Leaf, with
 # bubbles and ready lanes); exact. Where no frame places it affine (tree-arb:

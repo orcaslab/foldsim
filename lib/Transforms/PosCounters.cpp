@@ -38,6 +38,7 @@ void PosCounters::begin(unsigned ii_, unsigned posWidth_, Value clock_,
   advance = advance_;
   known.clear();
   cache.clear();
+  rankCache.clear();
 }
 
 void PosCounters::addReg(Value reg, Value next) {
@@ -129,6 +130,69 @@ std::pair<Value, Value> PosCounters::divmod(ImplicitLocOpBuilder &b, Value v,
     break;
   }
   cache[key] = out;
+  return out;
+}
+
+Value PosCounters::rank(ImplicitLocOpBuilder &b, Value v, ArrayRef<uint64_t> set,
+                        uint64_t key, function_ref<Value(Value)> inSet) {
+  auto ck = std::make_pair(v.getAsOpaquePointer(), key);
+  auto it = rankCache.find(ck);
+  if (it != rankCache.end())
+    return it->second;
+  uint64_t total = 0;
+  for (unsigned p = 0; p < ii && p < set.size(); ++p)
+    total += set[p] ? 1 : 0;
+  unsigned w = std::max(1u, unsigned(llvm::Log2_64_Ceil(total + 1)));
+  auto type = b.getIntegerType(w);
+  uint64_t mask = w >= 64 ? ~uint64_t(0) : (uint64_t(1) << w) - 1;
+  auto c = [&](uint64_t x) -> Value { return hw::ConstantOp::create(b, type, x & mask); };
+  auto eqc = [&](Value x, uint64_t k) -> Value {
+    return comb::ICmpOp::create(b, comb::ICmpPredicate::eq, x,
+                                hw::ConstantOp::create(b, x.getType(), k));
+  };
+  // The rank after `pos` stepped once: its own, and one more where `pos`
+  // is in the set.
+  auto stepped = [&](Value pos) -> Value {
+    Value r = rank(b, pos, set, key, inSet);
+    Value bit = inSet(pos);
+    Value inc = w > 1 ? b.createOrFold<comb::ConcatOp>(
+                            hw::ConstantOp::create(b, b.getIntegerType(w - 1), 0), bit)
+                      : bit;
+    return comb::AddOp::create(b, r, inc);
+  };
+  auto node = known.find(v);
+  assert(node != known.end() && "a position the counters do not know");
+  Node n = node->second;
+  Value out;
+  switch (n.kind) {
+  case Reg: {
+    auto reg = seq::FirRegOp::create(b, c(total), clock,
+                                     b.getStringAttr("posrank" + std::to_string(key % 100000)),
+                                     reset, c(total), hw::InnerSymAttr{},
+                                     /*isAsync=*/false, b.getIntegerAttr(type, total));
+    rankCache[ck] = reg;
+    reg.getNextMutable().assign(rank(b, n.a, set, key, inSet));
+    return reg;
+  }
+  case Next: {
+    Value end = comb::OrOp::create(b, eqc(n.a, ii - 1), eqc(n.a, ii));
+    Value step = comb::MuxOp::create(b, end, comb::MuxOp::create(b, go, c(0), c(total)),
+                                     stepped(n.a));
+    out = advance ? Value(comb::MuxOp::create(b, advance, step,
+                                              rank(b, n.a, set, key, inSet)))
+                  : step;
+    break;
+  }
+  case NextFree: {
+    Value end = comb::OrOp::create(b, eqc(n.a, ii - 1), eqc(n.a, ii));
+    out = comb::MuxOp::create(b, end, c(0), stepped(n.a));
+    break;
+  }
+  case Shown:
+    out = comb::MuxOp::create(b, n.bubble, c(total), rank(b, n.a, set, key, inSet));
+    break;
+  }
+  rankCache[ck] = out;
   return out;
 }
 

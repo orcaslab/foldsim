@@ -9760,6 +9760,19 @@ LogicalResult StaticFolder::schedule() {
     }
   }
 
+  // (FOLDSIM_SLOT_DUMP, a debug hook: each class's passes' slots, by
+  // instance.)
+  if (getenv("FOLDSIM_SLOT_DUMP"))
+    for (auto &cls : classes)
+      for (auto pass : {kReady, kState}) {
+        if (pass == kReady && !cls.hasReady)
+          continue;
+        llvm::errs() << "slot-dump " << cls.name << " " << (pass == kState ? "state" : "ready")
+                     << " stages " << cls.stages << " pp " << cls.pp << ":";
+        for (unsigned i = 0; i < cls.threads(); ++i)
+          llvm::errs() << " " << cls.slot[pass][i];
+        llvm::errs() << "\n";
+      }
   std::string text;
   llvm::raw_string_ostream os(text);
   os << "foldsim-fold-static: II = " << ii << "\n";
@@ -17204,6 +17217,12 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
       if (getenv("FOLDSIM_TABLE_SITES"))
         llvm::errs() << "table-dec " << site << " " << rows.size() << " " << width << " "
                      << foldsim::slotSequencerStats().segments - segsBefore << "\n";
+      if (const char *ds = getenv("FOLDSIM_TABLE_DUMP_SITE"); ds && int(site) == atoi(ds)) {
+        llvm::errs() << "table-rows " << site << " " << width << ":";
+        for (auto r : rows)
+          llvm::errs() << " " << r;
+        llvm::errs() << "\n";
+      }
       // (FOLDSIM_SLOT_CHECK, a debug hook: the table built beside its
       // decoder, and a simulation stops where they differ.)
       if (getenv("FOLDSIM_SLOT_CHECK")) {
@@ -18395,39 +18414,134 @@ LogicalResult StaticFolder::buildSim() {
       if (threads > 1)
         ctl.ppInst3 = table(b, at, pinstRow, idxWidth);
       ctl.ppRow3 = table(b, at, prowRow, rowWidth);
+      // A value of the pass's instance read through the instance's rank in
+      // the frame (the passes of the instances before it: a counter beside
+      // the position registers, PosCounters::rank) and a table of the rank
+      // (affine where the instances' order is), where that gives every pass
+      // its value; else a table of the position (as many segments as the
+      // schedule's irregular parts, which grow with the instances).
+      auto *posCtrs = foldsim::currentPosCounters();
+      auto byRank = [&](ArrayRef<uint64_t> setRows, ArrayRef<uint64_t> perRank,
+                        ArrayRef<uint64_t> rows, ArrayRef<uint8_t> valid,
+                        unsigned width) -> Value {
+        // (Only where the position's own table would be kept: the rank's
+        // counters cost more than a decoder of a few segments.)
+        auto plainSegs = [&] {
+          unsigned lim = gSlotSegments + 1;
+          return std::min(foldsim::slotSegments(rows, width, lim, true).size(),
+                          foldsim::slotSegments(rows, width, lim, false).size());
+        };
+        if (!getenv("FOLDSIM_NO_RANK") && posCtrs && posCtrs->knows(at) && gSlotSegments &&
+            plainSegs() > gSlotSegments) {
+          uint64_t mask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
+          bool ok = true;
+          uint64_t rk = 0;
+          for (unsigned p = 0; p < ii && ok; ++p) {
+            if (valid[p])
+              ok = rk < perRank.size() && (perRank[rk] & mask) == (rows[p] & mask);
+            rk += setRows[p] ? 1 : 0;
+          }
+          if (ok) {
+            uint64_t key = llvm::hash_combine_range(setRows.begin(), setRows.end());
+            Value r = posCtrs->rank(b, at, setRows, key, [&](Value pos) {
+              return table(b, pos, setRows, 1);
+            });
+            return table(b, r, perRank, width);
+          }
+        }
+        return table(b, at, rows, width);
+      };
+      // The instances in the order of their last passes (mod the frame), and
+      // the set of those positions.
+      SmallVector<unsigned> passOrder(threads);
+      for (unsigned i = 0; i < threads; ++i)
+        passOrder[i] = i;
+      auto lastPass = [&](unsigned i) {
+        int r = cls.slot[kState][i] - int(cls.stages) + int(cls.pp) - 1;
+        return unsigned(((r % int(ii)) + int(ii)) % int(ii));
+      };
+      llvm::stable_sort(passOrder, [&](unsigned x, unsigned y) { return lastPass(x) < lastPass(y); });
+      SmallVector<uint64_t> lastSet(ii + 1, 0);
+      SmallVector<uint8_t> passValid(ii + 1, 0);
+      for (unsigned i = 0; i < threads; ++i) {
+        lastSet[lastPass(i)] = 1;
+        for (unsigned j = 0; j < cls.pp; ++j) {
+          int r = cls.slot[kState][i] - int(cls.stages) + int(j);
+          passValid[unsigned(r) % ii] = 1;
+        }
+      }
       if (cls.ppPartial()) {
         // Partly resident: each pass's resident index and stream bit (of its
         // instance), read at the position.
         SmallVector<uint64_t> presRow(ii + 1, 0), pstrRow(ii + 1, 0);
+        // (The fixed pattern's index for every instance, a streamed one's
+        // unused: an affine table of the instance.)
+        auto resOf = [&](unsigned i) -> uint64_t {
+          if (cls.ppFixed)
+            return uint64_t(i / cls.ppFixedB) * cls.ppFixedR + i % cls.ppFixedB;
+          return cls.ppStreamed[i] ? 0 : cls.residentSlot[i];
+        };
         for (unsigned i = 0; i < threads; ++i)
           for (unsigned j = 0; j < cls.pp; ++j) {
             int r = cls.slot[kState][i] - int(cls.stages) + int(j);
             unsigned pos = unsigned(r) % ii;
-            presRow[pos] = cls.ppStreamed[i] ? 0 : cls.residentSlot[i];
+            presRow[pos] = resOf(i);
             pstrRow[pos] = cls.ppStreamed[i];
           }
-        ctl.ppRes3 = table(b, at, presRow, cls.ppResBits());
-        ctl.ppStr3 = table(b, at, pstrRow, 1);
+        SmallVector<uint64_t> resRank(threads, 0), strRank(threads, 0);
+        for (unsigned k = 0; k < threads; ++k) {
+          resRank[k] = resOf(passOrder[k]);
+          strRank[k] = cls.ppStreamed[passOrder[k]];
+        }
+        ctl.ppRes3 = byRank(lastSet, resRank, presRow, passValid, cls.ppResBits());
+        ctl.ppStr3 = byRank(lastSet, strRank, pstrRow, passValid, 1);
       }
       if (cls.ppHbm) {
         // Streamed: each pass's window slot (of its instance).
         SmallVector<uint64_t> pslotRow(ii + 1, 0);
+        SmallVector<uint8_t> strValid(ii + 1, 0);
         for (unsigned i = 0; i < threads; ++i)
           for (unsigned j = 0; j < cls.pp; ++j) {
             int r = cls.slot[kState][i] - int(cls.stages) + int(j);
             pslotRow[unsigned(r) % ii] = cls.windowSlot[i];
+            strValid[unsigned(r) % ii] = cls.ppStreamed[i];
           }
-        ctl.ppSlot3 = table(b, at, pslotRow, cls.ppSlotBits());
-        // And each prefetch read's slot (its instance's), by position.
+        // (A resident instance's slot unused: the streamed ones' count
+        // before it, so the slots run on as the instances do.)
+        SmallVector<uint64_t> slotRank(threads, 0);
+        uint64_t streamedBefore = 0;
+        for (unsigned k = 0; k < threads; ++k) {
+          unsigned i = passOrder[k];
+          slotRank[k] = cls.ppStreamed[i] ? cls.windowSlot[i] : streamedBefore;
+          streamedBefore += cls.ppStreamed[i] ? 1 : 0;
+        }
+        ctl.ppSlot3 = byRank(lastSet, slotRank, pslotRow, strValid, cls.ppSlotBits());
+        // And each prefetch read's slot (its instance's), by position: the
+        // rank in the prefetches' own order.
         SmallVector<int> pf;
         ppPrefetches(cls, cls.pageWindow, pf);
-        SmallVector<uint64_t> pfSlotRow(ii + 1, 0);
-        for (unsigned i = 0; i < threads; ++i)
-          for (unsigned j = 0; j < cls.pp && cls.ppStreamed[i]; ++j) {
+        SmallVector<uint64_t> pfSlotRow(ii + 1, 0), pfSet(ii + 1, 0);
+        SmallVector<uint8_t> pfValid(ii + 1, 0);
+        SmallVector<std::pair<unsigned, unsigned>> pfOrder;
+        for (unsigned i = 0; i < threads; ++i) {
+          if (!cls.ppStreamed[i])
+            continue;
+          for (unsigned j = 0; j < cls.pp; ++j) {
             int pos = pf[i] + int(j);
-            pfSlotRow[unsigned(((pos % int(ii)) + int(ii)) % int(ii))] = cls.windowSlot[i];
+            unsigned q = unsigned(((pos % int(ii)) + int(ii)) % int(ii));
+            pfSlotRow[q] = cls.windowSlot[i];
+            pfValid[q] = 1;
+            if (j + 1 == cls.pp) {
+              pfSet[q] = 1;
+              pfOrder.push_back({q, i});
+            }
           }
-        ctl.ppPrefSlot3 = table(b, at, pfSlotRow, cls.ppSlotBits());
+        }
+        llvm::sort(pfOrder);
+        SmallVector<uint64_t> pfRank;
+        for (auto [q, i] : pfOrder)
+          pfRank.push_back(cls.windowSlot[i]);
+        ctl.ppPrefSlot3 = byRank(pfSet, pfRank, pfSlotRow, pfValid, cls.ppSlotBits());
       }
     }
   }
