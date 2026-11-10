@@ -80,5 +80,7 @@
 # MLIR: seq.firmem.write_port %ram_ring[{{.*}}] = %vm1_rsp_data, clock %hostClock enable %vm1_rsp_valid
 # MLIR: %ram_ring_flight_queue = seq.firmem 0, 1, undefined, undefined : <64 x 6, mask 1>
 # MLIR: %ram_ring_flight_writes = seq.firmem 0, 1, undefined, undefined : <32 x 12, mask 1>
+# A prefetch's entry, its rank in the frame's prefetches mod R, is counted from the frame's first position (no table).
+# MLIR: %ram_ring_prank = seq.firreg
 # FAST: {{^}}MATCH 196 cycles in 4400 host cycles, H 22.00
 # CHECK: {{^}}MATCH

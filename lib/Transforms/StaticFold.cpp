@@ -20292,12 +20292,20 @@ LogicalResult StaticFolder::buildSim() {
     auto chain3 = [&](Value v, const Twine &n) {
       return reg(reg(reg(v, n + "2"), n + "1"), n + "0");
     };
-    rb.pref0 = resetReg(resetReg(resetReg(table(b, at, plan.prefValid, 1), prefix + "_pref2", 0),
-                                 prefix + "_pref1", 0),
+    Value pv3 = table(b, at, plan.prefValid, 1);
+    rb.pref0 = resetReg(resetReg(resetReg(pv3, prefix + "_pref2", 0), prefix + "_pref1", 0),
                         prefix + "_pref0", 0);
     rb.pinst0 = idxWidth ? chain3(tableCare(b, at, plan.prefInst, prefRows, idxWidth), prefix + "_pinst")
                          : constant(1, 0);
-    rb.pentry0 = chain3(tableCare(b, at, plan.prefEntry, prefRows, eb), prefix + "_pentry");
+    // A prefetch's entry is its rank in the frame's prefetches mod R
+    // (planRing), counted from the frame's first position: no table of the
+    // positions (whose rows break into segments as the schedule's runs do).
+    auto rankNext = backedges.get(b.getIntegerType(eb));
+    Value rank = resetReg(rankNext, prefix + "_prank", 0);
+    Value rank3 = comb::MuxOp::create(b, eq(at, 0), constant(eb, 0), rank);
+    rankNext.setValue(comb::AddOp::create(
+        b, rank3, eb > 1 ? b.createOrFold<comb::ConcatOp>(constant(eb - 1, 0), pv3) : pv3));
+    rb.pentry0 = chain3(rank3, prefix + "_pentry");
     Value irspValid = body->getArgument(image.firstInput);
     Value irspTag = body->getArgument(image.firstInput + 1);
     Value irspEntry = b.createOrFold<comb::ExtractOp>(b.getIntegerType(eb), irspTag, 1);
