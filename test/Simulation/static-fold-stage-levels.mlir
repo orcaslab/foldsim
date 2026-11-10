@@ -43,8 +43,12 @@
 // RUN: foldsim-opt %t/in.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top fold-stage-levels-class=Model:1})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=S1LOG
 // RUN: foldsim-opt %t/in.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top fold-stage-levels=1 fold-stage-levels-class=Mod*:off})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=KOFF
 // RUN: not foldsim-opt %t/in.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top fold-stage-levels-class=Nope:1})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=KNONE
+// Staged evaluation (stage-levels) of a class it cannot stage says why (its
+// logic keeps its depth): every reason, not the last one found.
+// RUN: foldsim-opt %t/in.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top stage-levels=4})" -o /dev/null 2>&1 | FileCheck %s --check-prefix=NOSTAGE
 // KOFF-NOT: fold-stage-levels:
 // KNONE: fold-stage-levels-class: 'Nope:1' matches no class
+// NOSTAGE: foldsim-fold-static: Model not staged at 4 levels: folded pipelines, black boxes
 
 // CHECK: {{^}}MATCH 4 outputs x 88 cycles
 

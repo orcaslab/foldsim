@@ -60,7 +60,9 @@ const BeaconTarget kTargets[] = {
 /// Vivado restructures a path that misses its period; for area, its common
 /// subexpressions shared and mapped to the fewest cells, as Vivado maps the
 /// rest of the design, module by module.
-std::string mapPipeline(const BeaconTarget &target, bool area) {
+} // namespace
+
+std::string foldsim::beaconMapPipeline(const BeaconTarget &target, bool area) {
   // Cells pack across small modules on a critical path; area keeps every
   // module, so each instance's resources stay its own.
   std::string pipeline =
@@ -85,6 +87,12 @@ std::string mapPipeline(const BeaconTarget &target, bool area) {
   return pipeline + "synth-generic-lut-mapper{max-lut-size=" +
          std::to_string(target.cutSize) + " strategy=" +
          (area ? "area" : "timing") + "},cse)";
+}
+
+namespace {
+
+std::string mapPipeline(const BeaconTarget &target, bool area) {
+  return foldsim::beaconMapPipeline(target, area);
 }
 
 struct BeaconMapPass : public foldsim::impl::BeaconMapBase<BeaconMapPass> {
