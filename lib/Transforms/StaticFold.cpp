@@ -193,6 +193,9 @@ struct Class {
   /// (planStateInRam, for the scratch's placement).
   bool ppHbm = false;
   uint64_t rowStateBits = 0;
+  /// A paged class's register bits an instance pages (planScratch, for the
+  /// HBM bits a frame of its pages streamed).
+  uint64_t pageStateBits = 0;
   /// Partly resident (state-scratch-bits' remainder): the instances kept in
   /// the scratch (0: all stream), and per instance whether it streams and
   /// its resident index (chooseStreamWindows: spread over the frame).
@@ -8309,8 +8312,10 @@ LogicalResult StaticFolder::planStateInRam() {
               : 1;
     }
     // RAMB36 at 512 x 72 while the rows fit, else URAM288 (4096 x 72).
+    // (state-scratch-fixed: URAM288 at every instance count, the scratch's
+    // RAM the same.)
     if (style.empty())
-      style = uint64_t(entries) * p <= 512 ? "block" : "ultra";
+      style = !stateScratchFixed && uint64_t(entries) * p <= 512 ? "block" : "ultra";
     cls.sir = p;
     cls.sirStyle = style;
     cls.rowStateBits = bits;
@@ -12539,8 +12544,10 @@ LogicalResult StaticFolder::planScratchFixed() {
       if (hbmRule || cls.pagesOffChip)
         continue;
       uint64_t bits = regBits(cls);
-      item.perInstance =
-          uint64_t(cls.page) * llvm::divideCeil(llvm::divideCeil(bits, cls.page), 72) * 72;
+      cls.pageStateBits = bits;
+      item.columns = llvm::divideCeil(llvm::divideCeil(bits, cls.page), 72);
+      item.rowsPow = llvm::PowerOf2Ceil(cls.page);
+      item.perInstance = uint64_t(cls.page) * item.columns * 72;
     } else {
       continue;
     }
@@ -12552,17 +12559,89 @@ LogicalResult StaticFolder::planScratchFixed() {
   if (items.empty())
     return success();
   uint64_t left = budget > forced ? budget - forced : 0;
+  // The shares as the RAM primitives take them (URAM288 4,096 x 72, RAMB36
+  // 512 x 72, by the class's kind): a PP class's resident RAM cap x 2^P
+  // rows deep, a paged class's page RAMs 2^ceil(log2 cap) x pages. The
+  // largest proportional shares (cap_c = n_c x V / rows, V the same for
+  // every class) whose primitives fit in the scratch; each share then fills
+  // its primitives' depth.
+  auto depthOf = [&](const Item &item) -> uint64_t {
+    return item.ultra ? 4096 : 512;
+  };
+  auto rowsFor = [&](const Item &item, uint64_t cap) -> uint64_t {
+    return item.pp ? cap * item.rowsPow
+                   : (cap ? llvm::PowerOf2Ceil(cap) : 0) * item.rowsPow;
+  };
+  auto costOf = [&](const Item &item, uint64_t cap) -> uint64_t {
+    uint64_t d = depthOf(item);
+    return item.columns * llvm::divideCeil(rowsFor(item, cap), d) * d * 72;
+  };
+  auto fill = [&](const Item &item, uint64_t cap) -> uint64_t {
+    if (!cap)
+      return 0;
+    uint64_t d = depthOf(item);
+    uint64_t rows = llvm::divideCeil(rowsFor(item, cap), d) * d;
+    if (item.pp)
+      return rows / item.rowsPow;
+    // (A paged class's: a power of two of instances.)
+    return llvm::bit_floor(rows / item.rowsPow);
+  };
+  auto shareAt = [&](const Item &item, uint64_t v) -> uint64_t {
+    return uint64_t((unsigned __int128)classes[item.c].threads() * v / total);
+  };
+  uint64_t lo = 0, hi = std::max<uint64_t>(1, left) * 64;
+  while (lo < hi) {
+    uint64_t mid = lo + (hi - lo + 1) / 2, cost = 0;
+    for (auto &item : items)
+      cost += costOf(item, shareAt(item, mid));
+    if (cost <= left)
+      lo = mid;
+    else
+      hi = mid - 1;
+  }
+  // The primitives the proportional shares leave: a primitive's depth more
+  // to the classes in turn, the largest share of the rows first, while one
+  // fits (the order and the steps depend on the classes' rows per instance
+  // and their ratio alone, not on the instance count).
+  SmallVector<uint64_t> caps;
+  uint64_t used = 0;
+  for (auto &item : items) {
+    caps.push_back(fill(item, shareAt(item, lo)));
+    used += costOf(item, caps.back());
+  }
+  SmallVector<unsigned> byShare(items.size());
+  for (unsigned k = 0; k < items.size(); ++k)
+    byShare[k] = k;
+  llvm::stable_sort(byShare, [&](unsigned x, unsigned y) {
+    return classes[items[x].c].threads() * items[x].perInstance >
+           classes[items[y].c].threads() * items[y].perInstance;
+  });
+  for (bool more = true; more;) {
+    more = false;
+    for (unsigned k : byShare) {
+      auto &item = items[k];
+      uint64_t d = depthOf(item);
+      uint64_t next = item.pp ? caps[k] + d / item.rowsPow
+                              : std::max<uint64_t>(1, 2 * caps[k]);
+      next = fill(item, next);
+      uint64_t extra = costOf(item, next) - costOf(item, caps[k]);
+      if (next > caps[k] && used + extra <= left) {
+        used += extra;
+        caps[k] = next;
+        more = true;
+      }
+    }
+  }
   uint64_t resident = 0, allocated = 0, streamed = 0;
   unsigned streamedClasses = 0;
-  for (auto &item : items) {
+  for (auto [k, item] : llvm::enumerate(items)) {
     auto &cls = classes[item.c];
     unsigned n = cls.threads();
-    // Its share, in instances: n * left / total (128-bit: n * left).
-    unsigned cap = unsigned(std::min<uint64_t>(
-        UINT32_MAX, uint64_t((unsigned __int128)n * left / total)));
+    // Its share, in instances, filling its primitives.
+    unsigned cap = unsigned(std::min<uint64_t>(UINT32_MAX, caps[k]));
     if (!item.pp) {
       cls.pageCapacity = cap;
-      uint64_t share = uint64_t(cap) * item.perInstance;
+      uint64_t share = costOf(item, cap);
       allocated += share;
       if (n <= cap) {
         resident += uint64_t(n) * item.perInstance;
@@ -12587,7 +12666,7 @@ LogicalResult StaticFolder::planScratchFixed() {
     // the landing windows and the HBM path are there at every count.
     if (n < 32) {
       // (Few instances: resident whole while its share holds them.)
-      allocated += uint64_t(cap) * item.perInstance;
+      allocated += costOf(item, cap);
       if (n <= cap) {
         resident += uint64_t(n) * item.perInstance;
         continue;
@@ -12605,8 +12684,14 @@ LogicalResult StaticFolder::planScratchFixed() {
     for (unsigned b = 16; b <= std::min(n, 1024u); b *= 2) {
       unsigned k = n / b;
       unsigned rr = unsigned(std::min<uint64_t>(b - b / 16, cap / k));
+      // (The streamed instances a multiple of 8, or of half their count
+      // when fewer, so that a landing window of 8 slots divides them.)
+      auto streamsOk = [&](unsigned x) {
+        uint64_t s = uint64_t(n) - uint64_t(k) * x;
+        return s % std::max<uint64_t>(1, std::min<uint64_t>(8, s / 2)) == 0;
+      };
       SmallVector<std::pair<bool, unsigned>> terms;
-      while (rr && !foldsim::csdTerms(rr, 32, 3, terms))
+      while (rr && (!foldsim::csdTerms(rr, 32, 3, terms) || !streamsOk(rr)))
         --rr;
       if (uint64_t(k) * rr > uint64_t(blocks) * r) {
         B = b;
@@ -12622,13 +12707,13 @@ LogicalResult StaticFolder::planScratchFixed() {
     cls.ppCapacity = r ? cap : 0;
     if (r && cls.sirStyle.empty())
       cls.sirStyle = "ultra";
-    allocated += uint64_t(cls.ppCapacity) * item.perInstance;
+    allocated += costOf(item, cls.ppCapacity);
     resident += uint64_t(cls.ppResident) * item.perInstance;
     streamed += uint64_t(n - cls.ppResident) * item.perInstance;
     ++streamedClasses;
     llvm::errs() << "foldsim-fold-static: state-scratch: fixed: " << cls.name
                  << ": a share of " << cap << " instances ("
-                 << uint64_t(cls.ppCapacity) * item.perInstance << " bits); "
+                 << costOf(item, cls.ppCapacity) << " bits); "
                  << cls.ppResident << " of " << n << " resident (" << r
                  << " of each " << B << "), " << n - cls.ppResident
                  << " stream from HBM\n";
@@ -12712,6 +12797,7 @@ LogicalResult StaticFolder::planScratch() {
       item.forced = true;
     } else if (cls.page && !cls.pagesOffChip && !cls.sirMixed) {
       uint64_t perInstance = regBits(cls);
+      cls.pageStateBits = perInstance;
       item.bits = entries * perInstance;
       for (auto &rule : storageRules)
         if (rule.model == model && !rule.regs && rule.store == "pages" &&
@@ -13106,7 +13192,7 @@ LogicalResult StaticFolder::chooseStreamWindows() {
   for (auto &cls : classes)
     if (cls.page && cls.pagesOffChip)
       hbmBits += 2 * uint64_t(cls.threads()) * cls.page *
-                 llvm::divideCeil(cls.rowStateBits, cls.page);
+                 llvm::divideCeil(std::max(cls.rowStateBits, cls.pageStateBits), cls.page);
   if (hbmBits) {
     // The busiest master bounds it too (a master's share of the usable).
     uint64_t perMaster = kStreamBitsPerCycle / kStreamMasters;
@@ -16540,12 +16626,34 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
   if (gSlotSegments && !gTableRaw && int(indexWidth) >= minIndexBits) {
     auto *pc = foldsim::currentPosCounters();
     bool counted = pc && pc->knows(index);
-    if (Value decoded = foldsim::decodeSlotTable(
-            b, index, rows, width, gSlotSegments,
-            counted ? llvm::function_ref<std::pair<Value, Value>(unsigned)>(
-                          [&](unsigned d) { return pc->divmod(b, index, d); })
-                    : nullptr))
+    if (Value decoded = tryDecodeTable(b, index, rows, width)) {
+      // (FOLDSIM_SLOT_CHECK, a debug hook: the table built beside its
+      // decoder, and a simulation stops where they differ.)
+      if (getenv("FOLDSIM_SLOT_CHECK")) {
+        gTableRaw = true;
+        Value raw = table(b, index, rows, width, site);
+        gTableRaw = false;
+        auto mod = decoded.getParentBlock()->getParentOp();
+        Value clk;
+        if (auto hm = dyn_cast<hw::HWModuleOp>(mod))
+          for (auto [k, name] : llvm::enumerate(hm.getInputNames()))
+            if (cast<StringAttr>(name).getValue() == "hostClock")
+              clk = hm.getBodyBlock()->getArgument(k);
+        if (clk) {
+          Value ne = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, decoded, raw);
+          Value clock = seq::FromClockOp::create(b, clk);
+          std::string what = ("foldsim: slot-sequencer: decoder differs from its table (line " + Twine(site) + ", " +
+                              Twine(rows.size()) + " x " + Twine(width) + ")").str();
+          sv::AlwaysOp::create(b, ArrayRef{sv::EventControl::AtPosEdge},
+                               ArrayRef{clock}, [&] {
+            sv::IfOp::create(b, ne, [&] {
+              sv::FatalProceduralOp::create(b, 1, b.getStringAttr(what));
+            });
+          });
+        }
+      }
       return decoded;
+    }
     // A position table through a class's pass sequence: the sequence's
     // passes and instance at p + offset (position tables, the same for every
     // table of that class and offset, so one after CSE) and the table's
@@ -16585,6 +16693,20 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
         llvm::errs() << " [" << sg.start << "+" << sg.stride << "j=" << sg.value
                      << "+" << sg.step << "j x" << sg.count << "]";
       llvm::errs() << "\n";
+    }
+    // (A debug hook: each kept table's rows, a line each, appended to the
+    // file FOLDSIM_TABLE_DUMP names.)
+    if (const char *dump = getenv("FOLDSIM_TABLE_DUMP")) {
+      std::error_code ec;
+      llvm::raw_fd_ostream os(dump, ec, llvm::sys::fs::OF_Append);
+      if (!ec) {
+        os << site << " " << width << " " << indexWidth << " "
+           << (foldsim::currentPosCounters() && foldsim::currentPosCounters()->knows(index))
+           << ":";
+        for (auto r : rows)
+          os << " " << r;
+        os << "\n";
+      }
     }
   }
   // One constant of the whole array (what canonicalization makes of an
@@ -16639,11 +16761,34 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
     return {};
   auto *pc = foldsim::currentPosCounters();
   bool counted = pc && pc->knows(index);
-  return foldsim::decodeSlotTable(
-      b, index, rows, width, gSlotSegments,
-      counted ? llvm::function_ref<std::pair<Value, Value>(unsigned)>(
-                    [&](unsigned d) { return pc->divmod(b, index, d); })
-              : nullptr);
+  auto byCounters = [&](unsigned d) { return pc->divmod(b, index, d); };
+  llvm::function_ref<std::pair<Value, Value>(unsigned)> divmod = nullptr;
+  if (counted)
+    divmod = byCounters;
+  if (Value decoded =
+          foldsim::decodeSlotTable(b, index, rows, width, gSlotSegments, divmod))
+    return decoded;
+  // A one-bit table whose zero rows are the fewer segments (a set of nearly
+  // every position: a copy's passes but a few holes): its complement
+  // decoded and inverted, zero past the rows.
+  if (width != 1)
+    return {};
+  SmallVector<uint64_t> inverse(rows.size());
+  for (auto [k, r] : llvm::enumerate(rows))
+    inverse[k] = (r & 1) ^ 1;
+  Value decoded =
+      foldsim::decodeSlotTable(b, index, inverse, 1, gSlotSegments, divmod);
+  if (!decoded)
+    return {};
+  unsigned indexWidth = hw::getBitWidth(index.getType());
+  Value v = comb::XorOp::create(b, decoded,
+                                hw::ConstantOp::create(b, b.getI1Type(), 1));
+  if (rows.size() < (uint64_t(1) << indexWidth))
+    v = comb::AndOp::create(
+        b, v,
+        comb::ICmpOp::create(b, comb::ICmpPredicate::ult, index,
+                             hw::ConstantOp::create(b, index.getType(), rows.size())));
+  return v;
 }
 
 void StaticFolder::buildFrameTable(bool stalls) {
@@ -20533,7 +20678,29 @@ LogicalResult StaticFolder::buildSim() {
         for (unsigned d = 0; d < window && d < ii; ++d)
           inflight[q] += st.popValid[(q + ii - d) % ii];
       unsigned cw = llvm::Log2_32_Ceil(window + 1);
-      Value count = table(b, next, inflight, cw);
+      // (Where the count does not decode: the sum of the window's landings,
+      // each the landing table a position before, when every one decodes.)
+      Value count = tryDecodeTable(b, next, inflight, cw);
+      if (!count) {
+        SmallVector<Value> parts;
+        for (unsigned d = 0; d < window && d < ii; ++d) {
+          SmallVector<uint64_t> landed(ii + 1, 0);
+          for (unsigned q = 0; q < ii; ++q)
+            landed[q] = st.popValid[(q + ii - d) % ii];
+          Value bit = tryDecodeTable(b, next, landed, 1);
+          if (!bit) {
+            parts.clear();
+            break;
+          }
+          parts.push_back(cw > 1 ? b.createOrFold<comb::ConcatOp>(constant(cw - 1, 0), bit)
+                                 : bit);
+        }
+        count = parts.empty() ? Value(table(b, next, inflight, cw))
+                : parts.size() == 1 ? parts[0]
+                                    : Value(comb::AddOp::create(b, parts, false));
+      }
+      if (!count)
+        count = table(b, next, inflight, cw);
       SmallVector<Value> clear;
       for (unsigned d = 0; d < window; ++d) {
         Value at = comb::AddOp::create(b, sb.popPtr, constant(ib, d));

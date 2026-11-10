@@ -44,14 +44,25 @@
 # RUN: FileCheck %s --check-prefix=LOG < %t/aff.log
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DCOPIES2 -DIW=1 -Mdir %t/aff/obj %S/Inputs/tb_vmem.sv top.sv %t/aff/foldsim_sim.sv > %t/aff/build.log 2>&1
 # RUN: %t/aff/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=40 +bubble=60 +burst=8 +stall=20 +full=20 | FileCheck %s
-# Negative: a table needing more segments than K (here K = 1) stays a
-# constant, counted, and the simulator stays exact.
+# K = 1: every table here is a one-bit set of one run, or of one run of
+# zeros (its complement decoded and inverted); exact.
 # RUN: cd %S/../Driver/Inputs/vmem
 # RUN: foldsim --srcs top.f --top Top --out %t/neg --static --modulo --min-ii 160 --virtual-memories ram --copies Leaf:2 --slot-segments 1 Leaf > %t/neg.log 2>&1
 # RUN: FileCheck %s --check-prefix=NEG < %t/neg.log
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DCOPIES2 -DIW=1 -Mdir %t/neg/obj %S/Inputs/tb_vmem.sv top.sv %t/neg/foldsim_sim.sv > %t/neg/build.log 2>&1
 # RUN: %t/neg/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +lo=1 +hi=40 +stall=20 | FileCheck %s
-# NEG: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), {{[1-9][0-9]*}} tables kept
+# NEG: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), 0 tables kept
+# Negative: a table needing more segments than K (a copy's passes 9 positions
+# apart, cut at the period: Driver/Inputs/fixedscratch, 128 leaves in a chain,
+# their rows streamed) stays a constant, counted, and the simulator stays
+# exact. FOLDSIM_SLOT_CHECK builds each decoded table beside its decoder: the
+# simulation stops where they differ.
+# RUN: cd %S/../Driver/Inputs/fixedscratch
+# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_PP_ROWS=balanced foldsim --srcs top128.f --top Top --out %t/neg2 --static --nest --modulo --bubbles --slot-segments 8 --state-in-ram Leaf::8 --state-in-ram-pp --storage Leaf:sir=block --state-scratch-bits 40000 --state-scratch-fixed Leaf > %t/neg2.log 2>&1
+# RUN: FileCheck %s --check-prefix=NEG2 < %t/neg2.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/neg2 -DBUBBLES -Mdir %t/neg2/obj %S/Inputs/tb_pages.sv leaf.sv top128.sv %t/neg2/foldsim_sim.sv > %t/neg2/build.log 2>&1
+# RUN: %t/neg2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# NEG2: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), {{[1-9][0-9]*}} tables kept
 # --affine-auto (bits 0, K 1): a class whose slot rows do not decode within
 # K is placed affine and the frame scheduled again (lanes_late: Leaf, with
 # bubbles and ready lanes); exact. Where no frame places it affine (tree-arb:
