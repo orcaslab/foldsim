@@ -1,0 +1,33 @@
+# REQUIRES: verilator
+# `--lane-scan` prefix stages: a found-flag priority loop over the top's eight
+# Leaf lanes (Driver/Inputs/lane-prefix) canonicalizes into a chain where
+# lane j's ops read lane j - 1's (found_j = found_{j-1} | onehot_j, onehot_j =
+# req_j & ~found_{j-1}). From the stage where every lane's ops are alike, the
+# stages are a lane cell's packs linked lane to lane (st<k>_in/out); the top
+# keeps the first stages, the chain's start. Exact against the target,
+# channels stalled or not, and with the cell in two copies, bubbles and chain
+# cuts.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/lane-prefix
+# RUN: foldsim --srcs top.f --top Top --out %t/zl --static --nest --modulo --compact-links --zero-latency-links --zero-latency-chains --lane-scan Leaf 2>&1 | FileCheck %s --check-prefix=SCAN
+# RUN: FileCheck %s --check-prefix=TOP < %t/zl/flat.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/zl/obj %S/Inputs/tb_reset.sv top.sv %t/zl/foldsim_sim.sv > %t/zl/build.log 2>&1
+# RUN: %t/zl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/zl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=40 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/cp --static --nest --modulo --compact-links --bubbles --share-links --zero-latency-links --zero-latency-chains --zero-chain-hops 2 --copies Top_lane_Leaf:2 --lane-scan Leaf 2>&1 | FileCheck %s --check-prefix=SCAN
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/cp/obj %S/Inputs/tb_reset.sv top.sv %t/cp/foldsim_sim.sv > %t/cp/build.log 2>&1
+# RUN: %t/cp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 +bubble=0 | FileCheck %s
+# RUN: %t/cp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=40 +bubble=30 | FileCheck %s
+
+# SCAN: lane-scan: cell Top_lane_Leaf
+# SCAN: lane-scan: Top lanes Leaf x8: {{.*}}scans stage 3 (2 chains, 2 bits)
+
+# The cell: the stages' values in and out.
+# TOP-LABEL: hw.module @Top_lane_Leaf(
+# TOP-SAME: st0_in
+# TOP-SAME: st0_out
+# The top: the eight cells chained from the start stage.
+# TOP-LABEL: hw.module @Top(
+# TOP-COUNT-8: hw.instance "lane_Leaf_{{[0-7]}}" @Top_lane_Leaf(
+# TOP: hw.output
+
+# CHECK: MATCH

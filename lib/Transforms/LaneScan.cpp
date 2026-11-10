@@ -58,6 +58,7 @@
 #include "llvm/ADT/SetVector.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/raw_ostream.h"
+#include <climits>
 #include <map>
 
 namespace foldsim {
@@ -70,7 +71,7 @@ using namespace circt;
 
 namespace {
 
-enum class Kind : uint8_t { Scalar, Elem, Vec, Arr, Multi };
+enum class Kind : uint8_t { Scalar, Elem, Vec, Arr, Multi, Pfx };
 
 /// What a value of the parent is, lane-wise.
 struct Info {
@@ -95,6 +96,14 @@ struct Info {
   static Info elem(int lane) {
     Info i;
     i.kind = Kind::Elem;
+    i.lane = lane;
+    return i;
+  }
+  /// A stage of a prefix chain: a value over lanes 0..lane, computed at lane
+  /// `lane` from that lane's values and the previous stage's.
+  static Info pfx(int lane) {
+    Info i;
+    i.kind = Kind::Pfx;
     i.lane = lane;
     return i;
   }
@@ -197,6 +206,10 @@ struct Scan {
   DenseSet<Value> backward;
   std::vector<std::vector<Value>> packMembers; // pack -> lane -> member
   std::vector<bool> packComplete;
+  // The first lane (stage) of a pack: 0 but for a prefix chain's packs,
+  // whose first stages the parent computes (they read the start).
+  std::vector<int> packFirst;
+  Value tmpl(int p) { return packMembers[p][packFirst[p]]; }
   // Carry chains: comb.add ops whose result is a Vec.
   DenseSet<Operation *> carries;
   // Assembled values: the bits of values over several lanes built by
@@ -227,6 +240,8 @@ struct Scan {
     return it == info.end() ? s : it->second;
   }
   bool isElem(Value v) { return get(v).kind == Kind::Elem; }
+  bool isPfx(Value v) { return get(v).kind == Kind::Pfx; }
+  bool isLaneVal(Value v) { return isElem(v) || isPfx(v); }
 
   void classify();
   Info transfer(Operation *op, unsigned result);
@@ -443,6 +458,10 @@ bool Scan::bitsOf(Value v, std::vector<BitSrc> &out) {
     out = std::move(tmp);
     return true;
   }
+  case Kind::Pfx:
+    for (int64_t b = 0; b < w; ++b)
+      out.push_back({BitSrc::Lane, i.lane, v, unsigned(b)});
+    return true;
   case Kind::Vec:
     out.resize(w);
     for (unsigned j = 0; j < F; ++j)
@@ -623,11 +642,24 @@ Info Scan::assemble(Operation *op, Value res) {
 Info Scan::transfer(Operation *op, unsigned result) {
   Info r = transferBase(op, result);
   Value res = op->getResult(result);
-  if (r.kind == Kind::Multi &&
-      isa<comb::ConcatOp, comb::ExtractOp, comb::AndOp, comb::OrOp,
-          comb::XorOp, comb::ReplicateOp, comb::ShlOp, comb::ShrUOp,
-          comb::MuxOp>(op))
+  bool wiring = isa<comb::ConcatOp, comb::ExtractOp, comb::AndOp, comb::OrOp,
+                    comb::XorOp, comb::ReplicateOp, comb::ShlOp, comb::ShrUOp,
+                    comb::MuxOp>(op);
+  if (r.kind == Kind::Multi && wiring)
     return assemble(op, res);
+  // Two neighbors' pieces put side by side (an OR of disjoint shifted
+  // pieces) are wiring, not a prefix stage.
+  if (r.kind == Kind::Pfx && wiring) {
+    Info a = assemble(op, res);
+    if (a.kind != Kind::Multi)
+      return a;
+    auto it = bits.find(res);
+    if (it != bits.end() &&
+        llvm::none_of(it->second,
+                      [](const BitSrc &b) { return b.k == BitSrc::Opaque; }))
+      return a;
+    bits.erase(res);
+  }
   return r;
 }
 
@@ -748,6 +780,29 @@ Info Scan::transferBase(Operation *op, unsigned result) {
     return Info::multi();
   }
 
+  // A prefix chain's stage: comb logic over lane j's values and stage j - 1's
+  // (or lane j - 1's), and the parent's.
+  if (isa<comb::CombDialect>(op->getDialect()) &&
+      !isa<comb::ConcatOp, comb::ExtractOp, comb::ReplicateOp>(op)) {
+    int hi = -1, lo = INT_MAX;
+    bool lanesOnly = true, anyPfx = false;
+    for (Value v : operands) {
+      auto &i = get(v);
+      if (i.kind == Kind::Scalar)
+        continue;
+      if (i.kind != Kind::Elem && i.kind != Kind::Pfx) {
+        lanesOnly = false;
+        break;
+      }
+      anyPfx |= i.kind == Kind::Pfx;
+      hi = std::max(hi, i.lane);
+      lo = std::min(lo, i.lane);
+    }
+    if (lanesOnly && hi >= 0 && hi - lo == 1)
+      return Info::pfx(hi);
+    if (lanesOnly && hi >= 0 && hi == lo && anyPfx)
+      return Info::pfx(hi);
+  }
   // Ops whose packed lane vectors stay lane vectors.
   bool bitwise = isa<comb::AndOp, comb::OrOp, comb::XorOp, seq::FirRegOp,
                      seq::CompRegOp>(op);
@@ -891,11 +946,14 @@ void Scan::classify() {
 }
 
 /// A value's operand descriptor for the local signature.
-static void describe(Scan &s, Value v, raw_ostream &os) {
+static void describe(Scan &s, Value v, raw_ostream &os, int at = -1) {
   auto &i = s.get(v);
   switch (i.kind) {
   case Kind::Elem:
-    os << "E";
+  case Kind::Pfx:
+    // A lane value: by its lane relative to the reader's (a prefix stage
+    // reads the previous lane's), whether a lane's own or a stage's.
+    os << "L" << (at >= 0 ? i.lane - at : 0);
     return;
   case Kind::Vec:
     os << "V" << v.getAsOpaquePointer();
@@ -933,12 +991,13 @@ void Scan::computePacks() {
   packOf.clear();
   packMembers.clear();
   packComplete.clear();
+  packFirst.clear();
   // The Elem values and their local signatures.
   SmallVector<Value> elems;
   DenseMap<Value, std::string> local;
   for (auto &op : *parent.getBodyBlock())
     for (auto [r, v] : llvm::enumerate(op.getResults())) {
-      if (!isElem(v))
+      if (!isLaneVal(v))
         continue;
       std::string sig;
       llvm::raw_string_ostream os(sig);
@@ -971,7 +1030,7 @@ void Scan::computePacks() {
           os << t << ",";
         os << "(";
         for (Value o : op.getOperands()) {
-          describe(*this, o, os);
+          describe(*this, o, os, get(v).lane);
           os << ",";
         }
         os << ")";
@@ -999,8 +1058,16 @@ void Scan::computePacks() {
                 sig += std::to_string(pid.lookup(pc.src)) + ",";
           } else if (!slice) {
             sig += "|";
-            for (Value o : op->getOperands())
-              sig += isElem(o) ? std::to_string(pid.lookup(o)) + "," : "-,";
+            for (Value o : op->getOperands()) {
+              // A stage's read of the previous stage: by what it is, not by
+              // its own pack (which a chain's start makes differ stage by
+              // stage).
+              if (isLaneVal(o) && get(o).lane == get(v).lane - 1)
+                sig += "L" + local[o] + ",";
+              else
+                sig += isLaneVal(o) ? std::to_string(pid.lookup(o)) + ","
+                                    : "-,";
+            }
           }
         }
       auto [it, _] = ids.try_emplace(sig, ids.size());
@@ -1013,18 +1080,37 @@ void Scan::computePacks() {
   }
   packMembers.assign(count, std::vector<Value>(F));
   packComplete.assign(count, true);
+  packFirst.assign(count, 0);
+  std::vector<bool> isP(count, false);
   for (Value v : elems) {
     int p = pid[v];
     packOf[v] = p;
+    isP[p] = isP[p] || isPfx(v);
     auto &slot = packMembers[p][get(v).lane];
     if (slot)
       packComplete[p] = false; // two members in one lane
     slot = v;
   }
-  for (unsigned p = 0; p < count; ++p)
-    for (Value m : packMembers[p])
-      if (!m)
+  // A prefix chain's pack starts at its first stage (the parent computes
+  // the ones before, the chain's start); from there every stage once.
+  for (unsigned p = 0; p < count; ++p) {
+    unsigned first = 0;
+    if (isP[p])
+      while (first < F && !packMembers[p][first])
+        ++first;
+    packFirst[p] = first;
+    // A stage pack may also end early (the last stage's value unread, so
+    // gone): its cells compute it anyway, unused.
+    unsigned last = F;
+    if (isP[p])
+      while (last > first && !packMembers[p][last - 1])
+        --last;
+    if (first >= F || (isP[p] && (first > 2 || last - first < 2)))
+      packComplete[p] = false;
+    for (unsigned j = first; j < last; ++j)
+      if (!packMembers[p][j])
         packComplete[p] = false;
+  }
 }
 
 /// Whether `values` are the members of one complete pack, every lane once.
@@ -1104,7 +1190,8 @@ bool Scan::matchPatterns() {
           v = unalias(v);
         auto *d = v.getDefiningOp();
         if (depth < 64 && d && d->getName() == op.getName() &&
-            !isa<comb::AddOp>(op) && get(v).kind == Kind::Multi &&
+            !isa<comb::AddOp>(op) &&
+            (get(v).kind == Kind::Multi || get(v).kind == Kind::Pfx) &&
             !patterns.count(d)) {
           for (Value o : d->getOperands())
             flatten(o, depth + 1);
@@ -1353,7 +1440,8 @@ bool Scan::orLanes(Value v, SmallVectorImpl<std::pair<int, Value>> &out,
     return true;
   }
   auto o = v.getDefiningOp<comb::OrOp>();
-  if (!o || depth > 64 || get(v).kind != Kind::Multi)
+  if (!o || depth > 64 ||
+      (get(v).kind != Kind::Multi && get(v).kind != Kind::Pfx))
     return false;
   for (Value x : o.getInputs())
     if (!orLanes(x, out, depth + 1))
@@ -1772,8 +1860,19 @@ void LaneScanPass::runOnOperation() {
     if (getenv("FOLDSIM_LANE_DEBUG"))
       for (auto &op : *parent.getBodyBlock()) {
         if (op.getNumResults() != 1 || isa<hw::InstanceOp>(op) ||
-            s.get(op.getResult(0)).kind != Kind::Multi)
+            (s.get(op.getResult(0)).kind != Kind::Multi &&
+             !(getenv("FOLDSIM_LANE_DEBUG")[0] == '2' &&
+               s.isLaneVal(op.getResult(0)))))
           continue;
+        if (s.isLaneVal(op.getResult(0))) {
+          Value v = op.getResult(0);
+          int pk = s.packOf.lookup(v);
+          llvm::errs() << "lane-debug " << (s.isPfx(v) ? "P" : "E")
+                       << s.get(v).lane << " pack " << pk << " first "
+                       << s.packFirst[pk] << " complete "
+                       << s.packComplete[pk] << " : " << op << "\n";
+          continue;
+        }
         llvm::errs() << "lane-debug " << callee << " " << nameOf(&op) << " i"
                      << widthOf(op.getResult(0)) << " (";
         for (Value o : op.getOperands()) {
@@ -1803,7 +1902,7 @@ void LaneScanPass::runOnOperation() {
           cellVec.insert(v);
     auto valueIn = [&](Value v) {
       auto &i = s.get(v);
-      if (i.kind == Kind::Elem)
+      if (i.kind == Kind::Elem || i.kind == Kind::Pfx)
         return bool(cellPack[s.packOf.lookup(v)]);
       if (i.kind == Kind::Vec)
         return cellVec.count(v) != 0;
@@ -1814,8 +1913,9 @@ void LaneScanPass::runOnOperation() {
       for (auto &op : *body) {
         for (Value v : op.getResults()) {
           auto &i = s.get(v);
-          bool in = i.kind == Kind::Elem ? bool(cellPack[s.packOf.lookup(v)])
-                                         : cellVec.count(v) != 0;
+          bool lv = i.kind == Kind::Elem || i.kind == Kind::Pfx;
+          bool in = lv ? bool(cellPack[s.packOf.lookup(v)])
+                       : cellVec.count(v) != 0;
           if (!in || isa<hw::InstanceOp>(op))
             continue;
           bool ok;
@@ -1849,7 +1949,54 @@ void LaneScanPass::runOnOperation() {
               }
             }
           } else {
-            ok = llvm::all_of(op.getOperands(), valueIn);
+            // (The previous lane's values a stage reads: below.)
+            ok = llvm::all_of(op.getOperands(), [&](Value o) {
+              return (s.isLaneVal(o) && s.get(o).lane == i.lane - 1) ||
+                     valueIn(o);
+            });
+            // A stage reads packs that start no later than its own; what it
+            // reads of the previous stage, the cell makes one stage on.
+            int pk = s.packOf.lookup(v);
+            for (bool retry = true; ok && retry;) {
+              retry = false;
+              int first = s.packFirst[pk];
+              if (i.lane < first)
+                break; // not a member the cell makes
+              for (auto [k, o] : llvm::enumerate(op.getOperands())) {
+                if (!ok || !s.isLaneVal(o))
+                  continue;
+                bool late = false;
+                if (s.get(o).lane == i.lane - 1) {
+                  Value next = first + 1 < int(F) ? s.packMembers[pk][first + 1]
+                                                  : Value();
+                  if (!next) {
+                    ok = false;
+                    continue;
+                  }
+                  Value role = next.getDefiningOp()->getOperand(k);
+                  if (!s.isLaneVal(role) || !valueIn(role))
+                    late = true;
+                  else if (s.packFirst[s.packOf.lookup(role)] > first)
+                    late = true;
+                } else if (s.packFirst[s.packOf.lookup(o)] > first) {
+                  late = true;
+                }
+                // A stage that reads a pack starting later starts later
+                // itself (the parent computes its first stages).
+                if (late) {
+                  int last = F;
+                  while (last > first && !s.packMembers[pk][last - 1])
+                    --last;
+                  if (s.isPfx(s.tmpl(pk)) && first + 3 <= last) {
+                    s.packFirst[pk] = first + 1;
+                    changed = retry = true;
+                  } else {
+                    ok = false;
+                  }
+                  break;
+                }
+              }
+            }
           }
           if (isa<comb::ConcatOp>(op) && i.kind == Kind::Vec && !i.gather) {
             // The lanes' pieces: one pack.
@@ -1863,7 +2010,7 @@ void LaneScanPass::runOnOperation() {
             if (reg.getPresetAttr() && i.kind == Kind::Vec)
               ok = false;
           if (!ok) {
-            if (i.kind == Kind::Elem)
+            if (lv)
               cellPack[s.packOf.lookup(v)] = false;
             else
               cellVec.erase(v);
@@ -1915,7 +2062,7 @@ void LaneScanPass::runOnOperation() {
     for (unsigned p = 0; p < cellPack.size(); ++p)
       if (cellPack[p]) {
         ++movedPacks;
-        if (!isa<hw::InstanceOp>(s.packMembers[p][0].getDefiningOp()))
+        if (!isa<hw::InstanceOp>(s.tmpl(p).getDefiningOp()))
           movedOps += F;
       }
     movedVecs = cellVec.size();
@@ -1930,9 +2077,16 @@ void LaneScanPass::runOnOperation() {
     for (auto &op : *body)
       if (s.carries.count(&op) && cellVec.count(op.getResult(0)))
         kinds["carry"]++;
+    for (unsigned p = 0; p < cellPack.size(); ++p)
+      if (cellPack[p] && s.isPfx(s.tmpl(p)))
+        kinds["stage"]++;
     // Nothing to scan: the per-lane logic stays where it is (a cell would
     // only hand it back to the parent or the lanes).
-    if (pats.empty())
+    bool stages = false;
+    for (unsigned p = 0; p < cellPack.size(); ++p)
+      if (cellPack[p] && s.isPfx(s.tmpl(p)))
+        stages = true;
+    if (pats.empty() && !stages)
       continue;
 
     DenseSet<Operation *> before;
@@ -1968,12 +2122,16 @@ void LaneScanPass::runOnOperation() {
       // Per lane: the parent's value it replaces (Export), or chain index.
       SmallVector<Value> replaces;
       int chain = -1;
+      // A value made later than the output is declared: its parent value,
+      // looked up when the outputs are made.
+      Value key = {};
     };
     struct Chain {
       Type type;
       Value init;      // the parent's value into the first lane
       bool down = false; // lane F-1 first
       int in = -1, out = -1;
+      int start = 0;     // the lane that takes `init` (lanes before ignore)
     };
     SmallVector<In> ins;
     SmallVector<Out> outs;
@@ -2161,8 +2319,8 @@ void LaneScanPass::runOnOperation() {
     DenseMap<Value, Value> alias;
     auto canon = [&](Value v) {
       for (;;) {
-        if (s.isElem(v))
-          v = s.packMembers[s.packOf.lookup(v)][0];
+        if (s.isLaneVal(v))
+          v = s.tmpl(s.packOf.lookup(v));
         auto it = alias.find(v);
         if (it == alias.end())
           return v;
@@ -2245,15 +2403,47 @@ void LaneScanPass::runOnOperation() {
       return comb::ConcatOp::create(b, parts);
     };
     // Operand k of a pack member op, as the cell sees it.
+    // A prefix chain's link: the previous stage's value of a pack (lane j - 1
+    // read at lane j), from the cell before; the parent's value of it into
+    // the pack's first stage.
+    DenseMap<std::pair<Value, int>, Value> stageIn;
+    auto prevStage = [&](int pack, unsigned k, Value o0) -> Value {
+      int start = s.packFirst[pack];
+      // The value this operand reads, one stage on: what the cell makes.
+      Value role = s.packMembers[pack][start + 1].getDefiningOp()->getOperand(k);
+      Value key = canon(role);
+      auto it = stageIn.find({key, start});
+      if (it != stageIn.end())
+        return it->second;
+      o0 = role;
+      Value init = s.packMembers[pack][start].getDefiningOp()->getOperand(k);
+      int c = chains.size();
+      chains.push_back({o0.getType(), init, false});
+      chains[c].start = start;
+      Value in = cbody->addArgument(o0.getType(), parent.getLoc());
+      ins.push_back({"st" + std::to_string(c) + "_in", o0.getType(), {}});
+      ins.back().chain = c;
+      chains[c].in = ins.size() - 1;
+      outs.push_back({"st" + std::to_string(c) + "_out", Value(), {}, c, o0});
+      chains[c].out = outs.size() - 1;
+      stageIn[{key, start}] = in;
+      return in;
+    };
     auto operandOf = [&](int pack, unsigned k) -> Value {
-      Value o0 = s.packMembers[pack][0].getDefiningOp()->getOperand(k);
-      if (s.isElem(o0))
+      Value t = s.tmpl(pack);
+      Value o0 = t.getDefiningOp()->getOperand(k);
+      if (s.isLaneVal(o0)) {
+        if (s.get(o0).lane == s.get(t).lane - 1)
+          return prevStage(pack, k, o0);
         return cellValue(o0);
+      }
       if (s.get(o0).kind == Kind::Vec)
         return cellValue(o0);
       SmallVector<Value> vs;
-      for (unsigned j = 0; j < F; ++j)
-        vs.push_back(s.packMembers[pack][j].getDefiningOp()->getOperand(k));
+      for (unsigned j = 0; j < F; ++j) {
+        Value m = s.packMembers[pack][j] ? s.packMembers[pack][j] : t;
+        vs.push_back(m.getDefiningOp()->getOperand(k));
+      }
       return perLane(vs);
     };
 
@@ -2264,9 +2454,9 @@ void LaneScanPass::runOnOperation() {
         continue;
       for (auto [r, v] : llvm::enumerate(op.getResults())) {
         auto &i = s.get(v);
-        if (i.kind == Kind::Elem) {
+        if (i.kind == Kind::Elem || i.kind == Kind::Pfx) {
           int p = s.packOf.lookup(v);
-          if (!cellPack[p] || s.packMembers[p][0] != v)
+          if (!cellPack[p] || s.tmpl(p) != v)
             continue;
           // A lane's value of its own bits.
           if (auto it = s.assembled.find(v); it != s.assembled.end()) {
@@ -2448,7 +2638,7 @@ void LaneScanPass::runOnOperation() {
         auto [c, in] = newChain(rt, pconst(rt, id), false);
         SmallVector<Value> operands{in};
         for (int pk : p->packs)
-          operands.push_back(cellValue(s.packMembers[pk][0]));
+          operands.push_back(cellValue(s.tmpl(pk)));
         for (Value v : p->vecs) {
           Value bit = cellValue(v);
           if (rw > 1)
@@ -2528,7 +2718,7 @@ void LaneScanPass::runOnOperation() {
             break;
           }
         int pc = s.packOf.lookup(p->conds[lane0]);
-        Value cond = cellValue(s.packMembers[pc][0]);
+        Value cond = cellValue(s.tmpl(pc));
         SmallVector<int64_t> en;
         for (unsigned j = 0; j < F; ++j)
           en.push_back(p->conds[j] ? 1 : 0);
@@ -2702,8 +2892,9 @@ void LaneScanPass::runOnOperation() {
     DenseSet<Operation *> moved;
     for (unsigned p = 0; p < cellPack.size(); ++p)
       if (cellPack[p])
-        for (Value m : s.packMembers[p])
-          if (!isa<hw::InstanceOp>(m.getDefiningOp()))
+        for (auto [j, m] : llvm::enumerate(s.packMembers[p]))
+          if (m && int(j) >= s.packFirst[p] &&
+              !isa<hw::InstanceOp>(m.getDefiningOp()))
             moved.insert(m.getDefiningOp());
     for (Value v : cellVec)
       moved.insert(v.getDefiningOp());
@@ -2752,6 +2943,9 @@ void LaneScanPass::runOnOperation() {
       if (in.chain < 0)
         for (Value v : in.values)
           reach(v);
+    for (auto &ch : chains)
+      if (ch.init)
+        reach(ch.init);
     while (!work.empty()) {
       Value v = work.pop_back_val();
       keep(v.getDefiningOp());
@@ -2760,14 +2954,16 @@ void LaneScanPass::runOnOperation() {
     SetVector<int> exportPacks;
     SetVector<Value> exportVecs;
     for (Value v : exported) {
-      if (s.isElem(v))
+      if (s.isLaneVal(v))
         exportPacks.insert(s.packOf.lookup(v));
       else
         exportVecs.insert(v);
     }
     for (int p : exportPacks) {
-      Value cv = cellValue(s.packMembers[p][0]);
+      Value cv = cellValue(s.tmpl(p));
       SmallVector<Value> ms(s.packMembers[p].begin(), s.packMembers[p].end());
+      for (int j = 0; j < s.packFirst[p]; ++j)
+        ms[j] = Value(); // the parent's own
       outs.push_back({"out" + std::to_string(outs.size()), cv, ms});
     }
     for (Value v : exportVecs)
@@ -2791,7 +2987,9 @@ void LaneScanPass::runOnOperation() {
     unsigned residualOps = 0, residualBits = 0;
     for (auto &op : *body)
       if (before.count(&op) && live.count(&op) && !rootOf.count(&op) &&
-          op.getNumResults() && s.get(op.getResult(0)).kind == Kind::Multi &&
+          op.getNumResults() &&
+          (s.get(op.getResult(0)).kind == Kind::Multi ||
+           (s.isPfx(op.getResult(0)) && !moved.count(&op))) &&
           !isa<comb::ConcatOp, comb::ExtractOp, comb::ReplicateOp,
                hw::ArrayCreateOp, hw::BitcastOp, hw::StructCreateOp,
                hw::StructExtractOp, hw::ArrayConcatOp, hw::ArraySliceOp>(
@@ -2846,6 +3044,9 @@ void LaneScanPass::runOnOperation() {
     // The cell's ports and terminator.
     for (auto &in : ins)
       addPort(in.name, in.type, true);
+    for (auto &o : outs)
+      if (o.key)
+        o.cell = cellValue(o.key);
     SmallVector<Value> outVals;
     for (auto &o : outs) {
       addPort(o.name, o.cell.getType(), false);
@@ -2907,7 +3108,7 @@ void LaneScanPass::runOnOperation() {
         Value v;
         if (in.chain >= 0) {
           auto &ch = chains[in.chain];
-          bool first = ch.down ? j == F - 1 : j == 0;
+          bool first = ch.down ? j == F - 1 : j <= unsigned(ch.start);
           if (first)
             v = ch.init;
           else
@@ -2947,6 +3148,8 @@ void LaneScanPass::runOnOperation() {
       }
       for (unsigned j = 0; j < F; ++j) {
         Value m = o.replaces[j];
+        if (!m)
+          continue;
         m.replaceUsesWithIf(cells[j].getResult(k), [&](OpOperand &use) {
           return !moved.count(use.getOwner()) &&
                  use.getOwner()->getBlock() == body;
