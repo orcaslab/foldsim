@@ -312,6 +312,9 @@ struct Class {
     /// `vmem-rings`: its read buffer a ring (the class's `ring` plan), its
     /// answers written to an image read back a lead before each use.
     bool ring = false;
+    /// Its write data and mask outputs are zero while its write valid is
+    /// low (registers reset by it): a page engine ORs them without a select.
+    bool idleZero = false;
   };
   SmallVector<VirtualMemory> virtualMemories;
   /// `vmem-rings`: the class's ring plan, if any of its memories take one.
@@ -14422,8 +14425,28 @@ LogicalResult StaticFolder::buildPPStream(
       return b.createOrFold<comb::ConcatOp>(
           SmallVector<Value>(parts.rbegin(), parts.rend()));
     };
-    Value wrData = reg(pack(words, width, dw), prefix + "_wr_data");
-    Value wrMask = reg(pack(masks, n * 9, dw / 8), prefix + "_wr_mask");
+    // (Zero while no write leaves: a register reset by the write valid's
+    // input, a flop's synchronous reset, so that a page engine merges its
+    // members' writes with an OR, without a select a member. A mask of
+    // whole rows is the write valid itself.)
+    Value idle = comb::OrOp::create(
+        b, hostReset, comb::XorOp::create(b, wvalid0, constant(1, 1)));
+    auto zeroReg = [&](Value v, const Twine &name) -> Value {
+      auto type = v.getType();
+      return keep(seq::FirRegOp::create(
+          b, v, hostClock, b.getStringAttr(name), idle,
+          hw::ConstantOp::create(b, type, 0), hw::InnerSymAttr{},
+          /*isAsync=*/false));
+    };
+    Value wrData = zeroReg(pack(words, width, dw), prefix + "_wr_data");
+    bool wholeRows = llvm::all_of(masks, [](Value m) {
+      auto c = m.getDefiningOp<hw::ConstantOp>();
+      return c && c.getValue().isAllOnes();
+    });
+    Value wrMask = wholeRows && dw / 8 == n * 9
+                       ? b.createOrFold<comb::ReplicateOp>(bits(dw / 8), wvalidQ)
+                       : zeroReg(pack(masks, n * 9, dw / 8), prefix + "_wr_mask");
+    vm.idleZero = true;
     Value zero1 = constant(1, 0);
     SmallVector<Value> values{read0,  rdInst, zero1,  wvalidQ, winstQ,
                               zero1,  wrData, wrMask, pending};
@@ -23540,8 +23563,10 @@ LogicalResult StaticFolder::buildSim() {
         wrInst.push_back(when(wv, b.createOrFold<comb::ConcatOp>(
                                       tagOf(out(4)), constant(1, 0))));
         wrRow.push_back(when(wv, rowOf(out(4), out(5))));
-        wrData.push_back(when(wv, zext(out(6), dw)));
-        wrMask.push_back(when(wv, zext(out(7), dw / 8)));
+        // (A member whose idle write fields are zero: ORed as they are.)
+        wrData.push_back(vm.idleZero ? zext(out(6), dw) : when(wv, zext(out(6), dw)));
+        wrMask.push_back(vm.idleZero ? zext(out(7), dw / 8)
+                                     : when(wv, zext(out(7), dw / 8)));
       }
       // Its link streams': a read's member tag its slot, a write's the top
       // bit (the stream's own {tag, instance} without the instance bit); its

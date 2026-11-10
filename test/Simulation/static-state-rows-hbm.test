@@ -31,6 +31,11 @@
 # RUN: %t/ppe/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
 # RUN: %t/ppe/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
 # PPE: page engine 0 216 bits, tag {{[0-9]+}}, row {{[0-9]+}}: Leaf:pps0_rows
+# The chunk's write data and mask are zero while no write leaves (flops reset by the write valid's input), so the
+# engine ORs its members' writes without a select a member.
+# RUN: FileCheck %s --check-prefix=PPEZ < %t/ppe/foldsim_sim.mlir
+# PPEZ: %pps0_wr_data = seq.firreg {{.*}} reset sync
+# PPEZ: hw.output {{.*}}%Leaf_copy.vm0_wr_data, %Leaf_copy.vm0_wr_mask :
 # RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/p3 --static --state-in-ram Leaf::3 --state-in-ram-pp --state-scratch-bits 0 Leaf > %t/p3.log 2>&1
 # A column's write select over the rows that hold its bits (2 of the 4).
 # RUN: FileCheck %s --check-prefix=P3LOG < %t/p3.log
