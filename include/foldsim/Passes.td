@@ -1357,6 +1357,47 @@ def Sort : Pass<"foldsim-sort"> {
   }];
 }
 
+def LaneScan : Pass<"foldsim-lane-scan", "::mlir::ModuleOp"> {
+  let summary = "Fold an unfolded parent's per-child glue into a lane cell "
+                "class and its reductions into scans";
+  let description = [{
+    In the flat `module` (the unfolded parent of the classes), the instances
+    of one module, at least `min-lanes` of them (the modules of `lanes`, all
+    if empty), are lanes. Values computed per lane, isomorphic across the
+    lanes (packs, SLP-style: per-lane ops, packed lane vectors whose bits j
+    are lane j's, registers over them), move into a generated module
+    `<module>_lane_<lane module>`, one instance per lane: a class to fold.
+    Reductions across the lanes become zero-latency chains through those
+    instances, the parent reading the chain's end: XOR / OR / AND / ADD over
+    a pack (ac), AND / OR / XOR of a packed lane vector (icmp against all
+    ones or zero, parity: vec), priority mux chains in lane order (prio),
+    hw.array_get of a pack at a parent index (select), a bit of a packed lane
+    vector at a parent index (bitsel), and comb.add of a packed lane vector
+    and a constant or a vector of the same layout (carry). Lane-varying
+    constants and slices of parent values are per-lane inputs of the cell;
+    moved values the parent still reads are cell outputs. Prints a line per
+    lane group: `lane-scan: cell <name>`, and the packs, scans and per-lane
+    ports. Exact: the same operators on the same operands in the same target
+    cycle.
+  }];
+  let options = [
+    Option<"module", "module", "std::string", "\"\"",
+           "The unfolded parent (flat but for its class instances)">,
+    ListOption<"lanes", "lanes", "std::string",
+               "The lane modules (all modules with min-lanes instances if "
+               "empty)">,
+    Option<"minLanes", "min-lanes", "unsigned", "4",
+           "The fewest instances of a module that make lanes">,
+    Option<"dryRun", "dry-run", "bool", "false",
+           "Report what would move; change nothing">,
+  ];
+  let dependentDialects = [
+    "circt::hw::HWDialect",
+    "circt::comb::CombDialect",
+    "circt::seq::SeqDialect"
+  ];
+}
+
 def FindPipelines : Pass<"foldsim-find-pipelines", "::mlir::ModuleOp"> {
   let summary = "Report the fixed-latency pipelines of each model";
   let description = [{

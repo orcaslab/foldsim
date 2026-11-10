@@ -10,6 +10,7 @@ add_mlir_library(FoldsimTransforms
   MemoriesToRegisters.cpp
   MergeMemories.cpp
   FuseModels.cpp
+  LaneScan.cpp
   LowerWideNegation.cpp
   CompressAddTrees.cpp
   CsfReadySplit.cpp
