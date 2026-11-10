@@ -3408,6 +3408,16 @@ int StaticFolder::mappedDepthOf(hw::HWModuleOp model, unsigned entryBits,
       }
     }
     std::string name = copy.getSymName().str();
+    // (FOLDSIM_STAGE_DUMP=<dir>: the design timed, before its mapping.)
+    if (const char *dir = getenv("FOLDSIM_STAGE_DUMP")) {
+      std::error_code ec;
+      llvm::raw_fd_ostream os(std::string(dir) + "/" + name + "_" +
+                                  std::to_string(stages ? stages->size() : 0) +
+                                  ".mlir",
+                              ec);
+      if (!ec)
+        design->print(os);
+    }
     PassManager pm(model.getContext(), ModuleOp::getOperationName());
     if (succeeded(parsePassPipeline(foldsim::beaconMapPipeline(*target, false), pm)) &&
         succeeded(pm.run(*design)))
@@ -3652,11 +3662,13 @@ LogicalResult StaticFolder::chooseStages() {
         unsigned want = depth <= sl ? 0u : unsigned((depth + sl - 1) / sl) - 1;
         llvm::errs() << "foldsim-fold-static: " << cls.name << ": mapped depth "
                      << depth << " levels at " << sl << " a stage";
-        unsigned chosen = est;
-        if (want == 0) {
-          chosen = 0;
-        } else {
-          for (unsigned t = want; t < est;) {
+        // The best so far: no stage at the mapped depth itself.
+        unsigned chosen = 0;
+        int best = depth;
+        bool fits = want == 0;
+        if (want > 0) {
+          unsigned tries = 0;
+          for (unsigned t = want; t < est && tries < 4; ++tries) {
             // The least limit whose soonest cut takes at most t stages.
             int lo = 2 * sl, hi = lo;
             {
@@ -3683,17 +3695,30 @@ LogicalResult StaticFolder::chooseStages() {
                   stageOf(result, hi, cut, eb);
             int d = mappedDepthOf(cls.model, eb, &cut);
             llvm::errs() << "; " << t << " stages: " << d;
-            if (d >= 0 && d <= sl) {
+            if (d < 0)
+              break;
+            if (d < best) {
+              best = d;
+              chosen = t;
+            }
+            if (d <= sl) {
+              fits = true;
               chosen = t;
               break;
             }
-            if (d < 0)
-              break;
             // The next count to try, as deep as this one ran over.
             t = std::max(t + 1, unsigned(((t + 1) * d + sl - 1) / sl) - 1);
           }
+          // No timed cut fits: none if no cut is shallower than the logic
+          // unstaged (staging buys nothing), else (or with no count below
+          // the estimate's to try) the estimate's count: its cut, finer than
+          // the timed ones, may fit where they did not.
+          if (!fits)
+            chosen = tries == 0 || best < depth ? est : 0;
         }
-        llvm::errs() << ": " << chosen << " stages (estimate " << est << ")\n";
+        llvm::errs() << ": " << chosen << " stages"
+                     << (fits ? "" : chosen ? " (no timed cut fits)" : " (no cut is shallower)")
+                     << " (estimate " << est << ")\n";
         cls.stages = std::min(est, chosen);
         mappedStageCut.insert(cls.model.getOperation());
       }
