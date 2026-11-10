@@ -16817,6 +16817,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     }
     Value zero72 = hw::ConstantOp::create(b, bits(72), 0);
     SmallVector<std::pair<Value, Value>> streamWrites;
+    unsigned compactCols = 0, compactRows = 0;
     for (auto [c, col] : llvm::enumerate(cols)) {
       auto &g = groups[c / 16];
       SmallVector<Value> words, masks;
@@ -16851,12 +16852,44 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           masks.push_back(b.createOrFold<comb::ConcatOp>(high));
         }
       }
-      // The select a column's own, a host cycle ahead of the pass.
-      Value sel = keepReg(g.wRow1, "pp_col" + Twine(c) + "_sel");
+      // The select a column's own, a host cycle ahead of the pass: over the
+      // rows that hold any of the column's bits alone (the others' words are
+      // zeros, and a pass of another row writes nothing it reads back: its
+      // value is don't care), the row mapped to its index among them.
+      SmallVector<unsigned> usedRows;
+      for (unsigned j = 0; j < rowsPow; ++j)
+        if (j < P && !col.parts[j].empty())
+          usedRows.push_back(j);
+      Value sel;
+      if (usedRows.size() > 1 && usedRows.size() < rowsPow) {
+        ++compactCols;
+        compactRows = std::max<unsigned>(compactRows, usedRows.size());
+        unsigned ub = llvm::Log2_32_Ceil(usedRows.size());
+        SmallVector<uint64_t> index(rowsPow, 0);
+        for (auto [x, j] : llvm::enumerate(usedRows))
+          index[j] = x;
+        unsigned rw = hw::getBitWidth(g.wRow1.getType());
+        index.resize(size_t(1) << rw, 0);
+        sel = keepReg(table(b, g.wRow1, index, ub), "pp_col" + Twine(c) + "_sel");
+      } else {
+        sel = keepReg(g.wRow1, "pp_col" + Twine(c) + "_sel");
+      }
       auto pick = [&](ArrayRef<Value> items) -> Value {
         if (items.size() == 1)
           return items[0];
-        SmallVector<Value> high(items.rbegin(), items.rend());
+        SmallVector<Value> chosen;
+        if (usedRows.size() > 1 && usedRows.size() < rowsPow) {
+          for (unsigned j : usedRows)
+            chosen.push_back(items[j]);
+          unsigned n = unsigned(llvm::PowerOf2Ceil(chosen.size()));
+          while (chosen.size() < n)
+            chosen.push_back(chosen.back());
+        } else if (usedRows.size() == 1) {
+          return items[usedRows[0]];
+        } else {
+          chosen.assign(items.begin(), items.end());
+        }
+        SmallVector<Value> high(chosen.rbegin(), chosen.rend());
         return hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, high), sel);
       };
       Value data = pick(words);
@@ -16882,6 +16915,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       seq::FirMemWriteOp::create(b, col.memory, g.wAddr, hostClock, enable, data,
                                  mask);
     }
+    if (compactCols)
+      llvm::errs() << "foldsim-fold-static: state-in-ram-pp: " << cls.name << ": " << compactCols
+                   << " columns' write selects over the rows they hold (at most " << compactRows
+                   << " of " << rowsPow << ")\n";
     if (hbm) {
       SmallVector<seq::FirMemOp> memories;
       for (auto [c, col] : llvm::enumerate(cols))
