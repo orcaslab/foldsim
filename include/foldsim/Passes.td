@@ -1021,6 +1021,19 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "keeps the instances the rest of the scratch holds resident (in "
            "RAMs of their own) and streams only the "
            "others, spread over the frame (false: the whole class streams)">,
+    Option<"stateScratchFixed", "state-scratch-fixed", "bool", "false",
+           "With state-scratch-bits: the scratch as a fixed allocation, the "
+           "same RAM at every instance count. Each scratch class (state-in-"
+           "ram-pp, and paged classes, a storage rule's on-chip page kind "
+           "included) takes the share of the scratch its rows' share of all "
+           "the classes' rows gives, in instances (the same at every count "
+           "when the classes scale together); its resident RAMs are that "
+           "deep, under-filled at small counts. A PP class streams the rest "
+           "(at least one instance in 16, so that its landing windows and "
+           "HBM path are there at every count; resident: the first r of each "
+           "B instances, B a power of two); a paged class is resident while its share holds "
+           "it, else its pages stream (pages=hbm). Folded pipelines' stores "
+           "take no scratch">,
     Option<"stateStreamWindow", "state-stream-window", "unsigned", "0",
            "With state-in-ram-pp, a class streamed from HBM: the most "
            "instance slots of its landing window (each instance's P rows "

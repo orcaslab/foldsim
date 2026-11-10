@@ -1,0 +1,73 @@
+# REQUIRES: verilator
+# The state scratch as a fixed allocation (foldsim-fold-static state-scratch-fixed): the same scratch RAM at every
+# instance count. A class's share of the scratch is its rows' share of all the scratch classes' rows, in instances
+# (n x C / rows): the same at 32 and 64 instances here (Driver/Inputs/fixedscratch: chains of 32 and 64 leaves of
+# Driver/Inputs/paged). Its resident RAMs are that deep, under-filled when fewer instances are resident.
+# - A state-in-ram-pp class keeps the first r of each 16 instances resident (r = min(15, share / (n / 16))) and
+#   streams the others from HBM, at least one in 16, so that its landing window and HBM path exist at every count.
+#   The stream bit and resident index are digits of the instance (decoded tables).
+# - A paged class (its storage rule's on-chip kind included) keeps its pages on chip, page RAMs as deep as its share,
+#   while the share holds all its instances; else its pages stream from HBM (pages=hbm).
+# Against the target from zero state (Inputs/tb_pages.sv with a controller model per virtual memory, or
+# Inputs/tb_late.sv when nothing is virtual), at response latencies of 1-60 host cycles, stalls, full controllers
+# and bubbles.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/fixedscratch
+# A large scratch: 30 of 32 resident, a share of 173 instances deep.
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top32.f --top Top --out %t/a32 --static --state-in-ram Leaf::8 --state-in-ram-pp --state-scratch-bits 100000 --state-scratch-fixed Leaf > %t/a32.log 2>&1
+# RUN: FileCheck %s --check-prefix=A32 < %t/a32.log
+# RUN: FileCheck %s --check-prefix=A32SV < %t/a32/foldsim_sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/a32 -Mdir %t/a32/obj %S/Inputs/tb_pages.sv leaf.sv top32.sv %t/a32/foldsim_sim.sv > %t/a32/build.log 2>&1
+# RUN: %t/a32/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/a32/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+# A small scratch (forced streaming): a share of 8 instances at 32 and at 64, the resident RAM 64 rows deep at both.
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top32.f --top Top --out %t/s32 --static --state-in-ram Leaf::8 --state-in-ram-pp --state-scratch-bits 5000 --state-scratch-fixed Leaf > %t/s32.log 2>&1
+# RUN: FileCheck %s --check-prefix=S32 < %t/s32.log
+# RUN: FileCheck %s --check-prefix=SSV < %t/s32/foldsim_sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/s32 -Mdir %t/s32/obj %S/Inputs/tb_pages.sv leaf.sv top32.sv %t/s32/foldsim_sim.sv > %t/s32/build.log 2>&1
+# RUN: %t/s32/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/s32/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top64.f --top Top --out %t/s64 --static --state-in-ram Leaf::8 --state-in-ram-pp --state-scratch-bits 5000 --state-scratch-fixed Leaf > %t/s64.log 2>&1
+# RUN: FileCheck %s --check-prefix=S64 < %t/s64.log
+# RUN: FileCheck %s --check-prefix=SSV < %t/s64/foldsim_sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/s64 -Mdir %t/s64/obj %S/Inputs/tb_pages.sv leaf.sv top64.sv %t/s64/foldsim_sim.sv > %t/s64/build.log 2>&1
+# RUN: %t/s64/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/s64/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=40 +stall=20 +full=10 | FileCheck %s
+# With bubbles, and with no scratch (everything streams).
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top32.f --top Top --out %t/b32 --static --state-in-ram Leaf::8 --state-in-ram-pp --state-scratch-bits 5000 --state-scratch-fixed --bubbles --modulo Leaf > %t/b32.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/b32 -DBUBBLES -Mdir %t/b32/obj %S/Inputs/tb_pages.sv leaf.sv top32.sv %t/b32/foldsim_sim.sv > %t/b32/build.log 2>&1
+# RUN: %t/b32/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top64.f --top Top --out %t/z64 --static --state-in-ram Leaf::8 --state-in-ram-pp --state-scratch-bits 0 --state-scratch-fixed Leaf > %t/z64.log 2>&1
+# RUN: FileCheck %s --check-prefix=Z64 < %t/z64.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/z64 -Mdir %t/z64/obj %S/Inputs/tb_pages.sv leaf.sv top64.sv %t/z64/foldsim_sim.sv > %t/z64/build.log 2>&1
+# RUN: %t/z64/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+# Paged, a pages=ultra rule: resident in page RAMs as deep as the share (347 instances: 512 x 2 pages) at 32 and
+# 64; past the share, the pages stream from HBM.
+# RUN: foldsim --srcs top32.f --top Top --out %t/p32 --static --page Leaf:2 --storage Leaf:pages=ultra --state-scratch-bits 100000 --state-scratch-fixed Leaf > %t/p32.log 2>&1
+# RUN: FileCheck %s --check-prefix=P32 < %t/p32.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/p32/obj %S/Inputs/tb_late.sv leaf.sv top32.sv %t/p32/foldsim_sim.sv > %t/p32/build.log 2>&1
+# RUN: %t/p32/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 | FileCheck %s
+# RUN: foldsim --srcs top64.f --top Top --out %t/p64 --static --page Leaf:2 --storage Leaf:pages=ultra --state-scratch-bits 100000 --state-scratch-fixed Leaf > %t/p64.log 2>&1
+# RUN: FileCheck %s --check-prefix=P64 < %t/p64.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/p64/obj %S/Inputs/tb_late.sv leaf.sv top64.sv %t/p64/foldsim_sim.sv > %t/p64/build.log 2>&1
+# RUN: %t/p64/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 | FileCheck %s
+# RUN: foldsim --srcs top32.f --top Top --out %t/q32 --static --page Leaf:2 --storage Leaf:pages=ultra --state-scratch-bits 5000 --state-scratch-fixed Leaf > %t/q32.log 2>&1
+# RUN: FileCheck %s --check-prefix=Q32 < %t/q32.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/q32 -Mdir %t/q32/obj %S/Inputs/tb_pages.sv leaf.sv top32.sv %t/q32/foldsim_sim.sv > %t/q32/build.log 2>&1
+# RUN: %t/q32/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/q32/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+
+# A32: state-scratch: fixed: Leaf: a share of 173 instances (99648 bits); 30 of 32 resident (15 of each 16), 2 stream from HBM
+# A32: state-stream: Leaf: P 8, 2 of 32 instances streamed
+# A32SV: {{pp(_res)?}}_1384x72 pp_res0_ext (
+# S32: state-scratch: fixed: Leaf: a share of 8 instances (4608 bits); 8 of 32 resident (4 of each 16), 24 stream from HBM
+# S64: state-scratch: fixed: Leaf: a share of 8 instances (4608 bits); 8 of 64 resident (2 of each 16), 56 stream from HBM
+# SSV: {{pp(_res)?}}_64x72 pp_res0_ext (
+# Z64: state-scratch: fixed: Leaf: a share of 0 instances (0 bits); 0 of 64 resident (0 of each 16), 64 stream from HBM
+# P32: state-scratch: fixed: Leaf: pages resident, a share of 347 instances (99936 bits) for 32
+# P32: pages Leaf: p 2, {{.*}}; page RAMs 1024 rows x 168 bits in 1 columns
+# P64: state-scratch: fixed: Leaf: pages resident, a share of 347 instances (99936 bits) for 64
+# P64: pages Leaf: p 2, {{.*}}; page RAMs 1024 rows x 168 bits in 1 columns
+# Q32: state-scratch: fixed: Leaf: 9216 bits of pages stream from HBM (its share of 17 instances does not hold its 32; the share stays unused)
+# Q32: pages Leaf: p 2, {{.*}}; off chip: 1 virtual memories
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL

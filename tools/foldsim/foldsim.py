@@ -560,6 +560,8 @@ def frame_options(a):
             fold += f' state-scratch-reserve-ultra={int(ultra)}'
     if getattr(a, 'state_scratch_whole', False):
         fold += ' state-scratch-partial=false'
+    if getattr(a, 'state_scratch_fixed', False):
+        fold += ' state-scratch-fixed'
     if getattr(a, 'csf_single_bank', False):
         fold += ' csf-single-bank'
     if getattr(a, 'csf_mailbox_builder', False):
@@ -1774,6 +1776,13 @@ def build_parser():
                     help='with --state-scratch-bits: a PP class past the scratch streams whole (default: the '
                          'instances the rest of the scratch holds stay resident; foldsim-fold-static '
                          'state-scratch-partial=false)')
+    ap.add_argument('--state-scratch-fixed', action='store_true',
+                    help='with --state-scratch-bits: the scratch as a fixed allocation, the same RAM at every '
+                         'instance count: each PP or paged class takes its rows\' share of it in instances (its '
+                         'resident RAMs that deep, under-filled at small counts); a PP class streams the rest '
+                         '(at least one instance in 16), a paged class streams whole past its share; a storage '
+                         'rule\'s on-chip page kind names the RAM, no longer keeps the pages on chip past the '
+                         'share (foldsim-fold-static state-scratch-fixed)')
     ap.add_argument('--state-stream-window', type=int, default=0, metavar='N',
                     help='with --state-scratch-bits: a streamed PP class\'s landing window, in instance slots '
                          '(foldsim-fold-static state-stream-window; 0: a RAMB36 deep, 512 / P)')
