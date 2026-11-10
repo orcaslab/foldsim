@@ -174,6 +174,9 @@ struct Pattern {
   // AC whose lanes' values are in several packs, each lane in one (a lane
   // constant picks): packVals[k] are pack k's lanes.
   bool mixed = false;
+  // AC: the packs (indices into packs) whose values the parent makes and
+  // the cell reads, a lane each.
+  SmallVector<unsigned> parentPacks;
 };
 
 struct LaneScanPass : public foldsim::impl::LaneScanBase<LaneScanPass> {
@@ -375,7 +378,8 @@ struct Scan {
   bool matchCone(Operation *op);
   bool matchAddCone(Operation *op);
   bool addLeaves(Value v, SmallVectorImpl<Value> &leaves, APInt &max,
-                 SmallVectorImpl<Operation *> &ops, int depth);
+                 SmallVectorImpl<Operation *> &ops, int depth,
+                 SmallVectorImpl<Value> *rest = nullptr);
   bool matchConeAs(Operation *op, bool isAnd, bool invert);
   bool orCone(Value v, SmallVectorImpl<std::pair<int, Value>> &out);
   bool coneThroughRed = false;
@@ -1768,11 +1772,48 @@ bool Scan::finishPrio(Pattern &p, ArrayRef<int> order) {
   }
 }
 
+/// The largest value `v` can take (in 64 bits), from its structure: sums
+/// and zero extensions of narrower values (a lane's own adder tree).
+static APInt maxOf(Value v, int depth) {
+  int64_t w = bitWidthOf(v);
+  APInt all = APInt::getLowBitsSet(64, std::min<int64_t>(std::max<int64_t>(w, 0), 63));
+  APInt c;
+  if (w <= 0 || w > 63 || depth > 32)
+    return all;
+  if (isConstant(v, c))
+    return c.zext(64);
+  auto *d = v.getDefiningOp();
+  if (auto cc = dyn_cast_or_null<comb::ConcatOp>(d)) {
+    auto in = cc.getInputs();
+    for (unsigned k = 0; k + 1 < in.size(); ++k)
+      if (!isConstant(in[k], c) || !c.isZero())
+        return all;
+    return maxOf(in.back(), depth + 1);
+  }
+  if (auto add = dyn_cast_or_null<comb::AddOp>(d)) {
+    APInt sum(64, 0);
+    for (Value o : add.getInputs()) {
+      bool ov = false;
+      sum = sum.uadd_ov(maxOf(o, depth + 1), ov);
+      if (ov)
+        return all;
+    }
+    return sum.ult(all) ? sum : all;
+  }
+  if (auto ex = dyn_cast_or_null<comb::ExtractOp>(d))
+    if (ex.getLowBit() == 0) {
+      APInt m = maxOf(ex.getInput(), depth + 1);
+      return m.ult(all) ? m : all;
+    }
+  return all;
+}
+
 /// The lanes' values whose sum `v` is, through adds that cannot overflow
 /// and zero extensions (an adder tree whose widths grow, a popcount): each
 /// leaf zero-extended. `max` is v's largest value (in 64 bits).
 bool Scan::addLeaves(Value v, SmallVectorImpl<Value> &leaves, APInt &max,
-                     SmallVectorImpl<Operation *> &ops, int depth) {
+                     SmallVectorImpl<Operation *> &ops, int depth,
+                     SmallVectorImpl<Value> *rest) {
   int64_t w = bitWidthOf(v);
   if (depth > 64 || w <= 0 || w > 63)
     return false;
@@ -1781,9 +1822,25 @@ bool Scan::addLeaves(Value v, SmallVectorImpl<Value> &leaves, APInt &max,
     max = APInt(64, 0);
     return true;
   }
+  // A parent value (a non-lane source's bit, also a parent bit of a register
+  // that holds lane bits beside it): added in the parent.
+  if (rest) {
+    bool parentOnly = get(v).kind == Kind::Scalar;
+    std::vector<BitSrc> bs;
+    if (!parentOnly && get(v).kind == Kind::Multi && bitsOf(v, bs))
+      parentOnly = llvm::all_of(bs, [](const BitSrc &b) {
+        return b.k == BitSrc::Scalar || b.k == BitSrc::Zero ||
+               b.k == BitSrc::One;
+      });
+    if (parentOnly) {
+      rest->push_back(v);
+      max = APInt::getLowBitsSet(64, w);
+      return true;
+    }
+  }
   if (isElem(v)) {
     leaves.push_back(v);
-    max = APInt::getLowBitsSet(64, w);
+    max = maxOf(v, 0);
     return true;
   }
   auto *d = v.getDefiningOp();
@@ -1803,34 +1860,34 @@ bool Scan::addLeaves(Value v, SmallVectorImpl<Value> &leaves, APInt &max,
             a.getOperand(1) == x.getOperand(0)))) {
         ops.append({d, a, x});
         APInt m0, m1;
-        if (!addLeaves(a.getOperand(0), leaves, m0, ops, depth + 1) ||
-            !addLeaves(a.getOperand(1), leaves, m1, ops, depth + 1))
+        if (!addLeaves(a.getOperand(0), leaves, m0, ops, depth + 1, rest) ||
+            !addLeaves(a.getOperand(1), leaves, m1, ops, depth + 1, rest))
           return false;
         max = m0 + m1;
         return true;
       }
     }
     // {0, x}: x.
+    bool zext = true;
     for (unsigned k = 0; k + 1 < in.size(); ++k)
-      if (!isConstant(in[k], c) || !c.isZero())
-        return false;
-    ops.push_back(d);
-    return addLeaves(in.back(), leaves, max, ops, depth + 1);
+      zext &= isConstant(in[k], c) && c.isZero();
+    if (zext) {
+      ops.push_back(d);
+      return addLeaves(in.back(), leaves, max, ops, depth + 1, rest);
+    }
   }
-  if (auto ex = dyn_cast<comb::ExtractOp>(d)) {
+  if (auto ex = dyn_cast<comb::ExtractOp>(d); ex && ex.getLowBit() == 0) {
     // The low bits of a value that fits in them.
-    if (ex.getLowBit() != 0)
-      return false;
     ops.push_back(d);
-    return addLeaves(ex.getInput(), leaves, max, ops, depth + 1) &&
+    return addLeaves(ex.getInput(), leaves, max, ops, depth + 1, rest) &&
            max.ule(APInt::getLowBitsSet(64, w));
   }
-  if (auto add = dyn_cast<comb::AddOp>(d)) {
+  if (auto add = dyn_cast_or_null<comb::AddOp>(d)) {
     ops.push_back(d);
     APInt sum(64, 0);
     for (Value o : add.getInputs()) {
       APInt m;
-      if (!addLeaves(o, leaves, m, ops, depth + 1))
+      if (!addLeaves(o, leaves, m, ops, depth + 1, rest))
         return false;
       bool ov = false;
       sum = sum.uadd_ov(m, ov);
@@ -1838,6 +1895,13 @@ bool Scan::addLeaves(Value v, SmallVectorImpl<Value> &leaves, APInt &max,
         return false;
     }
     max = sum;
+    return true;
+  }
+  // Any other narrow value the parent makes (a parent bit of a register
+  // holding lane bits beside it, say): a term added in the parent.
+  if (rest && w <= 8 && !isElem(v) && !isPfx(v)) {
+    rest->push_back(v);
+    max = APInt::getLowBitsSet(64, w);
     return true;
   }
   return false;
@@ -1855,12 +1919,11 @@ bool Scan::matchAddCone(Operation *op) {
         return isa<comb::AddOp>(u);
       }))
     return false;
-  SmallVector<Value> leaves;
+  SmallVector<Value> leaves, rest;
   SmallVector<Operation *> ops;
-  APInt sum(64, 0);
   for (Value o : op->getOperands()) {
     APInt m;
-    if (!addLeaves(o, leaves, m, ops, 1))
+    if (!addLeaves(o, leaves, m, ops, 1, &rest))
       return false;
   }
   llvm::MapVector<int, SmallVector<Value>> byPack;
@@ -1880,6 +1943,7 @@ bool Scan::matchAddCone(Operation *op) {
   if (p.packs.empty())
     return false;
   p.acOp = "comb.add";
+  p.rest = rest;
   p.internal.assign(ops.begin(), ops.end());
   patterns[op] = std::move(p);
   red.insert(res);
@@ -2838,7 +2902,15 @@ void LaneScanPass::runOnOperation() {
   };
   std::vector<Work> work;
   std::map<std::pair<StringRef, bool>, unsigned> probeScore;
-  for (auto &[callee, insts] : groups) {
+  // The groups with the most lanes first: a reduction over several groups'
+  // values is scanned at the finest grain (a popcount over the sockets'
+  // ports, not over the slices' partial sums).
+  SmallVector<std::pair<StringRef, SmallVector<hw::InstanceOp>>> order(
+      groups.begin(), groups.end());
+  llvm::stable_sort(order, [](auto &a, auto &b) {
+    return a.second.size() > b.second.size();
+  });
+  for (auto &[callee, insts] : order) {
     if (insts.size() < minLanes || (!wanted.empty() && !wanted.count(callee)))
       continue;
     SmallVector<hw::InstanceOp> r(insts.rbegin(), insts.rend());
@@ -3122,8 +3194,18 @@ void LaneScanPass::runOnOperation() {
           }
           p.packs[k] = pack;
         }
-        for (int pk : p.packs)
-          ok &= ok && cellPack[pk];
+        // A pack the cell cannot make (its values read a reduction the
+        // parent makes): the parent's values are the cell's inputs, one a
+        // lane, for a sum (narrow values only: an input link a lane).
+        p.parentPacks.clear();
+        for (auto [k, pk] : llvm::enumerate(p.packs))
+          if (ok && !cellPack[pk]) {
+            if (p.acOp == "comb.add" && !p.mixed &&
+                widthOf(s.tmpl(pk)) <= 8)
+              p.parentPacks.push_back(k);
+            else
+              ok = false;
+          }
         for (Value v : p.vecs)
           ok &= cellVec.count(v) != 0;
         break;
@@ -3359,20 +3441,6 @@ void LaneScanPass::runOnOperation() {
     // Lane j's values of one operand position: the same value everywhere
     // (broadcast or constant), per-lane constants, slices of one parent value
     // at offsets affine in the lane, or a per-lane input.
-    // A value the parent makes from the lanes' outputs and parent values by
-    // wiring alone.
-    std::function<bool(Value, int)> fromInputs = [&](Value v, int depth) {
-      auto *d = v.getDefiningOp();
-      if (!d || depth > 16)
-        return false;
-      if (isa<hw::InstanceOp>(d) || s.get(v).kind == Kind::Scalar)
-        return true;
-      if (!isa<hw::BitcastOp, hw::StructExtractOp, comb::ExtractOp,
-               hw::ArrayGetOp, comb::ConcatOp>(d))
-        return false;
-      return llvm::all_of(d->getOperands(),
-                          [&](Value o) { return fromInputs(o, depth + 1); });
-    };
     auto perLane = [&](ArrayRef<Value> values) -> Value {
       if (llvm::all_equal(values))
         return bcast(values[0]);
@@ -3599,18 +3667,6 @@ void LaneScanPass::runOnOperation() {
                                                 rel, n));
             continue;
           }
-          // A narrowing of the lanes' outputs (a field, a slice): the parent
-          // makes it (wiring, free there) and the cell reads only its bits,
-          // not the whole output.
-          if (isa<hw::BitcastOp, hw::StructExtractOp, comb::ExtractOp,
-                  hw::ArrayGetOp>(op) &&
-              s.packComplete[p] && fromInputs(v, 0) &&
-              bitWidthOf(v) < bitWidthOf(op.getOperand(0))) {
-            SmallVector<Value> vs(s.packMembers[p].begin(),
-                                  s.packMembers[p].end());
-            define(v, perLane(vs));
-            continue;
-          }
           IRMapping map;
           for (unsigned k = 0; k < op.getNumOperands(); ++k)
             map.map(op.getOperand(k), operandOf(p, k));
@@ -3791,8 +3847,16 @@ void LaneScanPass::runOnOperation() {
           }
           operands.push_back(v);
         } else {
-          for (int pk : p->packs)
+          for (auto [k, pk] : llvm::enumerate(p->packs)) {
+            if (llvm::is_contained(p->parentPacks, unsigned(k))) {
+              SmallVector<Value> vs(F);
+              for (Value x : p->packVals[k])
+                vs[s.get(x).lane] = x;
+              operands.push_back(perLane(vs));
+              continue;
+            }
             operands.push_back(cellValue(s.tmpl(pk)));
+          }
         }
         // Narrower lane values (an adder tree's bits): zero-extended.
         for (auto &o : operands)
@@ -3820,6 +3884,15 @@ void LaneScanPass::runOnOperation() {
                              Value r = end;
                              if (!rest.empty()) {
                                SmallVector<Value> ops(rest);
+                               // Narrower parent terms of a sum: widened.
+                               for (auto &o : ops)
+                                 if (widthOf(o) < widthOf(end))
+                                   o = comb::ConcatOp::create(
+                                       ob, end.getLoc(),
+                                       hw::ConstantOp::create(
+                                           ob, end.getLoc(),
+                                           APInt(widthOf(end) - widthOf(o), 0)),
+                                       o);
                                ops.push_back(end);
                                OperationState st(root->getLoc(), opName);
                                st.addOperands(ops);
