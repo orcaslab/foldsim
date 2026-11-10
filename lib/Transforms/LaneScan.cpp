@@ -3441,20 +3441,6 @@ void LaneScanPass::runOnOperation() {
     // Lane j's values of one operand position: the same value everywhere
     // (broadcast or constant), per-lane constants, slices of one parent value
     // at offsets affine in the lane, or a per-lane input.
-    // A value the parent makes from the lanes' outputs and parent values by
-    // wiring alone.
-    std::function<bool(Value, int)> fromInputs = [&](Value v, int depth) {
-      auto *d = v.getDefiningOp();
-      if (!d || depth > 16)
-        return false;
-      if (isa<hw::InstanceOp>(d) || s.get(v).kind == Kind::Scalar)
-        return true;
-      if (!isa<hw::BitcastOp, hw::StructExtractOp, comb::ExtractOp,
-               hw::ArrayGetOp, comb::ConcatOp>(d))
-        return false;
-      return llvm::all_of(d->getOperands(),
-                          [&](Value o) { return fromInputs(o, depth + 1); });
-    };
     auto perLane = [&](ArrayRef<Value> values) -> Value {
       if (llvm::all_equal(values))
         return bcast(values[0]);
@@ -3679,18 +3665,6 @@ void LaneScanPass::runOnOperation() {
             else
               define(v, comb::ExtractOp::create(b, cellValue(ex.getInput()),
                                                 rel, n));
-            continue;
-          }
-          // A narrowing of the lanes' outputs (a field, a slice): the parent
-          // makes it (wiring, free there) and the cell reads only its bits,
-          // not the whole output.
-          if (isa<hw::BitcastOp, hw::StructExtractOp, comb::ExtractOp,
-                  hw::ArrayGetOp>(op) &&
-              s.packComplete[p] && fromInputs(v, 0) &&
-              bitWidthOf(v) < bitWidthOf(op.getOperand(0))) {
-            SmallVector<Value> vs(s.packMembers[p].begin(),
-                                  s.packMembers[p].end());
-            define(v, perLane(vs));
             continue;
           }
           IRMapping map;
