@@ -19730,6 +19730,10 @@ LogicalResult StaticFolder::buildSim() {
   // run) takes no slot and loads zero, the link's content before any write.
   struct StreamBuilt {
     Value pop1, inst1, row1, page1, data, popPtr, pending;
+    /// The landing read as is, and whether it is a skipped one (zero): a
+    /// member's registers load zero there by their reset, taken with their
+    /// enable, not through a mux of the whole word.
+    Value raw, skip;
     /// A mailbox stream of one row a pass (pingPong): its landings alternate
     /// between two sets of the members' registers, so that its reader's
     /// passes need not be spaced. `popPar` the set a landing loads (at its
@@ -19877,6 +19881,8 @@ LogicalResult StaticFolder::buildSim() {
     Value read = seq::FirMemReadOp::create(b, landing, sb.popPtr, hostClock,
                                           constant(1, 1));
     sb.data = comb::MuxOp::create(b, skip0, constant(st.dw, 0), read);
+    sb.raw = read;
+    sb.skip = skip0;
     // The requests, now.
     Value req0 = chain3r(table(b, rctl.at3, st.reqValid, 1), prefix + "_req");
     Value flip0 = chain3(table(b, rctl.at3, st.reqFlip, 1), prefix + "_flip");
@@ -20473,17 +20479,24 @@ LogicalResult StaticFolder::buildSim() {
             }
             Value en0 = resetReg(en1, name + "_en" + Twine(j), 0);
             Value bits = b.createOrFold<comb::ExtractOp>(
-                b.getIntegerType(hi - lo), sb.data, lo - j * st.dw);
+                b.getIntegerType(hi - lo), sb.raw, lo - j * st.dw);
+            // (A skipped landing loads zero: the registers' synchronous
+            // reset, with their enable.)
+            Value zero = constant(hi - lo, 0);
+            auto skipped = [&](Value en) -> Value {
+              return comb::AndOp::create(b, en, sb.skip);
+            };
             if (sb.pingPong) {
               // Two sets, loaded in turn, read in turn.
+              Value enA = comb::AndOp::create(b, en0, notOf(sb.popPar));
+              Value enB = comb::AndOp::create(b, en0, sb.popPar);
               Value setA = seq::CompRegClockEnabledOp::create(
-                  b, bits, hostClock,
-                  comb::AndOp::create(b, en0, notOf(sb.popPar)),
-                  b.getStringAttr(name + Twine(j) + "_a"), Value(), Value(),
+                  b, bits, hostClock, enA,
+                  b.getStringAttr(name + Twine(j) + "_a"), skipped(enA), zero,
                   Value(), hw::InnerSymAttr());
               Value setB = seq::CompRegClockEnabledOp::create(
-                  b, bits, hostClock, comb::AndOp::create(b, en0, sb.popPar),
-                  b.getStringAttr(name + Twine(j) + "_b"), Value(), Value(),
+                  b, bits, hostClock, enB,
+                  b.getStringAttr(name + Twine(j) + "_b"), skipped(enB), zero,
                   Value(), hw::InnerSymAttr());
               slices.push_back(comb::MuxOp::create(b, sb.useSel, setB, setA));
               early.push_back(comb::MuxOp::create(b, sb.useSelEarly, setB, setA));
@@ -20491,7 +20504,7 @@ LogicalResult StaticFolder::buildSim() {
             }
             Value r = seq::CompRegClockEnabledOp::create(
                 b, bits, hostClock, en0, b.getStringAttr(name + Twine(j)),
-                Value(), Value(), Value(), hw::InnerSymAttr());
+                skipped(en0), zero, Value(), hw::InnerSymAttr());
             slices.push_back(r);
             early.push_back(r);
           }
