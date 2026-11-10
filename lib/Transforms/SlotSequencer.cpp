@@ -709,19 +709,23 @@ bool findSeparable(ArrayRef<uint64_t> rows, unsigned width, bool anyPeriod,
         SmallVector<uint64_t> f(nq), g(d);
         for (uint64_t r = 0; r < d; ++r)
           g[r] = row(start + r);
-        bool ok = true;
-        for (uint64_t q = 0; q < nq && ok; ++q) {
+        for (uint64_t q = 0; q < nq; ++q) {
           uint64_t base = row(start + q * d);
           f[q] = isXor ? (base ^ g0) & mask : (base - g0) & mask;
+        }
+        // F: the parent's number, a segment or two (not a table of its own);
+        // checked first, the cheaper test.
+        if (slotSegments(f, width, 2).size() > 2)
+          continue;
+        bool ok = true;
+        for (uint64_t q = 0; q < nq && ok; ++q)
           for (uint64_t r = 0; r < d && ok; ++r) {
             uint64_t k = start + q * d + r;
             if (k >= end)
               break;
             ok = row(k) == op(f[q], g[r]);
           }
-        }
-        // F: the parent's number, a segment or two (not a table of its own).
-        if (!ok || slotSegments(f, width, 2).size() > 2)
+        if (!ok)
           continue;
         out.start = start;
         out.end = end;
