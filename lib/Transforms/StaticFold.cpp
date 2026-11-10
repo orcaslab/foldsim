@@ -13350,7 +13350,7 @@ LogicalResult StaticFolder::buildPPStream(
   }
   Value rdInst = instOf(rinst0, rrow0);
   // The slot whose prefetch starts (three ahead) and its bit: the pending
-  // bits are the window's slots' (zero-extended to the instances' port).
+  // bits are the window's slots' (a port as wide as the window).
   // (Registered: the slot table after the position tables, a host cycle
   // before the prefetch's first read leaves at stage 0.)
   Value startSlot = reg(ppStreamSlot(cls, b, idxWidth ? offChip3[1] : Value()),
@@ -13449,9 +13449,8 @@ LogicalResult StaticFolder::buildPPStream(
                 b, comb::MuxOp::create(b, done, doneBit, constant(slotsPow, 0)),
                 all)),
         comb::MuxOp::create(b, first2, startBit, constant(slotsPow, 0))));
-    if (slotsPow < entries)
-      pending = b.createOrFold<comb::ConcatOp>(constant(entries - slotsPow, 0),
-                                               pending);
+    // (The pending port is the window's slots', as wide as the window: not
+    // an instance's bit each, which would grow with the instances.)
     // The pass's write: the chunk's columns, their bytes enabled by their
     // lanes (8-bit lanes; every byte without masks); the padding off.
     SmallVector<Value> words, masks;
@@ -20698,9 +20697,13 @@ LogicalResult StaticFolder::buildSim() {
         Value bit = pending;
         Value inst = vm.pages ? pageInst : classInst;
         if (inst) {
-          unsigned entries = 1u << idxWidth;
-          Value shift = b.createOrFold<comb::ConcatOp>(
-              constant(entries - idxWidth, 0), inst);
+          // (The pending bits are the instances', or a streamed PP class's
+          // window slots' (its pageInst a slot): the shift as wide as they.)
+          unsigned pw = hw::getBitWidth(pending.getType());
+          unsigned iw = hw::getBitWidth(inst.getType());
+          Value shift = iw < pw ? b.createOrFold<comb::ConcatOp>(constant(pw - iw, 0), inst)
+                        : iw > pw ? b.createOrFold<comb::ExtractOp>(b.getIntegerType(pw), inst, 0)
+                                  : inst;
           bit = b.createOrFold<comb::ExtractOp>(
               i1, comb::ShrUOp::create(b, pending, shift), 0);
         }
