@@ -519,6 +519,9 @@ public:
   bool stateScratchPartial = true;
   /// `state-scratch-fixed`: the scratch as a fixed allocation (planScratch).
   bool stateScratchFixed = false;
+  /// `state-scratch-fixed-pp`: paged classes as state in RAM (PP, P their
+  /// pages), so that the fixed scratch streams part of them.
+  bool stateScratchFixedPP = true;
   /// `state-scratch-device-bits` / `state-scratch-reserve`: the scratch
   /// from the device (auto), less what else the fold places on chip.
   uint64_t stateScratchDeviceBits = 0, stateScratchReserve = 30000000;
@@ -8406,6 +8409,22 @@ LogicalResult StaticFolder::planStateInRam() {
       if (auto glob = llvm::GlobPattern::create(spec.glob);
           glob && glob->match(base))
         match = &spec;
+    // state-scratch-fixed-pp (with state-in-ram-pp): a paged class of several
+    // instances is state in RAM too, P its pages, so that the fixed scratch
+    // keeps a share of its instances and streams the rest (pages are kept or
+    // streamed whole: a step at the count where they no longer fit, a share
+    // left unused, an instance's pending bit each). The same choice at every
+    // instance count.
+    Spec implied;
+    if (!match && stateScratchFixed && stateScratchFixedPP && stateInRamPP && cls.page &&
+        !cls.sirMixed &&
+        cls.threads() >= 2) {
+      implied.glob = base.str();
+      implied.passes = cls.page;
+      match = &implied;
+      llvm::errs() << "foldsim-fold-static: state-in-ram: " << cls.name
+                   << ": state-scratch-fixed: paged, P " << cls.page << "\n";
+    }
     if (!match)
       continue;
     match->used = true;
@@ -22695,6 +22714,7 @@ void FoldStaticPass::runOnOperation() {
   folder.stateStreamWindow = stateStreamWindow;
   folder.stateScratchPartial = stateScratchPartial;
   folder.stateScratchFixed = stateScratchFixed;
+  folder.stateScratchFixedPP = stateScratchFixedPP;
   folder.stateScratchDeviceBits = stateScratchDeviceBits;
   folder.stateScratchDeviceBlockBits = stateScratchDeviceBlockBits;
   folder.stateScratchReserveUltra = stateScratchReserveUltra;
