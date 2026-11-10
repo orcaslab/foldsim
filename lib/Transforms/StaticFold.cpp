@@ -1424,6 +1424,10 @@ private:
     /// row's first beat alone (the stream's own tables, shifted); counters
     /// step the beats.
     unsigned beats = 1;
+    /// With beats, on a page engine: the positions its requests moved
+    /// earlier and its writes later, the same for every row (its tables
+    /// shifted, as regular as before).
+    unsigned requestOffset = 0, writeOffset = 0;
     unsigned beatBits() const { return beats > 1 ? llvm::Log2_32_Ceil(beats) : 0; }
     unsigned beatWidth() const {
       return beats > 1 ? unsigned(llvm::alignTo(llvm::divideCeil(dw, beats), 8)) : dw;
@@ -4921,7 +4925,7 @@ LogicalResult StaticFolder::planStreams() {
 
 unsigned StaticFolder::streamBeats(const LinkStream &st) const {
   if (!linkHbmBeatBits || st.dw <= linkHbmBeatBits || st.landings.empty() ||
-      st.writePasses.empty() || pageEngineCap)
+      st.writePasses.empty())
     return 1;
   unsigned k = std::min(8u, unsigned(llvm::divideCeil(st.dw, linkHbmBeatBits)));
   static const bool log = getenv("FOLDSIM_BEAT_LOG");
@@ -5005,7 +5009,7 @@ void StaticFolder::setStreamTables(LinkStream &st, ArrayRef<int> requests,
     for (unsigned j = 0; j < st.pages; ++j) {
       st.writeShift = std::max(
           st.writeShift, unsigned(writes[x] - (st.writePasses[p] + 1 + int(j))));
-      int w0 = k > 1 ? st.writePasses[p] + 1 + int(j) * k : writes[x];
+      int w0 = k > 1 ? st.writePasses[p] + 1 + int(st.writeOffset) + int(j) * k : writes[x];
       ++x;
       unsigned pos = mod(w0);
       st.writeValid[pos] = 1;
@@ -5212,6 +5216,104 @@ LogicalResult StaticFolder::assignPageEngines() {
   for (auto [k, st] : llvm::enumerate(linkStreams)) {
     if (!st.kept)
       continue;
+    // `link-hbm-beat-bits`: a stream of beats at its own positions (each
+    // landing's beats before its request position, each page's after its
+    // write position), on the first engine where they are all free, else a
+    // new one.
+    if (st.beats > 1) {
+      // Every row's requests moved `sr` earlier and its writes `sw` later
+      // (the same for all: the tables stay shifted copies), within the
+      // stream's room past the beats' own moves, each request after its
+      // slot's previous landing (the 8-position margin), each pass's writes
+      // before its next pass; the least moves on the first engine they fit.
+      int kb = int(st.beats), n = int(st.landings.size()), slots = int(st.slots());
+      int budget = int(st.room) - int(st.lead) - (kb - 1) * (1 + int(st.pages));
+      auto landingAt = [&](int i) {
+        int back = i < 0 ? (-i + n - 1) / n : 0;
+        return int(wrap(st.landings[i + back * n].q)) - back * frame;
+      };
+      int maxR = std::max(0, std::min(budget, 64));
+      for (int i = 0; i < n && maxR >= 0; ++i)
+        maxR = std::min(maxR, landingAt(i) - int(st.lead) - (kb - 1) - (landingAt(i - slots) + 8));
+      int maxW = std::max(0, std::min(budget, 64));
+      for (size_t x = 0; x < st.writePasses.size(); ++x) {
+        int w = st.writePasses[x];
+        int next = x + 1 < st.writePasses.size() ? st.writePasses[x + 1] : st.writePasses[0] + frame;
+        maxW = std::min(maxW, next - w - int(st.pages) * kb);
+      }
+      auto requestsFit = [&](unsigned e, int sr) {
+        for (auto &l : st.landings)
+          for (int b = 0; b < kb; ++b)
+            if (pageEngines[e].reads[wrap(l.q - int(st.lead) - sr - (kb - 1) + b)])
+              return false;
+        return true;
+      };
+      auto writesFit = [&](unsigned e, int sw) {
+        for (int w : st.writePasses)
+          for (unsigned j = 0; j < st.pages; ++j)
+            for (int b = 0; b < kb; ++b)
+              if (pageEngines[e].writes[wrap(w + 1 + sw + int(j) * kb + b)])
+                return false;
+        return true;
+      };
+      unsigned e = 0;
+      int sr = 0, sw = 0;
+      bool found = false;
+      for (; e < pageEngines.size() && maxR >= 0 && maxW >= 0 && !found; ++e) {
+        int r = 0, w = 0;
+        while (r <= maxR && !requestsFit(e, r))
+          ++r;
+        if (r > maxR)
+          continue;
+        while (w <= maxW && r + w <= budget && !writesFit(e, w))
+          ++w;
+        if (w > maxW || r + w > budget)
+          continue;
+        sr = r;
+        sw = w;
+        found = true;
+        break;
+      }
+      if (!found) {
+        e = pageEngines.size();
+        if (e >= pageEngineCap)
+          return netlist.emitError("page engines: ")
+                 << pageEngineCap << " engines cannot carry the link stream "
+                 << modelOf(st.pcls) << " -> " << modelOf(st.rcls);
+        newEngine();
+      }
+      st.requestOffset = unsigned(sr);
+      st.writeOffset = unsigned(sw);
+      if (sr || sw) {
+        SmallVector<int> requests, writes;
+        for (auto &l : st.landings)
+          requests.push_back(l.q - int(st.lead) - sr);
+        for (int w : st.writePasses)
+          for (unsigned j = 0; j < st.pages; ++j)
+            writes.push_back(w + 1 + int(j));
+        bool collide = false;
+        setStreamTables(st, requests, writes, collide);
+        st.writeShift = unsigned(sw);
+      }
+      SmallVector<unsigned> rq, wr;
+      for (auto &l : st.landings)
+        for (int b = 0; b < kb; ++b)
+          rq.push_back(wrap(l.q - int(st.lead) - sr - (kb - 1) + b));
+      for (int w : st.writePasses)
+        for (unsigned j = 0; j < st.pages; ++j)
+          for (int b = 0; b < kb; ++b)
+            wr.push_back(wrap(w + 1 + sw + int(j) * kb + b));
+      auto &eng = pageEngines[e];
+      for (unsigned q : rq)
+        eng.reads[q] = 1;
+      for (unsigned q : wr)
+        eng.writes[q] = 1;
+      eng.streams.push_back(unsigned(k));
+      eng.dataWidth = std::max(eng.dataWidth, st.portDW());
+      eng.instWidth = std::max(eng.instWidth, st.tagBits());
+      eng.addrWidth = std::max(eng.addrWidth, streamRowBits(st));
+      continue;
+    }
     // At its own positions, or within `link-hbm-shift` of them where an
     // engine leaves them taken; on a new engine at its own.
     // With `link-hbm-fit-slots`, the fewest landing slots its own positions
@@ -5256,7 +5358,7 @@ LogicalResult StaticFolder::assignPageEngines() {
       eng.writes[q] |= st.writeValid[q];
     }
     eng.streams.push_back(unsigned(k));
-    eng.dataWidth = std::max(eng.dataWidth, st.dw);
+    eng.dataWidth = std::max(eng.dataWidth, st.portDW());
     eng.instWidth = std::max(eng.instWidth, st.tagBits());
     eng.addrWidth = std::max(eng.addrWidth, streamRowBits(st));
   }
@@ -20314,8 +20416,10 @@ LogicalResult StaticFolder::buildSim() {
       rsp = comb::AndOp::create(b, body->getArgument(v.firstInput),
                                 eq(member, st.member));
       rspInst = b.createOrFold<comb::ExtractOp>(b.getIntegerType(ib), tag, 0);
+      if (st.beats > 1)
+        rspBeat = b.createOrFold<comb::ExtractOp>(b.getIntegerType(st.beatBits()), tag, ib);
       rspData = b.createOrFold<comb::ExtractOp>(
-          b.getIntegerType(st.dw), body->getArgument(v.firstInput + 2), 0);
+          b.getIntegerType(st.portDW()), body->getArgument(v.firstInput + 2), 0);
     }
     auto chain3 = [&](Value v, const Twine &n) {
       return reg(reg(reg(v, n + "2"), n + "1"), n + "0");
@@ -23228,7 +23332,7 @@ LogicalResult StaticFolder::buildSim() {
         wrRow.push_back(when(wv, rowOf(outs[5])));
         wrData.push_back(when(wv, zext(outs[6], dw)));
         wrMask.push_back(when(wv, zext(st.mailbox ? outs[7]
-                                                  : constant((st.dw + 7) / 8, ~0ull),
+                                                  : constant((st.portDW() + 7) / 8, ~0ull),
                                        dw / 8)));
       }
       auto any = [&](SmallVector<Value> &xs) -> Value {
