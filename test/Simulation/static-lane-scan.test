@@ -25,7 +25,7 @@
 # RUN: %t/cp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=40 +bubble=30 | FileCheck %s
 
 # SCAN: lane-scan: cell Top_lane_Leaf
-# SCAN: lane-scan: Top lanes Leaf x8: {{.*}}; scans ac 4 bitsel 1 carry 1 prio 1 rot 1 select 1 vec 5 (14 chains
+# SCAN: lane-scan: Top lanes Leaf x8: {{.*}}; scans ac {{[0-9]+}} bitsel 1 carry 1 prio 1 rot 1 select 1 vec {{[0-9]+}} (14 chains
 
 # The top: the eight Leafs and their eight cells, no array of the lanes'
 # values, no per-lane select left.

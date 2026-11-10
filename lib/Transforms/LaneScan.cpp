@@ -373,9 +373,14 @@ struct Scan {
                 DenseSet<std::pair<Value, unsigned>> &seen,
                 llvm::SetVector<Operation *> &ops, int depth);
   bool matchCone(Operation *op);
+  bool matchAddCone(Operation *op);
+  bool addLeaves(Value v, SmallVectorImpl<Value> &leaves, APInt &max,
+                 SmallVectorImpl<Operation *> &ops, int depth);
   bool matchConeAs(Operation *op, bool isAnd, bool invert);
   bool orCone(Value v, SmallVectorImpl<std::pair<int, Value>> &out);
   bool coneThroughRed = false;
+  // Pattern roots dropped as inside another pattern: not matched again.
+  DenseSet<Operation *> droppedRoots;
   bool splitRegisters();
   SmallVector<Operation *> *visitLog = nullptr;
 };
@@ -1380,6 +1385,9 @@ bool Scan::fullPack(ArrayRef<Value> values, int &pack) {
 
 bool Scan::matchPatterns() {
   bool any = false;
+  DenseSet<Operation *> oldRoots;
+  for (auto &[r, p] : patterns)
+    oldRoots.insert(r);
   SmallVector<comb::MuxOp> treeCands;
   auto *body = parent.getBodyBlock();
   auto add = [&](Pattern p) {
@@ -1410,7 +1418,8 @@ bool Scan::matchPatterns() {
         rotGathers.insert(m.getCond());
       }
   for (auto &op : *body) {
-    if (op.getNumResults() != 1 || patterns.count(&op))
+    if (op.getNumResults() != 1 || patterns.count(&op) ||
+        droppedRoots.count(&op))
       continue;
     Value res = op.getResult(0);
     if (rotGathers.count(res))
@@ -1515,6 +1524,8 @@ bool Scan::matchPatterns() {
         add(std::move(p));
       } else if (!isa<comb::AddOp>(op) && matchCone(&op)) {
         any = true;
+      } else if (isa<comb::AddOp>(op) && matchAddCone(&op)) {
+        any = true;
       }
       continue;
     }
@@ -1524,6 +1535,12 @@ bool Scan::matchPatterns() {
       if (get(b).kind == Kind::Vec)
         std::swap(a, b);
       APInt c;
+      // A reduction of lanes' bits: a cone over the lanes' values first (its
+      // packs move whole); the vector's own reduction when it is not one.
+      if (get(a).kind == Kind::Vec && matchCone(&op)) {
+        any = true;
+        continue;
+      }
       if (get(a).kind == Kind::Vec && isConstant(b, c) &&
           (c.isZero() || c.isAllOnes())) {
         auto pred = icmp.getPredicate();
@@ -1693,8 +1710,14 @@ bool Scan::matchPatterns() {
   for (auto *r : drop) {
     red.erase(r->getResult(0));
     patterns.erase(r);
+    droppedRoots.insert(r);
   }
-  return any;
+  // New patterns only (one dropped as inside another is not news).
+  (void)any;
+  for (auto &[r, p] : patterns)
+    if (!oldRoots.count(r))
+      return true;
+  return false;
 }
 
 bool Scan::finishPrio(Pattern &p, ArrayRef<int> order) {
@@ -1743,6 +1766,124 @@ bool Scan::finishPrio(Pattern &p, ArrayRef<int> order) {
       return ok;
     }
   }
+}
+
+/// The lanes' values whose sum `v` is, through adds that cannot overflow
+/// and zero extensions (an adder tree whose widths grow, a popcount): each
+/// leaf zero-extended. `max` is v's largest value (in 64 bits).
+bool Scan::addLeaves(Value v, SmallVectorImpl<Value> &leaves, APInt &max,
+                     SmallVectorImpl<Operation *> &ops, int depth) {
+  int64_t w = bitWidthOf(v);
+  if (depth > 64 || w <= 0 || w > 63)
+    return false;
+  APInt c;
+  if (isConstant(v, c) && c.isZero()) {
+    max = APInt(64, 0);
+    return true;
+  }
+  if (isElem(v)) {
+    leaves.push_back(v);
+    max = APInt::getLowBitsSet(64, w);
+    return true;
+  }
+  auto *d = v.getDefiningOp();
+  if (!d || (get(v).kind != Kind::Multi && get(v).kind != Kind::Vec &&
+             get(v).kind != Kind::Pfx))
+    return false;
+  if (auto cc = dyn_cast<comb::ConcatOp>(d)) {
+    auto in = cc.getInputs();
+    // {a & b, a ^ b}: a + b of two bits (a half adder).
+    if (in.size() == 2 && bitWidthOf(in[0]) == 1 && bitWidthOf(in[1]) == 1) {
+      auto a = in[0].getDefiningOp<comb::AndOp>();
+      auto x = in[1].getDefiningOp<comb::XorOp>();
+      if (a && x && a.getNumOperands() == 2 && x.getNumOperands() == 2 &&
+          ((a.getOperand(0) == x.getOperand(0) &&
+            a.getOperand(1) == x.getOperand(1)) ||
+           (a.getOperand(0) == x.getOperand(1) &&
+            a.getOperand(1) == x.getOperand(0)))) {
+        ops.append({d, a, x});
+        APInt m0, m1;
+        if (!addLeaves(a.getOperand(0), leaves, m0, ops, depth + 1) ||
+            !addLeaves(a.getOperand(1), leaves, m1, ops, depth + 1))
+          return false;
+        max = m0 + m1;
+        return true;
+      }
+    }
+    // {0, x}: x.
+    for (unsigned k = 0; k + 1 < in.size(); ++k)
+      if (!isConstant(in[k], c) || !c.isZero())
+        return false;
+    ops.push_back(d);
+    return addLeaves(in.back(), leaves, max, ops, depth + 1);
+  }
+  if (auto ex = dyn_cast<comb::ExtractOp>(d)) {
+    // The low bits of a value that fits in them.
+    if (ex.getLowBit() != 0)
+      return false;
+    ops.push_back(d);
+    return addLeaves(ex.getInput(), leaves, max, ops, depth + 1) &&
+           max.ule(APInt::getLowBitsSet(64, w));
+  }
+  if (auto add = dyn_cast<comb::AddOp>(d)) {
+    ops.push_back(d);
+    APInt sum(64, 0);
+    for (Value o : add.getInputs()) {
+      APInt m;
+      if (!addLeaves(o, leaves, m, ops, depth + 1))
+        return false;
+      bool ov = false;
+      sum = sum.uadd_ov(m, ov);
+      if (ov)
+        return false;
+    }
+    max = sum;
+    return true;
+  }
+  return false;
+}
+
+/// A sum of every lane's value of some packs (an adder tree, a popcount):
+/// one AC chain of adds.
+bool Scan::matchAddCone(Operation *op) {
+  Value res = op->getResult(0);
+  int64_t rw = bitWidthOf(res);
+  if (rw <= 0 || rw > 63)
+    return false;
+  // From the root only.
+  if (!res.use_empty() && llvm::all_of(res.getUsers(), [](Operation *u) {
+        return isa<comb::AddOp>(u);
+      }))
+    return false;
+  SmallVector<Value> leaves;
+  SmallVector<Operation *> ops;
+  APInt sum(64, 0);
+  for (Value o : op->getOperands()) {
+    APInt m;
+    if (!addLeaves(o, leaves, m, ops, 1))
+      return false;
+  }
+  llvm::MapVector<int, SmallVector<Value>> byPack;
+  for (Value l : leaves) {
+    if (!packOf.count(l) || bitWidthOf(l) > rw)
+      return false;
+    byPack[packOf.lookup(l)].push_back(l);
+  }
+  Pattern p{PatKind::AC, op};
+  for (auto &[pk, vs] : byPack) {
+    int pack;
+    if (!fullPack(vs, pack))
+      return false;
+    p.packs.push_back(pk);
+    p.packVals.push_back(vs);
+  }
+  if (p.packs.empty())
+    return false;
+  p.acOp = "comb.add";
+  p.internal.assign(ops.begin(), ops.end());
+  patterns[op] = std::move(p);
+  red.insert(res);
+  return true;
 }
 
 /// The lanes' one-bit values and the parent's one-bit values whose OR (AND)
@@ -3218,6 +3359,20 @@ void LaneScanPass::runOnOperation() {
     // Lane j's values of one operand position: the same value everywhere
     // (broadcast or constant), per-lane constants, slices of one parent value
     // at offsets affine in the lane, or a per-lane input.
+    // A value the parent makes from the lanes' outputs and parent values by
+    // wiring alone.
+    std::function<bool(Value, int)> fromInputs = [&](Value v, int depth) {
+      auto *d = v.getDefiningOp();
+      if (!d || depth > 16)
+        return false;
+      if (isa<hw::InstanceOp>(d) || s.get(v).kind == Kind::Scalar)
+        return true;
+      if (!isa<hw::BitcastOp, hw::StructExtractOp, comb::ExtractOp,
+               hw::ArrayGetOp, comb::ConcatOp>(d))
+        return false;
+      return llvm::all_of(d->getOperands(),
+                          [&](Value o) { return fromInputs(o, depth + 1); });
+    };
     auto perLane = [&](ArrayRef<Value> values) -> Value {
       if (llvm::all_equal(values))
         return bcast(values[0]);
@@ -3444,6 +3599,18 @@ void LaneScanPass::runOnOperation() {
                                                 rel, n));
             continue;
           }
+          // A narrowing of the lanes' outputs (a field, a slice): the parent
+          // makes it (wiring, free there) and the cell reads only its bits,
+          // not the whole output.
+          if (isa<hw::BitcastOp, hw::StructExtractOp, comb::ExtractOp,
+                  hw::ArrayGetOp>(op) &&
+              s.packComplete[p] && fromInputs(v, 0) &&
+              bitWidthOf(v) < bitWidthOf(op.getOperand(0))) {
+            SmallVector<Value> vs(s.packMembers[p].begin(),
+                                  s.packMembers[p].end());
+            define(v, perLane(vs));
+            continue;
+          }
           IRMapping map;
           for (unsigned k = 0; k < op.getNumOperands(); ++k)
             map.map(op.getOperand(k), operandOf(p, k));
@@ -3627,6 +3794,11 @@ void LaneScanPass::runOnOperation() {
           for (int pk : p->packs)
             operands.push_back(cellValue(s.tmpl(pk)));
         }
+        // Narrower lane values (an adder tree's bits): zero-extended.
+        for (auto &o : operands)
+          if (isa<IntegerType>(o.getType()) && widthOf(o) < int64_t(rw))
+            o = comb::ConcatOp::create(
+                b, hw::ConstantOp::create(b, APInt(rw - widthOf(o), 0)), o);
         for (Value v : p->vecs) {
           Value bit = cellValue(v);
           if (rw > 1)
@@ -3923,6 +4095,13 @@ void LaneScanPass::runOnOperation() {
       auto *d = v.getDefiningOp();
       if (!d)
         return;
+      // Wiring the parent reads stays in the parent too (free there; an
+      // export would send its bits back): only what it reads is exported.
+      if (moved.count(d) &&
+          isa<hw::BitcastOp, hw::StructExtractOp, comb::ExtractOp,
+              comb::ConcatOp, comb::ReplicateOp, hw::StructCreateOp,
+              hw::ArrayCreateOp>(d))
+        moved.erase(d);
       if (moved.count(d)) {
         exported.insert(v);
         return;
@@ -3978,6 +4157,9 @@ void LaneScanPass::runOnOperation() {
         exportVecs.insert(v);
     }
     for (int p : exportPacks) {
+      if (getenv("FOLDSIM_LANE_EXPORTS"))
+        llvm::errs() << "lane-export " << tag << " i" << widthOf(s.tmpl(p))
+                     << " : " << s.tmpl(p) << "\n";
       Value cv = cellValue(s.tmpl(p));
       SmallVector<Value> ms(s.packMembers[p].begin(), s.packMembers[p].end());
       for (int j = 0; j < s.packFirst[p]; ++j)
