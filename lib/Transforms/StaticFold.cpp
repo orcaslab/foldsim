@@ -3391,6 +3391,10 @@ static int sinkStage(Value value, int extra, int limit,
   return s.stage + (s.levels > 0 && s.levels + extra > limit ? 1 : 0);
 }
 
+/// The carry block (bits) Beacon's fold screen times adders and compares by
+/// on an FPGA (ci/beacon.py's `screen` preset: --carry-block-size 8).
+static constexpr unsigned kBeaconCarryBlock = 8;
+
 int StaticFolder::mappedDepthOf(hw::HWModuleOp model, unsigned entryBits,
                                 const DenseMap<Value, ::Staging> *stages) {
   auto key = std::make_pair(model.getOperation(), entryBits);
@@ -3414,6 +3418,22 @@ int StaticFolder::mappedDepthOf(hw::HWModuleOp model, unsigned entryBits,
         memory->setAttr("foldsim.instance_rows",
                         b.getI64IntegerAttr(int64_t(1) << entryBits));
       });
+    // The copy updates a register at its instance's pass alone, its next
+    // value held otherwise (a select of the next value and the register,
+    // which Beacon maps as logic on the register's input): every register
+    // of the clone takes that select, by an enable of its own input.
+    {
+      auto *body = copy.getBodyBlock();
+      Value enable;
+      SmallVector<seq::FirRegOp> regs(body->getOps<seq::FirRegOp>());
+      for (auto reg : regs) {
+        if (!enable)
+          enable = copy.appendInput("fsmapped_pass", b.getI1Type()).second;
+        b.setInsertionPoint(reg);
+        reg.getNextMutable().assign(comb::MuxOp::create(
+            b, reg.getLoc(), enable, reg.getNext(), reg.getResult()));
+      }
+    }
     // With `stages` (each value's stage): a register on every operand of the
     // logic taken from an earlier stage, as the stage registers cut it.
     if (stages) {
@@ -3459,7 +3479,10 @@ int StaticFolder::mappedDepthOf(hw::HWModuleOp model, unsigned entryBits,
         design->print(os);
     }
     PassManager pm(model.getContext(), ModuleOp::getOperationName());
-    if (succeeded(parsePassPipeline(foldsim::beaconMapPipeline(*target, false), pm)) &&
+    // (Mapped as Beacon screens a fold: adders and compares timed by carry
+    // block on an FPGA.)
+    unsigned carryBlock = target->asic ? 0 : kBeaconCarryBlock;
+    if (succeeded(parsePassPipeline(foldsim::beaconMapPipeline(*target, false, carryBlock), pm)) &&
         succeeded(pm.run(*design)))
       if (auto d = foldsim::beaconDeepestLevels(*design, name, *target); succeeded(d))
         depth = *d;
