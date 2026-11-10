@@ -5276,7 +5276,22 @@ LogicalResult StaticFolder::assignPageEngines() {
         eng.readFirst = true;
       }
     }
-  for (auto [k, st] : llvm::enumerate(linkStreams)) {
+  // (With link-hbm-beat-bits: the streams in order of the positions they
+  // take, most first (first fit decreasing packs fewer engines); else in
+  // their own order.)
+  SmallVector<unsigned> streamOrder;
+  for (unsigned k = 0; k < linkStreams.size(); ++k)
+    streamOrder.push_back(k);
+  if (linkHbmBeatBits) {
+    auto taken = [&](const LinkStream &st) {
+      return uint64_t(st.landings.size() + st.writePasses.size() * st.pages) * st.beats;
+    };
+    llvm::stable_sort(streamOrder, [&](unsigned x, unsigned y) {
+      return taken(linkStreams[x]) > taken(linkStreams[y]);
+    });
+  }
+  for (unsigned k : streamOrder) {
+    auto &st = linkStreams[k];
     if (!st.kept)
       continue;
     // `link-hbm-beat-bits`: a stream of beats at its own positions (each
