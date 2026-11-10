@@ -1246,7 +1246,9 @@ void LaneScanPass::runOnOperation() {
     for (auto &op : *body)
       if (s.carries.count(&op) && cellVec.count(op.getResult(0)))
         kinds["carry"]++;
-    if (movedPacks == 0 && pats.empty())
+    // Nothing to scan: the per-lane logic stays where it is (a cell would
+    // only hand it back to the parent or the lanes).
+    if (pats.empty())
       continue;
 
     DenseSet<Operation *> before;
@@ -2019,6 +2021,23 @@ void LaneScanPass::runOnOperation() {
       return signalPassFailure();
     }
 
+    // Report.
+    unsigned paramBits = 0, params = 0;
+    for (auto &in : ins)
+      if (in.chain < 0 && in.values.size() == F &&
+          !StringRef(in.name).starts_with("in_")) {
+        ++params;
+        paramBits += in.type.getIntOrFloatBitWidth();
+      }
+    unsigned exportBits = 0, exports = 0;
+    for (auto &o : outs)
+      if (o.chain < 0) {
+        ++exports;
+        exportBits += widthOf(o.cell);
+      }
+    unsigned chainBits = 0;
+    for (auto &c : chains)
+      chainBits += c.type.getIntOrFloatBitWidth();
     // The cell's ports and terminator.
     for (auto &in : ins)
       addPort(in.name, in.type, true);
@@ -2138,28 +2157,22 @@ void LaneScanPass::runOnOperation() {
       if (before.count(&op) && !isa<hw::OutputOp>(op) &&
           (!live.count(&op) || rootOf.count(&op)))
         dead.push_back(&op);
+    {
+      DenseSet<Operation *> deadSet(dead.begin(), dead.end());
+      for (auto *op : dead)
+        for (Value r : op->getResults())
+          for (auto *u : r.getUsers())
+            if (!deadSet.count(u)) {
+              op->emitError("lane-scan: a value still read is dropped: ")
+                  << *u;
+              return signalPassFailure();
+            }
+    }
     for (auto *op : dead)
       op->dropAllReferences();
     for (auto *op : dead)
       op->erase();
 
-    // Report.
-    unsigned paramBits = 0, params = 0;
-    for (auto &in : ins)
-      if (in.chain < 0 && in.values.size() == F &&
-          !in.values[0].getDefiningOp<hw::InstanceOp>()) {
-        ++params;
-        paramBits += in.type.getIntOrFloatBitWidth();
-      }
-    unsigned exportBits = 0, exports = 0;
-    for (auto &o : outs)
-      if (o.chain < 0) {
-        ++exports;
-        exportBits += widthOf(o.cell);
-      }
-    unsigned chainBits = 0;
-    for (auto &c : chains)
-      chainBits += c.type.getIntOrFloatBitWidth();
     llvm::errs() << "lane-scan: cell " << cellName << "\n";
     llvm::errs() << "lane-scan: " << module << " lanes " << callee << " x" << F
                  << ": " << movedPacks << " packs (" << movedOps
