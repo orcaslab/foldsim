@@ -1898,6 +1898,16 @@ def build_parser():
     ap.add_argument('--unstaged-env', action='store_true',
                     help="with --static: the endpoints take a token in the host cycle it is offered "
                          "(the kernel's memory endpoints unstaged)")
+    ap.add_argument('--lane-scan', action='store_true',
+                    help='fold the top\'s per-child glue: the instances of each class with at least '
+                         '--lane-scan-min instances in the top (or of --lane-scan-modules) are lanes; '
+                         'their per-lane logic becomes a lane cell class <top>_lane_<module>, the reductions '
+                         'across them zero-latency scans through its instances (foldsim-lane-scan; needs '
+                         '--zero-latency-links --zero-latency-chains)')
+    ap.add_argument('--lane-scan-modules', default='', metavar='M,...',
+                    help='with --lane-scan: the lane modules (default: every module with enough instances)')
+    ap.add_argument('--lane-scan-min', type=int, default=4, metavar='N',
+                    help='with --lane-scan: the fewest instances that make lanes (default %(default)s)')
     ap.add_argument('--zero-latency-chains', action='store_true',
                     help='with --zero-latency-links: every late link, chaining across models within '
                          'a host cycle as the native design does within a cycle')
@@ -2123,6 +2133,21 @@ def main():
          + (f' mode=auto min-bits={a.retime_memory_reads}' if a.retime_memory_reads is not None else ''),
          '--canonicalize', '--cse', '-o', flat])
     os.remove(flat + '.in')
+    # The top's per-child glue folded: lanes, a lane cell class, scans.
+    if a.lane_scan:
+        lanes = f' lanes={a.lane_scan_modules}' if a.lane_scan_modules else ''
+        r = run([foldsim_opt, flat, f'--pass-pipeline=builtin.module(foldsim-lane-scan{{module={a.top}{lanes}'
+                 f' min-lanes={a.lane_scan_min}}},hw.module(foldsim-remove-dead-state),canonicalize,cse)',
+                 '-o', flat + '.ls'], check=False, capture_output=True)
+        sys.stderr.write(r.stderr)
+        if r.returncode:
+            sys.exit('foldsim: lane-scan failed')
+        os.replace(flat + '.ls', flat)
+        with open(out('lane_scan.txt'), 'w') as f:
+            f.write(r.stderr)
+        for cell in re.findall(r'^lane-scan: cell (\S+)$', r.stderr, re.M):
+            modules.append(cell)
+            a.classes.append(cell)
     text = open(flat).read()
 
     # Each module with class instances, innermost first, becomes a netlist.
