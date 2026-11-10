@@ -16881,9 +16881,6 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         if (usedRows.size() > 1 && usedRows.size() < rowsPow) {
           for (unsigned j : usedRows)
             chosen.push_back(items[j]);
-          unsigned n = unsigned(llvm::PowerOf2Ceil(chosen.size()));
-          while (chosen.size() < n)
-            chosen.push_back(chosen.back());
         } else if (usedRows.size() == 1) {
           return items[usedRows[0]];
         } else {
