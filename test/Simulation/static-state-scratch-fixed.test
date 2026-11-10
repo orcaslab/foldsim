@@ -60,6 +60,24 @@
 # RUN: %t/q32/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
 # RUN: %t/q32/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
 
+# Paged with state-in-ram-pp: the paged class is state in RAM (PP, P its pages: 2), so the fixed scratch streams part
+# of it (here all: a share of none at C = 40,000, one URAM288 column's depth not fitting).
+# RUN: foldsim --srcs top64.f --top Top --out %t/fp64 --static --page Leaf:2 --storage Leaf:pages=ultra --state-in-ram-pp --state-scratch-bits 40000 --state-scratch-fixed Leaf > %t/fp64.log 2>&1
+# RUN: FileCheck %s --check-prefix=FP64 < %t/fp64.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/fp64 -Mdir %t/fp64/obj %S/Inputs/tb_pages.sv leaf.sv top64.sv %t/fp64/foldsim_sim.sv > %t/fp64/build.log 2>&1
+# RUN: %t/fp64/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/fp64/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+# One page: PP with one pass a row (P 1), streamed; with bubbles.
+# RUN: foldsim --srcs top64.f --top Top --out %t/f1p --static --page Leaf:1 --storage Leaf:pages=ultra --state-in-ram-pp --state-scratch-bits 40000 --state-scratch-fixed --bubbles --modulo Leaf > %t/f1p.log 2>&1
+# RUN: FileCheck %s --check-prefix=F1P < %t/f1p.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/f1p -DBUBBLES -Mdir %t/f1p/obj %S/Inputs/tb_pages.sv leaf.sv top64.sv %t/f1p/foldsim_sim.sv > %t/f1p/build.log 2>&1
+# RUN: %t/f1p/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# F1P: state-in-ram: Leaf: PP: 1 passes
+# F1P: state-scratch: fixed: Leaf: a share of 0 instances (0 bits); 0 of 64 resident (0 of each 4), 64 stream from HBM
+# FP64: state-in-ram: Leaf: state-scratch-fixed: paged, P 2
+# FP64: state-in-ram: Leaf: replaces page 2
+# FP64: state-scratch: fixed: Leaf: a share of 0 instances (0 bits); 0 of 64 resident (0 of each 4), 64 stream from HBM
+
 # A32: state-scratch: fixed: Leaf: a share of 128 instances (73728 bits); 30 of 32 resident (15 of each 16), 2 stream from HBM
 # A32: state-stream: Leaf: P 8, 2 of 32 instances streamed
 # A32SV: {{pp(_res)?}}_1024x72 pp_res0_ext (

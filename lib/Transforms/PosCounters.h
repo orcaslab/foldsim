@@ -18,6 +18,8 @@
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Value.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/ArrayRef.h"
 #include <map>
 #include <utility>
 
@@ -30,7 +32,7 @@ public:
   /// (null without bubbles).
   void begin(unsigned ii, unsigned posWidth, mlir::Value clock,
              mlir::Value reset, mlir::Value go, mlir::Value advance);
-  void end() { known.clear(); cache.clear(); on = false; }
+  void end() { known.clear(); cache.clear(); rankCache.clear(); on = false; }
   bool active() const { return on; }
 
   /// `reg` is a position register loaded with `next` (a position value), its
@@ -48,6 +50,16 @@ public:
   std::pair<mlir::Value, mlir::Value> divmod(mlir::ImplicitLocOpBuilder &b,
                                              mlir::Value v, unsigned d);
 
+  /// `v`'s rank in the set `set` of the frame's positions (rows 0..ii, the
+  /// last the idle position's): how many of the set's positions are before
+  /// it (`ii`: all of them), as a counter beside each position register,
+  /// stepped as the position is. `inSet(pos)` builds the set's one-bit table
+  /// at a position value (a slot table). `key` names the set (the same key,
+  /// the same counters).
+  mlir::Value rank(mlir::ImplicitLocOpBuilder &b, mlir::Value v,
+                   llvm::ArrayRef<uint64_t> set, uint64_t key,
+                   llvm::function_ref<mlir::Value(mlir::Value)> inSet);
+
 private:
   enum Kind { Reg, Next, NextFree, Shown };
   struct Node {
@@ -59,6 +71,7 @@ private:
   mlir::Value clock, reset, go, advance;
   llvm::DenseMap<mlir::Value, Node> known;
   std::map<std::pair<void *, unsigned>, std::pair<mlir::Value, mlir::Value>> cache;
+  std::map<std::pair<void *, uint64_t>, mlir::Value> rankCache;
 };
 
 /// The simulator's position counters while it is built (null otherwise):

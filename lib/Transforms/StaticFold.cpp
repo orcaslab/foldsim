@@ -519,6 +519,9 @@ public:
   bool stateScratchPartial = true;
   /// `state-scratch-fixed`: the scratch as a fixed allocation (planScratch).
   bool stateScratchFixed = false;
+  /// `state-scratch-fixed-pp`: paged classes as state in RAM (PP, P their
+  /// pages), so that the fixed scratch streams part of them.
+  bool stateScratchFixedPP = true;
   /// `state-scratch-device-bits` / `state-scratch-reserve`: the scratch
   /// from the device (auto), less what else the fold places on chip.
   uint64_t stateScratchDeviceBits = 0, stateScratchReserve = 30000000;
@@ -561,6 +564,8 @@ public:
     Value valid3, inst3, row3;
     /// Partly resident: whether the pass's instance streams (else null).
     Value streamed3;
+    /// The prefetch's window slot by position (`ppfslot3`, three ahead).
+    Value prefSlot3;
   };
   /// Builds a streamed PP class's HBM rows: a virtual memory a chunk of
   /// columns (at most 4,096 bits), the prefetches' responses written into
@@ -8398,6 +8403,19 @@ LogicalResult StaticFolder::planStateInRam() {
              << "' is not <glob>[:<min-bits>[:<P>|auto]], P at least 1";
     specs.push_back(spec);
   }
+  // state-scratch-fixed: the longest sweep of a class (instances x its
+  // passes or pages), a bound under the frame (below).
+  uint64_t maxSweep = 0;
+  for (auto &cls : classes) {
+    StringRef base = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
+                                        : StringRef(cls.name);
+    unsigned passes = std::max(1u, cls.page);
+    for (auto &spec : specs)
+      if (auto glob = llvm::GlobPattern::create(spec.glob);
+          glob && glob->match(base) && spec.passes)
+        passes = spec.passes;
+    maxSweep = std::max<uint64_t>(maxSweep, uint64_t(cls.threads()) * passes);
+  }
   for (auto &cls : classes) {
     StringRef base = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
                                         : StringRef(cls.name);
@@ -8406,6 +8424,22 @@ LogicalResult StaticFolder::planStateInRam() {
       if (auto glob = llvm::GlobPattern::create(spec.glob);
           glob && glob->match(base))
         match = &spec;
+    // state-scratch-fixed-pp (with state-in-ram-pp): a paged class of several
+    // instances is state in RAM too, P its pages, so that the fixed scratch
+    // keeps a share of its instances and streams the rest (pages are kept or
+    // streamed whole: a step at the count where they no longer fit, a share
+    // left unused, an instance's pending bit each). The same choice at every
+    // instance count.
+    Spec implied;
+    if (!match && stateScratchFixed && stateScratchFixedPP && stateInRamPP && cls.page &&
+        !cls.sirMixed &&
+        cls.threads() >= 2) {
+      implied.glob = base.str();
+      implied.passes = cls.page;
+      match = &implied;
+      llvm::errs() << "foldsim-fold-static: state-in-ram: " << cls.name
+                   << ": state-scratch-fixed: paged, P " << cls.page << "\n";
+    }
     if (!match)
       continue;
     match->used = true;
@@ -8495,6 +8529,18 @@ LogicalResult StaticFolder::planStateInRam() {
     // RAM the same.)
     if (style.empty())
       style = !stateScratchFixed && uint64_t(entries) * p <= 512 ? "block" : "ultra";
+    // state-scratch-fixed, PP: P a power of two where its sweep stays within
+    // the longest class sweep (the frame is at least that: no II), so that
+    // the passes' positions and the streamed rows' tables (the resident
+    // index, stream bit, window slot) are a power-of-two period's digits.
+    if (stateScratchFixed && stateInRamPP && p > 1 && !llvm::isPowerOf2_32(p) &&
+        uint64_t(threads) * llvm::PowerOf2Ceil(p) <= maxSweep) {
+      llvm::errs() << "foldsim-fold-static: state-in-ram: " << cls.name
+                   << ": state-scratch-fixed: P " << p << " -> " << llvm::PowerOf2Ceil(p)
+                   << " (sweep " << uint64_t(threads) * llvm::PowerOf2Ceil(p)
+                   << " within " << maxSweep << ")\n";
+      p = unsigned(llvm::PowerOf2Ceil(p));
+    }
     cls.sir = p;
     cls.sirStyle = style;
     cls.rowStateBits = bits;
@@ -8510,7 +8556,10 @@ LogicalResult StaticFolder::planStateInRam() {
     if (p == 1 && storageFor(cls, "sir-rows", /*reg=*/false, 0))
       return netlist.emitError("state-in-ram: ")
              << cls.name << ": sir-rows needs P > 1 (its rows are pages)";
-    if (p > 1 && stateInRamPP) {
+    // (state-scratch-fixed: P 1 too, one pass a row, so that the fixed
+    // scratch streams it as a PP class's rows: a P 1 row kept in place
+    // would be on chip whole at every count.)
+    if ((p > 1 || (stateScratchFixed && stateScratchFixedPP)) && stateInRamPP) {
       // CSF pass-partitioned (PP): no pages. Pass j reads row j in place and
       // writes it from the logic; the class is staged with P stages
       // (chooseStages), its copy's passes P apart (passSpacing).
@@ -9711,6 +9760,19 @@ LogicalResult StaticFolder::schedule() {
     }
   }
 
+  // (FOLDSIM_SLOT_DUMP, a debug hook: each class's passes' slots, by
+  // instance.)
+  if (getenv("FOLDSIM_SLOT_DUMP"))
+    for (auto &cls : classes)
+      for (auto pass : {kReady, kState}) {
+        if (pass == kReady && !cls.hasReady)
+          continue;
+        llvm::errs() << "slot-dump " << cls.name << " " << (pass == kState ? "state" : "ready")
+                     << " stages " << cls.stages << " pp " << cls.pp << ":";
+        for (unsigned i = 0; i < cls.threads(); ++i)
+          llvm::errs() << " " << cls.slot[pass][i];
+        llvm::errs() << "\n";
+      }
   std::string text;
   llvm::raw_string_ostream os(text);
   os << "foldsim-fold-static: II = " << ii << "\n";
@@ -10606,7 +10668,11 @@ static unsigned gSlotSegments = 0;
 /// `rows[index]` as a slot-segments decoder (through the position counters
 /// where the index is the frame's position), or null if it does not decode.
 static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
-                            ArrayRef<uint64_t> rows, unsigned width);
+                            ArrayRef<uint64_t> rows, unsigned width,
+                            ArrayRef<uint8_t> care = {});
+/// The rows the next table() reads (empty: all; a valid bit beside the
+/// table low elsewhere): set by tableCare for one call.
+static ArrayRef<uint8_t> gCare;
 /// While the simulator is built: the classes' pass sequences (each pass
 /// kind of each class of several instances) and the frame, for position
 /// tables that do not decode to be read through one (slot-segments).
@@ -13581,8 +13647,31 @@ LogicalResult StaticFolder::buildPPStream(
   // bits are the window's slots' (a port as wide as the window).
   // (Registered: the slot table after the position tables, a host cycle
   // before the prefetch's first read leaves at stage 0.)
-  Value startSlot = reg(ppStreamSlot(cls, b, idxWidth ? offChip3[1] : Value()),
+  Value startSlot = reg(ports.prefSlot3 ? ports.prefSlot3
+                                        : ppStreamSlot(cls, b, idxWidth ? offChip3[1] : Value()),
                         "pps_start_slot2");
+  // Each slot's instance, recorded as its prefetch starts: a response's slot
+  // is the one holding its instance (a slot holds one instance at a time),
+  // a compare a slot, not a table of the instances.
+  SmallVector<Value> slotInst;
+  if (idxWidth && slotBits) {
+    Value startInst2 = reg(offChip3[1], "pps_start_inst2");
+    for (unsigned w = 0; w < cls.pageWindow; ++w) {
+      auto next = edges.get(bits(idxWidth));
+      Value held = reg(next, "pps_slot_inst" + Twine(w));
+      Value here = resetReg(comb::AndOp::create(
+                          b, offChip3[0],
+                          comb::AndOp::create(
+                              b, isRow(offChip3[2], 0),
+                              comb::ICmpOp::create(b, comb::ICmpPredicate::eq,
+                                                   ports.prefSlot3 ? ports.prefSlot3
+                                                                   : ppStreamSlot(cls, b, offChip3[1]),
+                                                   constant(slotBits, w)))),
+                      "pps_slot_set2_" + Twine(w));
+      next.setValue(comb::MuxOp::create(b, here, startInst2, held));
+      slotInst.push_back(held);
+    }
+  }
   Value first2 = resetReg(first3, "pps_first2");
   auto slotBit = [&](Value slot) -> Value {
     Value index = slotBits ? slot : constant(1, 0);
@@ -13629,7 +13718,20 @@ LogicalResult StaticFolder::buildPPStream(
     Value rspInstance =
         idxWidth ? b.createOrFold<comb::ExtractOp>(bits(idxWidth), rspAt, rowBits)
                  : Value();
-    Value rspSlot = ppStreamSlot(cls, b, rspInstance);
+    Value rspSlot;
+    if (!slotInst.empty()) {
+      // The slot holding the response's instance (one-hot over the slots).
+      SmallVector<Value> hit;
+      for (auto held : slotInst)
+        hit.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::eq, held, rspInstance));
+      Value acc = constant(slotBits, 0);
+      for (unsigned w = 0; w < hit.size(); ++w)
+        acc = comb::OrOp::create(
+            b, acc, comb::MuxOp::create(b, hit[w], constant(slotBits, w), constant(slotBits, 0)));
+      rspSlot = acc;
+    } else {
+      rspSlot = ppStreamSlot(cls, b, rspInstance);
+    }
     Value writeAt = slotBits ? b.createOrFold<comb::ConcatOp>(rspSlot, rspRow) : rspRow;
     for (unsigned c = 0; c < n; ++c) {
       auto memory = columns[lo + c];
@@ -14247,8 +14349,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       addPort("ppres3", IntegerType::get(context, cls.ppResBits()), true);
       addPort("ppstr3", IntegerType::get(context, 1), true);
     }
-    if (cls.ppHbm)
+    if (cls.ppHbm) {
       addPort("ppslot3", IntegerType::get(context, cls.ppSlotBits()), true);
+      addPort("ppfslot3", IntegerType::get(context, cls.ppSlotBits()), true);
+    }
   }
   SmallVector<unsigned> inputArg(cls.inputNames.size(), 0);
   for (auto [i, name] : llvm::enumerate(cls.inputNames)) {
@@ -14402,7 +14506,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   BackedgeBuilder ppEdges(b, model.getLoc());
   SmallVector<PPReg> ppRegs;
   Operation *ppHeld = nullptr;
-  Value ppValid3, ppInst3, ppRow3, ppRinst0, ppRes3, ppStr3, ppSlotIn3;
+  Value ppValid3, ppInst3, ppRow3, ppRinst0, ppRes3, ppStr3, ppSlotIn3, ppPrefSlot3;
   if (cls.pp) {
     ppValid3 = body->getArgument(ppArg);
     if (threads > 1)
@@ -14414,8 +14518,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       ppRes3 = body->getArgument(next++);
       ppStr3 = body->getArgument(next++);
     }
-    if (cls.ppHbm)
+    if (cls.ppHbm) {
       ppSlotIn3 = body->getArgument(next++);
+      ppPrefSlot3 = body->getArgument(next++);
+    }
   }
   if (cls.stages) {
     auto chain = [&](Value value, unsigned regs, const Twine &name) {
@@ -16190,7 +16296,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         if (colHbm(c))
           memories.push_back(col.memory);
       PPStreamPorts ports{copy, body, hostClock, offChip3, ppValid3, ppInst3,
-                          ppRow3, str3};
+                          ppRow3, str3, ppPrefSlot3};
       if (failed(buildPPStream(cls, b, ports, memories, streamWrites, lanes,
                                pageRequests)))
         return failure();
@@ -17093,6 +17199,8 @@ LogicalResult StaticFolder::checkMulticycle(Class &cls) {
 /// A table indexed by `index`, of constants of `width` bits.
 static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                    unsigned width, unsigned site) {
+  ArrayRef<uint8_t> care = gCare;
+  gCare = {};
   auto type = b.getIntegerType(std::max(width, 1u));
   bool uniform = llvm::all_of(rows, [&](uint64_t v) { return v == rows[0]; });
   if (rows.empty() || uniform)
@@ -17104,10 +17212,23 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     const char *env = getenv("FOLDSIM_SLOT_MIN_INDEX_BITS");  // a test hook
     return env ? atoi(env) : 7;
   }();
+  // (FOLDSIM_TABLE_SITES, a debug hook: every table built, by line.)
+  if (getenv("FOLDSIM_TABLE_SITES"))
+    llvm::errs() << "table-site " << site << " " << rows.size() << " " << width << "\n";
   if (gSlotSegments && !gTableRaw && int(indexWidth) >= minIndexBits) {
     auto *pc = foldsim::currentPosCounters();
     bool counted = pc && pc->knows(index);
-    if (Value decoded = tryDecodeTable(b, index, rows, width)) {
+    uint64_t segsBefore = foldsim::slotSequencerStats().segments;
+    if (Value decoded = tryDecodeTable(b, index, rows, width, care)) {
+      if (getenv("FOLDSIM_TABLE_SITES"))
+        llvm::errs() << "table-dec " << site << " " << rows.size() << " " << width << " "
+                     << foldsim::slotSequencerStats().segments - segsBefore << "\n";
+      if (const char *ds = getenv("FOLDSIM_TABLE_DUMP_SITE"); ds && int(site) == atoi(ds)) {
+        llvm::errs() << "table-rows " << site << " " << width << ":";
+        for (auto r : rows)
+          llvm::errs() << " " << r;
+        llvm::errs() << "\n";
+      }
       // (FOLDSIM_SLOT_CHECK, a debug hook: the table built beside its
       // decoder, and a simulation stops where they differ.)
       if (getenv("FOLDSIM_SLOT_CHECK")) {
@@ -17122,6 +17243,14 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
               clk = hm.getBodyBlock()->getArgument(k);
         if (clk) {
           Value ne = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, decoded, raw);
+          // (Where the rows are read: a row nothing reads may differ.)
+          if (!care.empty()) {
+            SmallVector<uint64_t> careRows(care.begin(), care.end());
+            gTableRaw = true;
+            Value read = table(b, index, careRows, 1, site);
+            gTableRaw = false;
+            ne = comb::AndOp::create(b, ne, read);
+          }
           Value clock = seq::FromClockOp::create(b, clk);
           std::string what = ("foldsim: slot-sequencer: decoder differs from its table (line " + Twine(site) + ", " +
                               Twine(rows.size()) + " x " + Twine(width) + ")").str();
@@ -17142,7 +17271,7 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     // request and use rows of a reader are such tables.
     foldsim::SequenceFactor fac;
     if (!gFactoring && gPassII && rows.size() == gPassII + 1 &&
-        foldsim::factorThroughSequence(rows, width, gPassII, gPassSeqs, fac)) {
+        foldsim::factorThroughSequence(rows, width, gPassII, gPassSeqs, fac, care)) {
       gFactoring = true;
       auto &seq = gPassSeqs[fac.seq];
       unsigned ii = gPassII;
@@ -17237,7 +17366,8 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
 }
 
 static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
-                            ArrayRef<uint64_t> rows, unsigned width) {
+                            ArrayRef<uint64_t> rows, unsigned width,
+                            ArrayRef<uint8_t> care) {
   if (!gSlotSegments)
     return {};
   auto *pc = foldsim::currentPosCounters();
@@ -17247,8 +17377,73 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
   if (counted)
     divmod = byCounters;
   if (Value decoded =
-          foldsim::decodeSlotTable(b, index, rows, width, gSlotSegments, divmod))
+          foldsim::decodeSlotTable(b, index, rows, width, gSlotSegments, divmod, care))
     return decoded;
+  // A table separable in a period of its index (a hierarchical identifier:
+  // a parent's number joined with a child's constant): the period's
+  // quotient through F's decoder, its remainder through a table of the
+  // period's rows (G), as large at any count of parents. A power of two
+  // splits the index's bits; another period takes the position counters'
+  // quotient and remainder. (Also a position table that repeats a period of
+  // the schedule, F zero or the instances a period further: G that period's
+  // rows, up to 1,024.)
+  foldsim::Separable sp;
+  unsigned iwidth = hw::getBitWidth(index.getType());
+  if (width >= 2 && !gTableRaw &&
+      foldsim::findSeparable(rows, width, counted, 1024, sp)) {
+    auto itype = index.getType();
+    auto cst = [&](Type t, uint64_t v) -> Value { return hw::ConstantOp::create(b, t, v); };
+    Value q, r;
+    uint64_t d = sp.period;
+    if (llvm::isPowerOf2_64(d)) {
+      unsigned k = llvm::Log2_64(d);
+      Value off = sp.start ? Value(comb::SubOp::create(b, index, cst(itype, sp.start))) : index;
+      q = comb::ExtractOp::create(b, off, k, iwidth - k);
+      r = comb::ExtractOp::create(b, off, 0, k);
+    } else {
+      // The counters' quotient and remainder of the index; the remainder's
+      // table rotated by the start's, the quotient less the start's and a
+      // borrow where the remainder is below the start's.
+      auto [pq, pr] = pc->divmod(b, index, unsigned(d));
+      uint64_t sq = sp.start / d, sr = sp.start % d;
+      SmallVector<uint64_t> rot(d);
+      for (uint64_t x = 0; x < d; ++x)
+        rot[x] = sp.g[(x + d - sr) % d];
+      sp.g = std::move(rot);
+      r = pr;
+      q = pq;
+      unsigned qw = hw::getBitWidth(pq.getType());
+      if (sq)
+        q = comb::SubOp::create(b, q, cst(pq.getType(), sq));
+      if (sr) {
+        Value borrow = comb::ICmpOp::create(b, comb::ICmpPredicate::ult, pr,
+                                            cst(pr.getType(), sr));
+        q = comb::SubOp::create(
+            b, q, b.createOrFold<comb::ConcatOp>(cst(b.getIntegerType(qw - 1), 0), borrow));
+      }
+    }
+    Value fv = table(b, q, sp.f, width);
+    Value gv = table(b, r, sp.g, width);
+    Value v = sp.isXor ? Value(comb::XorOp::create(b, fv, gv))
+                       : Value(comb::AddOp::create(b, fv, gv));
+    SmallVector<Value> in;
+    if (sp.start)
+      in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge, index, cst(itype, sp.start)));
+    if (sp.end < (uint64_t(1) << iwidth))
+      in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::ult, index, cst(itype, sp.end)));
+    if (!in.empty()) {
+      Value hit = in.size() == 1 ? in[0] : Value(comb::AndOp::create(b, in, false));
+      v = comb::MuxOp::create(b, hit, v, cst(b.getIntegerType(width), 0));
+    }
+    auto &st = foldsim::slotSequencerStats();
+    ++st.decoded;
+    st.decodedBits += (uint64_t(1) << iwidth) * width;
+    if (getenv("FOLDSIM_AFFINE_LOG"))
+      llvm::errs() << "slot-sequencer: separable table of " << rows.size() << " x " << width
+                   << " bits: period " << d << (sp.isXor ? " xor" : " sum") << " from " << sp.start
+                   << " to " << sp.end << "\n";
+    return v;
+  }
   // A one-bit table whose zero rows are the fewer segments (a set of nearly
   // every position: a copy's passes but a few holes): its complement
   // decoded and inverted, zero past the rows.
@@ -17258,7 +17453,7 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
   for (auto [k, r] : llvm::enumerate(rows))
     inverse[k] = (r & 1) ^ 1;
   Value decoded =
-      foldsim::decodeSlotTable(b, index, inverse, 1, gSlotSegments, divmod);
+      foldsim::decodeSlotTable(b, index, inverse, 1, gSlotSegments, divmod, care);
   if (!decoded)
     return {};
   unsigned indexWidth = hw::getBitWidth(index.getType());
@@ -17269,6 +17464,18 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
         b, v,
         comb::ICmpOp::create(b, comb::ICmpPredicate::ult, index,
                              hw::ConstantOp::create(b, index.getType(), rows.size())));
+  return v;
+}
+
+/// table() of a value read only where `care` (a valid bit beside it): the
+/// other rows take whatever value decodes in the fewest segments.
+static Value tableCare(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+                       ArrayRef<uint8_t> care, unsigned width,
+                       unsigned site = __builtin_LINE()) {
+  if (!getenv("FOLDSIM_NO_CARE"))
+    gCare = care;
+  Value v = table(b, index, rows, width, site);
+  gCare = {};
   return v;
 }
 
@@ -17718,6 +17925,23 @@ LogicalResult StaticFolder::buildSim() {
       add(cls.slot[kState]);
       for (unsigned l = 0; l < cls.readyLevels; ++l)
         add(cls.readySlots(l));
+      // A PP class's passes, each instance's P of them (its rows' reads and
+      // their prefetches, a lead before, are at them).
+      if (cls.pp > 1) {
+        foldsim::PassSequence seq;
+        seq.instAt.assign(ii, -1);
+        seq.instances = cls.threads();
+        bool clash = false;
+        for (unsigned i = 0; i < cls.threads(); ++i)
+          for (unsigned j = 0; j < cls.pp; ++j) {
+            int r = cls.slot[kState][i] - int(cls.stages) + int(j);
+            unsigned q = unsigned(((r % int(ii)) + int(ii)) % int(ii));
+            clash |= seq.instAt[q] >= 0;
+            seq.instAt[q] = int(i);
+          }
+        if (!clash)
+          gPassSeqs.push_back(std::move(seq));
+      }
     }
   auto *context = top.getContext();
   auto i1 = IntegerType::get(context, 1);
@@ -18061,7 +18285,7 @@ LogicalResult StaticFolder::buildSim() {
     Value live3, pre3;
     /// CSF PP (state-in-ram-pp): whether the position three host cycles
     /// ahead is a pass of a state evaluation, its instance and its row.
-    Value ppValid3, ppInst3, ppRow3, ppRes3, ppStr3, ppSlot3;
+    Value ppValid3, ppInst3, ppRow3, ppRes3, ppStr3, ppSlot3, ppPrefSlot3;
   };
   SmallVector<Controls, 0> controls(classes.size());
   // Staged classes: what each reads at a position, its stages before each
@@ -18219,9 +18443,54 @@ LogicalResult StaticFolder::buildSim() {
           1u, llvm::Log2_32_Ceil(unsigned(llvm::PowerOf2Ceil(cls.pp))));
       SmallVector<uint64_t> readRow, instRow, rowRow;
       ppStreamRows(cls, readRow, instRow, rowRow);
-      ctl.offChip3 = {table(b, at, readRow, 1), table(b, at, instRow, idxWidth),
-                      table(b, at, rowRow, rowBits), constant(1, 0),
-                      constant(rowBits, 0)};
+      // (The read's instance and row are read with the read alone.)
+      SmallVector<uint8_t> reads(readRow.size());
+      for (auto [k, r] : llvm::enumerate(readRow))
+        reads[k] = r != 0;
+      Value read3 = table(b, at, readRow, 1);
+      Value row3 = tableCare(b, at, rowRow, reads, rowBits);
+      // The read's instance: its prefetch a fixed lead before its state
+      // pass, the instance of the state pass that lead ahead of the read's
+      // first row (the class's state passes' instance pattern, shifted by
+      // the lead: one row an instance), held over the instance's next P - 1
+      // reads (at the positions after it). Not a table of the reads, whose holes and
+      // displacements cut its runs as the instances grow; else that table.
+      SmallVector<int> pf;
+      ppPrefetches(cls, cls.pageWindow, pf);
+      int lead = 0;
+      bool fixedLead = threads > 1 && !getenv("FOLDSIM_NO_AHEAD"), firstSeen = false;
+      for (unsigned i = 0; i < threads && fixedLead; ++i) {
+        if (!cls.ppStreamed[i])
+          continue;
+        int d = cls.slot[kState][i] - pf[i];
+        if (firstSeen)
+          fixedLead = d == lead;
+        lead = d;
+        firstSeen = true;
+      }
+      Value inst3;
+      if (fixedLead && firstSeen && lead >= 0) {
+        // (The table of the position whose instance's state pass is the
+        // lead after it: the position's own counters decode it.)
+        SmallVector<uint64_t> aheadRow(ii + 1, 0);
+        SmallVector<uint8_t> aheadCare(ii + 1, 0);
+        for (unsigned i = 0; i < threads; ++i) {
+          if (!cls.ppStreamed[i])
+            continue;
+          unsigned q = wrap(cls.slot[kState][i] - lead);
+          aheadRow[q] = i;
+          aheadCare[q] = 1;
+        }
+        Value first = tableCare(b, at, aheadRow, aheadCare, idxWidth);
+        Value row0 = comb::ICmpOp::create(b, comb::ICmpPredicate::eq, row3, constant(rowBits, 0));
+        auto heldNext = backedges.get(b.getIntegerType(idxWidth));
+        Value held = reg(heldNext, prefix + "_pps_inst_held");
+        heldNext.setValue(comb::MuxOp::create(b, comb::AndOp::create(b, read3, row0), first, held));
+        inst3 = comb::MuxOp::create(b, row0, first, held);
+      } else {
+        inst3 = tableCare(b, at, instRow, reads, idxWidth);
+      }
+      ctl.offChip3 = {read3, inst3, row3, constant(1, 0), constant(rowBits, 0)};
     }
     for (auto [l, row] : llvm::enumerate(laterRows)) {
       Value later3 = table(b, at, row, 1);
@@ -18299,29 +18568,143 @@ LogicalResult StaticFolder::buildSim() {
       if (threads > 1)
         ctl.ppInst3 = table(b, at, pinstRow, idxWidth);
       ctl.ppRow3 = table(b, at, prowRow, rowWidth);
+      // A value of the pass's instance read through the instance's rank in
+      // the frame (the passes of the instances before it: a counter beside
+      // the position registers, PosCounters::rank) and a table of the rank
+      // (affine where the instances' order is), where that gives every pass
+      // its value; else a table of the position (as many segments as the
+      // schedule's irregular parts, which grow with the instances).
+      auto *posCtrs = foldsim::currentPosCounters();
+      auto byRank = [&](ArrayRef<uint64_t> setRows, ArrayRef<uint64_t> perRank,
+                        ArrayRef<uint64_t> rows, ArrayRef<uint8_t> valid,
+                        unsigned width) -> Value {
+        // (Only where the position's own table would be kept: the rank's
+        // counters cost more than a decoder of a few segments.)
+        auto plainSegs = [&] {
+          unsigned lim = gSlotSegments + 1;
+          return std::min(foldsim::slotSegments(rows, width, lim, true, false, valid).size(),
+                          foldsim::slotSegments(rows, width, lim, false, false, valid).size());
+        };
+        if (!getenv("FOLDSIM_NO_RANK") && posCtrs && posCtrs->knows(at) && gSlotSegments &&
+            plainSegs() > gSlotSegments) {
+          uint64_t mask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
+          // (Rank `total`: after the frame's last set position, the passes
+          // of the instance whose last pass is the frame's first, wrapped.)
+          SmallVector<uint64_t> cyclic(perRank.begin(), perRank.end());
+          if (!cyclic.empty())
+            cyclic.push_back(cyclic.front());
+          bool ok = !cyclic.empty();
+          uint64_t rk = 0;
+          for (unsigned p = 0; p < ii && ok; ++p) {
+            if (valid[p])
+              ok = rk < cyclic.size() && (cyclic[rk] & mask) == (rows[p] & mask);
+            rk += setRows[p] ? 1 : 0;
+          }
+          if (ok) {
+            uint64_t key = llvm::hash_combine_range(setRows.begin(), setRows.end());
+            Value r = posCtrs->rank(b, at, setRows, key, [&](Value pos) {
+              return table(b, pos, setRows, 1);
+            });
+            return table(b, r, cyclic, width);
+          }
+          if (getenv("FOLDSIM_AFFINE_LOG"))
+            llvm::errs() << "slot-sequencer: a pass value not by rank (" << rows.size() << " x "
+                         << width << ")\n";
+        }
+        // (Read at the class's passes alone: elsewhere any value.)
+        return tableCare(b, at, rows, valid, width);
+      };
+      // The instances in the order of their last passes (mod the frame), and
+      // the set of those positions.
+      SmallVector<unsigned> passOrder(threads);
+      for (unsigned i = 0; i < threads; ++i)
+        passOrder[i] = i;
+      auto lastPass = [&](unsigned i) {
+        int r = cls.slot[kState][i] - int(cls.stages) + int(cls.pp) - 1;
+        return unsigned(((r % int(ii)) + int(ii)) % int(ii));
+      };
+      llvm::stable_sort(passOrder, [&](unsigned x, unsigned y) { return lastPass(x) < lastPass(y); });
+      SmallVector<uint64_t> lastSet(ii + 1, 0);
+      SmallVector<uint8_t> passValid(ii + 1, 0);
+      for (unsigned i = 0; i < threads; ++i) {
+        lastSet[lastPass(i)] = 1;
+        for (unsigned j = 0; j < cls.pp; ++j) {
+          int r = cls.slot[kState][i] - int(cls.stages) + int(j);
+          passValid[unsigned(r) % ii] = 1;
+        }
+      }
       if (cls.ppPartial()) {
         // Partly resident: each pass's resident index and stream bit (of its
         // instance), read at the position.
         SmallVector<uint64_t> presRow(ii + 1, 0), pstrRow(ii + 1, 0);
+        // (The fixed pattern's index for every instance, a streamed one's
+        // unused: an affine table of the instance.)
+        auto resOf = [&](unsigned i) -> uint64_t {
+          if (cls.ppFixed)
+            return uint64_t(i / cls.ppFixedB) * cls.ppFixedR + i % cls.ppFixedB;
+          return cls.ppStreamed[i] ? 0 : cls.residentSlot[i];
+        };
         for (unsigned i = 0; i < threads; ++i)
           for (unsigned j = 0; j < cls.pp; ++j) {
             int r = cls.slot[kState][i] - int(cls.stages) + int(j);
             unsigned pos = unsigned(r) % ii;
-            presRow[pos] = cls.ppStreamed[i] ? 0 : cls.residentSlot[i];
+            presRow[pos] = resOf(i);
             pstrRow[pos] = cls.ppStreamed[i];
           }
-        ctl.ppRes3 = table(b, at, presRow, cls.ppResBits());
-        ctl.ppStr3 = table(b, at, pstrRow, 1);
+        SmallVector<uint64_t> resRank(threads, 0), strRank(threads, 0);
+        for (unsigned k = 0; k < threads; ++k) {
+          resRank[k] = resOf(passOrder[k]);
+          strRank[k] = cls.ppStreamed[passOrder[k]];
+        }
+        ctl.ppRes3 = byRank(lastSet, resRank, presRow, passValid, cls.ppResBits());
+        ctl.ppStr3 = byRank(lastSet, strRank, pstrRow, passValid, 1);
       }
       if (cls.ppHbm) {
         // Streamed: each pass's window slot (of its instance).
         SmallVector<uint64_t> pslotRow(ii + 1, 0);
+        SmallVector<uint8_t> strValid(ii + 1, 0);
         for (unsigned i = 0; i < threads; ++i)
           for (unsigned j = 0; j < cls.pp; ++j) {
             int r = cls.slot[kState][i] - int(cls.stages) + int(j);
             pslotRow[unsigned(r) % ii] = cls.windowSlot[i];
+            strValid[unsigned(r) % ii] = cls.ppStreamed[i];
           }
-        ctl.ppSlot3 = table(b, at, pslotRow, cls.ppSlotBits());
+        // (A resident instance's slot unused: the streamed ones' count
+        // before it, so the slots run on as the instances do.)
+        SmallVector<uint64_t> slotRank(threads, 0);
+        uint64_t streamedBefore = 0;
+        for (unsigned k = 0; k < threads; ++k) {
+          unsigned i = passOrder[k];
+          slotRank[k] = cls.ppStreamed[i] ? cls.windowSlot[i] : streamedBefore;
+          streamedBefore += cls.ppStreamed[i] ? 1 : 0;
+        }
+        ctl.ppSlot3 = byRank(lastSet, slotRank, pslotRow, strValid, cls.ppSlotBits());
+        // And each prefetch read's slot (its instance's), by position: the
+        // rank in the prefetches' own order.
+        SmallVector<int> pf;
+        ppPrefetches(cls, cls.pageWindow, pf);
+        SmallVector<uint64_t> pfSlotRow(ii + 1, 0), pfSet(ii + 1, 0);
+        SmallVector<uint8_t> pfValid(ii + 1, 0);
+        SmallVector<std::pair<unsigned, unsigned>> pfOrder;
+        for (unsigned i = 0; i < threads; ++i) {
+          if (!cls.ppStreamed[i])
+            continue;
+          for (unsigned j = 0; j < cls.pp; ++j) {
+            int pos = pf[i] + int(j);
+            unsigned q = unsigned(((pos % int(ii)) + int(ii)) % int(ii));
+            pfSlotRow[q] = cls.windowSlot[i];
+            pfValid[q] = 1;
+            if (j + 1 == cls.pp) {
+              pfSet[q] = 1;
+              pfOrder.push_back({q, i});
+            }
+          }
+        }
+        llvm::sort(pfOrder);
+        SmallVector<uint64_t> pfRank;
+        for (auto [q, i] : pfOrder)
+          pfRank.push_back(cls.windowSlot[i]);
+        ctl.ppPrefSlot3 = byRank(pfSet, pfRank, pfSlotRow, pfValid, cls.ppSlotBits());
       }
     }
   }
@@ -18685,7 +19068,13 @@ LogicalResult StaticFolder::buildSim() {
     auto seenNext = backedges.get(b.getI1Type());
     rb.seen = resetReg(seenNext, prefix + "_seen", 0);
     seenNext.setValue(comb::OrOp::create(b, rb.seen, eq(at, ii - 1)));
-    Value uentry2 = reg(table(b, at, plan.useEntry, eb), prefix + "_uentry2");
+    // (The entries and instances are read with their valid bits alone.)
+    SmallVector<uint8_t> useRows(ii + 1, 0), prefRows(ii + 1, 0);
+    for (unsigned p = 0; p < ii; ++p) {
+      useRows[p] = plan.useValid[p] != 0;
+      prefRows[p] = plan.prefValid[p] != 0;
+    }
+    Value uentry2 = reg(tableCare(b, at, plan.useEntry, useRows, eb), prefix + "_uentry2");
     Value skip2 = reg(comb::AndOp::create(b, table(b, at, plan.useCross, 1), notOf(rb.seen)),
                       prefix + "_skip2");
     Value skip1 = reg(skip2, prefix + "_skip1");
@@ -18696,9 +19085,9 @@ LogicalResult StaticFolder::buildSim() {
     rb.pref0 = resetReg(resetReg(resetReg(table(b, at, plan.prefValid, 1), prefix + "_pref2", 0),
                                  prefix + "_pref1", 0),
                         prefix + "_pref0", 0);
-    rb.pinst0 = idxWidth ? chain3(table(b, at, plan.prefInst, idxWidth), prefix + "_pinst")
+    rb.pinst0 = idxWidth ? chain3(tableCare(b, at, plan.prefInst, prefRows, idxWidth), prefix + "_pinst")
                          : constant(1, 0);
-    rb.pentry0 = chain3(table(b, at, plan.prefEntry, eb), prefix + "_pentry");
+    rb.pentry0 = chain3(tableCare(b, at, plan.prefEntry, prefRows, eb), prefix + "_pentry");
     Value irspValid = body->getArgument(image.firstInput);
     Value irspEntry = b.createOrFold<comb::ExtractOp>(
         b.getIntegerType(eb), body->getArgument(image.firstInput + 1), 1);
@@ -18763,8 +19152,10 @@ LogicalResult StaticFolder::buildSim() {
         operands.push_back(controls[c].ppRes3);
         operands.push_back(controls[c].ppStr3);
       }
-      if (cls.ppHbm)
+      if (cls.ppHbm) {
         operands.push_back(controls[c].ppSlot3);
+        operands.push_back(controls[c].ppPrefSlot3);
+      }
     }
     for (auto [i, type] : llvm::enumerate(cls.inputTypes)) {
       if (int(i) == cls.clockInput)
@@ -19436,7 +19827,11 @@ LogicalResult StaticFolder::buildSim() {
   // the first frame (a frame not run: `cross` frames before, more than have
   // run) takes no slot and loads zero, the link's content before any write.
   struct StreamBuilt {
-    Value pop1, inst1, row1, page1, data, popPtr, pending;
+    Value pop1, data, popPtr, pending;
+    /// The landing read as is, and whether it is a skipped one (zero): a
+    /// member's registers load zero there by their reset, taken with their
+    /// enable, not through a mux of the whole word.
+    Value raw, skip;
     /// A mailbox stream of one row a pass (pingPong): its landings alternate
     /// between two sets of the members' registers, so that its reader's
     /// passes need not be spaced. `popPar` the set a landing loads (at its
@@ -19537,9 +19932,8 @@ LogicalResult StaticFolder::buildSim() {
     };
     sb.pop1 = resetReg(resetReg(table(b, rctl.at3, st.popValid, 1), prefix + "_pop2", 0),
                        prefix + "_pop1", 0);
-    sb.inst1 = t1(st.popInst, rIdx, "inst");
-    sb.row1 = t1(st.popRow, pIdx, "row");
-    sb.page1 = t1(st.popPage, pgBits, "page");
+    // (A landing's instance, row and page are not read here: its slot is
+    // the pop pointer's, and the members' enables are their own tables.)
     // Missing: requested in a frame before the first (cross > the frames
     // run, which `ran` counts as the landing's host cycle runs).
     Value skip0 = constant(1, 0);
@@ -19584,6 +19978,8 @@ LogicalResult StaticFolder::buildSim() {
     Value read = seq::FirMemReadOp::create(b, landing, sb.popPtr, hostClock,
                                           constant(1, 1));
     sb.data = comb::MuxOp::create(b, skip0, constant(st.dw, 0), read);
+    sb.raw = read;
+    sb.skip = skip0;
     // The requests, now.
     Value req0 = chain3r(table(b, rctl.at3, st.reqValid, 1), prefix + "_req");
     Value flip0 = chain3(table(b, rctl.at3, st.reqFlip, 1), prefix + "_flip");
@@ -20042,12 +20438,54 @@ LogicalResult StaticFolder::buildSim() {
           // Each instance's constant, by instance: a table of up to 64 bits
           // a slice, the slices joined (high first).
           SmallVector<Value> slices;
+          // (A class whose passes are one a position, instance i at p0 + i:
+          // a table the instance's index neither decodes nor splits into a
+          // power of two's digits is read at the position instead, two host
+          // cycles before, whose counters give any period's digits.)
+          unsigned p0 = ~0u;
+          if (threads > 64 && gSlotSegments && ctl.at3 && ctl.instRow3.size() == ii + 1) {
+            unsigned lo = ~0u, hi = 0, passes = 0;
+            SmallVector<uint8_t> isPass(ii, 0);
+            // (The positions the table is read at: staged, each pass's read,
+            // its stages before.)
+            auto mark = [&](int s) { isPass[unsigned(((s % int(ii)) + int(ii)) % int(ii))] = 1; };
+            for (unsigned i = 0; i < threads; ++i) {
+              for (unsigned l = 0; l < cls.readyLevels && cls.hasReady; ++l)
+                mark(cls.stages ? cls.readSlot(kReady, l, i) : int(cls.readySlots(l)[i]));
+              mark(cls.slot[kState][i] - int(cls.stages));
+            }
+            for (unsigned p = 0; p < ii; ++p)
+              if (isPass[p]) {
+                lo = std::min(lo, p);
+                hi = std::max(hi, p);
+                ++passes;
+              }
+            bool contiguous = passes == threads && hi - lo + 1 == threads;
+            for (unsigned p = lo; contiguous && p <= hi; ++p)
+              contiguous = ctl.instRow3[p] == p - lo;
+            if (contiguous)
+              p0 = lo;
+          }
           for (unsigned lo = 0; lo < width; lo += 64) {
             unsigned w = std::min(64u, width - lo);
             SmallVector<uint64_t> rows(threads, 0);
             for (unsigned i = 0; i < threads; ++i)
               if (sourceOf[i] == key)
                 rows[i] = constants[i].extractBits(w, lo).getZExtValue();
+            if (p0 != ~0u) {
+              foldsim::Separable sp;
+              bool byInstance =
+                  foldsim::slotSegments(rows, w, gSlotSegments).size() <= gSlotSegments ||
+                  foldsim::findSeparable(rows, w, false, 512, sp);
+              if (!byInstance) {
+                SmallVector<uint64_t> posRows(ii + 1, 0);
+                for (unsigned i = 0; i < threads; ++i)
+                  posRows[p0 + i] = rows[i];
+                slices.push_back(reg(reg(table(b, ctl.at3, posRows, w), cls.name + "_cpos2"),
+                                     cls.name + "_cpos1"));
+                continue;
+              }
+            }
             slices.push_back(threads > 1 ? table(b, ctl.inst1, rows, w)
                                          : hw::ConstantOp::create(
                                                b, b.getIntegerType(w), rows[0]));
@@ -20093,44 +20531,69 @@ LogicalResult StaticFolder::buildSim() {
           std::string name = (producer.name + "_to_" + consumer.name + "_" +
                               Twine(at) + "_hbm")
                                  .str();
-          Value mine1 = sb.pop1;
-          if (threads > 1) {
-            SmallVector<uint64_t> takeRow(threads, 0);
-            for (unsigned i = 0; i < threads; ++i)
-              takeRow[i] = mine[i];
-            mine1 = comb::AndOp::create(b, mine1, table(b, sb.inst1, takeRow, 1));
-          }
-          if (pIdx) {
-            Value want = threads > 1 ? table(b, sb.inst1, wantRows, pIdx)
-                                     : constant(pIdx, wantRows[0]);
-            mine1 = comb::AndOp::create(
-                b, mine1,
-                comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.row1, want));
+          // A landing is this member's where its reader instance takes it
+          // and the row landed is the one that reader wants: both fixed by
+          // the landing's position (its reader instance and row are position
+          // tables), so one table of the position, registered as the
+          // landing's controls are, not tables of the reader instance (the
+          // connectivity: a reader's producer row, as many segments as the
+          // groups of a ring that is not a power of two).
+          Value mine1;
+          SmallVector<uint64_t> mineRows(st.popValid.size(), 0);
+          {
+            auto &rctl = controls[st.rcls];
+            for (unsigned p = 0; p < st.popValid.size(); ++p) {
+              if (!st.popValid[p])
+                continue;
+              unsigned i = threads > 1 ? unsigned(st.popInst[p]) : 0;
+              if (i >= threads || (threads > 1 && !mine[i]))
+                continue;
+              uint64_t rowMask = pIdx >= 64 ? ~uint64_t(0) : (uint64_t(1) << pIdx) - 1;
+              if (pIdx && (st.popRow[p] & rowMask) != (wantRows[i] & rowMask))
+                continue;
+              mineRows[p] = 1;
+            }
+            mine1 = resetReg(resetReg(table(b, rctl.at3, mineRows, 1), name + "_mine2", 0),
+                             name + "_mine1", 0);
           }
           SmallVector<Value> slices, early;
           for (unsigned j = off / st.dw; j <= (off + width - 1) / st.dw; ++j) {
             unsigned lo = std::max(off, j * st.dw);
             unsigned hi = std::min(off + width, (j + 1) * st.dw);
             Value en1 = mine1;
-            // (A sliced stream lands the reader's own page alone.)
-            if (pgBits && !st.sliced)
-              en1 = comb::AndOp::create(
-                  b, en1,
-                  comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.page1,
-                                       constant(pgBits, j)));
+            // (A sliced stream lands the reader's own page alone; else the
+            // page landed, fixed by the position too: the page's own table.)
+            if (pgBits && !st.sliced) {
+              auto &rctl = controls[st.rcls];
+              uint64_t pageMask = (uint64_t(1) << pgBits) - 1;
+              SmallVector<uint64_t> pageRows(mineRows.begin(), mineRows.end());
+              for (unsigned p = 0; p < pageRows.size(); ++p)
+                if (pageRows[p] && (st.popPage[p] & pageMask) != j)
+                  pageRows[p] = 0;
+              en1 = resetReg(resetReg(table(b, rctl.at3, pageRows, 1),
+                                      name + "_pg" + Twine(j) + "_2", 0),
+                             name + "_pg" + Twine(j) + "_1", 0);
+            }
             Value en0 = resetReg(en1, name + "_en" + Twine(j), 0);
             Value bits = b.createOrFold<comb::ExtractOp>(
-                b.getIntegerType(hi - lo), sb.data, lo - j * st.dw);
+                b.getIntegerType(hi - lo), sb.raw, lo - j * st.dw);
+            // (A skipped landing loads zero: the registers' synchronous
+            // reset, with their enable.)
+            Value zero = constant(hi - lo, 0);
+            auto skipped = [&](Value en) -> Value {
+              return comb::AndOp::create(b, en, sb.skip);
+            };
             if (sb.pingPong) {
               // Two sets, loaded in turn, read in turn.
+              Value enA = comb::AndOp::create(b, en0, notOf(sb.popPar));
+              Value enB = comb::AndOp::create(b, en0, sb.popPar);
               Value setA = seq::CompRegClockEnabledOp::create(
-                  b, bits, hostClock,
-                  comb::AndOp::create(b, en0, notOf(sb.popPar)),
-                  b.getStringAttr(name + Twine(j) + "_a"), Value(), Value(),
+                  b, bits, hostClock, enA,
+                  b.getStringAttr(name + Twine(j) + "_a"), skipped(enA), zero,
                   Value(), hw::InnerSymAttr());
               Value setB = seq::CompRegClockEnabledOp::create(
-                  b, bits, hostClock, comb::AndOp::create(b, en0, sb.popPar),
-                  b.getStringAttr(name + Twine(j) + "_b"), Value(), Value(),
+                  b, bits, hostClock, enB,
+                  b.getStringAttr(name + Twine(j) + "_b"), skipped(enB), zero,
                   Value(), hw::InnerSymAttr());
               slices.push_back(comb::MuxOp::create(b, sb.useSel, setB, setA));
               early.push_back(comb::MuxOp::create(b, sb.useSelEarly, setB, setA));
@@ -20138,7 +20601,7 @@ LogicalResult StaticFolder::buildSim() {
             }
             Value r = seq::CompRegClockEnabledOp::create(
                 b, bits, hostClock, en0, b.getStringAttr(name + Twine(j)),
-                Value(), Value(), Value(), hw::InnerSymAttr());
+                skipped(en0), zero, Value(), hw::InnerSymAttr());
             slices.push_back(r);
             early.push_back(r);
           }
@@ -22162,6 +22625,42 @@ LogicalResult StaticFolder::buildSim() {
           Twine(cls.passSplit) + ":" + Twine(cls.passHoldBits)));
   if (!splits.empty())
     sim->setAttr("foldsim.pass_split", b.getArrayAttr(splits));
+  // Registers nothing reads (and the logic only they read): built for a
+  // value no user took. Erased here, as synthesis would, so that the counts
+  // and screens see the simulator's own logic.
+  {
+    SmallVector<Operation *> work;
+    auto dead = [](Operation *op) {
+      if (!op->use_empty())
+        return false;
+      if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(op))
+        return !op->hasAttr("inner_sym");
+      // (Logic alone: not the builder's placeholders, resolved later.)
+      StringRef ns = op->getDialect() ? op->getDialect()->getNamespace() : "";
+      return (ns == "comb" || ns == "hw") && mlir::isOpTriviallyDead(op);
+    };
+    for (auto &op : *body)
+      if (dead(&op))
+        work.push_back(&op);
+    unsigned erased = 0;
+    while (!work.empty()) {
+      Operation *op = work.pop_back_val();
+      if (!op->getBlock() || !dead(op))
+        continue;
+      SmallVector<Operation *> feeds;
+      for (Value v : op->getOperands())
+        if (auto *d = v.getDefiningOp())
+          if (d->getBlock() == body)
+            feeds.push_back(d);
+      op->erase();
+      ++erased;
+      for (auto *d : feeds)
+        if (dead(d))
+          work.push_back(d);
+    }
+    if (erased && getenv("FOLDSIM_AFFINE_LOG"))
+      llvm::errs() << "foldsim-fold-static: " << erased << " unread ops erased\n";
+  }
   simModule = sim;
   return success();
 }
@@ -22670,6 +23169,7 @@ void FoldStaticPass::runOnOperation() {
   folder.stateStreamWindow = stateStreamWindow;
   folder.stateScratchPartial = stateScratchPartial;
   folder.stateScratchFixed = stateScratchFixed;
+  folder.stateScratchFixedPP = stateScratchFixedPP;
   folder.stateScratchDeviceBits = stateScratchDeviceBits;
   folder.stateScratchDeviceBlockBits = stateScratchDeviceBlockBits;
   folder.stateScratchReserveUltra = stateScratchReserveUltra;

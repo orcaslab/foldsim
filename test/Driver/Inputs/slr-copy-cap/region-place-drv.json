@@ -1,0 +1,5 @@
+{"about": "test region: two SLRs of 146 LUTs (slr-copy-cap.test DRV: its copy Leaf past each SLR) with a placement model (the placer fills 75 %; a cut copy's own SLLs by Rent's rule)",
+ "sites_per_lut": 1.0, "margin": 0.9, "netlist_lut_scale": 1.0, "netlist_ff_scale": 1.0, "sll_per_boundary": 60, "sll_margin": 0.5,
+ "slrs": [{"name": "SLR1", "luts": 146, "ramb36": 10, "uram": 2}, {"name": "SLR0", "luts": 146, "ramb36": 10, "uram": 2}],
+ "placement": {"fill": {"lut": 0.75, "lutram": 0.75, "ff": 0.75, "uram": 1.0, "bram": 1.0}, "balance_slack": 0.05,
+               "cut_copies": 2, "rent_t": 1.0, "rent_p": 0.75, "sll_per_link_bit": 0.5, "other_slls": 1, "sll_per_vmem_bit": 0}}

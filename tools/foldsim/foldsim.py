@@ -568,6 +568,11 @@ def frame_options(a):
         fold += ' state-scratch-partial=false'
     if getattr(a, 'state_scratch_fixed', False):
         fold += ' state-scratch-fixed'
+    if getattr(a, 'state_scratch_fixed_pages', False):
+        fold += ' state-scratch-fixed-pp=false'
+    elif getattr(a, 'state_scratch_fixed', False) and getattr(a, 'state_in_ram_pp', False) \
+            and not getattr(a, 'state_in_ram', ''):
+        fold += ' state-in-ram-pp'
     if getattr(a, 'csf_single_bank', False):
         fold += ' csf-single-bank'
     if getattr(a, 'csf_mailbox_hbm_chains', False):
@@ -1813,6 +1818,10 @@ def build_parser():
                          '(at least one instance in 16), a paged class streams whole past its share; a storage '
                          'rule\'s on-chip page kind names the RAM, no longer keeps the pages on chip past the '
                          'share (foldsim-fold-static state-scratch-fixed)')
+    ap.add_argument('--state-scratch-fixed-pages', action='store_true',
+                    help='with --state-scratch-fixed and --state-in-ram-pp: paged classes stay paged (default: every '
+                         'paged class of several instances is state in RAM, PP with P its pages, so that the fixed '
+                         'scratch streams part of it; foldsim-fold-static state-scratch-fixed-pp=false)')
     ap.add_argument('--state-stream-window', type=int, default=0, metavar='N',
                     help='with --state-scratch-bits: a streamed PP class\'s landing window, in instance slots '
                          '(foldsim-fold-static state-stream-window; 0: a RAMB36 deep, 512 / P)')
