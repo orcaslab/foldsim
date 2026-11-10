@@ -114,7 +114,9 @@
 # H24: link streams: 2 streams, 11 links, 76 bits
 # H24: link stream Sink Src 3 1 32 8 4 8 6 1
 # H24: link stream Src Sink 8 0 32 32 1 8 2 1
-# HBMAHEAD-COUNT-2: %vready_ahead{{[0-9]+}} = seq.firreg {{%[^ ]+}} clock %hostClock reset sync %hostReset, {{%[^ ]+}} preset {{[0-9]+}} : i3
+# The landings-in-flight count is read through lookahead registers (one-bit
+# landing tables summed, as the PP landing windows do), not decoded at `next`.
+# HBMAHEAD: %vready_ahead{{[0-9]+}} = seq.firreg {{%[^ ]+}} clock %hostClock reset sync %hostReset, {{%[^ ]+}} preset {{[0-9]+}} : i1
 # HBMVH: FOLDSIM_VMEM_0_DW 8
 # HBMVH-NEXT: FOLDSIM_VMEM_0_MW 1
 # HBMVH: FOLDSIM_VMEM_1_DW 32
