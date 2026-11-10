@@ -5284,6 +5284,16 @@ LogicalResult StaticFolder::assignPageEngines() {
           if (llvm::none_of(rq, [&](unsigned q) { return pageEngines[e].reads[q]; }) &&
               llvm::none_of(wr, [&](unsigned q) { return pageEngines[e].writes[q]; }))
             break;
+        if (getenv("FOLDSIM_PPE_LOG")) {
+          llvm::errs() << "ppe: " << cls.name << ":" << vm.name << " reads " << rq.size()
+                       << " writes " << wr.size() << " -> engine " << e << "; blocked:";
+          for (unsigned x = 0; x < e; ++x) {
+            unsigned nr = llvm::count_if(rq, [&](unsigned q) { return pageEngines[x].reads[q] != 0; });
+            unsigned nw = llvm::count_if(wr, [&](unsigned q) { return pageEngines[x].writes[q] != 0; });
+            llvm::errs() << " e" << x << "(r" << nr << ",w" << nw << ")";
+          }
+          llvm::errs() << "\n";
+        }
         if (e == pageEngines.size()) {
           if (e >= pageEngineCap)
             return netlist.emitError("page engines: ")
