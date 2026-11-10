@@ -412,6 +412,8 @@ def frame_options(a):
         fold += f' vmem-auto-instance-bits={a.vmem_auto_instance_bits}'
     if getattr(a, 'vmem_rings', 0):
         fold += f' vmem-rings={a.vmem_rings} vmem-ring-entries={a.vmem_ring_entries}'
+        if a.vmem_ring_image_each:
+            fold += ' vmem-ring-image-each=true'
     if a.unstaged_env:
         fold += ' staged-env=false'
     if getattr(a, 'register_state_entries', None) is not None:
@@ -460,6 +462,8 @@ def frame_options(a):
         fold += f' link-ultra-depth={a.link_ultra_depth}'
     if getattr(a, 'link_hbm_lead', 0):
         fold += f' link-hbm-lead={a.link_hbm_lead}'
+    if getattr(a, 'link_hbm_beat_bits', 0):
+        fold += f' link-hbm-beat-bits={a.link_hbm_beat_bits}'
     if getattr(a, 'link_hbm_row_bits', 0):
         fold += f' link-hbm-row-bits={a.link_hbm_row_bits}'
     if getattr(a, 'link_hbm_min_lead', 0):
@@ -1586,6 +1590,10 @@ def build_parser():
                          "(foldsim-fold-static vmem-rings; 0: none)")
     ap.add_argument('--vmem-ring-entries', type=int, default=1024, metavar='N',
                     help='with --vmem-rings: the most entries a ring may take (default 1024)')
+    ap.add_argument('--vmem-ring-image-each', action='store_true',
+                    help='with --vmem-rings: each ring its own image and controller (default: a class\'s rings '
+                         'share one image, the ring in the tag: one controller a class; foldsim-fold-static '
+                         'vmem-ring-image-each)')
     ap.add_argument('--vmem-skip-held-reads', action='store_true',
                     help='with --virtual-memories: a read whose address register holds (a registered '
                          'read address with its enable low) is not issued unless its row was written '
@@ -1661,6 +1669,10 @@ def build_parser():
                     help='with --static and hbm link kinds: the most positions a stream row\'s request '
                          'precedes its landing, the memory\'s round trip in host cycles and a margin '
                          '(foldsim-fold-static; 0: its default, 48)')
+    ap.add_argument('--link-hbm-beat-bits', type=int, default=0, metavar='N',
+                    help='with --static and hbm link kinds: a stream row wider than N bits moves as beats of '
+                         'a controller N bits wide where the positions allow (foldsim-fold-static '
+                         'link-hbm-beat-bits; 0: whole rows)')
     ap.add_argument('--link-hbm-row-bits', type=int, default=0, metavar='N',
                     help='with --static and hbm link kinds: the most bits of a stream row, its controller\'s '
                          'data width (8 to 4096; foldsim-fold-static; 0: its default, 512). A wider word is cut '

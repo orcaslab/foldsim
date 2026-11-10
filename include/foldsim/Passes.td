@@ -433,6 +433,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "use into entry instance mod R of a ring of R entries, R the "
            "smallest power of two the schedule's window allows. A class whose "
            "schedule leaves no room keeps its buffers (reported). 0: none">,
+    Option<"vmemRingImageEach", "vmem-ring-image-each", "bool", "false",
+           "With vmem-rings: each ring its own image (a controller each); by "
+           "default a class's rings share one image (a row per ring and "
+           "instance, the ring in the requests' tag): one controller a class, "
+           "as many at every instance count">,
     Option<"vmemRingEntries", "vmem-ring-entries", "unsigned", "1024",
            "With vmem-rings: the most entries a ring may take; a class that "
            "needs more keeps its buffers">,
@@ -677,6 +682,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "row's request precedes its landing (the memory's round trip in "
            "host cycles and a margin; less where a stream's writes come "
            "later)">,
+    Option<"linkHbmBeatBits", "link-hbm-beat-bits", "unsigned", "0",
+           "HBM link streams on their own controllers: a row wider than this "
+           "many bits moves as beats (at most 8) of a controller this wide, "
+           "requested at the positions before its landing's request and "
+           "written at those after its page's write, the landing slot written "
+           "beat by beat (no pass spaced: only where the landings and the "
+           "producer's passes leave the positions, else whole rows). A "
+           "controller costs its width (0: whole rows)">,
     Option<"linkHbmRowBits", "link-hbm-row-bits", "unsigned", "512",
            "HBM link streams: the most bits of a stream's row (its "
            "controller's data width, 8 to 4096): a wider word is cut into "

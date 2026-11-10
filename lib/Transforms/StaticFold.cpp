@@ -214,6 +214,10 @@ struct Class {
   /// (`windowSlot`); and the register bits an instance keeps in rows
   /// (planStateInRam, for the scratch's placement).
   bool ppHbm = false;
+  /// A streamed PP class's chunks spread over the kernel's masters (one a
+  /// master while a chunk keeps a beat's columns): only where the frame's
+  /// HBM bandwidth needs it (chooseStreamWindows), each chunk a controller.
+  bool ppChunkSpread = false;
   uint64_t rowStateBits = 0;
   /// A paged class's register bits an instance pages (planScratch, for the
   /// HBM bits a frame of its pages streamed).
@@ -416,6 +420,9 @@ static constexpr unsigned kRingQueue = 64;
 /// `vmem-rings`: the host cycles an image's `free` may take to show the
 /// requests taken.
 static constexpr unsigned kRingFreeLag = 4;
+/// `link-hbm-beat-bits` on page engines: the most positions a stream's
+/// requests move earlier, or its writes later, to share an engine.
+static constexpr int kLinkHbmMaxOffset = 1024;
 /// The control stages from a slot table's read to its pass: the state and
 /// ready passes' two staged registers and the one that makes them now.
 static constexpr int kControlStages = 3;
@@ -832,6 +839,7 @@ public:
            (vmemAutoInstanceBits && depth * width >= vmemAutoInstanceBits);
   }
   unsigned vmemRingLead = 0, vmemRingEntries = 1024;
+  bool vmemRingImageEach = false;
   /// Plans a class's rings (`vmem-rings`): marks its virtual memories that
   /// take one, or none if the schedule leaves no room (the reason reported).
   void planClassRing(Class &cls, function_ref<bool(const Class::VirtualMemory &)> eligible);
@@ -871,6 +879,7 @@ public:
   /// `link-hbm-row-bits`: the most bits of an HBM link stream's row (its
   /// controller's DW): a wider word is cut into rows (pages) of this many.
   unsigned linkHbmRowBits = 512;
+  unsigned linkHbmBeatBits = 0;
   /// `min-ii` (with modulo): the shortest frame the search starts from; the
   /// positions beyond the schedule's own stay idle. A longer frame is a
   /// longer prefetch distance for every request a pass issues (for studies
@@ -1410,6 +1419,24 @@ private:
     /// (producer instance, page, the frame's flip for the bank).
     SmallVector<uint64_t> popValid, popInst, popRow, popPage;
     SmallVector<uint64_t> reqValid, reqRow, reqPage, reqFlip;
+    /// `link-hbm-beat-bits`: a row moves as `beats` requests and writes of
+    /// `beatWidth()` bits each (its controller that wide), at consecutive
+    /// positions: a landing's beats from beats - 1 positions before its
+    /// request position, a page's from its write position (pages `beats`
+    /// apart); the landing slot written beat by beat. The tables hold each
+    /// row's first beat alone (the stream's own tables, shifted); counters
+    /// step the beats.
+    unsigned beats = 1;
+    /// With beats, on a page engine: the positions its requests moved
+    /// earlier and its writes later, the same for every row (its tables
+    /// shifted, as regular as before).
+    unsigned requestOffset = 0, writeOffset = 0;
+    unsigned beatBits() const { return beats > 1 ? llvm::Log2_32_Ceil(beats) : 0; }
+    unsigned beatWidth() const {
+      return beats > 1 ? unsigned(llvm::alignTo(llvm::divideCeil(dw, beats), 8)) : dw;
+    }
+    /// The controller's data width: a beat's.
+    unsigned portDW() const { return beatWidth(); }
     uint64_t readRows = 0;
     /// The simulator's virtual memory serving it (port vm<k>), once built;
     /// or, carried by a page engine (`page-engines`), that engine and its
@@ -1449,7 +1476,7 @@ private:
     /// landing slot, a write's has the top bit set, so no write ever carries
     /// the tag of an outstanding read (the controller's guarantees hold per
     /// tag and instance). The port's width is both.
-    unsigned tagBits() const { return instBits() + 1; }
+    unsigned tagBits() const { return instBits() + beatBits() + 1; }
     unsigned portInstBits() const { return tagBits() + 1; }
     /// `link-hbm-fit-slots`: the landing slots the placement needs (0: the
     /// most a lead takes, pow2(lead + 8)).
@@ -1623,8 +1650,11 @@ private:
   void reportPageEngines(raw_ostream &os);
   unsigned streamRowBits(const LinkStream &s) const {
     return 1 + s.rowIndexBits(classes[s.pcls].threads()) +
-           (s.pages > 1 ? llvm::Log2_32_Ceil(s.pages) : 0);
+           (s.pages > 1 ? llvm::Log2_32_Ceil(s.pages) : 0) + s.beatBits();
   }
+  /// `link-hbm-beat-bits`: the beats a stream's rows may take where its
+  /// positions leave room (planStreams), else 1.
+  unsigned streamBeats(const LinkStream &st) const;
   /// The page of the links from producer `p` to class `reader` (0: none).
   unsigned linkPageRule(unsigned p, unsigned reader) const {
     if (linkKinds.empty())
@@ -4870,18 +4900,75 @@ LogicalResult StaticFolder::planStreams() {
       for (unsigned j = 0; j < st.pages; ++j)
         writes.push_back(w + 1 + int(j));
     bool collide = false;
+    st.beats = 1;
     setStreamTables(st, requests, writes, collide);
+    // `link-hbm-beat-bits`: a wide row as beats where the positions allow
+    // (a stream carried by its own controller).
+    if (unsigned k = streamBeats(st); k > 1 && !collide) {
+      st.beats = k;
+      setStreamTables(st, requests, writes, collide);
+    }
     // A csf-mailbox-hbm stream's landing slots: the fewest its landings
     // need (fitSlots: those landing within its lead, not pow2(lead + 8)
-    // for a reader whose passes are apart).
-    if (st.twoSets && !linkHbmFitSlots)
-      st.slotCount = fitSlots(st, requests);
+    // for a reader whose passes are apart); a beat's request is up to
+    // beats - 1 positions earlier.
+    if (st.twoSets && !linkHbmFitSlots) {
+      SmallVector<int> earliest(requests.begin(), requests.end());
+      for (int &t : earliest)
+        t -= int(st.beats) - 1;
+      st.slotCount = fitSlots(st, earliest);
+    }
     if (collide)
       return netlist.emitError("link streams: ")
              << modelOf(st.pcls) << " -> " << modelOf(st.rcls)
              << ": two landings in one position (the reader's link port)";
   }
   return success();
+}
+
+unsigned StaticFolder::streamBeats(const LinkStream &st) const {
+  if (!linkHbmBeatBits || st.dw <= linkHbmBeatBits || st.landings.empty() ||
+      st.writePasses.empty())
+    return 1;
+  unsigned k = std::min(8u, unsigned(llvm::divideCeil(st.dw, linkHbmBeatBits)));
+  static const bool log = getenv("FOLDSIM_BEAT_LOG");
+  auto no = [&](const char *why) -> unsigned {
+    if (log)
+      llvm::errs() << "link-hbm-beat-bits: " << modelOf(st.pcls) << " -> " << modelOf(st.rcls)
+                   << " " << st.dw << " bits: whole rows (" << why << ")\n";
+    return 1;
+  };
+  int frame = int(ii);
+  auto mod = [&](int x) { return ((x % frame) + frame) % frame; };
+  // A landing's beats requested at its request position and the k - 1
+  // before it: the landings at least k positions apart (no two requests at
+  // a position).
+  SmallVector<int> at;
+  for (auto &l : st.landings)
+    at.push_back(mod(l.q));
+  llvm::sort(at);
+  for (size_t x = 0; x < at.size(); ++x) {
+    int next = x + 1 < at.size() ? at[x + 1] : at[0] + frame;
+    if (next - at[x] < int(k))
+      return no("landings closer than the beats");
+  }
+  // A pass's pages written beat by beat after it, all before the next pass
+  // (the held word is the pass's until then).
+  auto &w = st.writePasses;
+  for (size_t x = 0; x < w.size(); ++x) {
+    int next = x + 1 < w.size() ? w[x + 1] : w[0] + frame;
+    if (next - w[x] < int(st.pages * k))
+      return no("producer passes closer than the beats");
+  }
+  // A request moved k - 1 earlier and a write pages (k - 1) later keep the
+  // read after the frame before's write (the stream's room past its lead).
+  if ((k - 1) * (1 + st.pages) > st.room - st.lead)
+    return no("no room past the lead");
+  // The earliest beat after its slot's previous landing (its 8-position
+  // margin at the lead).
+  if (k - 1 >= 8)
+    return 1;
+  return k;
 }
 
 void StaticFolder::setStreamTables(LinkStream &st, ArrayRef<int> requests,
@@ -4896,6 +4983,10 @@ void StaticFolder::setStreamTables(LinkStream &st, ArrayRef<int> requests,
                   &st.writeValid, &st.writePage})
     v->assign(ii + 1, 0);
   st.shift = 0;
+  // (With beats: a landing's beat b requested beats - 1 - b positions
+  // before its request position, the last there; a page's beat b written
+  // b positions after its first, the pages beats apart.)
+  int k = int(st.beats);
   for (auto [l, t] : llvm::zip(st.landings, requests)) {
     unsigned pos = mod(l.q);
     if (st.popValid[pos])
@@ -4904,13 +4995,16 @@ void StaticFolder::setStreamTables(LinkStream &st, ArrayRef<int> requests,
     st.popInst[pos] = l.inst;
     st.popRow[pos] = l.row;
     st.popPage[pos] = l.page;
-    st.popLead[pos] = unsigned(l.q - t);
+    st.popLead[pos] = unsigned(l.q - t + k - 1);
     st.shift = std::max(st.shift, unsigned(l.q - t) - st.lead);
-    unsigned tpos = mod(t);
+    int tb = t - (k - 1);
+    unsigned tpos = mod(tb);
+    if (k > 1 && st.reqValid[tpos])
+      collide = true;
     st.reqValid[tpos] = 1;
     st.reqRow[tpos] = l.row;
     st.reqPage[tpos] = l.page;
-    st.reqFlip[tpos] = floorDiv(t) & 1;
+    st.reqFlip[tpos] = floorDiv(tb) & 1;
   }
   unsigned x = 0;
   st.writeShift = 0;
@@ -4918,7 +5012,9 @@ void StaticFolder::setStreamTables(LinkStream &st, ArrayRef<int> requests,
     for (unsigned j = 0; j < st.pages; ++j) {
       st.writeShift = std::max(
           st.writeShift, unsigned(writes[x] - (st.writePasses[p] + 1 + int(j))));
-      unsigned pos = mod(writes[x++]);
+      int w0 = k > 1 ? st.writePasses[p] + 1 + int(st.writeOffset) + int(j) * k : writes[x];
+      ++x;
+      unsigned pos = mod(w0);
       st.writeValid[pos] = 1;
       st.writePage[pos] = j;
     }
@@ -5123,6 +5219,109 @@ LogicalResult StaticFolder::assignPageEngines() {
   for (auto [k, st] : llvm::enumerate(linkStreams)) {
     if (!st.kept)
       continue;
+    // `link-hbm-beat-bits`: a stream of beats at its own positions (each
+    // landing's beats before its request position, each page's after its
+    // write position), on the first engine where they are all free, else a
+    // new one.
+    if (st.beats > 1 || linkHbmBeatBits) {
+      // Every row's requests moved `sr` earlier and its writes `sw` later
+      // (the same for all: the tables stay shifted copies), within the
+      // stream's room past the beats' own moves, each request after its
+      // slot's previous landing (the 8-position margin), each pass's writes
+      // before its next pass; the least moves on the first engine they fit.
+      int kb = int(st.beats), n = int(st.landings.size()), slots = int(st.slots());
+      int budget = int(st.room) - int(st.lead) - (kb - 1) * (1 + int(st.pages));
+      auto landingAt = [&](int i) {
+        int back = i < 0 ? (-i + n - 1) / n : 0;
+        return int(wrap(st.landings[i + back * n].q)) - back * frame;
+      };
+      int maxR = std::max(0, std::min(budget, kLinkHbmMaxOffset));
+      for (int i = 0; i < n && maxR >= 0; ++i)
+        maxR = std::min(maxR, landingAt(i) - int(st.lead) - (kb - 1) - (landingAt(i - slots) + 8));
+      int maxW = std::max(0, std::min(budget, kLinkHbmMaxOffset));
+      for (size_t x = 0; x < st.writePasses.size(); ++x) {
+        int w = st.writePasses[x];
+        int next = x + 1 < st.writePasses.size() ? st.writePasses[x + 1] : st.writePasses[0] + frame;
+        maxW = std::min(maxW, next - w - int(st.pages) * kb);
+      }
+      auto requestsFit = [&](unsigned e, int sr) {
+        for (auto &l : st.landings)
+          for (int b = 0; b < kb; ++b)
+            if (pageEngines[e].reads[wrap(l.q - int(st.lead) - sr - (kb - 1) + b)])
+              return false;
+        return true;
+      };
+      auto writesFit = [&](unsigned e, int sw) {
+        for (int w : st.writePasses)
+          for (unsigned j = 0; j < st.pages; ++j)
+            for (int b = 0; b < kb; ++b)
+              if (pageEngines[e].writes[wrap(w + 1 + sw + int(j) * kb + b)])
+                return false;
+        return true;
+      };
+      unsigned e = 0;
+      int sr = 0, sw = 0;
+      bool found = false;
+      for (; e < pageEngines.size() && maxR >= 0 && maxW >= 0 && !found; ++e) {
+        int r = 0, w = 0;
+        while (r <= maxR && !requestsFit(e, r))
+          ++r;
+        if (r > maxR)
+          continue;
+        while (w <= maxW && r + w <= budget && !writesFit(e, w))
+          ++w;
+        if (w > maxW || r + w > budget)
+          continue;
+        sr = r;
+        sw = w;
+        found = true;
+        break;
+      }
+      if (!found) {
+        e = pageEngines.size();
+        if (e >= pageEngineCap)
+          return netlist.emitError("page engines: ")
+                 << pageEngineCap << " engines cannot carry the link stream "
+                 << modelOf(st.pcls) << " -> " << modelOf(st.rcls);
+        newEngine();
+      }
+      if (getenv("FOLDSIM_BEAT_LOG"))
+        llvm::errs() << "link-hbm engines: " << modelOf(st.pcls) << " -> " << modelOf(st.rcls)
+                     << " beats " << kb << " budget " << budget << " maxR " << maxR << " maxW "
+                     << maxW << ": engine " << e << (found ? "" : " (new)") << " sr " << sr
+                     << " sw " << sw << "\n";
+      st.requestOffset = unsigned(sr);
+      st.writeOffset = unsigned(sw);
+      if (sr || sw) {
+        SmallVector<int> requests, writes;
+        for (auto &l : st.landings)
+          requests.push_back(l.q - int(st.lead) - sr);
+        for (int w : st.writePasses)
+          for (unsigned j = 0; j < st.pages; ++j)
+            writes.push_back(w + 1 + sw + int(j));
+        bool collide = false;
+        setStreamTables(st, requests, writes, collide);
+        st.writeShift = unsigned(sw);
+      }
+      SmallVector<unsigned> rq, wr;
+      for (auto &l : st.landings)
+        for (int b = 0; b < kb; ++b)
+          rq.push_back(wrap(l.q - int(st.lead) - sr - (kb - 1) + b));
+      for (int w : st.writePasses)
+        for (unsigned j = 0; j < st.pages; ++j)
+          for (int b = 0; b < kb; ++b)
+            wr.push_back(wrap(w + 1 + sw + int(j) * kb + b));
+      auto &eng = pageEngines[e];
+      for (unsigned q : rq)
+        eng.reads[q] = 1;
+      for (unsigned q : wr)
+        eng.writes[q] = 1;
+      eng.streams.push_back(unsigned(k));
+      eng.dataWidth = std::max(eng.dataWidth, st.portDW());
+      eng.instWidth = std::max(eng.instWidth, st.tagBits());
+      eng.addrWidth = std::max(eng.addrWidth, streamRowBits(st));
+      continue;
+    }
     // At its own positions, or within `link-hbm-shift` of them where an
     // engine leaves them taken; on a new engine at its own.
     // With `link-hbm-fit-slots`, the fewest landing slots its own positions
@@ -5167,7 +5366,7 @@ LogicalResult StaticFolder::assignPageEngines() {
       eng.writes[q] |= st.writeValid[q];
     }
     eng.streams.push_back(unsigned(k));
-    eng.dataWidth = std::max(eng.dataWidth, st.dw);
+    eng.dataWidth = std::max(eng.dataWidth, st.portDW());
     eng.instWidth = std::max(eng.instWidth, st.tagBits());
     eng.addrWidth = std::max(eng.addrWidth, streamRowBits(st));
   }
@@ -12890,19 +13089,25 @@ static constexpr unsigned kStreamLead = 64;
 static constexpr unsigned kStreamMasters = 8;
 
 /// A streamed PP class's chunks of `columns` 72-bit columns, each a virtual
-/// memory: at least ceil(columns / 56) (4,032 bits, a row of 8 beats), and
-/// one a master while a chunk keeps a beat's columns (7), so that its rows
-/// spread over the masters. Chunk k takes columns [lo, hi).
-static unsigned ppChunks(unsigned columns) {
+/// memory (a kernel controller): ceil(columns / 56) (4,032 bits, a row of 8
+/// beats), or with `spread` (the frame's HBM bandwidth needs the masters) one
+/// a master while a chunk keeps a beat's columns (7), so that its rows spread
+/// over the masters. A controller costs its data width and itself (Y's
+/// calibrated ctl_cost), so chunks are as few as the bandwidth allows. Chunk k
+/// takes columns [lo, hi).
+static unsigned ppChunks(unsigned columns, bool spread) {
   unsigned least = unsigned(llvm::divideCeil(columns, 56));
-  unsigned spread = std::min(kStreamMasters, unsigned(llvm::divideCeil(columns, 7)));
-  return std::max({1u, least, spread});
+  unsigned masters = spread ? std::min(kStreamMasters, unsigned(llvm::divideCeil(columns, 7))) : 1u;
+  return std::max({1u, least, masters});
 }
-static std::pair<unsigned, unsigned> ppChunk(unsigned columns, unsigned k) {
-  unsigned chunks = ppChunks(columns);
+static std::pair<unsigned, unsigned> ppChunk(unsigned columns, bool spread, unsigned k) {
+  unsigned chunks = ppChunks(columns, spread);
   return {k * columns / chunks, (k + 1) * columns / chunks};
 }
-static unsigned ppChunkBits(unsigned n) {
+/// A chunk's data width (its controller's): its columns' bits, whole bytes.
+static unsigned ppChunkBits(unsigned n) { return std::max(32u, n * 72); }
+/// The bytes a chunk's row moves in device memory: a power of two.
+static unsigned ppChunkMoveBits(unsigned n) {
   return std::max(32u, unsigned(llvm::PowerOf2Ceil(n * 72)));
 }
 
@@ -13607,6 +13812,12 @@ LogicalResult StaticFolder::chooseStreamWindows() {
   // numbers the controllers, approximately: other virtual memories share).
   SmallVector<uint64_t> masterBits(kStreamMasters, 0);
   unsigned nextMaster = 0;
+  // The chunks as few as can be (a controller each) and spread over the
+  // masters, priced side by side: spread only where the few would make the
+  // busiest master bound the frame.
+  SmallVector<uint64_t> spreadBits(kStreamMasters, 0);
+  unsigned nextSpread = 0;
+  uint64_t hbmSpread = 0;
   for (auto &cls : classes) {
     if (!cls.ppHbm)
       continue;
@@ -13716,12 +13927,18 @@ LogicalResult StaticFolder::chooseStreamWindows() {
       columns = unsigned(llvm::divideCeil(uint64_t(columns) * 112, 100));
     columns -= std::min(columns - 1, cls.ppResidentColumns);
     uint64_t bits = 0;
-    for (unsigned k = 0, e = ppChunks(columns); k < e; ++k) {
-      auto [lo, hi] = ppChunk(columns, k);
+    for (unsigned k = 0, e = ppChunks(columns, false); k < e; ++k) {
+      auto [lo, hi] = ppChunk(columns, false, k);
       // A row of the chunk moves its whole power-of-two bytes.
-      uint64_t chunk = 2 * uint64_t(n) * P * ppChunkBits(hi - lo);
+      uint64_t chunk = 2 * uint64_t(n) * P * ppChunkMoveBits(hi - lo);
       masterBits[nextMaster++ % kStreamMasters] += chunk;
       bits += chunk;
+    }
+    for (unsigned k = 0, e = ppChunks(columns, true); k < e; ++k) {
+      auto [lo, hi] = ppChunk(columns, true, k);
+      uint64_t chunk = 2 * uint64_t(n) * P * ppChunkMoveBits(hi - lo);
+      spreadBits[nextSpread++ % kStreamMasters] += chunk;
+      hbmSpread += chunk;
     }
     hbmBits += bits;
     llvm::errs() << "foldsim-fold-static: state-stream: " << cls.name << ": P "
@@ -13748,18 +13965,36 @@ LogicalResult StaticFolder::chooseStreamWindows() {
                                    1, llvm::divideCeil(fold.store.getType().getWidth(), 8)));
             uint64_t bits = (vmemRingLead ? 4 : 2) * uint64_t(cls.threads()) * row;
             masterBits[nextMaster++ % kStreamMasters] += bits;
+            spreadBits[nextSpread++ % kStreamMasters] += bits;
             foldBits += bits;
           }
   if (foldBits)
     llvm::errs() << "foldsim-fold-static: fold-store-stream: " << foldBits
                  << " HBM bits a frame (in the state stream's II_bw)\n";
   hbmBits += foldBits;
+  hbmSpread += foldBits;
   if (hbmBits) {
     // The busiest master bounds it too (a master's share of the usable).
     uint64_t perMaster = kStreamBitsPerCycle / kStreamMasters;
+    auto bwOf = [&](uint64_t total, ArrayRef<uint64_t> masters) {
+      return std::max(llvm::divideCeil(total, kStreamBitsPerCycle),
+                      llvm::divideCeil(*llvm::max_element(masters), perMaster));
+    };
+    // The chunks spread over the masters only where the few would bound
+    // the frame and spreading lowers that bound.
+    bool spread = bwOf(hbmBits, masterBits) > ii &&
+                  bwOf(hbmSpread, spreadBits) < bwOf(hbmBits, masterBits);
+    for (auto &cls : classes)
+      if (cls.ppHbm)
+        cls.ppChunkSpread = spread;
+    if (spread) {
+      masterBits = spreadBits;
+      hbmBits = hbmSpread;
+    }
     uint64_t busiest = *llvm::max_element(masterBits);
-    uint64_t bw = std::max(llvm::divideCeil(hbmBits, kStreamBitsPerCycle),
-                           llvm::divideCeil(busiest, perMaster));
+    uint64_t bw = bwOf(hbmBits, masterBits);
+    if (spread)
+      llvm::errs() << "foldsim-fold-static: state-stream: chunks spread over the masters\n";
     llvm::errs() << "foldsim-fold-static: state-stream: II_sched " << ii
                  << ", HBM state bits a frame " << hbmBits
                  << " (busiest master " << busiest << "), II_bw " << bw << " ("
@@ -13933,11 +14168,11 @@ LogicalResult StaticFolder::buildPPStream(
   Value all = hw::ConstantOp::create(b, APInt::getAllOnes(slotsPow));
 
   // A chunk of at most 56 columns (4,032 bits): a virtual memory each.
-  unsigned chunks = ppChunks(columns.size());
+  unsigned chunks = ppChunks(columns.size(), cls.ppChunkSpread);
   unsigned cw = llvm::Log2_32_Ceil(P + 1);
   Value one = constant(1, 1);
   for (unsigned k = 0; k < chunks; ++k) {
-    auto [lo, hi] = ppChunk(columns.size(), k);
+    auto [lo, hi] = ppChunk(columns.size(), cls.ppChunkSpread, k);
     unsigned n = hi - lo;
     unsigned width = n * 72;
     unsigned dw = ppChunkBits(n);
@@ -18309,18 +18544,48 @@ LogicalResult StaticFolder::buildSim() {
   // `vmem-rings`: each ring's image, a row per instance (row 0 of each),
   // written with the memory's answers, read by the ring's prefetches.
   std::map<std::pair<unsigned, unsigned>, unsigned> imageOf;
-  for (auto [c, cls] : llvm::enumerate(classes))
-    for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
-      if (!vm.ring || !simOf.count({unsigned(c), unsigned(k)}))
-        continue;
-      imageOf[{unsigned(c), unsigned(k)}] = simVirtuals.size();
+  // (A class's rings share images by default: as many rings an image as
+  // its one read and one write a host cycle serve in a frame (each ring's
+  // prefetches and answers, at most a frame's instances or prefetch groups
+  // each, within half the frame) and, the rings' prefetches at the same
+  // positions, in half the ring's lead: ring j of an image at rows {j, instance},
+  // j in the tag. The images are as many at every instance count, the
+  // frame growing with the instances. `imageMembers` an image's rings,
+  // `ringIndex` j.)
+  std::map<unsigned, SmallVector<std::pair<unsigned, unsigned>>> imageMembers;
+  std::map<std::pair<unsigned, unsigned>, unsigned> ringIndex;
+  std::map<unsigned, unsigned> imageEntryBits, imageInstBits;
+  auto memberBits = [&](unsigned img) -> unsigned {
+    unsigned n = imageMembers.count(img) ? imageMembers[img].size() : 1;
+    return n < 2 ? 0 : llvm::Log2_32_Ceil(n);
+  };
+  {
+    SmallVector<std::pair<unsigned, unsigned>> members;
+    uint64_t loadSum = 0;
+    auto flush = [&]() {
+      if (members.empty())
+        return;
+      unsigned img = simVirtuals.size();
+      unsigned kb = members.size() < 2 ? 0 : llvm::Log2_32_Ceil(members.size());
+      unsigned eb = 0, ib = 1, dataWidth = 0;
+      for (auto [j, ck] : llvm::enumerate(members)) {
+        auto &cl = classes[ck.first];
+        imageOf[ck] = img;
+        ringIndex[ck] = unsigned(j);
+        eb = std::max(eb, unsigned(llvm::Log2_32_Ceil(cl.ring->entries)));
+        ib = std::max(ib, unsigned(llvm::Log2_32_Ceil(cl.threads())));
+        dataWidth = std::max(dataWidth, cl.virtualMemories[ck.second].dataWidth);
+      }
+      imageMembers[img] = members;
+      imageEntryBits[img] = eb;
+      imageInstBits[img] = ib;
       std::string name = ("vm" + Twine(simVirtuals.size()) + "_").str();
-      // {write, entry, instance 0} (a read's tag its entry; foldsim_vmem
-      // TAGW), the row the instance.
-      auto iw = IntegerType::get(context, llvm::Log2_32_Ceil(cls.ring->entries) + 2);
-      auto aw = IntegerType::get(context, std::max(llvm::Log2_32_Ceil(cls.threads()), 1u));
-      auto dw = IntegerType::get(context, vm.dataWidth);
-      simVirtuals.push_back({unsigned(c), unsigned(k), unsigned(numIn)});
+      // {write, ring, entry, instance 0} (a read's tag its ring and entry;
+      // foldsim_vmem TAGW), the row {ring, instance}.
+      auto iw = IntegerType::get(context, eb + kb + 2);
+      auto aw = IntegerType::get(context, ib + kb);
+      auto dw = IntegerType::get(context, dataWidth);
+      simVirtuals.push_back({members.front().first, members.front().second, unsigned(numIn)});
       simVirtuals.back().image = true;
       addPort(name + "rsp_valid", i1, true);
       addPort(name + "rsp_inst", iw, true);
@@ -18334,7 +18599,25 @@ LogicalResult StaticFolder::buildSim() {
       addPort(name + "wr_row", aw, false);
       addPort(name + "wr_data", dw, false);
       addPort(name + "wr_mask", i1, false);
-    }
+      members.clear();
+      loadSum = 0;
+    };
+    // (The rings' prefetches at a class's same positions: an image's rings'
+    // reads of a position leave one a host cycle, within half the lead.)
+    uint64_t perLead = std::max<uint64_t>(1, vmemRingLead / 2);
+    for (auto [c, cls] : llvm::enumerate(classes))
+      for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
+        if (!vm.ring || !simOf.count({unsigned(c), unsigned(k)}))
+          continue;
+        uint64_t load = std::max<uint64_t>({1, cls.ring->prefetches, cls.threads()});
+        if (!members.empty() &&
+            (vmemRingImageEach || members.size() + 1 > perLead || loadSum + load > ii / 2))
+          flush();
+        members.push_back({unsigned(c), unsigned(k)});
+        loadSum += load;
+      }
+    flush();
+  }
   // Each HBM link stream's: its rows a single address (instances 1), the
   // request's tag a landing slot.
   for (auto [k, st] : llvm::enumerate(linkStreams)) {
@@ -18345,7 +18628,7 @@ LogicalResult StaticFolder::buildSim() {
     simVirtuals.push_back({unsigned(k), unsigned(k), unsigned(numIn), true});
     auto iw = IntegerType::get(context, st.portInstBits());
     auto aw = IntegerType::get(context, streamRowBits(st));
-    auto dw = IntegerType::get(context, st.dw);
+    auto dw = IntegerType::get(context, st.portDW());
     addPort(name + "rsp_valid", i1, true);
     addPort(name + "rsp_inst", iw, true);
     addPort(name + "rsp_data", dw, true);
@@ -18358,7 +18641,7 @@ LogicalResult StaticFolder::buildSim() {
     addPort(name + "wr_row", aw, false);
     addPort(name + "wr_data", dw, false);
     addPort(name + "wr_mask",
-            st.mailbox ? IntegerType::get(context, st.dw / 8) : i1, false);
+            st.mailbox ? IntegerType::get(context, st.portDW() / 8) : i1, false);
   }
   // Each page engine's: {tag, instance 0} requests, {member, instance, row}
   // rows, byte masks.
@@ -19290,6 +19573,9 @@ LogicalResult StaticFolder::buildSim() {
     Value issValid, issInst, issEntry, queued;
     /// The answers' image write leaving now: valid, instance, data.
     Value wissValid, wissInst, wissData;
+    /// A shared image's read and write grants of this ring (registered,
+    /// one-hot over the image's rings); null when the image is its own.
+    Value issGrant, wissGrant;
   };
   std::map<std::pair<unsigned, unsigned>, RingBuilt> ringBuilt;
   auto buildRing = [&](unsigned c, unsigned k) -> Value {
@@ -19336,9 +19622,19 @@ LogicalResult StaticFolder::buildSim() {
                          : constant(1, 0);
     rb.pentry0 = chain3(tableCare(b, at, plan.prefEntry, prefRows, eb), prefix + "_pentry");
     Value irspValid = body->getArgument(image.firstInput);
-    Value irspEntry = b.createOrFold<comb::ExtractOp>(
-        b.getIntegerType(eb), body->getArgument(image.firstInput + 1), 1);
-    Value irspData = body->getArgument(image.firstInput + 2);
+    Value irspTag = body->getArgument(image.firstInput + 1);
+    Value irspEntry = b.createOrFold<comb::ExtractOp>(b.getIntegerType(eb), irspTag, 1);
+    // (A shared image: the answers of this ring's reads, by the tag's ring.)
+    unsigned img = imageOf.at({c, k});
+    if (unsigned kb = memberBits(img))
+      irspValid = comb::AndOp::create(
+          b, irspValid,
+          comb::ICmpOp::create(b, comb::ICmpPredicate::eq,
+                               b.createOrFold<comb::ExtractOp>(b.getIntegerType(kb), irspTag,
+                                                               1 + imageEntryBits.at(img)),
+                               constant(kb, ringIndex.at({c, k}))));
+    Value irspData = b.createOrFold<comb::ExtractOp>(
+        b.getIntegerType(vm.dataWidth), body->getArgument(image.firstInput + 2), 0);
     auto ring = seq::FirMemOp::create(
         b, seq::FirMemType::get(context, plan.entries, vm.dataWidth, 1),
         /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old, seq::WUW::Undefined,
@@ -20107,11 +20403,16 @@ LogicalResult StaticFolder::buildSim() {
     // A response's landing slot: its tag's low bits, above the instance bit
     // (carried by a page engine: the engine's answer whose member is this
     // stream, the slot its member tag's low bits).
-    Value rsp, rspInst, rspData;
+    Value rsp, rspInst, rspData, rspBeat;
     if (st.engine < 0) {
       rsp = body->getArgument(simVirtuals[st.vm].firstInput);
       rspInst = b.createOrFold<comb::ExtractOp>(
           b.getIntegerType(ib), body->getArgument(simVirtuals[st.vm].firstInput + 1), 1);
+      // (Beats: the beat in the tag above the slot.)
+      if (st.beats > 1)
+        rspBeat = b.createOrFold<comb::ExtractOp>(
+            b.getIntegerType(st.beatBits()), body->getArgument(simVirtuals[st.vm].firstInput + 1),
+            1 + ib);
       rspData = body->getArgument(simVirtuals[st.vm].firstInput + 2);
     } else {
       auto &eng = pageEngines[st.engine];
@@ -20123,8 +20424,10 @@ LogicalResult StaticFolder::buildSim() {
       rsp = comb::AndOp::create(b, body->getArgument(v.firstInput),
                                 eq(member, st.member));
       rspInst = b.createOrFold<comb::ExtractOp>(b.getIntegerType(ib), tag, 0);
+      if (st.beats > 1)
+        rspBeat = b.createOrFold<comb::ExtractOp>(b.getIntegerType(st.beatBits()), tag, ib);
       rspData = b.createOrFold<comb::ExtractOp>(
-          b.getIntegerType(st.dw), body->getArgument(v.firstInput + 2), 0);
+          b.getIntegerType(st.portDW()), body->getArgument(v.firstInput + 2), 0);
     }
     auto chain3 = [&](Value v, const Twine &n) {
       return reg(reg(reg(v, n + "2"), n + "1"), n + "0");
@@ -20216,14 +20519,30 @@ LogicalResult StaticFolder::buildSim() {
     sb.popPtr = resetReg(popNext, prefix + "_popptr", 0);
     popNext.setValue(comb::AddOp::create(
         b, sb.popPtr, b.createOrFold<comb::ConcatOp>(constant(ib - 1, 0), take0)));
+    // (Beats: the slot written a beat at a time, its mask the beat's.)
+    unsigned kb = st.beats, bw = st.beatWidth(), bb = st.beatBits();
+    unsigned landW = kb > 1 ? kb * bw : st.dw;
     auto landing = seq::FirMemOp::create(
-        b, seq::FirMemType::get(context, slots, st.dw, 1), /*readLatency=*/0,
+        b, seq::FirMemType::get(context, slots, landW, kb > 1 ? std::optional<uint32_t>(kb) : 1),
+        /*readLatency=*/0,
         /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
         b.getStringAttr(prefix + "_landing"), hw::InnerSymAttr{},
         seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
-    seq::FirMemWriteOp::create(b, landing, rspInst, hostClock, rsp, rspData, Value{});
+    if (kb > 1) {
+      SmallVector<Value> copiesOf(kb, rspData);
+      Value one = b.createOrFold<comb::ConcatOp>(constant(kb - 1, 0), constant(1, 1));
+      Value mask = comb::ShlOp::create(
+          b, one, bb < kb ? Value(b.createOrFold<comb::ConcatOp>(constant(kb - bb, 0), rspBeat))
+                          : rspBeat);
+      seq::FirMemWriteOp::create(b, landing, rspInst, hostClock, rsp,
+                                 b.createOrFold<comb::ConcatOp>(copiesOf), mask);
+    } else {
+      seq::FirMemWriteOp::create(b, landing, rspInst, hostClock, rsp, rspData, Value{});
+    }
     Value read = seq::FirMemReadOp::create(b, landing, sb.popPtr, hostClock,
                                           constant(1, 1));
+    if (landW != st.dw)
+      read = b.createOrFold<comb::ExtractOp>(b.getIntegerType(st.dw), read, 0);
     sb.data = comb::MuxOp::create(b, skip0, constant(st.dw, 0), read);
     sb.raw = read;
     sb.skip = skip0;
@@ -20236,21 +20555,65 @@ LogicalResult StaticFolder::buildSim() {
       rowBits.push_back(chain3(table(b, rctl.at3, st.reqRow, pIdx), prefix + "_rrow"));
     if (pgBits)
       rowBits.push_back(chain3(table(b, rctl.at3, st.reqPage, pgBits), prefix + "_rpage"));
+    // (Beats: the table's request a landing's first beat; the next beats
+    // at the reader's next positions (a real one each: not a bubble's `ii`),
+    // the row held from the first, the beat the row's low bits; the slot
+    // pointer steps at the last.)
+    Value rbeat0, reqStep = req0;
+    if (kb > 1) {
+      SmallVector<uint64_t> real(ii + 1, 1);
+      real[ii] = 0;
+      Value ev0 = chain3r(table(b, rctl.at3, real, 1), prefix + "_rev");
+      auto beatNext = backedges.get(b.getIntegerType(bb));
+      auto actNext = backedges.get(i1);
+      Value beatR = resetReg(beatNext, prefix + "_rbeat", 0);
+      Value actR = resetReg(actNext, prefix + "_ract", 0);
+      Value start = req0;
+      Value issue = comb::OrOp::create(b, start, comb::AndOp::create(b, actR, ev0));
+      rbeat0 = comb::MuxOp::create(b, start, constant(bb, 0), beatR);
+      Value lastBeat = eq(rbeat0, kb - 1);
+      beatNext.setValue(comb::MuxOp::create(
+          b, issue, comb::AddOp::create(b, rbeat0, constant(bb, 1)), beatR));
+      actNext.setValue(comb::MuxOp::create(b, issue, notOf(lastBeat), actR));
+      Value rowNow = b.createOrFold<comb::ConcatOp>(rowBits);
+      auto rowNext = backedges.get(rowNow.getType());
+      Value rowR = reg(rowNext, prefix + "_rrowheld");
+      Value rowAt = comb::MuxOp::create(b, start, rowNow, rowR);
+      rowNext.setValue(rowAt);
+      rowBits.assign({rowAt, rbeat0});
+      req0 = issue;
+      reqStep = comb::AndOp::create(b, issue, lastBeat);
+    }
     auto reqNext = backedges.get(b.getIntegerType(ib));
     Value reqPtr = resetReg(reqNext, prefix + "_reqptr", 0);
     reqNext.setValue(comb::AddOp::create(
-        b, reqPtr, b.createOrFold<comb::ConcatOp>(constant(ib - 1, 0), req0)));
-    // Pending slots: set by a request, cleared by its response.
-    auto pendNext = backedges.get(b.getIntegerType(slots));
-    sb.pending = resetReg(pendNext, prefix + "_pending", 0);
+        b, reqPtr, b.createOrFold<comb::ConcatOp>(constant(ib - 1, 0), reqStep)));
+    // Pending slots: set by a request, cleared by its response (beats: a
+    // bit a slot's beat, the slot pending while any is).
+    unsigned pbits = slots * kb, pb = ib + bb;
+    auto pendNext = backedges.get(b.getIntegerType(pbits));
+    Value pendAll = resetReg(pendNext, prefix + "_pending", 0);
     auto bitAt = [&](Value on, Value at) -> Value {
-      Value one = b.createOrFold<comb::ConcatOp>(constant(slots - 1, 0), on);
+      Value one = b.createOrFold<comb::ConcatOp>(constant(pbits - 1, 0), on);
       return comb::ShlOp::create(
-          b, one, b.createOrFold<comb::ConcatOp>(constant(slots - ib, 0), at));
+          b, one, b.createOrFold<comb::ConcatOp>(constant(pbits - pb, 0), at));
     };
-    Value set = comb::OrOp::create(b, sb.pending, bitAt(req0, reqPtr));
+    Value reqAt = kb > 1 ? b.createOrFold<comb::ConcatOp>(reqPtr, rbeat0) : reqPtr;
+    Value rspAt = kb > 1 ? b.createOrFold<comb::ConcatOp>(rspInst, rspBeat) : rspInst;
+    Value set = comb::OrOp::create(b, pendAll, bitAt(req0, reqAt));
     pendNext.setValue(comb::AndOp::create(
-        b, set, comb::XorOp::create(b, bitAt(rsp, rspInst), constant(slots, ~0ull))));
+        b, set, comb::XorOp::create(b, bitAt(rsp, rspAt), hw::ConstantOp::create(b, APInt::getAllOnes(pbits)))));
+    if (kb > 1) {
+      SmallVector<Value> slotBits;
+      for (unsigned sl = slots; sl-- > 0;)
+        slotBits.push_back(comb::ICmpOp::create(
+            b, comb::ICmpPredicate::ne,
+            b.createOrFold<comb::ExtractOp>(b.getIntegerType(kb), pendAll, sl * kb),
+            constant(kb, 0)));
+      sb.pending = b.createOrFold<comb::ConcatOp>(slotBits);
+    } else {
+      sb.pending = pendAll;
+    }
     // The writes: the word held at the producer's pass, a row a host cycle
     // over the pages after it, at {bank, instance, page}.
     Value pass2 = !st.atReady ? pctl.state2
@@ -20333,6 +20696,38 @@ LogicalResult StaticFolder::buildSim() {
                                comb::ICmpOp::create(b, comb::ICmpPredicate::eq, wp0,
                                                     constant(pgBits, st.pages - 1))))
                          : wv0;
+    // (Beats: the table's write a page's first beat, the next beats at the
+    // producer's next real positions, the page held from the first; the
+    // pass's last write its last page's last beat.)
+    Value wb0;
+    if (kb > 1) {
+      SmallVector<uint64_t> real(ii + 1, 1);
+      real[ii] = 0;
+      Value ev0 = chain3r(table(b, pctl.at3, real, 1), prefix + "_wev");
+      auto beatNext = backedges.get(b.getIntegerType(bb));
+      auto actNext = backedges.get(i1);
+      Value beatR = resetReg(beatNext, prefix + "_wbeat", 0);
+      Value actR = resetReg(actNext, prefix + "_wact", 0);
+      Value start = wv0;
+      Value issue = comb::OrOp::create(b, start, comb::AndOp::create(b, actR, ev0));
+      wb0 = comb::MuxOp::create(b, start, constant(bb, 0), beatR);
+      Value lastBeat = eq(wb0, kb - 1);
+      beatNext.setValue(comb::MuxOp::create(
+          b, issue, comb::AddOp::create(b, wb0, constant(bb, 1)), beatR));
+      actNext.setValue(comb::MuxOp::create(b, issue, notOf(lastBeat), actR));
+      if (pgBits) {
+        auto pageNext = backedges.get(b.getIntegerType(pgBits));
+        Value pageR = reg(pageNext, prefix + "_wpageheld");
+        wp0 = comb::MuxOp::create(b, start, wp0, pageR);
+        pageNext.setValue(wp0);
+        lastW = comb::AndOp::create(
+            b, issue, eq(wp0, st.pages - 1));
+      } else {
+        lastW = issue;
+      }
+      lastW = comb::AndOp::create(b, lastW, lastBeat);
+      wv0 = issue;
+    }
     armNext.setValue(comb::MuxOp::create(
         b, we0, constant(1, 1), comb::MuxOp::create(b, lastW, constant(1, 0), armed)));
     Value we = comb::AndOp::create(b, wv0, armed);
@@ -20354,7 +20749,33 @@ LogicalResult StaticFolder::buildSim() {
                      ? b.createOrFold<comb::ConcatOp>(
                            constant(padded - st.wordBits, 0), held)
                      : held;
-    if (pgBits) {
+    // (Beats: page j's beat b the bits [b bw, (b + 1) bw) of its dw, zero
+    // past them; the row {held at, page, beat}.)
+    auto slice = [&](Value v, unsigned lo, unsigned n, unsigned w) -> Value {
+      unsigned have = hw::getBitWidth(v.getType());
+      unsigned take = lo >= have ? 0 : std::min(n, have - lo);
+      if (!take)
+        return constant(w, 0);
+      Value x = b.createOrFold<comb::ExtractOp>(b.getIntegerType(take), v, lo);
+      return take < w ? b.createOrFold<comb::ConcatOp>(constant(w - take, 0), x) : x;
+    };
+    if (kb > 1) {
+      SmallVector<Value> chunks, index;
+      unsigned ib2 = pgBits + bb;
+      for (unsigned x = 1u << ib2; x-- > 0;) {
+        unsigned j = x >> bb, bt = x & ((1u << bb) - 1);
+        chunks.push_back(j < st.pages && bt < kb
+                             ? slice(wide, j * st.dw + bt * bw, std::min(bw, st.dw - std::min(st.dw, bt * bw)), bw)
+                             : constant(bw, 0));
+      }
+      Value at = pgBits ? b.createOrFold<comb::ConcatOp>(wp0, wb0) : wb0;
+      wrData = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), at);
+      SmallVector<Value> rowParts{heldAt};
+      if (pgBits)
+        rowParts.push_back(wp0);
+      rowParts.push_back(wb0);
+      wrRow = b.createOrFold<comb::ConcatOp>(rowParts);
+    } else if (pgBits) {
       Value index = wp0;
       SmallVector<Value> chunks;
       for (unsigned j = 1u << pgBits; j-- > 0;)
@@ -20367,7 +20788,19 @@ LogicalResult StaticFolder::buildSim() {
       wrData = wide;
     }
     Value wrMask = constant(1, 1);
-    if (st.mailbox) {
+    if (st.mailbox && kb > 1) {
+      unsigned mb = st.dw / 8, bmb = bw / 8;
+      SmallVector<Value> chunks;
+      unsigned ib2 = pgBits + bb;
+      for (unsigned x = 1u << ib2; x-- > 0;) {
+        unsigned j = x >> bb, bt = x & ((1u << bb) - 1);
+        chunks.push_back(j < st.pages && bt < kb
+                             ? slice(heldMask, j * mb + bt * bmb, std::min(bmb, mb - std::min(mb, bt * bmb)), bmb)
+                             : constant(bmb, 0));
+      }
+      Value at = pgBits ? b.createOrFold<comb::ConcatOp>(wp0, wb0) : wb0;
+      wrMask = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), at);
+    } else if (st.mailbox) {
       unsigned mb = st.dw / 8;
       wrMask = heldMask;
       if (pgBits) {
@@ -20381,12 +20814,13 @@ LogicalResult StaticFolder::buildSim() {
     }
     // Requests' {tag, instance}: a read's tag its slot, a write's the top
     // bit alone; instance 0.
-    sb.outs = {req0,
-               b.createOrFold<comb::ConcatOp>(
-                   ValueRange{constant(1, 0), reqPtr, constant(1, 0)}),
+    // (Beats: a read's tag {beat, slot}.)
+    Value readTag = kb > 1 ? b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 0), rbeat0, reqPtr, constant(1, 0)})
+                           : b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 0), reqPtr, constant(1, 0)});
+    sb.outs = {req0, readTag,
                b.createOrFold<comb::ConcatOp>(rowBits), we,
                b.createOrFold<comb::ConcatOp>(
-                   ValueRange{constant(1, 1), constant(ib, 0), constant(1, 0)}),
+                   ValueRange{constant(1, 1), constant(ib + bb, 0), constant(1, 0)}),
                wrRow, wrData, wrMask};
     return sb;
   };
@@ -22309,6 +22743,27 @@ LogicalResult StaticFolder::buildSim() {
       return r;
     };
     SmallVector<Value> terms;
+    // A ring image's room and grants (vmem-rings), by image.
+    struct ImageShare {
+      bool built = false;
+      unsigned rings = 1;
+      Backedge sentNext, anyWrite;
+      /// Shared (rings > 1): an image's read and write grant this host cycle
+      /// (registered: the grants are decided a host cycle ahead; the
+      /// registers made before their users, their next values set below).
+      Backedge readGrantedNext, writeGrantedNext;
+      Value readGranted, writeGranted;
+      /// Shared: the image's requests that left a host cycle ago (each
+      /// ring's registered), whose sum the room's flags take, and the chain
+      /// of older ones (sent2..) it starts.
+      Backedge actualNext;
+      Value enough, enough2;
+      std::string prefix;
+      SmallVector<Value> readCands, writeCands, reads, writes;
+      SmallVector<Backedge> readGrants, writeGrants;
+      SmallVector<std::pair<unsigned, unsigned>> keys;
+    };
+    std::map<unsigned, ImageShare> imageShare;
     for (auto [c, cls] : llvm::enumerate(classes)) {
       if (cls.virtualMemories.empty())
         continue;
@@ -22463,22 +22918,71 @@ LogicalResult StaticFolder::buildSim() {
             // the `free` seen yet. The answers' writes first (a queue of
             // kRingReads, as many as the reads in flight), then a prefetch.
             unsigned fw = kVirtualFreeWidth;
-            Value freeImg = body->getArgument(simVirtuals[imageOf.at({unsigned(c), unsigned(&vm - cls.virtualMemories.data())})].firstInput + 3);
-            auto sentNext = backedges.get(b.getIntegerType(2));
-            SmallVector<Value> lag{resetReg(sentNext, fp + "_sent1", 0)};
-            for (unsigned l = 2; l <= kRingFreeLag; ++l)
-              lag.push_back(resetReg(lag.back(), fp + "_sent" + Twine(l), 0));
-            Value recent = constant(fw, 0);
-            for (Value x : lag)
-              recent = comb::AddOp::create(b, recent, b.createOrFold<comb::ConcatOp>(constant(fw - 2, 0), x));
-            Value used = comb::ShlOp::create(b, recent, constant(fw, 1));
-            Value credit = comb::SubOp::create(b, freeImg, used);
-            Value enough = comb::AndOp::create(
-                b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used),
-                comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit, constant(fw, 2)));
-            Value enough2 = comb::AndOp::create(
-                b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used),
-                comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit, constant(fw, 4)));
+            unsigned vk = unsigned(&vm - cls.virtualMemories.data());
+            // (The image's room, shared by the class's rings when they share
+            // it: a read and a write a host cycle at most, granted in turn.)
+            auto &share = imageShare[imageOf.at({unsigned(c), vk})];
+            if (!share.built) {
+              share.built = true;
+              unsigned img = imageOf.at({unsigned(c), vk});
+              // (Unique per image: a ring's name may recur across classes.)
+              share.prefix = (fp + "_img" + Twine(img)).str();
+              Value freeImg = body->getArgument(simVirtuals[imageOf.at({unsigned(c), vk})].firstInput + 3);
+              share.sentNext = backedges.get(b.getIntegerType(2));
+              unsigned rings = imageMembers.count(img) ? imageMembers[img].size() : 1;
+              SmallVector<Value> lag{resetReg(share.sentNext, share.prefix + "_sent1", 0)};
+              // (Shared: sent1 the newest host cycle's grants (at most one
+              // more than left), the older the requests that left, as the
+              // rings' registered requests sum them a host cycle on.)
+              Value actual;
+              if (rings > 1) {
+                share.actualNext = backedges.get(b.getIntegerType(2));
+                actual = share.actualNext;
+                lag.push_back(resetReg(actual, share.prefix + "_sent2", 0));
+              } else {
+                lag.push_back(resetReg(lag.back(), share.prefix + "_sent2", 0));
+              }
+              for (unsigned l = 3; l <= kRingFreeLag; ++l)
+                lag.push_back(resetReg(lag.back(), share.prefix + "_sent" + Twine(l), 0));
+              // The room, registered: a host cycle late, `free` misses the
+              // requests of one host cycle more, the last (sent1) taken at
+              // use. Flag k: free - 2 x (the requests of sent1..sentL) >= k,
+              // seen a host cycle later; then the room for a request (2 of
+              // free) is flag 2 + 2 x sent1, for two flag 4 + 2 x sent1 (the
+              // adders and compares off the requests' path).
+              Value recent = constant(fw, 0);
+              for (auto [l, x] : llvm::enumerate(lag))
+                recent = comb::AddOp::create(
+                    b, recent,
+                    b.createOrFold<comb::ConcatOp>(constant(fw - 2, 0), l == 0 && actual ? actual : x));
+              Value used = comb::ShlOp::create(b, recent, constant(fw, 1));
+              Value credit = comb::SubOp::create(b, freeImg, used);
+              Value covers = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used);
+              SmallVector<Value> flag;
+              for (unsigned k = 2; k <= 8; k += 2)
+                flag.push_back(resetReg(
+                    comb::AndOp::create(b, covers,
+                                        comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit,
+                                                             constant(fw, k))),
+                    share.prefix + "_room" + Twine(k), 0));
+              Value s1 = lag.front();
+              auto room = [&](unsigned at) -> Value {
+                return comb::MuxOp::create(
+                    b, eq(s1, 0), flag[at],
+                    comb::MuxOp::create(b, eq(s1, 1), flag[at + 1], flag[at + 2]));
+              };
+              share.enough = room(0);
+              share.enough2 = room(1);
+              share.rings = rings;
+              if (share.rings > 1) {
+                share.readGrantedNext = backedges.get(i1);
+                share.writeGrantedNext = backedges.get(i1);
+                share.readGranted = share.readGrantedNext;
+                share.writeGranted = share.writeGrantedNext;
+              }
+              share.anyWrite = backedges.get(i1);
+            }
+            Value enough = share.enough;
             // The answers' writes: {instance, data}, queued a host cycle after
             // the answer (rb.wv).
             unsigned dw = vm.dataWidth, wb = llvm::Log2_32_Ceil(kRingReads);
@@ -22497,18 +23001,34 @@ LogicalResult StaticFolder::buildSim() {
                                        b.createOrFold<comb::ConcatOp>(rb.winst, rb.wdata), Value{});
             Value wtop = seq::FirMemReadOp::create(b, wq, whead, hostClock, constant(1, 1));
             Value wany = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, wcount, constant(wb + 1, 0));
-            Value wgo = comb::AndOp::create(b, wany, enough);
+            Value wcand = comb::AndOp::create(b, wany, enough);
+            auto wgrantNext = backedges.get(i1);
+            Value wgrant = wgrantNext;
+            Value wgo = comb::AndOp::create(b, wcand, wgrant);
+            share.writeCands.push_back(wcand);
+            share.writeGrants.push_back(wgrantNext);
+            share.writes.push_back(wgo);
             wissNext.setValue(wgo);
             Value wtopInst = b.createOrFold<comb::ExtractOp>(b.getIntegerType(iw), wtop, dw);
             wissInstNext.setValue(wtopInst);
             rb.wissValid = wgo;
             rb.wissInst = wtopInst;
             rb.wissData = b.createOrFold<comb::ExtractOp>(b.getIntegerType(dw), wtop, 0);
-            rb.issValid = comb::AndOp::create(
-                b, ValueRange{any, notOf(busy), comb::MuxOp::create(b, wgo, enough2, enough)}, false);
-            sentNext.setValue(comb::AddOp::create(
-                b, b.createOrFold<comb::ConcatOp>(constant(1, 0), wgo),
-                b.createOrFold<comb::ConcatOp>(constant(1, 0), rb.issValid)));
+            // (Shared: room for two while the image's write grant is held,
+            // whether or not its ring writes.)
+            Value rcand = comb::AndOp::create(
+                b, ValueRange{any, notOf(busy),
+                              comb::MuxOp::create(b, share.rings > 1 ? share.writeGranted
+                                                                     : Value(share.anyWrite),
+                                                  share.enough2, enough)},
+                false);
+            auto rgrantNext = backedges.get(i1);
+            Value rgrant = rgrantNext;
+            rb.issValid = comb::AndOp::create(b, rcand, rgrant);
+            share.keys.push_back({unsigned(c), vk});
+            share.readCands.push_back(rcand);
+            share.readGrants.push_back(rgrantNext);
+            share.reads.push_back(rb.issValid);
             auto wstep = [&](Value v, Value on) -> Value {
               return comb::AddOp::create(
                   b, v, b.createOrFold<comb::ConcatOp>(constant(hw::getBitWidth(v.getType()) - 1, 0), on));
@@ -22561,6 +23081,85 @@ LogicalResult StaticFolder::buildSim() {
         terms.push_back(comb::OrOp::create(b, notOf(used), notOf(bit)));
       }
     }
+    // Each image's grants: a read and a write a host cycle, to the first
+    // ring asking at or after a pointer that turns every host cycle (each
+    // ring's turn comes within as many host cycles as rings). Decided a host
+    // cycle ahead from the candidates registered (two host cycles old): a
+    // ring granted issues if it still asks; the grant and the image's room
+    // never wait on the requests' own logic. The room counts every grant as
+    // a request (at most one more than went).
+    for (auto &[img, share] : imageShare) {
+      if (!share.built)
+        continue;
+      if (share.rings == 1) {
+        for (auto &g : share.readGrants)
+          g.setValue(constant(1, 1));
+        for (auto &g : share.writeGrants)
+          g.setValue(constant(1, 1));
+        Value anyRead = comb::OrOp::create(b, share.reads, false);
+        Value anyWrite = comb::OrOp::create(b, share.writes, false);
+        share.anyWrite.setValue(anyWrite);
+        share.sentNext.setValue(comb::AddOp::create(
+            b, b.createOrFold<comb::ConcatOp>(constant(1, 0), anyWrite),
+            b.createOrFold<comb::ConcatOp>(constant(1, 0), anyRead)));
+        continue;
+      }
+      auto pick = [&](ArrayRef<Value> live, const Twine &n, bool direct) -> std::pair<SmallVector<Value>, Value> {
+        unsigned r = live.size();
+        SmallVector<Value> cands;
+        for (auto [j, x] : llvm::enumerate(live))
+          cands.push_back(direct ? x : resetReg(x, share.prefix + n + "_cand" + Twine(j), 0));
+        unsigned pb = llvm::Log2_32_Ceil(r);
+        auto ptrNext = backedges.get(b.getIntegerType(pb));
+        Value ptr = resetReg(ptrNext, share.prefix + n + "_turn", 0);
+        ptrNext.setValue(comb::MuxOp::create(
+            b, eq(ptr, r - 1), constant(pb, 0), comb::AddOp::create(b, ptr, constant(pb, 1))));
+        // The first asking at or after the pointer, else the first asking:
+        // two priority picks, one chosen.
+        SmallVector<Value> hi;
+        for (unsigned j = 0; j < r; ++j)
+          hi.push_back(comb::AndOp::create(
+              b, cands[j], comb::ICmpOp::create(b, comb::ICmpPredicate::ule, ptr, constant(pb, j))));
+        Value anyHi = comb::OrOp::create(b, hi, false);
+        auto first = [&](ArrayRef<Value> xs, unsigned j) -> Value {
+          if (!j)
+            return xs[0];
+          return comb::AndOp::create(b, xs[j], notOf(comb::OrOp::create(b, xs.take_front(j), false)));
+        };
+        SmallVector<Value> grants;
+        for (unsigned j = 0; j < r; ++j)
+          grants.push_back(comb::MuxOp::create(b, anyHi, first(hi, j), first(cands, j)));
+        return {grants, comb::OrOp::create(b, cands, false)};
+      };
+      // (The writes' candidates are shallow (a count and the room's flags):
+      // their grants from them directly, a host cycle ahead; the reads'
+      // from their registers.)
+      auto [rg, rAny] = pick(share.readCands, "_rd", false);
+      auto [wg, wAny] = pick(share.writeCands, "_wr", false);
+      {
+        SmallVector<Value> rs, ws;
+        for (auto [j, x] : llvm::enumerate(share.reads))
+          rs.push_back(resetReg(x, share.prefix + "_rd_went" + Twine(j), 0));
+        for (auto [j, x] : llvm::enumerate(share.writes))
+          ws.push_back(resetReg(x, share.prefix + "_wr_went" + Twine(j), 0));
+        share.actualNext.setValue(comb::AddOp::create(
+            b, b.createOrFold<comb::ConcatOp>(constant(1, 0), comb::OrOp::create(b, ws, false)),
+            b.createOrFold<comb::ConcatOp>(constant(1, 0), comb::OrOp::create(b, rs, false))));
+      }
+      for (unsigned j = 0; j < rg.size(); ++j) {
+        share.readGrants[j].setValue(rg[j]);
+        share.writeGrants[j].setValue(wg[j]);
+        auto &rb = ringBuilt.at(share.keys[j]);
+        rb.issGrant = rg[j];
+        rb.wissGrant = wg[j];
+      }
+      share.readGrantedNext.setValue(rAny);
+      share.writeGrantedNext.setValue(wAny);
+      share.anyWrite.setValue(wAny);
+      share.sentNext.setValue(comb::AddOp::create(
+          b, b.createOrFold<comb::ConcatOp>(constant(1, 0), wAny),
+          b.createOrFold<comb::ConcatOp>(constant(1, 0), rAny)));
+    }
     for (auto &v : simVirtuals) {
       // `vmem-rings`: an image's requests (its queued prefetches and its
       // answers' writes) leave only within its room, not at decisions.
@@ -22600,13 +23199,31 @@ LogicalResult StaticFolder::buildSim() {
       // before: one-bit tables, which decode where the count's rows do not.
       // Without lookahead tables: the count, or that sum, read at `next`.
       Value count;
+      Value landsNext = atNext(st.popValid, 1);
       if (lookaheadTables) {
+        // The landing table at `next` - d is the one at `next` d steps of
+        // `next` before (`next` steps by one, wrapping from ii - 1 to 0, and
+        // holds through the gap between frames): one lookahead table, d - 1
+        // registers after it shifted as `next` steps, not a table each.
+        // (`next` steps on an advance unless at the frame's end with no
+        // frame starting; posD resets to `ii`, `next` 0: each register
+        // resets to its table there.)
         SmallVector<Value> parts;
+        Value prev;
+        Value steps = comb::OrOp::create(b, notOf(end), go);
+        if (advance)
+          steps = comb::AndOp::create(b, advance, steps);
         for (unsigned d = 0; d < window && d < ii; ++d) {
-          SmallVector<uint64_t> landed(ii + 1, 0);
-          for (unsigned q = 0; q < ii; ++q)
-            landed[q] = st.popValid[(q + ii - d) % ii];
-          Value bit = atNext(landed, 1);
+          Value bit;
+          if (!d) {
+            bit = landsNext;
+          } else {
+            auto self = backedges.get(i1);
+            bit = resetReg(self, "landed_ahead" + Twine(aheadCount++),
+                           st.popValid[(ii - d) % ii]);
+            self.setValue(comb::MuxOp::create(b, steps, prev, bit));
+          }
+          prev = bit;
           parts.push_back(cw > 1 ? b.createOrFold<comb::ConcatOp>(constant(cw - 1, 0), bit)
                                  : bit);
         }
@@ -22649,7 +23266,7 @@ LogicalResult StaticFolder::buildSim() {
         clear.push_back(comb::OrOp::create(b, notOf(bit), beyond));
       }
       terms.push_back(comb::OrOp::create(
-          b, notOf(atNext(st.popValid, 1)),
+          b, notOf(landsNext),
           comb::AndOp::create(b, clear, false)));
     }
     virtualReady.setValue(comb::AndOp::create(b, terms, false));
@@ -22751,7 +23368,7 @@ LogicalResult StaticFolder::buildSim() {
         wrRow.push_back(when(wv, rowOf(outs[5])));
         wrData.push_back(when(wv, zext(outs[6], dw)));
         wrMask.push_back(when(wv, zext(st.mailbox ? outs[7]
-                                                  : constant((st.dw + 7) / 8, ~0ull),
+                                                  : constant((st.portDW() + 7) / 8, ~0ull),
                                        dw / 8)));
       }
       auto any = [&](SmallVector<Value> &xs) -> Value {
@@ -22763,15 +23380,48 @@ LogicalResult StaticFolder::buildSim() {
     }
     if (v.image) {
       // `vmem-rings`: the prefetches' reads (row 0 of each instance) and the
-      // answers' writes.
-      auto &rb = ringBuilt.at({v.cls, v.k});
-      unsigned eb = llvm::Log2_32_Ceil(classes[v.cls].ring->entries);
-      results.append(
-          {rb.issValid,
-           b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 0), rb.issEntry, constant(1, 0)}),
-           rb.issInst, rb.wissValid,
-           b.createOrFold<comb::ConcatOp>(ValueRange{constant(1, 1), constant(eb, 0), constant(1, 0)}),
-           rb.wissInst, rb.wissData, constant(1, 1)});
+      // answers' writes; a shared image's of every ring it holds, one of
+      // each granted a host cycle, the ring in the tag and the row.
+      unsigned img = unsigned(&v - simVirtuals.data());
+      unsigned kb = memberBits(img), eb = imageEntryBits.at(img), ib = imageInstBits.at(img);
+      auto &members = imageMembers[img];
+      unsigned dw = 0;
+      for (auto [mc, mk] : members)
+        dw = std::max(dw, classes[mc].virtualMemories[mk].dataWidth);
+      auto zext = [&](Value x, unsigned w) -> Value {
+        unsigned xw = hw::getBitWidth(x.getType());
+        return xw == w ? x : b.createOrFold<comb::ConcatOp>(constant(w - xw, 0), x);
+      };
+      auto withRing = [&](Value low, unsigned j) -> Value {
+        return kb ? b.createOrFold<comb::ConcatOp>(constant(kb, j), low) : low;
+      };
+      SmallVector<Value> rdV, rdTag, rdRow, wrV, wrTag, wrRow, wrData;
+      for (auto [j, ck] : llvm::enumerate(members)) {
+        auto &rb = ringBuilt.at(ck);
+        auto when = [&](Value on, Value x) -> Value {
+          return comb::MuxOp::create(b, on, x, constant(hw::getBitWidth(x.getType()), 0));
+        };
+        // (Shared: the fields by the ring's grant, one-hot and registered,
+        // the valid bits alone by the requests.)
+        Value rsel = rb.issGrant ? rb.issGrant : rb.issValid;
+        Value wsel = rb.wissGrant ? rb.wissGrant : rb.wissValid;
+        rdV.push_back(rb.issValid);
+        rdTag.push_back(when(rsel,
+                             b.createOrFold<comb::ConcatOp>(ValueRange{
+                                 constant(1, 0), withRing(zext(rb.issEntry, eb), j), constant(1, 0)})));
+        rdRow.push_back(when(rsel, withRing(zext(rb.issInst, ib), j)));
+        wrV.push_back(rb.wissValid);
+        wrTag.push_back(when(wsel,
+                             b.createOrFold<comb::ConcatOp>(ValueRange{
+                                 constant(1, 1), withRing(constant(eb, 0), j), constant(1, 0)})));
+        wrRow.push_back(when(wsel, withRing(zext(rb.wissInst, ib), j)));
+        wrData.push_back(when(wsel, zext(rb.wissData, dw)));
+      }
+      auto any = [&](SmallVector<Value> &xs) -> Value {
+        return xs.size() == 1 ? xs[0] : Value(comb::OrOp::create(b, xs, false));
+      };
+      results.append({any(rdV), any(rdTag), any(rdRow), any(wrV), any(wrTag), any(wrRow),
+                      any(wrData), constant(1, 1)});
       continue;
     }
     auto &vm = classes[v.cls].virtualMemories[v.k];
@@ -22804,21 +23454,25 @@ LogicalResult StaticFolder::buildSim() {
         virtuals.push_back(b.getStringAttr(
             "link_" + modelOf(st.pcls) + "_" + modelOf(st.rcls) + ":__link" +
             Twine(v.k) + ":" + Twine(st.portInstBits()) + ":" +
-            Twine(streamRowBits(st)) + ":" + Twine(st.dw) + ":" +
-            Twine(st.mailbox ? st.dw / 8 : 1) + ":0:1:" +
+            Twine(streamRowBits(st)) + ":" + Twine(st.portDW()) + ":" +
+            Twine(st.mailbox ? st.portDW() / 8 : 1) + ":0:1:" +
             Twine(st.tagBits())));
         continue;
       }
       auto &cls = classes[v.cls];
       auto &vm = cls.virtualMemories[v.k];
       if (v.image) {
-        // A ring's image: a row per instance (instances x 1 row).
-        // {write, entry} tags over instance 0, a row per instance.
-        unsigned tags = llvm::Log2_32_Ceil(cls.ring->entries) + 1;
+        // A ring's image (or a class's rings' shared one: a row per ring and
+        // instance). {write, ring, entry} tags over instance 0.
+        unsigned img = unsigned(&v - simVirtuals.data());
+        unsigned kb = memberBits(img);
+        unsigned tags = imageEntryBits.at(img) + 1 + kb;
+        unsigned dw = 0;
+        for (auto [mc, mk] : imageMembers[img])
+          dw = std::max(dw, classes[mc].virtualMemories[mk].dataWidth);
         virtuals.push_back(b.getStringAttr(
             vm.name + "_img:" + cls.name + ":" + Twine(tags + 1) + ":" +
-            Twine(std::max(llvm::Log2_32_Ceil(cls.threads()), 1u)) + ":" +
-            Twine(vm.dataWidth) + ":1:1:1:" + Twine(tags)));
+            Twine(imageInstBits.at(img) + kb) + ":" + Twine(dw) + ":1:1:1:" + Twine(tags)));
         continue;
       }
       unsigned instWidth =
@@ -23491,6 +24145,7 @@ void FoldStaticPass::runOnOperation() {
   folder.vmemAutoInstanceBits = vmemAutoInstanceBits;
   folder.vmemRingLead = vmemRings;
   folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));
+  folder.vmemRingImageEach = vmemRingImageEach;
   folder.foldStoreRam = foldStoreRam;
   folder.foldStoreStyle = foldStoreStyle;
   folder.foldStoreHbm = foldStoreHbm;
@@ -23511,6 +24166,7 @@ void FoldStaticPass::runOnOperation() {
     return signalPassFailure();
   }
   folder.linkHbmRowBits = linkHbmRowBits;
+  folder.linkHbmBeatBits = linkHbmBeatBits;
   folder.minII = minII;
   folder.slrSerializeSpecs.assign(slrSerialize.begin(), slrSerialize.end());
   folder.readyChoice = readyChoice;
