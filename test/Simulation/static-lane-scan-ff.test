@@ -1,0 +1,21 @@
+# REQUIRES: verilator
+# `--lane-scan` over procedural trees on packed arrays (Driver/Inputs/lane-ff):
+# a find-first whose node values are stored into packed vectors and read back
+# is one priority chain (its subtrees are not chains of their own), its valid
+# an OR cone through the packed array (one AC chain), and an AND tree compared
+# to all ones another. Exact against the target, channels stalled or not, and
+# with the cell in two copies, bubbles and chain cuts.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/lane-ff
+# RUN: foldsim --srcs top.f --top Top --out %t/zl --static --nest --modulo --compact-links --zero-latency-links --zero-latency-chains --lane-scan Leaf 2>&1 | FileCheck %s --check-prefix=SCAN
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/zl/obj %S/Inputs/tb_reset.sv top.sv %t/zl/foldsim_sim.sv > %t/zl/build.log 2>&1
+# RUN: %t/zl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/zl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=40 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/cp --static --nest --modulo --compact-links --bubbles --share-links --zero-latency-links --zero-latency-chains --zero-chain-hops 2 --copies Top_lane_Leaf:2 --lane-scan Leaf 2>&1 | FileCheck %s --check-prefix=SCAN
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/cp/obj %S/Inputs/tb_reset.sv top.sv %t/cp/foldsim_sim.sv > %t/cp/build.log 2>&1
+# RUN: %t/cp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 +bubble=0 | FileCheck %s
+# RUN: %t/cp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=40 +bubble=30 | FileCheck %s
+
+# SCAN: lane-scan: cell Top_lane_Leaf
+# SCAN: lane-scan: Top lanes Leaf x32: {{.*}}; scans ac 2 prio 1 (3 chains
+
+# CHECK: MATCH

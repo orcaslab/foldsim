@@ -17,6 +17,6 @@
 # RUN: %t/cp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=40 +bubble=30 | FileCheck %s
 
 # SCAN: lane-scan: cell Top_lane_Leaf_r
-# SCAN: lane-scan: Top lanes Leaf_r x8: {{.*}} lane vectors; scans carry 1 {{.*}}stage 1
+# SCAN: lane-scan: Top lanes Leaf_r x8: {{.*}} lane vectors; scans {{.*}}carry 1 {{.*}}stage 1
 
 # CHECK: MATCH

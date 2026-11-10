@@ -163,6 +163,11 @@ struct Pattern {
   SmallVector<Value> elems;
   Value index;
   SmallVector<int64_t> pos;
+  // A priority tree / a bit-level reduction: the ops it is made of.
+  SmallVector<Operation *> internal;
+  // AC over a bit-level cone (the root an icmp, say): the gate, and whether
+  // the result is inverted.
+  StringRef acOp;
 };
 
 struct LaneScanPass : public foldsim::impl::LaneScanBase<LaneScanPass> {
@@ -221,6 +226,21 @@ struct Scan {
   // A value that is another's bits passed through wiring (a tree node put in
   // a packed array and extracted back): that value.
   DenseMap<Value, Value> aliasOf;
+  /// A lane's one-bit value wiring passed on (a bit of a packed array): the
+  /// value itself, so one bit has one name.
+  Value canonLeaf(Value v) {
+    for (int k = 0; k < 64; ++k) {
+      auto it = bits.find(v);
+      if (it == bits.end() || it->second.size() != 1)
+        return v;
+      auto &b = it->second[0];
+      if (b.k != BitSrc::Lane || !b.src || b.src == v || b.bit != 0 ||
+          !b.src.getType().isInteger(1))
+        return v;
+      v = b.src;
+    }
+    return v;
+  }
   Value unalias(Value v) {
     for (int k = 0; k < 64; ++k) {
       auto it = aliasOf.find(v);
@@ -253,7 +273,10 @@ struct Scan {
   bool orLanes(Value v, SmallVectorImpl<std::pair<int, Value>> &out, int depth);
   bool treeOf(Value v, SmallVectorImpl<std::pair<int, Value>> &pinned,
               DenseMap<int, Value> &valid, Value &tail, int depth);
+  bool treeNode(Value v, SmallVectorImpl<std::pair<int, Value>> &pinned,
+                DenseMap<int, Value> &valid, Value &tail, int depth);
   bool matchTree(comb::MuxOp root, Pattern &p, SmallVectorImpl<int> &order);
+  bool matchTreeAt(comb::MuxOp root, Pattern &p, SmallVectorImpl<int> &order);
   bool smallTree(Value v, SmallVectorImpl<std::pair<int, Value>> &pinned,
                  DenseMap<int, Value> &valid, Value &tail,
                  SmallVectorImpl<int> &lanes,
@@ -264,7 +287,13 @@ struct Scan {
   /// The lane at index / bit `x` of a gather's source, -1 if none.
   int laneAt(Value src, uint64_t x);
   bool fullPack(ArrayRef<Value> values, int &pack);
+  bool coneBits(Value v, unsigned b, bool isAnd, llvm::SetVector<Value> &leaves,
+                llvm::SetVector<Value> &rest,
+                DenseSet<std::pair<Value, unsigned>> &seen,
+                llvm::SetVector<Operation *> &ops, int depth);
+  bool matchCone(Operation *op);
   bool splitRegisters();
+  SmallVector<Operation *> *visitLog = nullptr;
 };
 
 static StringRef nameOf(Operation *op) {
@@ -293,8 +322,10 @@ static bool isConstant(Value v, APInt &value) {
 }
 
 /// The value of `v` with `free` = `p`, constants elsewhere: comb logic only.
+using EvalHook = std::function<bool(Value, APInt &, int)>;
 static bool evalAt(Value v, Value free, const APInt &p,
-                   DenseMap<Value, APInt> &memo, APInt &out, int depth = 0) {
+                   DenseMap<Value, APInt> &memo, APInt &out, int depth = 0,
+                   const EvalHook *hook = nullptr) {
   if (v == free) {
     out = p;
     return true;
@@ -303,8 +334,12 @@ static bool evalAt(Value v, Value free, const APInt &p,
     out = it->second;
     return true;
   }
+  if (hook && (*hook)(v, out, depth)) {
+    memo[v] = out;
+    return true;
+  }
   auto *op = v.getDefiningOp();
-  if (!op || depth > 48)
+  if (!op || depth > 96)
     return false;
   if (auto c = dyn_cast<hw::ConstantOp>(op)) {
     out = c.getValue();
@@ -315,7 +350,7 @@ static bool evalAt(Value v, Value free, const APInt &p,
   SmallVector<APInt> a;
   for (Value o : op->getOperands()) {
     APInt x;
-    if (!evalAt(o, free, p, memo, x, depth + 1))
+    if (!evalAt(o, free, p, memo, x, depth + 1, hook))
       return false;
     a.push_back(x);
   }
@@ -466,8 +501,9 @@ bool Scan::bitsOf(Value v, std::vector<BitSrc> &out) {
     return true;
   }
   case Kind::Pfx:
+    // A stage's value is over several lanes: wiring passes it on whole.
     for (int64_t b = 0; b < w; ++b)
-      out.push_back({BitSrc::Lane, i.lane, v, unsigned(b)});
+      out.push_back({BitSrc::Opaque, -1, v, unsigned(b)});
     return true;
   case Kind::Vec:
     // An assembled vector: its bits as assembled (constants where a lane is
@@ -1368,6 +1404,8 @@ bool Scan::matchPatterns() {
         p.rest = rest;
         p.vecs = vecTerms;
         add(std::move(p));
+      } else if (!isa<comb::AddOp>(op) && matchCone(&op)) {
+        any = true;
       }
       continue;
     }
@@ -1392,6 +1430,8 @@ bool Scan::matchPatterns() {
           p.red = "or", p.invert = true;
         if (!p.red.empty())
           add(std::move(p));
+      } else if (matchCone(&op)) {
+        any = true;
       }
       continue;
     }
@@ -1491,6 +1531,48 @@ bool Scan::matchPatterns() {
       continue;
     }
   }
+  // A tree matched from a subtree's root and from the whole tree's: the
+  // whole one.
+  // Dropped only when the outer pattern's root is all that reads it (it is
+  // dead once that root is replaced).
+  DenseMap<Operation *, SmallVector<Operation *, 2>> inner;
+  for (auto &[r, p] : patterns)
+    for (auto *o : p.internal)
+      if (o != r)
+        inner[o].push_back(r);
+  auto deadBehind = [&](Operation *r, Operation *outer) {
+    SmallVector<Operation *> work{r};
+    DenseSet<Operation *> seen{r};
+    while (!work.empty()) {
+      auto *o = work.pop_back_val();
+      for (Value res : o->getResults())
+        for (auto *u : res.getUsers()) {
+          if (u == outer || !seen.insert(u).second)
+            continue;
+          // Wiring that only passes the outer root's bits on.
+          if (u->getNumResults() == 1 &&
+              unalias(u->getResult(0)) == outer->getResult(0))
+            continue;
+          if (u->getNumResults() == 0 || isa<hw::InstanceOp>(u) ||
+              !isPure(u) || seen.size() > 100000) {
+            return false;
+          }
+          work.push_back(u);
+        }
+    }
+    return true;
+  };
+  SmallVector<Operation *> drop;
+  for (auto &[r, p] : patterns)
+    if (auto it = inner.find(r);
+        it != inner.end() && llvm::any_of(it->second, [&](Operation *o) {
+          return deadBehind(r, o);
+        }))
+      drop.push_back(r);
+  for (auto *r : drop) {
+    red.erase(r->getResult(0));
+    patterns.erase(r);
+  }
   return any;
 }
 
@@ -1530,6 +1612,167 @@ bool Scan::finishPrio(Pattern &p, ArrayRef<int> order) {
   }
 }
 
+/// The lanes' one-bit values and the parent's one-bit values whose OR (AND)
+/// bit `b` of `v` is, through wiring (concat / extract / packed arrays),
+/// gates of the same kind and reductions of vectors (icmp ne 0 / eq ~0).
+/// OR and AND are idempotent: a leaf read twice is read once.
+bool Scan::coneBits(Value v, unsigned b, bool isAnd,
+                    llvm::SetVector<Value> &leaves, llvm::SetVector<Value> &rest,
+                    DenseSet<std::pair<Value, unsigned>> &seen,
+                    llvm::SetVector<Operation *> &ops, int depth) {
+  if (depth > 512 || seen.size() > 1u << 16)
+    return false;
+  v = unalias(v);
+  if (!seen.insert({v, b}).second)
+    return true;
+  int64_t w = bitWidthOf(v);
+  if (w <= 0 || b >= w)
+    return false;
+  auto &i = get(v);
+  APInt c;
+  if (isConstant(v, c))
+    return c[b] == isAnd;
+  if (i.kind == Kind::Scalar) {
+    if (w != 1)
+      return false;
+    rest.insert(v);
+    return true;
+  }
+  if (i.kind == Kind::Elem && w == 1) {
+    Value l = canonLeaf(v);
+    if (!isElem(l) || widthOf(l) != 1)
+      return false;
+    leaves.insert(l);
+    return true;
+  }
+  auto *d = v.getDefiningOp();
+  if (d && ((isAnd && isa<comb::AndOp>(d)) || (!isAnd && isa<comb::OrOp>(d)))) {
+    ops.insert(d);
+    for (Value o : d->getOperands())
+      if (!coneBits(o, b, isAnd, leaves, rest, seen, ops, depth + 1))
+        return false;
+    return true;
+  }
+  if (auto ex = dyn_cast_or_null<comb::ExtractOp>(d)) {
+    ops.insert(d);
+    return coneBits(ex.getInput(), ex.getLowBit() + b, isAnd, leaves, rest,
+                    seen, ops, depth + 1);
+  }
+  if (auto cc = dyn_cast_or_null<comb::ConcatOp>(d)) {
+    ops.insert(d);
+    unsigned lo = 0;
+    for (Value o : llvm::reverse(cc.getInputs())) {
+      unsigned ow = bitWidthOf(o);
+      if (b < lo + ow)
+        return coneBits(o, b - lo, isAnd, leaves, rest, seen, ops, depth + 1);
+      lo += ow;
+    }
+    return false;
+  }
+  if (auto ic = dyn_cast_or_null<comb::ICmpOp>(d)) {
+    Value x = ic.getLhs(), k = ic.getRhs();
+    if (!isConstant(k, c))
+      std::swap(x, k);
+    if (!isConstant(k, c))
+      return false;
+    auto pr = ic.getPredicate();
+    bool ok = isAnd ? pr == comb::ICmpPredicate::eq && c.isAllOnes()
+                    : pr == comb::ICmpPredicate::ne && c.isZero();
+    if (!ok)
+      return false;
+    ops.insert(d);
+    for (unsigned k2 = 0, n = bitWidthOf(x); k2 < n; ++k2)
+      if (!coneBits(x, k2, isAnd, leaves, rest, seen, ops, depth + 1))
+        return false;
+    return true;
+  }
+  // Other wiring: its bits' sources.
+  std::vector<BitSrc> bs;
+  if (!bitsOf(v, bs) || b >= bs.size())
+    return false;
+  auto &s = bs[b];
+  if (s.k == BitSrc::Zero || s.k == BitSrc::One)
+    return (s.k == BitSrc::One) == isAnd;
+  if (!s.src || (s.src == v && s.bit == b))
+    return false;
+  if (s.k == BitSrc::Lane && bitWidthOf(s.src) == 1 && isElem(s.src)) {
+    leaves.insert(canonLeaf(s.src));
+    return true;
+  }
+  if (s.k == BitSrc::Opaque || s.k == BitSrc::Scalar)
+    return coneBits(s.src, s.bit, isAnd, leaves, rest, seen, ops, depth + 1);
+  return false;
+}
+
+/// A one-bit OR (AND) of every lane's one-bit value of some packs, reduced
+/// through wiring (a procedural tree over a packed array, say): one AC chain.
+bool Scan::matchCone(Operation *op) {
+  if (op->getNumResults() != 1 || bitWidthOf(op->getResult(0)) != 1)
+    return false;
+  bool isAnd, invert = false;
+  if (isa<comb::OrOp>(op))
+    isAnd = false;
+  else if (isa<comb::AndOp>(op))
+    isAnd = true;
+  else if (auto ic = dyn_cast<comb::ICmpOp>(op)) {
+    APInt c;
+    Value k = ic.getRhs();
+    if (!isConstant(k, c))
+      k = ic.getLhs();
+    if (!isConstant(k, c))
+      return false;
+    auto pr = ic.getPredicate();
+    if (pr == comb::ICmpPredicate::ne && c.isZero())
+      isAnd = false;
+    else if (pr == comb::ICmpPredicate::eq && c.isZero())
+      isAnd = false, invert = true;
+    else if (pr == comb::ICmpPredicate::eq && c.isAllOnes())
+      isAnd = true;
+    else if (pr == comb::ICmpPredicate::ne && c.isAllOnes())
+      isAnd = true, invert = true;
+    else
+      return false;
+  } else {
+    return false;
+  }
+  llvm::SetVector<Value> leaves, rest;
+  DenseSet<std::pair<Value, unsigned>> seen;
+  llvm::SetVector<Operation *> ops;
+  if (invert) {
+    // The reduction is of the compared vector.
+    auto ic = cast<comb::ICmpOp>(op);
+    Value x = ic.getLhs();
+    APInt c;
+    if (isConstant(x, c))
+      x = ic.getRhs();
+    for (unsigned k = 0, n = bitWidthOf(x); k < n; ++k)
+      if (!coneBits(x, k, isAnd, leaves, rest, seen, ops, 0))
+        return false;
+  } else if (!coneBits(op->getResult(0), 0, isAnd, leaves, rest, seen, ops,
+                       0)) {
+    return false;
+  }
+  llvm::MapVector<int, SmallVector<Value>> byPack;
+  for (Value l : leaves)
+    byPack[packOf.lookup(l)].push_back(l);
+  Pattern p{PatKind::AC, op};
+  for (auto &[pk, vs] : byPack) {
+    int pack;
+    if (!fullPack(vs, pack))
+      return false;
+    p.packs.push_back(pk);
+  }
+  if (p.packs.empty())
+    return false;
+  p.rest.assign(rest.begin(), rest.end());
+  p.acOp = isAnd ? "comb.and" : "comb.or";
+  p.invert = invert;
+  p.internal.assign(ops.begin(), ops.end());
+  patterns[op] = std::move(p);
+  red.insert(op->getResult(0));
+  return true;
+}
+
 /// The lanes whose one-bit values an OR tree reads (each lane once).
 bool Scan::orLanes(Value v, SmallVectorImpl<std::pair<int, Value>> &out,
                    int depth) {
@@ -1538,6 +1781,7 @@ bool Scan::orLanes(Value v, SmallVectorImpl<std::pair<int, Value>> &out,
   if (isConstant(v, c) && c.isZero())
     return true;
   if (isElem(v) && widthOf(v) == 1) {
+    v = canonLeaf(v);
     int j = get(v).lane;
     for (auto &[l, x] : out)
       if (l == j)
@@ -1559,8 +1803,33 @@ bool Scan::orLanes(Value v, SmallVectorImpl<std::pair<int, Value>> &out,
 /// valid and value) and its last leaf's value (`tail`, the default).
 bool Scan::treeOf(Value v, SmallVectorImpl<std::pair<int, Value>> &pinned,
                   DenseMap<int, Value> &valid, Value &tail, int depth) {
+  // A node whose parts the canonicalizer merged (a leaf's index and its
+  // neighbor's valid in one constant-and-bit value): its truth table.
+  SmallVector<std::pair<int, Value>> p0(pinned.begin(), pinned.end());
+  DenseMap<int, Value> v0 = valid;
+  if (treeNode(v, pinned, valid, tail, depth))
+    return true;
+  pinned.assign(p0.begin(), p0.end());
+  valid = v0;
+  SmallVector<int> sl;
+  SmallVector<std::pair<int, Value>> sp;
+  Value st;
+  if (depth > 0 && v.getDefiningOp<comb::MuxOp>() &&
+      smallTree(v, sp, valid, st, sl)) {
+    pinned.append(sp.begin(), sp.end());
+    tail = st;
+    return true;
+  }
+  valid = v0;
+  return false;
+}
+
+bool Scan::treeNode(Value v, SmallVectorImpl<std::pair<int, Value>> &pinned,
+                    DenseMap<int, Value> &valid, Value &tail, int depth) {
   v = unalias(v);
   auto m = v.getDefiningOp<comb::MuxOp>();
+  if (m && visitLog)
+    visitLog->push_back(m);
   if (!m || depth > 64 || get(v).kind == Kind::Scalar)
     return false;
   SmallVector<std::pair<int, Value>> cl;
@@ -1651,8 +1920,26 @@ bool Scan::smallTree(Value v, SmallVectorImpl<std::pair<int, Value>> &pinned,
   SmallVector<std::pair<int, Value>> leaves;
   DenseSet<Value> seen;
   bool ok = true;
+  // Through wiring, by bit sources (a node array's slot is its node).
+  auto srcsOf = [&](Value x, SmallVectorImpl<Value> &srcs) -> bool {
+    auto it = bits.find(x);
+    if (it == bits.end())
+      return false;
+    DenseSet<Value> seenSrc;
+    for (auto &bb : it->second) {
+      if (bb.k == BitSrc::Zero || bb.k == BitSrc::One)
+        continue;
+      if (bb.k == BitSrc::Scalar || bb.src == x)
+        return false; // a value of its own: walked as an op
+      if (seenSrc.insert(bb.src).second)
+        srcs.push_back(bb.src);
+    }
+    return true;
+  };
   std::function<void(Value, int)> walk = [&](Value x, int depth) {
     x = unalias(x);
+    if (isElem(x) && widthOf(x) == 1)
+      x = canonLeaf(x);
     if (!ok || !seen.insert(x).second)
       return;
     if (x.getDefiningOp<hw::ConstantOp>())
@@ -1672,13 +1959,22 @@ bool Scan::smallTree(Value v, SmallVectorImpl<std::pair<int, Value>> &pinned,
       leaves.push_back({j, x});
       return;
     }
-    auto *d = x.getDefiningOp();
-    if (!d || depth > 32 || !isa<comb::CombDialect>(d->getDialect()) ||
+    if (depth > 96) {
+      ok = false;
+      return;
+    }
+    SmallVector<Value> srcs;
+    if (srcsOf(x, srcs)) {
+      for (Value y : srcs)
+        walk(y, depth + 1);
+      return;
+    }
+    if (!xd || !isa<comb::CombDialect>(xd->getDialect()) ||
         get(x).kind == Kind::Scalar) {
       ok = false;
       return;
     }
-    for (Value o : d->getOperands())
+    for (Value o : xd->getOperands())
       walk(o, depth + 1);
   };
   walk(v, 0);
@@ -1697,7 +1993,34 @@ bool Scan::smallTree(Value v, SmallVectorImpl<std::pair<int, Value>> &pinned,
     DenseMap<Value, APInt> memo;
     for (unsigned i = 0; i < k; ++i)
       memo[leaves[i].second] = APInt(1, (mask >> i) & 1);
-    return evalAt(v, Value(), APInt(), memo, out);
+    EvalHook hook;
+    hook = [&](Value x, APInt &o, int depth) -> bool {
+      auto it = bits.find(x);
+      if (it == bits.end() || !isa<IntegerType>(x.getType()))
+        return false;
+      for (auto &bb : it->second)
+        if (bb.src == x || bb.k == BitSrc::Scalar)
+          return false; // a value of its own: evaluated as an op
+      unsigned w = it->second.size();
+      o = APInt(w, 0);
+      for (unsigned b = 0; b < w; ++b) {
+        auto &bb = it->second[b];
+        if (bb.k == BitSrc::One) {
+          o.setBit(b);
+          continue;
+        }
+        if (bb.k == BitSrc::Zero)
+          continue;
+        APInt sv;
+        if (!isa<IntegerType>(bb.src.getType()) ||
+            !evalAt(bb.src, Value(), APInt(), memo, sv, depth + 1, &hook))
+          return false;
+        if (sv[bb.bit])
+          o.setBit(b);
+      }
+      return true;
+    };
+    return evalAt(v, Value(), APInt(), memo, out, 0, &hook);
   };
   SmallVector<APInt> val(k);
   APInt def;
@@ -1772,6 +2095,17 @@ bool Scan::smallTree(Value v, SmallVectorImpl<std::pair<int, Value>> &pinned,
 }
 
 bool Scan::matchTree(comb::MuxOp root, Pattern &p, SmallVectorImpl<int> &order) {
+  SmallVector<Operation *> log;
+  visitLog = &log;
+  bool ok = matchTreeAt(root, p, order);
+  visitLog = nullptr;
+  if (ok)
+    p.internal = log;
+  return ok;
+}
+
+bool Scan::matchTreeAt(comb::MuxOp root, Pattern &p,
+                       SmallVectorImpl<int> &order) {
   // Only from the root: not a subtree of another tree.
   for (auto *u : root.getResult().getUsers())
     if (auto m = dyn_cast<comb::MuxOp>(u))
@@ -3005,7 +3339,7 @@ void LaneScanPass::runOnOperation() {
       unsigned rw = widthOf(root->getResult(0));
       switch (p->kind) {
       case PatKind::AC: {
-        StringRef name = nameOf(root);
+        StringRef name = p->acOp.empty() ? nameOf(root) : p->acOp;
         APInt id = name == "comb.and" ? APInt::getAllOnes(rw) : APInt(rw, 0);
         auto [c, in] = newChain(rt, pconst(rt, id), false);
         SmallVector<Value> operands{in};
@@ -3018,23 +3352,33 @@ void LaneScanPass::runOnOperation() {
                 b, hw::ConstantOp::create(b, APInt(rw - 1, 0)), bit);
           operands.push_back(bit);
         }
-        OperationState st(root->getLoc(), root->getName());
+        OperationName opName(name, root->getContext());
+        OperationState st(root->getLoc(), opName);
         st.addOperands(operands);
         st.addTypes(rt);
-        if (root->hasAttr("twoState"))
+        if (root->hasAttr("twoState") && p->acOp.empty())
           st.addAttribute("twoState", root->getAttr("twoState"));
         endChain(c, b.create(st)->getResult(0));
         SmallVector<Value> rest = p->rest;
-        endings.push_back({root, c, [rest, root](OpBuilder &ob, Value end) -> Value {
-                             if (rest.empty())
-                               return end;
-                             SmallVector<Value> ops(rest);
-                             ops.push_back(end);
-                             OperationState st(root->getLoc(),
-                                               root->getName());
-                             st.addOperands(ops);
-                             st.addTypes(end.getType());
-                             return ob.create(st)->getResult(0);
+        bool invert = p->invert;
+        endings.push_back({root, c, [rest, root, opName, invert](
+                                        OpBuilder &ob, Value end) -> Value {
+                             Value r = end;
+                             if (!rest.empty()) {
+                               SmallVector<Value> ops(rest);
+                               ops.push_back(end);
+                               OperationState st(root->getLoc(), opName);
+                               st.addOperands(ops);
+                               st.addTypes(end.getType());
+                               r = ob.create(st)->getResult(0);
+                             }
+                             if (invert)
+                               r = comb::XorOp::create(
+                                   ob, r.getLoc(), r,
+                                   hw::ConstantOp::create(ob, r.getLoc(),
+                                                          APInt(1, 1)),
+                                   false);
+                             return r;
                            }});
         break;
       }
@@ -3318,6 +3662,9 @@ void LaneScanPass::runOnOperation() {
     for (auto &ch : chains)
       if (ch.init)
         reach(ch.init);
+    // Every scan's ending is built: what it keeps is read.
+    for (auto *p : pats)
+      keep(p->root);
     while (!work.empty()) {
       Value v = work.pop_back_val();
       keep(v.getDefiningOp());
@@ -3554,7 +3901,7 @@ void LaneScanPass::runOnOperation() {
           for (auto *u : r.getUsers())
             if (!deadSet.count(u)) {
               op->emitError("lane-scan: a value still read is dropped: ")
-                  << *u;
+                  << *op << " read by " << *u;
               return signalPassFailure();
             }
     }
