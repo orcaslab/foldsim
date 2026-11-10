@@ -18497,11 +18497,16 @@ LogicalResult StaticFolder::buildSim() {
         if (!getenv("FOLDSIM_NO_RANK") && posCtrs && posCtrs->knows(at) && gSlotSegments &&
             plainSegs() > gSlotSegments) {
           uint64_t mask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
-          bool ok = true;
+          // (Rank `total`: after the frame's last set position, the passes
+          // of the instance whose last pass is the frame's first, wrapped.)
+          SmallVector<uint64_t> cyclic(perRank.begin(), perRank.end());
+          if (!cyclic.empty())
+            cyclic.push_back(cyclic.front());
+          bool ok = !cyclic.empty();
           uint64_t rk = 0;
           for (unsigned p = 0; p < ii && ok; ++p) {
             if (valid[p])
-              ok = rk < perRank.size() && (perRank[rk] & mask) == (rows[p] & mask);
+              ok = rk < cyclic.size() && (cyclic[rk] & mask) == (rows[p] & mask);
             rk += setRows[p] ? 1 : 0;
           }
           if (ok) {
@@ -18509,8 +18514,11 @@ LogicalResult StaticFolder::buildSim() {
             Value r = posCtrs->rank(b, at, setRows, key, [&](Value pos) {
               return table(b, pos, setRows, 1);
             });
-            return table(b, r, perRank, width);
+            return table(b, r, cyclic, width);
           }
+          if (getenv("FOLDSIM_AFFINE_LOG"))
+            llvm::errs() << "slot-sequencer: a pass value not by rank (" << rows.size() << " x "
+                         << width << ")\n";
         }
         return table(b, at, rows, width);
       };
