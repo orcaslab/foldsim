@@ -1,0 +1,20 @@
+# --vmem-auto-instance-bits N: a memory is virtual by the image of ONE instance (rows x width), not the threaded
+# image of vmem-auto-bits, so the same memories are virtual at any instance count and the virtual memories (and
+# their controllers) of a constant shell do not change with N (a32_1109/S7: a port queue of 118 bits an instance
+# crossed vmem-auto-bits 65,536 only at 1,024 SMs, adding controllers there). Sixteen leaves of a 256 x 8 memory:
+# 2,048 bits an instance, 32 kbit threaded.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/scratchvm
+# By the threaded image: under 40,000 bits, on chip; by the instance's: at least 2,048, virtual; at least 4,096, not.
+# RUN: foldsim --srcs top.f --top Top --out %t/thr --static --vmem-auto-bits 40000 Leaf > %t/thr.log 2>&1
+# RUN: FileCheck %s --check-prefix=CHIP < %t/thr.log
+# RUN: foldsim --srcs top.f --top Top --out %t/inst --static --vmem-auto-instance-bits 2048 Leaf > %t/inst.log 2>&1
+# RUN: FileCheck %s --check-prefix=AUTO < %t/inst.log
+# RUN: FileCheck %s --check-prefix=AUTOV < %t/inst.log
+# RUN: foldsim --srcs top.f --top Top --out %t/big --static --vmem-auto-instance-bits 4096 Leaf > %t/big.log 2>&1
+# RUN: FileCheck %s --check-prefix=CHIP < %t/big.log
+# Either rule makes it virtual: the threaded one past it, the instance one under.
+# RUN: foldsim --srcs top.f --top Top --out %t/both --static --vmem-auto-bits 40000 --vmem-auto-instance-bits 2048 Leaf > %t/both.log 2>&1
+# RUN: FileCheck %s --check-prefix=AUTOV < %t/both.log
+# CHIP: state-scratch: auto {{[0-9]+}} bits {{.*}} less the models' memories on chip 32768
+# AUTO: state-scratch: auto {{[0-9]+}} bits {{.*}} less the models' memories on chip 0 (0 ultra)
+# AUTOV: vmem-auto-bits: {{[A-Za-z_]+}}: 1 virtual memories; 0 kept on chip

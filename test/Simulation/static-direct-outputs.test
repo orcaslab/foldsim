@@ -1,0 +1,29 @@
+# REQUIRES: verilator
+# --direct-outputs (foldsim-extract-models direct-outputs): the top's port
+# bundles mp_<k>_{avalid,addr,data,ack} are wired straight out of the Unit
+# instances, so the netlist takes them from the Units' links, not from the
+# top's model passing them on a slot later (no "late mp_<k>_* @state <-
+# u<k>_*" in the top's schedule; the pushes at the Units' slots, spread one
+# bundle a host cycle, and the frame shorter: II 14 -> 10). The bundles are
+# folded (--fold-ports) as in static-fold-ports.test and run against the same
+# harness (Inputs/tb_ports.sv: every bundle busy, answers 1 to 400 host
+# cycles late in random bundle order, channels stalled, bubbles).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/ports
+# RUN: foldsim --srcs top.f --top Top --out %t/on --static --nest --modulo --direct-outputs --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst Unit > %t/on.log 2>&1
+# RUN: FileCheck %s --check-prefix=SLOT < %t/on/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/on -Mdir %t/on/obj %S/Inputs/tb_ports.sv top.sv %t/on/foldsim_sim.sv > %t/on/build.log 2>&1
+# RUN: %t/on/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s
+# RUN: %t/on/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s
+# RUN: %t/on/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bu --static --nest --modulo --bubbles --direct-outputs --fold-ports mp_ --fold-ports-reset rst Unit > %t/bu.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/bu -DBUBBLES -Mdir %t/bu/obj %S/Inputs/tb_ports.sv top.sv %t/bu/foldsim_sim.sv > %t/bu/build.log 2>&1
+# RUN: %t/bu/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +lo=1 +hi=30 +bubble=30 +stall=30 | FileCheck %s
+# SLOT: foldsim-fold-static: II = 10
+# SLOT-NOT: late mp_{{[0-9]+}}_addr
+# SLOT-DAG: output mp_0_addr @0
+# SLOT-DAG: output mp_1_addr @1
+# SLOT-DAG: output mp_2_addr @2
+# SLOT-DAG: output mp_3_addr @3
+# SLOT-DAG: output mp_3_tag @3 (next)
+# CHECK-NOT: ORDER
+# CHECK: {{^}}MATCH 196 cycles

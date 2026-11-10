@@ -1159,6 +1159,57 @@ void ExtractModelsPass::runOnOperation() {
   // a channel of tokens, with no bits.
   BitTracer tracer(ports, /*throughRegisters=*/false);
   auto builder = ImplicitLocOpBuilder::atBlockTerminator(parent.getLoc(), body);
+  // `direct-outputs`: each parent output that is only wiring of models'
+  // outputs, parent inputs and constants, by bit; the parent's model gives a
+  // constant there instead, so it no longer reads those model outputs for it.
+  DenseMap<unsigned, BitSources> directOutputBits;
+  if (netlist && directOutputs) {
+    auto output = cast<hw::OutputOp>(body->getTerminator());
+    SmallVector<Operation *> maybeDead;
+    for (unsigned k = 0; k < output->getNumOperands(); ++k) {
+      Value operand = output->getOperand(k);
+      auto width = hw::getBitWidth(operand.getType());
+      if (width <= 0 || isa<seq::ClockType>(operand.getType()))
+        continue;
+      BitSources sources = tracer.get(operand);
+      if (sources.size() != unsigned(width) ||
+          llvm::any_of(sources, [](auto &source) {
+            return source.kind == BitSource::Logic;
+          }))
+        continue;
+      // A model's output bit that is always a constant is that constant.
+      for (auto &source : sources) {
+        if (source.kind != BitSource::Port || isa<BlockArgument>(source.port))
+          continue;
+        auto result = cast<OpResult>(source.port);
+        auto constants = constantOutputs.lookup(
+            cast<hw::InstanceOp>(result.getOwner()).getModuleNameAttr().getAttr());
+        if (!constants.empty() &&
+            constants[result.getResultNumber()][source.bit].kind ==
+                BitSource::Constant)
+          source = constants[result.getResultNumber()][source.bit];
+      }
+      directOutputBits[k] = sources;
+      if (auto *def = operand.getDefiningOp())
+        maybeDead.push_back(def);
+      Value zero = hw::ConstantOp::create(builder, APInt::getZero(width));
+      if (zero.getType() != operand.getType())
+        zero = hw::BitcastOp::create(builder, operand.getType(), zero);
+      output->setOperand(k, zero);
+    }
+    // The wiring that only fed those outputs goes, so that no model output
+    // seems read by the parent through it.
+    while (!maybeDead.empty()) {
+      Operation *op = maybeDead.pop_back_val();
+      if (!op->use_empty() || isa<hw::InstanceOp>(op) ||
+          !(BitTracer::isWiring(op) || isa<comb::CombDialect>(op->getDialect())))
+        continue;
+      for (Value operand : op->getOperands())
+        if (auto *def = operand.getDefiningOp())
+          maybeDead.push_back(def);
+      op->erase();
+    }
+  }
   SmallVector<std::pair<StringAttr, Value>> newOutputs;
   DenseMap<Value, std::string> portNames;
   for (auto [index, arg] : llvm::enumerate(body->getArguments()))
@@ -1510,8 +1561,45 @@ void ExtractModelsPass::runOnOperation() {
         modelInputs[instanceIndex][index].setValue(value);
       }
     }
-    hw::OutputOp::create(b,
-                         ValueRange(logic.getResults().take_front(numOutputs)));
+    // The outputs: the parent model's, or with `direct-outputs` their bits.
+    auto bitsValue = [&](const BitSources &bits) -> Value {
+      SmallVector<Value> parts;
+      for (unsigned hi = bits.size(); hi > 0;) {
+        auto &first = bits[hi - 1];
+        unsigned lo = hi - 1;
+        while (lo > 0) {
+          auto &next = bits[lo - 1];
+          bool same = first.kind == BitSource::Constant
+                          ? next.kind == BitSource::Constant
+                          : next.kind == BitSource::Port &&
+                                next.port == first.port &&
+                                next.bit + (hi - lo) == first.bit;
+          if (!same)
+            break;
+          --lo;
+        }
+        if (first.kind == BitSource::Constant) {
+          APInt constant(hi - lo, 0);
+          for (unsigned bit = lo; bit < hi; ++bit)
+            constant.setBitVal(bit - lo, bits[bit].value);
+          parts.push_back(hw::ConstantOp::create(b, constant));
+        } else {
+          parts.push_back(
+              bitsOf(netValues[first.port], first.bit - (hi - 1 - lo), hi - lo));
+        }
+        hi = lo;
+      }
+      return parts.size() == 1 ? parts[0]
+                               : b.createOrFold<comb::ConcatOp>(parts);
+    };
+    SmallVector<Value> results;
+    for (unsigned k = 0; k < numOutputs; ++k) {
+      Value value = logic.getResult(k);
+      if (auto it = directOutputBits.find(k); it != directOutputBits.end())
+        value = castTo(bitsValue(it->second), value.getType());
+      results.push_back(value);
+    }
+    hw::OutputOp::create(b, results);
   }
   for (auto instance : instances)
     instance.erase();

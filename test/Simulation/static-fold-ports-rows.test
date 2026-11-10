@@ -1,0 +1,53 @@
+# REQUIRES: verilator
+# --fold-ports-rows (with --fold-ports): the bundles' state is rows of fixed
+# memories, not registers per bundle and field, so that the simulator's logic
+# and flops for the target's memory ports do not grow with the bundle count.
+# - Responses: each field one memory of a row per bundle and frame mod 4,
+#   written as the records come (at the loaded frame + 1) and read where the
+#   frame reads it; a held bit per bundle (ports_held<k>) and one count of
+#   the bundles holding; no token / frame / previous-frame registers per
+#   bundle and field (mp_<k>_rdata_token, _frame, _prev).
+# - Requests: each field one memory of a row per bundle and frame mod 4,
+#   written at the field's pushes (one bundle a host cycle) with ONE link read
+#   per producer at the pushing bundle's instance (Unit_<port>_to_ports_<field>,
+#   position tables registered from three host cycles ahead), not a link read,
+#   a count, a due count and a write pointer per bundle and field; records
+#   leave in bundle order, frame after frame (a count of complete records,
+#   the bundle and frame to send, the frames decided and not all sent).
+# The same harness as static-fold-ports.test (Inputs/tb_ports.sv: every bundle
+# busy, answers 1 to 400 host cycles late in random bundle order, channels
+# stalled, bubbles), with and without --direct-outputs: MATCH, in the same host
+# cycles as the per-bundle build.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/ports
+# RUN: foldsim --srcs top.f --top Top --out %t/on --static --nest --modulo --direct-outputs --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --fold-ports-rows Unit > %t/on.log 2>&1
+# RUN: FileCheck %s --check-prefix=SV < %t/on/foldsim_sim.sv
+# RUN: not grep -E 'reg .*mp_[0-9]+_[a-z]+_(token|frame|prev|held|count|due|wp)[0-9]*\b' %t/on/foldsim_sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/on -Mdir %t/on/obj %S/Inputs/tb_ports.sv top.sv %t/on/foldsim_sim.sv > %t/on/build.log 2>&1
+# RUN: %t/on/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s --check-prefix=ON1
+# RUN: %t/on/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s
+# RUN: %t/on/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nd --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --fold-ports-rows Unit > %t/nd.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/nd -Mdir %t/nd/obj %S/Inputs/tb_ports.sv top.sv %t/nd/foldsim_sim.sv > %t/nd/build.log 2>&1
+# RUN: %t/nd/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s --check-prefix=ND1
+# RUN: %t/nd/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s
+# RUN: %t/nd/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bu --static --nest --modulo --bubbles --direct-outputs --fold-ports mp_ --fold-ports-reset rst --fold-ports-rows Unit > %t/bu.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/bu -DBUBBLES -Mdir %t/bu/obj %S/Inputs/tb_ports.sv top.sv %t/bu/foldsim_sim.sv > %t/bu/build.log 2>&1
+# RUN: %t/bu/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +lo=1 +hi=30 +bubble=30 +stall=30 | FileCheck %s
+# Error: a spec group over a bundle's inputs.
+# RUN: not foldsim --srcs top.f --top Top --out %t/sp --static --nest --modulo --spec-groups mp_0_ack=mp_0_rvalid:mp_0_rdata,mp_1_ack=mp_1_rvalid:mp_1_rdata,mp_2_ack=mp_2_rvalid:mp_2_rdata,mp_3_ack=mp_3_rvalid:mp_3_rdata --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --fold-ports-rows Unit 2>&1 | FileCheck %s --check-prefix=SPEC
+# SV-DAG: reg ports_held0
+# SV-DAG: reg ports_held3
+# SV-DAG: reg {{.*}}ports_held_count
+# SV-DAG: reg {{.*}}ports_send_bundle
+# SV-DAG: reg {{.*}}ports_frames_out
+# SV-DAG: ports_16x16 ports_rows_rdata_ext (
+# SV-DAG: ports_16x1 ports_rows_rvalid_ext (
+# SV-DAG: ports_addr_16x8 ports_addr_ext (
+# SV-DAG: Unit_addr_to_ports_addr_0_4x8 Unit_addr_to_ports_addr_0_ext (
+# SV-DAG: Unit_data_to_ports_data_0_8x16 Unit_data_to_ports_data_0_ext (
+# SPEC: error: fold-ports-rows: input 'mp_0_rvalid' is in a spec group
+# CHECK-NOT: ORDER
+# CHECK: {{^}}MATCH 196 cycles
+# ON1: {{^}}MATCH 196 cycles in 1999 host cycles
+# ND1: {{^}}MATCH 196 cycles in 2799 host cycles
