@@ -3467,9 +3467,8 @@ LogicalResult StaticFolder::chooseStages() {
     if (cls.folding && !cls.folding->folds.empty())
       why = "folded pipelines";
     auto *body = cls.model.getBodyBlock();
-    for (auto &op : *body)
-      if (isa<hw::InstanceOp>(op))
-        why = "black boxes";
+    if (llvm::any_of(*body, [](Operation &op) { return isa<hw::InstanceOp>(op); }))
+      why += std::string(why.empty() ? "" : ", ") + "black boxes";
     // A multicycle class evaluates one instance at a time from capture
     // registers: never with late outputs (its ready passes and readers
     // would wait the span) or held reads (their skip is decided at the
@@ -3488,6 +3487,10 @@ LogicalResult StaticFolder::chooseStages() {
       if (listed)
         return cls.model.emitError("multicycle: ")
                << cls.name << " cannot be multicycle: " << why;
+      // Said, not silent: its logic keeps its depth.
+      llvm::errs() << "foldsim-fold-static: " << cls.name
+                   << " not staged at " << stageLevels << " levels: " << why
+                   << "\n";
       continue;
     }
     // Its wide arithmetic in pieces a stage may end between (once a model:
