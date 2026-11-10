@@ -1,7 +1,7 @@
 // For foldsim-lane-scan over 32 Leaf lanes: a registered vector of the
-// lanes' fire bits and its population count by an adder tree whose widths
-// grow a level at a time (no add can overflow), and a sum of 4-bit lane
-// values the same way.
+// lanes' fire bits beside two parent bits (added in the parent), its
+// population count by an adder tree whose widths grow a level at a time (no
+// add can overflow), and a sum of 4-bit lane values the same way.
 module popcount #(parameter N = 1, parameter M = $clog2(N+1)) (
     input  wire [N-1:0] data_in,
     output wire [M-1:0] data_out
@@ -45,10 +45,15 @@ module Top(input logic clk, input logic rst, input logic [7:0] x, output logic [
   for (genvar j = 0; j < N; ++j) begin : g
     Leaf u(.clk, .rst, .x(x ^ 8'(j)), .K(8'(3*j+1)), .v(v[j]), .d(d[j]));
   end
-  logic [N-1:0] fire_r;
-  always_ff @(posedge clk) fire_r <= rst ? '0 : v;
+  // The fire bits in a register beside two parent bits.
+  logic [N-1:0] fire;
+  for (genvar j = 0; j < N; ++j) begin : g_fire
+    assign fire[j] = v[j] & ~x[j % 8];
+  end
+  logic [N+1:0] fire_r;
+  always_ff @(posedge clk) fire_r <= rst ? '0 : {x[6:5], fire};
   logic [5:0] cnt;
-  popcount #(.N(N)) pc (.data_in(fire_r), .data_out(cnt));
+  popcount #(.N(N+2)) pc (.data_in(fire_r), .data_out(cnt));
   // A sum of the lanes' 4-bit values: a tree of 9-bit adds.
   logic [8:0] sum;
   always_comb begin
