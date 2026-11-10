@@ -12935,6 +12935,25 @@ LogicalResult StaticFolder::chooseStreamWindows() {
     if (cls.page && cls.pagesOffChip)
       hbmBits += 2 * uint64_t(cls.threads()) * cls.page *
                  llvm::divideCeil(cls.rowStateBits, cls.page);
+  // `fold-store-stream`: each streamed store's rows, an instance's read and
+  // write a frame, and (with vmem-rings) its answer's image row written and
+  // read back: 4 whole power-of-two rows of bytes, the most.
+  uint64_t foldBits = 0;
+  if (foldStoreStream)
+    for (auto &cls : classes)
+      if (auto *folding = cls.folding.get())
+        for (auto &fold : folding->folds)
+          if (fold.landingRing) {
+            uint64_t row = 8 * llvm::PowerOf2Ceil(std::max<uint64_t>(
+                                   1, llvm::divideCeil(fold.store.getType().getWidth(), 8)));
+            uint64_t bits = (vmemRingLead ? 4 : 2) * uint64_t(cls.threads()) * row;
+            masterBits[nextMaster++ % kStreamMasters] += bits;
+            foldBits += bits;
+          }
+  if (foldBits)
+    llvm::errs() << "foldsim-fold-static: fold-store-stream: " << foldBits
+                 << " HBM bits a frame (in the state stream's II_bw)\n";
+  hbmBits += foldBits;
   if (hbmBits) {
     // The busiest master bounds it too (a master's share of the usable).
     uint64_t perMaster = kStreamBitsPerCycle / kStreamMasters;
