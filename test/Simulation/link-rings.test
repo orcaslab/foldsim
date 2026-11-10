@@ -1,0 +1,89 @@
+# REQUIRES: verilator
+# Constant-shell fold, `--link-rings K`: a link memory whose entries are each
+# live for a short window of the frame (from the write a read takes to that
+# read) keeps K entries (a power of two, at most the option's), the entry's
+# index mod K, where the schedule shows no other entry of that address
+# written in any read's window; its storage is the schedule's spacing, not
+# the instances'. An entry whose window holds K writes or more (the frame's
+# wrap) is held at an address of its own past the ring, by table.
+# Driver/Inputs/ringlinks: eight groups of eight nodes; a zero-latency chain
+# (zout -> zin, late) through the ready-cone class Node_rc, a registered ring
+# (rout -> rin, an early chain link) and the groups' pass-through outputs.
+# - k8: rings, with shared write registers, takes in the slot and bubbles;
+# - h2: two entries held (FOLDSIM_RING_HOLD, a test hook holding the lowest
+#   entries read, as a wrap would): a ring of 8 and 2 held, 10 entries;
+# - off: no ring without the option.
+# Each exact against its target, channels stalled or not.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/ringlinks
+# RUN: foldsim --srcs top.f --top Top --out %t/k8 --static --nest --modulo --compact-links --share-links --zero-latency-links --zero-latency-chains --bubbles --csf-ready-copies Node:2 --csf-ready-cones --link-rings 8 Node Grp 2>&1 | FileCheck %s --check-prefix=K8
+# RUN: FileCheck %s --check-prefix=K8SIM < %t/k8/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/k8/obj %S/Inputs/tb_reset.sv top.sv %t/k8/foldsim_sim.sv > %t/k8/build.log 2>&1
+# RUN: %t/k8/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 +bubble=0 | FileCheck %s
+# RUN: %t/k8/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=40 +bubble=30 | FileCheck %s
+# RUN: env FOLDSIM_RING_HOLD=2 foldsim --srcs top.f --top Top --out %t/h2 --static --nest --modulo --compact-links --share-links --zero-latency-links --zero-latency-chains --bubbles --csf-ready-copies Node:2 --csf-ready-cones --link-rings 8 Node Grp 2>&1 | FileCheck %s --check-prefix=H2
+# RUN: FileCheck %s --check-prefix=H2SIM < %t/h2/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/h2/obj %S/Inputs/tb_reset.sv top.sv %t/h2/foldsim_sim.sv > %t/h2/build.log 2>&1
+# RUN: %t/h2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 +bubble=0 | FileCheck %s
+# RUN: %t/h2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=40 +bubble=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/off --static --nest --modulo --compact-links --share-links --zero-latency-links --zero-latency-chains --bubbles --csf-ready-copies Node:2 --csf-ready-cones Node Grp 2>&1 | FileCheck %s --check-prefix=OFF
+# RUN: FileCheck %s --check-prefix=OFFSIM < %t/off/foldsim_sim.mlir
+# `--csf-mailbox-hbm-chains`: the early chain link (rout -> rin, each entry
+# read by the next node a frame after its write) streams through HBM as a
+# reader-indexed mailbox like any other early link (without the option it
+# stays an on-chip memory of every node); against the controllers' model
+# (Inputs/tb_mailbox_hbm.sv: 1 to 80 host cycles, stalls, full, bubbles,
+# the protocol checked).
+# RUN: foldsim --srcs top.f --top Top --out %t/ch --static --nest --modulo --min-ii 160 --compact-links --share-links --zero-latency-links --zero-latency-chains --bubbles --link-rings 8 --csf-mailbox-hbm --csf-mailbox-hbm-chains Node Grp > %t/ch.log 2>&1
+# RUN: FileCheck %s --check-prefix=CH < %t/ch/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/ch -DVM1 -DBUBBLES -Mdir %t/ch/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/ch/foldsim_sim.sv > %t/ch/build.log 2>&1
+# RUN: %t/ch/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/ch/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
+# RUN: %t/ch/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=5 +hi=80 +bubble=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nch --static --nest --modulo --min-ii 160 --compact-links --share-links --zero-latency-links --zero-latency-chains --bubbles --link-rings 8 --csf-mailbox-hbm Node Grp > %t/nch.log 2>&1
+# RUN: FileCheck %s --check-prefix=NCH < %t/nch/schedule.txt
+# `--csf-mailbox-hbm-split` (Driver/Inputs/splitpage: four Par of eight Kid; a
+# Par register to each child rotated, another to its first child): with rows
+# of 8 bits the first child's page (16 bits) passes a row, so the sliced
+# stream splits in two (eight pages of 8 bits, one page of 8 bits for the
+# first child's second input); without the option the pair is one
+# producer-indexed stream of 72-bit words. Exact against the controllers'
+# model.
+# RUN: cd %S/../Driver/Inputs/splitpage
+# RUN: foldsim --srcs top.f --top Top --out %t/sp --static --nest --modulo --min-ii 96 --compact-links --share-links --bubbles --csf-mailbox-hbm --csf-mailbox-hbm-chains --csf-mailbox-hbm-row-bits 8 --csf-mailbox-hbm-split Kid Par > %t/sp.log 2>&1
+# RUN: FileCheck %s --check-prefix=SP < %t/sp/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/sp -DVM1 -DVM2 -DVM3 -DVM4 -DBUBBLES -Mdir %t/sp/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/sp/foldsim_sim.sv > %t/sp/build.log 2>&1
+# RUN: %t/sp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/sp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
+# RUN: %t/sp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=5 +hi=80 +bubble=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nsp --static --nest --modulo --min-ii 96 --compact-links --share-links --bubbles --csf-mailbox-hbm --csf-mailbox-hbm-chains --csf-mailbox-hbm-row-bits 8 Kid Par > %t/nsp.log 2>&1
+# RUN: FileCheck %s --check-prefix=NSP < %t/nsp/schedule.txt
+# `--csf-mailbox-hbm-share` (splitpage, rows of 4,096 bits: one sliced stream,
+# each Kid's i at offset 0 of its page): Kid's input i, eight sources (a Par
+# port per child), lands in one set of read registers (10 landing registers
+# for 24), exact.
+# RUN: foldsim --srcs top.f --top Top --out %t/sh --static --nest --modulo --min-ii 96 --compact-links --share-links --bubbles --csf-mailbox-hbm --csf-mailbox-hbm-chains --csf-mailbox-hbm-share Kid Par 2>&1 | FileCheck %s --check-prefix=SH
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/sh -DVM1 -DVM2 -DBUBBLES -Mdir %t/sh/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/sh/foldsim_sim.sv > %t/sh/build.log 2>&1
+# RUN: %t/sh/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/sh/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
+# RUN: %t/sh/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=5 +hi=80 +bubble=30 | FileCheck %s
+# RUN: grep -c '_hbm[0-9]*_[ab] = ' %t/sh/foldsim_sim.mlir | FileCheck %s --check-prefix=SHN
+# SH: hbm shared 1
+# SHN: {{^}}10{{$}}
+# SP: link streams: 5 streams, 12 links
+# SP: link stream Par_model Kid 8 0 64 8 8 32
+# SP-NEXT: link stream Par_model Kid 1 0 8 8 1 4
+# NSP: link stream Par_model Kid 9 0 72 72 1 4
+# K8: rings 4 (112 bits, 320 as instance memories, 0 held entries)
+# H2: rings 1 (80 bits, 224 as instance memories, 2 held entries)
+# OFF-NOT: as instance memories
+# The late chain's memory: 8 entries (of 28 node instances read), or 10 with
+# two held (their addresses by table, registered as the instance is).
+# K8SIM: %Node_rc_zout_to_Node_zin_0 = seq.firmem 0, 1, undefined, undefined : <8 x 8
+# H2SIM-DAG: %Node_rc_zout_to_Node_zin_0_ring0 = seq.firreg
+# H2SIM-DAG: %Node_rc_zout_to_Node_zin_0 = seq.firmem 0, 1, undefined, undefined : <10 x 8
+# OFFSIM: %Node_rc_zout_to_Node_zin_0 = seq.firmem 0, 1, undefined, undefined : <28 x 8
+# CH: link stream Node Node 1 0 8 8 1 64
+# CH: link stream Node Grp_model
+# NCH-NOT: link stream Node Node
+# CHECK: {{^}}MATCH
+# CHECK-NOT: MISMATCH
