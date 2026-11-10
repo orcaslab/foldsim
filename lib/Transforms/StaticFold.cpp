@@ -5276,7 +5276,22 @@ LogicalResult StaticFolder::assignPageEngines() {
         eng.readFirst = true;
       }
     }
-  for (auto [k, st] : llvm::enumerate(linkStreams)) {
+  // (With link-hbm-beat-bits: the streams in order of the positions they
+  // take, most first (first fit decreasing packs fewer engines); else in
+  // their own order.)
+  SmallVector<unsigned> streamOrder;
+  for (unsigned k = 0; k < linkStreams.size(); ++k)
+    streamOrder.push_back(k);
+  if (linkHbmBeatBits) {
+    auto taken = [&](const LinkStream &st) {
+      return uint64_t(st.landings.size() + st.writePasses.size() * st.pages) * st.beats;
+    };
+    llvm::stable_sort(streamOrder, [&](unsigned x, unsigned y) {
+      return taken(linkStreams[x]) > taken(linkStreams[y]);
+    });
+  }
+  for (unsigned k : streamOrder) {
+    auto &st = linkStreams[k];
     if (!st.kept)
       continue;
     // `link-hbm-beat-bits`: a stream of beats at its own positions (each
@@ -12731,7 +12746,7 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
   DenseMap<std::pair<Value, unsigned>, Value> piped;
   Value live;
   unsigned onLive = 512, liveMade = 0;
-  uint64_t pipeBits = 0, captureBits = 0, holdBits = 0, rawBits = 0;
+  uint64_t pipeBits = 0, captureBits = 0, holdBits = 0, rawBits = 0, constantLead = 0;
   // (The captures by what first needed them, and by their pass.)
   std::map<std::string, uint64_t> whyBits;
   SmallVector<uint64_t> fromBits(P + 1, 0);
@@ -12767,10 +12782,29 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
     return staged;
   };
   DenseMap<Value, Value> captured;
-  auto capture = [&](Value value, bool hold) -> Value {
+  std::function<Value(Value, bool)> capture;
+  capture = [&](Value value, bool hold) -> Value {
+    Value &known0 = captured[value];
+    if (known0)
+      return known0;
+    // A concatenation led by constant bits (a zero extension, say): its
+    // other bits captured, the constant joined after (a shift amount
+    // extended to the shift's width then carries its own bits alone, and
+    // what reads it sees the constant).
+    if (auto concat = value.getDefiningOp<comb::ConcatOp>();
+        concat && concat.getNumOperands() > 1 &&
+        isa_and_nonnull<hw::ConstantOp>(concat.getOperand(0).getDefiningOp())) {
+      SmallVector<Value> rest(concat.getOperands().drop_front());
+      Value tail = rest.size() == 1 ? rest[0] : b.createOrFold<comb::ConcatOp>(rest);
+      if (tail != rest[0] || rest.size() > 1)
+        stageOfValue[tail] = stageAt(value);
+      Value held = capture(tail, hold);
+      constantLead += hw::getBitWidth(concat.getOperand(0).getType());
+      Value joined = b.createOrFold<comb::ConcatOp>(concat.getOperand(0), held);
+      stageOfValue[joined] = -1;
+      return captured[value] = joined;
+    }
     Value &known = captured[value];
-    if (known)
-      return known;
     int from = stageAt(value);
     Value bits = asBits(b, value);
     (hold ? holdBits : captureBits) += hw::getBitWidth(bits.getType());
@@ -13105,7 +13139,8 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
        << hazards.size() << " hazard registers (with those; "
        << hazardBits << " bits) and " << keptRegs - hazards.size()
        << " other stored registers (" << keptBits - hazardBits
-       << " bits) kept; " << captureBits << " capture bits, " << holdBits
+       << " bits) kept; " << captureBits << " capture bits (" << constantLead
+       << " constant leading bits left out), " << holdBits
        << " hold bits (" << rawBits << " of them a row's register values), " << pipeBits << " stage register bits (ready cone, "
        << lateCone.size() << " ops); " << bankedReads << " banked reads, "
        << bankCount << " bank address copies; captures by need:";
@@ -16817,6 +16852,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     }
     Value zero72 = hw::ConstantOp::create(b, bits(72), 0);
     SmallVector<std::pair<Value, Value>> streamWrites;
+    unsigned compactCols = 0, compactRows = 0;
     for (auto [c, col] : llvm::enumerate(cols)) {
       auto &g = groups[c / 16];
       SmallVector<Value> words, masks;
@@ -16851,12 +16887,41 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           masks.push_back(b.createOrFold<comb::ConcatOp>(high));
         }
       }
-      // The select a column's own, a host cycle ahead of the pass.
-      Value sel = keepReg(g.wRow1, "pp_col" + Twine(c) + "_sel");
+      // The select a column's own, a host cycle ahead of the pass: over the
+      // rows that hold any of the column's bits alone (the others' words are
+      // zeros, and a pass of another row writes nothing it reads back: its
+      // value is don't care), the row mapped to its index among them.
+      SmallVector<unsigned> usedRows;
+      for (unsigned j = 0; j < rowsPow; ++j)
+        if (j < P && !col.parts[j].empty())
+          usedRows.push_back(j);
+      Value sel;
+      if (usedRows.size() > 1 && usedRows.size() < rowsPow) {
+        ++compactCols;
+        compactRows = std::max<unsigned>(compactRows, usedRows.size());
+        unsigned ub = llvm::Log2_32_Ceil(usedRows.size());
+        SmallVector<uint64_t> index(rowsPow, 0);
+        for (auto [x, j] : llvm::enumerate(usedRows))
+          index[j] = x;
+        unsigned rw = hw::getBitWidth(g.wRow1.getType());
+        index.resize(size_t(1) << rw, 0);
+        sel = keepReg(table(b, g.wRow1, index, ub), "pp_col" + Twine(c) + "_sel");
+      } else {
+        sel = keepReg(g.wRow1, "pp_col" + Twine(c) + "_sel");
+      }
       auto pick = [&](ArrayRef<Value> items) -> Value {
         if (items.size() == 1)
           return items[0];
-        SmallVector<Value> high(items.rbegin(), items.rend());
+        SmallVector<Value> chosen;
+        if (usedRows.size() > 1 && usedRows.size() < rowsPow) {
+          for (unsigned j : usedRows)
+            chosen.push_back(items[j]);
+        } else if (usedRows.size() == 1) {
+          return items[usedRows[0]];
+        } else {
+          chosen.assign(items.begin(), items.end());
+        }
+        SmallVector<Value> high(chosen.rbegin(), chosen.rend());
         return hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, high), sel);
       };
       Value data = pick(words);
@@ -16882,6 +16947,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       seq::FirMemWriteOp::create(b, col.memory, g.wAddr, hostClock, enable, data,
                                  mask);
     }
+    if (compactCols)
+      llvm::errs() << "foldsim-fold-static: state-in-ram-pp: " << cls.name << ": " << compactCols
+                   << " columns' write selects over the rows they hold (at most " << compactRows
+                   << " of " << rowsPow << ")\n";
     if (hbm) {
       SmallVector<seq::FirMemOp> memories;
       for (auto [c, col] : llvm::enumerate(cols))

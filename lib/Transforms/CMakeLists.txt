@@ -12,6 +12,7 @@ add_mlir_library(FoldsimTransforms
   FuseModels.cpp
   LaneScan.cpp
   LowerWideNegation.cpp
+  NarrowShiftAmounts.cpp
   CompressAddTrees.cpp
   CsfReadySplit.cpp
   SlotSequencer.cpp

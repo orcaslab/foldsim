@@ -1623,6 +1623,11 @@ def build_parser():
                          'cycle early, at the address\'s next value, reading new data (circt-opt '
                          'seq-retime-firmem-reads mode=auto). Exact; such a memory may then be '
                          'virtual (--virtual-memories) or in block RAM')
+    ap.add_argument('--narrow-shifts', type=int, default=17, metavar='MIN_WIDTH',
+                    help='before folding: a shift of at least MIN_WIDTH bits by a non-constant amount takes the '
+                         "amount's low ceil(log2 width) bits and an OR of the rest (out of range), so a pass "
+                         'split carries those bits, not the whole amount (foldsim-narrow-shift-amounts; exact; '
+                         '0: none)')
     ap.add_argument('--vmem-group', metavar='copy|N|auto[:M]',
                     help="with --virtual-memories: one kernel controller (foldsim_vmem_group) for a "
                          "class copy's virtual memories of the same row size and read-during-write "
@@ -2281,6 +2286,8 @@ def main():
     # model before it is folded (exact rewrites; the RTL is unchanged).
     if a.prefix_negate:
         passes.append(f'hw.module(foldsim-lower-wide-negation{{min-width={a.prefix_negate}}})')
+    if a.narrow_shifts:
+        passes.append(f'hw.module(foldsim-narrow-shift-amounts{{min-width={a.narrow_shifts}}})')
     if a.balance_mux:
         passes.append(f'hw.module(comb-balance-mux{{mux-chain-threshold={a.balance_mux}}})')
     if a.compress_adds:

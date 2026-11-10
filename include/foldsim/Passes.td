@@ -1487,6 +1487,26 @@ def LowerWideNegation : Pass<"foldsim-lower-wide-negation",
   let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
 }
 
+def NarrowShiftAmounts : Pass<"foldsim-narrow-shift-amounts",
+                              "::circt::hw::HWModuleOp"> {
+  let summary = "Shift amounts narrowed to log2 of the width";
+  let description = [{
+    Rewrites a shift (`comb.shl`, `comb.shru`, `comb.shrs`) of at least
+    `min-width` bits whose amount is not a constant (nor already a zero
+    extension of its low ceil(log2 width) bits) as `hi != 0 ? fill : x op
+    zext(lo)`, lo the amount's low ceil(log2 width) bits, hi the rest, fill
+    zeros (the sign for `shrs`). Exact. The out-of-range test is an OR of
+    the high bits (a w-bit `a >= w` compare lowers as a chain, ~w/8 levels),
+    and a split evaluation that carries the amount across passes (state in
+    RAM, PP captures) carries ceil(log2 width) + 1 bits, not w.
+  }];
+  let options = [
+    Option<"minWidth", "min-width", "unsigned", "17",
+           "Shifts of at least this many bits are rewritten">,
+  ];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
+}
+
 def CompressAddTrees : Pass<"foldsim-compress-add-trees",
                             "::circt::hw::HWModuleOp"> {
   let summary = "Wide sums of many addends as compressor trees";

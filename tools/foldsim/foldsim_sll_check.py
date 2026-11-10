@@ -609,6 +609,19 @@ def main():
     report = os.path.join(out, 'sll.txt')
 
     def finish(lines, verdict):
+        # The kernel's controllers beside the simulator, priced (foldsim_storage.ctl_cost, as read_built
+        # counts them): not in the verdict's region sums (the region's `kernel` holds a fixed share), a line
+        # for the caller's own total (r16c measured about 2.2x the model).
+        try:
+            built = foldsim_degree.read_built(os.path.join(gdir, 'foldsim_sim.json'))
+            ctl = built.get('controllers', [])
+            if ctl:
+                lut = sum(x['logic'] + x['lutram'] for x in ctl)
+                lines.append(f'  kernel controllers: {len(ctl)}, {sum(x.get("dw", 0) for x in ctl):,} data bits, '
+                             f'{lut:,.0f} LUT [model] ({2.2 * lut:,.0f} at r16c\'s measured 2.2x), '
+                             f'{sum(x["bram"] for x in ctl):,.1f} RAMB36')
+        except Exception:
+            pass
         lines.append(f'{name}: {verdict}')
         print('\n'.join(lines))
         with open(report, 'a' if os.path.exists(report) else 'w') as f:
