@@ -1058,6 +1058,25 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "all of whose reads of a frame come before its producer writes "
            "the entry in that frame keeps one bank, not two; the others "
            "keep two (the schedule decides, link by link)">,
+    Option<"csfMailboxHbmChains", "csf-mailbox-hbm-chains", "bool", "false",
+           "With csf-mailbox-hbm: early chain links (a ring of siblings' "
+           "registered outputs, each entry read by the next instance a frame "
+           "after its write) stream through HBM like other early links; "
+           "zero-latency chains (late links) stay on chip either way">,
+    Option<"csfMailboxHbmSplit", "csf-mailbox-hbm-split", "bool", "false",
+           "With csf-mailbox-hbm: a producer-indexed stream sliced by reader "
+           "whose reader page is wider than a row (csf-mailbox-hbm-row-bits; "
+           "a parent's wide outputs to one child) is split into streams whose "
+           "pages each fit a row, a reader pass landing a row of each, rather "
+           "than left to on-chip memories">,
+    Option<"linkRings", "link-rings", "unsigned", "0",
+           "Constant-shell fold: a link memory whose entries are each live "
+           "for a short window of the frame (from the write a read takes to "
+           "that read) keeps K entries, K a power of two up to this many, "
+           "addressed by the entry's index mod K, where the schedule shows "
+           "no other entry of its address written in any read's window "
+           "(early links drop their banks); its storage is set by the "
+           "schedule's spacing, not by the instances (0: off)">,
     Option<"csfMailboxHbmRowBits", "csf-mailbox-hbm-row-bits", "unsigned",
            "4096",
            "With csf-mailbox-hbm: the most bits of a mailbox stream's row (8 "

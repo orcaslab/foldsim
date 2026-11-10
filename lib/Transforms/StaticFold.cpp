@@ -570,11 +570,45 @@ public:
   /// `csf-single-bank`: an early link whose every read of a frame precedes
   /// its producer's write of the entry in that frame keeps one bank.
   bool csfSingleBank = false;
+  /// `link-rings`: the most entries of a ring link (0: none). A link
+  /// memory of one producer (its entries: the producer's instances, or the
+  /// kept ones of a compact link) whose every read takes a write made a
+  /// short window before it keeps K entries, the entry's index mod K, where
+  /// no other entry of that address is written in any read's window
+  /// (`linkRing`). An early link's ring has one bank: its reads come before
+  /// their entry's next write.
+  unsigned linkRings = 0;
+  /// A ring link's plan: K ring entries (an entry e at e mod K) and the
+  /// held entries (sorted), each at K + its index among them; `depth` the
+  /// memory's entries, 0 for none.
+  struct RingPlan {
+    unsigned k = 0, depth = 0;
+    SmallVector<int64_t> held;
+    uint64_t addr(int64_t e) const {
+      auto it = llvm::lower_bound(held, e);
+      if (it != held.end() && *it == e)
+        return k + uint64_t(it - held.begin());
+      return uint64_t(e) % k;
+    }
+    explicit operator bool() const { return depth > 0; }
+  };
+  /// The ring link's plan for the read of producer `p`'s bits by class `c`
+  /// (its instances `takes`, at producer instance `rows[i]`; `kept`, the
+  /// producer instances a compact link keeps, sorted, else empty), or none.
+  /// Only the reads that matter count: the state pass's, and a ready pass's
+  /// where an output that pass writes depends on the input (`port`).
+  RingPlan linkRing(unsigned p, unsigned c, unsigned port, ArrayRef<bool> takes,
+                    ArrayRef<uint64_t> rows, ArrayRef<uint64_t> kept) const;
   /// `csf-mailbox-builder`: links as lanes of reader-indexed mailboxes
   /// (CsfMailboxes.h).
   bool csfMailboxBuilder = false;
   /// `csf-mailbox-hbm`: reader-indexed mailboxes in HBM (layoutMailboxStreams).
   bool csfMailboxHbm = false;
+  /// `csf-mailbox-hbm-chains`: early chain links (isChainLink) stream too.
+  bool csfMailboxHbmChains = false;
+  /// `csf-mailbox-hbm-split`: a class pair's sliced stream whose reader page
+  /// is wider than a row is split into streams of a row's page each.
+  bool csfMailboxHbmSplit = false;
   /// `csf-mailbox-hbm-lead`: the most positions a csf-mailbox-hbm stream's
   /// request precedes its landing (the HBM round trip at the worst latency
   /// and a margin; less where the schedule leaves less room).
@@ -3908,7 +3942,10 @@ void StaticFolder::layoutMailboxStreams(std::vector<LinkStream> &out,
       fanout |= r >= 0 && r != int64_t(i);
       r = i;
     }
-    if (!fanout && isChainLink(link))
+    // An early chain link (a ring of siblings' registered outputs) reads
+    // each entry a frame after its write: it streams like any other where
+    // `csf-mailbox-hbm-chains` (a zero-latency chain is late: never here).
+    if (!fanout && isChainLink(link) && !csfMailboxHbmChains)
       continue;
     auto &read = rowsRead[{link.pcls, link.rcls, link.writeKey}];
     for (auto [i, row] : llvm::zip(use.readers, use.readerRows))
@@ -3978,66 +4015,160 @@ void StaticFolder::layoutMailboxStreams(std::vector<LinkStream> &out,
           groups.push_back(taken[i]);
         readerPage[i] = g->second;
       }
-      // Shared members (of several groups) first, at the same offset in
-      // every page; then each group's own.
-      SmallVector<unsigned> groupsOf(memberUse.size(), 0);
-      for (auto &g : groups)
-        for (unsigned m : g)
-          ++groupsOf[m];
-      SmallVector<unsigned> offset(memberUse.size(), 0);
-      unsigned shared = 0, page = 0;
-      for (unsigned m = 0; m < memberUse.size(); ++m)
-        if (groupsOf[m] > 1) {
-          offset[m] = shared;
-          shared += memberUse[m]->width;
-        }
-      for (auto &g : groups) {
-        unsigned at = shared;
-        for (unsigned m : g)
-          if (groupsOf[m] == 1) {
-            offset[m] = at;
-            at += memberUse[m]->width;
-          }
-        page = std::max(page, at);
-      }
-      page = std::max(8u, (page + 7) / 8 * 8);
-      if (!oneRow || page > sliceBits || groups.empty())
+      if (!oneRow || groups.empty())
         continue;  // (layoutStreamsOf's, below)
-      LinkStream st;
-      st.pcls = pcls;
-      st.rcls = rcls;
-      st.atReady = wk > 0;
-      st.level = wk > 0 ? wk - 1 : 0;
-      st.twoSets = true;
-      st.sliced = true;
-      st.readerPage = readerPage;
-      st.dw = page;
-      st.pages = groups.size();
-      st.wordBits = page * st.pages;
-      for (auto [g, members] : llvm::enumerate(groups))
-        for (unsigned m : members)
-          st.runs.push_back({memberUse[m]->producer, memberUse[m]->low,
-                             memberUse[m]->width,
-                             unsigned(g) * page + offset[m]});
-      llvm::sort(st.runs, [](const StreamRun &a, const StreamRun &b) {
-        return a.offset < b.offset;
-      });
-      st.needs.resize(rthreads);
-      for (unsigned i = 0; i < rthreads; ++i) {
-        if (readerPage[i] < 0)
-          continue;
-        st.needs[i].push_back({*rowsOfReader[i].begin(), unsigned(readerPage[i])});
-        st.maxNeed = 1;
-        st.readRows += 1 + classes[rcls].readyLevels;
-        ++st.kept;
+      // The layout of a part of the members (a stream): its groups (each
+      // reader group's members in the part, equal ones one page), shared
+      // members (of several of its groups) first, at the same offset in
+      // every page, then each group's own; its page bits.
+      struct Part {
+        SmallVector<unsigned> members;
+        SmallVector<std::set<unsigned>> groups;
+        SmallVector<int64_t> pageOf;  // per original group, or -1
+        SmallVector<unsigned> offset;  // per member (of memberUse)
+        unsigned page = 0;
+      };
+      auto layoutPart = [&](ArrayRef<unsigned> ms) {
+        Part part;
+        part.members.assign(ms.begin(), ms.end());
+        std::set<unsigned> in(ms.begin(), ms.end());
+        std::map<std::set<unsigned>, unsigned> pageOfSet;
+        part.pageOf.assign(groups.size(), -1);
+        for (auto [g, members] : llvm::enumerate(groups)) {
+          std::set<unsigned> mine;
+          for (unsigned m : members)
+            if (in.count(m))
+              mine.insert(m);
+          if (mine.empty())
+            continue;
+          auto [it, fresh] = pageOfSet.try_emplace(mine, part.groups.size());
+          if (fresh)
+            part.groups.push_back(mine);
+          part.pageOf[g] = it->second;
+        }
+        SmallVector<unsigned> groupsOf(memberUse.size(), 0);
+        for (auto &g : part.groups)
+          for (unsigned m : g)
+            ++groupsOf[m];
+        part.offset.assign(memberUse.size(), 0);
+        unsigned shared = 0, page = 0;
+        for (unsigned m : part.members)
+          if (groupsOf[m] > 1) {
+            part.offset[m] = shared;
+            shared += memberUse[m]->width;
+          }
+        for (auto &g : part.groups) {
+          unsigned at = shared;
+          for (unsigned m : g)
+            if (groupsOf[m] == 1) {
+              part.offset[m] = at;
+              at += memberUse[m]->width;
+            }
+          page = std::max(page, at);
+        }
+        part.page = std::max(8u, (page + 7) / 8 * 8);
+        return part;
+      };
+      SmallVector<unsigned> all(memberUse.size());
+      for (unsigned m = 0; m < all.size(); ++m)
+        all[m] = m;
+      std::vector<Part> parts{layoutPart(all)};
+      // A page wider than a row (a reader group taking more than a row of
+      // bits: a parent's wide outputs to its first child, say) splits the
+      // pair's members into streams whose pages each fit a row
+      // (`csf-mailbox-hbm-split`), widest first, each into the first that
+      // keeps fitting: a reader pass lands one row of each stream it reads,
+      // the streams' controllers side by side. A member wider than a row
+      // keeps the pair as layoutStreamsOf lays it out.
+      if (parts[0].page > sliceBits) {
+        if (!csfMailboxHbmSplit ||
+            llvm::any_of(memberUse, [&](const LinkUse *u) { return u->width > sliceBits; }))
+          continue;  // (layoutStreamsOf's, below)
+        // First fit in three orders (as listed, widest first, narrowest
+        // first); the one whose streams write the fewest bits a producer
+        // pass (pages x page) wins.
+        auto firstFit = [&](ArrayRef<unsigned> order) {
+          SmallVector<SmallVector<unsigned>> sets;
+          for (unsigned m : order) {
+            bool placed = false;
+            for (auto &set : sets) {
+              set.push_back(m);
+              if (layoutPart(set).page <= sliceBits) {
+                placed = true;
+                break;
+              }
+              set.pop_back();
+            }
+            if (!placed)
+              sets.push_back({m});
+          }
+          std::vector<Part> out;
+          for (auto &set : sets) {
+            llvm::sort(set);
+            out.push_back(layoutPart(set));
+          }
+          return out;
+        };
+        auto bitsOf = [](const std::vector<Part> &ps) {
+          uint64_t n = 0;
+          for (auto &p : ps)
+            n += uint64_t(p.page) * p.groups.size();
+          return n;
+        };
+        SmallVector<unsigned> wide(all), narrow(all);
+        llvm::stable_sort(wide, [&](unsigned x, unsigned y) {
+          return memberUse[x]->width > memberUse[y]->width;
+        });
+        llvm::stable_sort(narrow, [&](unsigned x, unsigned y) {
+          return memberUse[x]->width < memberUse[y]->width;
+        });
+        parts = firstFit(all);
+        for (auto *order : {&wide, &narrow}) {
+          auto other = firstFit(*order);
+          if (bitsOf(other) < bitsOf(parts))
+            parts = std::move(other);
+        }
       }
-      if (members)
-        for (unsigned m = 0; m < memberUse.size(); ++m)
-          (*members)[keyOf(*memberUse[m])] =
-              StreamMember{unsigned(out.size()), offset[m], false};
+      for (auto &part : parts) {
+        LinkStream st;
+        st.pcls = pcls;
+        st.rcls = rcls;
+        st.atReady = wk > 0;
+        st.level = wk > 0 ? wk - 1 : 0;
+        st.twoSets = true;
+        st.sliced = true;
+        st.readerPage.assign(rthreads, -1);
+        for (unsigned i = 0; i < rthreads; ++i)
+          if (readerPage[i] >= 0)
+            st.readerPage[i] = part.pageOf[readerPage[i]];
+        st.dw = part.page;
+        st.pages = part.groups.size();
+        st.wordBits = part.page * st.pages;
+        for (auto [g, members] : llvm::enumerate(part.groups))
+          for (unsigned m : members)
+            st.runs.push_back({memberUse[m]->producer, memberUse[m]->low,
+                               memberUse[m]->width,
+                               unsigned(g) * part.page + part.offset[m]});
+        llvm::sort(st.runs, [](const StreamRun &a, const StreamRun &b) {
+          return a.offset < b.offset;
+        });
+        st.needs.resize(rthreads);
+        for (unsigned i = 0; i < rthreads; ++i) {
+          if (st.readerPage[i] < 0)
+            continue;
+          st.needs[i].push_back({*rowsOfReader[i].begin(), unsigned(st.readerPage[i])});
+          st.maxNeed = 1;
+          st.readRows += 1 + classes[rcls].readyLevels;
+          ++st.kept;
+        }
+        if (members)
+          for (unsigned m : part.members)
+            (*members)[keyOf(*memberUse[m])] =
+                StreamMember{unsigned(out.size()), part.offset[m], false};
+        out.push_back(std::move(st));
+      }
       for (auto *use : pairUses)
         byProducer.erase(keyOf(*use));
-      out.push_back(std::move(st));
     }
   }
   if (!byProducer.empty()) {
@@ -9069,7 +9200,24 @@ void StaticFolder::reportLinks(raw_ostream &os) {
       hbm.memories++;
       hbm.bits += depth * use.width;
     } else {
-      depth = linkDepth(entries, banked);
+      // link-rings: K entries, one bank, as buildSim decides.
+      unsigned ring = 0;
+      if (haveSchedule && linkRings && entries > 1) {
+        unsigned rthreads = classes[use.reader].threads();
+        SmallVector<bool> takes(rthreads, false);
+        SmallVector<uint64_t> rws(rthreads, 0);
+        for (auto [i, r] : llvm::zip(use.readers, use.readerRows)) {
+          takes[i] = true;
+          rws[i] = r;
+        }
+        ring = linkRing(use.producer, use.reader, use.port, takes, rws,
+                        compact ? ArrayRef<uint64_t>(use.rows)
+                                : ArrayRef<uint64_t>())
+                   .depth;
+        if (ring)
+          banked = false;
+      }
+      depth = ring ? ring : linkDepth(entries, banked);
       StringRef style;
       if (haveSchedule && entries != 1 && (slrOf.empty() || slrLinkRams) &&
           (use.sources == 1 || !shortLead)) {
@@ -9117,7 +9265,7 @@ void StaticFolder::reportLinks(raw_ostream &os) {
                                    lutram(depth, use.width)});
       }
       // A paged link: p rows an entry of a p-th of its bits.
-      if (!style.empty())
+      if (!style.empty() && !ring)
         page = linkPaged(use, banked, entries);
       uint64_t rows = page ? depth * llvm::PowerOf2Ceil(page) : depth;
       unsigned cols = page ? (use.width + page - 1) / page : use.width;
@@ -16576,6 +16724,188 @@ bool StaticFolder::hitsOnlyTakes(unsigned p, unsigned c, ArrayRef<bool> takes,
   return true;
 }
 
+StaticFolder::RingPlan
+StaticFolder::linkRing(unsigned p, unsigned c, unsigned port,
+                       ArrayRef<bool> takes, ArrayRef<uint64_t> rows,
+                       ArrayRef<uint64_t> kept) const {
+  RingPlan plan;
+  auto &producer = producers[p];
+  if (!linkRings || ii == 0 || producer.cls < 0)
+    return plan;
+  // Within one SLR group and not split: the write's timing is the pass's.
+  if (crosses(producer.cls, int(c)) || splitDelayP(int(p)))
+    return plan;
+  auto &pcls = classes[producer.cls];
+  auto &rcls = classes[c];
+  static const bool debug = getenv("FOLDSIM_RING_DEBUG");
+  auto why = [&](const char *reason, int64_t a = 0, int64_t b2 = 0) {
+    if (debug)
+      llvm::errs() << "ring " << producer.name << " -> " << rcls.name << ": "
+                   << reason << " " << a << " " << b2 << "\n";
+    return plan;
+  };
+  unsigned pthreads = pcls.threads();
+  unsigned entries = kept.empty() ? pthreads : unsigned(kept.size());
+  if (entries < 4)
+    return plan;
+  int frame = int(ii);
+  auto mod = [&](int64_t s) { return int(((s % frame) + frame) % frame); };
+  auto writeAt = [&](uint64_t inst) {
+    return producer.atReady ? pcls.readySlots(producer.readyLevel)[inst]
+                            : pcls.slot[kState][inst];
+  };
+  auto entryOf = [&](uint64_t inst) -> int64_t {
+    return kept.empty() ? int64_t(inst)
+                        : int64_t(llvm::lower_bound(kept, inst) - kept.begin());
+  };
+  // Every entry's write, by position of the frame (a compact link writes
+  // its kept instances alone; an ordinary one, every instance).
+  SmallVector<std::pair<int, int64_t>> writes;
+  if (kept.empty())
+    for (unsigned r = 0; r < pthreads; ++r)
+      writes.push_back({mod(writeAt(r)), int64_t(r)});
+  else
+    for (auto [e, r] : llvm::enumerate(kept))
+      writes.push_back({mod(writeAt(r)), int64_t(e)});
+  llvm::sort(writes);
+  // A ready pass of level l uses the input where an output it writes (a
+  // late one, of that level) depends on it combinationally; its read is
+  // otherwise never used (the state pass reads the input anew).
+  SmallVector<bool> readyUses(rcls.readyLevels, false);
+  for (auto [o, q] : llvm::enumerate(rcls.producerOf)) {
+    if (q < 0 || o >= rcls.deps.size())
+      continue;
+    auto &out = producers[q];
+    if (out.atReady && out.readyLevel < rcls.readyLevels &&
+        port < rcls.deps[o].size() && rcls.deps[o].test(port))
+      readyUses[out.readyLevel] = true;
+  }
+  // Each read of an entry takes the write made at T: for an early link the
+  // frame before's (and its own next write comes after the read), for a
+  // late one the last at or before the read. Its window, from T to the
+  // read (a host cycle before and three after: a write registered once
+  // more, a read a host cycle ahead, a take in the slot), holds the writes
+  // of the other entries; a ring of K entries (entry mod K) is exact where
+  // none of them has the read's entry's address. An entry whose window
+  // holds `linkRings` writes or more is held: an address of its own past
+  // the ring (the wrap of a frame, read near its end, written near its
+  // start).
+  std::vector<std::pair<int64_t, int64_t>> pairs;  // (entry, a writer in its window)
+  std::map<int64_t, unsigned> mostOf;               // per entry, its widest window
+  std::set<int64_t> held;
+  for (unsigned i = 0; i < rcls.threads(); ++i) {
+    if (!takes[i])
+      continue;
+    int64_t e = entryOf(rows[i]);
+    int64_t w = writeAt(rows[i]);
+    SmallVector<int> reads{rcls.readSlot(kState, 0, i)};
+    for (unsigned l = 0; l < rcls.readyLevels; ++l)
+      if (readyUses[l])
+        reads.push_back(rcls.readSlot(kReady, l, i));
+    for (int r : reads) {
+      int64_t t;
+      if (!producer.late) {
+        if (w <= int64_t(r) + 3)
+          return why("early read after its write", w, r);
+        t = w - frame;
+      } else {
+        int64_t k = (int64_t(r) - w) >= 0 ? (int64_t(r) - w) / frame
+                                           : -((w - int64_t(r) + frame - 1) / frame);
+        t = w + k * frame;
+      }
+      int64_t lo = t - 1, hi = int64_t(r) + 3;
+      if (hi - lo + 1 >= frame) {
+        held.insert(e);
+        continue;
+      }
+      size_t mark = pairs.size();
+      unsigned count = 0;
+      auto visit = [&](int from, int to) {  // positions [from, to)
+        auto it = llvm::lower_bound(writes, std::make_pair(from, int64_t(-1)));
+        for (; it != writes.end() && it->first < to && count < linkRings; ++it)
+          if (it->second != e) {
+            pairs.push_back({e, it->second});
+            ++count;
+          }
+      };
+      int a = mod(lo), len = int(hi - lo + 1);
+      if (a + len <= frame) {
+        visit(a, a + len);
+      } else {
+        visit(a, frame);
+        visit(0, a + len - frame);
+      }
+      if (count >= linkRings) {
+        pairs.resize(mark);
+        held.insert(e);
+        continue;
+      }
+      unsigned &m = mostOf[e];
+      m = std::max(m, count);
+    }
+  }
+  if (held.size() > linkRings)
+    return why("held", held.size(), entries);
+  // Each threshold: the entries whose widest window holds as many writes
+  // are held too; the ring's K the least power of two none of the rest's
+  // pairs agree mod. The least depth wins.
+  unsigned bestDepth = 0, bestK = 0;
+  std::set<int64_t> bestHeld;
+  // (A test hook: FOLDSIM_RING_HOLD=n holds the n lowest entries read
+  // besides, as a wrap would: a held entry's address is its own.)
+  static const unsigned forced = [] {
+    const char *env = getenv("FOLDSIM_RING_HOLD");
+    return env ? unsigned(atoi(env)) : 0u;
+  }();
+  for (auto [e, m] : mostOf)
+    if (held.size() < forced)
+      held.insert(e);
+  for (unsigned tau = linkRings; tau >= 2; tau /= 2) {
+    std::set<int64_t> hs = held;
+    for (auto [e, m] : mostOf)
+      if (m + 1 > tau)
+        hs.insert(e);
+    if (hs.size() > linkRings)
+      break;
+    unsigned most = 0;
+    std::map<int64_t, unsigned> count;
+    for (auto [e, x] : pairs)
+      if (!hs.count(e) && !hs.count(x))
+        most = std::max(most, ++count[e]);
+    (void)most;
+    unsigned least = 0;
+    for (auto [e, m] : mostOf)
+      if (!hs.count(e))
+        least = std::max(least, m);
+    for (unsigned k = std::max(2u, unsigned(llvm::PowerOf2Ceil(least + 1)));
+         k <= linkRings; k *= 2) {
+      bool ok = true;
+      for (auto [e, x] : pairs)
+        if (!hs.count(e) && !hs.count(x) && (x - e) % int64_t(k) == 0) {
+          ok = false;
+          break;
+        }
+      if (!ok)
+        continue;
+      unsigned depth = k + unsigned(hs.size());
+      if (2 * depth <= entries && (!bestDepth || depth < bestDepth)) {
+        bestDepth = depth;
+        bestK = k;
+        bestHeld = hs;
+      }
+      break;
+    }
+  }
+  if (!bestDepth)
+    return why("no K", held.size(), entries);
+  plan.k = bestK;
+  plan.depth = bestDepth;
+  plan.held.assign(bestHeld.begin(), bestHeld.end());
+  if (debug)
+    why("ring", plan.k, plan.held.size());
+  return plan;
+}
+
 void StaticFolder::offerMailboxLinks(
     std::map<std::tuple<unsigned, unsigned, int, unsigned>, unsigned> &linkOf,
     SmallVectorImpl<MailboxLink> &links, SmallVectorImpl<MailboxPlan> &plans,
@@ -16638,6 +16968,23 @@ void StaticFolder::offerMailboxLinks(
       for (auto &[key, link] : bySource) {
         if (fanout.count(key) || isChainLink(link))
           continue;
+        // link-rings: a ring link's storage is already the schedule's, not
+        // the instances': no mailbox row.
+        if (linkRings) {
+          SmallVector<bool> takes(threads, false);
+          SmallVector<uint64_t> rows(threads, 0);
+          SmallVector<uint64_t> kept;
+          for (auto [r, i] : llvm::enumerate(link.readerOf))
+            if (i >= 0) {
+              takes[i] = true;
+              rows[i] = r;
+              kept.push_back(r);
+            }
+          if (!compacted(unsigned(key.first), kept.size()))
+            kept.clear();
+          if (linkRing(unsigned(key.first), c, consumer.port, takes, rows, kept))
+            continue;
+        }
         linkOf[{unsigned(k), at, key.first, key.second}] = links.size();
         links.push_back(std::move(link));
       }
@@ -17776,9 +18123,11 @@ LogicalResult StaticFolder::buildSim() {
                       ArrayRef<uint64_t> compact = {},
                       StringRef syncStyle = {}, unsigned page = 0,
                       const LinkGather *gather = nullptr,
-                      bool single = false) -> Value {
+                      bool single = false, unsigned ring = 0,
+                      ArrayRef<uint64_t> ringWrite = {}) -> Value {
     assert((!page || (gather && !late && !now && !forward && !after)) &&
            "a paged link is never forwarded, taken now or written late");
+    assert(!(ring && page) && "a ring link is never paged");
     auto &producer = producers[p];
     unsigned c = producer.cls;
     auto &ctl = controls[c];
@@ -17788,6 +18137,17 @@ LogicalResult StaticFolder::buildSim() {
     // csf-single-bank: an early link read before its next write, one bank.
     if (single)
       banked = false;
+    // link-rings: K entries, an entry's index mod K, one bank.
+    if (ring)
+      banked = false;
+    unsigned ringBits = ring ? llvm::Log2_32_Ceil(ring) : 0;
+    auto ringAt = [&](Value v) -> Value {
+      if (!ring || !v)
+        return v;
+      if (hw::getBitWidth(v.getType()) == int64_t(ringBits))
+        return v;
+      return b.createOrFold<comb::ExtractOp>(b.getIntegerType(ringBits), v, 0);
+    };
     bool crossing = to >= 0 && !slrOf.empty() && slrOf[c] != to;
     assert(!(crossing && now) && "a link between SLR groups is never zero");
     // slr-serialize: the host cycles the crossing takes; every register of
@@ -18003,7 +18363,7 @@ LogicalResult StaticFolder::buildSim() {
       // the bank of 1 starts past every index: with instances not a power of
       // two, beyond the last instance.
       unsigned indices = threads > 1 ? llvm::PowerOf2Ceil(threads) : 1;
-      unsigned depth = banked ? 2 * indices : threads;
+      unsigned depth = ring ? ring : banked ? 2 * indices : threads;
       // A block or ultra RAM link (`syncStyle`) reads at the same registered
       // address a host cycle on, into its output register, which is the read
       // register: read-first, as a distributed RAM's read register takes the
@@ -18022,6 +18382,7 @@ LogicalResult StaticFolder::buildSim() {
       };
       // The bank in the high bit, the instance in the low ones.
       SmallVector<Value> writeAddress, readAddress;
+      Value ringInst, ringInstLate;
       if (banked) {
         if (!group.bank) {
           // The frame the write belongs to: the one before in a slot past it.
@@ -18047,8 +18408,19 @@ LogicalResult StaticFolder::buildSim() {
             group.inst = lateBy(group.inst, group.prefix + "_inst_late");
           group.inst = splitBy(group.inst, group.prefix + "_inst_split");
         }
-        writeAddress.push_back(compact.empty() ? group.inst : compactInst);
-        readAddress.push_back(address());
+        // A ring with held entries: each producer instance's address by
+        // table, registered as the group's instance is.
+        if (!ringWrite.empty() && !ringInst) {
+          ringInst = copyReg(copyReg(table(b, ctl.inst2, ringWrite, ringBits),
+                                     name + "_ring1"),
+                             name + "_ring0");
+          if (late)
+            ringInstLate = copyReg(ringInst, name + "_ring_late");
+        }
+        writeAddress.push_back(ringInst ? ringInst
+                                        : ringAt(compact.empty() ? group.inst
+                                                                 : compactInst));
+        readAddress.push_back(ringAt(address()));
       }
       if (page) {
         // A paged link (`link-kinds` with a page p): an entry in p rows of
@@ -18136,8 +18508,10 @@ LogicalResult StaticFolder::buildSim() {
         if (threads > 1) {
           if (compact.empty() && !group.instLate)
             group.instLate = copyReg(group.inst, group.prefix + "_inst_late");
-          lateAddress.push_back(compact.empty() ? group.instLate
-                                                : compactInstLate);
+          lateAddress.push_back(ringInstLate
+                                    ? ringInstLate
+                                    : ringAt(compact.empty() ? group.instLate
+                                                             : compactInstLate));
         }
         lateAt = b.createOrFold<comb::ConcatOp>(lateAddress);
       }
@@ -18196,8 +18570,9 @@ LogicalResult StaticFolder::buildSim() {
            lateReads = 0, forwardedLate = 0, compactReads = 0, stagedReads = 0,
            syncReads = 0, earlyReads = 0, pagedReads = 0, streamReads = 0,
            stagedDirectReads = 0, singleReads = 0, doubleReads = 0,
-           partialStreamReads = 0, partialMaskedReads = 0;
-  uint64_t singleBits = 0;
+           partialStreamReads = 0, partialMaskedReads = 0, ringReads = 0,
+           ringHeld = 0;
+  uint64_t singleBits = 0, ringBits = 0, ringFullBits = 0;
   // The class readers of each producer: a producer's bits read by several
   // are written to their links from one register of them.
   SmallVector<unsigned> classReaders(producers.size(), 0);
@@ -19090,6 +19465,33 @@ LogicalResult StaticFolder::buildSim() {
         bool now = zeroLink(key.first, c, consumer.port) &&
                    takesNow(key.first, c, takes, rows);
         nowAlone[index] = now && hitsOnlyTakes(key.first, c, takes, rows);
+        // link-rings: K entries where every read's window allows.
+        RingPlan ring = pThreads > 1 ? linkRing(key.first, c, consumer.port,
+                                                takes, rows, kept)
+                                     : RingPlan();
+        SmallVector<uint64_t> ringWrite;
+        if (ring) {
+          ++ringReads;
+          ringHeld += ring.held.size();
+          ringBits += uint64_t(width) * ring.depth;
+          ringFullBits += uint64_t(width) * linkDepth(pThreads, !producer.late);
+          // Held entries: the reads' and the writes' addresses by table.
+          if (!ring.held.empty()) {
+            for (unsigned i = 0; i < threads; ++i)
+              if (takes[i])
+                entryRows[i] = ring.addr(int64_t(entryRows[i]));
+            ringWrite.assign(pThreadsAll, 0);
+            for (unsigned r = 0; r < pThreadsAll; ++r) {
+              if (kept.empty()) {
+                ringWrite[r] = ring.addr(r);
+              } else if (auto it = llvm::lower_bound(kept, uint64_t(r));
+                         it != kept.end() && *it == r) {
+                ringWrite[r] = ring.addr(int64_t(it - kept.begin()));
+              }
+            }
+          }
+        }
+        unsigned styleDepth = ring ? ring.depth : linkDepth(pThreads, !producer.late);
         // A link between SLR groups is written crossLatency host cycles
         // later (its data, enable, entry and bank), from registered bits in
         // the producer's group, and never from a register shared with other
@@ -19119,15 +19521,14 @@ LogicalResult StaticFolder::buildSim() {
         if (sources.size() == 1 && !now && !forward && !(late && forwardLate) &&
             (to < 0 || slrLinkRams) && !(pThreads == 1 && !producer.late) &&
             !(pThreads == 1 && producer.late))
-          style = linkStyle(key.first, c, linkDepth(pThreads, !producer.late),
-                            width);
+          style = linkStyle(key.first, c, styleDepth, width);
         if (!style.empty()) {
           syncPart = true;
           ++syncReads;
         }
         // A paged link (`link-kinds` with a page), where the schedule lets it.
         unsigned page = 0;
-        if (!style.empty()) {
+        if (!style.empty() && !ring) {
           LinkUse use{unsigned(key.first), key.second, width, unsigned(c), std::string(), {}, {}, {}};
           std::set<uint64_t> distinct;
           for (unsigned i = 0; i < threads; ++i)
@@ -19152,8 +19553,7 @@ LogicalResult StaticFolder::buildSim() {
             !shortLead && (to < 0 || slrLinkRams) && pThreads != 1 &&
             !needsForward(key.first, c, takes, rows, 2 + cross) &&
             !(late && needsForward(key.first, c, takes, rows, 3 + cross))) {
-          style = linkStyle(key.first, c, linkDepth(pThreads, !producer.late),
-                            width);
+          style = linkStyle(key.first, c, styleDepth, width);
           early = !style.empty();
           if (early) {
             ++syncReads;
@@ -19203,7 +19603,7 @@ LogicalResult StaticFolder::buildSim() {
         // or forwarded, all of whose reads come at least 3 host cycles (4
         // from a shared write register) before its producer's write.
         bool single = false;
-        if (csfSingleBank && !producer.late && pThreads > 1) {
+        if (csfSingleBank && !producer.late && pThreads > 1 && !ring) {
           single = !now && !forward && !crossing &&
                    readsBeforeWrite(key.first, c, rows, takes, late ? 4 : 3);
           (single ? singleReads : doubleReads) += 1;
@@ -19213,7 +19613,7 @@ LogicalResult StaticFolder::buildSim() {
         // csf-mailbox-builder: a lane of its class pair's mailbox, where
         // planned; written and read as the link would be.
         if (!mailboxLinkOf.empty() && !now && !forward && !crossing &&
-            !(late && forwardLate)) {
+            !(late && forwardLate) && !ring) {
           auto planned =
               mailboxLinkOf.find({unsigned(k), at, key.first, key.second});
           if (planned != mailboxLinkOf.end() &&
@@ -19233,13 +19633,14 @@ LogicalResult StaticFolder::buildSim() {
                              producer.name + "_to_" + consumer.name + "_" +
                                  Twine(at),
                              to, nullptr, false, nullptr, late, false, kept,
-                             style, 0, nullptr, single)
+                             style, 0, nullptr, single, ring.depth, ringWrite)
                   : linkRead(key.first, key.second, width, address, bank,
                              producer.name + "_to_" + consumer.name + "_" +
                                  Twine(at),
                              to, now ? &sourceNow[index] : nullptr, forward,
                              after ? &sourceAfter[index] : nullptr, late,
-                             forwardLate, kept, style, 0, nullptr, single);
+                             forwardLate, kept, style, 0, nullptr, single,
+                             ring.depth, ringWrite);
       }
       // csf-mailbox-hbm: the stream's value for the instances it carries;
       // the on-chip rest's takes in the slot and forwards past the read
@@ -19650,6 +20051,10 @@ LogicalResult StaticFolder::buildSim() {
     if (csfSingleBank)
       os << "; csf single-bank " << singleReads << " (" << singleBits
          << " bits in one bank), two banks " << doubleReads;
+    if (linkRings)
+      os << "; rings " << ringReads << " (" << ringBits << " bits, "
+         << ringFullBits << " as instance memories, " << ringHeld
+         << " held entries)";
     if (stagedLinks)
       os << "; staged " << stagedReads;
     if (stagedLinkDirect)
@@ -21035,8 +21440,11 @@ void FoldStaticPass::runOnOperation() {
   folder.csfReadyCones = csfReadyCones;
   folder.csfMailboxLatency = csfMailboxLatency;
   folder.csfSingleBank = csfSingleBank;
+  folder.linkRings = std::min(unsigned(linkRings), 1u << 16);
   folder.csfMailboxBuilder = csfMailboxBuilder;
   folder.csfMailboxHbm = csfMailboxHbm;
+  folder.csfMailboxHbmChains = csfMailboxHbmChains;
+  folder.csfMailboxHbmSplit = csfMailboxHbmSplit;
   folder.csfMailboxHbmLead = std::max(1u, unsigned(csfMailboxHbmLead));
   folder.csfMailboxHbmRowBits = std::clamp(unsigned(csfMailboxHbmRowBits), 8u, 4096u);
   folder.stateInRamZeroLinks = stateInRamZeroLinks;

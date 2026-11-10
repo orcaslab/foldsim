@@ -562,6 +562,12 @@ def frame_options(a):
         fold += ' state-scratch-partial=false'
     if getattr(a, 'csf_single_bank', False):
         fold += ' csf-single-bank'
+    if getattr(a, 'csf_mailbox_hbm_chains', False):
+        fold += ' csf-mailbox-hbm-chains'
+    if getattr(a, 'csf_mailbox_hbm_split', False):
+        fold += ' csf-mailbox-hbm-split'
+    if getattr(a, 'link_rings', 0):
+        fold += f' link-rings={a.link_rings}'
     if getattr(a, 'csf_mailbox_builder', False):
         fold += ' csf-mailbox-builder'
     if getattr(a, 'csf_mailbox_hbm', False):
@@ -1803,6 +1809,17 @@ def build_parser():
     ap.add_argument('--csf-single-bank', action='store_true',
                     help='constant-shell fold: an early link read before its producer\'s next write keeps one '
                          'bank, the others two, as the schedule decides (foldsim-fold-static csf-single-bank)')
+    ap.add_argument('--csf-mailbox-hbm-chains', action='store_true',
+                    help='with --csf-mailbox-hbm: early chain links (a ring of siblings\' registered outputs) stream '
+                         'through HBM too; zero-latency chains stay on chip (foldsim-fold-static csf-mailbox-hbm-chains)')
+    ap.add_argument('--csf-mailbox-hbm-split', action='store_true',
+                    help='with --csf-mailbox-hbm: a stream sliced by reader whose reader page is wider than a row is '
+                         'split into streams of a row each (foldsim-fold-static csf-mailbox-hbm-split)')
+    ap.add_argument('--link-rings', type=int, default=0, metavar='K',
+                    help='constant-shell fold: a link memory whose entries are each live for a short window of the '
+                         'frame keeps at most K entries (a power of two), the entry index mod K, where the schedule '
+                         'shows no other entry of that address written in any read\'s window; early links drop their '
+                         'banks (foldsim-fold-static link-rings)')
     ap.add_argument('--csf-merge-links', type=int, default=0, metavar='BITS',
                     help='constant-shell fold: link memories of equal ports (a producer and reader class '
                          'pair) merged side by side into mailboxes of at most BITS bits '
