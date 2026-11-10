@@ -20108,9 +20108,9 @@ LogicalResult StaticFolder::buildSim() {
           // connectivity: a reader's producer row, as many segments as the
           // groups of a ring that is not a power of two).
           Value mine1;
+          SmallVector<uint64_t> mineRows(st.popValid.size(), 0);
           {
             auto &rctl = controls[st.rcls];
-            SmallVector<uint64_t> mineRows(st.popValid.size(), 0);
             for (unsigned p = 0; p < st.popValid.size(); ++p) {
               if (!st.popValid[p])
                 continue;
@@ -20130,12 +20130,19 @@ LogicalResult StaticFolder::buildSim() {
             unsigned lo = std::max(off, j * st.dw);
             unsigned hi = std::min(off + width, (j + 1) * st.dw);
             Value en1 = mine1;
-            // (A sliced stream lands the reader's own page alone.)
-            if (pgBits && !st.sliced)
-              en1 = comb::AndOp::create(
-                  b, en1,
-                  comb::ICmpOp::create(b, comb::ICmpPredicate::eq, sb.page1,
-                                       constant(pgBits, j)));
+            // (A sliced stream lands the reader's own page alone; else the
+            // page landed, fixed by the position too: the page's own table.)
+            if (pgBits && !st.sliced) {
+              auto &rctl = controls[st.rcls];
+              uint64_t pageMask = (uint64_t(1) << pgBits) - 1;
+              SmallVector<uint64_t> pageRows(mineRows.begin(), mineRows.end());
+              for (unsigned p = 0; p < pageRows.size(); ++p)
+                if (pageRows[p] && (st.popPage[p] & pageMask) != j)
+                  pageRows[p] = 0;
+              en1 = resetReg(resetReg(table(b, rctl.at3, pageRows, 1),
+                                      name + "_pg" + Twine(j) + "_2", 0),
+                             name + "_pg" + Twine(j) + "_1", 0);
+            }
             Value en0 = resetReg(en1, name + "_en" + Twine(j), 0);
             Value bits = b.createOrFold<comb::ExtractOp>(
                 b.getIntegerType(hi - lo), sb.data, lo - j * st.dw);
