@@ -22950,21 +22950,49 @@ LogicalResult StaticFolder::buildSim() {
               // seen a host cycle later; then the room for a request (2 of
               // free) is flag 2 + 2 x sent1, for two flag 4 + 2 x sent1 (the
               // adders and compares off the requests' path).
-              Value recent = constant(fw, 0);
-              for (auto [l, x] : llvm::enumerate(lag))
-                recent = comb::AddOp::create(
-                    b, recent,
-                    b.createOrFold<comb::ConcatOp>(constant(fw - 2, 0), l == 0 && actual ? actual : x));
-              Value used = comb::ShlOp::create(b, recent, constant(fw, 1));
-              Value credit = comb::SubOp::create(b, freeImg, used);
-              Value covers = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used);
+              auto wide = [&](Value x) {
+                return b.createOrFold<comb::ConcatOp>(constant(fw - 2, 0), x);
+              };
               SmallVector<Value> flag;
-              for (unsigned k = 2; k <= 8; k += 2)
-                flag.push_back(resetReg(
-                    comb::AndOp::create(b, covers,
-                                        comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit,
-                                                             constant(fw, k))),
-                    share.prefix + "_room" + Twine(k), 0));
+              if (!actual) {
+                Value recent = constant(fw, 0);
+                for (Value x : lag)
+                  recent = comb::AddOp::create(b, recent, wide(x));
+                Value used = comb::ShlOp::create(b, recent, constant(fw, 1));
+                Value credit = comb::SubOp::create(b, freeImg, used);
+                Value covers = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used);
+                for (unsigned k = 2; k <= 8; k += 2)
+                  flag.push_back(resetReg(
+                      comb::AndOp::create(b, covers,
+                                          comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit,
+                                                               constant(fw, k))),
+                      share.prefix + "_room" + Twine(k), 0));
+              } else {
+                // (Shared: the older requests' sum registered (Q: those of
+                // sent2..sentL), the newest that left (`actual`, 0 to 2) a
+                // select of compares with its three possible values, so the
+                // went registers' sum is not before the adders.)
+                Value qNext = actual ? wide(actual) : constant(fw, 0);
+                for (unsigned l = 1; l + 1 < lag.size(); ++l)
+                  qNext = comb::AddOp::create(b, qNext, wide(lag[l]));
+                Value q = resetReg(qNext, share.prefix + "_older", 0);
+                Value used = comb::ShlOp::create(b, q, constant(fw, 1));
+                Value credit = comb::SubOp::create(b, freeImg, used);
+                Value covers = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used);
+                SmallVector<Value> atLeast;  // credit >= 2, 4, ..., 12
+                for (unsigned m = 2; m <= 12; m += 2)
+                  atLeast.push_back(comb::AndOp::create(
+                      b, covers,
+                      comb::ICmpOp::create(b, comb::ICmpPredicate::uge, credit, constant(fw, m))));
+                for (unsigned k = 2; k <= 8; k += 2) {
+                  unsigned i = k / 2 - 1;
+                  flag.push_back(resetReg(
+                      comb::MuxOp::create(b, eq(actual, 0), atLeast[i],
+                                          comb::MuxOp::create(b, eq(actual, 1), atLeast[i + 1],
+                                                              atLeast[i + 2])),
+                      share.prefix + "_room" + Twine(k), 0));
+                }
+              }
               Value s1 = lag.front();
               auto room = [&](unsigned at) -> Value {
                 return comb::MuxOp::create(
