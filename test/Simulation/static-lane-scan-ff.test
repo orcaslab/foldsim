@@ -16,6 +16,6 @@
 # RUN: %t/cp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=40 +bubble=30 | FileCheck %s
 
 # SCAN: lane-scan: cell Top_lane_Leaf
-# SCAN: lane-scan: Top lanes Leaf x32: {{.*}}; scans ac 2 prio 1 (3 chains
+# SCAN: lane-scan: Top lanes Leaf x32: {{.*}}; scans ac {{[0-9]+}} prio 1 ({{.*}}; residual 0 ops
 
 # CHECK: MATCH

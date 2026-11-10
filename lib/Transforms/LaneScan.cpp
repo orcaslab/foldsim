@@ -140,6 +140,9 @@ struct Pattern {
   // AC: the op's name; the packs whose members are chained; the operands
   // that stay in the parent.
   SmallVector<int> packs;
+  // AC: each pack's members as matched (pack numbers change as later rounds
+  // regroup; resolved again when the cell is built).
+  SmallVector<SmallVector<Value>> packVals;
   SmallVector<Value> rest;
   // AC over the bits of lane vectors of one bit a lane (gathered whole).
   SmallVector<Value> vecs;
@@ -168,6 +171,9 @@ struct Pattern {
   // AC over a bit-level cone (the root an icmp, say): the gate, and whether
   // the result is inverted.
   StringRef acOp;
+  // AC whose lanes' values are in several packs, each lane in one (a lane
+  // constant picks): packVals[k] are pack k's lanes.
+  bool mixed = false;
 };
 
 struct LaneScanPass : public foldsim::impl::LaneScanBase<LaneScanPass> {
@@ -195,6 +201,9 @@ struct Piece {
   unsigned bit, len;
 };
 
+static int64_t widthOf(Value v);
+static bool isConstant(Value v, APInt &value);
+
 struct Scan {
   hw::HWModuleOp parent;
   StringRef callee;
@@ -214,6 +223,9 @@ struct Scan {
   // The first lane (stage) of a pack: 0 but for a prefix chain's packs,
   // whose first stages the parent computes (they read the start).
   std::vector<int> packFirst;
+  // A pack with at most one member in each lane (some lanes missing): the
+  // cell can make it in every lane, the missing ones unread.
+  std::vector<bool> packFill;
   Value tmpl(int p) { return packMembers[p][packFirst[p]]; }
   // Carry chains: comb.add ops whose result is a Vec.
   DenseSet<Operation *> carries;
@@ -244,11 +256,80 @@ struct Scan {
   Value unalias(Value v) {
     for (int k = 0; k < 64; ++k) {
       auto it = aliasOf.find(v);
-      if (it == aliasOf.end())
+      if (it != aliasOf.end()) {
+        v = it->second;
+        continue;
+      }
+      // Wiring of any kind (a packed array of reduced subtrees, say): the
+      // value whose bits it passes on whole.
+      auto ex = v.getDefiningOp<comb::ExtractOp>();
+      if (!ex)
         break;
-      v = it->second;
+      Value src = sliceSrc(ex.getInput(), ex.getLowBit(), widthOf(v), 0);
+      if (!src || src == v)
+        break;
+      v = src;
     }
     return v;
+  }
+  /// Bits [lo, lo + w) of `x` are zero, through wiring.
+  static bool zeroSlice(Value x, int64_t lo, int64_t w, int depth) {
+    if (depth > 64)
+      return false;
+    APInt c;
+    if (isConstant(x, c))
+      return c.extractBits(w, lo).isZero();
+    auto *d = x.getDefiningOp();
+    if (auto ex = dyn_cast_or_null<comb::ExtractOp>(d))
+      return zeroSlice(ex.getInput(), ex.getLowBit() + lo, w, depth + 1);
+    if (auto cc = dyn_cast_or_null<comb::ConcatOp>(d)) {
+      int64_t off = 0;
+      for (Value o : llvm::reverse(cc.getInputs())) {
+        int64_t ow = widthOf(o);
+        int64_t a = std::max(lo, off), b = std::min(lo + w, off + ow);
+        if (a < b && !zeroSlice(o, a - off, b - a, depth + 1))
+          return false;
+        off += ow;
+      }
+      return true;
+    }
+    if (auto o = dyn_cast_or_null<comb::OrOp>(d))
+      return llvm::all_of(o.getInputs(), [&](Value y) {
+        return zeroSlice(y, lo, w, depth + 1);
+      });
+    return false;
+  }
+  /// The value whose bits are bits [lo, lo + w) of `x`, through wiring.
+  static Value sliceSrc(Value x, int64_t lo, int64_t w, int depth) {
+    if (depth > 64 || !isa<IntegerType>(x.getType()))
+      return {};
+    auto *d = x.getDefiningOp();
+    if (auto ex = dyn_cast_or_null<comb::ExtractOp>(d))
+      return sliceSrc(ex.getInput(), ex.getLowBit() + lo, w, depth + 1);
+    if (auto cc = dyn_cast_or_null<comb::ConcatOp>(d)) {
+      int64_t off = 0;
+      for (Value o : llvm::reverse(cc.getInputs())) {
+        int64_t ow = widthOf(o);
+        if (lo >= off && lo + w <= off + ow)
+          return sliceSrc(o, lo - off, w, depth + 1);
+        off += ow;
+      }
+      return {};
+    }
+    if (auto o = dyn_cast_or_null<comb::OrOp>(d)) {
+      Value only;
+      for (Value y : o.getInputs()) {
+        if (zeroSlice(y, lo, w, depth + 1))
+          continue;
+        if (only)
+          return {};
+        only = y;
+      }
+      return only ? sliceSrc(only, lo, w, depth + 1) : Value();
+    }
+    if (lo == 0 && widthOf(x) == w)
+      return x;
+    return {};
   }
   bool bitsOf(Value v, std::vector<BitSrc> &out);
   Info assemble(Operation *op, Value res);
@@ -292,6 +373,9 @@ struct Scan {
                 DenseSet<std::pair<Value, unsigned>> &seen,
                 llvm::SetVector<Operation *> &ops, int depth);
   bool matchCone(Operation *op);
+  bool matchConeAs(Operation *op, bool isAnd, bool invert);
+  bool orCone(Value v, SmallVectorImpl<std::pair<int, Value>> &out);
+  bool coneThroughRed = false;
   bool splitRegisters();
   SmallVector<Operation *> *visitLog = nullptr;
 };
@@ -658,6 +742,17 @@ Info Scan::assemble(Operation *op, Value res) {
       bits[res] = std::move(out);
       return Info::multi();
     }
+  }
+  // A parent value (a reduction's result, say) passed on whole: an alias too,
+  // so a tree over reduced subtrees reads them.
+  if (!out.empty() && out[0].k == BitSrc::Scalar && out[0].bit == 0 &&
+      out[0].src && out[0].src != res && widthOf(out[0].src) == w) {
+    bool same = true;
+    for (int64_t b = 0; b < w && same; ++b)
+      same = out[b].k == BitSrc::Scalar && out[b].src == out[0].src &&
+             out[b].bit == unsigned(b);
+    if (same)
+      aliasOf[res] = out[0].src;
   }
   // One lane alone: a value of that lane, made of its bits.
   int lane = -2;
@@ -1222,6 +1317,7 @@ void Scan::computePacks() {
   }
   packMembers.assign(count, std::vector<Value>(F));
   packComplete.assign(count, true);
+  packFill.assign(count, true);
   packFirst.assign(count, 0);
   std::vector<bool> isP(count, false);
   for (Value v : elems) {
@@ -1230,7 +1326,7 @@ void Scan::computePacks() {
     isP[p] = isP[p] || isPfx(v);
     auto &slot = packMembers[p][get(v).lane];
     if (slot)
-      packComplete[p] = false; // two members in one lane
+      packComplete[p] = packFill[p] = false; // two members in one lane
     slot = v;
   }
   // A prefix chain's pack starts at its first stage (the parent computes
@@ -1252,6 +1348,12 @@ void Scan::computePacks() {
     for (unsigned j = first; j < last; ++j)
       if (!packMembers[p][j])
         packComplete[p] = false;
+    if (isP[p] || first >= F)
+      packFill[p] = false;
+    // A pack made in every lane: its template is its first member.
+    if (packFill[p] && !packComplete[p])
+      while (packFirst[p] < int(F) && !packMembers[p][packFirst[p]])
+        ++packFirst[p];
   }
 }
 
@@ -1262,7 +1364,7 @@ bool Scan::fullPack(ArrayRef<Value> values, int &pack) {
   pack = -1;
   SmallVector<bool> seen(F, false);
   for (Value v : values) {
-    if (!isElem(v))
+    if (!isElem(v) || !packOf.count(v))
       return false;
     int p = packOf.lookup(v);
     if (pack >= 0 && p != pack)
@@ -1278,6 +1380,7 @@ bool Scan::fullPack(ArrayRef<Value> values, int &pack) {
 
 bool Scan::matchPatterns() {
   bool any = false;
+  SmallVector<comb::MuxOp> treeCands;
   auto *body = parent.getBodyBlock();
   auto add = [&](Pattern p) {
     Value v = p.root->getResult(0);
@@ -1314,6 +1417,11 @@ bool Scan::matchPatterns() {
       continue;
     if (get(res).kind != Kind::Multi)
       continue;
+    // a reduction ending in a bit of a packed array
+    if (isa<comb::ExtractOp>(op) && bitWidthOf(res) == 1 && matchCone(&op)) {
+      any = true;
+      continue;
+    }
     // ac
     if (isa<comb::XorOp, comb::OrOp, comb::AndOp, comb::AddOp>(op) &&
         !carries.count(&op)) {
@@ -1399,6 +1507,7 @@ bool Scan::matchPatterns() {
         if (!fullPack(vs, pack))
           ok = false;
         p.packs.push_back(pk);
+        p.packVals.push_back(vs);
       }
       if (ok && (!p.packs.empty() || !vecTerms.empty())) {
         p.rest = rest;
@@ -1518,10 +1627,8 @@ bool Scan::matchPatterns() {
       if (order.size() < 2) {
         // A priority tree (find-first): a mux of the left range's OR'ed
         // valids picking the left range's first valid or the right range's.
-        Pattern q{PatKind::Prio, &op};
-        SmallVector<int> qorder;
-        if (matchTree(mux, q, qorder) && finishPrio(q, qorder))
-          add(std::move(q));
+        // Tried after the loop, users first.
+        treeCands.push_back(mux);
         continue;
       }
       p.terminal = cur;
@@ -1529,6 +1636,20 @@ bool Scan::matchPatterns() {
         continue;
       add(std::move(p));
       continue;
+    }
+  }
+  // Trees from the outermost node in: a node inside a tree matched is not
+  // tried; one inside a node that is not a tree (two trees combined, say) is.
+  DenseSet<Operation *> covered;
+  for (comb::MuxOp mux : llvm::reverse(treeCands)) {
+    if (covered.count(mux))
+      continue;
+    Pattern q{PatKind::Prio, mux};
+    SmallVector<int> qorder;
+    if (matchTree(mux, q, qorder) && finishPrio(q, qorder)) {
+      for (auto *o : q.internal)
+        covered.insert(o);
+      add(std::move(q));
     }
   }
   // A tree matched from a subtree's root and from the whole tree's: the
@@ -1590,13 +1711,19 @@ bool Scan::finishPrio(Pattern &p, ArrayRef<int> order) {
       // The conditions: one pack, every lane present (lanes outside the
       // chain take theirs with a lane enable of 0). Values: one pack, or
       // parent values.
+      // Conditions: one pack, or two (a lane whose condition the source
+      // writes differently, the last one compared to nothing, say): one
+      // complete, the other made in every lane, a lane constant picking.
       int pc = -1, pv = -1;
       bool ok = true, scalarVals = false, elemVals = false;
+      llvm::SmallSetVector<int, 4> cps;
       for (int j : order) {
-        int c = packOf.lookup(p.conds[j]);
-        ok &= pc < 0 || c == pc;
-        pc = c;
+        if (!packOf.count(p.conds[j]) || !isElem(p.conds[j]))
+          return false;
+        cps.insert(packOf.lookup(p.conds[j]));
         if (isElem(p.vals[j]) && !backward.count(p.vals[j])) {
+          if (!packOf.count(p.vals[j]))
+            return false;
           int v = packOf.lookup(p.vals[j]);
           ok &= pv < 0 || v == pv;
           pv = v;
@@ -1605,7 +1732,13 @@ bool Scan::finishPrio(Pattern &p, ArrayRef<int> order) {
           scalarVals = true;
         }
       }
-      ok &= !(scalarVals && elemVals) && pc >= 0 && packComplete[pc] &&
+      if (cps.size() == 1)
+        pc = packComplete[cps[0]] ? cps[0] : -1;
+      else if (cps.size() <= 16 && llvm::all_of(cps, [&](int q) {
+                 return packComplete[q] || packFill[q];
+               }))
+        pc = cps[0];
+      ok &= !(scalarVals && elemVals) && pc >= 0 &&
             (pv < 0 || packComplete[pv]);
       return ok;
     }
@@ -1632,7 +1765,12 @@ bool Scan::coneBits(Value v, unsigned b, bool isAnd,
   APInt c;
   if (isConstant(v, c))
     return c[b] == isAnd;
-  if (i.kind == Kind::Scalar) {
+  auto *d = v.getDefiningOp();
+  // A reduction's result is the parent's; a tree's conditions read through it.
+  bool through = coneThroughRed && d &&
+                 isa<comb::OrOp, comb::AndOp, comb::ExtractOp, comb::ConcatOp,
+                     comb::ICmpOp>(d);
+  if (i.kind == Kind::Scalar && !through) {
     if (w != 1)
       return false;
     rest.insert(v);
@@ -1645,7 +1783,6 @@ bool Scan::coneBits(Value v, unsigned b, bool isAnd,
     leaves.insert(l);
     return true;
   }
-  auto *d = v.getDefiningOp();
   if (d && ((isAnd && isa<comb::AndOp>(d)) || (!isAnd && isa<comb::OrOp>(d)))) {
     ops.insert(d);
     for (Value o : d->getOperands())
@@ -1709,7 +1846,16 @@ bool Scan::coneBits(Value v, unsigned b, bool isAnd,
 bool Scan::matchCone(Operation *op) {
   if (op->getNumResults() != 1 || bitWidthOf(op->getResult(0)) != 1)
     return false;
+
   bool isAnd, invert = false;
+  if (isa<comb::ExtractOp>(op)) {
+    // A bit of a packed array of OR (AND) nodes: either kind.
+    isAnd = false;
+    if (matchConeAs(op, false, false))
+      return true;
+    isAnd = true;
+    return matchConeAs(op, true, false);
+  }
   if (isa<comb::OrOp>(op))
     isAnd = false;
   else if (isa<comb::AndOp>(op))
@@ -1735,6 +1881,17 @@ bool Scan::matchCone(Operation *op) {
   } else {
     return false;
   }
+  return matchConeAs(op, isAnd, invert);
+}
+
+bool Scan::matchConeAs(Operation *op, bool isAnd, bool invert) {
+  // From its root only: a value read only by wiring and gates of the cone's
+  // kind is inside a bigger cone.
+  if (!op->getResult(0).use_empty() &&
+      llvm::all_of(op->getResult(0).getUsers(), [&](Operation *u) {
+        return isAnd ? isa<comb::AndOp>(u) : isa<comb::OrOp>(u);
+      }))
+    return false;
   llvm::SetVector<Value> leaves, rest;
   DenseSet<std::pair<Value, unsigned>> seen;
   llvm::SetVector<Operation *> ops;
@@ -1753,23 +1910,61 @@ bool Scan::matchCone(Operation *op) {
     return false;
   }
   llvm::MapVector<int, SmallVector<Value>> byPack;
-  for (Value l : leaves)
+  for (Value l : leaves) {
     byPack[packOf.lookup(l)].push_back(l);
+  }
   Pattern p{PatKind::AC, op};
+  bool full = true;
   for (auto &[pk, vs] : byPack) {
     int pack;
     if (!fullPack(vs, pack))
-      return false;
+      full = false;
     p.packs.push_back(pk);
+    p.packVals.push_back(vs);
   }
   if (p.packs.empty())
     return false;
+  if (!full) {
+    // Several packs, each lane in exactly one: a lane constant picks.
+    if (p.packs.size() > 16 || leaves.size() != F)
+      return false;
+    SmallVector<bool> hit(F, false);
+    for (Value l : leaves) {
+      int j = get(l).lane;
+      int q = packOf.count(l) ? int(packOf.lookup(l)) : -1;
+      if (j < 0 || hit[j] || q < 0 || !(packComplete[q] || packFill[q]))
+        return false;
+      hit[j] = true;
+    }
+    p.mixed = true;
+  }
   p.rest.assign(rest.begin(), rest.end());
   p.acOp = isAnd ? "comb.and" : "comb.or";
   p.invert = invert;
   p.internal.assign(ops.begin(), ops.end());
   patterns[op] = std::move(p);
   red.insert(op->getResult(0));
+  return true;
+}
+
+/// The lanes whose one-bit values an OR cone reads, through wiring (each
+/// lane by one value).
+bool Scan::orCone(Value v, SmallVectorImpl<std::pair<int, Value>> &out) {
+  llvm::SetVector<Value> leaves, rest;
+  DenseSet<std::pair<Value, unsigned>> seen;
+  llvm::SetVector<Operation *> ops;
+  coneThroughRed = true;
+  bool cb = bitWidthOf(v) == 1 &&
+            coneBits(v, 0, false, leaves, rest, seen, ops, 0);
+  coneThroughRed = false;
+  if (!cb || !rest.empty())
+    return false;
+  for (Value l : leaves) {
+    int j = get(l).lane;
+    if (j < 0 || llvm::any_of(out, [&](auto &e) { return e.first == j; }))
+      return false;
+    out.push_back({j, l});
+  }
   return true;
 }
 
@@ -1818,6 +2013,22 @@ bool Scan::treeOf(Value v, SmallVectorImpl<std::pair<int, Value>> &pinned,
       smallTree(v, sp, valid, st, sl)) {
     pinned.append(sp.begin(), sp.end());
     tail = st;
+    // The tree's muxes below: its own (a subtree is not a tree of its own).
+    if (visitLog) {
+      SmallVector<Value> work{v};
+      DenseSet<Value> seen;
+      while (!work.empty() && seen.size() < 4096) {
+        Value x = unalias(work.pop_back_val());
+        auto *d = x.getDefiningOp();
+        if (!d || !seen.insert(x).second ||
+            (get(x).kind != Kind::Multi && get(x).kind != Kind::Pfx))
+          continue;
+        if (isa<comb::MuxOp>(d))
+          visitLog->push_back(d);
+        for (Value o : d->getOperands())
+          work.push_back(o);
+      }
+    }
     return true;
   }
   valid = v0;
@@ -1830,11 +2041,16 @@ bool Scan::treeNode(Value v, SmallVectorImpl<std::pair<int, Value>> &pinned,
   auto m = v.getDefiningOp<comb::MuxOp>();
   if (m && visitLog)
     visitLog->push_back(m);
-  if (!m || depth > 64 || get(v).kind == Kind::Scalar)
+  if (!m || depth > 64 || get(v).kind == Kind::Scalar) {
     return false;
+  }
   SmallVector<std::pair<int, Value>> cl;
-  if (!orLanes(m.getCond(), cl, 0) || cl.empty())
-    return false;
+  if (!orLanes(m.getCond(), cl, 0) || cl.empty()) {
+    // An OR through wiring (a procedural tree's valid array): its cone.
+    cl.clear();
+    if (!orCone(m.getCond(), cl) || cl.empty())
+      return false;
+  }
   for (auto &[l, x] : cl) {
     auto it = valid.find(l);
     if (it != valid.end() && it->second != x)
@@ -2106,12 +2322,9 @@ bool Scan::matchTree(comb::MuxOp root, Pattern &p, SmallVectorImpl<int> &order) 
 
 bool Scan::matchTreeAt(comb::MuxOp root, Pattern &p,
                        SmallVectorImpl<int> &order) {
-  // Only from the root: not a subtree of another tree.
-  for (auto *u : root.getResult().getUsers())
-    if (auto m = dyn_cast<comb::MuxOp>(u))
-      if (m.getCond() != root.getResult() &&
-          get(m.getCond()).kind != Kind::Scalar)
-        return false;
+  // Every node is tried: a subtree inside a matched tree is dropped later
+  // (when the tree's root is all that reads it); one inside a node that is
+  // not a tree (two trees combined, say) stays a tree of its own.
   SmallVector<std::pair<int, Value>> pinned;
   DenseMap<int, Value> valid;
   Value tail;
@@ -2580,6 +2793,42 @@ void LaneScanPass::runOnOperation() {
     std::vector<bool> cellPack(s.packMembers.size());
     for (unsigned p = 0; p < cellPack.size(); ++p)
       cellPack[p] = s.packComplete[p];
+    // The other condition packs of a priority chain, and the packs they
+    // read: made in every lane.
+    {
+      SmallVector<int> fill;
+      auto fillOf = [&](Value c) {
+        if (c && s.packOf.count(c) && s.packFill[s.packOf.lookup(c)] &&
+            !cellPack[s.packOf.lookup(c)]) {
+          cellPack[s.packOf.lookup(c)] = true;
+          fill.push_back(s.packOf.lookup(c));
+        }
+      };
+      for (auto &[r, p] : s.patterns) {
+        if (p.kind == PatKind::Prio)
+          for (Value c : p.conds)
+            fillOf(c);
+        if (p.kind == PatKind::AC && p.mixed)
+          for (auto &vs : p.packVals)
+            fillOf(vs[0]);
+      }
+      while (!fill.empty()) {
+        int q = fill.pop_back_val();
+        for (Value m : s.packMembers[q]) {
+          if (!m || !m.getDefiningOp())
+            continue;
+          for (Value o : m.getDefiningOp()->getOperands())
+            if (s.isLaneVal(o) && s.packOf.count(o) &&
+                s.get(o).lane == s.get(m).lane) {
+              int r = s.packOf.lookup(o);
+              if (!cellPack[r] && s.packFill[r]) {
+                cellPack[r] = true;
+                fill.push_back(r);
+              }
+            }
+        }
+      }
+    }
     DenseSet<Value> cellVec;
     for (auto &op : *body)
       for (Value v : op.getResults())
@@ -2588,7 +2837,7 @@ void LaneScanPass::runOnOperation() {
     auto valueIn = [&](Value v) {
       auto &i = s.get(v);
       if (i.kind == Kind::Elem || i.kind == Kind::Pfx)
-        return bool(cellPack[s.packOf.lookup(v)]);
+        return s.packOf.count(v) && bool(cellPack[s.packOf.lookup(v)]);
       if (i.kind == Kind::Vec)
         return cellVec.count(v) != 0;
       return i.kind == Kind::Scalar;
@@ -2599,7 +2848,7 @@ void LaneScanPass::runOnOperation() {
         for (Value v : op.getResults()) {
           auto &i = s.get(v);
           bool lv = i.kind == Kind::Elem || i.kind == Kind::Pfx;
-          bool in = lv ? bool(cellPack[s.packOf.lookup(v)])
+          bool in = lv ? s.packOf.count(v) && bool(cellPack[s.packOf.lookup(v)])
                        : cellVec.count(v) != 0;
           if (!in || isa<hw::InstanceOp>(op))
             continue;
@@ -2714,8 +2963,26 @@ void LaneScanPass::runOnOperation() {
       bool ok = true;
       switch (p.kind) {
       case PatKind::AC:
+        for (auto [k, vs] : llvm::enumerate(p.packVals)) {
+          int pack;
+          if (p.mixed) {
+            ok &= llvm::all_of(vs, [&](Value v) {
+              return s.packOf.count(v) &&
+                     s.packOf.lookup(v) == s.packOf.lookup(vs[0]);
+            });
+            if (!ok)
+              break;
+            p.packs[k] = s.packOf.lookup(vs[0]);
+            continue;
+          }
+          if (!s.fullPack(vs, pack)) {
+            ok = false;
+            break;
+          }
+          p.packs[k] = pack;
+        }
         for (int pk : p.packs)
-          ok &= cellPack[pk];
+          ok &= ok && cellPack[pk];
         for (Value v : p.vecs)
           ok &= cellVec.count(v) != 0;
         break;
@@ -3343,8 +3610,23 @@ void LaneScanPass::runOnOperation() {
         APInt id = name == "comb.and" ? APInt::getAllOnes(rw) : APInt(rw, 0);
         auto [c, in] = newChain(rt, pconst(rt, id), false);
         SmallVector<Value> operands{in};
-        for (int pk : p->packs)
-          operands.push_back(cellValue(s.tmpl(pk)));
+        if (p->mixed) {
+          // Each lane's value from its pack.
+          Value v = cellValue(s.tmpl(p->packs[0]));
+          for (auto [k, vs] : llvm::enumerate(p->packVals)) {
+            if (k == 0)
+              continue;
+            SmallVector<int64_t> inK(F, 0);
+            for (Value x : vs)
+              inK[s.get(x).lane] = 1;
+            v = comb::MuxOp::create(b, laneConst(b.getI1Type(), inK),
+                                    cellValue(s.tmpl(p->packs[k])), v, false);
+          }
+          operands.push_back(v);
+        } else {
+          for (int pk : p->packs)
+            operands.push_back(cellValue(s.tmpl(pk)));
+        }
         for (Value v : p->vecs) {
           Value bit = cellValue(v);
           if (rw > 1)
@@ -3435,6 +3717,23 @@ void LaneScanPass::runOnOperation() {
           }
         int pc = s.packOf.lookup(p->conds[lane0]);
         Value cond = cellValue(s.tmpl(pc));
+        {
+          // Several condition packs (lanes whose conditions the source or
+          // the canonicalizer write differently): lane constants pick.
+          llvm::SmallSetVector<int, 4> cps;
+          for (unsigned j = 0; j < F; ++j)
+            if (p->conds[j])
+              cps.insert(s.packOf.lookup(p->conds[j]));
+          for (int q : cps) {
+            if (q == pc)
+              continue;
+            SmallVector<int64_t> inQ;
+            for (unsigned j = 0; j < F; ++j)
+              inQ.push_back(p->conds[j] && s.packOf.lookup(p->conds[j]) == q);
+            cond = comb::MuxOp::create(b, laneConst(b.getI1Type(), inQ),
+                                       cellValue(s.tmpl(q)), cond, false);
+          }
+        }
         SmallVector<int64_t> en;
         for (unsigned j = 0; j < F; ++j)
           en.push_back(p->conds[j] ? 1 : 0);
