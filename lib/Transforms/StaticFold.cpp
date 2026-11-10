@@ -420,6 +420,9 @@ static constexpr unsigned kRingQueue = 64;
 /// `vmem-rings`: the host cycles an image's `free` may take to show the
 /// requests taken.
 static constexpr unsigned kRingFreeLag = 4;
+/// `link-hbm-beat-bits` on page engines: the most positions a stream's
+/// requests move earlier, or its writes later, to share an engine.
+static constexpr int kLinkHbmMaxOffset = 1024;
 /// The control stages from a slot table's read to its pass: the state and
 /// ready passes' two staged registers and the one that makes them now.
 static constexpr int kControlStages = 3;
@@ -5220,7 +5223,7 @@ LogicalResult StaticFolder::assignPageEngines() {
     // landing's beats before its request position, each page's after its
     // write position), on the first engine where they are all free, else a
     // new one.
-    if (st.beats > 1) {
+    if (st.beats > 1 || linkHbmBeatBits) {
       // Every row's requests moved `sr` earlier and its writes `sw` later
       // (the same for all: the tables stay shifted copies), within the
       // stream's room past the beats' own moves, each request after its
@@ -5232,10 +5235,10 @@ LogicalResult StaticFolder::assignPageEngines() {
         int back = i < 0 ? (-i + n - 1) / n : 0;
         return int(wrap(st.landings[i + back * n].q)) - back * frame;
       };
-      int maxR = std::max(0, std::min(budget, 64));
+      int maxR = std::max(0, std::min(budget, kLinkHbmMaxOffset));
       for (int i = 0; i < n && maxR >= 0; ++i)
         maxR = std::min(maxR, landingAt(i) - int(st.lead) - (kb - 1) - (landingAt(i - slots) + 8));
-      int maxW = std::max(0, std::min(budget, 64));
+      int maxW = std::max(0, std::min(budget, kLinkHbmMaxOffset));
       for (size_t x = 0; x < st.writePasses.size(); ++x) {
         int w = st.writePasses[x];
         int next = x + 1 < st.writePasses.size() ? st.writePasses[x + 1] : st.writePasses[0] + frame;
@@ -5282,6 +5285,11 @@ LogicalResult StaticFolder::assignPageEngines() {
                  << modelOf(st.pcls) << " -> " << modelOf(st.rcls);
         newEngine();
       }
+      if (getenv("FOLDSIM_BEAT_LOG"))
+        llvm::errs() << "link-hbm engines: " << modelOf(st.pcls) << " -> " << modelOf(st.rcls)
+                     << " beats " << kb << " budget " << budget << " maxR " << maxR << " maxW "
+                     << maxW << ": engine " << e << (found ? "" : " (new)") << " sr " << sr
+                     << " sw " << sw << "\n";
       st.requestOffset = unsigned(sr);
       st.writeOffset = unsigned(sw);
       if (sr || sw) {
@@ -5290,7 +5298,7 @@ LogicalResult StaticFolder::assignPageEngines() {
           requests.push_back(l.q - int(st.lead) - sr);
         for (int w : st.writePasses)
           for (unsigned j = 0; j < st.pages; ++j)
-            writes.push_back(w + 1 + int(j));
+            writes.push_back(w + 1 + sw + int(j));
         bool collide = false;
         setStreamTables(st, requests, writes, collide);
         st.writeShift = unsigned(sw);
