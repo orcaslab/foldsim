@@ -22753,6 +22753,10 @@ LogicalResult StaticFolder::buildSim() {
       /// registers made before their users, their next values set below).
       Backedge readGrantedNext, writeGrantedNext;
       Value readGranted, writeGranted;
+      /// Shared: the image's requests that left a host cycle ago (each
+      /// ring's registered), whose sum the room's flags take, and the chain
+      /// of older ones (sent2..) it starts.
+      Backedge actualNext;
       Value enough, enough2;
       std::string prefix;
       SmallVector<Value> readCands, writeCands, reads, writes;
@@ -22925,8 +22929,20 @@ LogicalResult StaticFolder::buildSim() {
               share.prefix = (fp + "_img" + Twine(img)).str();
               Value freeImg = body->getArgument(simVirtuals[imageOf.at({unsigned(c), vk})].firstInput + 3);
               share.sentNext = backedges.get(b.getIntegerType(2));
+              unsigned rings = imageMembers.count(img) ? imageMembers[img].size() : 1;
               SmallVector<Value> lag{resetReg(share.sentNext, share.prefix + "_sent1", 0)};
-              for (unsigned l = 2; l <= kRingFreeLag; ++l)
+              // (Shared: sent1 the newest host cycle's grants (at most one
+              // more than left), the older the requests that left, as the
+              // rings' registered requests sum them a host cycle on.)
+              Value actual;
+              if (rings > 1) {
+                share.actualNext = backedges.get(b.getIntegerType(2));
+                actual = share.actualNext;
+                lag.push_back(resetReg(actual, share.prefix + "_sent2", 0));
+              } else {
+                lag.push_back(resetReg(lag.back(), share.prefix + "_sent2", 0));
+              }
+              for (unsigned l = 3; l <= kRingFreeLag; ++l)
                 lag.push_back(resetReg(lag.back(), share.prefix + "_sent" + Twine(l), 0));
               // The room, registered: a host cycle late, `free` misses the
               // requests of one host cycle more, the last (sent1) taken at
@@ -22935,8 +22951,10 @@ LogicalResult StaticFolder::buildSim() {
               // free) is flag 2 + 2 x sent1, for two flag 4 + 2 x sent1 (the
               // adders and compares off the requests' path).
               Value recent = constant(fw, 0);
-              for (Value x : lag)
-                recent = comb::AddOp::create(b, recent, b.createOrFold<comb::ConcatOp>(constant(fw - 2, 0), x));
+              for (auto [l, x] : llvm::enumerate(lag))
+                recent = comb::AddOp::create(
+                    b, recent,
+                    b.createOrFold<comb::ConcatOp>(constant(fw - 2, 0), l == 0 && actual ? actual : x));
               Value used = comb::ShlOp::create(b, recent, constant(fw, 1));
               Value credit = comb::SubOp::create(b, freeImg, used);
               Value covers = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, freeImg, used);
@@ -22955,12 +22973,12 @@ LogicalResult StaticFolder::buildSim() {
               };
               share.enough = room(0);
               share.enough2 = room(1);
-              share.rings = imageMembers.count(img) ? imageMembers[img].size() : 1;
+              share.rings = rings;
               if (share.rings > 1) {
                 share.readGrantedNext = backedges.get(i1);
                 share.writeGrantedNext = backedges.get(i1);
-                share.readGranted = resetReg(share.readGrantedNext, share.prefix + "_rd_granted", 0);
-                share.writeGranted = resetReg(share.writeGrantedNext, share.prefix + "_wr_granted", 0);
+                share.readGranted = share.readGrantedNext;
+                share.writeGranted = share.writeGrantedNext;
               }
               share.anyWrite = backedges.get(i1);
             }
@@ -22985,8 +23003,7 @@ LogicalResult StaticFolder::buildSim() {
             Value wany = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, wcount, constant(wb + 1, 0));
             Value wcand = comb::AndOp::create(b, wany, enough);
             auto wgrantNext = backedges.get(i1);
-            Value wgrant = share.rings > 1 ? resetReg(wgrantNext, share.prefix + "_wr_grant" + Twine(share.keys.size()), 0)
-                                           : Value(wgrantNext);
+            Value wgrant = wgrantNext;
             Value wgo = comb::AndOp::create(b, wcand, wgrant);
             share.writeCands.push_back(wcand);
             share.writeGrants.push_back(wgrantNext);
@@ -23006,13 +23023,8 @@ LogicalResult StaticFolder::buildSim() {
                                                   share.enough2, enough)},
                 false);
             auto rgrantNext = backedges.get(i1);
-            Value rgrant = share.rings > 1 ? resetReg(rgrantNext, share.prefix + "_rd_grant" + Twine(share.keys.size()), 0)
-                                           : Value(rgrantNext);
+            Value rgrant = rgrantNext;
             rb.issValid = comb::AndOp::create(b, rcand, rgrant);
-            if (share.rings > 1) {
-              rb.issGrant = rgrant;
-              rb.wissGrant = wgrant;
-            }
             share.keys.push_back({unsigned(c), vk});
             share.readCands.push_back(rcand);
             share.readGrants.push_back(rgrantNext);
@@ -23092,11 +23104,11 @@ LogicalResult StaticFolder::buildSim() {
             b.createOrFold<comb::ConcatOp>(constant(1, 0), anyRead)));
         continue;
       }
-      auto pick = [&](ArrayRef<Value> live, const Twine &n) -> std::pair<SmallVector<Value>, Value> {
+      auto pick = [&](ArrayRef<Value> live, const Twine &n, bool direct) -> std::pair<SmallVector<Value>, Value> {
         unsigned r = live.size();
         SmallVector<Value> cands;
         for (auto [j, x] : llvm::enumerate(live))
-          cands.push_back(resetReg(x, share.prefix + n + "_cand" + Twine(j), 0));
+          cands.push_back(direct ? x : resetReg(x, share.prefix + n + "_cand" + Twine(j), 0));
         unsigned pb = llvm::Log2_32_Ceil(r);
         auto ptrNext = backedges.get(b.getIntegerType(pb));
         Value ptr = resetReg(ptrNext, share.prefix + n + "_turn", 0);
@@ -23119,18 +23131,34 @@ LogicalResult StaticFolder::buildSim() {
           grants.push_back(comb::MuxOp::create(b, anyHi, first(hi, j), first(cands, j)));
         return {grants, comb::OrOp::create(b, cands, false)};
       };
-      auto [rg, rAny] = pick(share.readCands, "_rd");
-      auto [wg, wAny] = pick(share.writeCands, "_wr");
+      // (The writes' candidates are shallow (a count and the room's flags):
+      // their grants from them directly, a host cycle ahead; the reads'
+      // from their registers.)
+      auto [rg, rAny] = pick(share.readCands, "_rd", false);
+      auto [wg, wAny] = pick(share.writeCands, "_wr", false);
+      {
+        SmallVector<Value> rs, ws;
+        for (auto [j, x] : llvm::enumerate(share.reads))
+          rs.push_back(resetReg(x, share.prefix + "_rd_went" + Twine(j), 0));
+        for (auto [j, x] : llvm::enumerate(share.writes))
+          ws.push_back(resetReg(x, share.prefix + "_wr_went" + Twine(j), 0));
+        share.actualNext.setValue(comb::AddOp::create(
+            b, b.createOrFold<comb::ConcatOp>(constant(1, 0), comb::OrOp::create(b, ws, false)),
+            b.createOrFold<comb::ConcatOp>(constant(1, 0), comb::OrOp::create(b, rs, false))));
+      }
       for (unsigned j = 0; j < rg.size(); ++j) {
         share.readGrants[j].setValue(rg[j]);
         share.writeGrants[j].setValue(wg[j]);
+        auto &rb = ringBuilt.at(share.keys[j]);
+        rb.issGrant = rg[j];
+        rb.wissGrant = wg[j];
       }
       share.readGrantedNext.setValue(rAny);
       share.writeGrantedNext.setValue(wAny);
-      share.anyWrite.setValue(share.writeGranted);
+      share.anyWrite.setValue(wAny);
       share.sentNext.setValue(comb::AddOp::create(
-          b, b.createOrFold<comb::ConcatOp>(constant(1, 0), share.writeGranted),
-          b.createOrFold<comb::ConcatOp>(constant(1, 0), share.readGranted)));
+          b, b.createOrFold<comb::ConcatOp>(constant(1, 0), wAny),
+          b.createOrFold<comb::ConcatOp>(constant(1, 0), rAny)));
     }
     for (auto &v : simVirtuals) {
       // `vmem-rings`: an image's requests (its queued prefetches and its
