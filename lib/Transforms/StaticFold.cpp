@@ -564,6 +564,8 @@ public:
     Value valid3, inst3, row3;
     /// Partly resident: whether the pass's instance streams (else null).
     Value streamed3;
+    /// The prefetch's window slot by position (`ppfslot3`, three ahead).
+    Value prefSlot3;
   };
   /// Builds a streamed PP class's HBM rows: a virtual memory a chunk of
   /// columns (at most 4,096 bits), the prefetches' responses written into
@@ -8401,6 +8403,19 @@ LogicalResult StaticFolder::planStateInRam() {
              << "' is not <glob>[:<min-bits>[:<P>|auto]], P at least 1";
     specs.push_back(spec);
   }
+  // state-scratch-fixed: the longest sweep of a class (instances x its
+  // passes or pages), a bound under the frame (below).
+  uint64_t maxSweep = 0;
+  for (auto &cls : classes) {
+    StringRef base = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
+                                        : StringRef(cls.name);
+    unsigned passes = std::max(1u, cls.page);
+    for (auto &spec : specs)
+      if (auto glob = llvm::GlobPattern::create(spec.glob);
+          glob && glob->match(base) && spec.passes)
+        passes = spec.passes;
+    maxSweep = std::max<uint64_t>(maxSweep, uint64_t(cls.threads()) * passes);
+  }
   for (auto &cls : classes) {
     StringRef base = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
                                         : StringRef(cls.name);
@@ -8514,6 +8529,18 @@ LogicalResult StaticFolder::planStateInRam() {
     // RAM the same.)
     if (style.empty())
       style = !stateScratchFixed && uint64_t(entries) * p <= 512 ? "block" : "ultra";
+    // state-scratch-fixed, PP: P a power of two where its sweep stays within
+    // the longest class sweep (the frame is at least that: no II), so that
+    // the passes' positions and the streamed rows' tables (the resident
+    // index, stream bit, window slot) are a power-of-two period's digits.
+    if (stateScratchFixed && stateInRamPP && p > 1 && !llvm::isPowerOf2_32(p) &&
+        uint64_t(threads) * llvm::PowerOf2Ceil(p) <= maxSweep) {
+      llvm::errs() << "foldsim-fold-static: state-in-ram: " << cls.name
+                   << ": state-scratch-fixed: P " << p << " -> " << llvm::PowerOf2Ceil(p)
+                   << " (sweep " << uint64_t(threads) * llvm::PowerOf2Ceil(p)
+                   << " within " << maxSweep << ")\n";
+      p = unsigned(llvm::PowerOf2Ceil(p));
+    }
     cls.sir = p;
     cls.sirStyle = style;
     cls.rowStateBits = bits;
@@ -8529,7 +8556,10 @@ LogicalResult StaticFolder::planStateInRam() {
     if (p == 1 && storageFor(cls, "sir-rows", /*reg=*/false, 0))
       return netlist.emitError("state-in-ram: ")
              << cls.name << ": sir-rows needs P > 1 (its rows are pages)";
-    if (p > 1 && stateInRamPP) {
+    // (state-scratch-fixed: P 1 too, one pass a row, so that the fixed
+    // scratch streams it as a PP class's rows: a P 1 row kept in place
+    // would be on chip whole at every count.)
+    if ((p > 1 || (stateScratchFixed && stateScratchFixedPP)) && stateInRamPP) {
       // CSF pass-partitioned (PP): no pages. Pass j reads row j in place and
       // writes it from the logic; the class is staged with P stages
       // (chooseStages), its copy's passes P apart (passSpacing).
@@ -13600,8 +13630,31 @@ LogicalResult StaticFolder::buildPPStream(
   // bits are the window's slots' (a port as wide as the window).
   // (Registered: the slot table after the position tables, a host cycle
   // before the prefetch's first read leaves at stage 0.)
-  Value startSlot = reg(ppStreamSlot(cls, b, idxWidth ? offChip3[1] : Value()),
+  Value startSlot = reg(ports.prefSlot3 ? ports.prefSlot3
+                                        : ppStreamSlot(cls, b, idxWidth ? offChip3[1] : Value()),
                         "pps_start_slot2");
+  // Each slot's instance, recorded as its prefetch starts: a response's slot
+  // is the one holding its instance (a slot holds one instance at a time),
+  // a compare a slot, not a table of the instances.
+  SmallVector<Value> slotInst;
+  if (idxWidth && slotBits) {
+    Value startInst2 = reg(offChip3[1], "pps_start_inst2");
+    for (unsigned w = 0; w < cls.pageWindow; ++w) {
+      auto next = edges.get(bits(idxWidth));
+      Value held = reg(next, "pps_slot_inst" + Twine(w));
+      Value here = resetReg(comb::AndOp::create(
+                          b, offChip3[0],
+                          comb::AndOp::create(
+                              b, isRow(offChip3[2], 0),
+                              comb::ICmpOp::create(b, comb::ICmpPredicate::eq,
+                                                   ports.prefSlot3 ? ports.prefSlot3
+                                                                   : ppStreamSlot(cls, b, offChip3[1]),
+                                                   constant(slotBits, w)))),
+                      "pps_slot_set2_" + Twine(w));
+      next.setValue(comb::MuxOp::create(b, here, startInst2, held));
+      slotInst.push_back(held);
+    }
+  }
   Value first2 = resetReg(first3, "pps_first2");
   auto slotBit = [&](Value slot) -> Value {
     Value index = slotBits ? slot : constant(1, 0);
@@ -13648,7 +13701,20 @@ LogicalResult StaticFolder::buildPPStream(
     Value rspInstance =
         idxWidth ? b.createOrFold<comb::ExtractOp>(bits(idxWidth), rspAt, rowBits)
                  : Value();
-    Value rspSlot = ppStreamSlot(cls, b, rspInstance);
+    Value rspSlot;
+    if (!slotInst.empty()) {
+      // The slot holding the response's instance (one-hot over the slots).
+      SmallVector<Value> hit;
+      for (auto held : slotInst)
+        hit.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::eq, held, rspInstance));
+      Value acc = constant(slotBits, 0);
+      for (unsigned w = 0; w < hit.size(); ++w)
+        acc = comb::OrOp::create(
+            b, acc, comb::MuxOp::create(b, hit[w], constant(slotBits, w), constant(slotBits, 0)));
+      rspSlot = acc;
+    } else {
+      rspSlot = ppStreamSlot(cls, b, rspInstance);
+    }
     Value writeAt = slotBits ? b.createOrFold<comb::ConcatOp>(rspSlot, rspRow) : rspRow;
     for (unsigned c = 0; c < n; ++c) {
       auto memory = columns[lo + c];
@@ -14266,8 +14332,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       addPort("ppres3", IntegerType::get(context, cls.ppResBits()), true);
       addPort("ppstr3", IntegerType::get(context, 1), true);
     }
-    if (cls.ppHbm)
+    if (cls.ppHbm) {
       addPort("ppslot3", IntegerType::get(context, cls.ppSlotBits()), true);
+      addPort("ppfslot3", IntegerType::get(context, cls.ppSlotBits()), true);
+    }
   }
   SmallVector<unsigned> inputArg(cls.inputNames.size(), 0);
   for (auto [i, name] : llvm::enumerate(cls.inputNames)) {
@@ -14421,7 +14489,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   BackedgeBuilder ppEdges(b, model.getLoc());
   SmallVector<PPReg> ppRegs;
   Operation *ppHeld = nullptr;
-  Value ppValid3, ppInst3, ppRow3, ppRinst0, ppRes3, ppStr3, ppSlotIn3;
+  Value ppValid3, ppInst3, ppRow3, ppRinst0, ppRes3, ppStr3, ppSlotIn3, ppPrefSlot3;
   if (cls.pp) {
     ppValid3 = body->getArgument(ppArg);
     if (threads > 1)
@@ -14433,8 +14501,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       ppRes3 = body->getArgument(next++);
       ppStr3 = body->getArgument(next++);
     }
-    if (cls.ppHbm)
+    if (cls.ppHbm) {
       ppSlotIn3 = body->getArgument(next++);
+      ppPrefSlot3 = body->getArgument(next++);
+    }
   }
   if (cls.stages) {
     auto chain = [&](Value value, unsigned regs, const Twine &name) {
@@ -16209,7 +16279,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         if (colHbm(c))
           memories.push_back(col.memory);
       PPStreamPorts ports{copy, body, hostClock, offChip3, ppValid3, ppInst3,
-                          ppRow3, str3};
+                          ppRow3, str3, ppPrefSlot3};
       if (failed(buildPPStream(cls, b, ports, memories, streamWrites, lanes,
                                pageRequests)))
         return failure();
@@ -18087,7 +18157,7 @@ LogicalResult StaticFolder::buildSim() {
     Value live3, pre3;
     /// CSF PP (state-in-ram-pp): whether the position three host cycles
     /// ahead is a pass of a state evaluation, its instance and its row.
-    Value ppValid3, ppInst3, ppRow3, ppRes3, ppStr3, ppSlot3;
+    Value ppValid3, ppInst3, ppRow3, ppRes3, ppStr3, ppSlot3, ppPrefSlot3;
   };
   SmallVector<Controls, 0> controls(classes.size());
   // Staged classes: what each reads at a position, its stages before each
@@ -18348,6 +18418,16 @@ LogicalResult StaticFolder::buildSim() {
             pslotRow[unsigned(r) % ii] = cls.windowSlot[i];
           }
         ctl.ppSlot3 = table(b, at, pslotRow, cls.ppSlotBits());
+        // And each prefetch read's slot (its instance's), by position.
+        SmallVector<int> pf;
+        ppPrefetches(cls, cls.pageWindow, pf);
+        SmallVector<uint64_t> pfSlotRow(ii + 1, 0);
+        for (unsigned i = 0; i < threads; ++i)
+          for (unsigned j = 0; j < cls.pp && cls.ppStreamed[i]; ++j) {
+            int pos = pf[i] + int(j);
+            pfSlotRow[unsigned(((pos % int(ii)) + int(ii)) % int(ii))] = cls.windowSlot[i];
+          }
+        ctl.ppPrefSlot3 = table(b, at, pfSlotRow, cls.ppSlotBits());
       }
     }
   }
@@ -18789,8 +18869,10 @@ LogicalResult StaticFolder::buildSim() {
         operands.push_back(controls[c].ppRes3);
         operands.push_back(controls[c].ppStr3);
       }
-      if (cls.ppHbm)
+      if (cls.ppHbm) {
         operands.push_back(controls[c].ppSlot3);
+        operands.push_back(controls[c].ppPrefSlot3);
+      }
     }
     for (auto [i, type] : llvm::enumerate(cls.inputTypes)) {
       if (int(i) == cls.clockInput)
