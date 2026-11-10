@@ -13818,6 +13818,14 @@ LogicalResult StaticFolder::chooseStreamWindows() {
   SmallVector<uint64_t> spreadBits(kStreamMasters, 0);
   unsigned nextSpread = 0;
   uint64_t hbmSpread = 0;
+  // Each streamed class's chunks' bits a frame, few and spread, in order
+  // (the controllers' order, their masters in turn), and the fold stores'.
+  struct ChunkBits {
+    Class *cls;
+    SmallVector<uint64_t> few, spread;
+  };
+  SmallVector<ChunkBits> chunkBits;
+  SmallVector<uint64_t> foldChunks;
   for (auto &cls : classes) {
     if (!cls.ppHbm)
       continue;
@@ -13927,18 +13935,21 @@ LogicalResult StaticFolder::chooseStreamWindows() {
       columns = unsigned(llvm::divideCeil(uint64_t(columns) * 112, 100));
     columns -= std::min(columns - 1, cls.ppResidentColumns);
     uint64_t bits = 0;
+    chunkBits.push_back({&cls, {}, {}});
     for (unsigned k = 0, e = ppChunks(columns, false); k < e; ++k) {
       auto [lo, hi] = ppChunk(columns, false, k);
       // A row of the chunk moves its whole power-of-two bytes.
       uint64_t chunk = 2 * uint64_t(n) * P * ppChunkMoveBits(hi - lo);
       masterBits[nextMaster++ % kStreamMasters] += chunk;
       bits += chunk;
+      chunkBits.back().few.push_back(chunk);
     }
     for (unsigned k = 0, e = ppChunks(columns, true); k < e; ++k) {
       auto [lo, hi] = ppChunk(columns, true, k);
       uint64_t chunk = 2 * uint64_t(n) * P * ppChunkMoveBits(hi - lo);
       spreadBits[nextSpread++ % kStreamMasters] += chunk;
       hbmSpread += chunk;
+      chunkBits.back().spread.push_back(chunk);
     }
     hbmBits += bits;
     llvm::errs() << "foldsim-fold-static: state-stream: " << cls.name << ": P "
@@ -13966,6 +13977,7 @@ LogicalResult StaticFolder::chooseStreamWindows() {
             uint64_t bits = (vmemRingLead ? 4 : 2) * uint64_t(cls.threads()) * row;
             masterBits[nextMaster++ % kStreamMasters] += bits;
             spreadBits[nextSpread++ % kStreamMasters] += bits;
+            foldChunks.push_back(bits);
             foldBits += bits;
           }
   if (foldBits)
@@ -13980,21 +13992,59 @@ LogicalResult StaticFolder::chooseStreamWindows() {
       return std::max(llvm::divideCeil(total, kStreamBitsPerCycle),
                       llvm::divideCeil(*llvm::max_element(masters), perMaster));
     };
-    // The chunks spread over the masters only where the few would bound
-    // the frame and spreading lowers that bound.
-    bool spread = bwOf(hbmBits, masterBits) > ii &&
-                  bwOf(hbmSpread, spreadBits) < bwOf(hbmBits, masterBits);
-    for (auto &cls : classes)
-      if (cls.ppHbm)
-        cls.ppChunkSpread = spread;
-    if (spread) {
-      masterBits = spreadBits;
-      hbmBits = hbmSpread;
+    // A class's chunks spread over the masters only where the few would
+    // bound the frame: the class whose spreading lowers that bound the most,
+    // one at a time, while it binds (controllers only where the bandwidth
+    // needs them).
+    SmallVector<bool> spreadOf(chunkBits.size(), false);
+    auto mastersOf = [&](ArrayRef<bool> choice, uint64_t &total) {
+      SmallVector<uint64_t> m(kStreamMasters, 0);
+      unsigned next = 0;
+      total = 0;
+      for (auto [x, cb] : llvm::enumerate(chunkBits))
+        for (uint64_t c : choice[x] ? cb.spread : cb.few) {
+          m[next++ % kStreamMasters] += c;
+          total += c;
+        }
+      for (uint64_t c : foldChunks) {
+        m[next++ % kStreamMasters] += c;
+        total += c;
+      }
+      return m;
+    };
+    uint64_t total = 0;
+    masterBits = mastersOf(spreadOf, total);
+    unsigned spreadCount = 0;
+    while (bwOf(total, masterBits) > ii) {
+      int best = -1;
+      uint64_t bestBw = bwOf(total, masterBits);
+      for (size_t x = 0; x < chunkBits.size(); ++x) {
+        if (spreadOf[x] || chunkBits[x].spread.size() == chunkBits[x].few.size())
+          continue;
+        spreadOf[x] = true;
+        uint64_t t = 0;
+        auto m = mastersOf(spreadOf, t);
+        spreadOf[x] = false;
+        if (bwOf(t, m) < bestBw) {
+          bestBw = bwOf(t, m);
+          best = int(x);
+        }
+      }
+      if (best < 0)
+        break;
+      spreadOf[best] = true;
+      ++spreadCount;
+      masterBits = mastersOf(spreadOf, total);
     }
+    for (auto [x, cb] : llvm::enumerate(chunkBits))
+      cb.cls->ppChunkSpread = spreadOf[x];
+    hbmBits = total;
+    (void)hbmSpread;
     uint64_t busiest = *llvm::max_element(masterBits);
     uint64_t bw = bwOf(hbmBits, masterBits);
-    if (spread)
-      llvm::errs() << "foldsim-fold-static: state-stream: chunks spread over the masters\n";
+    if (spreadCount)
+      llvm::errs() << "foldsim-fold-static: state-stream: " << spreadCount
+                   << " classes' chunks spread over the masters\n";
     llvm::errs() << "foldsim-fold-static: state-stream: II_sched " << ii
                  << ", HBM state bits a frame " << hbmBits
                  << " (busiest master " << busiest << "), II_bw " << bw << " ("
