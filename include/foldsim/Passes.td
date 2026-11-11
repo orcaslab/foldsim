@@ -718,6 +718,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "beat by beat (no pass spaced: only where the landings and the "
            "producer's passes leave the positions, else whole rows). A "
            "controller costs its width (0: whole rows)">,
+    Option<"linkLandingBlock", "link-landing-block", "unsigned", "0",
+           "An HBM link stream's (or mailbox's) landing memory in block RAM, "
+           "its read registered and addressed a host cycle ahead (the pop "
+           "pointer's next value), where its distributed RAM would cost at "
+           "least this many LUTs a RAMB36 it takes (the count's prices: a "
+           "masked one 2 LUTs a bit a 64 entries); 0: distributed RAM">,
     Option<"linkHbmBeatRows", "link-hbm-beat-rows", "bool", "false",
            "With link-hbm-beat-bits: a stream of beats lands in rows of a "
            "beat ({slot, beat}: its landing memory as deep as slots x beats "

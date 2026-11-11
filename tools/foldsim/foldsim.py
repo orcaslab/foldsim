@@ -483,6 +483,8 @@ def frame_options(a):
         fold += f' link-hbm-beat-bits={a.link_hbm_beat_bits}'
     if getattr(a, 'link_hbm_beat_rows', False):
         fold += ' link-hbm-beat-rows'
+    if getattr(a, 'link_landing_block', 0):
+        fold += f' link-landing-block={a.link_landing_block}'
     if getattr(a, 'link_hbm_row_bits', 0):
         fold += f' link-hbm-row-bits={a.link_hbm_row_bits}'
     if getattr(a, 'link_hbm_min_lead', 0):
@@ -1775,6 +1777,10 @@ def build_parser():
                     help='with --static and hbm link kinds: a stream row wider than N bits moves as beats of '
                          'a controller N bits wide where the positions allow (foldsim-fold-static '
                          'link-hbm-beat-bits; 0: whole rows)')
+    ap.add_argument('--link-landing-block', type=int, default=0, metavar='R',
+                    help='HBM link streams\' landing memories in block RAM (a registered read a host cycle '
+                         'ahead) where their distributed RAM costs at least R LUTs a RAMB36 (foldsim-fold-static '
+                         'link-landing-block)')
     ap.add_argument('--link-hbm-beat-rows', action='store_true',
                     help='with --link-hbm-beat-bits: a stream of beats lands in rows of a beat (a landing '
                          'memory slots x beats deep and a beat wide), read beat by beat into its members\' '

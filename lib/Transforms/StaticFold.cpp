@@ -941,6 +941,12 @@ public:
   /// after its first, which comes that many positions before the landing's
   /// own (popShift).
   bool linkHbmBeatRows = false;
+  /// `link-landing-block R`: an HBM link stream's landing memory in block
+  /// RAM (a registered read, its address a host cycle ahead) where its
+  /// distributed RAM costs at least R LUTs a RAMB36 it would take; 0: none.
+  unsigned linkLandingBlock = 0;
+  unsigned landingBlocks = 0, landingBlockMems = 0;
+  double landingBlockLuts = 0;
   bool pageEnginesPP = false;
   /// `pp-beat-bits`: see PPBeats.
   unsigned ppBeatBits = 0;
@@ -11905,6 +11911,23 @@ static Value heldReadRow(seq::FirMemReadOp read) {
   return rebuild(read.getAddress());
 }
 
+/// A memory's distributed-RAM LUTs and block RAMs (RAMB36) as the count
+/// prices them (foldsim_cost.mem_cost, 11-11: a masked distributed RAM is
+/// 2 LUTs a bit a 64 entries, of dual-port single-bit primitives).
+static std::pair<double, unsigned> landingPrices(uint64_t depth, unsigned width,
+                                                 unsigned lanes) {
+  double blocks64 = std::ceil(depth / 64.0);
+  double lut;
+  if (lanes > 1)
+    lut = width * blocks64 * 2.0 + (depth > 64 ? width * (blocks64 - 1) / 3 : 0);
+  else if (depth <= 32)
+    lut = width * 0.57;
+  else
+    lut = width * blocks64 * 1.14 + (depth > 64 ? width * (blocks64 - 1) / 3 : 0);
+  unsigned bram = unsigned(llvm::divideCeil(width, 72) * llvm::divideCeil(depth, 512));
+  return {lut, std::max(bram, 1u)};
+}
+
 /// Sets an operation's Vivado ram_style, replacing any it has.
 static void setRamStyle(Operation *op, StringRef kind) {
   auto *context = op->getContext();
@@ -21947,6 +21970,20 @@ LogicalResult StaticFolder::buildSim() {
         b, sb.popPtr, b.createOrFold<comb::ConcatOp>(constant(ib - 1, 0), take0)));
     // (Beats: the slot written a beat at a time, its mask the beat's.)
     unsigned kb = st.beats, bw = st.beatWidth(), bb = st.beatBits();
+    // link-landing-block: block RAM where the distributed RAM costs at
+    // least linkLandingBlock LUTs a RAMB36 (the count's prices).
+    auto landingBlock = [&](uint64_t depth, unsigned width, unsigned lanes) {
+      if (!linkLandingBlock)
+        return false;
+      auto [lut, bram] = landingPrices(depth, width, lanes);
+      if (lut < double(linkLandingBlock) * bram)
+        return false;
+      landingBlocks += bram;
+      landingBlockLuts += lut;
+      ++landingBlockMems;
+      return true;
+    };
+    bool landBlock = false;
     if (popShift(st)) {
       // `link-hbm-beat-rows`: the landing a row a beat, {slot, beat}, read a
       // beat a host cycle from the landing's first (the pop: the pointer
@@ -21972,17 +22009,31 @@ LogicalResult StaticFolder::buildSim() {
       Value skipR = resetReg(skipNext, prefix + "_popskip", 0);
       Value skipAt = comb::MuxOp::create(b, pop0, skip0, skipR);
       skipNext.setValue(skipAt);
+      // (link-landing-block: a registered read of the address a host cycle
+      // ahead, from the registers' next values. A slot's beats have all
+      // landed by the pop's decision, several host cycles before the read,
+      // and its next landing comes after its next request: no write a host
+      // cycle before a read of its row.)
+      bool block = landBlock = landingBlock(uint64_t(slots) << bb, bw, 1);
       auto landing = seq::FirMemOp::create(
           b, seq::FirMemType::get(context, uint64_t(slots) << bb, bw, 1),
-          /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
+          /*readLatency=*/block ? 1 : 0, /*writeLatency=*/1,
+          block ? seq::RUW::Old : seq::RUW::Undefined, seq::WUW::Undefined,
           b.getStringAttr(prefix + "_landing"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
           StringAttr{}, Attribute{});
+      if (block)
+        setRamStyle(landing, "block");
       seq::FirMemWriteOp::create(b, landing,
                                  b.createOrFold<comb::ConcatOp>(rspInst, rspBeat),
                                  hostClock, rsp, rspData, Value{});
-      Value read = seq::FirMemReadOp::create(
-          b, landing, b.createOrFold<comb::ConcatOp>(slotAt, beat), hostClock,
-          constant(1, 1));
+      Value addr = b.createOrFold<comb::ConcatOp>(slotAt, beat);
+      if (block) {
+        Value popNow = sb.pop1;   // pop0 a host cycle ahead
+        Value slotAhead = comb::MuxOp::create(b, popNow, Value(popNext), Value(slotNext));
+        Value beatAhead = comb::MuxOp::create(b, popNow, constant(bb, 0), Value(beatNext));
+        addr = b.createOrFold<comb::ConcatOp>(slotAhead, beatAhead);
+      }
+      Value read = seq::FirMemReadOp::create(b, landing, addr, hostClock, constant(1, 1));
       sb.data = read;
       sb.raw = read;
       sb.skip = skipAt;
@@ -21992,12 +22043,15 @@ LogicalResult StaticFolder::buildSim() {
     }
     if (!sb.beatRows) {
       unsigned landW = kb > 1 ? kb * bw : st.dw;
+      bool block = landBlock = landingBlock(slots, landW, kb);
       auto landing = seq::FirMemOp::create(
           b, seq::FirMemType::get(context, slots, landW, kb > 1 ? std::optional<uint32_t>(kb) : 1),
-          /*readLatency=*/0,
-          /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
+          /*readLatency=*/block ? 1 : 0,
+          /*writeLatency=*/1, block ? seq::RUW::Old : seq::RUW::Undefined, seq::WUW::Undefined,
           b.getStringAttr(prefix + "_landing"), hw::InnerSymAttr{},
           seq::FirMemInitAttr{}, StringAttr{}, Attribute{});
+      if (block)
+        setRamStyle(landing, "block");
       if (kb > 1) {
         SmallVector<Value> copiesOf(kb, rspData);
         Value one = b.createOrFold<comb::ConcatOp>(constant(kb - 1, 0), constant(1, 1));
@@ -22009,8 +22063,9 @@ LogicalResult StaticFolder::buildSim() {
       } else {
         seq::FirMemWriteOp::create(b, landing, rspInst, hostClock, rsp, rspData, Value{});
       }
-      Value read = seq::FirMemReadOp::create(b, landing, sb.popPtr, hostClock,
-                                            constant(1, 1));
+      // (Block: the pop pointer's next value, a host cycle ahead.)
+      Value read = seq::FirMemReadOp::create(b, landing, block ? Value(popNext) : sb.popPtr,
+                                            hostClock, constant(1, 1));
       if (landW != st.dw)
         read = b.createOrFold<comb::ExtractOp>(b.getIntegerType(st.dw), read, 0);
       sb.data = comb::MuxOp::create(b, skip0, constant(st.dw, 0), read);
@@ -22077,8 +22132,16 @@ LogicalResult StaticFolder::buildSim() {
     Value reqAt = kb > 1 ? b.createOrFold<comb::ConcatOp>(reqPtr, rbeat0) : reqPtr;
     Value rspAt = kb > 1 ? b.createOrFold<comb::ConcatOp>(rspInst, rspBeat) : rspInst;
     Value set = comb::OrOp::create(b, pendAll, bitAt(req0, reqAt));
+    // (A landing in block RAM: its registered read sees a row a host cycle
+    // after the distributed RAM's read would, so the row stays pending a
+    // host cycle more: the response clears it a host cycle late.)
+    Value clr = rsp, clrAt = rspAt;
+    if (landBlock) {
+      clr = resetReg(rsp, prefix + "_rspd", 0);
+      clrAt = reg(rspAt, prefix + "_rspatd");
+    }
     pendNext.setValue(comb::AndOp::create(
-        b, set, comb::XorOp::create(b, bitAt(rsp, rspAt), hw::ConstantOp::create(b, APInt::getAllOnes(pbits)))));
+        b, set, comb::XorOp::create(b, bitAt(clr, clrAt), hw::ConstantOp::create(b, APInt::getAllOnes(pbits)))));
     if (kb > 1) {
       SmallVector<Value> slotBits;
       for (unsigned sl = slots; sl-- > 0;)
@@ -25774,6 +25837,10 @@ void FoldStaticPass::runOnOperation() {
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.linkHbmBeatBits = linkHbmBeatBits;
   folder.linkHbmBeatRows = linkHbmBeatRows;
+  folder.linkLandingBlock = linkLandingBlock;
+  // (FOLDSIM_LINK_LANDING_BLOCK=R, a test hook: the whole suite with it.)
+  if (const char *env = getenv("FOLDSIM_LINK_LANDING_BLOCK"))
+    folder.linkLandingBlock = unsigned(atoi(env));
   folder.pageEnginesPP = pageEnginesPP;
   folder.ppBeatBits = ppBeatBits;
   folder.minII = minII;
@@ -25811,6 +25878,10 @@ void FoldStaticPass::runOnOperation() {
   llvm::scope_exit dropSources([] { gTableSource.clear(); });
   if (failed(folder.run()))
     return signalPassFailure();
+  if (folder.linkLandingBlock)
+    llvm::errs() << "foldsim-fold-static: link-landing-block: " << folder.landingBlockMems
+                 << " landings in block RAM (" << folder.landingBlocks << " RAMB36 for "
+                 << int64_t(folder.landingBlockLuts) << " LUTs of distributed RAM [count])\n";
   if (gSlotSegments) {
     auto &st = foldsim::slotSequencerStats();
     llvm::errs() << "foldsim-fold-static: slot-sequencer: " << st.decoded
