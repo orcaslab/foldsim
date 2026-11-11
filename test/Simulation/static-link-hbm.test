@@ -54,6 +54,20 @@
 # RUN: %t/beateng/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +bubble=30 +stall=30 +lo=1 +hi=30 +full=20 | FileCheck %s
 # RUN: %t/beateng/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=1 +hi=60 | FileCheck %s
 # BEATENG: page engine {{[0-9]+}} 16 bits
+# Three beats of 16 bits for a 32-bit row (--link-hbm-beat-bits 11): the beat
+# select has a fourth, zero entry, indexed while no write leaves, so the
+# stream's write data and mask are zero while idle and its engine takes them
+# without a select of its own (zero idle). Exact with bubbles, stalls and long
+# latencies.
+# RUN: foldsim --srcs top.f --top Top --out %t/beat3 --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --bubbles --min-ii 256 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm --link-hbm-beat-bits 11 --page-engines 4 Unit Reader > %t/beat3.log 2>&1
+# RUN: FileCheck %s --check-prefix=BEAT3 < %t/beat3/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/beat3 -DVM1 -DBUBBLES -Mdir %t/beat3/obj %S/Inputs/tb_linkhbm.sv top.sv %t/beat3/foldsim_sim.sv > %t/beat3/build.log 2>&1
+# RUN: %t/beat3/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +bubble=30 | FileCheck %s
+# RUN: %t/beat3/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +bubble=30 +stall=30 +lo=1 +hi=30 +full=20 | FileCheck %s
+# RUN: %t/beat3/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/beat3/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +bubble=50 +stall=50 +lo=1 +hi=600 +full=30 | FileCheck %s
+# BEAT3: page engine {{[0-9]+}} 16 bits, {{.*}} link:Reader>Unit(zero idle)
+# BEAT3: page engine {{[0-9]+}} 32 bits, {{.*}} link:Unit>Reader{{$}}
 # RUN: foldsim --srcs top.f --top Top --out %t/one --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --link-kinds Reader:Unit:hbm Unit Reader > %t/one.log 2>&1
 # RUN: FileCheck %s --check-prefix=ONE < %t/one/schedule.txt
 # A shorter lead (--link-hbm-lead): requests 10 positions ahead (the fewest: the decisions in flight + 6), more bubbles, as exact.

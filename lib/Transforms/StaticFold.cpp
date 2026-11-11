@@ -1468,6 +1468,16 @@ private:
     /// shifted, as regular as before).
     unsigned requestOffset = 0, writeOffset = 0;
     unsigned beatBits() const { return beats > 1 ? llvm::Log2_32_Ceil(beats) : 0; }
+    /// Its writes' page and beat select has a zero entry past its pages and
+    /// beats (they are not both powers of two): the select is indexed there
+    /// while no write leaves, so its write data and mask are zero while idle
+    /// and a page engine ORs them as they are, without a select.
+    bool idleZero() const {
+      unsigned pgBits = pages > 1 ? llvm::Log2_32_Ceil(pages) : 0;
+      unsigned selBits = pgBits + beatBits();
+      return selBits && selBits < 64 &&
+             uint64_t(pages) * beats < (uint64_t(1) << selBits);
+    }
     unsigned beatWidth() const {
       return beats > 1 ? unsigned(llvm::alignTo(llvm::divideCeil(dw, beats), 8)) : dw;
     }
@@ -5758,7 +5768,7 @@ void StaticFolder::reportPageEngines(raw_ostream &os) {
       os << " " << classes[c].name << ":" << classes[c].virtualMemories[k].name;
     for (unsigned k : eng.streams)
       os << " link:" << modelOf(linkStreams[k].pcls) << ">"
-         << modelOf(linkStreams[k].rcls);
+         << modelOf(linkStreams[k].rcls) << (linkStreams[k].idleZero() ? "(zero idle)" : "");
     os << "\n";
   }
   if (pageWriteGate) {
@@ -21271,6 +21281,9 @@ LogicalResult StaticFolder::buildSim() {
     bool pingPong = false;
     Value popPar, useSel, useSelEarly;
     SmallVector<Value> outs;
+    /// Its write data and mask zero while no write leaves (the page and
+    /// beat select's spare zero entry): a page engine ORs them as they are.
+    bool idleZero = false;
   };
   std::vector<StreamBuilt> streamBuilt(linkStreams.size());
   auto streamFor = [&](unsigned k) -> StreamBuilt & {
@@ -21637,6 +21650,19 @@ LogicalResult StaticFolder::buildSim() {
       we = comb::AndOp::create(b, we, heldAny);
     }
     Value wrRow = heldAt, wrData;
+    // (A page and beat select with an entry past the pages and beats, a
+    // zero chunk: its index there while no write leaves, so that the write
+    // data and mask are zero while idle and a page engine ORs them without
+    // a select of its own. The last index is such an entry wherever the
+    // pages or the beats are not a power of two.)
+    unsigned selBits = kb > 1 ? pgBits + bb : pgBits;
+    sb.idleZero = st.idleZero();
+    auto selIndex = [&](Value at) -> Value {
+      if (!sb.idleZero)
+        return at;
+      return comb::MuxOp::create(b, we, at,
+                                 hw::ConstantOp::create(b, APInt::getAllOnes(selBits)));
+    };
     unsigned padded = st.dw * st.pages;
     Value wide = padded > st.wordBits
                      ? b.createOrFold<comb::ConcatOp>(
@@ -21662,7 +21688,7 @@ LogicalResult StaticFolder::buildSim() {
                              : constant(bw, 0));
       }
       Value at = pgBits ? b.createOrFold<comb::ConcatOp>(wp0, wb0) : wb0;
-      wrData = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), at);
+      wrData = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), selIndex(at));
       SmallVector<Value> rowParts{heldAt};
       if (pgBits)
         rowParts.push_back(wp0);
@@ -21675,7 +21701,7 @@ LogicalResult StaticFolder::buildSim() {
         chunks.push_back(j < st.pages ? b.createOrFold<comb::ExtractOp>(
                                             b.getIntegerType(st.dw), wide, j * st.dw)
                                       : constant(st.dw, 0));
-      wrData = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), index);
+      wrData = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), selIndex(index));
       wrRow = b.createOrFold<comb::ConcatOp>(heldAt, index);
     } else {
       wrData = wide;
@@ -21692,7 +21718,7 @@ LogicalResult StaticFolder::buildSim() {
                              : constant(bmb, 0));
       }
       Value at = pgBits ? b.createOrFold<comb::ConcatOp>(wp0, wb0) : wb0;
-      wrMask = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), at);
+      wrMask = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), selIndex(at));
     } else if (st.mailbox) {
       unsigned mb = st.dw / 8;
       wrMask = heldMask;
@@ -21702,7 +21728,7 @@ LogicalResult StaticFolder::buildSim() {
           chunks.push_back(j < st.pages ? b.createOrFold<comb::ExtractOp>(
                                               b.getIntegerType(mb), heldMask, j * mb)
                                         : constant(mb, 0));
-        wrMask = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), wp0);
+        wrMask = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, chunks), selIndex(wp0));
       }
     }
     // Requests' {tag, instance}: a read's tag its slot, a write's the top
@@ -24289,10 +24315,15 @@ LogicalResult StaticFolder::buildSim() {
         wrInst.push_back(when(wv, b.createOrFold<comb::ConcatOp>(tagOf(outs[4]),
                                                                   constant(1, 0))));
         wrRow.push_back(when(wv, rowOf(outs[5])));
-        wrData.push_back(when(wv, zext(outs[6], dw)));
-        wrMask.push_back(when(wv, zext(st.mailbox ? outs[7]
-                                                  : constant((st.portDW() + 7) / 8, ~0ull),
-                                       dw / 8)));
+        // (Idle-zero streams' data and mask ORed as they are; a whole row's
+        // mask is the write valid itself.)
+        bool zeroed = streamFor(k).idleZero;
+        wrData.push_back(zeroed ? zext(outs[6], dw) : when(wv, zext(outs[6], dw)));
+        Value mask = !st.mailbox ? b.createOrFold<comb::ReplicateOp>(
+                                       b.getIntegerType((st.portDW() + 7) / 8), wv)
+                     : zeroed    ? outs[7]
+                                 : when(wv, outs[7]);
+        wrMask.push_back(zext(mask, dw / 8));
       }
       auto any = [&](SmallVector<Value> &xs) -> Value {
         return xs.size() == 1 ? xs[0] : Value(comb::OrOp::create(b, xs, false));
