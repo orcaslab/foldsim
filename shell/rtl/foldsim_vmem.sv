@@ -247,7 +247,12 @@ module foldsim_vmem #(
     localparam OW     = (OUTSTANDING > 1) ? $clog2(OUTSTANDING) : 1;
     // The ids in use and their reads in flight each: a read's slot of the
     // tables is {its place in its id's ring, its id}.
-    localparam NID    = ((1 << AXI_ID_W) < OUTSTANDING) ? (1 << AXI_ID_W) : OUTSTANDING;
+    // A controller that answers no read on chip (no host cache, no
+    // known-zero rows, no forwarding: a page engine, a link stream) with rows
+    // of several beats reads on one id: its bursts come back whole, in order,
+    // each beat straight into the answer's row (no row of beats per id).
+    localparam DIRECT = (CACHE_ROWS == 0) && (KNOWN_ZERO == 0) && (FORWARD == 0) && ((DW + 7) / 8 > 64);
+    localparam NID    = DIRECT ? 1 : ((1 << AXI_ID_W) < OUTSTANDING) ? (1 << AXI_ID_W) : OUTSTANDING;
     localparam IDW    = (NID > 1) ? $clog2(NID) : 1;
     localparam DEPTH  = OUTSTANDING / NID;
     localparam DPW    = (DEPTH > 1) ? $clog2(DEPTH) : 1;
@@ -979,7 +984,11 @@ module foldsim_vmem #(
     /* verilator lint_off UNUSEDSIGNAL */
     wire [BEATS*512-1:0] rc_row;
     /* verilator lint_on UNUSEDSIGNAL */
-    if (BEATS > 1) begin : g_beats
+    if (BEATS > 1 && DIRECT) begin : g_no_beats
+        // (DIRECT: the beats go straight into the answer, g_direct_r.)
+        assign rc_row[(BEATS-1)*512-1:0] = '0;
+    end
+    if (BEATS > 1 && !DIRECT) begin : g_beats
         for (genvar k = 0; k < BEATS - 1; ++k) begin : g_bm
             reg [511:0] bm [NID];
             always @(posedge clk)
@@ -1011,7 +1020,26 @@ module foldsim_vmem #(
     reg [DB-1:0] rsp_row;
     assign rsp_valid = rsp_q & ~reset;
     // A row's bits above DW are zero (written so), never answered.
-    assign rsp_data  = rsp_row[DW-1:0];
+    // (DIRECT: the row its beats were written into.)
+    wire [DW-1:0] d_data;
+    assign rsp_data  = DIRECT ? d_data : rsp_row[DW-1:0];
+    if (DIRECT) begin : g_direct_r
+        /* verilator lint_off UNUSEDSIGNAL */
+        reg [BEATS*512-1:0] d_row;
+        /* verilator lint_on UNUSEDSIGNAL */
+        assign d_data = d_row[DW-1:0];
+        // One id: a burst's beats come in order, not interleaved with
+        // another's; the last answers (rsp_q) as the row is whole, and the
+        // next burst's first beat lands a cycle after the answer at the
+        // earliest.
+        for (genvar k = 0; k < BEATS; ++k) begin : g_beat
+            always @(posedge clk)
+                if (rc_valid & (rc_beat == BW'(k)))
+                    d_row[k*512 +: 512] <= rc_data;
+        end
+    end else begin : g_no_direct_r
+        assign d_data = '0;
+    end
     if (DB > DW) begin : g_pad
         /* verilator lint_off UNUSEDSIGNAL */
         wire unused = |rsp_row[DB-1:DW];

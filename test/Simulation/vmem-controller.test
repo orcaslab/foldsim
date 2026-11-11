@@ -7,7 +7,9 @@
 # table, the slot taken in its lookup's cycle and Y's (no write-buffer match);
 # without a host cache a write's row goes into its buffer slot at intake (no
 # known-zero bits) or at X (known-zero rows made whole there), not through the
-# Y and Z stages. HBM latency 1 to 600 host cycles, channels stalled at random;
+# Y and Z stages; one that answers nothing on chip (no cache, no known-zero
+# rows, no forwarding: the first configuration) reads on one id, each beat
+# straight into the answer. HBM latency 1 to 600 host cycles, channels stalled at random;
 # rows of three beats, of a beat with byte enables, of 32 bits sharing lines;
 # with a host cache; with forwarding.
 # RUN: rm -rf %t && mkdir -p %t
