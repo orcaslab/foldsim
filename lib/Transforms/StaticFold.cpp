@@ -18518,13 +18518,14 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
   return b.createOrFold<comb::ConcatOp>(parts);
 }
 
+static Value sumTree(ImplicitLocOpBuilder &b, SmallVector<Value> values, unsigned width);
 /// `x * c` (mod 2^width), c's canonical signed digits as shifts and adds.
 static Value constTimes(ImplicitLocOpBuilder &b, Value x, uint64_t c, unsigned width) {
   auto type = b.getIntegerType(width);
   unsigned xw = hw::getBitWidth(x.getType());
   SmallVector<std::pair<bool, unsigned>> terms;
   foldsim::csdTerms(c, width, 64, terms);
-  Value acc;
+  SmallVector<Value> pos, neg_;
   for (auto [neg, sh] : terms) {
     if (sh >= width)
       continue;
@@ -18536,12 +18537,12 @@ static Value constTimes(ImplicitLocOpBuilder &b, Value x, uint64_t c, unsigned w
     if (sh)
       parts.push_back(hw::ConstantOp::create(b, b.getIntegerType(sh), 0));
     Value t = parts.size() == 1 ? parts[0] : Value(comb::ConcatOp::create(b, parts));
-    if (!acc)
-      acc = neg ? Value(comb::SubOp::create(b, hw::ConstantOp::create(b, type, 0), t)) : t;
-    else
-      acc = neg ? Value(comb::SubOp::create(b, acc, t)) : Value(comb::AddOp::create(b, acc, t));
+    (neg ? neg_ : pos).push_back(t);
   }
-  return acc ? acc : Value(hw::ConstantOp::create(b, type, 0));
+  // The positive terms' and the negative terms' sums as balanced trees, one
+  // subtraction.
+  Value p = sumTree(b, pos, width);
+  return neg_.empty() ? p : Value(comb::SubOp::create(b, p, sumTree(b, neg_, width)));
 }
 
 /// The quotient and remainder of `x` (at most `maxX`) by the constant `d`:
@@ -18583,44 +18584,98 @@ static std::pair<Value, Value> constDivmod(ImplicitLocOpBuilder &b, Value x,
   return {};
 }
 
-/// A ColumnAffine as hardware: per piece, hit = start <= index < end, the
-/// offset's quotient q and remainder r by the period, a[r] + sum over the
-/// slopes s of (s[r] == s ? s * q : 0); ORed with the residual's table.
+/// `values` summed (mod 2^width) as a balanced tree of adders.
+static Value sumTree(ImplicitLocOpBuilder &b, SmallVector<Value> values, unsigned width) {
+  if (values.empty())
+    return hw::ConstantOp::create(b, b.getIntegerType(width), 0);
+  while (values.size() > 1) {
+    SmallVector<Value> next;
+    for (size_t k = 0; k + 1 < values.size(); k += 2)
+      next.push_back(comb::AddOp::create(b, values[k], values[k + 1]));
+    if (values.size() % 2)
+      next.push_back(values.back());
+    values = std::move(next);
+  }
+  return values[0];
+}
+
+/// A ColumnAffine as hardware. Each piece [a, b) of period D reads the
+/// index's quotient and remainder by D: the position counters' (registers
+/// beside the position's) where the index is a position, else, where the
+/// index is a register (an instance register loaded from its table), a
+/// constant division of the register's next value, registered beside it;
+/// else none (null). The piece's offset a is folded into its tables (no
+/// subtraction): with x = index, a = qa D + ra, the piece's r = (x - ra) mod
+/// D and q = x div D - qa - (x mod D < ra), so a[r] + s[r] q = A2[x mod D] +
+/// S2[x mod D] (x div D), A2 and S2 tables of the D remainders. The value
+/// is A2 plus, for each distinct slope, the slope times the quotient where
+/// the remainder takes it, summed as a balanced tree; a range compare
+/// selects the piece; the pieces and the residual's table are ORed.
 static Value buildColumnAffine(ImplicitLocOpBuilder &b, Value index,
                                const foldsim::ColumnAffine &ca, unsigned width) {
   auto itype = index.getType();
   unsigned iw = hw::getBitWidth(itype);
   auto type = b.getIntegerType(width);
+  uint64_t wmask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
   auto cst = [&](Type t, uint64_t v) -> Value { return hw::ConstantOp::create(b, t, v); };
+  auto *pc = foldsim::currentPosCounters();
+  bool counted = pc && pc->knows(index);
+  auto reg = index.getDefiningOp<seq::FirRegOp>();
+  if (!counted && (!reg || reg.getReset() || reg.getPreset()))
+    return {};
+  // The quotient and remainder of the index by d (cached per d).
+  std::map<uint64_t, std::pair<Value, Value>> qrOf;
+  auto qrBy = [&](uint64_t d) -> std::pair<Value, Value> {
+    auto it = qrOf.find(d);
+    if (it != qrOf.end())
+      return it->second;
+    std::pair<Value, Value> qr;
+    if (counted) {
+      qr = pc->divmod(b, index, unsigned(d));
+    } else {
+      auto [qn, rn] = constDivmod(b, reg.getNext(), d, (uint64_t(1) << iw) - 1);
+      if (qn)
+        qr = {seq::FirRegOp::create(b, qn, reg.getClk(), b.getStringAttr("cadivq" + Twine(d))),
+              seq::FirRegOp::create(b, rn, reg.getClk(), b.getStringAttr("cadivr" + Twine(d)))};
+    }
+    qrOf[d] = qr;
+    return qr;
+  };
   gColumnAffine = true;
   llvm::scope_exit done([&] { gColumnAffine = false; });
   SmallVector<Value> parts;
-  for (auto &pc : ca.pieces) {
-    Value off = pc.start ? Value(comb::SubOp::create(b, index, cst(itype, pc.start))) : index;
-    auto [q, r] = constDivmod(b, off, pc.period, pc.end - pc.start - 1);
+  for (auto &pc_ : ca.pieces) {
+    uint64_t d = pc_.period, qa = pc_.start / d, ra = pc_.start % d;
+    auto [q, r] = qrBy(d);
     if (!q)
       return {};
-    Value v = table(b, r, pc.a, width);
+    SmallVector<uint64_t> a2(d), s2(d);
+    for (uint64_t x = 0; x < d; ++x) {
+      uint64_t pr = (x + d - ra) % d, sl = pc_.s[pr];
+      a2[x] = (pc_.a[pr] - sl * (qa + (x < ra ? 1 : 0))) & wmask;
+      s2[x] = sl;
+    }
+    SmallVector<Value> terms{table(b, r, a2, width)};
     SmallVector<uint64_t, 4> slopes;
-    for (auto x : pc.s)
+    for (auto x : s2)
       if (x && !llvm::is_contained(slopes, x))
         slopes.push_back(x);
     unsigned qw = hw::getBitWidth(q.getType());
     Value qx = qw >= width ? Value(comb::ExtractOp::create(b, q, 0, width))
                            : Value(comb::ConcatOp::create(b, ValueRange{cst(b.getIntegerType(width - qw), 0), q}));
     for (auto sl : slopes) {
-      SmallVector<uint64_t> sel(pc.period);
-      for (auto [k, x] : llvm::enumerate(pc.s))
+      SmallVector<uint64_t> sel(d);
+      for (auto [k, x] : llvm::enumerate(s2))
         sel[k] = x == sl;
       Value on = table(b, r, sel, 1);
-      Value term = constTimes(b, qx, sl, width);
-      v = comb::AddOp::create(b, v, comb::MuxOp::create(b, on, term, cst(type, 0)));
+      terms.push_back(comb::MuxOp::create(b, on, constTimes(b, qx, sl, width), cst(type, 0)));
     }
+    Value v = sumTree(b, terms, width);
     SmallVector<Value> in;
-    if (pc.start)
-      in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge, index, cst(itype, pc.start)));
-    if (pc.end < (uint64_t(1) << iw))
-      in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::ult, index, cst(itype, pc.end)));
+    if (pc_.start)
+      in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge, index, cst(itype, pc_.start)));
+    if (pc_.end < (uint64_t(1) << iw))
+      in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::ult, index, cst(itype, pc_.end)));
     if (!in.empty()) {
       Value hit = in.size() == 1 ? in[0] : Value(comb::AndOp::create(b, in, false));
       v = comb::MuxOp::create(b, hit, v, cst(type, 0));
@@ -18635,9 +18690,10 @@ static Value buildColumnAffine(ImplicitLocOpBuilder &b, Value index,
   st.segments += ca.pieces.size();
   if (getenv("FOLDSIM_AFFINE_LOG")) {
     llvm::errs() << "slot-sequencer: column-affine table of " << ca.residual.size() << " x "
-                 << width << " bits:";
-    for (auto &pc : ca.pieces)
-      llvm::errs() << " [" << pc.start << ", " << pc.end << ") period " << pc.period;
+                 << width << " bits" << (counted ? " (position counters)" : " (registered division)")
+                 << ":";
+    for (auto &pc_ : ca.pieces)
+      llvm::errs() << " [" << pc_.start << ", " << pc_.end << ") period " << pc_.period;
     llvm::errs() << "\n";
   }
   return parts.size() == 1 ? parts[0] : Value(comb::OrOp::create(b, parts, false));

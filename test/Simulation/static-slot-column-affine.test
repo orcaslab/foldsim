@@ -18,6 +18,17 @@
 # RUN: %t/ca/obj/Vtb +stall=0 | FileCheck %s
 # RUN: %t/ca/obj/Vtb +stall=30 | FileCheck %s
 # OFF: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), 1 tables kept
-# CA: slot-sequencer: column-affine table of {{[0-9]+}} x 16 bits: [0, 60) period 10 [60, 120) period 6
+# CA: slot-sequencer: column-affine table of {{[0-9]+}} x 16 bits{{.*}}: [0, 60) period 10 [60, 120) period 6
 # CA: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), 0 tables kept
 # CHECK: {{^}}MATCH
+# An instance-indexed table (Driver/Inputs/ids/topcai.sv: consumer i reads
+# producer src(i), column-affine in i): its index is the consumers' instance
+# register, so the quotient and remainder are a constant division of that
+# register's next value, registered beside it. No table kept; exact.
+# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_AFFINE_LOG=1 foldsim --srcs topcai.f --top Top --out %t/ci --static --modulo --slot-segments 4 --slot-column-affine Prod Cons > %t/ci.log 2>&1
+# RUN: FileCheck %s --check-prefix=CI < %t/ci.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/ci/obj %S/Inputs/tb_nest.sv topcai.sv %t/ci/foldsim_sim.sv > %t/ci/build.log 2>&1
+# RUN: %t/ci/obj/Vtb +stall=0 | FileCheck %s
+# RUN: %t/ci/obj/Vtb +stall=30 | FileCheck %s
+# CI: slot-sequencer: column-affine table of 120 x 7 bits (registered division): [{{[0-9]+}}, 51) period 10 [60, 120) period 6
+# CI: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), 0 tables kept
