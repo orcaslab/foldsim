@@ -130,6 +130,31 @@ struct Separable {
 bool findSeparable(llvm::ArrayRef<uint64_t> rows, unsigned width,
                    bool anyPeriod, unsigned maxPeriod, Separable &out);
 
+/// A table cut into column-affine pieces: on [start, end), with q and r the
+/// quotient and remainder of (k - start) by `period`, rows[k] = a[r] +
+/// s[r] * q (mod 2^width): a run of a parent's children whose constants
+/// (a child's place, a link's source among them) step by a few slopes from
+/// one parent to the next. Instance tables of a class nested `period`
+/// children a parent (a switch network's stages, its ports) are a piece or
+/// two whatever the parents' count. `residual`: the rows outside the pieces
+/// (zero inside them), for the segments.
+struct ColumnAffine {
+  struct Piece {
+    uint64_t start = 0, end = 0, period = 0;
+    llvm::SmallVector<uint64_t> a, s;
+  };
+  llvm::SmallVector<Piece> pieces;
+  llvm::SmallVector<uint64_t> residual;
+};
+/// The pieces, greedily the longest from the lowest row left: periods 2 to
+/// `maxPeriod`, each piece at least 4 periods long, at most `maxSlopes`
+/// distinct nonzero slopes each of at most three signed powers of two; at
+/// most `maxPieces` pieces, covering at least half the nonzero rows (false
+/// otherwise).
+bool findColumnAffine(llvm::ArrayRef<uint64_t> rows, unsigned width,
+                      unsigned maxPeriod, unsigned maxPieces,
+                      unsigned maxSlopes, ColumnAffine &out);
+
 } // namespace foldsim
 
 #endif // FOLDSIM_SLOTSEQUENCER_H

@@ -661,6 +661,13 @@ public:
   /// `affine-auto-bits`: only a class whose undecoded rows hold at least
   /// this many bits is made affine.
   uint64_t affineAutoBits = 0;
+  /// `affine-stride exact`: a group's stride not rounded up to a power of
+  /// two (its runs decode with the position counters' quotient and
+  /// remainder); undecodedClasses then counts runs of any stride.
+  bool affineExact = false;
+  /// `affine-auto-segments`: undecodedClasses' bound on a row's segments
+  /// (0: slot-segments).
+  unsigned affineAutoSegments = 0;
   unsigned affineAutoRounds = 0;
   unsigned affineTrial = 0;   // nesting of affine-auto's trial schedules
   unsigned slotSegmentsK = 0;
@@ -7283,7 +7290,21 @@ unsigned StaticFolder::placeModulo(
         for (auto [k, n] : llvm::enumerate(m))
           anodes[n].index = unsigned(k);
       }
-      auto strides = foldsim::affineStrides(groups);
+      auto strides = foldsim::affineStrides(groups, affineExact);
+      if (getenv("FOLDSIM_AFFINE_LOG")) {
+        // Each resource's groups and strides (the first period tried).
+        static unsigned logged = 0;
+        if (logged++ < 1)
+          for (auto [g, grp] : llvm::enumerate(groups))
+            if (grp.count > 1)
+              llvm::errs() << "affine-stride: " << classes[nodes[members[g][0]].cls].name
+                           << (nodes[members[g][0]].pass == kState
+                                   ? std::string(".state")
+                                   : ".ready" + std::to_string(nodes[members[g][0]].level))
+                           << "@" << grp.resource << " x" << grp.count << " minStride "
+                           << grp.minStride << " stride " << strides[g] << " (II " << period
+                           << ")\n";
+      }
       auto fitsAt = [&](unsigned n, int t) {
         unsigned c = nodes[n].cls;
         return t >= 0 && !busy[resourceOf(nodes[n])].test(unsigned(t) % period) &&
@@ -10225,7 +10246,7 @@ static void printSlots(raw_ostream &os, ArrayRef<int> slots) {
 
 SmallVector<unsigned> StaticFolder::undecodedClasses() {
   SmallVector<unsigned> out;
-  unsigned k = slotSegmentsK ? slotSegmentsK : 8;
+  unsigned k = affineAutoSegments ? affineAutoSegments : slotSegmentsK ? slotSegmentsK : 8;
   uint64_t rowBits = uint64_t(llvm::PowerOf2Ceil(ii + 1));
   // An HBM link stream's tables lie at its reader's read passes (landings,
   // requests) and its producer's passes (writes): their kept bits count for
@@ -10236,7 +10257,7 @@ SmallVector<unsigned> StaticFolder::undecodedClasses() {
       if (st.excluded || !st.kept)
         continue;
       auto bitsOf = [&](ArrayRef<uint64_t> row, unsigned width) -> uint64_t {
-        return foldsim::slotSegments(row, std::max(width, 1u), k).size() > k
+        return foldsim::slotSegments(row, std::max(width, 1u), k, affineExact).size() > k
                    ? rowBits * std::max(width, 1u)
                    : 0;
       };
@@ -10276,7 +10297,7 @@ SmallVector<unsigned> StaticFolder::undecodedClasses() {
         prow[pos] = j;
       }
     auto check = [&](ArrayRef<uint64_t> row, unsigned width) {
-      if (foldsim::slotSegments(row, width, k).size() > k)
+      if (foldsim::slotSegments(row, width, k, affineExact).size() > k)
         kept += rowBits * width;
     };
     check(inst, idxWidth);
@@ -11358,6 +11379,12 @@ static unsigned gPassII = 0;
 static bool gFactoring = false;
 /// A table built as a constant whatever slot-segments could make of it.
 static bool gTableRaw = false;
+/// `slot-column-affine`: a table of an index the position counters do not
+/// know (an instance) cut into column-affine pieces (findColumnAffine),
+/// its quotient and remainder by a constant division; `gColumnAffine`
+/// while one is built (its residual rows are not cut again).
+static bool gSlotColumnAffine = false;
+static bool gColumnAffine = false;
 
 /// The regions sharing a copy of the slot controls two host cycles ahead.
 static constexpr unsigned kRegionsPerGroup = 16;
@@ -18491,6 +18518,131 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
   return b.createOrFold<comb::ConcatOp>(parts);
 }
 
+/// `x * c` (mod 2^width), c's canonical signed digits as shifts and adds.
+static Value constTimes(ImplicitLocOpBuilder &b, Value x, uint64_t c, unsigned width) {
+  auto type = b.getIntegerType(width);
+  unsigned xw = hw::getBitWidth(x.getType());
+  SmallVector<std::pair<bool, unsigned>> terms;
+  foldsim::csdTerms(c, width, 64, terms);
+  Value acc;
+  for (auto [neg, sh] : terms) {
+    if (sh >= width)
+      continue;
+    unsigned keep = std::min(xw, width - sh);
+    SmallVector<Value> parts;
+    if (keep + sh < width)
+      parts.push_back(hw::ConstantOp::create(b, b.getIntegerType(width - keep - sh), 0));
+    parts.push_back(keep == xw ? x : Value(comb::ExtractOp::create(b, x, 0, keep)));
+    if (sh)
+      parts.push_back(hw::ConstantOp::create(b, b.getIntegerType(sh), 0));
+    Value t = parts.size() == 1 ? parts[0] : Value(comb::ConcatOp::create(b, parts));
+    if (!acc)
+      acc = neg ? Value(comb::SubOp::create(b, hw::ConstantOp::create(b, type, 0), t)) : t;
+    else
+      acc = neg ? Value(comb::SubOp::create(b, acc, t)) : Value(comb::AddOp::create(b, acc, t));
+  }
+  return acc ? acc : Value(hw::ConstantOp::create(b, type, 0));
+}
+
+/// The quotient and remainder of `x` (at most `maxX`) by the constant `d`:
+/// q = (x * m) >> s with m = ceil(2^s / d), the least s exact for every x
+/// up to maxX (checked), r = x - q * d. Null if none up to 2^40 is exact.
+static std::pair<Value, Value> constDivmod(ImplicitLocOpBuilder &b, Value x,
+                                           uint64_t d, uint64_t maxX) {
+  unsigned xw = hw::getBitWidth(x.getType());
+  unsigned qw = std::max(1u, unsigned(llvm::Log2_64_Ceil(maxX / d + 1)));
+  unsigned rw = std::max(1u, unsigned(llvm::Log2_64_Ceil(d)));
+  if (llvm::isPowerOf2_64(d)) {
+    unsigned k = llvm::Log2_64(d);
+    Value q = k >= xw ? Value(hw::ConstantOp::create(b, b.getIntegerType(qw), 0))
+                      : Value(comb::ExtractOp::create(b, x, k, std::min(qw, xw - k)));
+    if (hw::getBitWidth(q.getType()) < qw)
+      q = comb::ConcatOp::create(
+          b, ValueRange{hw::ConstantOp::create(b, b.getIntegerType(qw - hw::getBitWidth(q.getType())), 0), q});
+    Value r = comb::ExtractOp::create(b, x, 0, std::min(rw, xw));
+    return {q, r};
+  }
+  for (unsigned sh = xw; sh <= 40; ++sh) {
+    uint64_t m = ((uint64_t(1) << sh) + d - 1) / d;
+    bool exact = true;
+    for (uint64_t v = 0; v <= maxX && exact; ++v)
+      exact = ((__uint128_t(v) * m) >> sh) == v / d;
+    if (!exact)
+      continue;
+    unsigned pw = sh + qw;
+    Value wide = comb::ConcatOp::create(
+        b, ValueRange{hw::ConstantOp::create(b, b.getIntegerType(pw - xw), 0), x});
+    Value prod = constTimes(b, wide, m, pw);
+    Value q = comb::ExtractOp::create(b, prod, sh, qw);
+    // r = x - q * d, in the remainder's bits (the low bits of the exact
+    // difference).
+    Value qd = constTimes(b, q, d, xw);
+    Value r = comb::ExtractOp::create(b, comb::SubOp::create(b, x, qd), 0, std::min(rw, xw));
+    return {q, r};
+  }
+  return {};
+}
+
+/// A ColumnAffine as hardware: per piece, hit = start <= index < end, the
+/// offset's quotient q and remainder r by the period, a[r] + sum over the
+/// slopes s of (s[r] == s ? s * q : 0); ORed with the residual's table.
+static Value buildColumnAffine(ImplicitLocOpBuilder &b, Value index,
+                               const foldsim::ColumnAffine &ca, unsigned width) {
+  auto itype = index.getType();
+  unsigned iw = hw::getBitWidth(itype);
+  auto type = b.getIntegerType(width);
+  auto cst = [&](Type t, uint64_t v) -> Value { return hw::ConstantOp::create(b, t, v); };
+  gColumnAffine = true;
+  llvm::scope_exit done([&] { gColumnAffine = false; });
+  SmallVector<Value> parts;
+  for (auto &pc : ca.pieces) {
+    Value off = pc.start ? Value(comb::SubOp::create(b, index, cst(itype, pc.start))) : index;
+    auto [q, r] = constDivmod(b, off, pc.period, pc.end - pc.start - 1);
+    if (!q)
+      return {};
+    Value v = table(b, r, pc.a, width);
+    SmallVector<uint64_t, 4> slopes;
+    for (auto x : pc.s)
+      if (x && !llvm::is_contained(slopes, x))
+        slopes.push_back(x);
+    unsigned qw = hw::getBitWidth(q.getType());
+    Value qx = qw >= width ? Value(comb::ExtractOp::create(b, q, 0, width))
+                           : Value(comb::ConcatOp::create(b, ValueRange{cst(b.getIntegerType(width - qw), 0), q}));
+    for (auto sl : slopes) {
+      SmallVector<uint64_t> sel(pc.period);
+      for (auto [k, x] : llvm::enumerate(pc.s))
+        sel[k] = x == sl;
+      Value on = table(b, r, sel, 1);
+      Value term = constTimes(b, qx, sl, width);
+      v = comb::AddOp::create(b, v, comb::MuxOp::create(b, on, term, cst(type, 0)));
+    }
+    SmallVector<Value> in;
+    if (pc.start)
+      in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge, index, cst(itype, pc.start)));
+    if (pc.end < (uint64_t(1) << iw))
+      in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::ult, index, cst(itype, pc.end)));
+    if (!in.empty()) {
+      Value hit = in.size() == 1 ? in[0] : Value(comb::AndOp::create(b, in, false));
+      v = comb::MuxOp::create(b, hit, v, cst(type, 0));
+    }
+    parts.push_back(v);
+  }
+  if (llvm::any_of(ca.residual, [](uint64_t x) { return x != 0; }))
+    parts.push_back(table(b, index, ca.residual, width));
+  auto &st = foldsim::slotSequencerStats();
+  ++st.decoded;
+  st.decodedBits += (uint64_t(1) << iw) * width;
+  st.segments += ca.pieces.size();
+  if (getenv("FOLDSIM_AFFINE_LOG")) {
+    llvm::errs() << "slot-sequencer: column-affine table of " << ca.residual.size() << " x "
+                 << width << " bits:";
+    for (auto &pc : ca.pieces)
+      llvm::errs() << " [" << pc.start << ", " << pc.end << ") period " << pc.period;
+    llvm::errs() << "\n";
+  }
+  return parts.size() == 1 ? parts[0] : Value(comb::OrOp::create(b, parts, false));
+}
+
 static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
                             ArrayRef<uint64_t> rows, unsigned width,
                             ArrayRef<uint8_t> care) {
@@ -18569,6 +18721,18 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
                    << " bits: period " << d << (sp.isXor ? " xor" : " sum") << " from " << sp.start
                    << " to " << sp.end << "\n";
     return v;
+  }
+  // Column-affine pieces (an instance table of a class nested a few
+  // children a parent: a switch network's ports): each a range compare, the
+  // offset's quotient and remainder by the period (a constant division),
+  // a table of the period's rows plus a few slopes times the quotient; the
+  // rows left to the segments.
+  if (gSlotColumnAffine && !gColumnAffine && !gTableRaw && iwidth <= 24 &&
+      rows.size() >= 64) {
+    foldsim::ColumnAffine ca;
+    if (foldsim::findColumnAffine(rows, width, 64, 4, 3, ca))
+      if (Value v = buildColumnAffine(b, index, ca, width))
+        return v;
   }
   // A one-bit table whose zero rows are the fewer segments (a set of nearly
   // every position: a copy's passes but a few holes): its complement
@@ -24896,9 +25060,17 @@ void FoldStaticPass::runOnOperation() {
   folder.affineSlots = affineSlots;
   folder.affineAuto = affineAuto;
   folder.affineAutoBits = affineAutoBits;
+  folder.affineAutoSegments = affineAutoSegments;
+  if (affineStride != "pow2" && affineStride != "exact") {
+    getOperation().emitError("affine-stride: '")
+        << affineStride << "' is neither pow2 nor exact";
+    return signalPassFailure();
+  }
+  folder.affineExact = affineStride == "exact";
   folder.slotSegmentsK = slotSegments;
   gMaxTableBits = std::max<uint64_t>(1, maxTableBits);
   gSlotSegments = slotSegments;
+  gSlotColumnAffine = slotColumnAffine;
   // FOLDSIM_SLOT_SEGMENTS: the default for runs that leave it 0 (a test
   // hook: the whole suite with decoders).
   if (!gSlotSegments)

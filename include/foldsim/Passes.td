@@ -908,6 +908,26 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "With affine-auto: only a class whose undecoded slot rows hold at "
            "least this many table bits is made affine (the frame's cost paid "
            "where the tables are large)">,
+    Option<"affineAutoSegments", "affine-auto-segments", "unsigned", "0",
+           "With affine-auto: a class is made affine where its own slot rows "
+           "need more than this many segments (0: slot-segments), so a "
+           "decoder's segments stay as few at any count of instances">,
+    Option<"affineStride", "affine-stride", "std::string", "\"pow2\"",
+           "With affine-slots / affine-auto: a group's stride, the most of its "
+           "resource's group count and its own least spacing, rounded up to a "
+           "power of two (pow2) or kept as it is (exact: a resource's kinds of "
+           "passes interleave without idle positions; the slot tables' runs "
+           "of a stride not a power of two decode with the position's "
+           "quotient and remainder counters, slot-segments; affine-auto then "
+           "counts a class's rows decoded by runs of any stride)">,
+    Option<"slotColumnAffine", "slot-column-affine", "bool", "false",
+           "With slot-segments: a table indexed by a value the position "
+           "counters do not know (an instance) that the segments do not "
+           "decode is cut into column-affine pieces: on a range, with q and "
+           "r the offset's quotient and remainder by a period (a constant "
+           "division), a[r] + s[r] * q for a few slopes s (an instance table "
+           "of a class nested a fixed count of children a parent: a switch "
+           "network's ports), as large at any count of parents">,
     Option<"slotSegments", "slot-segments", "unsigned", "0",
            "Slot tables (constants read by the frame's position or an "
            "instance) of at most this many affine segments of nonzero rows "
