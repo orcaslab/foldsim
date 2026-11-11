@@ -1775,6 +1775,9 @@ private:
   LinkTiming linkTiming(const LinkUse &use) const;
   /// The schedule report's lines on the links' storage.
   void reportLinks(raw_ostream &os);
+  /// FOLDSIM_TRANSFER_CSV=<file> (a report, off by default): every logical
+  /// transfer of the schedule, a CSV line each (exportTransfers).
+  void exportTransfers();
   /// What each class evaluates at each position (`frameAt`), and whether
   /// any host cycle may idle (bubbles); then whether a link's reads ever
   /// need its producer's write forwarded, or taken around the read register
@@ -9846,6 +9849,204 @@ void StaticFolder::planLinkKinds(raw_ostream &os) {
   ls << " of the budget\n";
   llvm::errs() << ls.str();
   os << ls.str();
+}
+
+/// FOLDSIM_TRANSFER_CSV=<file>: one CSV line per logical transfer of the
+/// schedule, for transport models outside the compiler (a bandwidth screen of
+/// the moves a frame makes, by their windows); nothing is built from it.
+/// Columns: id, kind, src_class, dst_class, bits, beats512 (512-bit beats),
+/// release (the first host cycle the data exists where it is moved from),
+/// deadline (the host cycle it must be where it is read: a pass's read),
+/// room (deadline - release), src_slr, dst_slr (slr-groups, -1 without),
+/// direction (chip, wr: to HBM, rd: from HBM), timing (early, late, zero:
+/// a link's producer port; early for the others). Positions are host cycles
+/// of the frame (0 to II-1), a release before 0 the frame before's. Kinds:
+/// - link.register / link.staged / link.memory: an on-chip link, a line per
+///   reader instance's read (the write of the entry it takes to the read);
+/// - link.hbm / mbox.hbm: an HBM link stream (a reader-indexed mailbox):
+///   each producer pass's row writes (wr: to the room the stream's least
+///   member leaves) and each landing (rd: from the row's write, the frame
+///   before's, to the landing); its links are not repeated as on-chip lines;
+/// - pp.prefetch / pp.drain: a streamed PP class's rows (rd: from the pass of
+///   the window slot's previous occupant's row to its own pass; wr: from its
+///   pass to the next occupant's);
+/// - page.rd / page.wr: an off-chip paged class's pages (a frame each way);
+/// - fold.rd / fold.wr: a streamed folded store's rows (fold-store-stream).
+void StaticFolder::exportTransfers() {
+  const char *path = getenv("FOLDSIM_TRANSFER_CSV");
+  if (!path || frameAt.empty())
+    return;
+  std::error_code ec;
+  llvm::raw_fd_ostream out(path, ec);
+  if (ec) {
+    llvm::errs() << "foldsim-fold-static: FOLDSIM_TRANSFER_CSV: " << path
+                 << ": " << ec.message() << "\n";
+    return;
+  }
+  if (!linkStreams.empty())
+    (void)planStreams();
+  int frame = int(ii);
+  uint64_t id = 0;
+  auto slr = [&](int c) {
+    return c >= 0 && unsigned(c) < slrOf.size() ? slrOf[c] : -1;
+  };
+  out << "id,kind,src_class,dst_class,bits,beats512,release,deadline,room,"
+         "src_slr,dst_slr,direction,timing\n";
+  auto line = [&](StringRef kind, int sc, int dc, uint64_t bits, int release,
+                  int deadline, StringRef dir, StringRef timing) {
+    out << id++ << "," << kind << ","
+        << (sc >= 0 ? StringRef(classes[sc].name) : StringRef("hbm")) << ","
+        << (dc >= 0 ? StringRef(classes[dc].name) : StringRef("hbm")) << ","
+        << bits << "," << (bits + 511) / 512 << "," << release << ","
+        << deadline << "," << deadline - release << "," << slr(sc) << ","
+        << slr(dc) << "," << dir << "," << timing << "\n";
+  };
+  // On-chip links: each reader instance's read of the entry it takes.
+  std::vector<LinkUse> uses;
+  linkUses(uses);
+  for (auto &use : uses) {
+    auto &producer = producers[use.producer];
+    auto &pcls = classes[producer.cls];
+    auto &rcls = classes[use.reader];
+    auto it = streamMembers.find(
+        {use.reader, use.port, use.at, use.producer, use.low});
+    bool hbm = it != streamMembers.end() && it->second.kept &&
+               linkStreams[it->second.stream].kept;
+    StringRef timing =
+        !producer.late ? "early"
+        : zeroLink(use.producer, use.reader, use.port) ? "zero" : "late";
+    bool compact = compacted(use.producer, use.rows.size());
+    unsigned entries = compact ? use.rows.size() : pcls.threads();
+    bool banked = !producer.late;
+    StringRef kind =
+        entries == 1 && !banked ? "link.register"
+        : entries == 1 &&
+                stagedCopy(use.producer, compact ? unsigned(use.rows[0]) : 0,
+                           use.reader, use.readers) >= 0
+            ? "link.staged"
+            : "link.memory";
+    auto writeAt = [&](uint64_t inst) {
+      return producer.atReady ? pcls.readySlots(producer.readyLevel)[inst]
+                              : pcls.slot[kState][inst];
+    };
+    for (auto [i, row] : llvm::zip(use.readers, use.readerRows)) {
+      // (Carried by its stream: the stream's rows below.)
+      if (hbm && (it->second.keepInst.empty() ||
+                  (i < it->second.keepInst.size() && it->second.keepInst[i])))
+        continue;
+      int release = writeAt(row) - (producer.late ? 0 : frame) + 1;
+      line(kind, producer.cls, use.reader, use.width, release,
+           rcls.readSlot(kState, 0, i), "chip", timing);
+      for (unsigned l = 0; l < rcls.readyLevels; ++l)
+        line(kind, producer.cls, use.reader, use.width, release,
+             rcls.readSlot(kReady, l, i), "chip", timing);
+    }
+  }
+  // HBM link streams and mailboxes: rows written and landed.
+  for (auto &st : linkStreams) {
+    if (!st.kept)
+      continue;
+    auto &pcls = classes[st.pcls];
+    auto writeSlot = [&](uint64_t j) {
+      return st.atReady ? pcls.readySlots(st.level)[j] : pcls.slot[kState][j];
+    };
+    StringRef kind = st.mailbox ? "mbox.hbm" : "link.hbm";
+    for (unsigned j = 0; j < pcls.threads(); ++j) {
+      uint64_t bits = st.dw;
+      if (st.mailbox) {
+        // A producer instance's own lanes of the row, byte-masked.
+        bits = 0;
+        for (auto [r, run] : llvm::enumerate(st.runs))
+          if (r < st.runDomain.size() && st.mbDomains[st.runDomain[r]][j])
+            bits += run.width;
+        if (!bits)
+          continue;
+      }
+      for (unsigned p = 0; p < st.pages; ++p) {
+        int release = writeSlot(j) + 1 + int(p);
+        line(kind, st.pcls, -1, bits, release, release + int(st.room), "wr",
+             "early");
+      }
+    }
+    for (auto &l : st.landings) {
+      int written = INT_MIN;
+      if (st.mailbox) {
+        for (auto [j, r] : llvm::enumerate(st.mbWriteRow))
+          if (r == l.row && st.writes(j))
+            written = std::max(written, writeSlot(j));
+      } else if (l.row < pcls.threads()) {
+        written = writeSlot(l.row);
+      }
+      if (written == INT_MIN)
+        continue;
+      line(kind, -1, st.rcls, st.dw, written - frame + 1 + int(l.page), l.q,
+           "rd", "early");
+    }
+  }
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    int ci = int(c);
+    // Streamed PP rows: a window slot's row j from its previous occupant's
+    // pass of row j (written, and drained after it) to the pass reading it.
+    if (cls.ppHbm && cls.pageWindow && cls.pp) {
+      unsigned P = cls.pp;
+      unsigned columns =
+          unsigned(llvm::divideCeil(llvm::divideCeil(cls.rowStateBits, P), 72));
+      columns -= std::min(columns - 1, cls.ppResidentColumns);
+      uint64_t bits = uint64_t(columns) * 72;
+      SmallVector<unsigned> order;
+      for (unsigned i = 0; i < cls.threads(); ++i)
+        if (cls.ppStreamed.empty() || cls.ppStreamed[i])
+          order.push_back(i);
+      llvm::sort(order, [&](unsigned x, unsigned y) {
+        return cls.slot[kState][x] < cls.slot[kState][y];
+      });
+      int n = int(order.size()), w = int(cls.pageWindow);
+      auto passOf = [&](int k, unsigned j) {
+        int r = ((k % n) + n) % n;
+        return cls.slot[kState][order[r]] - int(cls.stages) + int(j) +
+               (k - r) / n * frame;
+      };
+      for (int k = 0; k < n; ++k)
+        for (unsigned j = 0; j < P; ++j) {
+          int pass = passOf(k, j);
+          line("pp.prefetch", -1, ci, bits, passOf(k - w, j) + 1, pass, "rd",
+               "early");
+          line("pp.drain", ci, -1, bits, pass + 1, passOf(k + w, j), "wr",
+               "early");
+        }
+    }
+    // Off-chip pages: each instance's pages read for its state pass and
+    // written after it.
+    if (cls.page && cls.pagesOffChip) {
+      uint64_t bits = llvm::divideCeil(
+          std::max(cls.rowStateBits, cls.pageStateBits), cls.page);
+      for (unsigned i = 0; i < cls.threads(); ++i) {
+        int s = cls.slot[kState][i];
+        for (unsigned p = 0; p < cls.page; ++p) {
+          line("page.rd", -1, ci, bits, s - frame + 1, s, "rd", "early");
+          line("page.wr", ci, -1, bits, s + 1, s + frame, "wr", "early");
+        }
+      }
+    }
+    // Streamed folded stores: an instance's row written after its pass and
+    // read back before its next.
+    if (foldStoreStream)
+      if (auto *folding = cls.folding.get())
+        for (auto &fold : folding->folds)
+          if (fold.landingRing) {
+            uint64_t row = 8 * llvm::PowerOf2Ceil(std::max<uint64_t>(
+                                   1, llvm::divideCeil(
+                                          fold.store.getType().getWidth(), 8)));
+            for (unsigned i = 0; i < cls.threads(); ++i) {
+              int s = cls.slot[kState][i];
+              line("fold.wr", ci, -1, row, s + 1, s + frame - 1, "wr", "early");
+              line("fold.rd", -1, ci, row, s + 1, s + frame - 1, "rd", "early");
+            }
+          }
+  }
+  out.flush();
+  llvm::errs() << "foldsim-fold-static: FOLDSIM_TRANSFER_CSV: " << id
+               << " transfers in " << path << "\n";
 }
 
 void StaticFolder::reportLinks(raw_ostream &os) {
@@ -24694,6 +24895,7 @@ LogicalResult StaticFolder::run() {
   }
   choosePageGates();
   reportStateInRam();
+  exportTransfers();
   if (scheduleOnly) {
     // The page engines the build would take (and the link streams they
     // carry), in the report too: a cost model prices a schedule as built.

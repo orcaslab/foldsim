@@ -1,0 +1,42 @@
+# FOLDSIM_TRANSFER_CSV=<file>: a report of every logical transfer of the
+# schedule (a CSV line each: kind, classes, bits, 512-bit beats, window), off
+# by default; nothing is built from it, the schedule and the netlist are the
+# same with it or without it.
+# RUN: rm -rf %t && mkdir -p %t
+# Off by default: no file.
+# RUN: cd %S/Inputs/mailbox && foldsim --srcs top.f --top Top --out %t/off --static --schedule-only --nest --modulo --min-ii 40 --compact-links --csf-mailbox-hbm --bubbles Src Sink > %t/off.log 2>&1
+# RUN: test ! -e %t/mb.csv
+# HBM mailboxes and link streams: each producer pass's row write (wr), each
+# landing (rd), and the on-chip links a line per reader's read.
+# RUN: cd %S/Inputs/mailbox && env FOLDSIM_TRANSFER_CSV=%t/mb.csv foldsim --srcs top.f --top Top --out %t/mb --static --schedule-only --nest --modulo --min-ii 40 --compact-links --csf-mailbox-hbm --bubbles Src Sink 2>&1 | FileCheck %s --check-prefix=LOG
+# RUN: FileCheck %s --check-prefix=MB < %t/mb.csv
+# RUN: diff %t/off/schedule.txt %t/mb/schedule.txt
+# Every line's room is its deadline less its release.
+# RUN: awk -F, 'NR > 1 && $9 != $8 - $7 { exit 1 }' %t/mb.csv
+# A streamed PP class (fixed scratch): a prefetch and a drain per streamed
+# row, from the window slot's previous occupant's pass to the next one's.
+# RUN: cd %S/Inputs/fixedscratch && env FOLDSIM_PP_ROWS=balanced FOLDSIM_TRANSFER_CSV=%t/pp.csv foldsim --srcs top64.f --top Top --out %t/pp --static --schedule-only --state-in-ram Leaf::8 --state-in-ram-pp --storage Leaf:sir=block --state-scratch-bits 40000 --state-scratch-fixed Leaf > %t/pp.log 2>&1
+# RUN: FileCheck %s --check-prefix=PP < %t/pp.csv
+# RUN: grep -c ',pp.prefetch,' %t/pp.csv | FileCheck %s --check-prefix=NPP
+# RUN: grep -c ',pp.drain,' %t/pp.csv | FileCheck %s --check-prefix=NPP
+# RUN: awk -F, '$2 ~ /^pp/ && $9 < 1 { exit 1 }' %t/pp.csv
+# Streamed folded stores: a row written after each instance's pass and read
+# back before its next.
+# RUN: cd %S/Inputs/fold_stream && env FOLDSIM_TRANSFER_CSV=%t/fs.csv foldsim --srcs top.f --top Top --out %t/fs --static --schedule-only --fold-store-stream Leaf > %t/fs.log 2>&1
+# RUN: FileCheck %s --check-prefix=FS < %t/fs.csv
+
+# LOG: FOLDSIM_TRANSFER_CSV: {{[0-9]+}} transfers in {{.*}}mb.csv
+
+# MB: id,kind,src_class,dst_class,bits,beats512,release,deadline,room,src_slr,dst_slr,direction,timing
+# MB-DAG: ,link.memory,{{[A-Za-z_]+}},{{[A-Za-z_]+}},{{[0-9]+}},1,{{-?[0-9]+}},{{-?[0-9]+}},{{-?[0-9]+}},-1,-1,chip,late
+# MB-DAG: ,link.hbm,Sink,hbm,{{[0-9]+}},1,{{[0-9]+}},{{[0-9]+}},{{[0-9]+}},-1,-1,wr,early
+# MB-DAG: ,mbox.hbm,Src,hbm,{{[0-9]+}},1,{{[0-9]+}},{{[0-9]+}},{{[0-9]+}},-1,-1,wr,early
+# MB-DAG: ,mbox.hbm,hbm,Sink,{{[0-9]+}},1,{{-?[0-9]+}},{{-?[0-9]+}},{{[0-9]+}},-1,-1,rd,early
+
+# PP: id,kind,
+# PP-DAG: ,pp.prefetch,hbm,Leaf,72,1,{{-?[0-9]+}},{{[0-9]+}},{{[0-9]+}},-1,-1,rd,early
+# PP-DAG: ,pp.drain,Leaf,hbm,72,1,{{[0-9]+}},{{[0-9]+}},{{[0-9]+}},-1,-1,wr,early
+# NPP: 32
+
+# FS-DAG: ,fold.wr,Leaf,hbm,8,1,{{[0-9]+}},{{[0-9]+}},20,-1,-1,wr,early
+# FS-DAG: ,fold.rd,hbm,Leaf,8,1,{{[0-9]+}},{{[0-9]+}},20,-1,-1,rd,early
