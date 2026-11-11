@@ -661,6 +661,13 @@ public:
   /// `affine-auto-bits`: only a class whose undecoded rows hold at least
   /// this many bits is made affine.
   uint64_t affineAutoBits = 0;
+  /// `affine-stride exact`: a group's stride not rounded up to a power of
+  /// two (its runs decode with the position counters' quotient and
+  /// remainder); undecodedClasses then counts runs of any stride.
+  bool affineExact = false;
+  /// `affine-auto-segments`: undecodedClasses' bound on a row's segments
+  /// (0: slot-segments).
+  unsigned affineAutoSegments = 0;
   unsigned affineAutoRounds = 0;
   unsigned affineTrial = 0;   // nesting of affine-auto's trial schedules
   unsigned slotSegmentsK = 0;
@@ -7360,7 +7367,21 @@ unsigned StaticFolder::placeModulo(
         for (auto [k, n] : llvm::enumerate(m))
           anodes[n].index = unsigned(k);
       }
-      auto strides = foldsim::affineStrides(groups);
+      auto strides = foldsim::affineStrides(groups, affineExact);
+      if (getenv("FOLDSIM_AFFINE_LOG")) {
+        // Each resource's groups and strides (the first period tried).
+        static unsigned logged = 0;
+        if (logged++ < 1)
+          for (auto [g, grp] : llvm::enumerate(groups))
+            if (grp.count > 1)
+              llvm::errs() << "affine-stride: " << classes[nodes[members[g][0]].cls].name
+                           << (nodes[members[g][0]].pass == kState
+                                   ? std::string(".state")
+                                   : ".ready" + std::to_string(nodes[members[g][0]].level))
+                           << "@" << grp.resource << " x" << grp.count << " minStride "
+                           << grp.minStride << " stride " << strides[g] << " (II " << period
+                           << ")\n";
+      }
       auto fitsAt = [&](unsigned n, int t) {
         unsigned c = nodes[n].cls;
         return t >= 0 && !busy[resourceOf(nodes[n])].test(unsigned(t) % period) &&
@@ -10514,7 +10535,7 @@ static void printSlots(raw_ostream &os, ArrayRef<int> slots) {
 
 SmallVector<unsigned> StaticFolder::undecodedClasses() {
   SmallVector<unsigned> out;
-  unsigned k = slotSegmentsK ? slotSegmentsK : 8;
+  unsigned k = affineAutoSegments ? affineAutoSegments : slotSegmentsK ? slotSegmentsK : 8;
   uint64_t rowBits = uint64_t(llvm::PowerOf2Ceil(ii + 1));
   // An HBM link stream's tables lie at its reader's read passes (landings,
   // requests) and its producer's passes (writes): their kept bits count for
@@ -10525,7 +10546,7 @@ SmallVector<unsigned> StaticFolder::undecodedClasses() {
       if (st.excluded || !st.kept)
         continue;
       auto bitsOf = [&](ArrayRef<uint64_t> row, unsigned width) -> uint64_t {
-        return foldsim::slotSegments(row, std::max(width, 1u), k).size() > k
+        return foldsim::slotSegments(row, std::max(width, 1u), k, affineExact).size() > k
                    ? rowBits * std::max(width, 1u)
                    : 0;
       };
@@ -10565,7 +10586,7 @@ SmallVector<unsigned> StaticFolder::undecodedClasses() {
         prow[pos] = j;
       }
     auto check = [&](ArrayRef<uint64_t> row, unsigned width) {
-      if (foldsim::slotSegments(row, width, k).size() > k)
+      if (foldsim::slotSegments(row, width, k, affineExact).size() > k)
         kept += rowBits * width;
     };
     check(inst, idxWidth);
@@ -11625,6 +11646,9 @@ static LogicalResult foldPipelines(
 /// A slot table: `rows[index]` (`width` bits; zero past the rows).
 static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                    unsigned width, unsigned site = __builtin_LINE());
+static std::pair<Value, Value> fixedResident(ImplicitLocOpBuilder &b, Value i, unsigned B,
+                                             unsigned R, unsigned threads, unsigned rw);
+static Value constTimes(ImplicitLocOpBuilder &b, Value x, uint64_t c, unsigned width);
 /// `max-table-bits`: the largest table constant, in bits (Vivado's variable
 /// limit); a larger one is cut into column slices.
 static uint64_t gMaxTableBits = 1000000;
@@ -11647,6 +11671,21 @@ static unsigned gPassII = 0;
 static bool gFactoring = false;
 /// A table built as a constant whatever slot-segments could make of it.
 static bool gTableRaw = false;
+/// `slot-column-affine`: a table of an index the position counters do not
+/// know (an instance) cut into column-affine pieces (findColumnAffine),
+/// its quotient and remainder by a constant division; `gColumnAffine`
+/// while one is built (its residual rows are not cut again).
+static bool gSlotColumnAffine = false;
+static bool gColumnAffine = false;
+/// `slot-table-compose`: a table of a position table's value read through
+/// the inner table's position (composed rows), the position's decoders.
+static bool gSlotTableCompose = false;
+/// tableThenReg: the table's value is registered right after (a plain
+/// register of the host clock); a column-affine decoder of an instance
+/// register may then take that register into its own (the index's quotient
+/// and remainder registered after a division of the index itself, the
+/// decoder after them) and says so in gRegAfterTaken.
+static bool gRegAfter = false, gRegAfterActive = false, gRegAfterTaken = false;
 
 /// The regions sharing a copy of the slot controls two host cycles ahead.
 static constexpr unsigned kRegionsPerGroup = 16;
@@ -17470,7 +17509,18 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         Group g;
         std::string prefix = ("pp_g" + Twine(c / 16)).str();
         Value row2 = keepReg(ppRow3, prefix + "_rrow2");
-        if (partial) {
+        // state-scratch-fixed: the resident index and stream bit from the
+        // registered instance (fixedResident), not the simulator's inputs.
+        bool fixedRes = partial && cls.ppFixed && threads > 1 && cls.ppFixedR &&
+                        llvm::isPowerOf2_32(cls.ppFixedB);
+        unsigned rw = std::max(1u, llvm::Log2_32_Ceil(resPow));
+        if (fixedRes) {
+          auto [r2, s2] = fixedResident(b, keepReg(ppInst3, prefix + "_rresinst2"),
+                                        cls.ppFixedB, cls.ppFixedR, threads, rw);
+          (void)s2;
+          g.resRead = resPow > 1 ? b.createOrFold<comb::ConcatOp>(r2, row2) : row2;
+          g.str1 = keepReg(keepReg(str3, prefix + "_rstr2"), prefix + "_rstr1");
+        } else if (partial) {
           Value r2 = keepReg(res3, prefix + "_rres2");
           g.resRead = resPow > 1 ? b.createOrFold<comb::ConcatOp>(r2, row2) : row2;
           g.str1 = keepReg(keepReg(str3, prefix + "_rstr2"), prefix + "_rstr1");
@@ -17495,7 +17545,15 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           g.wAddr = b.createOrFold<comb::ConcatOp>(
               keepReg(inst1, prefix + "_winst0"), g.wAddr);
         }
-        if (partial) {
+        if (fixedRes) {
+          Value i1 = keepReg(keepReg(ppInst3, prefix + "_wresinst2"), prefix + "_wresinst1");
+          Value r0 = keepReg(fixedResident(b, i1, cls.ppFixedB, cls.ppFixedR, threads, rw).first,
+                             prefix + "_wres0");
+          Value wrow0 = keepReg(g.wRow1, prefix + "_wresrow0");
+          g.resWrite = resPow > 1 ? b.createOrFold<comb::ConcatOp>(r0, wrow0) : wrow0;
+          g.str0 = keepReg(keepReg(keepReg(str3, prefix + "_wstr2"), prefix + "_wstr1"),
+                           prefix + "_wstr0");
+        } else if (partial) {
           Value r0 = keepReg(keepReg(keepReg(res3, prefix + "_wres2"),
                                      prefix + "_wres1"),
                              prefix + "_wres0");
@@ -18618,10 +18676,61 @@ LogicalResult StaticFolder::checkMulticycle(Class &cls) {
 //===----------------------------------------------------------------------===//
 
 /// A table indexed by `index`, of constants of `width` bits.
+/// slot-table-compose: the position tables built (their index, rows and
+/// rows read), by result, for a table of a table's value: read through the
+/// inner table's position instead (composed rows), which the position's
+/// decoders take.
+struct TableSource {
+  Value index;
+  SmallVector<uint32_t> rows;
+  SmallVector<uint8_t> care;
+};
+static DenseMap<Value, TableSource> gTableSource;
+
+static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+                       unsigned width, unsigned site, ArrayRef<uint8_t> care);
+
 static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                    unsigned width, unsigned site) {
   ArrayRef<uint8_t> care = gCare;
   gCare = {};
+  bool regAfter = gRegAfter;
+  gRegAfter = false;
+  bool outer = gRegAfterActive;
+  gRegAfterActive = regAfter;
+  Value v = tableBody(b, index, rows, width, site, care);
+  gRegAfterActive = outer;
+  // (Instance-like values of a position: kept for a table of them.)
+  if ((gSlotTableCompose || gSlotColumnAffine) && v && width >= 4 && width <= 32 &&
+      rows.size() <= (1u << 17) &&
+      !gTableSource.count(v)) {
+    auto *pc = foldsim::currentPosCounters();
+    if (pc && pc->knows(index)) {
+      auto &src = gTableSource[v];
+      src.index = index;
+      src.rows.assign(rows.begin(), rows.end());
+      src.care.assign(care.begin(), care.end());
+    }
+  }
+  return v;
+}
+
+/// `reg1(table(index, rows))`, the table's decoder free to take that
+/// register into its own pipeline (gRegAfter).
+static Value tableThenReg(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+                          unsigned width, function_ref<Value(Value)> reg1,
+                          unsigned site = __builtin_LINE()) {
+  gRegAfter = true;
+  gRegAfterTaken = false;
+  Value v = table(b, index, rows, width, site);
+  gRegAfter = false;
+  bool taken = gRegAfterTaken;
+  gRegAfterTaken = false;
+  return taken ? v : reg1(v);
+}
+
+static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+                       unsigned width, unsigned site, ArrayRef<uint8_t> care) {
   auto type = b.getIntegerType(std::max(width, 1u));
   bool uniform = llvm::all_of(rows, [&](uint64_t v) { return v == rows[0]; });
   if (rows.empty() || uniform)
@@ -18786,6 +18895,272 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
   return b.createOrFold<comb::ConcatOp>(parts);
 }
 
+static Value sumTree(ImplicitLocOpBuilder &b, SmallVector<Value> values, unsigned width);
+/// `x * c` (mod 2^width), c's canonical signed digits as shifts and adds.
+static Value constTimes(ImplicitLocOpBuilder &b, Value x, uint64_t c, unsigned width) {
+  auto type = b.getIntegerType(width);
+  unsigned xw = hw::getBitWidth(x.getType());
+  SmallVector<std::pair<bool, unsigned>> terms;
+  foldsim::csdTerms(c, width, 64, terms);
+  SmallVector<Value> pos, neg_;
+  for (auto [neg, sh] : terms) {
+    if (sh >= width)
+      continue;
+    unsigned keep = std::min(xw, width - sh);
+    SmallVector<Value> parts;
+    if (keep + sh < width)
+      parts.push_back(hw::ConstantOp::create(b, b.getIntegerType(width - keep - sh), 0));
+    parts.push_back(keep == xw ? x : Value(comb::ExtractOp::create(b, x, 0, keep)));
+    if (sh)
+      parts.push_back(hw::ConstantOp::create(b, b.getIntegerType(sh), 0));
+    Value t = parts.size() == 1 ? parts[0] : Value(comb::ConcatOp::create(b, parts));
+    (neg ? neg_ : pos).push_back(t);
+  }
+  // The positive terms' and the negative terms' sums as balanced trees, one
+  // subtraction.
+  Value p = sumTree(b, pos, width);
+  return neg_.empty() ? p : Value(comb::SubOp::create(b, p, sumTree(b, neg_, width)));
+}
+
+/// state-scratch-fixed: of each B instances (a power of two) the first R
+/// resident. Instance i's resident index (i >> log B) * R + i % B (`rw`
+/// bits) and stream bit (i past the last whole block, or i % B >= R).
+static std::pair<Value, Value> fixedResident(ImplicitLocOpBuilder &b, Value i, unsigned B,
+                                             unsigned R, unsigned threads, unsigned rw) {
+  unsigned iw = hw::getBitWidth(i.getType()), lb = llvm::Log2_32(B);
+  unsigned full = threads / B * B;
+  auto cst = [&](unsigned w, uint64_t v) -> Value { return hw::ConstantOp::create(b, b.getIntegerType(w), v); };
+  auto zext = [&](Value v, unsigned w) -> Value {
+    unsigned vw = hw::getBitWidth(v.getType());
+    if (vw == w)
+      return v;
+    if (vw > w)
+      return comb::ExtractOp::create(b, v, 0, w);
+    return comb::ConcatOp::create(b, ValueRange{cst(w - vw, 0), v});
+  };
+  Value low = lb ? Value(comb::ExtractOp::create(b, i, 0, std::min(lb, iw))) : cst(1, 0);
+  Value res = zext(low, rw);
+  if (lb < iw) {
+    Value q = comb::ExtractOp::create(b, i, lb, iw - lb);
+    res = comb::AddOp::create(b, res, constTimes(b, zext(q, rw), R, rw));
+  }
+  Value tail = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, zext(low, lb + 1), cst(lb + 1, R));
+  Value str = full >= (uint64_t(1) << iw)
+                  ? tail
+                  : Value(comb::OrOp::create(
+                        b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, i, cst(iw, full)), tail));
+  return {res, str};
+}
+
+/// The quotient and remainder of `x` (at most `maxX`) by the constant `d`:
+/// q = (x * m) >> s with m = ceil(2^s / d), the least s exact for every x
+/// up to maxX (checked), r = x - q * d. Null if none up to 2^40 is exact.
+static std::pair<Value, Value> constDivmod(ImplicitLocOpBuilder &b, Value x,
+                                           uint64_t d, uint64_t maxX) {
+  unsigned xw = hw::getBitWidth(x.getType());
+  unsigned qw = std::max(1u, unsigned(llvm::Log2_64_Ceil(maxX / d + 1)));
+  unsigned rw = std::max(1u, unsigned(llvm::Log2_64_Ceil(d)));
+  if (llvm::isPowerOf2_64(d)) {
+    unsigned k = llvm::Log2_64(d);
+    Value q = k >= xw ? Value(hw::ConstantOp::create(b, b.getIntegerType(qw), 0))
+                      : Value(comb::ExtractOp::create(b, x, k, std::min(qw, xw - k)));
+    if (hw::getBitWidth(q.getType()) < qw)
+      q = comb::ConcatOp::create(
+          b, ValueRange{hw::ConstantOp::create(b, b.getIntegerType(qw - hw::getBitWidth(q.getType())), 0), q});
+    Value r = comb::ExtractOp::create(b, x, 0, std::min(rw, xw));
+    return {q, r};
+  }
+  for (unsigned sh = xw; sh <= 40; ++sh) {
+    uint64_t m = ((uint64_t(1) << sh) + d - 1) / d;
+    bool exact = true;
+    for (uint64_t v = 0; v <= maxX && exact; ++v)
+      exact = ((__uint128_t(v) * m) >> sh) == v / d;
+    if (!exact)
+      continue;
+    unsigned pw = sh + qw;
+    Value wide = comb::ConcatOp::create(
+        b, ValueRange{hw::ConstantOp::create(b, b.getIntegerType(pw - xw), 0), x});
+    Value prod = constTimes(b, wide, m, pw);
+    Value q = comb::ExtractOp::create(b, prod, sh, qw);
+    // r = x - q * d, in the remainder's bits (the low bits of the exact
+    // difference).
+    Value qd = constTimes(b, q, d, xw);
+    Value r = comb::ExtractOp::create(b, comb::SubOp::create(b, x, qd), 0, std::min(rw, xw));
+    return {q, r};
+  }
+  return {};
+}
+
+/// `values` summed (mod 2^width) as a balanced tree of adders.
+static Value sumTree(ImplicitLocOpBuilder &b, SmallVector<Value> values, unsigned width) {
+  if (values.empty())
+    return hw::ConstantOp::create(b, b.getIntegerType(width), 0);
+  while (values.size() > 1) {
+    SmallVector<Value> next;
+    for (size_t k = 0; k + 1 < values.size(); k += 2)
+      next.push_back(comb::AddOp::create(b, values[k], values[k + 1]));
+    if (values.size() % 2)
+      next.push_back(values.back());
+    values = std::move(next);
+  }
+  return values[0];
+}
+
+/// A ColumnAffine as hardware. Each piece [a, b) of period D reads the
+/// index's quotient and remainder by D: the position counters' (registers
+/// beside the position's) where the index is a position, else, where the
+/// index is a register (an instance register loaded from its table), a
+/// constant division of the register's next value, registered beside it;
+/// else none (null). The piece's offset a is folded into its tables (no
+/// subtraction): with x = index, a = qa D + ra, the piece's r = (x - ra) mod
+/// D and q = x div D - qa - (x mod D < ra), so a[r] + s[r] q = A2[x mod D] +
+/// S2[x mod D] (x div D), A2 and S2 tables of the D remainders. The value
+/// is A2 plus, for each distinct slope, the slope times the quotient where
+/// the remainder takes it, summed as a balanced tree; a range compare
+/// selects the piece; the pieces and the residual's table are ORed.
+static Value buildColumnAffine(ImplicitLocOpBuilder &b, Value index,
+                               const foldsim::ColumnAffine &ca, unsigned width) {
+  auto itype = index.getType();
+  unsigned iw = hw::getBitWidth(itype);
+  auto type = b.getIntegerType(width);
+  uint64_t wmask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
+  auto cst = [&](Type t, uint64_t v) -> Value { return hw::ConstantOp::create(b, t, v); };
+  auto *pc = foldsim::currentPosCounters();
+  bool counted = pc && pc->knows(index);
+  auto reg = index.getDefiningOp<seq::FirRegOp>();
+  if (!counted && (!reg || reg.getReset() || reg.getPreset()))
+    return {};
+  // The caller registers the value right after (tableThenReg): an instance
+  // register's quotient and remainder by a division of the register itself,
+  // registered, and the range compares and the residual registered too;
+  // the decoder after them gives that register's value.
+  bool late = !counted && gRegAfterActive;
+  gRegAfterActive = false;
+  auto lateReg = [&](Value v, const Twine &n) -> Value {
+    return late ? Value(seq::FirRegOp::create(b, v, reg.getClk(), b.getStringAttr(n))) : v;
+  };
+  // The quotient and remainder of the index by d (cached per d).
+  std::map<uint64_t, std::pair<Value, Value>> qrOf;
+  auto qrBy = [&](uint64_t d) -> std::pair<Value, Value> {
+    auto it = qrOf.find(d);
+    if (it != qrOf.end())
+      return it->second;
+    std::pair<Value, Value> qr;
+    if (counted) {
+      qr = pc->divmod(b, index, unsigned(d));
+    } else if (late) {
+      auto [qn, rn] = constDivmod(b, index, d, (uint64_t(1) << iw) - 1);
+      if (qn)
+        qr = {lateReg(qn, "cadivq" + Twine(d)), lateReg(rn, "cadivr" + Twine(d))};
+    } else {
+      // The register's next value a position table (an instance decoded
+      // from the position): its quotient and remainder as position tables
+      // of their own (the rows composed), decoded by the position's
+      // segments and counters, registered as the index is. Where they do
+      // not decode, a constant division of the next value, only for an
+      // index of at most 8 bits (a division after a decoder is a deep
+      // path: past that, the table stays a table).
+      Value qn, rn;
+      auto src = gTableSource.find(reg.getNext());
+      if (src != gTableSource.end()) {
+        auto in = src->second;   // (a copy: the map may grow below)
+        unsigned qw = std::max(1u, unsigned(llvm::Log2_64_Ceil(((uint64_t(1) << iw) - 1) / d + 1)));
+        unsigned rw = std::max(1u, unsigned(llvm::Log2_64_Ceil(d)));
+        SmallVector<uint64_t> qrows(in.rows.size()), rrows(in.rows.size());
+        for (auto [p, x] : llvm::enumerate(in.rows)) {
+          qrows[p] = x / d;
+          rrows[p] = x % d;
+        }
+        // (Built only where the position's segments take both: a table
+        // built and dropped would still be counted.)
+        auto decodes = [&](ArrayRef<uint64_t> r, unsigned w) {
+          foldsim::Separable sp;
+          return foldsim::slotSegments(r, w, gSlotSegments, true, false, in.care).size() <=
+                     gSlotSegments ||
+                 (w >= 2 && foldsim::findSeparable(r, w, true, 1024, sp));
+        };
+        if (decodes(qrows, qw) && decodes(rrows, rw)) {
+          gCare = in.care;
+          qn = table(b, in.index, qrows, qw);
+          gCare = in.care;
+          rn = table(b, in.index, rrows, rw);
+        } else if (getenv("FOLDSIM_AFFINE_LOG")) {
+          llvm::errs() << "slot-sequencer: column-affine: the index's quotient by " << d
+                       << " does not decode at the position\n";
+        }
+      }
+      if (!qn && iw <= 8)
+        std::tie(qn, rn) = constDivmod(b, reg.getNext(), d, (uint64_t(1) << iw) - 1);
+      if (qn)
+        qr = {seq::FirRegOp::create(b, qn, reg.getClk(), b.getStringAttr("cadivq" + Twine(d))),
+              seq::FirRegOp::create(b, rn, reg.getClk(), b.getStringAttr("cadivr" + Twine(d)))};
+    }
+    qrOf[d] = qr;
+    return qr;
+  };
+  gColumnAffine = true;
+  llvm::scope_exit done([&] { gColumnAffine = false; });
+  SmallVector<Value> parts;
+  for (auto &pc_ : ca.pieces) {
+    uint64_t d = pc_.period, qa = pc_.start / d, ra = pc_.start % d;
+    auto [q, r] = qrBy(d);
+    if (!q)
+      return {};
+    SmallVector<uint64_t> a2(d), s2(d);
+    for (uint64_t x = 0; x < d; ++x) {
+      uint64_t pr = (x + d - ra) % d, sl = pc_.s[pr];
+      a2[x] = (pc_.a[pr] - sl * (qa + (x < ra ? 1 : 0))) & wmask;
+      s2[x] = sl;
+    }
+    SmallVector<Value> terms{table(b, r, a2, width)};
+    SmallVector<uint64_t, 4> slopes;
+    for (auto x : s2)
+      if (x && !llvm::is_contained(slopes, x))
+        slopes.push_back(x);
+    unsigned qw = hw::getBitWidth(q.getType());
+    Value qx = qw >= width ? Value(comb::ExtractOp::create(b, q, 0, width))
+                           : Value(comb::ConcatOp::create(b, ValueRange{cst(b.getIntegerType(width - qw), 0), q}));
+    for (auto sl : slopes) {
+      SmallVector<uint64_t> sel(d);
+      for (auto [k, x] : llvm::enumerate(s2))
+        sel[k] = x == sl;
+      Value on = table(b, r, sel, 1);
+      terms.push_back(comb::MuxOp::create(b, on, constTimes(b, qx, sl, width), cst(type, 0)));
+    }
+    Value v = sumTree(b, terms, width);
+    SmallVector<Value> in;
+    if (pc_.start)
+      in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge, index, cst(itype, pc_.start)));
+    if (pc_.end < (uint64_t(1) << iw))
+      in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::ult, index, cst(itype, pc_.end)));
+    if (!in.empty()) {
+      Value hit = in.size() == 1 ? in[0] : Value(comb::AndOp::create(b, in, false));
+      v = comb::MuxOp::create(b, lateReg(hit, "cahit"), v, cst(type, 0));
+    }
+    parts.push_back(v);
+  }
+  if (llvm::any_of(ca.residual, [](uint64_t x) { return x != 0; }))
+    parts.push_back(lateReg(table(b, index, ca.residual, width), "caresidual"));
+  if (late)
+    gRegAfterTaken = true;
+  auto &st = foldsim::slotSequencerStats();
+  ++st.decoded;
+  st.decodedBits += (uint64_t(1) << iw) * width;
+  st.segments += ca.pieces.size();
+  if (getenv("FOLDSIM_AFFINE_LOG")) {
+    llvm::errs() << "slot-sequencer: column-affine table of " << ca.residual.size() << " x "
+                 << width << " bits"
+                 << (counted ? " (position counters)"
+                     : late  ? " (division, then the caller's register)"
+                             : " (registered division)")
+                 << ":";
+    for (auto &pc_ : ca.pieces)
+      llvm::errs() << " [" << pc_.start << ", " << pc_.end << ") period " << pc_.period;
+    llvm::errs() << "\n";
+  }
+  return parts.size() == 1 ? parts[0] : Value(comb::OrOp::create(b, parts, false));
+}
+
 static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
                             ArrayRef<uint64_t> rows, unsigned width,
                             ArrayRef<uint8_t> care) {
@@ -18864,6 +19239,49 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
                    << " bits: period " << d << (sp.isXor ? " xor" : " sum") << " from " << sp.start
                    << " to " << sp.end << "\n";
     return v;
+  }
+  // Column-affine pieces (an instance table of a class nested a few
+  // children a parent: a switch network's ports): each a range compare, the
+  // offset's quotient and remainder by the period (a constant division),
+  // a table of the period's rows plus a few slopes times the quotient; the
+  // rows left to the segments.
+  if (gSlotColumnAffine && !gColumnAffine && !gTableRaw && iwidth <= 24 &&
+      rows.size() >= 64) {
+    foldsim::ColumnAffine ca;
+    if (foldsim::findColumnAffine(rows, width, 64, 6, 3, ca))
+      if (Value v = buildColumnAffine(b, index, ca, width))
+        return v;
+  }
+  // A table of a position table's value: the composed rows at the inner
+  // table's position (read where the inner value is read).
+  if (gSlotTableCompose && !gTableRaw && !counted) {
+    auto it = gTableSource.find(index);
+    if (it != gTableSource.end()) {
+      auto src = it->second;   // (a copy: the map may grow below)
+      SmallVector<uint64_t> composed(src.rows.size(), 0);
+      for (auto [p, x] : llvm::enumerate(src.rows))
+        composed[p] = x < rows.size() ? rows[x] : 0;
+      // (Only where the position's decoders take the composed rows: kept,
+      // a table of the position is larger than the table of the value.)
+      foldsim::Separable sp;
+      foldsim::ColumnAffine cap;
+      bool decodes =
+          foldsim::slotSegments(composed, width, gSlotSegments, true, false, src.care).size() <=
+              gSlotSegments ||
+          (width >= 2 && foldsim::findSeparable(composed, width, true, 1024, sp)) ||
+          (gSlotColumnAffine && foldsim::findColumnAffine(composed, width, 64, 6, 3, cap) &&
+           foldsim::slotSegments(cap.residual, width, gSlotSegments, true, false, src.care).size() <=
+               gSlotSegments);
+      if (decodes) {
+        gCare = src.care;
+        Value v = table(b, src.index, composed, width);
+        if (getenv("FOLDSIM_AFFINE_LOG"))
+          llvm::errs() << "slot-sequencer: a table of " << rows.size() << " x " << width
+                       << " bits read through its index's table of " << src.rows.size()
+                       << " positions\n";
+        return v;
+      }
+    }
   }
   // A one-bit table whose zero rows are the fewer segments (a set of nearly
   // every position: a copy's passes but a few holes): its complement
@@ -20155,8 +20573,21 @@ LogicalResult StaticFolder::buildSim() {
           resRank[k] = resOf(passOrder[k]);
           strRank[k] = cls.ppStreamed[passOrder[k]];
         }
-        ctl.ppRes3 = byRank(lastSet, resRank, presRow, passValid, cls.ppResBits());
-        ctl.ppStr3 = byRank(lastSet, strRank, pstrRow, passValid, 1);
+        if (cls.ppFixed && ctl.ppInst3 && cls.ppFixedR && llvm::isPowerOf2_32(cls.ppFixedB)) {
+          // state-scratch-fixed: the resident index and stream bit are
+          // digits of the pass's instance (fixedResident): no table of the
+          // position or of its rank (whose rows follow the instances' pass
+          // order, irregular). The stream bit here (two compares); the index
+          // (an adder) the copy computes from the instance it registers,
+          // not after the instance's decoder.
+          ctl.ppRes3 = constant(cls.ppResBits(), 0);
+          ctl.ppStr3 = fixedResident(b, ctl.ppInst3, cls.ppFixedB, cls.ppFixedR, threads,
+                                     cls.ppResBits())
+                           .second;
+        } else {
+          ctl.ppRes3 = byRank(lastSet, resRank, presRow, passValid, cls.ppResBits());
+          ctl.ppStr3 = byRank(lastSet, strRank, pstrRow, passValid, 1);
+        }
       }
       if (cls.ppHbm) {
         // Streamed: each pass's window slot (of its instance).
@@ -21666,8 +22097,8 @@ LogicalResult StaticFolder::buildSim() {
           b, wparity, reg(reg(pctl.tail2, prefix + "_tail1"), prefix + "_tail0"));
     SmallVector<Value> at{notOf(wparity)};
     if (pIdx && st.mailbox)
-      at.push_back(reg(reg(table(b, pctl.inst2, st.mbWriteRow, pIdx),
-                           prefix + "_wrow1"),
+      at.push_back(reg(tableThenReg(b, pctl.inst2, st.mbWriteRow, pIdx,
+                                    [&](Value v) { return reg(v, prefix + "_wrow1"); }),
                        prefix + "_wrow0"));
     else if (pIdx)
       at.push_back(reg(reg(pctl.inst2, prefix + "_winst1"), prefix + "_winst0"));
@@ -21700,11 +22131,13 @@ LogicalResult StaticFolder::buildSim() {
         Value &bit = domainBit[d];
         if (!bit)
           bit = d < 0 ? constant(1, 0)
-                      : reg(reg(table(b, pctl.inst2,
-                                      SmallVector<uint64_t>(st.mbDomains[d].begin(),
-                                                            st.mbDomains[d].end()),
-                                      1),
-                                prefix + "_wdom" + Twine(d) + "_1"),
+                      : reg(tableThenReg(b, pctl.inst2,
+                                         SmallVector<uint64_t>(st.mbDomains[d].begin(),
+                                                               st.mbDomains[d].end()),
+                                         1,
+                                         [&](Value v) {
+                                           return reg(v, prefix + "_wdom" + Twine(d) + "_1");
+                                         }),
                             prefix + "_wdom" + Twine(d) + "_0");
         maskBytes.push_back(bit);
       }
@@ -21776,7 +22209,8 @@ LogicalResult StaticFolder::buildSim() {
       SmallVector<uint64_t> writer(pthreads, 0);
       for (unsigned j = 0; j < pthreads; ++j)
         writer[j] = st.writes(j);
-      Value any = reg(reg(table(b, pctl.inst2, writer, 1), prefix + "_wany1"),
+      Value any = reg(tableThenReg(b, pctl.inst2, writer, 1,
+                                   [&](Value v) { return reg(v, prefix + "_wany1"); }),
                       prefix + "_wany0");
       Value heldAny = seq::CompRegClockEnabledOp::create(
           b, any, hostClock, we0, b.getStringAttr(prefix + "_any"), Value(),
@@ -21909,9 +22343,11 @@ LogicalResult StaticFolder::buildSim() {
       }
       write = comb::AndOp::create(
           b, write,
-          copyReg(copyReg(table(b, pctl.inst2, kept, 1), name + "_mine1"),
+          copyReg(tableThenReg(b, pctl.inst2, kept, 1,
+                               [&](Value v) { return copyReg(v, name + "_mine1"); }),
                   name + "_mine0"));
-      writeAt = copyReg(copyReg(table(b, pctl.inst2, index, aw), name + "_at1"),
+      writeAt = copyReg(tableThenReg(b, pctl.inst2, index, aw,
+                                     [&](Value v) { return copyReg(v, name + "_at1"); }),
                         name + "_at0");
     }
     auto memory = seq::FirMemOp::create(
@@ -22882,9 +23318,9 @@ LogicalResult StaticFolder::buildSim() {
         SmallVector<Value> chosen;
         for (unsigned low = 0; low < width; low += regionBits) {
           unsigned n = std::min<unsigned>(regionBits, width - low);
-          Value select = copyReg(table(b, ctl.inst2, rows, w),
-                                 consumer.name + "_select" + Twine(at) + "_" +
-                                     Twine(low));
+          Value select = tableThenReg(b, ctl.inst2, rows, w, [&](Value v) {
+            return copyReg(v, consumer.name + "_select" + Twine(at) + "_" + Twine(low));
+          });
           SmallVector<Value> elements;
           for (uint64_t s = (uint64_t(1) << w); s-- > 0;)
             elements.push_back(b.createOrFold<comb::ExtractOp>(
@@ -22914,9 +23350,10 @@ LogicalResult StaticFolder::buildSim() {
           unsigned w = llvm::Log2_32_Ceil(sources.size());
           mine = comb::ICmpOp::create(
               b, comb::ICmpPredicate::eq,
-              copyReg(table(b, ctl.inst2, rows, w),
-                      consumer.name + "_select_after" + Twine(at) + "_" +
-                          Twine(index)),
+              tableThenReg(b, ctl.inst2, rows, w, [&](Value v) {
+                return copyReg(v, consumer.name + "_select_after" + Twine(at) + "_" +
+                                      Twine(index));
+              }),
               constant(w, index));
         }
         for (auto &piece : sourceAfter[index]) {
@@ -23054,8 +23491,8 @@ LogicalResult StaticFolder::buildSim() {
           box.lanes.size());
       for (auto [k, piece] : llvm::enumerate(layout.pieces)) {
         std::string name = base + "_" + std::to_string(k);
-        auto twice = [&](Value v, const std::string &n) {
-          v = copyReg(copyReg(v, name + n + "1"), name + n + "0");
+        auto twice = [&](Value v, const std::string &n, bool once = false) {
+          v = copyReg(once ? v : copyReg(v, name + n + "1"), name + n + "0");
           for (unsigned j = 0; j < splitLate; ++j)
             v = copyReg(v, name + n + "_split" + std::to_string(j + 1));
           if (box.late)
@@ -23077,8 +23514,12 @@ LogicalResult StaticFolder::buildSim() {
             if (!domainBit.count(d)) {
               SmallVector<uint64_t> memberOf(domainMembers[d].begin(),
                                              domainMembers[d].end());
-              domainBit[d] = twice(table(b, pctl.inst2, memberOf, 1),
-                                   "_mask" + std::to_string(d));
+              {
+            std::string n = "_mask" + std::to_string(d);
+            domainBit[d] = twice(tableThenReg(b, pctl.inst2, memberOf, 1,
+                                              [&](Value v) { return copyReg(v, name + n + "1"); }),
+                                 n, /*once=*/true);
+          }
             }
           SmallVector<Value> bytes;
           for (unsigned d : llvm::reverse(piece.byteDomain))
@@ -23115,7 +23556,9 @@ LogicalResult StaticFolder::buildSim() {
           SmallVector<uint64_t> rowOf(pThreads, 0);
           for (unsigned j = 0; j < pThreads; ++j)
             rowOf[j] = rowOfProducer[j] >= 0 ? uint64_t(rowOfProducer[j]) : 0;
-          writeAddress.push_back(twice(table(b, pctl.inst2, rowOf, rowBits), "_row"));
+          writeAddress.push_back(twice(tableThenReg(b, pctl.inst2, rowOf, rowBits,
+                                                    [&](Value v) { return copyReg(v, name + "_row1"); }),
+                                       "_row", /*once=*/true));
           Value inst = box.early ? rctl.inst3 : rctl.inst2;
           if (!identity) {
             SmallVector<uint64_t> readRow(rThreads, 0);
@@ -25325,15 +25768,29 @@ void FoldStaticPass::runOnOperation() {
   folder.affineSlots = affineSlots;
   folder.affineAuto = affineAuto;
   folder.affineAutoBits = affineAutoBits;
+  folder.affineAutoSegments = affineAutoSegments;
+  if (affineStride != "pow2" && affineStride != "exact") {
+    getOperation().emitError("affine-stride: '")
+        << affineStride << "' is neither pow2 nor exact";
+    return signalPassFailure();
+  }
+  folder.affineExact = affineStride == "exact";
   folder.slotSegmentsK = slotSegments;
   gMaxTableBits = std::max<uint64_t>(1, maxTableBits);
   gSlotSegments = slotSegments;
+  gSlotColumnAffine = slotColumnAffine;
+  gSlotTableCompose = slotTableCompose;
+  // (FOLDSIM_SLOT_COLUMN_AFFINE, a test hook: the whole suite with both.)
+  if (getenv("FOLDSIM_SLOT_COLUMN_AFFINE"))
+    gSlotColumnAffine = gSlotTableCompose = true;
+  gTableSource.clear();
   // FOLDSIM_SLOT_SEGMENTS: the default for runs that leave it 0 (a test
   // hook: the whole suite with decoders).
   if (!gSlotSegments)
     if (const char *env = getenv("FOLDSIM_SLOT_SEGMENTS"))
       gSlotSegments = unsigned(atoi(env));
   foldsim::slotSequencerStats().reset();
+  llvm::scope_exit dropSources([] { gTableSource.clear(); });
   if (failed(folder.run()))
     return signalPassFailure();
   if (gSlotSegments) {

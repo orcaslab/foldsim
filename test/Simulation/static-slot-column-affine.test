@@ -1,0 +1,34 @@
+# REQUIRES: verilator
+# --slot-column-affine: a per-instance constant of a class nested in runs of
+# parents (Driver/Inputs/ids/topca.sv: 6 parents of 10 children, then 10 of
+# 6) whose child constant steps by a slope that depends on the child (3 or
+# 12, then 5 or 3) is a table no run of segments and no separable F op G
+# decodes (kept without the option). Cut into column-affine pieces, each
+# piece is a range compare, the offset's quotient and remainder by the period
+# (a constant division), a table of the period's rows plus the slopes times
+# the quotient: no table kept, as large at any count of parents. Exact
+# against the target (FOLDSIM_SLOT_CHECK: each decoded table beside its
+# decoder), stalled channels.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/ids
+# RUN: env FOLDSIM_AFFINE_LOG=1 foldsim --srcs topca.f --top Top --out %t/off --static --modulo --slot-segments 4 Leaf > %t/off.log 2>&1
+# RUN: FileCheck %s --check-prefix=OFF < %t/off.log
+# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_AFFINE_LOG=1 foldsim --srcs topca.f --top Top --out %t/ca --static --modulo --slot-segments 4 --slot-column-affine Leaf > %t/ca.log 2>&1
+# RUN: FileCheck %s --check-prefix=CA < %t/ca.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/ca/obj %S/Inputs/tb_nest.sv leaf.sv topca.sv %t/ca/foldsim_sim.sv > %t/ca/build.log 2>&1
+# RUN: %t/ca/obj/Vtb +stall=0 | FileCheck %s
+# RUN: %t/ca/obj/Vtb +stall=30 | FileCheck %s
+# OFF: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), 1 tables kept
+# CA: slot-sequencer: column-affine table of {{[0-9]+}} x 16 bits{{.*}}: [0, 60) period 10 [60, 120) period 6
+# CA: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), 0 tables kept
+# CHECK: {{^}}MATCH
+# An instance-indexed table (Driver/Inputs/ids/topcai.sv: consumer i reads
+# producer src(i), column-affine in i): its index is the consumers' instance
+# register, so the quotient and remainder are a constant division of that
+# register's next value, registered beside it. No table kept; exact.
+# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_AFFINE_LOG=1 foldsim --srcs topcai.f --top Top --out %t/ci --static --modulo --slot-segments 4 --slot-column-affine Prod Cons > %t/ci.log 2>&1
+# RUN: FileCheck %s --check-prefix=CI < %t/ci.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/ci/obj %S/Inputs/tb_nest.sv topcai.sv %t/ci/foldsim_sim.sv > %t/ci/build.log 2>&1
+# RUN: %t/ci/obj/Vtb +stall=0 | FileCheck %s
+# RUN: %t/ci/obj/Vtb +stall=30 | FileCheck %s
+# CI: slot-sequencer: column-affine table of 120 x 7 bits (registered division): [{{[0-9]+}}, 51) period 10 [60, 120) period 6
+# CI: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), 0 tables kept

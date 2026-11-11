@@ -37,7 +37,10 @@ struct AffineGroup {
 /// The groups' strides: each the power of two at least its resource's group
 /// count and its own least stride (a resource's groups interleave; a paged
 /// state pass's page does not hold its ready passes apart).
-llvm::SmallVector<unsigned> affineStrides(llvm::ArrayRef<AffineGroup> groups);
+/// With `exact`, the most of those, not rounded (a run of another stride
+/// decodes with the position counters' quotient and remainder).
+llvm::SmallVector<unsigned> affineStrides(llvm::ArrayRef<AffineGroup> groups,
+                                          bool exact = false);
 
 /// Places every group at o_g (node at o_g + index * stride_g), each node at
 /// or after its predecessors' slots plus the latency (`preds[n]`: (p,

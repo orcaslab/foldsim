@@ -1,0 +1,27 @@
+# REQUIRES: verilator
+# --affine-stride exact: an affine group's stride is its least (its page
+# spacing or its resource's group count), not that rounded up to a power of
+# two. Paged classes of page 3 (Driver/Inputs/linkshare, 16 instances each):
+# a stride of 3, the frame 48 (16 x 3), against 63 with strides of 4. Runs of
+# stride 3 decode with the position counters (no table kept); exact against
+# the target with HBM link streams on shared page engines, nested sequencers
+# and bubbles (frames padded to 160 so that every table is decoded;
+# FOLDSIM_SLOT_CHECK builds each decoded table beside its decoder).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/linkshare
+# RUN: env FOLDSIM_AFFINE_LOG=1 foldsim --srcs top.f --top Top --out %t/p2 --static --nest --modulo --bubbles --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-shift 8 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm --affine-slots --schedule-only Unit Vnit Reader Sink > %t/p2.log 2>&1
+# RUN: FileCheck %s --check-prefix=POW2 < %t/p2.log
+# RUN: env FOLDSIM_AFFINE_LOG=1 foldsim --srcs top.f --top Top --out %t/ex --static --nest --modulo --bubbles --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-shift 8 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm --affine-slots --affine-stride exact --schedule-only Unit Vnit Reader Sink > %t/ex.log 2>&1
+# RUN: FileCheck %s --check-prefix=EXACT < %t/ex.log
+# RUN: env FOLDSIM_SLOT_CHECK=1 foldsim --srcs top.f --top Top --out %t/sim --static --nest --modulo --bubbles --min-ii 160 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-hbm-shift 8 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm --affine-slots --affine-stride exact --slot-segments 8 Unit Vnit Reader Sink > %t/sim.log 2>&1
+# RUN: FileCheck %s --check-prefix=SIM < %t/sim.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/sim -DBUBBLES -Mdir %t/sim/obj %S/Inputs/tb_linkhbm.sv top.sv %t/sim/foldsim_sim.sv > %t/sim/build.log 2>&1
+# RUN: %t/sim/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +lo=1 +hi=30 +bubble=30 +stall=30 +full=20 | FileCheck %s
+# RUN: %t/sim/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=40 +hi=60 +full=40 | FileCheck %s
+# POW2: affine-stride: Unit.state@{{[0-9]+}} x16 minStride 3 stride 4
+# POW2: foldsim-fold-static: II = 63
+# EXACT: affine-stride: Unit.state@{{[0-9]+}} x16 minStride 3 stride 3
+# EXACT: foldsim-fold-static: II = 48
+# SIM: foldsim-fold-static: II = 160
+# SIM: foldsim-fold-static: slot-sequencer: {{[0-9]+}} tables decoded ({{.*}}), 0 tables kept
+# CHECK-NOT: PROTOCOL
+# CHECK: {{^}}MATCH

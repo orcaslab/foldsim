@@ -753,6 +753,92 @@ bool findSeparable(ArrayRef<uint64_t> rows, unsigned width, bool anyPeriod,
   return false;
 }
 
+bool findColumnAffine(ArrayRef<uint64_t> rows, unsigned width, unsigned maxPeriod,
+                      unsigned maxPieces, unsigned maxSlopes, ColumnAffine &out) {
+  uint64_t mask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
+  size_t n = rows.size();
+  auto row = [&](uint64_t k) { return k < n ? rows[k] & mask : 0; };
+  uint64_t live = 0, last = 0;
+  for (uint64_t k = 0; k < n; ++k)
+    if (row(k)) {
+      ++live;
+      last = k + 1;
+    }
+  if (live < 16)
+    return false;
+  out = ColumnAffine();
+  out.residual.assign(rows.begin(), rows.end());
+  for (auto &r : out.residual)
+    r &= mask;
+  uint64_t covered = 0;
+  // The piece of period d from a: its end (a whole number of periods, or
+  // the table's last live row), 0 if it holds fewer than 4 periods or too
+  // many slopes.
+  auto extend = [&](uint64_t a, uint64_t d, ColumnAffine::Piece &pc) -> uint64_t {
+    if (a + 2 * d > last)
+      return 0;
+    SmallVector<uint64_t> av(d), sv(d);
+    for (uint64_t r = 0; r < d; ++r) {
+      av[r] = row(a + r);
+      sv[r] = (row(a + d + r) - av[r]) & mask;
+    }
+    SmallVector<uint64_t, 4> slopes;
+    for (auto x : sv)
+      if (x && !llvm::is_contained(slopes, x)) {
+        if (slopes.size() >= maxSlopes || !stepOk(x, width))
+          return 0;
+        slopes.push_back(x);
+      }
+    uint64_t k = a + 2 * d;
+    for (; k < last; ++k) {
+      uint64_t q = (k - a) / d, r = (k - a) % d;
+      if (row(k) != ((av[r] + sv[r] * q) & mask)) {
+        k -= r;
+        break;
+      }
+    }
+    // (At least 4 periods and 32 rows: a short run is the segments'.)
+    if (k - a < std::max<uint64_t>(4 * d, 32))
+      return 0;
+    pc.start = a;
+    pc.end = k;
+    pc.period = d;
+    pc.a = std::move(av);
+    pc.s = std::move(sv);
+    return k;
+  };
+  uint64_t a = 0;
+  while (a < last) {
+    if (!row(a)) {
+      ++a;
+      continue;
+    }
+    ColumnAffine::Piece best;
+    uint64_t bestEnd = 0;
+    for (uint64_t d = 2; d <= maxPeriod; ++d) {
+      ColumnAffine::Piece pc;
+      uint64_t e = extend(a, d, pc);
+      if (e > bestEnd) {
+        bestEnd = e;
+        best = std::move(pc);
+      }
+    }
+    if (!bestEnd) {
+      ++a;
+      continue;
+    }
+    if (out.pieces.size() >= maxPieces)
+      return false;
+    for (uint64_t k = best.start; k < best.end; ++k) {
+      covered += row(k) != 0;
+      out.residual[k] = 0;
+    }
+    out.pieces.push_back(std::move(best));
+    a = bestEnd;
+  }
+  return !out.pieces.empty() && 2 * covered >= live;
+}
+
 void countFallback(unsigned indexWidth, unsigned width, unsigned segments) {
   auto &stats = slotSequencerStats();
   ++stats.fallback;

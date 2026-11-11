@@ -36,7 +36,7 @@ using namespace llvm;
 
 namespace foldsim {
 
-SmallVector<unsigned> affineStrides(ArrayRef<AffineGroup> groups) {
+SmallVector<unsigned> affineStrides(ArrayRef<AffineGroup> groups, bool exact) {
   // Each group its own stride: the resource's group count (so its kinds of
   // passes interleave) or its own spacing, whichever is more. A paged
   // copy's state passes keep their page apart; its ready passes, which take
@@ -45,9 +45,10 @@ SmallVector<unsigned> affineStrides(ArrayRef<AffineGroup> groups) {
   for (auto &g : groups)
     ++count[g.resource];
   SmallVector<unsigned> strides;
-  for (auto &g : groups)
-    strides.push_back(unsigned(
-        PowerOf2Ceil(std::max({1u, g.minStride, count[g.resource]}))));
+  for (auto &g : groups) {
+    unsigned least = std::max({1u, g.minStride, count[g.resource]});
+    strides.push_back(exact ? least : unsigned(PowerOf2Ceil(least)));
+  }
   return strides;
 }
 
@@ -104,17 +105,45 @@ bool placeAffine(unsigned period, ArrayRef<AffineNode> nodes,
   SmallVector<long> at(numGroups, 0);
   for (unsigned round = 0; round < 4 * numGroups + 16; ++round) {
     // Longest paths from the lower bounds.
+    SmallVector<int> via(numGroups, -1);
     for (unsigned pass = 0;; ++pass) {
       bool changed = false;
+      int last = -1;
       for (auto &[p, n, w] : edges)
         if (lower[p] + w > lower[n]) {
           lower[n] = lower[p] + w;
+          via[n] = int(p);
+          last = int(n);
           changed = true;
         }
       if (!changed)
         break;
       if (pass > numGroups) {
         why = "affine: a cycle of dependences between groups";
+        if (groupName) {
+          // The cycle: back along the last relaxations from a group that
+          // moved (numGroups steps land inside it).
+          int g = last;
+          for (unsigned k = 0; k < numGroups && g >= 0; ++k)
+            g = via[g];
+          if (g >= 0) {
+            why += " (";
+            int h = g;
+            for (unsigned k = 0; k <= numGroups; ++k) {
+              int p = via[h];
+              if (p < 0)
+                break;
+              auto key = std::make_pair(unsigned(p), unsigned(h));
+              why += groupName(unsigned(h)) + " <-" + std::to_string(bound[key]) + " (ranks " +
+                     std::to_string(why_[key].first) + "->" + std::to_string(why_[key].second) +
+                     ")- ";
+              h = p;
+              if (h == g)
+                break;
+            }
+            why += groupName(unsigned(g)) + ")";
+          }
+        }
         return false;
       }
     }
