@@ -79,7 +79,8 @@
 # MLIR: %ram_ring = seq.firmem 0, 1, undefined, undefined : <4 x 8, mask 1>
 # MLIR: seq.firmem.write_port %ram_ring[{{.*}}] = %vm1_rsp_data, clock %hostClock enable %vm1_rsp_valid
 # MLIR: %ram_ring_flight_queue = seq.firmem 0, 1, undefined, undefined : <64 x 6, mask 1>
-# MLIR: %ram_ring_flight_writes = seq.firmem 0, 1, undefined, undefined : <32 x 12, mask 1>
+# The answer queue: 32 rows and a zero row (read while the ring's image write is not granted).
+# MLIR: %ram_ring_flight_writes = seq.firmem 0, 1, undefined, undefined : <33 x 12, mask 1>
 # The entry read combinationally into a register whose synchronous reset is the skip (a use whose prefetch would
 # have come before the first frame reads zero): no select on the data.
 # MLIR: %ram_ring_data = seq.firreg %{{.*}} clock %hostClock reset sync %ram_ring_skip2, %c0_i8

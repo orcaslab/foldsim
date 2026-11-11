@@ -21,11 +21,11 @@
 # RUN: %t/fa/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +full=30 +bubble=30 | FileCheck %s
 # RUN: %t/fa/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=20 +hi=600 +full=50 +bubble=60 +burst=8 | FileCheck %s
 # RUN: %t/fa/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=40 +hi=200 +lo1=1 +hi1=2 +fifo=8 +drain=50 | FileCheck %s
-# Eight entries: flight 0..7, an answer queue of 8.
+# Eight entries: flight 0..7, an answer queue of 8 (and its zero row).
 # F8-DAG: %ram_ring_flight7_valid = seq.firreg
 # F8N-NOT: ram_ring_flight8_valid
-# F8-DAG: %ram_ring_flight_writes = seq.firmem 0, 1, undefined, undefined : <8 x {{[0-9]+}}, mask 1>
+# F8-DAG: %ram_ring_flight_writes = seq.firmem 0, 1, undefined, undefined : <9 x {{[0-9]+}}, mask 1>
 # Sixteen prefetches a frame of a short frame: the 256-position latency asks for the most (32).
 # FA-DAG: %ram_ring_flight31_valid = seq.firreg
-# FA-DAG: %ram_ring_flight_writes = seq.firmem 0, 1, undefined, undefined : <32 x {{[0-9]+}}, mask 1>
+# FA-DAG: %ram_ring_flight_writes = seq.firmem 0, 1, undefined, undefined : <33 x {{[0-9]+}}, mask 1>
 # CHECK: {{^}}MATCH

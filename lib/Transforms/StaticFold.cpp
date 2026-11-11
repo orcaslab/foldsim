@@ -21122,14 +21122,22 @@ LogicalResult StaticFolder::buildSim() {
     landedNext.setValue(comb::AndOp::create(
         b, comb::OrOp::create(b, rb.landed, bitOf(irspValid, irspEntry)),
         comb::XorOp::create(b, cleared, constant(plan.entries, ~0ull))));
-    // The image's writes: the memory's answers, a host cycle on.
-    rb.wv = resetReg(body->getArgument(main.firstInput), prefix + "_wv", 0);
+    // The image's writes: the memory's answers, a host cycle on; zero while
+    // there is none (the registers' synchronous reset: the answer queue's
+    // zero row is written with them, below).
+    Value mvalid = body->getArgument(main.firstInput);
+    rb.wv = resetReg(mvalid, prefix + "_wv", 0);
     Value minst = body->getArgument(main.firstInput + 1);
-    rb.winst = reg(hw::getBitWidth(minst.getType()) == iw
-                       ? minst
-                       : b.createOrFold<comb::ExtractOp>(b.getIntegerType(iw), minst, 0),
-                   prefix + "_winst");
-    rb.wdata = reg(body->getArgument(main.firstInput + 2), prefix + "_wdata");
+    auto zeroUnless = [&](Value v, const Twine &n) -> Value {
+      return seq::FirRegOp::create(b, v, hostClock, b.getStringAttr(n), notOf(mvalid),
+                                   hw::ConstantOp::create(b, v.getType(), 0), hw::InnerSymAttr{},
+                                   /*isAsync=*/false, b.getIntegerAttr(v.getType(), 0));
+    };
+    rb.winst = zeroUnless(hw::getBitWidth(minst.getType()) == iw
+                              ? minst
+                              : b.createOrFold<comb::ExtractOp>(b.getIntegerType(iw), minst, 0),
+                          prefix + "_winst");
+    rb.wdata = zeroUnless(body->getArgument(main.firstInput + 2), prefix + "_wdata");
     return data;
   };
 
@@ -24449,11 +24457,33 @@ LogicalResult StaticFolder::buildSim() {
       unsigned iw = std::max(threads > 1 ? llvm::Log2_32_Ceil(threads) : 0u, 1u);
       unsigned eb = llvm::Log2_32_Ceil(plan.entries);
       auto out = cast<hw::OutputOp>(cls.copy.getBodyBlock()->getTerminator());
-      llvm::MapVector<Value, SmallVector<unsigned>> byInst;
+      // (The instance a read issues with, up to the copy's control replicas:
+      // a chain of plain registers (no reset, no enable) from one value, as
+      // deep, is that value as many host cycles later.)
+      auto issueKey = [&](Value v) -> std::pair<Value, unsigned> {
+        unsigned depth = 0;
+        while (auto r = v.getDefiningOp<seq::FirRegOp>()) {
+          if (r.getReset() || r.getPreset() || r.getIsAsync())
+            break;
+          v = r.getNext();
+          ++depth;
+        }
+        return {v, depth};
+      };
+      std::map<std::pair<void *, unsigned>, SmallVector<unsigned>> byKey;
+      SmallVector<std::pair<void *, unsigned>> keyOrder;
       for (auto [k, vm] : llvm::enumerate(cls.virtualMemories))
-        if (vm.ring && ringBuilt.count({c, unsigned(k)}))
-          byInst[out.getOperand(vm.firstOutput + 1)].push_back(unsigned(k));
-      for (auto &[instValue, ks] : byInst) {
+        if (vm.ring && ringBuilt.count({c, unsigned(k)})) {
+          auto [root, depth] = issueKey(out.getOperand(vm.firstOutput + 1));
+          std::pair<void *, unsigned> key{root.getAsOpaquePointer(), depth};
+          if (!byKey.count(key))
+            keyOrder.push_back(key);
+          byKey[key].push_back(unsigned(k));
+        }
+      SmallVector<SmallVector<unsigned>> byInst;
+      for (auto &key : keyOrder)
+        byInst.push_back(byKey[key]);
+      for (auto &ks : byInst) {
         auto &g = ringGroups.emplace_back();
         unsigned n = ks.size();
         for (auto [r, k] : llvm::enumerate(ks))
@@ -24866,25 +24896,36 @@ LogicalResult StaticFolder::buildSim() {
             Value enough = share.enough;
             // The answers' writes: {instance, data}, queued a host cycle after
             // the answer (rb.wv).
+            // (A row past the queue's, `flight`, always zero: written with
+            // the answer registers' zeros in every host cycle without an
+            // answer, and read in every host cycle the ring's write is not
+            // granted, so a shared image ORs its rings' writes without a
+            // select of the data. The same distributed RAM up to 63 rows.)
             unsigned dw = vm.dataWidth, wb = llvm::Log2_32_Ceil(rb.flight);
             auto wq = seq::FirMemOp::create(
-                b, seq::FirMemType::get(context, rb.flight, iw + dw, 1), /*readLatency=*/0,
+                b, seq::FirMemType::get(context, rb.flight + 1, iw + dw, 1), /*readLatency=*/0,
                 /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
                 b.getStringAttr(fp + "_writes"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
                 StringAttr{}, Attribute{});
+            Value zeroRow = constant(wb + 1, rb.flight);
+            auto row = [&](Value ptr) {
+              return b.createOrFold<comb::ConcatOp>(constant(1, 0), ptr);
+            };
             auto wheadNext = backedges.get(b.getIntegerType(wb));
             auto wtailNext = backedges.get(b.getIntegerType(wb));
             auto wcountNext = backedges.get(b.getIntegerType(wb + 1));
             Value whead = resetReg(wheadNext, fp + "_whead", 0);
             Value wtail = resetReg(wtailNext, fp + "_wtail", 0);
             Value wcount = resetReg(wcountNext, fp + "_wcount", 0);
-            seq::FirMemWriteOp::create(b, wq, wtail, hostClock, rb.wv,
+            seq::FirMemWriteOp::create(b, wq, comb::MuxOp::create(b, rb.wv, row(wtail), zeroRow),
+                                       hostClock, constant(1, 1),
                                        b.createOrFold<comb::ConcatOp>(rb.winst, rb.wdata), Value{});
-            Value wtop = seq::FirMemReadOp::create(b, wq, whead, hostClock, constant(1, 1));
-            Value wany = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, wcount, constant(wb + 1, 0));
-            Value wcand = comb::AndOp::create(b, wany, enough);
             auto wgrantNext = backedges.get(i1);
             Value wgrant = wgrantNext;
+            Value wtop = seq::FirMemReadOp::create(
+                b, wq, comb::MuxOp::create(b, wgrant, row(whead), zeroRow), hostClock, constant(1, 1));
+            Value wany = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, wcount, constant(wb + 1, 0));
+            Value wcand = comb::AndOp::create(b, wany, enough);
             Value wgo = comb::AndOp::create(b, wcand, wgrant);
             share.writeCands.push_back(wcand);
             share.writeGrants.push_back(wgrantNext);
@@ -25316,7 +25357,9 @@ LogicalResult StaticFolder::buildSim() {
                              b.createOrFold<comb::ConcatOp>(ValueRange{
                                  constant(1, 1), withRing(constant(eb, 0), j), constant(1, 0)})));
         wrRow.push_back(when(wsel, withRing(zext(rb.wissInst, ib), j)));
-        wrData.push_back(when(wsel, zext(rb.wissData, dw)));
+        // (The data zero unless the ring's write is granted: its answer
+        // queue's zero row.)
+        wrData.push_back(zext(rb.wissData, dw));
       }
       auto any = [&](SmallVector<Value> &xs) -> Value {
         return xs.size() == 1 ? xs[0] : Value(comb::OrOp::create(b, xs, false));
