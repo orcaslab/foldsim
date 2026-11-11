@@ -6,6 +6,7 @@ sys.path.insert(0, sys.argv[1])
 import foldsim_sll_check as sc, foldsim_storage as st
 region = json.load(open(os.path.join(sys.argv[1], 'foldsim_v80_slr.json')))
 d = sys.argv[2]
+print('scales', dict(sorted(region['kernel']['ctl_lut_scale'].items())), region['kernel']['ctl_bram_scale'])
 def vm(cls, dw):
     return {'class': cls, 'data_width': dw, 'row_width': 8, 'inst_width': 4, 'cache_rows': 0, 'instances': 1}
 cases = {
