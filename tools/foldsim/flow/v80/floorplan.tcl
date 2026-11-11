@@ -11,7 +11,10 @@ if {[info exists ::env(FOLDSIM_FLOORPLAN)] && $::env(FOLDSIM_FLOORPLAN) ne ""} {
         error "foldsim floorplan not found: $fs_floorplan"
     }
     set fp [open $fs_floorplan r]
-    set fs_groups [regexp -all {USER_SLR_ASSIGNMENT} [read $fp]]
+    # The copies' groups (foldsim_slr<n>); the virtual-memory controllers
+    # placed with them (--vmem-engines) are cells of the kernel, absent from
+    # an out-of-context run of the simulator alone.
+    set fs_groups [regexp -all {hierarchical foldsim_slr} [read $fp]]
     close $fp
     source $fs_floorplan
     set fs_cells [get_cells -quiet -hierarchical -filter {USER_SLR_ASSIGNMENT =~ "fs_*"}]

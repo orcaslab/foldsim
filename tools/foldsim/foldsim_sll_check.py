@@ -391,14 +391,19 @@ def vmem_bits(gdir):
     return sum(2 * v['data_width'] + v['row_width'] + v['inst_width'] for v in json.load(open(path)).get('vmem', []))
 
 
-def port_links(stext):
+def port_links(stext, wires=None):
     """{(producer class, reader class): bits} of the schedule's `A -> B: n links, m bits` lines: each link's bits
-    once (its producer's output port), what crosses when the two sit in different SLRs."""
+    once (its producer's output port), what crosses when the two sit in different SLRs. The fold writes those lines
+    only for the links between SLR groups (--slr-groups); without groups, its sll estimate's `wires A B n` lines
+    (`wires`: the same bits, each producer output's bits a reader class reads once, both ways of a pair summed)
+    stand for them, so the link term is never silently empty."""
     out = {}
     for line in stext.split('\n'):
         m = re.match(r'\s+(\S+) -> (\S+): (\d+) links, (\d+) bits', line)
         if m:
             out[(m.group(1), m.group(2))] = int(m.group(4))
+    if not out and wires:
+        out = {(c, d): w for (c, d), w in wires.items() if w}
     return out
 
 
@@ -525,12 +530,117 @@ def plan(res, splits, links, room, model, other):
     return at, slls(at)
 
 
-def boundary_slls(shares, res, wires, top_share, model, vbits=0, splits=None, links=None):
+def vmem_controllers(gdir, stext=''):
+    """The kernel's virtual-memory controllers (foldsim_sim.json): each group
+    (foldsim --vmem-group), else each memory, as {name, cls, port_bits,
+    members}: the bits of their ports (each port's read and write data, row
+    and instance) and the class copies those ports are wired to (`members`,
+    class -> weight). A class's own controller: that class. A page engine
+    (class `__pages<k>`, the simulator level's): the classes of its members as
+    the schedule's `page engine <k> ...: <members>` line names them (a PP row
+    chunk `<class>:pps<j>_rows`, a page column `<class>:<column>`, a link
+    stream `link:<producer>><reader>`: half each), each member alike."""
+    path = os.path.join(gdir, 'foldsim_sim.json')
+    if not os.path.exists(path):
+        return []
+    j = json.load(open(path))
+    vm = j.get('vmem', [])
+    bits = lambda v: 2 * v['data_width'] + v['row_width'] + v['inst_width']
+    engines = {}
+    for line in (stext or '').split('\n'):
+        mm = re.match(r'\s+page engine (\d+) \d+ bits, tag \d+, row \d+: (.*)$', line)
+        if not mm:
+            continue
+        w = defaultdict(float)
+        for x in mm.group(2).split():
+            if x.startswith('link:') and '>' in x:
+                pc, rc = x[5:].split('>', 1)
+                w[pc] += 0.5
+                w[rc] += 0.5
+            elif ':' in x:
+                w[x.split(':', 1)[0]] += 1.0
+        if w:
+            engines[f'__pages{mm.group(1)}'] = dict(w)
+    def members(cls):
+        return engines.get(cls) or {cls: 1.0}
+    if j.get('vmem_groups'):
+        return [dict(name=f'G{g}', cls=x['class'], members=members(x['class']),
+                     port_bits=sum(bits(vm[k]) for k in x['members'])) for g, x in enumerate(j['vmem_groups'])]
+    return [dict(name=str(k), cls=v['class'], members=members(v['class']), port_bits=bits(v))
+            for k, v in enumerate(vm)]
+
+
+# --vmem-engines: where each controller (its engine) sits. placer (default) and auto: where it crosses the fewest
+# SLLs (the placer moves it there: y8r1di, 11-07, put each controller beside its class copy, VX_opc_unit's in
+# SLR1 with its master crossing to the NMUs); nmu: at its HBM NMU's SLR; local: in its copies' main SLR; flat: the
+# 11-07 fitted constant (sll_per_vmem_bit x every port bit at every boundary).
+VMEM_ENGINES = ('placer', 'auto', 'nmu', 'local', 'flat')
+
+
+def vmem_slls(ctrls, shares, top_spread, names, noc, mode):
+    """Each boundary's SLLs of the virtual-memory wiring with the controllers
+    placed by `mode` (--vmem-engines), and each controller's placement.
+
+    A controller sits between the class copies its ports are wired to
+    (`port_bits` wires, from where those copies sit: their shares of the SLRs'
+    LUTs, as assigned; a class the assignment does not name, the simulator
+    level's spread) and a memory NoC master unit, the NMU of the shell nearest
+    its SLR that reaches HBM (`noc['ports']`, flow/v80/noc_ports.py: all eight
+    in SLR2 on the V80 compute shell), over its AXI master (`master_bits`
+    wires); the NoC carries the traffic on without SLLs. A port wire bit
+    crossing a boundary takes `sll_per_port_bit` SLLs, a master's
+    `sll_per_master_bit` (fit on y8r1di's placed controllers, 11-11: see the
+    region's noc `about`). Only the bits that cross a boundary are charged to
+    it. Returns ([SLLs per boundary], [{name, cls, slr, slls}])."""
+    n = len(names)
+    at = {nm: i for i, nm in enumerate(names)}
+    hbm = sorted({at[p['slr']] for p in noc.get('ports', []) if 'HBM' in p.get('targets', ()) and p.get('slr') in at})
+    if not hbm:
+        raise SystemExit('foldsim_sll_check.py: the region\'s noc section names no NMU reaching HBM')
+    near = lambda i: min(hbm, key=lambda j: (abs(i - j), j))
+    mbits = noc.get('master_bits', 1290)
+    kp = noc.get('sll_per_port_bit', noc.get('sll_per_bit', 1.0))
+    km = noc.get('sll_per_master_bit', noc.get('sll_per_bit', 1.0))
+    tot = sum(t['lut'] for t in top_spread) or 1.0
+    top = [t['lut'] / tot for t in top_spread]
+    out, rows = [0.0] * (n - 1), []
+    for c in ctrls:
+        mem = c.get('members') or {c['cls']: 1.0}
+        wsum = sum(mem.values()) or 1.0
+        dist = [0.0] * n
+        for cls, w in mem.items():
+            d = shares[cls]['lut'] if cls in shares else top
+            for i in range(n):
+                dist[i] += w / wsum * d[i]
+
+        def slls_at(g):
+            x = [0.0] * (n - 1)
+            for i, f in enumerate(dist):
+                for b in range(min(i, g), max(i, g)):
+                    x[b] += kp * c['port_bits'] * f
+            h = near(g)
+            for b in range(min(g, h), max(g, h)):
+                x[b] += km * mbits
+            return x
+        if mode == 'nmu':
+            g = min(hbm, key=lambda h: (sum(slls_at(h)), h))
+        elif mode == 'local':
+            g = max(range(n), key=lambda i: (dist[i], -i))
+        else:
+            g = min(range(n), key=lambda i: (sum(slls_at(i)), i))
+        x = slls_at(g)
+        out = [u + v for u, v in zip(out, x)]
+        rows.append(dict(name=c['name'], cls=c['cls'], slr=names[g], slls=x))
+    return out, rows
+
+
+def boundary_slls(shares, res, wires, top_share, model, vbits=0, splits=None, links=None, vmem=None):
     """Each boundary's SLLs: SLLs per link wire bit times the link wires
     between the copies' shares on either side; Rent's rule (t x LUTs^p) over
     each cut copy's smaller side (and over the simulator level's, with
     top_rent_t); and the simulator level and the kernel beside it (a
-    constant, other_slls, and SLLs per virtual memory port bit).
+    constant, other_slls, and SLLs per virtual memory port bit, or with
+    `vmem` that boundary's virtual-memory SLLs as vmem_slls placed them).
     Returns [(link SLLs, cut SLLs, simulator-level and kernel SLLs)] per
     boundary."""
     n = len(top_share)
@@ -554,7 +664,7 @@ def boundary_slls(shares, res, wires, top_share, model, vbits=0, splits=None, li
         th = sum(x['lut'] for x in top_share[b + 1:])
         # The simulator level and the kernel beside it, spread over the SLRs.
         sim = model.get('top_rent_t', 0.0) * min(tl, th) ** p + model.get('other_slls', 0.0) + \
-            model.get('sll_per_vmem_bit', 0.0) * vbits
+            (vmem[b] if vmem is not None else model.get('sll_per_vmem_bit', 0.0) * vbits)
         out.append((model['sll_per_link_bit'] * link, cut, sim))
     return out
 
@@ -591,6 +701,13 @@ def main():
                          'suggested assignment, never a refusal; the design past the placement fill, the memories '
                          'past the region\'s and the SLLs past a boundary still refuse. strict: a copy past every SLR '
                          'refuses (the 11-08 hard SLR rule)')
+    ap.add_argument('--vmem-engines', choices=VMEM_ENGINES, default='placer',
+                    help='the virtual-memory controllers\' SLLs, placed against the region\'s memory NMUs (its '
+                         '`noc` section, flow/v80/noc_ports.py), only the wire bits that cross a boundary charged '
+                         'to it: placer (default) and auto, each controller where it crosses the fewest (the '
+                         'placer\'s choice on y8r1di); nmu, at its HBM NMU (its ports cross); local, with its '
+                         'copies (its master crosses); flat, the 11-07 fitted term (sll_per_vmem_bit x every port '
+                         'bit at every boundary)')
     a = ap.parse_args()
     gen = os.path.abspath(a.gen.rstrip('/'))
     gdir = os.path.join(gen, 'gen') if os.path.isdir(os.path.join(gen, 'gen')) else gen
@@ -916,20 +1033,33 @@ def main():
                 lines.append(f'    {c} cut over the SLRs: ' + ', '.join(
                     f'{s["name"]} {100 * x:.0f} %' for s, x in zip(full, shares[c]['lut'])) + ' of its logic')
             if model:
+                vm = None
+                if a.vmem_engines != 'flat' and 'noc' in region:
+                    vm, vmem_rows = vmem_slls(vmem_controllers(gdir, stext), shares, top_spread, names,
+                                              region['noc'], a.vmem_engines)
+                    by_slr = defaultdict(lambda: [0, 0])
+                    for r in vmem_rows:
+                        by_slr[r['slr']][0] += 1
+                    lines.append(f'  virtual memories (--vmem-engines {a.vmem_engines}): {len(vmem_rows)} controllers, '
+                                 + ', '.join(f'{k} {v[0]}' for k, v in sorted(by_slr.items())))
+                elif a.vmem_engines != 'flat':
+                    lines.append(f'  virtual memories: the region ({region_path}) has no noc section: the fitted '
+                                 'flat term (sll_per_vmem_bit x port bits at every boundary)')
                 slls = boundary_slls(shares, res, wires, top_spread, model, vmem_bits(gdir), splits,
-                                     None if grouped else port_links(stext))
+                                     None if grouped else port_links(stext, wires), vm)
                 if grouped:
                     # The generation's own link wires over each boundary (serialized links a k-th): one SLL a wire.
                     slls = [(float(bwires[b]) if b < len(bwires) else 0.0, ct, sm) for b, (_, ct, sm) in enumerate(slls)]
                 for b, (lk, ct, sm) in enumerate(slls):
                     lines.append(f'    boundary {names[b]}-{names[b + 1]}: {lk + ct + sm:,.0f} SLLs projected '
                                  f'(links {lk:,.0f}, cut copies {ct:,.0f}{" and split crossings" if splits else ""}, '
-                                 f'simulator level and kernel {sm:,.0f})')
+                                 f'simulator level and kernel {sm:,.0f}'
+                                 + (f', of which virtual memories {vm[b]:,.0f}' if vm is not None else '') + ')')
     if a.plan:
         # The global plan: the region's caps (the margin) less the simulator level's spread share.
         room_p = [{r: caps[g][r] - top_spread[g][r] for r in RESOURCES} for g in range(len(caps))]
         other = model.get('other_slls', 0.0) + model.get('sll_per_vmem_bit', 0.0) * vmem_bits(gdir)
-        at, pl = plan(res, splits, port_links(stext), room_p, model, other)
+        at, pl = plan(res, splits, port_links(stext, wires), room_p, model, other)
         if at is None:
             lines.append('  plan: no assignment of the copies and split parts within the SLRs\' caps; the closest past them: '
                          + ', '.join(f'{names[g]} {r} {fmt(r, u)} > {fmt(r, c_)}' for g, r, u, c_ in PLAN_OVER))

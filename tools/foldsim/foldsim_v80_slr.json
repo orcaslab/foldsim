@@ -35,7 +35,7 @@
   "ff": 0.99
  },
  "placement": {
-  "about": "foldsim_sll_check.py's placement model, fit 11-07 on three placed V80 builds (b4e routed, y8r1di post-place phys_opt, b4ct150 post-place; per-copy SLR placement and SLR-crossing nets read from the checkpoints, est_1107/inv). The placer balances the SLRs: whole copies fill each SLR up to `fill` of a resource (0.70), the region as a whole to `region_fill` (0.80: placed builds 66-74 % of its LUTs, r16c failed at 85 %), a cut copy up to the region fill (logic: LUT, LUTRAM, flops; memories whole counts, their primitives placed apart), the copies other than the cut ones up to the region's fill of the whole design plus balance_slack; where no whole assignment exists the largest copies by logic (at most cut_copies) fill their SLR's room and level the next SLRs' fill. Measured: y8r1di's slice copy 11/62/26 % over SLR2/1/0 (model 14/58/28), SLR fills 60/75/59 % (model 60/75/60); b4e's 8/60/32 % (model 8/66/26). A cut copy's own SLLs follow Rent's rule over its smaller side, rent_t x placed LUTs^rent_p (per-copy fit of the crossing nets: t 0.93-1.52 at p 0.75); links: SLLs per link wire bit between the two sides (measured 0.002-0.065: link memories are read a word at a time); other_slls the simulator level and shell; sll_per_vmem_bit the virtual memory ports' wiring to the kernel's controllers (only y8r1di has many: 23,570 bits). Least squares over the 6 boundaries with links 0.01 and other 500 fixed: worst boundary b4e 9,326 vs 10,114 placed (-8 %), y8r1di 15,015 vs 15,631 (-4 %), b4ct150 9,746 vs 8,981 (+9 %); leave one build out: -10 / -29 / +14 % (the vmem term rests on y8r1di alone). Refit 11-07 19:00 with the synthesis-fit scales and links charged to their readers: worst boundary b4e 9,403 vs 10,134 (-7 %), y8r1di 13,953 vs 15,631 (-11 %), b4ct150 9,436 vs 8,981 (+5 %); modelled slice cuts y8r1di 11 / 62 / 26 % (measured 11 / 62 / 26), b4e 24 / 48 / 28 (8 / 60 / 32), b4ct150 24 / 48 / 28 (13 / 70 / 17); b4ct150's own slice crossing nets 4,150 / 6,447 against Rent 4.7k / 5.7k (not in the fit). sll_per_port_bit (11-08 slrsplit): the links counted by their port widths (each link's bits once, the schedule's \"A -> B: n links, m bits\"), SLLs per bit where the two ends sit in different SLRs; fit on the split b4e image C-1 (p0 SLR2, p1 SLR1 pblocks; Vivado Place 30-5425 demanded 20,059 SLLs SLR1-SLR2: 11,822 split crossings + 1,002 + 0.45 x 16,057 port bits). At 1 a bit (full width) b4e straddled projects 36k against 4,700 measured; at 0.01 a link bit C-1 projects 13,385 against 20,059.",
+  "about": "foldsim_sll_check.py's placement model, fit 11-07 on three placed V80 builds (b4e routed, y8r1di post-place phys_opt, b4ct150 post-place; per-copy SLR placement and SLR-crossing nets read from the checkpoints, est_1107/inv). The placer balances the SLRs: whole copies fill each SLR up to `fill` of a resource (0.70), the region as a whole to `region_fill` (0.80: placed builds 66-74 % of its LUTs, r16c failed at 85 %), a cut copy up to the region fill (logic: LUT, LUTRAM, flops; memories whole counts, their primitives placed apart), the copies other than the cut ones up to the region's fill of the whole design plus balance_slack; where no whole assignment exists the largest copies by logic (at most cut_copies) fill their SLR's room and level the next SLRs' fill. Measured: y8r1di's slice copy 11/62/26 % over SLR2/1/0 (model 14/58/28), SLR fills 60/75/59 % (model 60/75/60); b4e's 8/60/32 % (model 8/66/26). A cut copy's own SLLs follow Rent's rule over its smaller side, rent_t x placed LUTs^rent_p (per-copy fit of the crossing nets: t 0.93-1.52 at p 0.75); links: SLLs per link wire bit between the two sides (measured 0.002-0.065: link memories are read a word at a time); other_slls the simulator level and shell; sll_per_vmem_bit the virtual memory ports' wiring to the kernel's controllers (only y8r1di has many: 23,570 bits). Least squares over the 6 boundaries with links 0.01 and other 500 fixed: worst boundary b4e 9,326 vs 10,114 placed (-8 %), y8r1di 15,015 vs 15,631 (-4 %), b4ct150 9,746 vs 8,981 (+9 %); leave one build out: -10 / -29 / +14 % (the vmem term rests on y8r1di alone). Refit 11-07 19:00 with the synthesis-fit scales and links charged to their readers: worst boundary b4e 9,403 vs 10,134 (-7 %), y8r1di 13,953 vs 15,631 (-11 %), b4ct150 9,436 vs 8,981 (+5 %); modelled slice cuts y8r1di 11 / 62 / 26 % (measured 11 / 62 / 26), b4e 24 / 48 / 28 (8 / 60 / 32), b4ct150 24 / 48 / 28 (13 / 70 / 17); b4ct150's own slice crossing nets 4,150 / 6,447 against Rent 4.7k / 5.7k (not in the fit). sll_per_port_bit (11-08 slrsplit): the links counted by their port widths (each link's bits once, the schedule's \"A -> B: n links, m bits\"), SLLs per bit where the two ends sit in different SLRs; fit on the split b4e image C-1 (p0 SLR2, p1 SLR1 pblocks; Vivado Place 30-5425 demanded 20,059 SLLs SLR1-SLR2: 11,822 split crossings + 1,002 + 0.45 x 16,057 port bits). At 1 a bit (full width) b4e straddled projects 36k against 4,700 measured; at 0.01 a link bit C-1 projects 13,385 against 20,059. Refit 11-11 (a32-G0): links counted by port width now from the sll estimate's `wires` lines when the schedule has no `A -> B` lines (no --slr-groups: the term had read 0); sll_per_port_bit 0.45 -> 0.39, least squares (other_slls 500 fixed) over the 6 boundaries of y8r1di, b4e, b4ct150 against their measured crossing nets that are neither a copy's own nor a virtual-memory controller's (est_1107/inv/<b>/crossing.tsv: y8r1di 7,209 / 9,943, b4e 2,387 / 2,913, b4ct150 3,585 / 3,792; model 7,325 / 8,163, 4,037 / 4,076, 4,085 / 4,085: -18 to +69 %, the worst b4e SLR2-SLR1 where the model's slice shares 24/48/28 % miss the placed 8/60/32 %). sll_per_vmem_bit is the flat term of --vmem-engines flat only: by default the virtual-memory wiring is placed (the noc section).",
   "fill": {
    "lut": 0.7,
    "lutram": 0.7,
@@ -55,11 +55,306 @@
    "lutram": 0.8,
    "ff": 0.8
   },
-  "sll_per_port_bit": 0.45
+  "sll_per_port_bit": 0.39
  },
  "netlist_lutram_scale": 0.896,
  "kernel": {
   "lut": 155000,
   "ff": 65000
+ },
+ "noc": {
+  "about": "The compute shell's memory NoC ports, from its NoC solution (flow/v80/noc_ports.py on the b4e image's impl_1/top_wrapper.ncr, 11-09: the pinned shell of 09-01, slash_base.tcl PHYSICAL_LOC NOC_NMU512_X*Y13..17). The RP's NoC master units (NMUs) keep the shell's sites: an RM placing one elsewhere fails opt_design (DRC HDPR-122), and a new NMU to HBM would need a route through the static region's NoC switches. All 8 HBM ports (hbm_vnoc_00..07) enter the NoC in SLR2; SLR1 has 6 DDR4 ports (ddr_noc_4..7, 9, 11: one DDR4-3200 x72 controller, 0x600_0000_0000 32 GB), SLR0 none. read_latency: the NoC compiler's achieved read latency over each NMU's paths (min / mean / max); the 07-31 unpinned shell's hbm_vnoc NMUs in SLR1 read HBM at 69-87 against 25-53 from SLR2. master_bits: an AXI4 master of 512-bit data, 64-bit address and 8-bit IDs (AW and AR 87 each, W 579, R 525, B 12). Placed pricing (foldsim_sll_check.py --vmem-engines, default placer): each controller sits where its wiring crosses the fewest SLLs, between the copies its ports are wired to (their SLR shares) and the nearest HBM NMU over its master; a boundary is charged only the wire bits that cross it: sll_per_port_bit per port bit, sll_per_master_bit per master wire. Fit 11-11 (a32-G0) on y8r1di (s8_1105/img_y8r1di physopt, the one placed build with wide controllers: 8 groups, 23,570 port bits): the placer put every controller beside its copies (slrxing_1108/y8r1di/inst_slr.tsv: g_vg2, VX_opc_unit's, in SLR1, the others with their copies in SLR2), as the model places them; the nets of the controller cells crossing (est_1107/inv/y8r1di/crossing.tsv) are 1,521 over SLR2-SLR1 (VX_opc_unit's master: sll_per_master_bit 1.0) and 290 over SLR1-SLR0 (VX_opc_unit's ports to its copy's 15 % in SLR0: 0.23 a port bit), against the 11-07 flat term's 6,204 at both. b4e and b4ct150 (2 controllers, 2,074 port bits, l2req beside its copy) measure 0 and 1; the model gives 0 and 272 (b4ct150's l2req copy straddles; its port registers sit with the controller).",
+  "rows": {
+   "SLR0": [
+    0,
+    6
+   ],
+   "SLR1": [
+    7,
+    12
+   ],
+   "SLR2": [
+    13,
+    18
+   ]
+  },
+  "master_bits": 1290,
+  "ports": [
+   {
+    "name": "ddr_noc_0",
+    "site": "NOC_NMU512_X1Y15",
+    "slr": "SLR2",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     106,
+     109.0,
+     112
+    ]
+   },
+   {
+    "name": "ddr_noc_1",
+    "site": "NOC_NMU512_X0Y14",
+    "slr": "SLR2",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     102,
+     103.0,
+     104
+    ]
+   },
+   {
+    "name": "ddr_noc_10",
+    "site": "NOC_NMU512_X0Y15",
+    "slr": "SLR2",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     104,
+     105.0,
+     106
+    ]
+   },
+   {
+    "name": "ddr_noc_11",
+    "site": "NOC_NMU512_X1Y12",
+    "slr": "SLR1",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     72,
+     75.0,
+     78
+    ]
+   },
+   {
+    "name": "ddr_noc_2",
+    "site": "NOC_NMU512_X1Y16",
+    "slr": "SLR2",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     108,
+     111.0,
+     114
+    ]
+   },
+   {
+    "name": "ddr_noc_3",
+    "site": "NOC_NMU512_X1Y17",
+    "slr": "SLR2",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     110,
+     113.0,
+     116
+    ]
+   },
+   {
+    "name": "ddr_noc_4",
+    "site": "NOC_NMU512_X1Y10",
+    "slr": "SLR1",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     68,
+     71.0,
+     74
+    ]
+   },
+   {
+    "name": "ddr_noc_5",
+    "site": "NOC_NMU512_X1Y9",
+    "slr": "SLR1",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     66,
+     69.0,
+     72
+    ]
+   },
+   {
+    "name": "ddr_noc_6",
+    "site": "NOC_NMU512_X2Y11",
+    "slr": "SLR1",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     74,
+     77.0,
+     80
+    ]
+   },
+   {
+    "name": "ddr_noc_7",
+    "site": "NOC_NMU512_X2Y12",
+    "slr": "SLR1",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     76,
+     79.0,
+     82
+    ]
+   },
+   {
+    "name": "ddr_noc_8",
+    "site": "NOC_NMU512_X3Y13",
+    "slr": "SLR2",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     112,
+     115.0,
+     118
+    ]
+   },
+   {
+    "name": "ddr_noc_9",
+    "site": "NOC_NMU512_X2Y10",
+    "slr": "SLR1",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     72,
+     75.0,
+     78
+    ]
+   },
+   {
+    "name": "hbm_vnoc_00",
+    "site": "NOC_NMU512_X0Y13",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     33,
+     40.9,
+     53
+    ]
+   },
+   {
+    "name": "hbm_vnoc_01",
+    "site": "NOC_NMU512_X2Y15",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     29,
+     33.9,
+     43
+    ]
+   },
+   {
+    "name": "hbm_vnoc_02",
+    "site": "NOC_NMU512_X1Y14",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     31,
+     36.2,
+     45
+    ]
+   },
+   {
+    "name": "hbm_vnoc_03",
+    "site": "NOC_NMU512_X3Y16",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     27,
+     35.0,
+     47
+    ]
+   },
+   {
+    "name": "hbm_vnoc_04",
+    "site": "NOC_NMU512_X0Y17",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     25,
+     32.6,
+     45
+    ]
+   },
+   {
+    "name": "hbm_vnoc_05",
+    "site": "NOC_NMU512_X1Y13",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     33,
+     37.8,
+     47
+    ]
+   },
+   {
+    "name": "hbm_vnoc_06",
+    "site": "NOC_NMU512_X2Y14",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     31,
+     36.2,
+     45
+    ]
+   },
+   {
+    "name": "hbm_vnoc_07",
+    "site": "NOC_NMU512_X3Y15",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     29,
+     37.3,
+     49
+    ]
+   },
+   {
+    "name": "qdma_slave_bridge_noc",
+    "site": "NOC_NMU512_X2Y13",
+    "slr": "SLR2",
+    "targets": [
+     "other"
+    ],
+    "read_latency": [
+     114,
+     114.0,
+     114
+    ]
+   }
+  ],
+  "sll_per_port_bit": 0.23,
+  "sll_per_master_bit": 1.0
  }
 }

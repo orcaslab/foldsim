@@ -1,0 +1,70 @@
+# The virtual-memory controllers placed against the shell's memory NoC ports
+# (per-SLR vmem engines, 11-09; artifacts/foldsim/proposals/research/
+# per_slr_vmem_1109.md).
+#
+# flow/v80/noc_ports.py: the RP's NoC master units from a NoC solution (.ncr),
+# each with its site's SLR (the NOC_NMU512 rows), the memories it reaches and
+# its read latency; the static region's NMUs and the RP's slaves left out.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: python3 %foldsim_tools/flow/v80/noc_ports.py %S/Inputs/vmem-engines/shell.ncr --json %t/noc.json | FileCheck %s --check-prefix=NOC
+# RUN: FileCheck %s --check-prefix=NOCJ < %t/noc.json
+# NOC: ddr_noc_4{{[[:space:]]+}}NOC_NMU512_X1Y10{{[[:space:]]+}}SLR1{{[[:space:]]+}}DDR{{[[:space:]]+}}read latency 71/71.0/71
+# NOC-NEXT: hbm_vnoc_00{{[[:space:]]+}}NOC_NMU512_X0Y13{{[[:space:]]+}}SLR2{{[[:space:]]+}}HBM{{[[:space:]]+}}read latency 25/39.0/53
+# NOC-NEXT: SLR0: 0 HBM, 0 DDR
+# NOC-NEXT: SLR1: 0 HBM, 1 DDR
+# NOC-NEXT: SLR2: 1 HBM, 0 DDR
+# NOC-NOT: axi_noc_0
+# NOCJ: "name": "ddr_noc_4"
+# NOCJ: "slr": "SLR1"
+#
+# The V80 region's noc section: the compute shell's 8 HBM ports all in SLR2.
+# RUN: python3 -c "import json,sys; n=json.load(open(sys.argv[1]))['noc']; print(sorted({p['slr'] for p in n['ports'] if 'HBM' in p['targets']}), n['master_bits'])" %foldsim_tools/foldsim_v80_slr.json | FileCheck %s --check-prefix=V80
+# V80: ['SLR2'] 1290
+#
+# foldsim_sll_check.vmem_slls (placed, 11-11): a wide copy's controller
+# (16,440 port bits) in SLR1, a narrow one's (1,050) in SLR0, a page engine's
+# spread as the simulator level (half SLR2, half SLR0); a port bit crossing a
+# boundary 0.23 SLLs, a master wire 1 (the region's noc section, fit on
+# y8r1di). placer (the default): each where it crosses the fewest (the wide
+# one beside its copy, its master crossing; the narrow ones at the NMUs);
+# nmu: every port crosses to SLR2; local: every controller with its copies.
+# Only the bits crossing a boundary are charged to it. With an HBM port in
+# every SLR only the spread page engine's far half crosses.
+# A page engine's copies come from the schedule's `page engine` line; the link
+# term's port bits from the sll estimate's `wires` when the schedule has no
+# `A -> B` lines (no --slr-groups: the term had read 0).
+# RUN: python3 %S/Inputs/vmem-engines/price.py %foldsim_tools/foldsim %t/pe | FileCheck %s --check-prefix=PRICE
+# PRICE: v80 placer: 1652 362 | G0:SLR1 G1:SLR2 G2:SLR2
+# PRICE-NEXT: v80 nmu: 4143 362 | G0:SLR2 G1:SLR2 G2:SLR2
+# PRICE-NEXT: v80 local: 2701 1411 | G0:SLR1 G1:SLR0 G2:SLR2
+# PRICE-NEXT: per-slr placer: 121 121 | G0:SLR1 G1:SLR0 G2:SLR2
+# PRICE-NEXT: per-slr nmu: 121 121 | G0:SLR1 G1:SLR0 G2:SLR2
+# PRICE-NEXT: per-slr local: 121 121 | G0:SLR1 G1:SLR0 G2:SLR2
+# PRICE-NEXT: engine members: __pages0 1042 [('narrow', 0.5), ('wide', 1.5)]
+# PRICE-NEXT: engine placed: SLR2 240 60
+# PRICE-NEXT: port links from wires: {('wide', 'narrow'): 96}
+# PRICE-NEXT: port links from A -> B: {('wide', 'narrow'): 64}
+#
+# The driver: --vmem-engines local with --slr-groups puts each controller
+# (foldsim_afu's g_vg<g>.vmem / .group) in its copy's SLR group in the
+# floorplan, and the SLR check prices the controllers so; auto leaves these
+# narrow ones (85-bit ports, under a master's 1,290) to the placer.
+# RUN: cd %S/Inputs/vmem_multi
+# RUN: foldsim --srcs top.f --top Top --out %t/loc --static --virtual-memories 'Leaf:.*' --vmem-group copy --copies Leaf:2 --slr-groups --vmem-engines local Leaf 2>&1 | FileCheck %s --check-prefix=LOC
+# RUN: FileCheck %s --check-prefix=LOCP < %t/loc/foldsim_floorplan.tcl
+# RUN: FileCheck %s --check-prefix=LOCS < %t/loc/sll/sll.txt
+# LOC: foldsim: --vmem-engines local: 6 controllers with their copies in foldsim_floorplan.tcl
+# LOCP: set_property USER_SLR_ASSIGNMENT fs_slr0 $c }
+# LOCP: # Virtual-memory controllers with their class copy (--vmem-engines local).
+# LOCP-NEXT: set c [get_cells -quiet -hierarchical -regexp {.*/g_vg0[./](vmem|group)$}]
+# LOCP-NEXT: if {[llength $c] == 1} { set_property USER_SLR_ASSIGNMENT fs_slr0 $c }
+# LOCS: virtual memories (--vmem-engines local): 6 controllers, SLR2 6
+# LOCS: of which virtual memories 0)
+# RUN: foldsim --srcs top.f --top Top --out %t/auto --static --virtual-memories 'Leaf:.*' --vmem-group copy --copies Leaf:2 --slr-groups --vmem-engines auto Leaf 2>&1 | FileCheck %s --check-prefix=AUTO
+# RUN: FileCheck %s --check-prefix=AUTOP < %t/auto/foldsim_floorplan.tcl
+# AUTO: foldsim: --vmem-engines auto: 0 controllers with their copies
+# AUTOP-NOT: g_vg
+# The default leaves the floorplan to the copies.
+# RUN: foldsim --srcs top.f --top Top --out %t/def --static --virtual-memories 'Leaf:.*' --vmem-group copy --copies Leaf:2 --slr-groups Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=DEFP < %t/def/foldsim_floorplan.tcl
+# DEFP-NOT: Virtual-memory

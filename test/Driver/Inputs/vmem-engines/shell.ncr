@@ -1,0 +1,101 @@
+{
+ "SolutionType": "OPTIMAL",
+ "LogicalInstances": [
+  {
+   "Name": "top_i/slash/hbm_vnoc_00/inst/S00_AXI_nmu/x_INST/NOC_NMU512_INST",
+   "DesignName": "/hbm_vnoc_00/S00_AXI",
+   "IsMaster": true,
+   "CompType": "PL_NMU",
+   "Protocol": "AXI_MM"
+  },
+  {
+   "Name": "top_i/slash/ddr_noc_4/inst/S00_AXI_nmu/x_INST/NOC_NMU512_INST",
+   "DesignName": "/ddr_noc_4/S00_AXI",
+   "IsMaster": true,
+   "CompType": "PL_NMU",
+   "Protocol": "AXI_MM"
+  },
+  {
+   "Name": "top_i/static_region/aved/axi_noc_0/inst/S00_AXI_nmu/x_INST/NOC_NMU512_INST",
+   "DesignName": "/axi_noc_0/S00_AXI",
+   "IsMaster": true,
+   "CompType": "PL_NMU",
+   "Protocol": "AXI_MM"
+  },
+  {
+   "Name": "top_i/slash/axi_noc_0/inst/M00_AXI_nsu/x/NOC_NSU512_INST",
+   "DesignName": "/axi_noc_0/M00_AXI",
+   "IsMaster": false,
+   "CompType": "PL_NSU",
+   "Protocol": "AXI_MM"
+  }
+ ],
+ "Paths": [
+  {
+   "From": "top_i/slash/hbm_vnoc_00/inst/S00_AXI_nmu/x_INST/NOC_NMU512_INST",
+   "To": "top_i/static_region/noc/axi_noc_cips/inst/MC_hbmc/inst/hbm_st0/I_hbm_chnl0/I_hbm_mc",
+   "Nets": [
+    {
+     "CommType": "READ",
+     "AchievedLatency": 25,
+     "Connections": []
+    },
+    {
+     "CommType": "WRITE",
+     "AchievedLatency": 30,
+     "Connections": []
+    }
+   ]
+  },
+  {
+   "From": "top_i/slash/hbm_vnoc_00/inst/S00_AXI_nmu/x_INST/NOC_NMU512_INST",
+   "To": "top_i/static_region/noc/axi_noc_cips/inst/MC_hbmc/inst/hbm_st1/I_hbm_chnl2/I_hbm_mc",
+   "Nets": [
+    {
+     "CommType": "READ",
+     "AchievedLatency": 53,
+     "Connections": []
+    }
+   ]
+  },
+  {
+   "From": "top_i/slash/ddr_noc_4/inst/S00_AXI_nmu/x_INST/NOC_NMU512_INST",
+   "To": "top_i/static_region/noc/axi_noc_mc_ddr4_1/inst/MC0_ddrc",
+   "Nets": [
+    {
+     "CommType": "READ",
+     "AchievedLatency": 71,
+     "Connections": []
+    }
+   ]
+  },
+  {
+   "From": "top_i/static_region/aved/axi_noc_0/inst/S00_AXI_nmu/x_INST/NOC_NMU512_INST",
+   "To": "top_i/static_region/x/NOC_NSU512_INST",
+   "Nets": [
+    {
+     "CommType": "READ",
+     "AchievedLatency": 100,
+     "Connections": []
+    }
+   ]
+  }
+ ],
+ "Components": [
+  {
+   "Name": "NOC_NMU512_X0Y13",
+   "TrafficLInst": "top_i/slash/hbm_vnoc_00/inst/S00_AXI_nmu/x_INST/NOC_NMU512_INST",
+   "DestId": 1
+  },
+  {
+   "Name": "NOC_NMU512_X1Y10",
+   "TrafficLInst": "top_i/slash/ddr_noc_4/inst/S00_AXI_nmu/x_INST/NOC_NMU512_INST",
+   "DestId": 2
+  },
+  {
+   "Name": "NOC_NMU512_X0Y1",
+   "TrafficLInst": "top_i/static_region/aved/axi_noc_0/inst/S00_AXI_nmu/x_INST/NOC_NMU512_INST",
+   "DestId": 3
+  }
+ ]
+}

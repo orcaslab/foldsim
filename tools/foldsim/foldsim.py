@@ -1247,6 +1247,56 @@ def write_slr_groups(sv, path, names=None):
                     f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT {where} $c }}\n')
 
 
+# An AXI4 device-memory master's wires (512-bit data, 64-bit address, 8-bit
+# IDs) where the region gives none (its noc section's master_bits).
+VMEM_MASTER_BITS = 1290
+
+
+def vmem_engine_groups(sv):
+    """{virtual memory k: its SLR group's instance (foldsim_slr<n>)}: the group
+    whose ports carry memory k's (foldsim_sim's vm<k>_* wired to it)."""
+    body = sv[sv.index('module foldsim_sim('):]
+    body = body[:body.index('endmodule')]
+    out = {}
+    for m in re.finditer(r'^\s+\w+ (foldsim_slr\d+) \((.*?)\);', body, re.M | re.S):
+        for k in re.findall(r'\(vm(\d+)_rd_valid\)', m.group(2)):
+            out[int(k)] = m.group(1)
+    return out
+
+
+def write_vmem_engines(sv, info, path, mode, master_bits, names=None):
+    """Appends to the floorplan (write_slr_groups) the virtual-memory
+    controllers placed with their class copy (--vmem-engines local, or auto
+    where the ports are wider than the controller's device-memory master):
+    each in its copy's SLR group, so that only its master crosses to the
+    memory NoC ports rather than its ports (foldsim_sll_check.py
+    vmem_slls). The kernel's instances: foldsim_afu's vmem_<k> (a memory's
+    own controller) or g_vg<g>.vmem / g_vg<g>.group (group g's). Returns
+    [(controller, group)]."""
+    if mode not in ('local', 'auto') or not info.get('vmem'):
+        return []
+    at = vmem_engine_groups(sv)
+    bits = lambda v: 2 * v['data_width'] + v['row_width'] + v['inst_width']
+    if info.get('vmem_groups'):
+        ctrls = [(f'.*/g_vg{g}[./](vmem|group)$', x['members'], sum(bits(info['vmem'][k]) for k in x['members']))
+                 for g, x in enumerate(info['vmem_groups'])]
+    else:
+        ctrls = [(f'.*/vmem_{k}$', [k], bits(v)) for k, v in enumerate(info['vmem'])]
+    placed = []
+    with open(path, 'a') as f:
+        f.write(f'# Virtual-memory controllers with their class copy (--vmem-engines {mode}).\n')
+        for cell, members, port_bits in ctrls:
+            port = info['vmem'][members[0]].get('port', f'vm{members[0]}')
+            group = at.get(int(port[len('vm'):]))
+            if group is None or (mode == 'auto' and port_bits <= master_bits):
+                continue
+            where = names[int(group[len('foldsim_slr'):])] if names else f'fs_{group[len("foldsim_"):]}'
+            f.write(f'set c [get_cells -quiet -hierarchical -regexp {{{cell}}}]\n'
+                    f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT {where} $c }}\n')
+            placed.append((cell, group))
+    return placed
+
+
 def write_multicycle_xdc(entries, path, splits=()):
     """Each multicycle copy's paths from its capture registers to its end
     registers, M host cycles (setup M, hold M - 1). The compiler checks that
@@ -2095,6 +2145,13 @@ def build_parser():
                          'refusals other than a straddle (the design past the region\'s placement fill, the SLLs '
                          'projected past a boundary), which are otherwise warnings; with --slr-groups the groups '
                          'also keep the boundary budget (sll_per_boundary x sll_margin) in link bits')
+    ap.add_argument('--vmem-engines', choices=('placer', 'auto', 'nmu', 'local', 'flat'), default='placer',
+                    help='where the kernel\'s virtual-memory controllers go, for the SLR check '
+                         '(foldsim_sll_check.py --vmem-engines) and the floorplan: placer (default), left to the '
+                         'placer, the check\'s fitted term; nmu, with the memory NoC ports (the region\'s noc '
+                         'section); local, each with its class copy (with --slr-groups, in its SLR group in '
+                         '<out>/foldsim_floorplan.tcl), its device-memory master crossing to the NoC ports; auto, '
+                         'local where the ports are wider than the master')
     ap.add_argument('--region', default='auto', metavar='JSON',
                     help='with --static: the dynamic region the simulator is placed in (JSON, per SLR its LUTs, '
                          'LUTRAM, URAM and RAMB36 and the margin: foldsim_v80_slr.json, or `v80`). After the fold the '
@@ -2587,6 +2644,13 @@ def main():
         for e in entries[1:]:
             kind, name, lo, w = e.split(':')
             info['port_bundles'][kind.lower()].append({'name': name, 'lo': int(lo), 'width': int(w)})
+    if a.slr_groups and a.vmem_engines in ('local', 'auto'):
+        noc = json.load(open(region)).get('noc', {}) if region else {}
+        placed = write_vmem_engines(open(out('foldsim_sim.sv')).read(), info, out('foldsim_floorplan.tcl'),
+                                    a.vmem_engines, noc.get('master_bits', VMEM_MASTER_BITS), names)
+        info['vmem_engines'] = {'mode': a.vmem_engines, 'local': [c for c, _ in placed]}
+        print(f'foldsim: --vmem-engines {a.vmem_engines}: {len(placed)} controllers with their copies '
+              f'in foldsim_floorplan.tcl', file=sys.stderr)
     with open(out('foldsim_sim.json'), 'w') as f:
         json.dump(info, f, indent=1)
     # The kernel's view of it: how many classes report their finishes, bit c
@@ -2664,7 +2728,7 @@ def main():
         r = run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_sll_check.py'),
                  a.out, '--models', out('models.mlir'), '--fold-options', sll_fold, '--foldsim-opt', foldsim_opt,
                  '--slr-region', region, '--out', out('sll'), '--json', out('sll/sll.json'),
-                 '--slr-policy', a.slr_policy],
+                 '--slr-policy', a.slr_policy, '--vmem-engines', a.vmem_engines],
                 check=False, capture_output=True)
         line = next((l for l in reversed(r.stdout.splitlines()) if re.search(r': (OK|WARN|REFUSE):', l)), None)
         print(f'foldsim: SLL check: {line or "failed: " + (r.stderr or r.stdout)[-2000:]}', file=sys.stderr)
