@@ -18966,13 +18966,26 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
       SmallVector<uint64_t> composed(src.rows.size(), 0);
       for (auto [p, x] : llvm::enumerate(src.rows))
         composed[p] = x < rows.size() ? rows[x] : 0;
-      gCare = src.care;
-      Value v = table(b, src.index, composed, width);
-      if (getenv("FOLDSIM_AFFINE_LOG"))
-        llvm::errs() << "slot-sequencer: a table of " << rows.size() << " x " << width
-                     << " bits read through its index's table of " << src.rows.size()
-                     << " positions\n";
-      return v;
+      // (Only where the position's decoders take the composed rows: kept,
+      // a table of the position is larger than the table of the value.)
+      foldsim::Separable sp;
+      foldsim::ColumnAffine cap;
+      bool decodes =
+          foldsim::slotSegments(composed, width, gSlotSegments, true, false, src.care).size() <=
+              gSlotSegments ||
+          (width >= 2 && foldsim::findSeparable(composed, width, true, 1024, sp)) ||
+          (gSlotColumnAffine && foldsim::findColumnAffine(composed, width, 64, 6, 3, cap) &&
+           foldsim::slotSegments(cap.residual, width, gSlotSegments, true, false, src.care).size() <=
+               gSlotSegments);
+      if (decodes) {
+        gCare = src.care;
+        Value v = table(b, src.index, composed, width);
+        if (getenv("FOLDSIM_AFFINE_LOG"))
+          llvm::errs() << "slot-sequencer: a table of " << rows.size() << " x " << width
+                       << " bits read through its index's table of " << src.rows.size()
+                       << " positions\n";
+        return v;
+      }
     }
   }
   // A one-bit table whose zero rows are the fewer segments (a set of nearly
