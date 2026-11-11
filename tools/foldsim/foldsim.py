@@ -422,6 +422,9 @@ def frame_options(a):
         fold += f' vmem-rings={a.vmem_rings} vmem-ring-entries={a.vmem_ring_entries}'
     if getattr(a, 'fold_store_rings', 0):
         fold += f' fold-store-rings={a.fold_store_rings}'
+    if getattr(a, 'vmem_rings', 0) or getattr(a, 'fold_store_rings', 0):
+        if getattr(a, 'vmem_ring_flight', 32) != 32:
+            fold += f' vmem-ring-flight={a.vmem_ring_flight}'
         if a.vmem_ring_image_each:
             fold += ' vmem-ring-image-each=true'
     if a.unstaged_env:
@@ -1675,6 +1678,9 @@ def build_parser():
                          "(foldsim-fold-static vmem-rings; 0: none)")
     ap.add_argument('--vmem-ring-entries', type=int, default=1024, metavar='N',
                     help='with --vmem-rings: the most entries a ring may take (default 1024)')
+    ap.add_argument('--vmem-ring-flight', type=int, default=32, metavar='N',
+                    help='with --vmem-rings: entries of each ring\'s reads-in-flight table and answer queue (a power of two '
+                         '>= 8, default 32); 0: per ring by its read rate, 8 to 32 (foldsim-fold-static vmem-ring-flight)')
     ap.add_argument('--vmem-ring-image-each', action='store_true',
                     help='with --vmem-rings: each ring its own image and controller (default: a class\'s rings '
                          'share one image, the ring in the tag: one controller a class; foldsim-fold-static '

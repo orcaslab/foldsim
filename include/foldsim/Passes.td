@@ -448,6 +448,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"vmemRingEntries", "vmem-ring-entries", "unsigned", "1024",
            "With vmem-rings: the most entries a ring may take; a class that "
            "needs more keeps its buffers">,
+    Option<"vmemRingFlight", "vmem-ring-flight", "unsigned", "32",
+           "With vmem-rings: the entries of each ring's table of reads in "
+           "flight and of its answer-write queue (a power of two, at least "
+           "8; default 32). 0: sized per ring by its read rate, the power of "
+           "two covering the decision lead + 2 and the reads of an assumed "
+           "256-position answer latency (prefetches a frame x 256 / II), "
+           "between 8 and 32: a ring of a sparse class needs few. Never "
+           "inexact: a ring whose table is full holds its decisions "
+           "(bubbles)">,
     Option<"vmemSkipHeldReads", "vmem-skip-held-reads", "bool", "false",
            "With virtual-memories, a read whose address is provably the "
            "previous target cycle's (the address a function of mux(c, A, q) "

@@ -422,6 +422,9 @@ static constexpr unsigned kVirtualFreeWidth = 16;
 /// `vmem-rings`: the most reads of a ring memory in flight (its table's
 /// entries), whatever the instances.
 static constexpr unsigned kRingReads = 32;
+/// vmem-ring-flight=0: the answer latency, in positions, a ring's table of
+/// reads in flight is sized for (a fuller table only holds decisions).
+static constexpr unsigned kRingFlightLatency = 256;
 /// `vmem-rings`: the prefetches a ring memory may hold queued (waiting for
 /// their instances' reads).
 static constexpr unsigned kRingQueue = 64;
@@ -878,7 +881,7 @@ public:
     return (vmemAutoBits && depth * threads * width >= vmemAutoBits) ||
            (vmemAutoInstanceBits && depth * width >= vmemAutoInstanceBits);
   }
-  unsigned vmemRingLead = 0, vmemRingEntries = 1024;
+  unsigned vmemRingLead = 0, vmemRingEntries = 1024, vmemRingFlight = kRingReads;
   /// `fold-store-rings`: without vmem-rings, the streamed folded stores'
   /// read buffers alone as rings of this lead (0: none).
   unsigned foldRingLead = 0;
@@ -20972,6 +20975,8 @@ LogicalResult StaticFolder::buildSim() {
     /// to come) and a fixed table of their instances (`kRingReads` entries).
     Value out;
     SmallVector<Value> flightValid, flightInst;
+    /// Its entries (vmem-ring-flight).
+    unsigned flight = kRingReads;
     /// The prefetch queue's head leaving now: valid, instance, entry; its count.
     Value issValid, issInst, issEntry, queued;
     /// The answers' image write leaving now: valid, instance, data.
@@ -24386,6 +24391,18 @@ LogicalResult StaticFolder::buildSim() {
           // its answer's image write leaves (below). Its room: the decisions
           // in flight may issue L + 1 more (a term below keeps them within it).
           unsigned iw = std::max(idxWidth, 1u);
+          // (vmem-ring-flight: the table's and the answer queue's entries F,
+          // fixed, or by the ring's read rate: the decisions in flight plus
+          // the reads of an assumed 256-position latency, 8 to 32.)
+          unsigned flight = vmemRingFlight;
+          if (!flight) {
+            uint64_t need = decisionLead() + 2 +
+                            (uint64_t(plan.prefetches) * kRingFlightLatency + ii - 1) / std::max(1u, ii);
+            flight = unsigned(std::min<uint64_t>(kRingReads, llvm::PowerOf2Ceil(need)));
+          }
+          flight = std::max<unsigned>(llvm::PowerOf2Ceil(std::max(flight, 8u)),
+                                      llvm::PowerOf2Ceil(decisionLead() + 3));
+          rb.flight = flight;
           auto wissNext = backedges.get(i1);
           auto wissInstNext = backedges.get(b.getIntegerType(iw));
           Value wiss = wissNext, wissInst = wissInstNext;
@@ -24393,7 +24410,7 @@ LogicalResult StaticFolder::buildSim() {
           Value issuedInst = copies[c].getResult(vm.firstOutput + 1);
           std::string fp = vm.name + "_ring_flight";
           Value taken = constant(1, 0);
-          for (unsigned e = 0; e < kRingReads; ++e) {
+          for (unsigned e = 0; e < flight; ++e) {
             auto vNext = backedges.get(i1);
             auto iNext = backedges.get(b.getIntegerType(iw));
             Value v = resetReg(vNext, fp + Twine(e) + "_valid", 0);
@@ -24420,7 +24437,7 @@ LogicalResult StaticFolder::buildSim() {
             terms.push_back(comb::ICmpOp::create(
                 b, comb::ICmpPredicate::ult,
                 comb::AddOp::create(b, rb.out, constant(w, decisionLead() + 1)),
-                constant(w, kRingReads)));
+                constant(w, flight)));
           }
           auto bitAt = [&](Value bits, unsigned n, Value index, unsigned w) -> Value {
             if (!w)
@@ -24564,9 +24581,9 @@ LogicalResult StaticFolder::buildSim() {
             Value enough = share.enough;
             // The answers' writes: {instance, data}, queued a host cycle after
             // the answer (rb.wv).
-            unsigned dw = vm.dataWidth, wb = llvm::Log2_32_Ceil(kRingReads);
+            unsigned dw = vm.dataWidth, wb = llvm::Log2_32_Ceil(rb.flight);
             auto wq = seq::FirMemOp::create(
-                b, seq::FirMemType::get(context, kRingReads, iw + dw, 1), /*readLatency=*/0,
+                b, seq::FirMemType::get(context, rb.flight, iw + dw, 1), /*readLatency=*/0,
                 /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
                 b.getStringAttr(fp + "_writes"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
                 StringAttr{}, Attribute{});
@@ -25733,6 +25750,7 @@ void FoldStaticPass::runOnOperation() {
   folder.vmemRingLead = vmemRings;
   folder.foldRingLead = foldStoreRings;
   folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));
+  folder.vmemRingFlight = unsigned(vmemRingFlight);
   folder.vmemRingImageEach = vmemRingImageEach;
   folder.foldStoreRam = foldStoreRam;
   folder.foldStoreStyle = foldStoreStyle;
