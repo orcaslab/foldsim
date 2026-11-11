@@ -35,6 +35,19 @@
 # RUN: %t/ring/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 | FileCheck %s
 # RUN: %t/ring/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=1 +hi=30 +stall=20 | FileCheck %s
 # RUN: %t/ring/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=5 +hi=60 +full=30 | FileCheck %s
+# fold-store-rings without vmem-rings: the stores' read buffers alone as rings
+# (the same II, no read buffer row and no pending bit per instance).
+# RUN: foldsim --srcs top.f --top Top --out %t/fr --static --state-in-ram Leaf::4 --fold-store-stream --fold-store-rings 4 Leaf > %t/fr.log 2>&1
+# RUN: FileCheck %s --check-prefix=FR < %t/fr.log
+# RUN: FileCheck %s --check-prefix=FRIR < %t/fr/foldsim_sim.mlir
+# RUN: python3 %S/Inputs/vmem_bind.py %t/fr/foldsim_sim.json %t/fr
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/fr --top-module tb -Mdir %t/fr/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/fr/foldsim_sim.sv > %t/fr/build.log 2>&1
+# RUN: %t/fr/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +lo=1 | FileCheck %s
+# RUN: %t/fr/obj/Vtb +verilator+rand+reset+0 +verilator+seed+12 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: %t/fr/obj/Vtb +verilator+rand+reset+0 +verilator+seed+13 +lo=5 +hi=60 +full=30 | FileCheck %s
+# Without it (the same command): a pending bit per instance a store.
+# RUN: foldsim --srcs top.f --top Top --out %t/f0 --static --state-in-ram Leaf::4 --fold-store-stream Leaf > %t/f0.log 2>&1
+# RUN: FileCheck %s --check-prefix=F0IR < %t/f0/foldsim_sim.mlir
 # Two copies of 8 instances with bubbles (a landing entry per instance), rings.
 # RUN: foldsim --srcs top.f --top Top --out %t/cb --static --modulo --min-ii 64 --fold-store-stream --vmem-rings 4 --copies Leaf:2 --bubbles Leaf > %t/cb.log 2>&1
 # RUN: FileCheck %s --check-prefix=CB < %t/cb.log
@@ -62,6 +75,13 @@
 # RIR-NOT: _lvalid
 # RIR-DAG: %fold3_store_landing = seq.firmem 1, 1, old, undefined : <2 x 600
 # RIR-DAG: %fold3_store_ring = seq.firmem 1, 1, old, undefined : <2 x 600
+# FR: II = 67
+# FR: fold-store-stream: Leaf: landing ring of 2 entries (16 instances
+# FR: vmem-rings: Leaf: 4 read buffers as rings of 2 entries (window 2, 16 instances, 16 prefetches a frame, lead 4)
+# FRIR-NOT: _store_pending =
+# FRIR-NOT: _store_rdata = seq.firmem
+# FRIR: %fold{{[0-9]}}_store_ring = seq.firmem
+# F0IR: %fold0_store_pending = seq.firreg {{.*}} : i16
 # CB: fold-store-stream: Leaf: a landing entry per instance
 # CB: vmem-rings: Leaf: 4 read buffers as rings of
 # CB: fold-store-stream: Leaf_copy1: a landing entry per instance

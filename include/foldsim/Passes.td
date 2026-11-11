@@ -433,6 +433,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "use into entry instance mod R of a ring of R entries, R the "
            "smallest power of two the schedule's window allows. A class whose "
            "schedule leaves no room keeps its buffers (reported). 0: none">,
+    Option<"foldStoreRings", "fold-store-rings", "unsigned", "0",
+           "With fold-store-stream and without vmem-rings: the streamed folded "
+           "stores' read buffers alone as vmem rings of this lead (VmemRings.h): "
+           "a ring of R entries and a table of the reads in flight, the same at "
+           "every instance count, in place of a read buffer row and a pending "
+           "bit per instance; the class's other virtual memories keep theirs. "
+           "With vmem-rings the stores take rings already. 0: none">,
     Option<"vmemRingImageEach", "vmem-ring-image-each", "bool", "false",
            "With vmem-rings: each ring its own image (a controller each); by "
            "default a class's rings share one image (a row per ring and "

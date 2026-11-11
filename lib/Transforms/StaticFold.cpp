@@ -872,6 +872,18 @@ public:
            (vmemAutoInstanceBits && depth * width >= vmemAutoInstanceBits);
   }
   unsigned vmemRingLead = 0, vmemRingEntries = 1024;
+  /// `fold-store-rings`: without vmem-rings, the streamed folded stores'
+  /// read buffers alone as rings of this lead (0: none).
+  unsigned foldRingLead = 0;
+  /// The rings' lead: vmem-rings', else fold-store-rings'.
+  unsigned ringLead() const { return vmemRingLead ? vmemRingLead : foldRingLead; }
+  /// Whether a class has a folded store streamed through a landing ring
+  /// (fold-store-stream): fold-store-rings gives those stores rings.
+  bool hasStreamedFold(const Class &cls) const {
+    if (!cls.folding)
+      return false;
+    return llvm::any_of(cls.folding->folds, [](const Fold &f) { return f.landingRing; });
+  }
   bool vmemRingImageEach = false;
   /// Plans a class's rings (`vmem-rings`): marks its virtual memories that
   /// take one, or none if the schedule leaves no room (the reason reported).
@@ -9657,7 +9669,10 @@ int StaticFolder::minStateGap(const Class &cls) const {
             (pattern.match(name) || pattern.match((model + ":" + name).str()))) ||
            bySize(memory))) {
         gap = std::max(gap, decisionLead() + (cls.heldReads ? 2 : 1) +
-                                (vmemRingLead && cls.threads() > 1 ? decisionLead() + 3 : 0));
+                                ((vmemRingLead || (foldRingLead && hasStreamedFold(cls))) &&
+                                         cls.threads() > 1
+                                     ? decisionLead() + 3
+                                     : 0));
         break;
       }
     }
@@ -14505,7 +14520,7 @@ LogicalResult StaticFolder::chooseStreamWindows() {
           if (fold.landingRing) {
             uint64_t row = 8 * llvm::PowerOf2Ceil(std::max<uint64_t>(
                                    1, llvm::divideCeil(fold.store.getType().getWidth(), 8)));
-            uint64_t bits = (vmemRingLead ? 4 : 2) * uint64_t(cls.threads()) * row;
+            uint64_t bits = (ringLead() ? 4 : 2) * uint64_t(cls.threads()) * row;
             masterBits[nextMaster++ % kStreamMasters] += bits;
             spreadBits[nextSpread++ % kStreamMasters] += bits;
             foldChunks.push_back(bits);
@@ -15282,7 +15297,7 @@ void StaticFolder::planClassRing(
       return refuse("a ready pass after its state pass");
   }
   auto plan = std::make_shared<foldsim::RingPlan>(
-      foldsim::planRing(insts, ii, vmemRingLead, decisionLead() + 2, decisionLead() + 2,
+      foldsim::planRing(insts, ii, ringLead(), decisionLead() + 2, decisionLead() + 2,
                         vmemRingEntries));
   if (!plan->ok)
     return refuse(plan->why);
@@ -15297,7 +15312,7 @@ void StaticFolder::planClassRing(
                << rings << " read buffers as rings of " << plan->entries
                << " entries (window " << plan->window << ", " << cls.threads()
                << " instances, " << plan->prefetches << " prefetches a frame, lead "
-               << vmemRingLead << ")\n";
+               << ringLead() << ")\n";
 }
 
 LogicalResult StaticFolder::buildCopy(Class &cls) {
@@ -15599,6 +15614,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     planClassRing(cls, [&](const Class::VirtualMemory &vm) {
       Fold *fold = hbmFold(vm.lanes.front());
       return !vm.pages && !vm.delayed && (!fold || fold->landingRing);
+    });
+  else if (foldRingLead && foldStoreStream && threads > 1)
+    // `fold-store-rings`: the streamed folded stores alone.
+    planClassRing(cls, [&](const Class::VirtualMemory &vm) {
+      Fold *fold = hbmFold(vm.lanes.front());
+      return !vm.pages && !vm.delayed && fold && fold->landingRing;
     });
 
   // Paged register state: the registers a ready pass reads (the cone of an
@@ -19522,7 +19543,7 @@ LogicalResult StaticFolder::buildSim() {
     };
     // (The rings' prefetches at a class's same positions: an image's rings'
     // reads of a position leave one a host cycle, within half the lead.)
-    uint64_t perLead = std::max<uint64_t>(1, vmemRingLead / 2);
+    uint64_t perLead = std::max<uint64_t>(1, ringLead() / 2);
     for (auto [c, cls] : llvm::enumerate(classes))
       for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
         if (!vm.ring || !simOf.count({unsigned(c), unsigned(k)}))
@@ -25267,6 +25288,7 @@ void FoldStaticPass::runOnOperation() {
   folder.vmemAutoBits = vmemAutoBits;
   folder.vmemAutoInstanceBits = vmemAutoInstanceBits;
   folder.vmemRingLead = vmemRings;
+  folder.foldRingLead = foldStoreRings;
   folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));
   folder.vmemRingImageEach = vmemRingImageEach;
   folder.foldStoreRam = foldStoreRam;

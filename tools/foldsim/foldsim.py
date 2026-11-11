@@ -412,6 +412,8 @@ def frame_options(a):
         fold += f' vmem-auto-instance-bits={a.vmem_auto_instance_bits}'
     if getattr(a, 'vmem_rings', 0):
         fold += f' vmem-rings={a.vmem_rings} vmem-ring-entries={a.vmem_ring_entries}'
+    if getattr(a, 'fold_store_rings', 0):
+        fold += f' fold-store-rings={a.fold_store_rings}'
         if a.vmem_ring_image_each:
             fold += ' vmem-ring-image-each=true'
     if a.unstaged_env:
@@ -1640,6 +1642,10 @@ def build_parser():
                     help='with --static: every registered-read target memory (one read port, at most one write '
                          'port) whose threaded image is at least N bits is a virtual memory too, whatever storage '
                          'rule names it (foldsim-fold-static vmem-auto-bits; 0: none by size)')
+    ap.add_argument('--fold-store-rings', type=int, default=0, metavar='LEAD',
+                    help="with --fold-store-stream and without --vmem-rings: the streamed folded stores' read "
+                         "buffers alone as rings of this lead (a fixed ring and table of reads in flight, not a "
+                         "buffer row and pending bit per instance; foldsim-fold-static fold-store-rings; 0: none)")
     ap.add_argument('--vmem-rings', type=int, default=0, metavar='LEAD',
                     help="with virtual memories: each one's per-instance read buffer as a fixed ring, refilled "
                          "from an image of the answers in HBM LEAD positions before each instance's first use "
