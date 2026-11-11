@@ -18395,7 +18395,8 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
   gCare = {};
   Value v = tableBody(b, index, rows, width, site, care);
   // (Instance-like values of a position: kept for a table of them.)
-  if (gSlotTableCompose && v && width >= 4 && width <= 32 && rows.size() <= (1u << 17) &&
+  if ((gSlotTableCompose || gSlotColumnAffine) && v && width >= 4 && width <= 32 &&
+      rows.size() <= (1u << 17) &&
       !gTableSource.count(v)) {
     auto *pc = foldsim::currentPosCounters();
     if (pc && pc->knows(index)) {
@@ -18719,7 +18720,39 @@ static Value buildColumnAffine(ImplicitLocOpBuilder &b, Value index,
     if (counted) {
       qr = pc->divmod(b, index, unsigned(d));
     } else {
-      auto [qn, rn] = constDivmod(b, reg.getNext(), d, (uint64_t(1) << iw) - 1);
+      // The register's next value a position table (an instance decoded
+      // from the position): its quotient and remainder as position tables
+      // of their own (the rows composed), decoded by the position's
+      // segments and counters, registered as the index is. Where they do
+      // not decode, a constant division of the next value, only for an
+      // index of at most 8 bits (a division after a decoder is a deep
+      // path: past that, the table stays a table).
+      Value qn, rn;
+      auto src = gTableSource.find(reg.getNext());
+      if (src != gTableSource.end()) {
+        auto in = src->second;   // (a copy: the map may grow below)
+        unsigned qw = std::max(1u, unsigned(llvm::Log2_64_Ceil(((uint64_t(1) << iw) - 1) / d + 1)));
+        unsigned rw = std::max(1u, unsigned(llvm::Log2_64_Ceil(d)));
+        SmallVector<uint64_t> qrows(in.rows.size()), rrows(in.rows.size());
+        for (auto [p, x] : llvm::enumerate(in.rows)) {
+          qrows[p] = x / d;
+          rrows[p] = x % d;
+        }
+        uint64_t kept = foldsim::slotSequencerStats().fallback;
+        gCare = in.care;
+        Value tq = table(b, in.index, qrows, qw);
+        gCare = in.care;
+        Value tr = table(b, in.index, rrows, rw);
+        if (foldsim::slotSequencerStats().fallback == kept) {
+          qn = tq;
+          rn = tr;
+        } else if (getenv("FOLDSIM_AFFINE_LOG")) {
+          llvm::errs() << "slot-sequencer: column-affine: the index's quotient by " << d
+                       << " does not decode at the position\n";
+        }
+      }
+      if (!qn && iw <= 8)
+        std::tie(qn, rn) = constDivmod(b, reg.getNext(), d, (uint64_t(1) << iw) - 1);
       if (qn)
         qr = {seq::FirRegOp::create(b, qn, reg.getClk(), b.getStringAttr("cadivq" + Twine(d))),
               seq::FirRegOp::create(b, rn, reg.getClk(), b.getStringAttr("cadivr" + Twine(d)))};
