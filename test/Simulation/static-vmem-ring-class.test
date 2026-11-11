@@ -1,0 +1,38 @@
+# REQUIRES: verilator
+# vmem-ring-class-control: the rings of a class whose reads issue together
+# share one table of reads in flight (an entry an issue, a bit per ring read
+# then, each cleared as that ring's answer's image write leaves) and one
+# prefetch queue, whose head each ring reads in its image once no ring of the
+# class has a read of the instance in flight, and which leaves once every ring
+# has. The eight rings of a leaf (Driver/Inputs/vmem_multi, static-vmem-group)
+# against the controllers' model: in one image, and two rings an image (four
+# images, so two writes may leave in a host cycle and clear two bits of one
+# entry), at fast, slow, stalled, full and 600-host-cycle answers, with bubbles.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_multi
+# RUN: foldsim --srcs top.f --top Top --out %t/c16 --static --modulo --min-ii 160 --virtual-memories 'Leaf:.*' --vmem-rings 16 --vmem-ring-class-control Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=C16 < %t/c16/foldsim_sim.mlir
+# RUN: python3 %S/Inputs/vmem_bind.py %t/c16/foldsim_sim.json %t/c16
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/c16 --top-module tb -Mdir %t/c16/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/c16/foldsim_sim.sv > %t/c16/build.log 2>&1
+# RUN: %t/c16/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
+# RUN: %t/c16/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: %t/c16/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=20 +hi=200 +full=50 | FileCheck %s
+# RUN: %t/c16/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=40 +hi=600 +stall=10 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/c4 --static --modulo --min-ii 160 --virtual-memories 'Leaf:.*' --vmem-rings 4 --vmem-ring-class-control --bubbles Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=C4 < %t/c4/foldsim_sim.mlir
+# RUN: python3 %S/Inputs/vmem_bind.py %t/c4/foldsim_sim.json %t/c4
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/c4 --top-module tb -DBUBBLES -Mdir %t/c4/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/c4/foldsim_sim.sv > %t/c4/build.log 2>&1
+# RUN: %t/c4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 | FileCheck %s
+# RUN: %t/c4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=5 +hi=60 +full=30 +stall=20 +bubble=30 | FileCheck %s
+# RUN: %t/c4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=40 +hi=600 +full=50 +bubble=60 | FileCheck %s
+# One queue, one table of reads in flight for the eight rings (a bit per ring an entry), one head's rings read:
+# C16: _ring_flight_queue = seq.firmem
+# C16-NOT: _ring_flight_queue = seq.firmem
+# C16: _ring_flight0_rings = seq.firreg {{.*}} : i8
+# C16-NOT: _ring_flight0_rings =
+# C16: _ring_flight_used = seq.firreg
+# C16: _ring_flight_hdone = seq.firreg {{.*}} : i8
+# C16-NOT: _ring_flight_queue = seq.firmem
+# C16-NOT: _ring_flight0_rings =
+# C4: _ring_flight0_rings = seq.firreg {{.*}} : i8
+# C4-NOT: _ring_flight0_rings =
+# CHECK: {{^}}MATCH

@@ -427,6 +427,8 @@ def frame_options(a):
             fold += f' vmem-ring-flight={a.vmem_ring_flight}'
         if a.vmem_ring_image_each:
             fold += ' vmem-ring-image-each=true'
+        if getattr(a, 'vmem_ring_class_control', False):
+            fold += ' vmem-ring-class-control=true'
     if a.unstaged_env:
         fold += ' staged-env=false'
     if getattr(a, 'register_state_entries', None) is not None:
@@ -1683,6 +1685,10 @@ def build_parser():
     ap.add_argument('--vmem-ring-flight', type=int, default=32, metavar='N',
                     help='with --vmem-rings: entries of each ring\'s reads-in-flight table and answer queue (a power of two '
                          '>= 8, default 32); 0: per ring by its read rate, 8 to 32 (foldsim-fold-static vmem-ring-flight)')
+    ap.add_argument('--vmem-ring-class-control', action='store_true',
+                    help='with --vmem-rings: a class\'s rings whose reads issue together share one reads-in-flight '
+                         'table (a bit per ring an entry) and one prefetch queue, in place of one of each per ring '
+                         '(foldsim-fold-static vmem-ring-class-control)')
     ap.add_argument('--vmem-ring-image-each', action='store_true',
                     help='with --vmem-rings: each ring its own image and controller (default: a class\'s rings '
                          'share one image, the ring in the tag: one controller a class; foldsim-fold-static '

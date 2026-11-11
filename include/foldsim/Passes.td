@@ -448,6 +448,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"vmemRingEntries", "vmem-ring-entries", "unsigned", "1024",
            "With vmem-rings: the most entries a ring may take; a class that "
            "needs more keeps its buffers">,
+    Option<"vmemRingClassControl", "vmem-ring-class-control", "bool", "false",
+           "With vmem-rings: the rings of a class whose reads issue together "
+           "(the copy's same instance output) share one table of reads in "
+           "flight (an entry an issue, a bit per ring), one prefetch queue "
+           "and one decision term each, in place of a table, a queue and "
+           "terms per ring: a queued prefetch leaves once every one of its "
+           "rings has read its instance's image row, each ring's read once "
+           "no ring of the class has a read of the instance in flight. "
+           "Exact as the rings are (a prefetch may only wait longer)">,
     Option<"vmemRingFlight", "vmem-ring-flight", "unsigned", "32",
            "With vmem-rings: the entries of each ring's table of reads in "
            "flight and of its answer-write queue (a power of two, at least "
