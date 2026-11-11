@@ -11357,6 +11357,9 @@ static LogicalResult foldPipelines(
 /// A slot table: `rows[index]` (`width` bits; zero past the rows).
 static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                    unsigned width, unsigned site = __builtin_LINE());
+static std::pair<Value, Value> fixedResident(ImplicitLocOpBuilder &b, Value i, unsigned B,
+                                             unsigned R, unsigned threads, unsigned rw);
+static Value constTimes(ImplicitLocOpBuilder &b, Value x, uint64_t c, unsigned width);
 /// `max-table-bits`: the largest table constant, in bits (Vivado's variable
 /// limit); a larger one is cut into column slices.
 static uint64_t gMaxTableBits = 1000000;
@@ -17205,7 +17208,18 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
         Group g;
         std::string prefix = ("pp_g" + Twine(c / 16)).str();
         Value row2 = keepReg(ppRow3, prefix + "_rrow2");
-        if (partial) {
+        // state-scratch-fixed: the resident index and stream bit from the
+        // registered instance (fixedResident), not the simulator's inputs.
+        bool fixedRes = partial && cls.ppFixed && threads > 1 && cls.ppFixedR &&
+                        llvm::isPowerOf2_32(cls.ppFixedB);
+        unsigned rw = std::max(1u, llvm::Log2_32_Ceil(resPow));
+        if (fixedRes) {
+          auto [r2, s2] = fixedResident(b, keepReg(ppInst3, prefix + "_rresinst2"),
+                                        cls.ppFixedB, cls.ppFixedR, threads, rw);
+          (void)s2;
+          g.resRead = resPow > 1 ? b.createOrFold<comb::ConcatOp>(r2, row2) : row2;
+          g.str1 = keepReg(keepReg(str3, prefix + "_rstr2"), prefix + "_rstr1");
+        } else if (partial) {
           Value r2 = keepReg(res3, prefix + "_rres2");
           g.resRead = resPow > 1 ? b.createOrFold<comb::ConcatOp>(r2, row2) : row2;
           g.str1 = keepReg(keepReg(str3, prefix + "_rstr2"), prefix + "_rstr1");
@@ -17230,7 +17244,15 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           g.wAddr = b.createOrFold<comb::ConcatOp>(
               keepReg(inst1, prefix + "_winst0"), g.wAddr);
         }
-        if (partial) {
+        if (fixedRes) {
+          Value i1 = keepReg(keepReg(ppInst3, prefix + "_wresinst2"), prefix + "_wresinst1");
+          Value r0 = keepReg(fixedResident(b, i1, cls.ppFixedB, cls.ppFixedR, threads, rw).first,
+                             prefix + "_wres0");
+          Value wrow0 = keepReg(g.wRow1, prefix + "_wresrow0");
+          g.resWrite = resPow > 1 ? b.createOrFold<comb::ConcatOp>(r0, wrow0) : wrow0;
+          g.str0 = keepReg(keepReg(keepReg(str3, prefix + "_wstr2"), prefix + "_wstr1"),
+                           prefix + "_wstr0");
+        } else if (partial) {
           Value r0 = keepReg(keepReg(keepReg(res3, prefix + "_wres2"),
                                      prefix + "_wres1"),
                              prefix + "_wres0");
@@ -18577,6 +18599,36 @@ static Value constTimes(ImplicitLocOpBuilder &b, Value x, uint64_t c, unsigned w
   // subtraction.
   Value p = sumTree(b, pos, width);
   return neg_.empty() ? p : Value(comb::SubOp::create(b, p, sumTree(b, neg_, width)));
+}
+
+/// state-scratch-fixed: of each B instances (a power of two) the first R
+/// resident. Instance i's resident index (i >> log B) * R + i % B (`rw`
+/// bits) and stream bit (i past the last whole block, or i % B >= R).
+static std::pair<Value, Value> fixedResident(ImplicitLocOpBuilder &b, Value i, unsigned B,
+                                             unsigned R, unsigned threads, unsigned rw) {
+  unsigned iw = hw::getBitWidth(i.getType()), lb = llvm::Log2_32(B);
+  unsigned full = threads / B * B;
+  auto cst = [&](unsigned w, uint64_t v) -> Value { return hw::ConstantOp::create(b, b.getIntegerType(w), v); };
+  auto zext = [&](Value v, unsigned w) -> Value {
+    unsigned vw = hw::getBitWidth(v.getType());
+    if (vw == w)
+      return v;
+    if (vw > w)
+      return comb::ExtractOp::create(b, v, 0, w);
+    return comb::ConcatOp::create(b, ValueRange{cst(w - vw, 0), v});
+  };
+  Value low = lb ? Value(comb::ExtractOp::create(b, i, 0, std::min(lb, iw))) : cst(1, 0);
+  Value res = zext(low, rw);
+  if (lb < iw) {
+    Value q = comb::ExtractOp::create(b, i, lb, iw - lb);
+    res = comb::AddOp::create(b, res, constTimes(b, zext(q, rw), R, rw));
+  }
+  Value tail = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, zext(low, lb + 1), cst(lb + 1, R));
+  Value str = full >= (uint64_t(1) << iw)
+                  ? tail
+                  : Value(comb::OrOp::create(
+                        b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, i, cst(iw, full)), tail));
+  return {res, str};
 }
 
 /// The quotient and remainder of `x` (at most `maxX`) by the constant `d`:
@@ -20134,39 +20186,15 @@ LogicalResult StaticFolder::buildSim() {
         }
         if (cls.ppFixed && ctl.ppInst3 && cls.ppFixedR && llvm::isPowerOf2_32(cls.ppFixedB)) {
           // state-scratch-fixed: the resident index and stream bit are
-          // digits of the pass's instance i (of each B the first R
-          // resident): (i >> log B) * R + i % B, and i past the last whole
-          // block or i % B >= R. Arithmetic on the instance the pass reads
-          // anyway: no table of the position or of its rank (whose rows
-          // follow the instances' pass order, irregular).
-          unsigned lb = llvm::Log2_32(cls.ppFixedB), rw = cls.ppResBits();
-          unsigned full = threads / cls.ppFixedB * cls.ppFixedB;
-          Value i = ctl.ppInst3;
-          auto zext = [&](Value v, unsigned w) -> Value {
-            unsigned vw = hw::getBitWidth(v.getType());
-            if (vw == w)
-              return v;
-            if (vw > w)
-              return comb::ExtractOp::create(b, v, 0, w);
-            return comb::ConcatOp::create(b, ValueRange{constant(w - vw, 0), v});
-          };
-          Value low = lb ? Value(comb::ExtractOp::create(b, i, 0, std::min(lb, idxWidth)))
-                         : constant(1, 0);
-          Value res = zext(low, rw);
-          if (lb < idxWidth) {
-            Value q = comb::ExtractOp::create(b, i, lb, idxWidth - lb);
-            res = comb::AddOp::create(b, res, constTimes(b, zext(q, rw), cls.ppFixedR, rw));
-          }
-          ctl.ppRes3 = res;
-          Value tail = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, zext(low, lb + 1),
-                                            constant(lb + 1, cls.ppFixedR));
-          // (Every instance in a whole block: no tail past the last.)
-          ctl.ppStr3 = full >= (uint64_t(1) << idxWidth)
-                           ? tail
-                           : Value(comb::OrOp::create(
-                                 b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, i,
-                                                         constant(idxWidth, full)),
-                                 tail));
+          // digits of the pass's instance (fixedResident): no table of the
+          // position or of its rank (whose rows follow the instances' pass
+          // order, irregular). The stream bit here (two compares); the index
+          // (an adder) the copy computes from the instance it registers,
+          // not after the instance's decoder.
+          ctl.ppRes3 = constant(cls.ppResBits(), 0);
+          ctl.ppStr3 = fixedResident(b, ctl.ppInst3, cls.ppFixedB, cls.ppFixedR, threads,
+                                     cls.ppResBits())
+                           .second;
         } else {
           ctl.ppRes3 = byRank(lastSet, resRank, presRow, passValid, cls.ppResBits());
           ctl.ppStr3 = byRank(lastSet, strRank, pstrRow, passValid, 1);
