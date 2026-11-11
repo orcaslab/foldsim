@@ -67,9 +67,9 @@
 # RUN: %t/ring16/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=40 +hi=600 +stall=10 | FileCheck %s
 # RUN: %t/ring16/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +lo=1 +hi=300 +full=40 +stall=30 | FileCheck %s
 # RUN: FileCheck %s --check-prefix=ZROW < %t/ring16/foldsim_sim.mlir
-# The rings' answer queues have a zero row (32), written while no answer comes and read while the ring's image write
+# The rings' answer queues have a zero row (their last), written while no answer comes and read while the ring's image write
 # is not granted: the shared image ORs its rings' data with no select.
-# ZROW: seq.firmem.write_port %{{.*}}_ring_flight_writes[%{{.*}}] = %{{.*}}, clock %hostClock : <33 x 10, mask 1>
+# ZROW: seq.firmem.write_port %{{.*}}_ring_flight_writes[%{{.*}}] = %{{.*}}, clock %hostClock : <32 x 10, mask 1>
 # RUN: foldsim --srcs top.f --top Top --out %t/ring4 --static --modulo --min-ii 160 --virtual-memories 'Leaf:.*' --vmem-rings 4 Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=RING4 < %t/ring4/foldsim_sim.mlir
 # RING4-COUNT-4: _img:Leaf:5:3:

@@ -24896,21 +24896,21 @@ LogicalResult StaticFolder::buildSim() {
             Value enough = share.enough;
             // The answers' writes: {instance, data}, queued a host cycle after
             // the answer (rb.wv).
-            // (A row past the queue's, `flight`, always zero: written with
-            // the answer registers' zeros in every host cycle without an
-            // answer, and read in every host cycle the ring's write is not
-            // granted, so a shared image ORs its rings' writes without a
-            // select of the data. The same distributed RAM up to 63 rows.)
+            // (Its last row, `flight` - 1, always zero: written with the
+            // answer registers' zeros in every host cycle without an answer,
+            // and read in every host cycle the ring's write is not granted,
+            // so a shared image ORs its rings' writes without a select of the
+            // data. The queue takes the other rows, its pointers mod
+            // `flight` - 1: it never holds more answers than reads in flight,
+            // which the room term keeps under `flight`.)
             unsigned dw = vm.dataWidth, wb = llvm::Log2_32_Ceil(rb.flight);
             auto wq = seq::FirMemOp::create(
-                b, seq::FirMemType::get(context, rb.flight + 1, iw + dw, 1), /*readLatency=*/0,
+                b, seq::FirMemType::get(context, rb.flight, iw + dw, 1), /*readLatency=*/0,
                 /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
                 b.getStringAttr(fp + "_writes"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
                 StringAttr{}, Attribute{});
-            Value zeroRow = constant(wb + 1, rb.flight);
-            auto row = [&](Value ptr) {
-              return b.createOrFold<comb::ConcatOp>(constant(1, 0), ptr);
-            };
+            Value zeroRow = constant(wb, rb.flight - 1);
+            auto row = [&](Value ptr) { return ptr; };
             auto wheadNext = backedges.get(b.getIntegerType(wb));
             auto wtailNext = backedges.get(b.getIntegerType(wb));
             auto wcountNext = backedges.get(b.getIntegerType(wb + 1));
@@ -24964,8 +24964,12 @@ LogicalResult StaticFolder::buildSim() {
               return comb::AddOp::create(
                   b, v, b.createOrFold<comb::ConcatOp>(constant(hw::getBitWidth(v.getType()) - 1, 0), on));
             };
-            wheadNext.setValue(wstep(whead, wgo));
-            wtailNext.setValue(wstep(wtail, rb.wv));
+            auto wrap = [&](Value v, Value on) -> Value {
+              return comb::MuxOp::create(
+                  b, comb::AndOp::create(b, on, eq(v, rb.flight - 2)), constant(wb, 0), wstep(v, on));
+            };
+            wheadNext.setValue(wrap(whead, wgo));
+            wtailNext.setValue(wrap(wtail, rb.wv));
             wcountNext.setValue(comb::SubOp::create(
                 b, wstep(wcount, rb.wv), b.createOrFold<comb::ConcatOp>(constant(wb, 0), wgo)));
             rb.issInst = topInst;
