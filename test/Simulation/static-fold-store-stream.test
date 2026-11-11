@@ -74,7 +74,7 @@
 # RIR-NOT: _rdata = seq.firmem
 # RIR-NOT: _lvalid
 # RIR-DAG: %fold3_store_landing = seq.firmem 1, 1, old, undefined : <2 x 600
-# RIR-DAG: %fold3_store_ring = seq.firmem 1, 1, old, undefined : <2 x 600
+# RIR-DAG: %fold3_store_ring = seq.firmem 0, 1, undefined, undefined : <2 x 600
 # FR: II = 67
 # FR: fold-store-stream: Leaf: landing ring of 2 entries (16 instances
 # FR: vmem-rings: Leaf: 4 read buffers as rings of 2 entries (window 2, 16 instances, 16 prefetches a frame, lead 4)

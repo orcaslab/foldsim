@@ -21041,7 +21041,6 @@ LogicalResult StaticFolder::buildSim() {
     Value uentry2 = reg(tableCare(b, at, plan.useEntry, useRows, eb), prefix + "_uentry2");
     Value skip2 = reg(comb::AndOp::create(b, table(b, at, plan.useCross, 1), notOf(rb.seen)),
                       prefix + "_skip2");
-    Value skip1 = reg(skip2, prefix + "_skip1");
     // The prefetches, queued now: {instance, entry}.
     auto chain3 = [&](Value v, const Twine &n) {
       return reg(reg(reg(v, n + "2"), n + "1"), n + "0");
@@ -21074,13 +21073,22 @@ LogicalResult StaticFolder::buildSim() {
                                constant(kb, ringIndex.at({c, k}))));
     Value irspData = b.createOrFold<comb::ExtractOp>(
         b.getIntegerType(vm.dataWidth), body->getArgument(image.firstInput + 2), 0);
+    // (Read combinationally and registered here: the register's synchronous
+    // reset is the skip, so a use whose prefetch would have come before the
+    // first frame reads zero with no select on the data (the flop's reset
+    // pin); the same data, a host cycle after the address, old data under a
+    // write, as a registered read.)
     auto ring = seq::FirMemOp::create(
         b, seq::FirMemType::get(context, plan.entries, vm.dataWidth, 1),
-        /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old, seq::WUW::Undefined,
+        /*readLatency=*/0, /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
         b.getStringAttr(prefix), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
         StringAttr{}, Attribute{});
     seq::FirMemWriteOp::create(b, ring, irspEntry, hostClock, irspValid, irspData, Value{});
-    Value data = seq::FirMemReadOp::create(b, ring, uentry2, hostClock, constant(1, 1));
+    Value read = seq::FirMemReadOp::create(b, ring, uentry2, hostClock, constant(1, 1));
+    Value data = seq::FirRegOp::create(
+        b, read, hostClock, b.getStringAttr(prefix + "_data"), skip2,
+        hw::ConstantOp::create(b, read.getType(), 0), hw::InnerSymAttr{},
+        /*isAsync=*/false, b.getIntegerAttr(read.getType(), 0));
     // Landed entries: set by an answer, cleared by a prefetch's queueing (a
     // use group of the entry's later than the previous one's uses) and by its
     // group's last use, now.
@@ -21102,7 +21110,7 @@ LogicalResult StaticFolder::buildSim() {
                        : b.createOrFold<comb::ExtractOp>(b.getIntegerType(iw), minst, 0),
                    prefix + "_winst");
     rb.wdata = reg(body->getArgument(main.firstInput + 2), prefix + "_wdata");
-    return comb::MuxOp::create(b, skip1, constant(vm.dataWidth, 0), data);
+    return data;
   };
 
   // The copies, their inputs backedges until the links are built.

@@ -76,10 +76,14 @@
 # the queue of prefetches waiting for their instances' reads ({instance, entry})
 # and the queue of the answers' image writes ({instance, data}).
 # MLIR-NOT: ram_rdata = seq.firmem
-# MLIR: %ram_ring = seq.firmem 1, 1, old, undefined : <4 x 8, mask 1>
+# MLIR: %ram_ring = seq.firmem 0, 1, undefined, undefined : <4 x 8, mask 1>
 # MLIR: seq.firmem.write_port %ram_ring[{{.*}}] = %vm1_rsp_data, clock %hostClock enable %vm1_rsp_valid
 # MLIR: %ram_ring_flight_queue = seq.firmem 0, 1, undefined, undefined : <64 x 6, mask 1>
 # MLIR: %ram_ring_flight_writes = seq.firmem 0, 1, undefined, undefined : <32 x 12, mask 1>
+# The entry read combinationally into a register whose synchronous reset is the skip (a use whose prefetch would
+# have come before the first frame reads zero): no select on the data.
+# MLIR: %ram_ring_data = seq.firreg %{{.*}} clock %hostClock reset sync %ram_ring_skip2, %c0_i8
+# MLIR-NOT: ram_ring_skip1
 # A prefetch's entry, its rank in the frame's prefetches mod R, is counted from the frame's first position (no table).
 # MLIR: %ram_ring_prank = seq.firreg
 # FAST: {{^}}MATCH 196 cycles in 4400 host cycles, H 22.00
