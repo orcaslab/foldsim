@@ -1,0 +1,29 @@
+# REQUIRES: verilator
+# The kernel's virtual-memory controller (shell/rtl/foldsim_vmem.sv) alone,
+# against Inputs/tb_vmem_ctl.sv: a memory that applies a write at its B and
+# reads rows at AR, so a read that reached AR before the B of an earlier write
+# of its row answers the old row; answers checked against a reference RAM.
+# Without forwarding (FORWARD 0) a read's newest write comes from the hazard
+# table, the slot taken in its lookup's cycle and Y's (no write-buffer match);
+# without a host cache a write's row goes into its buffer slot at intake (no
+# known-zero bits) or at X (known-zero rows made whole there), not through the
+# Y and Z stages. HBM latency 1 to 600 host cycles, channels stalled at random;
+# rows of three beats, of a beat with byte enables, of 32 bits sharing lines;
+# with a host cache; with forwarding.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -Mdir %t/wide %S/Inputs/tb_vmem_ctl.sv %S/../../shell/rtl/foldsim_vmem.sv > %t/wide.log 2>&1
+# RUN: %t/wide/Vtb +verilator+seed+1 +hi=1 | FileCheck %s
+# RUN: %t/wide/Vtb +verilator+seed+2 +hi=600 +stall=30 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GKNOWN_ZERO=1 -GMW=130 -Mdir %t/kz %S/Inputs/tb_vmem_ctl.sv %S/../../shell/rtl/foldsim_vmem.sv > %t/kz.log 2>&1
+# RUN: %t/kz/Vtb +verilator+seed+3 +hi=60 +stall=20 | FileCheck %s
+# RUN: %t/kz/Vtb +verilator+seed+4 +hi=600 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=32 -GMW=4 -Mdir %t/narrow %S/Inputs/tb_vmem_ctl.sv %S/../../shell/rtl/foldsim_vmem.sv > %t/narrow.log 2>&1
+# RUN: %t/narrow/Vtb +verilator+seed+5 +hi=300 +stall=40 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GCACHE_ROWS=32 -GDW=512 -GMW=64 -GKNOWN_ZERO=1 -Mdir %t/cache %S/Inputs/tb_vmem_ctl.sv %S/../../shell/rtl/foldsim_vmem.sv > %t/cache.log 2>&1
+# RUN: %t/cache/Vtb +verilator+seed+6 +hi=600 +stall=20 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GFORWARD=1 -GRDW_READ_FIRST=0 -Mdir %t/fwd %S/Inputs/tb_vmem_ctl.sv %S/../../shell/rtl/foldsim_vmem.sv > %t/fwd.log 2>&1
+# RUN: %t/fwd/Vtb +verilator+seed+7 +hi=200 +stall=20 | FileCheck %s
+# CHECK-NOT: FAIL
+# CHECK-NOT: %Error
+# CHECK: {{[0-9]+}} reads ({{[0-9]+}} answered), {{[0-9]+}} writes
+# CHECK-NEXT: PASS
