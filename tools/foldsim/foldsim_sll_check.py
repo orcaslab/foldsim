@@ -237,11 +237,59 @@ def netlist_resources(sim, copies, region, synthesis=None):
     scale(rest)
     # The kernel beside the simulator (its memory endpoints, virtual memory
     # controllers, host interface): not in the netlist, placed with it.
-    k = region.get('kernel', {})
-    rest['lut'] += k.get('lut', 0.0)
-    rest['ff'] += k.get('ff', 0.0)
+    kr = kernel_resources(os.path.dirname(os.path.abspath(sim)), region)
+    for r in ('lut', 'lutram', 'ff', 'bram'):
+        rest[r] += kr[r] * (pl.get(r, 1.0) if r in ('lut', 'lutram', 'ff') else 1.0)
+    KERNEL['last'] = kr
     out['__top__'] = rest
     return out
+
+
+KERNEL = {}
+
+
+def ctl_scaled(path, k):
+    """The netlist's controllers (foldsim_degree.read_built: foldsim_storage.ctl_cost) at the kernel fit's
+    synthesized scales: `ctl_lut_scale` by kind (vmem of one memory, vmem_group of several, engine) for logic
+    and LUTRAM, `ctl_bram_scale` for RAMB36."""
+    j = json.load(open(path))
+    sizes = [g.get('size') or len(g.get('members', [])) or 1 for g in j['vmem_groups']] if j.get('vmem_groups') \
+        else [1] * len(j.get('vmem', []))
+    sc = k['ctl_lut_scale']
+    out = []
+    for c, n in zip(foldsim_degree.read_built(path)['controllers'], sizes):
+        key = 'engine' if c['kind'] == 'engine' else ('vmem_group' if n > 1 else 'vmem')
+        f = sc.get(key, sc.get('vmem', 1.0)) if isinstance(sc, dict) else sc
+        out.append(dict(c, logic=c['logic'] * f, lutram=c['lutram'] * f, bram=c['bram'] * k.get('ctl_bram_scale', 1.0)))
+    return out
+
+
+def kernel_resources(gdir, region):
+    """The kernel beside a netlist's simulator, synthesized: {lut, lutram, ff, bram, parts}. With the region's
+    `kernel` fit (11-11, a32-G0: `ctl_lut_scale` present): a fixed residue (host control, `base_lut`), the memory
+    endpoints (one folded endpoint, `mem_fold_lut`, where the netlist folds its memory port bundles, else
+    `mem_port_lut` a m_axi_mem_<k> port) and the netlist's own virtual-memory controllers
+    (foldsim_degree.read_built -> foldsim_storage.ctl_cost, LUT x `ctl_lut_scale`, RAMB36 x `ctl_bram_scale`). Without
+    it, the region's flat `lut` / `ff` (the 11-07 term, which held the calibration builds' own controllers)."""
+    k = region.get('kernel', {})
+    if 'ctl_lut_scale' not in k:
+        return dict(lut=k.get('lut', 0.0), lutram=0.0, ff=k.get('ff', 0.0), bram=0.0, parts={'flat': k.get('lut', 0.0)})
+    path = os.path.join(gdir, 'foldsim_sim.json')
+    j = json.load(open(path)) if os.path.exists(path) else {}
+    if j.get('port_bundles'):
+        mem = k['mem_fold_lut']
+        mem_what = 'folded memory endpoint'
+    else:
+        ports = {m.group(1) for m in (re.match(r'(m_axi_mem_\d+)_', p.get('name', '')) for p in j.get('ports', [])) if m}
+        mem = k['mem_port_lut'] * len(ports)
+        mem_what = f'{len(ports)} memory port endpoints'
+    ctl = ctl_scaled(path, k) if j else []
+    cl = sum(c['logic'] for c in ctl)
+    cr = sum(c['lutram'] for c in ctl)
+    cb = sum(c['bram'] for c in ctl)
+    return dict(lut=k['base_lut'] + mem + cl + cr, lutram=cr, ff=k.get('ff', 0.0), bram=cb,
+                parts={'base': k['base_lut'], mem_what: mem, f'{len(ctl)} controllers': cl + cr,
+                       'controller RAMB36': cb})
 
 
 PARSED = {}
@@ -728,17 +776,19 @@ def main():
     report = os.path.join(out, 'sll.txt')
 
     def finish(lines, verdict):
-        # The kernel's controllers beside the simulator, priced (foldsim_storage.ctl_cost, as read_built
-        # counts them): not in the verdict's region sums (the region's `kernel` holds a fixed share), a line
-        # for the caller's own total (r16c measured about 2.2x the model).
+        # The kernel beside the simulator, as the region sums take it (kernel_resources); and its controllers
+        # priced by the bare model (foldsim_storage.ctl_cost).
         try:
             built = foldsim_degree.read_built(os.path.join(gdir, 'foldsim_sim.json'))
             ctl = built.get('controllers', [])
             if ctl:
                 lut = sum(x['logic'] + x['lutram'] for x in ctl)
                 lines.append(f'  kernel controllers: {len(ctl)}, {sum(x.get("dw", 0) for x in ctl):,} data bits, '
-                             f'{lut:,.0f} LUT [model] ({2.2 * lut:,.0f} at r16c\'s measured 2.2x), '
-                             f'{sum(x["bram"] for x in ctl):,.1f} RAMB36')
+                             f'{lut:,.0f} LUT [ctl_cost], {sum(x["bram"] for x in ctl):,.1f} RAMB36')
+            kr = KERNEL.get('last')
+            if kr:
+                lines.append('  kernel (in the region sums): ' + ', '.join(
+                    f'{n} {v:,.0f}' for n, v in kr['parts'].items()) + f'; LUT {kr["lut"]:,.0f}, RAMB36 {kr["bram"]:,.1f}')
         except Exception:
             pass
         lines.append(f'{name}: {verdict}')
@@ -1039,6 +1089,16 @@ def main():
                 if a.vmem_engines != 'flat' and 'noc' in region:
                     vm, vmem_rows = vmem_slls(vmem_controllers(gdir, stext), shares, top_spread, names,
                                               region['noc'], a.vmem_engines)
+                    # Where the controllers sit (their LUTs and RAMB36 by the kernel fit, if any): per die.
+                    kk = region.get('kernel', {})
+                    if 'ctl_lut_scale' in kk:
+                        built = ctl_scaled(os.path.join(gdir, 'foldsim_sim.json'), kk)
+                        die = defaultdict(lambda: [0.0, 0.0])
+                        for row, c in zip(vmem_rows, built):
+                            die[row['slr']][0] += c['logic'] + c['lutram']
+                            die[row['slr']][1] += c['bram']
+                        lines.append('  kernel controllers as placed: ' + ', '.join(
+                            f'{n} LUT {v[0]:,.0f} RAMB36 {v[1]:,.1f}' for n, v in sorted(die.items())))
                     by_slr = defaultdict(lambda: [0, 0])
                     for r in vmem_rows:
                         by_slr[r['slr']][0] += 1

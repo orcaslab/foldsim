@@ -1,0 +1,10 @@
+# The kernel beside the simulator in the SLR check's region sums (foldsim_sll_check.kernel_resources, 11-11): a
+# fixed residue (host control 4,200) + the memory endpoints (a folded endpoint 94,600 where the netlist folds its
+# memory port bundles, else 30,600 a m_axi_mem port) + the netlist's own controllers at foldsim_storage.ctl_cost
+# times the synthesized scale of their kind (vmem 1.21, a vmem group 2.05, a page engine 1.44; RAMB36 1.08), fit on
+# the 5 calibration builds (foldsim_v80_slr.json kernel.about). A region without the fit keeps the flat 11-07 term.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: python3 %S/Inputs/kernel-term/kernel.py %foldsim_tools %t | FileCheck %s
+# CHECK: fold {'base': 4200, 'folded memory endpoint': 94600, '3 controllers': 10014, 'controller RAMB36': 0} 108814 0.0
+# CHECK-NEXT: ports {'base': 4200, '4 memory port endpoints': 122400, '0 controllers': 0, 'controller RAMB36': 0} 126600 0
+# CHECK-NEXT: flat 155000 65000

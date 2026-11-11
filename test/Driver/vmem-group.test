@@ -153,7 +153,8 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/autow --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --vmem-group auto:5 --vmem-weights %t/w.json --vmem-row-bytes-min 64 --copies Leaf:2 Leaf 2> %t/autow.log > /dev/null
 # RUN: FileCheck %s --check-prefix=AUTOW < %t/autow.log
 # AUTOW: foldsim: vmem controllers: g0 vm0, g1 vm3, g2 vm1, g3 vm2, g4 vm4+vm5+vm6+vm7
-# The SLR check prices the kernel's controllers beside its verdict (the model,
-# and at r16c's measured factor).
+# The SLR check prices the kernel's controllers (the bare ctl_cost) and the kernel
+# its region sums take (residue, memory endpoints, controllers at their kind's scale).
 # RUN: FileCheck %s --check-prefix=CTL < %t/auto/sll/sll.txt
-# CTL: kernel controllers: {{[0-9]+}}, {{[0-9,]+}} data bits, {{[0-9,]+}} LUT [model] ({{[0-9,]+}} at r16c's measured 2.2x)
+# CTL: kernel controllers: 6, {{[0-9,]+}} data bits, {{[0-9,]+}} LUT [ctl_cost]
+# CTL: kernel (in the region sums): base 4,200, 0 memory port endpoints 0, 6 controllers {{[0-9,]+}}
