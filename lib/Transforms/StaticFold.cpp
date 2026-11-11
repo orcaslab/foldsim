@@ -21277,7 +21277,12 @@ LogicalResult StaticFolder::buildSim() {
         b, reqPtr, b.createOrFold<comb::ConcatOp>(constant(ib - 1, 0), reqStep)));
     // Pending slots: set by a request, cleared by its response (beats: a
     // bit a slot's beat, the slot pending while any is).
-    unsigned pbits = slots * kb, pb = ib + bb;
+    // (A slot's beats at a stride of 2^bb bits, as {slot, beat} indexes
+    // them: with beats not a power of two, slot * beats would put a slot's
+    // last beats in the next slot's bits, so a slot read as landed while
+    // beats of it were still pending. The bits past `beats` stay zero.)
+    unsigned stride = kb > 1 ? 1u << bb : 1;
+    unsigned pbits = slots * stride, pb = ib + bb;
     auto pendNext = backedges.get(b.getIntegerType(pbits));
     Value pendAll = resetReg(pendNext, prefix + "_pending", 0);
     auto bitAt = [&](Value on, Value at) -> Value {
@@ -21295,8 +21300,8 @@ LogicalResult StaticFolder::buildSim() {
       for (unsigned sl = slots; sl-- > 0;)
         slotBits.push_back(comb::ICmpOp::create(
             b, comb::ICmpPredicate::ne,
-            b.createOrFold<comb::ExtractOp>(b.getIntegerType(kb), pendAll, sl * kb),
-            constant(kb, 0)));
+            b.createOrFold<comb::ExtractOp>(b.getIntegerType(stride), pendAll, sl * stride),
+            constant(stride, 0)));
       sb.pending = b.createOrFold<comb::ConcatOp>(slotBits);
     } else {
       sb.pending = pendAll;
