@@ -24903,11 +24903,18 @@ LogicalResult StaticFolder::buildSim() {
             // data. The queue takes the other rows, its pointers mod
             // `flight` - 1: it never holds more answers than reads in flight,
             // which the room term keeps under `flight`.)
+            // (The instances apart, read at the head whatever the grant: the
+            // reads-in-flight compares do not wait on the grant.)
             unsigned dw = vm.dataWidth, wb = llvm::Log2_32_Ceil(rb.flight);
             auto wq = seq::FirMemOp::create(
-                b, seq::FirMemType::get(context, rb.flight, iw + dw, 1), /*readLatency=*/0,
+                b, seq::FirMemType::get(context, rb.flight, dw, 1), /*readLatency=*/0,
                 /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
                 b.getStringAttr(fp + "_writes"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
+                StringAttr{}, Attribute{});
+            auto wqi = seq::FirMemOp::create(
+                b, seq::FirMemType::get(context, rb.flight, iw, 1), /*readLatency=*/0,
+                /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
+                b.getStringAttr(fp + "_writes_inst"), hw::InnerSymAttr{}, seq::FirMemInitAttr{},
                 StringAttr{}, Attribute{});
             Value zeroRow = constant(wb, rb.flight - 1);
             auto row = [&](Value ptr) { return ptr; };
@@ -24918,19 +24925,19 @@ LogicalResult StaticFolder::buildSim() {
             Value wtail = resetReg(wtailNext, fp + "_wtail", 0);
             Value wcount = resetReg(wcountNext, fp + "_wcount", 0);
             seq::FirMemWriteOp::create(b, wq, comb::MuxOp::create(b, rb.wv, row(wtail), zeroRow),
-                                       hostClock, constant(1, 1),
-                                       b.createOrFold<comb::ConcatOp>(rb.winst, rb.wdata), Value{});
+                                       hostClock, constant(1, 1), rb.wdata, Value{});
+            seq::FirMemWriteOp::create(b, wqi, row(wtail), hostClock, rb.wv, rb.winst, Value{});
             auto wgrantNext = backedges.get(i1);
             Value wgrant = wgrantNext;
             Value wtop = seq::FirMemReadOp::create(
                 b, wq, comb::MuxOp::create(b, wgrant, row(whead), zeroRow), hostClock, constant(1, 1));
+            Value wtopInst = seq::FirMemReadOp::create(b, wqi, row(whead), hostClock, constant(1, 1));
             Value wany = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, wcount, constant(wb + 1, 0));
             Value wcand = comb::AndOp::create(b, wany, enough);
             Value wgo = comb::AndOp::create(b, wcand, wgrant);
             share.writeCands.push_back(wcand);
             share.writeGrants.push_back(wgrantNext);
             share.writes.push_back(wgo);
-            Value wtopInst = b.createOrFold<comb::ExtractOp>(b.getIntegerType(iw), wtop, dw);
             if (grp) {
               grp->wiss[gm].setValue(wgo);
               grp->wissInst[gm].setValue(wtopInst);
@@ -24940,7 +24947,7 @@ LogicalResult StaticFolder::buildSim() {
             }
             rb.wissValid = wgo;
             rb.wissInst = wtopInst;
-            rb.wissData = b.createOrFold<comb::ExtractOp>(b.getIntegerType(dw), wtop, 0);
+            rb.wissData = wtop;
             // (Shared: room for two while the image's write grant is held,
             // whether or not its ring writes.)
             // (Class control: a ring reads the group's head once.)
