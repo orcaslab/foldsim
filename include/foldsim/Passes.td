@@ -702,6 +702,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "beat by beat (no pass spaced: only where the landings and the "
            "producer's passes leave the positions, else whole rows). A "
            "controller costs its width (0: whole rows)">,
+    Option<"linkHbmBeatRows", "link-hbm-beat-rows", "bool", "false",
+           "With link-hbm-beat-bits: a stream of beats lands in rows of a "
+           "beat ({slot, beat}: its landing memory as deep as slots x beats "
+           "and a beat wide, not a row wide), read beat by beat into the "
+           "members' registers from beats - 1 positions before the landing's "
+           "own position">,
     Option<"linkHbmRowBits", "link-hbm-row-bits", "unsigned", "512",
            "HBM link streams: the most bits of a stream's row (its "
            "controller's data width, 8 to 4096): a wider word is cut into "
