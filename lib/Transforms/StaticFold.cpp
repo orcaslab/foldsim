@@ -24994,7 +24994,19 @@ LogicalResult StaticFolder::buildSim() {
           Value entry = atNext(plan.useEntry, eb);
           Value seen = comb::OrOp::create(b, rb.seen, eq(posD, ii - 1));
           Value skip = comb::AndOp::create(b, atNext(plan.useCross, 1), notOf(seen));
-          Value landed = bitAt(rb.landed, plan.entries, entry, eb);
+          // (Class control: one term a group, its rings' landed bits ANDed
+          // first, at its first ring.)
+          Value landedBits = rb.landed;
+          if (grp) {
+            if (gm != 0)
+              continue;
+            SmallVector<Value> all;
+            for (auto &[key, gi] : ringGroupOf)
+              if (gi.first == grp)
+                all.push_back(ringBuilt.at(key).landed);
+            landedBits = all.size() == 1 ? all.front() : Value(comb::AndOp::create(b, all, false));
+          }
+          Value landed = bitAt(landedBits, plan.entries, entry, eb);
           terms.push_back(comb::OrOp::create(b, ValueRange{notOf(uv), skip, landed}, false));
           continue;
         }
