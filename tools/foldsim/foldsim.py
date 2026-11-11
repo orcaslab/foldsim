@@ -380,6 +380,8 @@ def frame_options(a):
         fold += f' slot-segments={a.slot_segments}'
     if getattr(a, 'slot_column_affine', False):
         fold += ' slot-column-affine'
+    if getattr(a, 'slot_table_compose', False):
+        fold += ' slot-table-compose'
     if getattr(a, 'modulo_linear', None) is not None:
         fold += f' modulo-linear={a.modulo_linear}'
     if getattr(a, 'ready_choice', ''):
@@ -1537,6 +1539,10 @@ def build_parser():
     ap.add_argument('--affine-slots', action='store_true',
                     help='with --static --modulo: each copy\'s passes of a kind placed as one affine run over its '
                          'instances (foldsim-fold-static affine-slots): slot tables of a segment a pass')
+    ap.add_argument('--slot-table-compose', action='store_true',
+                    help='with --slot-segments: a table read at a position table\'s value that does not decode is '
+                         'read through the inner table\'s position (composed rows) (foldsim-fold-static '
+                         'slot-table-compose)')
     ap.add_argument('--slot-column-affine', action='store_true',
                     help='with --slot-segments: instance tables the segments do not decode cut into column-affine '
                          'pieces (a period\'s rows plus a few slopes times the quotient, by a constant division) '

@@ -11385,6 +11385,9 @@ static bool gTableRaw = false;
 /// while one is built (its residual rows are not cut again).
 static bool gSlotColumnAffine = false;
 static bool gColumnAffine = false;
+/// `slot-table-compose`: a table of a position table's value read through
+/// the inner table's position (composed rows), the position's decoders.
+static bool gSlotTableCompose = false;
 
 /// The regions sharing a copy of the slot controls two host cycles ahead.
 static constexpr unsigned kRegionsPerGroup = 16;
@@ -18350,10 +18353,41 @@ LogicalResult StaticFolder::checkMulticycle(Class &cls) {
 //===----------------------------------------------------------------------===//
 
 /// A table indexed by `index`, of constants of `width` bits.
+/// slot-table-compose: the position tables built (their index, rows and
+/// rows read), by result, for a table of a table's value: read through the
+/// inner table's position instead (composed rows), which the position's
+/// decoders take.
+struct TableSource {
+  Value index;
+  SmallVector<uint32_t> rows;
+  SmallVector<uint8_t> care;
+};
+static DenseMap<Value, TableSource> gTableSource;
+
+static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+                       unsigned width, unsigned site, ArrayRef<uint8_t> care);
+
 static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                    unsigned width, unsigned site) {
   ArrayRef<uint8_t> care = gCare;
   gCare = {};
+  Value v = tableBody(b, index, rows, width, site, care);
+  // (Instance-like values of a position: kept for a table of them.)
+  if (gSlotTableCompose && v && width >= 4 && width <= 32 && rows.size() <= (1u << 17) &&
+      !gTableSource.count(v)) {
+    auto *pc = foldsim::currentPosCounters();
+    if (pc && pc->knows(index)) {
+      auto &src = gTableSource[v];
+      src.index = index;
+      src.rows.assign(rows.begin(), rows.end());
+      src.care.assign(care.begin(), care.end());
+    }
+  }
+  return v;
+}
+
+static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+                       unsigned width, unsigned site, ArrayRef<uint8_t> care) {
   auto type = b.getIntegerType(std::max(width, 1u));
   bool uniform = llvm::all_of(rows, [&](uint64_t v) { return v == rows[0]; });
   if (rows.empty() || uniform)
@@ -18789,6 +18823,24 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
     if (foldsim::findColumnAffine(rows, width, 64, 6, 3, ca))
       if (Value v = buildColumnAffine(b, index, ca, width))
         return v;
+  }
+  // A table of a position table's value: the composed rows at the inner
+  // table's position (read where the inner value is read).
+  if (gSlotTableCompose && !gTableRaw && !counted) {
+    auto it = gTableSource.find(index);
+    if (it != gTableSource.end()) {
+      auto src = it->second;   // (a copy: the map may grow below)
+      SmallVector<uint64_t> composed(src.rows.size(), 0);
+      for (auto [p, x] : llvm::enumerate(src.rows))
+        composed[p] = x < rows.size() ? rows[x] : 0;
+      gCare = src.care;
+      Value v = table(b, src.index, composed, width);
+      if (getenv("FOLDSIM_AFFINE_LOG"))
+        llvm::errs() << "slot-sequencer: a table of " << rows.size() << " x " << width
+                     << " bits read through its index's table of " << src.rows.size()
+                     << " positions\n";
+      return v;
+    }
   }
   // A one-bit table whose zero rows are the fewer segments (a set of nearly
   // every position: a copy's passes but a few holes): its complement
@@ -25164,12 +25216,18 @@ void FoldStaticPass::runOnOperation() {
   gMaxTableBits = std::max<uint64_t>(1, maxTableBits);
   gSlotSegments = slotSegments;
   gSlotColumnAffine = slotColumnAffine;
+  gSlotTableCompose = slotTableCompose;
+  // (FOLDSIM_SLOT_COLUMN_AFFINE, a test hook: the whole suite with both.)
+  if (getenv("FOLDSIM_SLOT_COLUMN_AFFINE"))
+    gSlotColumnAffine = gSlotTableCompose = true;
+  gTableSource.clear();
   // FOLDSIM_SLOT_SEGMENTS: the default for runs that leave it 0 (a test
   // hook: the whole suite with decoders).
   if (!gSlotSegments)
     if (const char *env = getenv("FOLDSIM_SLOT_SEGMENTS"))
       gSlotSegments = unsigned(atoi(env));
   foldsim::slotSequencerStats().reset();
+  llvm::scope_exit dropSources([] { gTableSource.clear(); });
   if (failed(folder.run()))
     return signalPassFailure();
   if (gSlotSegments) {

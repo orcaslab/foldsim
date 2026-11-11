@@ -928,6 +928,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "division), a[r] + s[r] * q for a few slopes s (an instance table "
            "of a class nested a fixed count of children a parent: a switch "
            "network's ports), as large at any count of parents">,
+    Option<"slotTableCompose", "slot-table-compose", "bool", "false",
+           "With slot-segments: a table read at the value of a position table "
+           "(an instance decoded from the position) that does not decode is "
+           "read through the inner table's position instead (its rows "
+           "composed), where the position's decoders and counters take it">,
     Option<"slotSegments", "slot-segments", "unsigned", "0",
            "Slot tables (constants read by the frame's position or an "
            "instance) of at most this many affine segments of nonzero rows "
