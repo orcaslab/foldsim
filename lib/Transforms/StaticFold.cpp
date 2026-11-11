@@ -11391,6 +11391,12 @@ static bool gColumnAffine = false;
 /// `slot-table-compose`: a table of a position table's value read through
 /// the inner table's position (composed rows), the position's decoders.
 static bool gSlotTableCompose = false;
+/// tableThenReg: the table's value is registered right after (a plain
+/// register of the host clock); a column-affine decoder of an instance
+/// register may then take that register into its own (the index's quotient
+/// and remainder registered after a division of the index itself, the
+/// decoder after them) and says so in gRegAfterTaken.
+static bool gRegAfter = false, gRegAfterActive = false, gRegAfterTaken = false;
 
 /// The regions sharing a copy of the slot controls two host cycles ahead.
 static constexpr unsigned kRegionsPerGroup = 16;
@@ -18393,7 +18399,12 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
                    unsigned width, unsigned site) {
   ArrayRef<uint8_t> care = gCare;
   gCare = {};
+  bool regAfter = gRegAfter;
+  gRegAfter = false;
+  bool outer = gRegAfterActive;
+  gRegAfterActive = regAfter;
   Value v = tableBody(b, index, rows, width, site, care);
+  gRegAfterActive = outer;
   // (Instance-like values of a position: kept for a table of them.)
   if ((gSlotTableCompose || gSlotColumnAffine) && v && width >= 4 && width <= 32 &&
       rows.size() <= (1u << 17) &&
@@ -18407,6 +18418,20 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     }
   }
   return v;
+}
+
+/// `reg1(table(index, rows))`, the table's decoder free to take that
+/// register into its own pipeline (gRegAfter).
+static Value tableThenReg(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+                          unsigned width, function_ref<Value(Value)> reg1,
+                          unsigned site = __builtin_LINE()) {
+  gRegAfter = true;
+  gRegAfterTaken = false;
+  Value v = table(b, index, rows, width, site);
+  gRegAfter = false;
+  bool taken = gRegAfterTaken;
+  gRegAfterTaken = false;
+  return taken ? v : reg1(v);
 }
 
 static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
@@ -18710,6 +18735,15 @@ static Value buildColumnAffine(ImplicitLocOpBuilder &b, Value index,
   auto reg = index.getDefiningOp<seq::FirRegOp>();
   if (!counted && (!reg || reg.getReset() || reg.getPreset()))
     return {};
+  // The caller registers the value right after (tableThenReg): an instance
+  // register's quotient and remainder by a division of the register itself,
+  // registered, and the range compares and the residual registered too;
+  // the decoder after them gives that register's value.
+  bool late = !counted && gRegAfterActive;
+  gRegAfterActive = false;
+  auto lateReg = [&](Value v, const Twine &n) -> Value {
+    return late ? Value(seq::FirRegOp::create(b, v, reg.getClk(), b.getStringAttr(n))) : v;
+  };
   // The quotient and remainder of the index by d (cached per d).
   std::map<uint64_t, std::pair<Value, Value>> qrOf;
   auto qrBy = [&](uint64_t d) -> std::pair<Value, Value> {
@@ -18719,6 +18753,10 @@ static Value buildColumnAffine(ImplicitLocOpBuilder &b, Value index,
     std::pair<Value, Value> qr;
     if (counted) {
       qr = pc->divmod(b, index, unsigned(d));
+    } else if (late) {
+      auto [qn, rn] = constDivmod(b, index, d, (uint64_t(1) << iw) - 1);
+      if (qn)
+        qr = {lateReg(qn, "cadivq" + Twine(d)), lateReg(rn, "cadivr" + Twine(d))};
     } else {
       // The register's next value a position table (an instance decoded
       // from the position): its quotient and remainder as position tables
@@ -18738,14 +18776,19 @@ static Value buildColumnAffine(ImplicitLocOpBuilder &b, Value index,
           qrows[p] = x / d;
           rrows[p] = x % d;
         }
-        uint64_t kept = foldsim::slotSequencerStats().fallback;
-        gCare = in.care;
-        Value tq = table(b, in.index, qrows, qw);
-        gCare = in.care;
-        Value tr = table(b, in.index, rrows, rw);
-        if (foldsim::slotSequencerStats().fallback == kept) {
-          qn = tq;
-          rn = tr;
+        // (Built only where the position's segments take both: a table
+        // built and dropped would still be counted.)
+        auto decodes = [&](ArrayRef<uint64_t> r, unsigned w) {
+          foldsim::Separable sp;
+          return foldsim::slotSegments(r, w, gSlotSegments, true, false, in.care).size() <=
+                     gSlotSegments ||
+                 (w >= 2 && foldsim::findSeparable(r, w, true, 1024, sp));
+        };
+        if (decodes(qrows, qw) && decodes(rrows, rw)) {
+          gCare = in.care;
+          qn = table(b, in.index, qrows, qw);
+          gCare = in.care;
+          rn = table(b, in.index, rrows, rw);
         } else if (getenv("FOLDSIM_AFFINE_LOG")) {
           llvm::errs() << "slot-sequencer: column-affine: the index's quotient by " << d
                        << " does not decode at the position\n";
@@ -18797,19 +18840,24 @@ static Value buildColumnAffine(ImplicitLocOpBuilder &b, Value index,
       in.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::ult, index, cst(itype, pc_.end)));
     if (!in.empty()) {
       Value hit = in.size() == 1 ? in[0] : Value(comb::AndOp::create(b, in, false));
-      v = comb::MuxOp::create(b, hit, v, cst(type, 0));
+      v = comb::MuxOp::create(b, lateReg(hit, "cahit"), v, cst(type, 0));
     }
     parts.push_back(v);
   }
   if (llvm::any_of(ca.residual, [](uint64_t x) { return x != 0; }))
-    parts.push_back(table(b, index, ca.residual, width));
+    parts.push_back(lateReg(table(b, index, ca.residual, width), "caresidual"));
+  if (late)
+    gRegAfterTaken = true;
   auto &st = foldsim::slotSequencerStats();
   ++st.decoded;
   st.decodedBits += (uint64_t(1) << iw) * width;
   st.segments += ca.pieces.size();
   if (getenv("FOLDSIM_AFFINE_LOG")) {
     llvm::errs() << "slot-sequencer: column-affine table of " << ca.residual.size() << " x "
-                 << width << " bits" << (counted ? " (position counters)" : " (registered division)")
+                 << width << " bits"
+                 << (counted ? " (position counters)"
+                     : late  ? " (division, then the caller's register)"
+                             : " (registered division)")
                  << ":";
     for (auto &pc_ : ca.pieces)
       llvm::errs() << " [" << pc_.start << ", " << pc_.end << ") period " << pc_.period;
@@ -21683,8 +21731,8 @@ LogicalResult StaticFolder::buildSim() {
           b, wparity, reg(reg(pctl.tail2, prefix + "_tail1"), prefix + "_tail0"));
     SmallVector<Value> at{notOf(wparity)};
     if (pIdx && st.mailbox)
-      at.push_back(reg(reg(table(b, pctl.inst2, st.mbWriteRow, pIdx),
-                           prefix + "_wrow1"),
+      at.push_back(reg(tableThenReg(b, pctl.inst2, st.mbWriteRow, pIdx,
+                                    [&](Value v) { return reg(v, prefix + "_wrow1"); }),
                        prefix + "_wrow0"));
     else if (pIdx)
       at.push_back(reg(reg(pctl.inst2, prefix + "_winst1"), prefix + "_winst0"));
@@ -21717,11 +21765,13 @@ LogicalResult StaticFolder::buildSim() {
         Value &bit = domainBit[d];
         if (!bit)
           bit = d < 0 ? constant(1, 0)
-                      : reg(reg(table(b, pctl.inst2,
-                                      SmallVector<uint64_t>(st.mbDomains[d].begin(),
-                                                            st.mbDomains[d].end()),
-                                      1),
-                                prefix + "_wdom" + Twine(d) + "_1"),
+                      : reg(tableThenReg(b, pctl.inst2,
+                                         SmallVector<uint64_t>(st.mbDomains[d].begin(),
+                                                               st.mbDomains[d].end()),
+                                         1,
+                                         [&](Value v) {
+                                           return reg(v, prefix + "_wdom" + Twine(d) + "_1");
+                                         }),
                             prefix + "_wdom" + Twine(d) + "_0");
         maskBytes.push_back(bit);
       }
@@ -21793,7 +21843,8 @@ LogicalResult StaticFolder::buildSim() {
       SmallVector<uint64_t> writer(pthreads, 0);
       for (unsigned j = 0; j < pthreads; ++j)
         writer[j] = st.writes(j);
-      Value any = reg(reg(table(b, pctl.inst2, writer, 1), prefix + "_wany1"),
+      Value any = reg(tableThenReg(b, pctl.inst2, writer, 1,
+                                   [&](Value v) { return reg(v, prefix + "_wany1"); }),
                       prefix + "_wany0");
       Value heldAny = seq::CompRegClockEnabledOp::create(
           b, any, hostClock, we0, b.getStringAttr(prefix + "_any"), Value(),
@@ -21913,9 +21964,11 @@ LogicalResult StaticFolder::buildSim() {
       }
       write = comb::AndOp::create(
           b, write,
-          copyReg(copyReg(table(b, pctl.inst2, kept, 1), name + "_mine1"),
+          copyReg(tableThenReg(b, pctl.inst2, kept, 1,
+                               [&](Value v) { return copyReg(v, name + "_mine1"); }),
                   name + "_mine0"));
-      writeAt = copyReg(copyReg(table(b, pctl.inst2, index, aw), name + "_at1"),
+      writeAt = copyReg(tableThenReg(b, pctl.inst2, index, aw,
+                                     [&](Value v) { return copyReg(v, name + "_at1"); }),
                         name + "_at0");
     }
     auto memory = seq::FirMemOp::create(
@@ -22831,9 +22884,9 @@ LogicalResult StaticFolder::buildSim() {
         SmallVector<Value> chosen;
         for (unsigned low = 0; low < width; low += regionBits) {
           unsigned n = std::min<unsigned>(regionBits, width - low);
-          Value select = copyReg(table(b, ctl.inst2, rows, w),
-                                 consumer.name + "_select" + Twine(at) + "_" +
-                                     Twine(low));
+          Value select = tableThenReg(b, ctl.inst2, rows, w, [&](Value v) {
+            return copyReg(v, consumer.name + "_select" + Twine(at) + "_" + Twine(low));
+          });
           SmallVector<Value> elements;
           for (uint64_t s = (uint64_t(1) << w); s-- > 0;)
             elements.push_back(b.createOrFold<comb::ExtractOp>(
@@ -22863,9 +22916,10 @@ LogicalResult StaticFolder::buildSim() {
           unsigned w = llvm::Log2_32_Ceil(sources.size());
           mine = comb::ICmpOp::create(
               b, comb::ICmpPredicate::eq,
-              copyReg(table(b, ctl.inst2, rows, w),
-                      consumer.name + "_select_after" + Twine(at) + "_" +
-                          Twine(index)),
+              tableThenReg(b, ctl.inst2, rows, w, [&](Value v) {
+                return copyReg(v, consumer.name + "_select_after" + Twine(at) + "_" +
+                                      Twine(index));
+              }),
               constant(w, index));
         }
         for (auto &piece : sourceAfter[index]) {
@@ -23003,8 +23057,8 @@ LogicalResult StaticFolder::buildSim() {
           box.lanes.size());
       for (auto [k, piece] : llvm::enumerate(layout.pieces)) {
         std::string name = base + "_" + std::to_string(k);
-        auto twice = [&](Value v, const std::string &n) {
-          v = copyReg(copyReg(v, name + n + "1"), name + n + "0");
+        auto twice = [&](Value v, const std::string &n, bool once = false) {
+          v = copyReg(once ? v : copyReg(v, name + n + "1"), name + n + "0");
           for (unsigned j = 0; j < splitLate; ++j)
             v = copyReg(v, name + n + "_split" + std::to_string(j + 1));
           if (box.late)
@@ -23026,8 +23080,12 @@ LogicalResult StaticFolder::buildSim() {
             if (!domainBit.count(d)) {
               SmallVector<uint64_t> memberOf(domainMembers[d].begin(),
                                              domainMembers[d].end());
-              domainBit[d] = twice(table(b, pctl.inst2, memberOf, 1),
-                                   "_mask" + std::to_string(d));
+              {
+            std::string n = "_mask" + std::to_string(d);
+            domainBit[d] = twice(tableThenReg(b, pctl.inst2, memberOf, 1,
+                                              [&](Value v) { return copyReg(v, name + n + "1"); }),
+                                 n, /*once=*/true);
+          }
             }
           SmallVector<Value> bytes;
           for (unsigned d : llvm::reverse(piece.byteDomain))
@@ -23064,7 +23122,9 @@ LogicalResult StaticFolder::buildSim() {
           SmallVector<uint64_t> rowOf(pThreads, 0);
           for (unsigned j = 0; j < pThreads; ++j)
             rowOf[j] = rowOfProducer[j] >= 0 ? uint64_t(rowOfProducer[j]) : 0;
-          writeAddress.push_back(twice(table(b, pctl.inst2, rowOf, rowBits), "_row"));
+          writeAddress.push_back(twice(tableThenReg(b, pctl.inst2, rowOf, rowBits,
+                                                    [&](Value v) { return copyReg(v, name + "_row1"); }),
+                                       "_row", /*once=*/true));
           Value inst = box.early ? rctl.inst3 : rctl.inst2;
           if (!identity) {
             SmallVector<uint64_t> readRow(rThreads, 0);
