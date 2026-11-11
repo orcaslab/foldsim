@@ -18786,7 +18786,7 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
   if (gSlotColumnAffine && !gColumnAffine && !gTableRaw && iwidth <= 24 &&
       rows.size() >= 64) {
     foldsim::ColumnAffine ca;
-    if (foldsim::findColumnAffine(rows, width, 64, 4, 3, ca))
+    if (foldsim::findColumnAffine(rows, width, 64, 6, 3, ca))
       if (Value v = buildColumnAffine(b, index, ca, width))
         return v;
   }
@@ -20080,8 +20080,45 @@ LogicalResult StaticFolder::buildSim() {
           resRank[k] = resOf(passOrder[k]);
           strRank[k] = cls.ppStreamed[passOrder[k]];
         }
-        ctl.ppRes3 = byRank(lastSet, resRank, presRow, passValid, cls.ppResBits());
-        ctl.ppStr3 = byRank(lastSet, strRank, pstrRow, passValid, 1);
+        if (cls.ppFixed && ctl.ppInst3 && cls.ppFixedR && llvm::isPowerOf2_32(cls.ppFixedB)) {
+          // state-scratch-fixed: the resident index and stream bit are
+          // digits of the pass's instance i (of each B the first R
+          // resident): (i >> log B) * R + i % B, and i past the last whole
+          // block or i % B >= R. Arithmetic on the instance the pass reads
+          // anyway: no table of the position or of its rank (whose rows
+          // follow the instances' pass order, irregular).
+          unsigned lb = llvm::Log2_32(cls.ppFixedB), rw = cls.ppResBits();
+          unsigned full = threads / cls.ppFixedB * cls.ppFixedB;
+          Value i = ctl.ppInst3;
+          auto zext = [&](Value v, unsigned w) -> Value {
+            unsigned vw = hw::getBitWidth(v.getType());
+            if (vw == w)
+              return v;
+            if (vw > w)
+              return comb::ExtractOp::create(b, v, 0, w);
+            return comb::ConcatOp::create(b, ValueRange{constant(w - vw, 0), v});
+          };
+          Value low = lb ? Value(comb::ExtractOp::create(b, i, 0, std::min(lb, idxWidth)))
+                         : constant(1, 0);
+          Value res = zext(low, rw);
+          if (lb < idxWidth) {
+            Value q = comb::ExtractOp::create(b, i, lb, idxWidth - lb);
+            res = comb::AddOp::create(b, res, constTimes(b, zext(q, rw), cls.ppFixedR, rw));
+          }
+          ctl.ppRes3 = res;
+          Value tail = comb::ICmpOp::create(b, comb::ICmpPredicate::uge, zext(low, lb + 1),
+                                            constant(lb + 1, cls.ppFixedR));
+          // (Every instance in a whole block: no tail past the last.)
+          ctl.ppStr3 = full >= (uint64_t(1) << idxWidth)
+                           ? tail
+                           : Value(comb::OrOp::create(
+                                 b, comb::ICmpOp::create(b, comb::ICmpPredicate::uge, i,
+                                                         constant(idxWidth, full)),
+                                 tail));
+        } else {
+          ctl.ppRes3 = byRank(lastSet, resRank, presRow, passValid, cls.ppResBits());
+          ctl.ppStr3 = byRank(lastSet, strRank, pstrRow, passValid, 1);
+        }
       }
       if (cls.ppHbm) {
         // Streamed: each pass's window slot (of its instance).

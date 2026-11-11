@@ -147,7 +147,7 @@ struct ColumnAffine {
   llvm::SmallVector<uint64_t> residual;
 };
 /// The pieces, greedily the longest from the lowest row left: periods 2 to
-/// `maxPeriod`, each piece at least 4 periods long, at most `maxSlopes`
+/// `maxPeriod`, each piece at least 4 periods and 32 rows long, at most `maxSlopes`
 /// distinct nonzero slopes each of at most three signed powers of two; at
 /// most `maxPieces` pieces, covering at least half the nonzero rows (false
 /// otherwise).

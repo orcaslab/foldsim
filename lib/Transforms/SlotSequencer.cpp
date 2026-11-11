@@ -797,7 +797,8 @@ bool findColumnAffine(ArrayRef<uint64_t> rows, unsigned width, unsigned maxPerio
         break;
       }
     }
-    if (k - a < 4 * d)
+    // (At least 4 periods and 32 rows: a short run is the segments'.)
+    if (k - a < std::max<uint64_t>(4 * d, 32))
       return 0;
     pc.start = a;
     pc.end = k;
