@@ -1,0 +1,8 @@
+# foldsim_cost prices an array read or write by the elements its index can
+# address. An index with known-constant bits (a lane index {pid, 4'd6}, as a
+# commit arbiter writes one lane of a 32-lane word) reaches 2 of 32 elements:
+# the inject's other element selects and the get's other choices fold away in
+# synthesis. inject {pid, 6}: 2 x 32 x 0.5 = 32 LUTs (not 512); get {pid, 6}:
+# 32 x 1 / 3; a free index: 32 x 31 / 3; {2'b11, j}: 8 elements, 32 x 7 / 3.
+# RUN: python3 -c "import sys; sys.path.insert(0, '%foldsim_tools'); import foldsim_cost as c; m = c.parse('%S/Inputs/cost-lane-index/m.mlir')[0]['M']; print('inject', m.lut['array_inject'], 'get', round(m.lut['array_get'], 2))" | FileCheck %s
+# CHECK: inject 32.0 get 416.0

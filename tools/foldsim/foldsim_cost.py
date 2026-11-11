@@ -333,6 +333,32 @@ def bit_counts(w, live):
     return [sum((l >> b) & 1 for l in live) for b in range(w)]
 
 
+def reachable(mod, idx, n, rhs):
+    """The elements of an n-element array an index can address: an index with known-constant bits (a lane
+    index {pid, 4'd6}, say) reaches 2^(free bits) of them, the rest of a get's choice and of an inject's
+    element selects constant-fold away."""
+    if idx is None:
+        return n
+    m = re.search(r'\]\s*(?:,\s*' + SSA + r'\s*)?:\s*!hw\.array<\d+x.*>\s*,\s*i(\d+)\s*$', rhs)
+    iw = int(m.group(1)) if m else max(1, math.ceil(math.log2(max(n, 2))))
+    known = (mod.Z.get(idx, 0) | mod.O.get(idx, 0)) & ((1 << iw) - 1)
+    free = iw - popcount(known)
+    if not known:
+        return n
+    # the addresses with the known bits fixed, below n
+    o = mod.O.get(idx, 0) & known
+    cnt, bits = 0, [b for b in range(iw) if not (known >> b) & 1]
+    if (1 << free) > 4 * n:
+        return min(n, 1 << free)
+    for k in range(1 << free):
+        a = o
+        for j, b in enumerate(bits):
+            if (k >> j) & 1:
+                a |= 1 << b
+        cnt += a < n
+    return max(1, cnt)
+
+
 def lut_cost(op, rhs, mod, operands):
     """LUT6 estimate of one op; known-constant bits (mod.Z/mod.O) cost nothing."""
     t = result_type(rhs)
@@ -411,6 +437,7 @@ def lut_cost(op, rhs, mod, operands):
         if not m or (idx and idx[0] in mod.consts):
             return 0
         n, w = int(m.group(1)), width(m.group(2))
+        n = reachable(mod, idx[0] if idx else None, n, rhs)
         return w * (n - 1) / 3
     if op == 'hw.array_inject':
         m = re.search(r'!hw\.array<(\d+)x(.*)>\s*,', rhs)
@@ -418,7 +445,7 @@ def lut_cost(op, rhs, mod, operands):
         if not m:
             return 0
         n, w = int(m.group(1)), width(m.group(2))
-        return 0 if (idx and idx[0] in mod.consts) else n * w * 0.5
+        return 0 if (idx and idx[0] in mod.consts) else reachable(mod, idx[0] if idx else None, n, rhs) * w * 0.5
     return None
 
 
