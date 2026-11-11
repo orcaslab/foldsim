@@ -46,6 +46,12 @@ MEASURED_AS = dict(lut='lut', logic='logic', lutram='lutram', lutram_lb='lutram'
                    uram='uram',
                    bram='bram', dsp='dsp')
 URAM_DEPTH, URAM_WIDTH = 4096, 72
+# The level's array reads priced (foldsim_cost.array_reads); FOLDSIM_COST_LEVEL_ARRAY_READS=0 leaves them out, as
+# before 11-11.
+ARRAY_READS = os.environ.get('FOLDSIM_COST_LEVEL_ARRAY_READS', '1') != '0'
+# The level's other logic at its synthesized share (foldsim_cost.LEVEL_LOGIC_SYNTH, 11-11);
+# FOLDSIM_COST_LEVEL_SCALE=1 counts it as parsed, as before.
+LEVEL_SCALE = float(os.environ.get('FOLDSIM_COST_LEVEL_SCALE', foldsim_cost.LEVEL_LOGIC_SYNTH))
 
 
 def lutram_primitives(d, w, r):
@@ -63,13 +69,13 @@ def memory(rec):
     """{lutram, lutram_lb, uram, bram} of one foldsim_cost memory record as Vivado builds it by its ram_style
     (foldsim_sll_check.mem_ram: URAM288 in 72-bit columns of 4,096 rows, a read port beyond the first of a
     memory without a read-write port a copy; else foldsim_cost.mem_cost's block or distributed RAM)."""
-    _, d, w, r, wr, rl, st, *_ = rec
+    _, d, w, r, wr, rl, st, mk, *_ = rec
     out = dict(lutram=0.0, lutram_lb=0.0, lutram_forced=0.0, uram=0.0, bram=0.0)
     if st == 'ultra':
         copies = max(1, r if wr else math.ceil(r / 2))
         out['uram'] = math.ceil(w / URAM_WIDTH) * math.ceil(d / URAM_DEPTH) * copies
         return out
-    lr, br = foldsim_cost.mem_cost(d, w, r, rl, st)
+    lr, br = foldsim_cost.mem_cost(d, w, r, rl, st, mk)
     out['bram'] = br
     if lr:
         out['lutram'] = lr
@@ -146,11 +152,15 @@ def count(gen):
     rest = new()
     links = {c: new() for c in copies}
     regs = {}
+    # The level's array reads (hw.array_get: the link streams' word selects, tables, reader selects), priced on what
+    # each array is built of (foldsim_cost.array_reads): foldsim_cost.parse prices every one as a select of all
+    # its entries, which the r16c rule left out wholesale.
+    reads = foldsim_cost.array_reads(sim_path(gen), level) if ARRAY_READS else {}
     for lv in level:
         m = mods[lv]
         # The level's array reads are its link registers' reads by instance, built in the registers' read
         # selects: its other logic only (foldsim_sll_check.netlist_resources).
-        lg = sum(v for k, v in m.lut.items() if k != 'array_get')
+        lg = LEVEL_SCALE * sum(v for k, v in m.lut.items() if k != 'array_get') + reads.get(lv, (0.0, {}))[0]
         rest['logic'] += lg
         rest['lut'] += lg
         for rec in m.mems:

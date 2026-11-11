@@ -84,20 +84,20 @@ def mem_ram(rec):
     """(URAM288, RAMB36) of a foldsim_cost memory record as Vivado builds it: a
     ram_style ultra memory in 72-bit columns of 4,096 rows (Vivado puts a
     small one in a whole URAM too), else foldsim_cost.mem_cost's block RAM."""
-    _, d, w, r, wr, rl, st, *_ = rec
+    _, d, w, r, wr, rl, st, mk, *_ = rec
     if st == 'ultra':
         # A read port beyond the first is a copy (foldsim_storage.kind_cost).
         copies = max(1, r if wr else math.ceil(r / 2))
         return math.ceil(w / URAM_WIDTH) * math.ceil(d / URAM_DEPTH) * copies, 0.0
-    return 0.0, foldsim_cost.mem_cost(d, w, r, rl, st)[1]
+    return 0.0, foldsim_cost.mem_cost(d, w, r, rl, st, mk)[1]
 
 
 def add_memory(acc, rec):
     """A memory's URAM288, RAMB36 and distributed RAM LUTs (in `lut` and in
     `lutram`: a LUTRAM LUT takes a SLICEM's, of which an SLR has a share)."""
     u, b = mem_ram(rec)
-    _, d, w, r, wr, rl, st, *_ = rec
-    lr = foldsim_cost.mem_cost(d, w, r, rl, st)[0] if st != 'ultra' else 0.0
+    _, d, w, r, wr, rl, st, mk, *_ = rec
+    lr = foldsim_cost.mem_cost(d, w, r, rl, st, mk)[0] if st != 'ultra' else 0.0
     acc['uram'] += u
     acc['bram'] += b
     acc['lut'] += lr
@@ -198,13 +198,15 @@ def netlist_resources(sim, copies, region, synthesis=None):
         # without a reader in its name, with its producer.
         return next((c for c in names if f'_to_{c}_' in n or n.endswith(f'_to_{c}')), None) or \
             next((c for c in names if n.startswith(c + '_')), None)
+    # The level's array reads: not as foldsim_cost.parse prices them (a select of every entry: r16c, 2.23M LUTs
+    # counted as array_get against a whole level of 129k synthesized), but on what each array is built of
+    # (foldsim_cost.array_reads, as foldsim_fitdb.count; FOLDSIM_COST_LEVEL_ARRAY_READS=0: left out, as before).
+    reads = foldsim_cost.array_reads(sim, level) \
+        if os.environ.get('FOLDSIM_COST_LEVEL_ARRAY_READS', '1') != '0' else {}
     for lv in level:
         m = mods[lv]
-        # The level's array reads are its link registers' reads by instance,
-        # which synthesis builds in the registers' read selects (r16c: 2.23M
-        # LUTs counted as array_get, the whole simulator level 129k LUTs
-        # synthesized besides its copies): its other logic only.
-        rest['lut'] += sum(v for k, v in m.lut.items() if k != 'array_get')
+        rest['lut'] += float(os.environ.get('FOLDSIM_COST_LEVEL_SCALE', foldsim_cost.LEVEL_LOGIC_SYNTH)) * \
+            sum(v for k, v in m.lut.items() if k != 'array_get') + reads.get(lv, (0.0, {}))[0]
         for rec in m.mems:
             o = owner(rec[0])
             add_memory(link[o] if o else rest, rec)

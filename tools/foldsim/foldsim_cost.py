@@ -631,9 +631,117 @@ def refund_enables(mod):
             pos += w
 
 
-def mem_cost(depth, w, rports, rlat, style=None):
+# Synthesized per counted, by the kind of array a level read selects from (11-11, a32-G0 OOC of the shell-sized
+# profile at 64 SMs, each read in a module of its own, -flatten_hierarchy none): array_create selects 34,275 LUTs
+# against 104,272 counted on their live entries (50 reads; 0.21-1.02 each: a link stream's page select of a held
+# word whose pages are mostly constant registers costs ~1 LUT a bit, a select of live words its full mux), the
+# other arrays 2,625 against 2,688; tables (88) none measurable.
+ARRAY_READ_SYNTH = {'const': 1.0, 'create': 0.33, 'other': 1.0}
+# The simulator level's other logic (its own ops as `parse` prices them, array reads and memories apart),
+# synthesized per counted: 80,549 / 110,618 = 0.73 in the same OOC, 89.3k / 126.6k = 0.71 in P/s11 p1_300 (routed,
+# flattened, the same profile's shell-sized fold of 11-09): foldsim_fitdb.count scales the level's logic by it.
+LEVEL_LOGIC_SYNTH = 0.73
+
+
+def array_read_cost(n, w, src, live=None, varying=None):
+    """LUT6s of one array read (hw.array_get) with a non-constant index, by
+    the array it reads (the simulator level's selects, foldsim_fitdb.count):
+    - a constant table (`src` 'const', hw.aggregate_constant): a ROM, one
+      LUT6 a varying output bit (`varying`: the bits not the same in every
+      entry) for every 64 entries, and a 4:1 select of them beyond 64;
+    - an array built of values (`src` 'create', hw.array_create): a select of
+      its `live` non-constant entries (a constant entry is folded into the
+      select's logic), (live - 1) / 3 LUTs a bit (LUT6 4:1 muxes with F7/F8),
+      times the synthesized share measured (ARRAY_READ_SYNTH);
+    - any other array: a select of all n entries."""
+    if src == 'const':
+        v = w if varying is None else varying
+        blocks = math.ceil(n / 64)
+        return ARRAY_READ_SYNTH['const'] * v * (blocks + (blocks - 1) / 3)
+    k = n if live is None else live
+    return ARRAY_READ_SYNTH.get(src, 1.0) * w * max(k - 1, 0) / 3
+
+
+def array_reads(path, modules, per_read=None):
+    """{module: (LUTs, {kind: LUTs})} of the hw.array_get reads with a
+    non-constant index in `modules` of an MLIR file, priced by
+    array_read_cost on what each array is built of (kinds: const, create,
+    other); `per_read`, a dict, takes each read's (kind, LUTs) by (module,
+    result). foldsim_fitdb.count adds them to the simulator level (11-11,
+    a32-G0: they had been left out, the r16c rule, while the level's link
+    stream word selects and tables are such reads)."""
+    modules = set(modules)
+    out = {}
+    cur = None
+    for line in open(path):
+        st = line.strip()
+        if st.startswith('hw.module'):
+            m = re.match(r'hw\.module(?:\.extern)?(?:\s+private)?\s+@([\w$.]+)', st)
+            cur = m.group(1) if m and m.group(1) in modules and 'extern' not in st else None
+            if cur:
+                consts, arrays = set(), {}
+                out[cur] = [0.0, {'const': 0.0, 'create': 0.0, 'other': 0.0}]
+            continue
+        if cur is None or ' = ' not in st or not st.startswith('%'):
+            continue
+        lhs, rhs = st.split(' = ', 1)
+        op = rhs.split()[0]
+        res = re.findall(SSA, lhs)
+        if op == 'hw.constant':
+            consts.update(res)
+        elif op == 'hw.aggregate_constant' and res:
+            mm = re.search(r'!hw\.array<(\d+)xi(\d+)>\s*$', rhs)
+            if mm:
+                vals = re.findall(r'(-?\d+|true|false) : i\d+', rhs.split('] :')[0])
+                w = int(mm.group(2))
+                if len(vals) == int(mm.group(1)):
+                    ints = [(1 if v == 'true' else 0 if v == 'false' else int(v)) & ((1 << w) - 1) for v in vals]
+                    a, o = (1 << w) - 1, 0
+                    for x in ints:
+                        a &= x
+                        o |= x
+                    varying = popcount(o & ~a)
+                else:
+                    varying = w
+                arrays[res[0]] = ('const', varying)
+            consts.update(res)
+        elif op == 'hw.array_create' and res:
+            ops = re.findall(SSA, rhs.split(' : ')[0])
+            arrays[res[0]] = ('create', sum(1 for o in ops if o not in consts))
+        elif op == 'hw.array_get':
+            mm = re.search(r'!hw\.array<(\d+)x(.*)>\s*,', rhs)
+            idx = re.findall(r'\[(' + SSA + r')\]', rhs)
+            ops = re.findall(SSA, rhs.split(' : ')[0])
+            if not mm or (idx and idx[0] in consts) or not ops:
+                continue
+            n, w = int(mm.group(1)), width(mm.group(2))
+            src = arrays.get(ops[0])
+            if src and src[0] == 'const':
+                kind, c = 'const', array_read_cost(n, w, 'const', varying=src[1])
+            elif src and src[0] == 'create':
+                kind, c = 'create', array_read_cost(n, w, 'create', live=src[1])
+            else:
+                kind, c = 'other', array_read_cost(n, w, 'other')
+            out[cur][0] += c
+            out[cur][1][kind] += c
+            if per_read is not None and res:
+                per_read[(cur, res[0])] = (kind, c)
+    return {k: (v[0], v[1]) for k, v in out.items()}
+
+
+# A distributed RAM written with a byte (or wider-lane) mask: Vivado builds it of dual-port single-bit primitives
+# (RAM32X1D / RAM64X1D, 2 LUTs a bit and read port), not RAM32M16's 14 bits in 8 LUTs: measured 11-11 (a32-G0 OOC,
+# -flatten_hierarchy none, the shell-sized profile at 64 SMs) on 23 masked landings of 8-32 entries, 50,512 bits:
+# 100,394 LUTs, 1.99 a bit, against 0.57 counted.
+MASKED_LUTRAM_PER_BIT = 2.0
+# FOLDSIM_COST_MASKED_LUTRAM=0: priced as unmasked, as before 11-11.
+MASKED_LUTRAM = os.environ.get('FOLDSIM_COST_MASKED_LUTRAM', '1') != '0'
+
+
+def mem_cost(depth, w, rports, rlat, style=None, mask=1):
     """(LUTRAM LUTs, BRAM36) of one memory. Synchronous reads from 32 entries up go to
-    block RAM, as Vivado infers them, unless the memory asks otherwise."""
+    block RAM, as Vivado infers them, unless the memory asks otherwise. `mask`: the
+    write mask's lanes (a masked distributed RAM: MASKED_LUTRAM_PER_BIT)."""
     rports = max(rports, 1)
     bram = style == 'block' or (style != 'distributed' and rlat >= 1 and depth >= 32 and depth * w >= 2048)
     if bram:
@@ -642,6 +750,9 @@ def mem_cost(depth, w, rports, rlat, style=None):
         else:
             per = math.ceil(w / 72) * math.ceil(depth / 512)
         return 0, per * max(1, math.ceil(rports / 2))
+    if mask > 1 and MASKED_LUTRAM:
+        blocks = math.ceil(depth / 64)
+        return w * blocks * MASKED_LUTRAM_PER_BIT * rports + (w * (blocks - 1) / 3 if depth > 64 else 0), 0
     if depth <= 32:
         return w * 0.57 * rports, 0
     return w * math.ceil(depth / 64) * 1.14 * rports + (w * (math.ceil(depth / 64) - 1) / 3 if depth > 64 else 0), 0
@@ -655,8 +766,8 @@ def mod_totals(mods, name, stop=(), mult=1, acc=None):
     acc['lut'] += mult * sum(m.lut.values())
     acc['ff'] += mult * m.ff
     acc['dsp'] += mult * m.dsp
-    for (_, d, w, r, wr, rl, st, *_) in m.mems:
-        lr, br = mem_cost(d, w, r, rl, st)
+    for (_, d, w, r, wr, rl, st, mk, *_) in m.mems:
+        lr, br = mem_cost(d, w, r, rl, st, mk)
         acc['membits'] += mult * d * w
         acc['lutram'] += mult * lr
         acc['bram'] += mult * br

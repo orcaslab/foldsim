@@ -1,3 +1,5 @@
+# (Placement cases on hand-sized regions, sized before the 11-11 count corrections (the level's array reads,
+# masked LUTRAM, the level logic's synthesized share): counted as before, so the cases stay the ones they test.)
 # The SLR check of a static fold (foldsim --region; foldsim_sll_check.py on the
 # netlist: each copy's LUT, LUTRAM, FF, URAM and RAMB36 counted on
 # foldsim_sim.mlir, an assignment of whole copies to the region's SLRs, the
@@ -20,7 +22,7 @@
 # RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/storage
 
 # Default: a static fold is checked against the V80 compute shell's region.
-# RUN: foldsim --srcs top.f --top Top --out %t/v80 --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 Leaf 2>&1 | FileCheck %s --check-prefix=V80
+# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 foldsim --srcs top.f --top Top --out %t/v80 --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 Leaf 2>&1 | FileCheck %s --check-prefix=V80
 # RUN: FileCheck %s --check-prefix=V80R < %t/v80/sll/sll.txt
 # V80: foldsim: SLL check: v80: OK
 # V80-NOT: GUIDE
@@ -29,7 +31,7 @@
 
 # Guide: two SLRs of 110 LUTs, the Leaf copy (about 123) fits neither whole but
 # the region holds the design: the copy is cut, a GUIDE warning, the netlist kept.
-# RUN: foldsim --srcs top.f --top Top --out %t/split --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --region %S/Inputs/slr-rule/region-split.json Leaf 2>&1 | FileCheck %s --check-prefix=SPLIT
+# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 foldsim --srcs top.f --top Top --out %t/split --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --region %S/Inputs/slr-rule/region-split.json Leaf 2>&1 | FileCheck %s --check-prefix=SPLIT
 # RUN: test -f %t/split/foldsim_sim.sv && not test -e %t/split/foldsim_sim.sv.slr-refused
 # SPLIT: foldsim: SLL check: split: OK
 # SPLIT: foldsim: GUIDE: SLR straddle (a guide, --slr-policy guide)
@@ -40,7 +42,7 @@
 # Guide: two Leaf copies, each fits an SLR whole but the placer fills an SLR to
 # half: no assignment of whole copies, the copies cut, the SLLs projected (a
 # placement model in the region): GUIDE lines with the boundary's SLLs.
-# RUN: foldsim --srcs top.f --top Top --out %t/cut --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:2 --region %S/Inputs/slr-rule/region-cut.json Leaf 2>&1 | FileCheck %s --check-prefix=CUT
+# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 foldsim --srcs top.f --top Top --out %t/cut --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:2 --region %S/Inputs/slr-rule/region-cut.json Leaf 2>&1 | FileCheck %s --check-prefix=CUT
 # RUN: test -f %t/cut/foldsim_sim.sv
 # CUT: foldsim: SLL check: cut: WARN: {{.*}} cut over SLRs
 # CUT: GUIDE: Leaf{{(_copy1)?}} straddles
@@ -49,17 +51,17 @@
 
 # Still a failure under guide: the design past the region's placement fill
 # (region-fill.json: region-cut.json at a 50 % fill).
-# RUN: not foldsim --srcs top.f --top Top --out %t/fill --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:2 --region %S/Inputs/slr-rule/region-fill.json Leaf 2>&1 | FileCheck %s --check-prefix=FILL
+# RUN: not env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 foldsim --srcs top.f --top Top --out %t/fill --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:2 --region %S/Inputs/slr-rule/region-fill.json Leaf 2>&1 | FileCheck %s --check-prefix=FILL
 # FILL: foldsim: SLL check: fill: REFUSE: the design's lut {{[0-9]+}} %, ff {{[0-9]+}} % of the region, past the placement fill
 # FILL: foldsim: error: the SLR check refuses this netlist: REFUSE: the design's
 
 # Guide with --allow-slr-straddle: accepted, a warning, no record.
-# RUN: foldsim --srcs top.f --top Top --out %t/gall --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --region %S/Inputs/slr-rule/region-split.json --allow-slr-straddle='old script' Leaf 2>&1 | FileCheck %s --check-prefix=GALL
+# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 foldsim --srcs top.f --top Top --out %t/gall --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --region %S/Inputs/slr-rule/region-split.json --allow-slr-straddle='old script' Leaf 2>&1 | FileCheck %s --check-prefix=GALL
 # RUN: not test -e %t/gall/SLR_STRADDLE_APPROVED
 # GALL: foldsim: warning: --allow-slr-straddle is no longer needed
 
 # Strict: two SLRs of 100 LUTs, the Leaf copy fits no SLR whole: the 11-08 rule.
-# RUN: not foldsim --srcs top.f --top Top --out %t/tiny --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --region %S/Inputs/slr-rule/region-tiny.json --slr-policy strict Leaf 2>&1 | FileCheck %s --check-prefix=TINY
+# RUN: not env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 foldsim --srcs top.f --top Top --out %t/tiny --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --region %S/Inputs/slr-rule/region-tiny.json --slr-policy strict Leaf 2>&1 | FileCheck %s --check-prefix=TINY
 # RUN: test -f %t/tiny/foldsim_sim.sv.slr-refused && not test -e %t/tiny/foldsim_sim.sv
 # TINY: foldsim: error: SLR rule: no class copy may cross an SLR boundary; this netlist: REFUSE: Leaf fits no SLR whole
 # TINY-NEXT: Leaf fits no SLR whole: lut {{[0-9,]+}}, lutram {{[0-9,]+}}, ff {{[0-9,]+}}, uram 0.0, bram 0.0
@@ -70,14 +72,14 @@
 # TINY-SAME: --allow-slr-straddle=<who, when, why>
 
 # Strict: the cut copies, a warning of the check, a failure of the rule.
-# RUN: not foldsim --srcs top.f --top Top --out %t/scut --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:2 --region %S/Inputs/slr-rule/region-cut.json --slr-policy strict Leaf 2>&1 | FileCheck %s --check-prefix=SCUT
+# RUN: not env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 foldsim --srcs top.f --top Top --out %t/scut --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:2 --region %S/Inputs/slr-rule/region-cut.json --slr-policy strict Leaf 2>&1 | FileCheck %s --check-prefix=SCUT
 # SCUT: foldsim: SLL check: scut: WARN: {{.*}} cut over SLRs
 # SCUT: foldsim: error: SLR rule: no class copy may cross an SLR boundary
 # SCUT: Leaf{{(_copy1)?}} is left out of every assignment of whole copies to the SLRs
 # SCUT: SLR1: lut 200, lutram 200, ff 400
 
 # Strict, the override: the compilation finishes, the reason recorded.
-# RUN: foldsim --srcs top.f --top Top --out %t/ovr --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --region %S/Inputs/slr-rule/region-tiny.json --slr-policy strict --allow-slr-straddle='lit test, 11-08, synthetic' Leaf 2>&1 | FileCheck %s --check-prefix=OVR
+# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 foldsim --srcs top.f --top Top --out %t/ovr --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --region %S/Inputs/slr-rule/region-tiny.json --slr-policy strict --allow-slr-straddle='lit test, 11-08, synthetic' Leaf 2>&1 | FileCheck %s --check-prefix=OVR
 # RUN: test -f %t/ovr/foldsim_sim.sv
 # RUN: FileCheck %s --check-prefix=OVRF < %t/ovr/SLR_STRADDLE_APPROVED
 # RUN: FileCheck %s --check-prefix=OVRJ < %t/ovr/foldsim_sim.json
@@ -89,6 +91,6 @@
 # OVRJ: "slr_straddle_approved"
 
 # A manifest whose platform is not the V80 has no default region: no check.
-# RUN: foldsim --manifest %S/Inputs/slr-rule/u55c.toml --out %t/u55c --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 Leaf 2>&1 | FileCheck %s --check-prefix=U55C
+# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 foldsim --manifest %S/Inputs/slr-rule/u55c.toml --out %t/u55c --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 Leaf 2>&1 | FileCheck %s --check-prefix=U55C
 # RUN: not test -e %t/u55c/sll
 # U55C-NOT: SLL check

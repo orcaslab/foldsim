@@ -1,0 +1,17 @@
+# The simulator level's count (foldsim_fitdb.count, 11-11), as validated per term on an OOC synthesis of the
+# shell-sized profile at 64 SMs (-flatten_hierarchy none, each level array read in a module of its own):
+# foldsim_cost.array_reads prices the level's array reads (hw.array_get with a non-constant index) on what each
+# array is built of, at the synthesized share measured (ARRAY_READ_SYNTH):
+# - a constant table: a ROM, one LUT6 a varying output bit a 64 entries (4 x i8 with 1 varying bit: 1; 8 x i1: 1);
+# - an array_create: a select of its live entries, 0.33 of (live - 1) / 3 a bit (3 live of 4, i8: 1.76; a constant
+#   index: none);
+# - any other array: a select of all its entries (4 x i8: 8).
+# RUN: python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import foldsim_cost as fc; r = {}; t = fc.array_reads(sys.argv[2], ['foldsim_sim'], r); print(round(t['foldsim_sim'][0], 2), {k: round(v, 2) for k, v in sorted(t['foldsim_sim'][1].items())}, len(r))" %foldsim_tools %S/Inputs/array-reads/level.mlir | FileCheck %s
+# CHECK: 11.76 {'const': 2.0, 'create': 1.76, 'other': 8.0} 4
+# A 4,096-entry table of 8 varying bits; a 65-live select of 1,176-bit words; a byte-masked distributed RAM of
+# 8 x 4,096 (2 LUTs a bit: dual-port single-bit primitives) against an unmasked one (0.57 a bit).
+# RUN: python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import foldsim_cost as fc; print(round(fc.array_read_cost(4096, 8, 'const', varying=8), 2), round(fc.array_read_cost(128, 1176, 'create', live=65), 1), fc.mem_cost(8, 4096, 1, 0, None, 8)[0], round(fc.mem_cost(8, 4096, 1, 0, None, 1)[0], 2))" %foldsim_tools | FileCheck %s --check-prefix=PRICE
+# PRICE: 680.0 8279.0 8192.0 2334.72
+# FOLDSIM_COST_MASKED_LUTRAM=0: the masked one priced unmasked (as before).
+# RUN: env FOLDSIM_COST_MASKED_LUTRAM=0 python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import foldsim_cost as fc; print(round(fc.mem_cost(8, 4096, 1, 0, None, 8)[0], 2))" %foldsim_tools | FileCheck %s --check-prefix=OLD
+# OLD: 2334.72
