@@ -29,11 +29,13 @@
 // Ordering AXI does not give, the port gives with two counters and a fence
 // each, instead of a per-row hazard table:
 //  - read after write: a read whose fence class is c (rd_fence) leaves only
-//    once every write taken before (now - c * 2^FS) host cycles has its B.
-//    The schedule proves, per member, that a read's row was last written at
-//    least that long before (class 0: any write; the class's distance is a
-//    lower bound the compiler checks over the frame). A ring of the write
-//    count, sampled every 2^FS cycles, holds the counts of the window.
+//    once every write taken (c+1) * 2^FS host cycles or more before it has
+//    its B (class 0: every write taken before it; with rd_new, its own
+//    cycle's write too). The schedule proves, per member, that a read's row
+//    was last written at least that long before (positions only stretch
+//    under bubbles, so host cycles bound them from below). A ring of the
+//    write count, sampled every 2^FS cycles, holds the counts of the window;
+//    the count a read waits for is decided as it is taken.
 //  - write after read (a read-first pair, wr_pair): the write leaves once
 //    every read taken before it has its last beat back.
 // A late answer is a bubble in the simulator, never a wrong row.
@@ -128,15 +130,17 @@ module foldsim_vport #(
 );
     localparam QW  = $clog2(QUEUE);
     localparam OUW = $clog2(OUTSTANDING);
-    localparam CW  = 24;                       // request counters (wrap-safe compares)
+    // Request counters: wrap-safe compares over at most QUEUE + OUTSTANDING
+    // + WRITES_OUT requests, and the fence window's writes.
+    localparam CW  = 16;
     localparam DB  = DW / 8;
     localparam GROUP = DB / MW;
 
-    // ---- read queue: {addr, len, tag, fence, write count at intake}
-    localparam RQW = OW + LW + TW + FCW + CW;
+    // ---- read queue: {addr, len, tag, the write count it waits for}
+    localparam RQW = OW + LW + TW + CW;
     reg  [RQW-1:0] rq_mem [QUEUE];
     reg  [QW:0]    rq_head, rq_tail;
-    // ---- write queue: {addr, len, pair, read count at intake} + the row
+    // ---- write queue: {addr, len, pair, epoch, read count at intake} + the row
     localparam WQW = OW + LW + 1 + 4 + CW;
     reg  [WQW-1:0] wq_mem   [QUEUE];
     reg  [DW-1:0]  wq_data  [QUEUE];
@@ -144,14 +148,12 @@ module foldsim_vport #(
     reg  [QW:0]    wq_head, wq_tail;
 
     // Counters, never reset (a kernel reset carries every transaction on AXI
-    // to its end): writes taken / B's back; reads taken into the queue / on
-    // AR / last beats back. Answers to reads from before a reset (`stale`)
-    // are dropped.
-    reg  [CW-1:0]  w_taken, w_done, r_in, r_taken, r_done;
-    reg  [CW-1:0]  stale;
-    reg  [CW-1:0]  w_aw;
+    // to its end): writes taken / AWs on AXI / B's back; reads taken into the
+    // queue / on AR / last beats back, and on AXI. Answers to reads from
+    // before a reset (`stale`) are dropped.
+    reg  [CW-1:0]  w_taken, w_aw, w_done, r_in, r_taken, r_done, r_out, stale;
     // Resets so far (mod 16): a pair taken before a reset has no read to wait for.
-    reg  [3:0]     epoch;                    // AWs on AXI (writes and fill bursts)
+    reg  [3:0]     epoch;
     // The write count sampled every 2^FS cycles, FCLASSES of them.
     reg  [CW-1:0]  w_ring [FCLASSES];
     reg  [FS-1:0]  tick;
@@ -161,39 +163,42 @@ module foldsim_vport #(
     reg            draining, filling;
     reg  [63:0]    fill_at;
 
+    // The head read, out of the queue's memory into registers.
+    reg            h_valid;
+    reg  [OW-1:0]  h_addr;
+    reg  [LW-1:0]  h_len;
+    reg  [TW-1:0]  h_tag;
+    reg  [CW-1:0]  h_need;
+    // The head write's fields likewise; its row stays in the queue's memory.
+    reg            g_valid;
+    reg  [OW-1:0]  g_addr;
+    reg  [LW-1:0]  g_len;
+    reg            g_pair;
+    reg  [3:0]     g_ep;
+    reg  [CW-1:0]  g_rcnt;
+    reg  [QW-1:0]  g_slot;
+
+    // In-flight reads: their tags and beats, in order.
+    reg  [TW+LW-1:0] of_mem [OUTSTANDING];
+    reg  [OUW:0]     of_head, of_tail;
+    reg  [LW-1:0]    r_beat;
+
+    reg            w_busy;                  // a row's beats are leaving
+    reg  [LW-1:0]  w_beat;
+    reg  [QW-1:0]  w_slot;
+    reg  [LW-1:0]  w_len;
+    reg  [5:0]     fill_beat;
+    reg            fill_w;                  // a fill burst's beats are leaving
+
 `ifdef SIMULATION
     // Power-up state (the FPGA's registers start at 0; draining from the start).
     initial begin
-        rq_head = '0;
-        rq_tail = '0;
-        wq_head = '0;
-        wq_tail = '0;
-        w_taken = '0;
-        w_done = '0;
-        r_in = '0;
-        r_taken = '0;
-        r_done = '0;
-        stale = '0;
-        w_aw = '0;
-        epoch = '0;
-        tick = '0;
-        ring_at = '0;
-        draining = 1'b1;
-        filling = 1'b0;
-        of_head = '0;
-        of_tail = '0;
-        r_beat = '0;
-        w_busy = 1'b0;
-        fill_beat = '0;
-        fill_w = 1'b0;
-        m_arvalid = 1'b0;
-        m_awvalid = 1'b0;
-        m_wvalid = 1'b0;
-        rsp_valid = 1'b0;
-        rd_free = '0;
-        wr_free = '0;
-        base_q = '0;
-        fill_at = '0;
+        rq_head = '0; rq_tail = '0; wq_head = '0; wq_tail = '0;
+        w_taken = '0; w_aw = '0; w_done = '0; r_in = '0; r_taken = '0; r_done = '0; r_out = '0; stale = '0;
+        epoch = '0; tick = '0; ring_at = '0; draining = 1'b1; filling = 1'b0; base_q = '0; fill_at = '0;
+        h_valid = 1'b0; g_valid = 1'b0; r_fence_ok = 1'b0; r_room = 1'b0; of_head = '0; of_tail = '0; r_beat = '0;
+        w_busy = 1'b0; w_beat = '0; fill_beat = '0; fill_w = 1'b0;
+        m_arvalid = 1'b0; m_awvalid = 1'b0; m_wvalid = 1'b0; rsp_valid = 1'b0; rd_free = '0; wr_free = '0;
         for (int i = 0; i < FCLASSES; i++) w_ring[i] = '0;
     end
 `endif
@@ -204,7 +209,7 @@ module foldsim_vport #(
     // Intake.
     always @(posedge clk) begin
         if (take_rd)
-            rq_mem[rq_tail[QW-1:0]] <= {rd_addr, rd_len, rd_tag, rd_fence, w_taken + CW'(rd_new && take_wr)};
+            rq_mem[rq_tail[QW-1:0]] <= {rd_addr, rd_len, rd_tag, in_need};
         if (take_wr) begin
             wq_mem[wq_tail[QW-1:0]]  <= {wr_addr, wr_len, wr_pair, epoch, r_in + CW'(take_rd)};
             wq_data[wq_tail[QW-1:0]] <= wr_data;
@@ -212,32 +217,44 @@ module foldsim_vport #(
         end
     end
 
+    // Writes a read must see have their B, decided as it is taken: class 0,
+    // every write taken before it (and its own cycle's, rd_new); class c,
+    // those of the count sampled c samples ago, taken at least (c+1) 2^FS
+    // host cycles before it (no later than its own count).
+    wire [CW-1:0]  in_wcnt  = w_taken + CW'(rd_new && take_wr);
+    wire [CW-1:0]  in_c     = w_ring[ring_at - rd_fence];
+    wire [CW-1:0]  in_need  = (rd_fence == 0) ? in_wcnt
+                            : (($signed(in_c - in_wcnt) < 0) ? in_c : in_wcnt);
+
     // ---- AR: the head read, once its fence holds.
     wire [RQW-1:0] rh = rq_mem[rq_head[QW-1:0]];
     wire [OW-1:0]  rh_addr  = rh[RQW-1 -: OW];
     wire [LW-1:0]  rh_len   = rh[RQW-OW-1 -: LW];
     wire [TW-1:0]  rh_tag   = rh[RQW-OW-LW-1 -: TW];
-    wire [FCW-1:0] rh_fence = rh[CW +: FCW];
-    wire [CW-1:0]  rh_wcnt  = rh[CW-1:0];
-    // Writes that must have their B: class 0, every write taken before the
-    // read; class c, the count c samples ago (no later than the read's own).
-    wire [CW-1:0]  need_c   = w_ring[ring_at - rh_fence];
-    wire [CW-1:0]  need     = (rh_fence == 0) ? rh_wcnt
-                            : (($signed(need_c - rh_wcnt) < 0) ? need_c : rh_wcnt);
-    wire           r_fence_ok = $signed(w_done - need) >= 0;
-    wire           r_room   = (r_taken - r_done) < OUTSTANDING;
-    wire           ar_go    = (rq_head != rq_tail) && r_fence_ok && r_room && (!m_arvalid || m_arready);
-
-    // In-flight reads: their tags and beats, in order.
-    reg  [TW+LW-1:0] of_mem [OUTSTANDING];
-    reg  [OUW:0]     of_head, of_tail;
-    reg  [LW-1:0]    r_beat;
+    wire [CW-1:0]  rh_need  = rh[CW-1:0];
+    // The head's fence, registered (a cycle late: B's only add, so it is
+    // conservative); a head loading this cycle is checked against its own.
+    reg            r_fence_ok;
+    wire [CW-1:0]  next_need = h_load ? rh_need : h_need;
+    // Room for another read on AXI, registered (one AR a cycle: a margin of one).
+    reg            r_room;
+    wire           ar_go    = h_valid && r_fence_ok && r_room && (!m_arvalid || m_arready) && !reset;
+    wire           rq_any   = rq_head != rq_tail;
+    wire           h_load   = rq_any && (!h_valid || ar_go);
 
     always @(posedge clk) begin
+        r_fence_ok <= $signed(w_done - next_need) >= 0;
+        r_room     <= r_out < CW'(OUTSTANDING - 1);
+        if (h_load) begin
+            h_addr <= rh_addr;
+            h_len  <= rh_len;
+            h_tag  <= rh_tag;
+            h_need <= rh_need;
+        end
         if (ar_go) begin
-            m_araddr <= base_q + 64'({rh_addr, 6'b0});
-            m_arlen  <= 8'(rh_len);
-            of_mem[of_tail[OUW-1:0]] <= {rh_tag, rh_len};
+            m_araddr <= base_q + 64'({h_addr, 6'b0});
+            m_arlen  <= 8'(h_len);
+            of_mem[of_tail[OUW-1:0]] <= {h_tag, h_len};
         end
     end
 
@@ -246,7 +263,7 @@ module foldsim_vport #(
     wire [TW+LW-1:0] oh = of_mem[of_head[OUW-1:0]];
     wire r_last_beat = m_rvalid && (r_beat == oh[LW-1:0]);
     always @(posedge clk) begin
-        rsp_valid <= m_rvalid && (stale == 0);
+        rsp_valid <= m_rvalid && (stale == 0) && !reset;
         rsp_tag   <= oh[TW+LW-1 -: TW];
         rsp_beat  <= r_beat;
         rsp_last  <= r_last_beat;
@@ -256,45 +273,47 @@ module foldsim_vport #(
     // ---- AW/W: the head write once its pair's reads are back; its beats
     // from the held row.
     wire [WQW-1:0] wh = wq_mem[wq_head[QW-1:0]];
-    wire [OW-1:0]  wh_addr = wh[WQW-1 -: OW];
-    wire [LW-1:0]  wh_len  = wh[WQW-OW-1 -: LW];
-    wire           wh_pair = wh[CW+4];
-    wire [3:0]     wh_ep   = wh[CW +: 4];
-    wire [CW-1:0]  wh_rcnt = wh[CW-1:0];
-    wire           w_pair_ok = !wh_pair || (wh_ep != epoch) || ($signed(r_done - wh_rcnt) >= 0);
-    wire           w_room  = (w_aw - w_done) < WRITES_OUT;
-    reg            w_busy;                // a row's beats are leaving
-    reg  [LW-1:0]  w_beat;
-    reg  [QW-1:0]  w_slot;
-    wire           wq_any  = (wq_head != wq_tail);
-    wire           aw_go   = wq_any && !w_busy && w_pair_ok && w_room
-                          && (!m_awvalid || m_awready);
+    wire           w_pair_ok = !g_pair || (g_ep != epoch) || ($signed(r_done - g_rcnt) >= 0);
+    wire           w_room  = (w_aw - w_done) < CW'(WRITES_OUT);
+    wire           wq_any  = wq_head != wq_tail;
+    wire           aw_go   = g_valid && !w_busy && !fill_w && w_pair_ok && w_room && (!m_awvalid || m_awready);
+    wire           g_load  = wq_any && (!g_valid || aw_go);
     wire           w_step  = w_busy && (!m_wvalid || m_wready);
+    wire           w_end   = w_step && (w_beat == w_len);
 
     // A beat of the held row, its mask's bytes.
     wire [DW-1:0]  wrow = wq_data[w_slot];
     wire [MW-1:0]  wmsk = wq_mask[w_slot];
-    reg  [511:0]   beat_d;
-    reg  [63:0]    beat_s;
-    always @* begin
-        beat_d = '0;
-        beat_s = '0;
-        for (int i = 0; i < 512; i++)
-            if (32'(w_beat) * 512 + i < DW)
-                beat_d[i] = wrow[32'(w_beat) * 512 + i];
-        for (int i = 0; i < 64; i++)
-            if (32'(w_beat) * 64 + i < DB)
-                beat_s[i] = wmsk[(32'(w_beat) * 64 + i) / GROUP];
+    // The row padded to whole beats, its mask as byte enables.
+    wire [BEATS*512-1:0] wrow_p = (BEATS*512)'(wrow);
+    wire [BEATS*64-1:0]  wbytes;
+    for (genvar j = 0; j < BEATS * 64; j++) begin : g_bytes
+        if (j < DB) begin : g_in
+            assign wbytes[j] = wmsk[j / GROUP];
+        end else begin : g_pad
+            assign wbytes[j] = 1'b0;
+        end
     end
+    wire [511:0]   beat_d = wrow_p[32'(w_beat) * 512 +: 512];
+    wire [63:0]    beat_s = wbytes[32'(w_beat) * 64 +: 64];
 
     // ---- zero fill (after a reset's drain): 4 KiB bursts of zeros.
-    reg  [5:0]     fill_beat;
-    reg            fill_w;                // a fill burst's beats are leaving
-    wire           fill_aw = filling && draining && !w_busy && !fill_w && !wq_any && w_room
+    wire           fill_aw = filling && draining && !g_valid && !wq_any && !w_busy && !fill_w && w_room
                           && (!m_awvalid || m_awready) && (fill_at < bytes);
 
     assign m_bready = 1'b1;
     assign busy     = draining;
+
+    always @(posedge clk) begin
+        if (g_load) begin
+            g_addr <= wh[WQW-1 -: OW];
+            g_len  <= wh[WQW-OW-1 -: LW];
+            g_pair <= wh[CW+4];
+            g_ep   <= wh[CW +: 4];
+            g_rcnt <= wh[CW-1:0];
+            g_slot <= wq_head[QW-1:0];
+        end
+    end
 
     always @(posedge clk) begin
         // samples of the write count
@@ -305,14 +324,18 @@ module foldsim_vport #(
         end
         if (take_rd) begin rq_tail <= rq_tail + 1'b1; r_in <= r_in + 1'b1; end
         if (take_wr) begin wq_tail <= wq_tail + 1'b1; w_taken <= w_taken + 1'b1; end
+        // the read head
+        if (h_load) rq_head <= rq_head + 1'b1;
+        if (h_load) h_valid <= 1'b1;
+        else if (ar_go) h_valid <= 1'b0;
         // AR
         if (m_arvalid && m_arready) m_arvalid <= 1'b0;
         if (ar_go) begin
             m_arvalid <= 1'b1;
-            rq_head   <= rq_head + 1'b1;
             of_tail   <= of_tail + 1'b1;
             r_taken   <= r_taken + 1'b1;
         end
+        r_out <= r_out + CW'(ar_go) - CW'(r_last_beat);
         // R
         if (m_rvalid) begin
             r_beat <= r_last_beat ? '0 : r_beat + 1'b1;
@@ -322,18 +345,22 @@ module foldsim_vport #(
                 if (stale != 0) stale <= stale - 1'b1;
             end
         end
+        // the write head
+        if (g_load) wq_head <= wq_head + 1'b1;
+        if (g_load) g_valid <= 1'b1;
+        else if (aw_go) g_valid <= 1'b0;
         // AW / W
         if (m_awvalid && m_awready) m_awvalid <= 1'b0;
         if (aw_go) begin
             m_awvalid <= 1'b1;
-            m_awaddr  <= base_q + 64'({wh_addr, 6'b0});
-            m_awlen   <= 8'(wh_len);
+            m_awaddr  <= base_q + 64'({g_addr, 6'b0});
+            m_awlen   <= 8'(g_len);
             w_busy    <= 1'b1;
             w_beat    <= '0;
-            w_slot    <= wq_head[QW-1:0];
+            w_len     <= g_len;
+            w_slot    <= g_slot;
             w_aw      <= w_aw + 1'b1;
         end else if (fill_aw) begin
-            w_aw      <= w_aw + 1'b1;
             m_awvalid <= 1'b1;
             m_awaddr  <= base_q + fill_at;
             m_awlen   <= 8'd63;
@@ -341,18 +368,16 @@ module foldsim_vport #(
             fill_beat <= '0;
             fill_at   <= fill_at + 64'd4096;
             w_taken   <= w_taken + 1'b1;
+            w_aw      <= w_aw + 1'b1;
         end
         if (m_wvalid && m_wready) m_wvalid <= 1'b0;
         if (w_step) begin
             m_wvalid <= 1'b1;
             m_wdata  <= beat_d;
             m_wstrb  <= beat_s;
-            m_wlast  <= (w_beat == wh_len);
+            m_wlast  <= (w_beat == w_len);
             w_beat   <= w_beat + 1'b1;
-            if (w_beat == wh_len) begin
-                w_busy  <= 1'b0;
-                wq_head <= wq_head + 1'b1;
-            end
+            if (w_end) w_busy <= 1'b0;
         end else if (fill_w && (!m_wvalid || m_wready)) begin
             m_wvalid  <= 1'b1;
             m_wdata   <= '0;
@@ -364,24 +389,26 @@ module foldsim_vport #(
         if (m_bvalid) w_done <= w_done + 1'b1;
         // Drain (reset / move): done once every queue is empty and every
         // transaction answered; then (reset) the fill; then free.
-        if (draining && rq_head == rq_tail && wq_head == wq_tail && !w_busy && !fill_w
-                && r_taken == r_done && w_aw == w_done && !m_arvalid && !m_awvalid && !m_wvalid
+        if (draining && !rq_any && !h_valid && !wq_any && !g_valid && !w_busy && !fill_w
+                && r_out == 0 && w_aw == w_done && !m_arvalid && !m_awvalid && !m_wvalid
                 && !(filling && fill_at < bytes)) begin
             filling  <= 1'b0;
             draining <= 1'b0;
             base_q   <= base;
         end
-        rd_free <= draining ? '0 : FW'(QUEUE - 32'(rq_tail - rq_head) - (take_rd ? 1 : 0) + (ar_go ? 1 : 0));
-        wr_free <= draining ? '0 : FW'(QUEUE - 32'(wq_tail - wq_head) - (take_wr ? 1 : 0)
-                                       + ((w_step && w_beat == wh_len) ? 1 : 0));
-        // Reset: drop the reads not yet on AR (and their answers to come),
-        // keep the writes (they reach memory before the fill); a move keeps
-        // everything and only drains.
+        // Room, from registers (a cycle conservative): the queue's entries,
+        // its head register, this cycle's intake.
+        rd_free <= draining ? '0 : FW'(QUEUE - 32'(rq_tail - rq_head) - 32'(h_valid) - 32'(take_rd));
+        wr_free <= draining ? '0 : FW'(QUEUE - 32'(wq_tail - wq_head) - 32'(g_valid) - 32'(take_wr));
+        // Reset: drop the reads not yet on AR (and the answers to those on
+        // AXI), keep the writes (they reach memory before the fill); a move
+        // keeps everything and only drains.
         if (reset) begin
             rq_head   <= rq_tail;
-            r_in      <= r_taken + CW'(ar_go);
+            h_valid   <= 1'b0;
+            stale     <= r_out - CW'(r_last_beat);
+            r_in      <= r_taken;
             epoch     <= epoch + 1'b1;
-            stale     <= r_taken + CW'(ar_go) - r_done - CW'(r_last_beat);
             draining  <= 1'b1;
             filling   <= (ZERO_FILL != 0);
             fill_at   <= '0;
