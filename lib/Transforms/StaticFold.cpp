@@ -1007,6 +1007,8 @@ public:
   /// `ready-ahead`: the readiness's pending bits read a host cycle ahead
   /// into registers; the classes' bubble registers kept apart.
   bool readyAhead = false;
+  /// `room-ahead`: the controllers' room terms registered (two entries more).
+  bool roomAhead = false;
   unsigned deadInputs = 0, partlyDeadInputs = 0;
   uint64_t deadInputBits = 0;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
@@ -26472,7 +26474,8 @@ LogicalResult StaticFolder::buildSim() {
           virtualRoom(v.engine ? std::max<unsigned>(pageEngines[v.k].delayed ? 1 : 0,
                                                     pageEngines[v.k].delay)
                       : !v.stream && classes[v.cls].virtualMemories[v.k].delayed);
-      // (`vport-engines`: the port's read and write room, each.)
+      // (`vport-engines`: the port's read and write room, each; not
+      // registered by `room-ahead`.)
       if (v.vport) {
         for (unsigned j : {6u, 7u})
           terms.push_back(comb::ICmpOp::create(
@@ -26480,9 +26483,20 @@ LogicalResult StaticFolder::buildSim() {
               constant(16, j == 7 && !pageEngines[v.k].images.empty() ? 2 * room : room)));
         continue;
       }
-      terms.push_back(comb::ICmpOp::create(
-          b, comb::ICmpPredicate::uge, body->getArgument(v.firstInput + 3),
-          constant(kVirtualFreeWidth, room)));
+      // `room-ahead`: the room as `free` showed it a host cycle before,
+      // registered: free has since lost at most that host cycle's decision's
+      // requests (a read and a write), so the register asks for two more
+      // (it may only wait longer). `free` comes from the kernel's controller,
+      // which may sit anywhere: its compare stays off the decision's path.
+      Value free = body->getArgument(v.firstInput + 3);
+      if (roomAhead)
+        terms.push_back(resetReg(
+            comb::ICmpOp::create(b, comb::ICmpPredicate::uge, free,
+                                 constant(kVirtualFreeWidth, room + 2)),
+            "vroom_ahead" + Twine(&v - simVirtuals.data()), 0));
+      else
+        terms.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge, free,
+                                             constant(kVirtualFreeWidth, room)));
     }
     // An HBM link stream's landing at the position: the next slots to land
     // (as many as the landings decided and not yet run) answered. Those are
@@ -28307,6 +28321,7 @@ void FoldStaticPass::runOnOperation() {
   folder.dropDeadInputs = dropDeadInputs;
   folder.lookaheadTables = lookaheadTables;
   folder.readyAhead = readyAhead;
+  folder.roomAhead = roomAhead;
   folder.affineSlots = affineSlots;
   folder.affineAuto = affineAuto;
   folder.affineAutoBits = affineAutoBits;

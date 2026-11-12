@@ -1149,6 +1149,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "register is kept apart (not merged with the other classes'), "
            "next to its slot tables. The same values: no schedule or host "
            "cycle moves">,
+    Option<"roomAhead", "room-ahead", "bool", "false",
+           "With virtual memories: each controller's room term of the frame "
+           "decision (its `free` at least the requests the decisions in "
+           "flight may issue) registered, from `free` a host cycle before and "
+           "two entries more (that host cycle's decision's read and write): "
+           "the kernel's `free` stays off the decision's path. Exact (a "
+           "position may only wait longer); host cycles move only while a "
+           "controller is within two entries of full, and once after reset">,
     Option<"dropDeadInputs", "drop-dead-inputs", "bool", "true",
            "A model input its body never reads (left over from a class cut: "
            "its bits go to a sibling class directly) takes no link, no "

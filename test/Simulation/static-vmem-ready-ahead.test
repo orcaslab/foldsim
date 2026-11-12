@@ -34,3 +34,14 @@
 # RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=1 +hi=30 +bubble=95 +burst=16 +stall=10 | FileCheck %s
 # FAST: {{^}}MATCH 196 cycles in 2000 host cycles, H 10.00
 # CHECK: {{^}}MATCH
+# --room-ahead: each controller's room term registered from `free` a host cycle
+# before, two entries more. Exact; it may add host cycles near a full
+# controller (and one after reset).
+# RUN: foldsim --srcs %S/../Driver/Inputs/vmem/top.f --top Top --out %t/room --static --virtual-memories ram --ready-ahead --room-ahead Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=ROOM < %t/room/foldsim_sim.mlir
+# ROOM: %vroom_ahead0 = seq.firreg {{%[^ ]+}} clock %hostClock reset sync %hostReset
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/room/obj %S/Inputs/tb_vmem.sv %S/../Driver/Inputs/vmem/top.sv %t/room/foldsim_sim.sv > %t/room/build.log 2>&1
+# RUN: %t/room/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=ROOMFAST
+# RUN: %t/room/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | FileCheck %s
+# RUN: %t/room/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=30 +full=60 +stall=20 | FileCheck %s
+# ROOMFAST: {{^}}MATCH 196 cycles in 2001 host cycles, H 10.01
