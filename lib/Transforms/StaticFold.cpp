@@ -15709,6 +15709,13 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     if (mergeLanes && !vm.laneBits) {
       unsigned bytes = bytesOf(memory);
       for (auto other : ArrayRef(candidates).drop_front(i + 1)) {
+        // (A lane's mask bits each enable whole bytes of it, as the row's
+        // byte enables take them: a lane of narrower enables stays a memory
+        // of its own, padded (laneBits).)
+        unsigned otherMask = other.getType().getMaskWidth().value_or(1);
+        if (otherMask > 1 && (other.getType().getWidth() % otherMask ||
+                              (other.getType().getWidth() / otherMask) % 8))
+          continue;
         if (merged.contains(other) || (bytes + bytesOf(other)) * 8 > 4096 ||
             hbmFold(memory) || hbmFold(other) || !sameRam(memory, other))
           continue;
