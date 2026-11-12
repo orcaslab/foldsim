@@ -18993,18 +18993,21 @@ static Value hostClockOf(Value v) {
 /// register beside each position register, its next value's decoder read at
 /// the position a host cycle before (PosCounters::ahead).
 static Value tableAhead(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
-                        unsigned width, ArrayRef<uint8_t> care) {
+                        unsigned width, ArrayRef<uint8_t> care, bool raw = false) {
   auto *pc = foldsim::currentPosCounters();
+  // (`raw`: the shifted rows a constant too, as the table was.)
   auto decode = [&](Value pos, ArrayRef<uint64_t> rr, ArrayRef<uint8_t> rc) -> Value {
-    bool outer = gAheadBusy;
+    bool outer = gAheadBusy, outerRaw = gTableRaw;
     gAheadBusy = true;
+    gTableRaw = outerRaw || raw;
     Value v = tableCare(b, pos, rr, rc, width);
     gAheadBusy = outer;
+    gTableRaw = outerRaw;
     return v;
   };
   uint64_t key = llvm::hash_combine(llvm::hash_combine_range(rows.begin(), rows.end()),
                                     llvm::hash_combine_range(care.begin(), care.end()), width,
-                                    uint64_t(0xa4eadull));
+                                    raw, uint64_t(0xa4eadull));
   return pc->ahead(b, index, rows, width, key, decode, care);
 }
 
@@ -19162,6 +19165,32 @@ static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> 
       ++st.factored;
       st.factoredBits += (uint64_t(1) << indexWidth) * width;
       return comb::MuxOp::create(b, hit, v, hw::ConstantOp::create(b, type, 0));
+    }
+    // slot-ahead: a position table kept as a constant (no decoder) read
+    // from a register loaded a host cycle ahead too: its next value reads
+    // the constant of the rows shifted by one at the position, which
+    // replaces this read (the same constant bits), so the constant's
+    // multiplexers no longer chain into the reader.
+    if (gSlotAhead && !gAheadBusy && counted && !gFactoring) {
+      if (getenv("FOLDSIM_TABLE_SITES"))
+        llvm::errs() << "table-ahead-kept " << site << " " << rows.size() << " " << width << "\n";
+      Value r = tableAhead(b, index, rows, width, care, /*raw=*/true);
+      if (getenv("FOLDSIM_SLOT_CHECK"))
+        if (Value clk = hostClockOf(index)) {
+          gTableRaw = true;
+          Value raw = table(b, index, rows, width, site);
+          Value ne = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, r, raw);
+          if (!care.empty()) {
+            SmallVector<uint64_t> careRows(care.begin(), care.end());
+            ne = comb::AndOp::create(b, ne, table(b, index, careRows, 1, site));
+          }
+          gTableRaw = false;
+          slotCheckFatal(b, clk, ne,
+                         ("foldsim: slot-ahead: a register differs from its kept table (line " +
+                          Twine(site) + ", " + Twine(rows.size()) + " x " + Twine(width) + ")")
+                             .str());
+        }
+      return r;
     }
     auto segs = foldsim::slotSegments(rows, width);
     foldsim::countFallback(indexWidth, width, segs.size());

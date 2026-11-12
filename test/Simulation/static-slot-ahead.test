@@ -27,6 +27,14 @@
 # RUN: FileCheck %s --check-prefix=SIM < %t/k/foldsim_sim.mlir
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/k -DBUBBLES -Mdir %t/k/obj %S/Inputs/tb_pages.sv leaf.sv top128.sv %t/k/foldsim_sim.sv > %t/k/build.log 2>&1
 # RUN: %t/k/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# K 64: no decoder is that large; a position table kept as a constant (it does
+# not decode in K segments) is such a register too, its next value the
+# constant of the shifted rows at the position (replacing the read: the same
+# constant bits); checked and exact.
+# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_TABLE_SITES=1 FOLDSIM_PP_ROWS=balanced foldsim --srcs top128.f --top Top --out %t/kept --static --nest --modulo --bubbles --slot-segments 2 --slot-ahead 64 --state-in-ram Leaf::8 --state-in-ram-pp --storage Leaf:sir=block --state-scratch-bits 40000 --state-scratch-fixed Leaf > %t/kept.log 2>&1
+# RUN: FileCheck %s --check-prefix=KEPT < %t/kept.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/kept -DBUBBLES -Mdir %t/kept/obj %S/Inputs/tb_pages.sv leaf.sv top128.sv %t/kept/foldsim_sim.sv > %t/kept/build.log 2>&1
+# RUN: %t/kept/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
 # Virtual memories (the readiness's lookahead reads a NextFree position),
 # nested sequencers with bubbles, and without bubbles: checked and exact.
 # RUN: cd %S/../Driver/Inputs/vmem
@@ -47,6 +55,7 @@
 # LOG: {{[1-9][0-9]*}} read through a class's passes
 # SIM-DAG: %slotahead{{[0-9]+}} = seq.firreg
 # SIM-DAG: %posrank{{[0-9]+}} = seq.firreg
+# KEPT: table-ahead-kept
 # VSIM: %slotahead{{[0-9]+}} = seq.firreg
 # OFF-NOT: slotahead
 # CHECK-NOT: slot-ahead
