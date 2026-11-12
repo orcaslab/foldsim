@@ -26,6 +26,14 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/c -Mdir %t/c/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/c/foldsim_sim.sv > %t/c/build.log 2>&1
 # RUN: %t/c/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
 # RUN: %t/c/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=1 +hi=600 +bubble=90 +burst=8 +stall=20 | FileCheck %s
+# SLR groups (--vmem-slr-groups): each static port its page engine's group (FOLDSIM_VPORT<p>_SLR), for the
+# kernel's masters by SLR (vmem_ports.py).
+# RUN: foldsim --srcs top.f --top Top --out %t/g --static --modulo --min-ii 160 --virtual-memories '(Narrow|Wide):.*' --page-engines 16 --vmem-on-engines --vport-engines --vport-hz 8 --vmem-slr-groups 'Narrow:0,Wide:1' Narrow Wide > %t/g.log 2>&1
+# RUN: FileCheck %s --check-prefix=G < %t/g/foldsim_sim.vh
+# G: {{^}}`define FOLDSIM_VPORTS 2{{$}}
+# G: {{^}}`define FOLDSIM_VPORT0_SLR 0{{$}}
+# G-NEXT: {{^}}`define FOLDSIM_VPORT1_SLR 1{{$}}
+# G-NEXT: {{^}}`define FOLDSIM_VMEM_SLR_NAMES "SLR2 SLR1 SLR0"{{$}}
 # FF: {{^}}`define FOLDSIM_VPORTS 2{{$}}
 # FF: {{^}}`define FOLDSIM_VPORT0_DW 8{{$}}
 # FF: {{^}}`define FOLDSIM_VPORT1_DW 600{{$}}

@@ -35,6 +35,15 @@
 # RUN: %t/rule/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=1 +hi=30 +stall=20 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/keep --static --fold-store-hbm 1 --state-scratch-bits 0 --storage Leaf:fold1_store=distributed Leaf > %t/keep.log 2>&1
 # RUN: FileCheck %s --check-prefix=KEEP < %t/keep.log
+# --vmem-cost weighs only the memories the pattern picks: the fold stores in
+# HBM stay virtual memories (it kept them on chip, 8 LUT < 159, while the folds
+# still issued to HBM: foldsim-opt crashed in buildCopy, 11-12).
+# RUN: foldsim --srcs top.f --top Top --out %t/cost --static --fold-store-hbm 1 --state-scratch-bits 0 --vmem-cost Leaf > %t/cost.log 2>&1
+# RUN: FileCheck %s --check-prefix=COST --implicit-check-not='_store kept on chip' < %t/cost.log
+# RUN: python3 %S/Inputs/vmem_bind.py %t/cost/foldsim_sim.json %t/cost
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -I%t/cost --top-module tb -Mdir %t/cost/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/cost/foldsim_sim.sv > %t/cost/build.log 2>&1
+# RUN: %t/cost/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# COST: fold-store-hbm: Leaf: 2 stores, 224 bits in HBM
 # ALL: fold-store-hbm: Leaf: 2 stores, 224 bits in HBM; landing and read buffers 128 bits on chip
 # IR-DAG: %fold0_store_landing = seq.firmem 1, 1, old, undefined : <4 x 8
 # IR-DAG: seq.firmem.write_port %fold0_store_landing[{{.*}}] = %fold0_wdata, clock %hostClock enable %fold0_valid{{[0-9]+}}

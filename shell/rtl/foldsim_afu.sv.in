@@ -939,9 +939,40 @@ module foldsim_afu #(
 `endif
 
 `ifdef FOLDSIM_VMEM_MASTERS
-    // Master j: controllers j, j + M, j + 2M, ... Each controller has at
-    // most VMEM_WRITES_OUT writes and VMEM_ID_READS reads per id in flight.
+    // Master j: the controllers foldsim_kernel.vh puts on it
+    // (FOLDSIM_VMEM_MASTER_OF, controller k's master: vmem_ports.py's masters
+    // by SLR group), else controllers j, j + M, j + 2M, ... Each controller
+    // has at most VMEM_WRITES_OUT writes and VMEM_ID_READS reads per id in
+    // flight.
     localparam VMEM_M = `FOLDSIM_VMEM_MASTERS;
+`ifdef FOLDSIM_VMEM_MASTER_OF
+    localparam int VMEM_MASTER_OF [VMEM_N] = '{`FOLDSIM_VMEM_MASTER_OF};
+`endif
+    function automatic int vmem_master_of(input int k);
+`ifdef FOLDSIM_VMEM_MASTER_OF
+        vmem_master_of = VMEM_MASTER_OF[k];
+`else
+        vmem_master_of = k % VMEM_M;
+`endif
+    endfunction
+    // The controllers on master j, and the i-th of them (in controller order).
+    function automatic int vmem_sharers(input int j);
+        vmem_sharers = 0;
+        for (int k = 0; k < VMEM_N; ++k)
+            if (vmem_master_of(k) == j)
+                vmem_sharers = vmem_sharers + 1;
+    endfunction
+    function automatic int vmem_sharer(input int j, input int i);
+        int n;
+        n = 0;
+        vmem_sharer = 0;
+        for (int k = 0; k < VMEM_N; ++k)
+            if (vmem_master_of(k) == j) begin
+                if (n == i)
+                    vmem_sharer = k;
+                n = n + 1;
+            end
+    endfunction
     wire                 vmm_awvalid [VMEM_M], vmm_awready [VMEM_M];
     wire [63:0]          vmm_awaddr  [VMEM_M];
     wire [VMEM_ID_W-1:0] vmm_awid    [VMEM_M];
@@ -959,7 +990,10 @@ module foldsim_afu #(
     wire [511:0]         vmm_rdata   [VMEM_M];
     wire [VMEM_ID_W-1:0] vmm_rid     [VMEM_M];
     for (genvar j = 0; j < VMEM_M; ++j) begin : g_vmem_master
-        localparam G = (VMEM_N - j + VMEM_M - 1) / VMEM_M;
+        localparam G = vmem_sharers(j);
+        if (G == 0) begin : g_unused
+            $error("foldsim_afu: virtual-memory master %0d has no controller", j);
+        end
         wire                 s_awvalid [G], s_awready [G];
         wire [63:0]          s_awaddr  [G];
         wire [VMEM_ID_W-1:0] s_awid    [G];
@@ -977,7 +1011,7 @@ module foldsim_afu #(
         wire [511:0]         s_rdata   [G];
         wire [VMEM_ID_W-1:0] s_rid     [G];
         for (genvar i = 0; i < G; ++i) begin : g_ctrl
-            localparam K = j + i * VMEM_M;
+            localparam K = vmem_sharer(j, i);
             assign s_awvalid[i] = vmc_awvalid[K];
             assign vmc_awready[K] = s_awready[i];
             assign s_awaddr[i]  = vmc_awaddr[K];

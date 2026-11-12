@@ -1,0 +1,83 @@
+# REQUIRES: verilator
+# The kernel's virtual-memory masters by SLR group (foldsim --vmem-slr-groups,
+# flow/v80/vmem_ports.py). Every HBM NoC entry of the V80 shell is in SLR2, so a
+# controller's master is the wire that crosses: the masters are split over the
+# controllers' SLR groups by port bits (as foldsim_sll_check --vmem-engines slr
+# prices them), each group's controllers on its own masters, and the
+# floorplan puts each controller and each master's share in its group's SLR.
+#
+# The driver: each page engine's group (its members', a link stream its
+# reader's) in foldsim_sim.vh (FOLDSIM_VMEM_<k>_SLR) and foldsim_sim.json, with
+# the region's SLR names.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/linkhbm
+# RUN: foldsim --srcs top.f --top Top --out %t/grp --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --min-ii 160 --page 1 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm --vmem-slr-groups Unit:0,Reader:1 Unit Reader > %t/grp.log 2>&1
+# RUN: FileCheck %s --check-prefix=DRV < %t/grp/foldsim_sim.vh
+# RUN: python3 -c "import json,sys; print([v['slr_group'] for v in json.load(open(sys.argv[1]))['vmem']])" %t/grp/foldsim_sim.json | FileCheck %s --check-prefix=JSON
+# DRV: `define FOLDSIM_VMEM_0_SLR 0
+# DRV-NEXT: `define FOLDSIM_VMEM_1_SLR 1
+# DRV-NEXT: `define FOLDSIM_VMEM_SLR_NAMES "SLR2 SLR1 SLR0"
+# JSON: [0, 1]
+#
+# vmem_ports.py on six groups (Inputs/vmem-slr/foldsim_sim.vh: G0, G1 in SLR
+# group 0 with 2,056 and 1,032 port bits, G2, G3 in 1, G4 in 2, G5 unnamed): 5
+# masters split 2/1/1/1 (group 0 by weight; at least one a group), numbered
+# group by group; each controller's port its master's.
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/vmem-slr/foldsim_sim.vh --mem-ports 1 --vmem-masters 5 > %t/k5.vh
+# RUN: FileCheck %s --check-prefix=M5 < %t/k5.vh
+# M5: `define FOLDSIM_VMEM_REPEAT(f,s) `f(1, 0) `s `f(2, 1) `s `f(3, 2) `s `f(3, 3) `s `f(4, 4) `s `f(5, 5)
+# M5: `define FOLDSIM_VMEM_MASTERS 5
+# M5-NEXT: `define FOLDSIM_VMEM_MASTER_REPEAT(f,s) `f(1, 0) `s `f(2, 1) `s `f(3, 2) `s `f(4, 3) `s `f(5, 4)
+# M5-NEXT: `define FOLDSIM_VMEM_MASTER_OF 0, 1, 2, 2, 3, 4
+# M5-NEXT: `define FOLDSIM_VMEM_MASTER_SLR 0, 0, 1, 2, -1
+# Fewer masters than groups: one a group (4), the linker's count with them.
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/vmem-slr/foldsim_sim.vh --mem-ports 1 --vmem-masters 2 | FileCheck %s --check-prefix=M2
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/vmem-slr/foldsim_sim.vh --mem-ports 1 --vmem-masters 2 --masters | FileCheck %s --check-prefix=M2N
+# M2: `define FOLDSIM_VMEM_MASTERS 4
+# M2: `define FOLDSIM_VMEM_MASTER_OF 0, 0, 1, 1, 2, 3
+# M2-NEXT: `define FOLDSIM_VMEM_MASTER_SLR 0, 1, 2, -1
+# M2N: {{^}}5{{$}}
+# One master each (the default): no sharing, no map.
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/vmem-slr/foldsim_sim.vh --mem-ports 1 | FileCheck %s --check-prefix=ONE
+# ONE-NOT: MASTER
+#
+# The floorplan: each named group's controller and each master's share in its
+# group's SLR; the unnamed group's left to the placer.
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/vmem-slr/foldsim_sim.vh --mem-ports 1 --vmem-masters 5 --floorplan | FileCheck %s --check-prefix=FP
+# FP: set c [get_cells -quiet -hierarchical -regexp {.*/g_vg0[./](g_vp[./])?(vmem|group|vport)$}]
+# FP-NEXT: if {[llength $c] == 1} { set_property USER_SLR_ASSIGNMENT SLR2 $c }
+# FP: g_vg3[./]
+# FP-NEXT: USER_SLR_ASSIGNMENT SLR1
+# FP: g_vg4[./]
+# FP-NEXT: USER_SLR_ASSIGNMENT SLR0
+# FP-NOT: g_vg5
+# FP: {.*/g_vmem_master\[0\][./]share$}
+# FP-NEXT: USER_SLR_ASSIGNMENT SLR2
+# FP: {.*/g_vmem_master\[2\][./]share$}
+# FP-NEXT: USER_SLR_ASSIGNMENT SLR1
+# FP: {.*/g_vmem_master\[3\][./]share$}
+# FP-NEXT: USER_SLR_ASSIGNMENT SLR0
+# FP-NOT: g_vmem_master\[4\]
+#
+# The kernel top's own sharing (foldsim_afu.sv.in's masters section, elaborated
+# by Verilator): master j takes the controllers FOLDSIM_VMEM_MASTER_OF puts on
+# it, in order; without the map, controllers j, j + M, ...
+# RUN: python3 %S/Inputs/vmem-slr/afu_masters.py %S/../../shell/rtl/foldsim_afu.sv.in %t/k5.vh 6 %t/tb5.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --prefix Vtb -Mdir %t/o5 %t/tb5.sv > %t/b5.log 2>&1
+# RUN: %t/o5/Vtb | FileCheck %s --check-prefix=AFU5
+# AFU5: master 0 sharer 0: controller 0 of 1
+# AFU5-NEXT: master 1 sharer 0: controller 1 of 1
+# AFU5-NEXT: master 2 sharer 0: controller 2 of 2
+# AFU5-NEXT: master 2 sharer 1: controller 3 of 2
+# AFU5-NEXT: master 3 sharer 0: controller 4 of 1
+# AFU5-NEXT: master 4 sharer 0: controller 5 of 1
+# RUN: grep -v '_SLR' %S/Inputs/vmem-slr/foldsim_sim.vh > %t/noslr.vh
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %t/noslr.vh --mem-ports 1 --vmem-masters 4 > %t/k4.vh
+# RUN: python3 %S/Inputs/vmem-slr/afu_masters.py %S/../../shell/rtl/foldsim_afu.sv.in %t/k4.vh 6 %t/tb4.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --prefix Vtb -Mdir %t/o4 %t/tb4.sv > %t/b4.log 2>&1
+# RUN: %t/o4/Vtb | FileCheck %s --check-prefix=AFU4
+# AFU4: master 0 sharer 0: controller 0 of 2
+# AFU4-NEXT: master 0 sharer 1: controller 4 of 2
+# AFU4-NEXT: master 1 sharer 0: controller 1 of 2
+# AFU4-NEXT: master 1 sharer 1: controller 5 of 2
+# AFU4-NEXT: master 2 sharer 0: controller 2 of 1
+# AFU4-NEXT: master 3 sharer 0: controller 3 of 1

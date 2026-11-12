@@ -16435,7 +16435,10 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       // than whole bytes is padded to them (laneBits).
       if (maskWidth > 1 && width % maskWidth)
         return memory.emitError("a virtual memory's mask lanes are not equal");
-      if (vmemCost) {
+      // (`vmem-cost` weighs the memories the pattern picked: a fold store in
+      // HBM is the fold's own, its landing ring and issues built for it, and
+      // stays a virtual memory.)
+      if (vmemCost && !hbmFold(memory)) {
         uint64_t ml = 0, cl = 0;
         if (vmemOnChipCheaper(type.getDepth(), width, threads, ml, cl)) {
           llvm::errs() << "foldsim-fold-static: vmem-cost: " << cls.name << ":" << memName << " kept on chip (" << cl << " LUT < " << ml << " as a virtual memory)\n";

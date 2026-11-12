@@ -27,6 +27,11 @@
 # RUN: grep -o 'hw.instance "vport[0-9]*" @foldsim_vport' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=N4
 # RUN: grep -o 'hw.instance "g_vmem_master_[0-9]*.share" @foldsim_vmem_share' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=N3
 # RUN: not grep -q hbm_clk %t/afu.mlir
+# SLR groups (foldsim --vmem-slr-groups: FOLDSIM_VPORT<p>_SLR, a port its page engine's group): the
+# masters split by group count the ports, each port on a master of its group; the floorplan places vport<p>.
+# RUN: mkdir -p %t/slr && cp %t/gen/foldsim_sim.vh %t/gen/foldsim_sim.sv %t/gen/foldsim_sim.json %t/slr/ && cat %S/Inputs/flow/vport_slr.vh >> %t/slr/foldsim_sim.vh
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %t/slr/foldsim_sim.vh --mem-ports 1 --vmem-masters 4 | FileCheck %s --check-prefix=SLR
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %t/slr/foldsim_sim.vh --mem-ports 1 --vmem-masters 4 --floorplan | FileCheck %s --check-prefix=FP
 # Ports alone.
 # RUN: python3 %S/Inputs/flow/vport_stub.py 2 %t/g2
 # RUN: python3 %foldsim_tools/foldsim_flow.py kernel-vh --manifest %t/plain.toml --gen %t/g2 -o %t/g2/foldsim_kernel.vh
@@ -72,6 +77,14 @@
 # TOP2-NEXT: {{^}}localparam VMEM_CTRLS = VMEM_MEMS + 2;
 # TOP2-NOT: {{foldsim_vmem |foldsim_vport_ctl}}
 # TOP2: {{^}}vp1_base <= vmem_base + VMEM_MEM_BYTES + 64'h10000000;
+# SLR: {{^}}`define FOLDSIM_VMEM_REPEAT(f,s) `f(1, 0) `s `f(2, 1){{$}}
+# SLR: {{^}}`define FOLDSIM_VMEM_MASTERS 4{{$}}
+# SLR: {{^}}`define FOLDSIM_VMEM_MASTER_OF 0, 1, 2, 0, 3, 1{{$}}
+# SLR-NEXT: {{^}}`define FOLDSIM_VMEM_MASTER_SLR 0, 1, 1, 2{{$}}
+# FP: {{^}}set c [get_cells -quiet -hierarchical -regexp {.*/vport0$}]{{$}}
+# FP-NEXT: {{^}}if {[llength $c] == 1} { set_property USER_SLR_ASSIGNMENT SLR1 $c }{{$}}
+# FP: {{^}}set c [get_cells -quiet -hierarchical -regexp {.*/vport2$}]{{$}}
+# FP-NEXT: {{^}}if {[llength $c] == 1} { set_property USER_SLR_ASSIGNMENT SLR0 $c }{{$}}
 # (Only the kernel's own two warnings.)
 # LINT: %Warning-DECLFILENAME: Filename 'foldsim_token'
 # LINT-NEXT: %Warning-UNUSEDSIGNAL: Signal is not used: 'advance'
