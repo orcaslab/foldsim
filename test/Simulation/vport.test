@@ -20,6 +20,9 @@
 # RUN: %t/wide/Vtb +verilator+seed+16 +hi=600 +stall=70 +wr=95 +cycles=30000 | FileCheck %s
 # Fence class 2 at its least distance: reads of rows written exactly 3 * 2^FS host cycles before.
 # RUN: %t/wide/Vtb +verilator+seed+17 +hi=40 +far=1 +edge=50 +stall=20 | FileCheck %s
+# Writes of part of a row (a member's slice): bursts cover only the beats with a byte enabled.
+# RUN: %t/wide/Vtb +verilator+seed+18 +hi=40 +sparse=60 +trim=1 | FileCheck %s
+# RUN: %t/wide/Vtb +verilator+seed+19 +hi=60 +sparse=50 +stall=20 +resets=3 +trim=1 | FileCheck %s
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=512 -GCYCLES=12000 -Mdir %t/beat %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/beat.log 2>&1
 # RUN: %t/beat/Vtb +verilator+seed+4 +hi=100 +far=1 | FileCheck %s
 # RUN: %t/beat/Vtb +verilator+seed+5 +hi=600 +resets=4 +cycles=30000 | FileCheck %s
@@ -65,6 +68,7 @@
 # RUN: %t/acopy/Vtb +verilator+seed+30 +sp=2500 +mp=1250 +hi=80 +copy=40 +stall=20 +resets=3 +far=1 | FileCheck %s
 # RUN: %t/acopy/Vtb +verilator+seed+31 +sp=2511 +mp=1777 +hi=60 +copy=30 +seq=60 +stall=10 +far=1 | FileCheck %s
 # RUN: %t/acopy/Vtb +verilator+seed+32 +sp=1000 +mp=3000 +hi=600 +copy=30 +stall=30 +cycles=30000 | FileCheck %s
+# RUN: %t/acopy/Vtb +verilator+seed+33 +sp=2511 +mp=1777 +hi=60 +copy=30 +sparse=60 +stall=20 +resets=2 +trim=1 | FileCheck %s
 # The write number a read waits for handed in by its sender (NEED_IN: the
 # driver keeps each row's newest number from w_count), with bursts and copies.
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=1040 -GNEED_IN=1 -GCYCLES=12000 -Mdir %t/need %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/need.log 2>&1

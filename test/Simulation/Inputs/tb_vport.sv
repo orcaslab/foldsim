@@ -19,6 +19,9 @@
 // +wr=P: percent of issues with a write (50); +cycles=N: run length.
 // +wf=P (not with +far): P percent of a same-row read and write are a write-first pair
 // (rd_new: the read answers the new row; with +copy its copy takes the new row too).
+// +sparse=P: P percent of the writes enable one run of 0-23 mask bits only (a member's slice of a wide
+// row; the port's burst covers only the beats with a byte enabled); +trim=1 fails a burst of several
+// beats that starts or ends with no byte enabled (outside a fill).
 // +edge=P (with +far): P percent of the issues read the row written exactly
 // 3 * 2^FS host cycles before, the least distance class 2 covers.
 //
@@ -97,7 +100,7 @@ module tb;
         .m_rlast(m_rlast));
 
     reg stop = 0;
-    integer edgep = 0, wf = 0, wfs = 0;
+    integer edgep = 0, wf = 0, wfs = 0, sparse = 0, trim = 0;
     integer hi = 40, stall = 0, far = 0, resets = 0, seq = 0, copy = 0, merge = 0, wmerge = 0, clean = 0, wr = 50, cycles = CYCLES;
     integer errors = 0, reads = 0, answered = 0, writes = 0, pairs = 0, copies = 0, img_reads = 0;
     integer ar_beats = 0, aw_beats = 0, ars = 0, aws = 0, ar_out = 0, aw_out = 0, ar_max = 0, aw_max = 0, fill_aws = 0;
@@ -180,6 +183,19 @@ module tb;
             for (int k = 0; k < b.beats; ++k) begin
                 d.push_back(wbuf.pop_front());
                 s.push_back(sbuf.pop_front());
+            end
+            // (+trim=1: a burst of several 512-bit beats starts and ends with a byte enabled.)
+            if (trim && !stop && b.beats > 512 / AXW) begin
+                reg f0, l0, any;
+                f0 = (|s[0]) || (AXW < 512 && (|s[1]));
+                l0 = (|s[b.beats - 1]) || (AXW < 512 && (|s[b.beats - 2]));
+                any = 0;
+                for (int k = 0; k < b.beats; ++k) any = any || (|s[k]);
+                // (A burst with no byte at all is a void copy row after a reset.)
+                if (any && (!f0 || !l0)) begin
+                    if (errors < 5) $display("FAIL: a write burst of %0d beats at %h with no byte enabled at its %s", b.beats, b.addr, f0 ? "end" : "start");
+                    errors = errors + 1;
+                end
             end
             b_at.push_back(t); b_addr.push_back(b.addr); b_beats.push_back(b.beats);
             b_data.push_back(d); b_strb.push_back(s);
@@ -333,6 +349,16 @@ module tb;
                     if (i == INST - 1) seq_r = (seq_r + 1) % 4;
                 end
                 m = ($urandom % 2) ? '1 : MW'({$urandom, $urandom, $urandom, $urandom, $urandom});
+                if (sparse != 0) begin
+                    // (Nested: without +sparse the random stream is the one before it.)
+                    if (($urandom % 100) < sparse) begin
+                        // A member's slice: one run of mask bits (or none), anywhere in the row.
+                        int a, n;
+                        a = int'($urandom % MW); n = int'($urandom % 24);
+                        m = '0;
+                        for (int q = 0; q < n && a + q < MW; ++q) m[a + q] = 1'b1;
+                    end
+                end
                 for (int q = 0; q < DW; q += 32) d[q +: 32] = $urandom;
                 if (dr) begin
                     rd_need <= num[i][ir ? ROWS + k : r];
@@ -385,6 +411,8 @@ module tb;
         void'($value$plusargs("far=%d", far));
         void'($value$plusargs("edge=%d", edgep));
         void'($value$plusargs("wf=%d", wf));
+        void'($value$plusargs("sparse=%d", sparse));
+        void'($value$plusargs("trim=%d", trim));
         for (int q = 0; q < 64; ++q) h_v[q] = 0;
         void'($value$plusargs("resets=%d", resets));
         void'($value$plusargs("seq=%d", seq));
