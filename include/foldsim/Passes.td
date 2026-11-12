@@ -405,6 +405,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "its state pass and keeps each instance's read data from the "
            "responses; a slot whose instance's read has not been answered "
            "waits in a bubble, so the target's cycles never change">,
+    Option<"vmemEngines", "vmem-on-engines", "bool", "false",
+           "With page-engines: the class virtual memories (the target's RAMs; "
+           "not page columns, rings or a class with folded-store streams) ride "
+           "the page engines as members at their requests' own positions (each "
+           "instance's state pass, a host cycle later for a held read), first "
+           "fit on an engine of the same read-during-write order and row bytes "
+           "whose positions are free, else a new one: a static port per engine, "
+           "no controller and no member queue per memory. A copy's memories "
+           "requesting at one position take distinct engines">,
     Option<"vmemCost", "vmem-cost", "bool", "false",
            "A memory the virtual-memory rules pick (pattern or size) stays a "
            "virtual memory only where that costs fewer LUTs than keeping its "

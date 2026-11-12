@@ -31,8 +31,8 @@ module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1}
     output bit ok);
   localparam DEPTH = 8;
   typedef struct packed { logic rd, wr; logic [7:0] inst, winst; logic [7:0] rrow, wrow; logic [1023:0] data; logic [127:0] mask; } ent_t;
-  // Rows of up to 1024 bits; instances (the address's) below 256, rows below 64.
-  logic [1023:0] mem [N][256][64];
+  // Rows of up to 1024 bits; instances (the address's) below 256, rows below 256 (a page engine's rows {member, instance, row}).
+  logic [1023:0] mem [N][256][256];
   ent_t fifo [N][DEPTH];
   int head [N], cnt [N];
   bit outstanding [N][256], answered [N][256];
@@ -45,7 +45,7 @@ module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1}
       head[m] = 0; cnt[m] = 0;
       for (int i = 0; i < 256; i++) begin
         outstanding[m][i] = 0; answered[m][i] = 0;
-        for (int r = 0; r < 64; r++) mem[m][i][r] = 0;
+        for (int r = 0; r < 256; r++) mem[m][i][r] = 0;
       end
     end
   end

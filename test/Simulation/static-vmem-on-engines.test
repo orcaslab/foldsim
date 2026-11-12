@@ -1,0 +1,50 @@
+# REQUIRES: verilator
+# Target RAMs on page engines (--vmem-on-engines, foldsim-fold-static
+# vmem-on-engines): each virtual memory of a class copy (Driver/Inputs/
+# vmem_multi: four byte lanes, two RAMs at the lanes' address, RAMs of 32 x 16
+# and 8 x 26; write-first) rides an engine as a member, at its own positions
+# (each instance's state pass): no controller and no member queue of its own.
+# The engine's requests are its members' ORed; the placement keeps them in
+# distinct host cycles (a copy's memories at one position on distinct engines,
+# the other copy's at its own positions on the same ones), and the simulator
+# stops ($fatal, FOLDSIM_CHECKS or any simulation) if two members ever request
+# in one host cycle. Against the controllers' models (Inputs/tb_vmem_multi.sv:
+# an engine is one controller of rows {member, instance, row}), the static
+# simulator matches the target at response latencies of 1 to 600 host cycles,
+# stalled channels and a controller out of room: two copies, lanes merged,
+# nested sequencers, with --bubbles, and eight leaves in one copy.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_multi
+# RUN: foldsim --srcs top.f --top Top --out %t/two --static --virtual-memories 'Leaf:.*' --copies Leaf:2 --page-engines 16 --vmem-on-engines Leaf 2>&1 | FileCheck %s --check-prefix=TWO
+# TWO: vmem-on-engines: 16 virtual memories on page engines (8 new, 8 engines)
+# RUN: FileCheck %s --check-prefix=MON < %t/two/foldsim_sim.sv
+# MON: vmem-on-engines: two members of page engine
+# RUN: python3 %S/Inputs/vmem_bind.py %t/two/foldsim_sim.json %t/two
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/two --top-module tb -Mdir %t/two/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/two/foldsim_sim.sv > %t/two/build.log 2>&1
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=FAST
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/merged --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --copies Leaf:2 --page-engines 16 --vmem-on-engines Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/merged/foldsim_sim.json %t/merged
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/merged --top-module tb -Mdir %t/merged/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/merged/foldsim_sim.sv > %t/merged/build.log 2>&1
+# RUN: %t/merged/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 | FileCheck %s --check-prefix=FAST
+# RUN: %t/merged/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=60 +full=50 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/nest --static --virtual-memories 'Leaf:.*' --nest --page-engines 16 --vmem-on-engines Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/nest/foldsim_sim.json %t/nest
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/nest --top-module tb -Mdir %t/nest/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/nest/foldsim_sim.sv > %t/nest/build.log 2>&1
+# RUN: %t/nest/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/bub --static --virtual-memories 'Leaf:.*' --bubbles --copies Leaf:2 --page-engines 16 --vmem-on-engines Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/bub/foldsim_sim.json %t/bub
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/bub --top-module tb -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=30 +bubble=30 +stall=10 | FileCheck %s
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=1 +hi=600 +bubble=90 +burst=8 +stall=20 | FileCheck %s
+# Eight leaves (Top8): one copy evaluates eight instances a frame; its memories
+# at each instance's position, eight engines carry them.
+# RUN: foldsim --srcs top.f --top Top8 --out %t/eight --static --virtual-memories 'Leaf:.*' --page-engines 16 --vmem-on-engines Leaf 2>&1 | FileCheck %s --check-prefix=EIGHT
+# EIGHT: vmem-on-engines: 8 virtual memories on page engines (8 new, 8 engines)
+# RUN: python3 %S/Inputs/vmem_bind.py %t/eight/foldsim_sim.json %t/eight
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/eight --top-module tb -DTOP8 -Mdir %t/eight/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/eight/foldsim_sim.sv > %t/eight/build.log 2>&1
+# RUN: %t/eight/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +full=95 | FileCheck %s
+# RUN: %t/eight/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +lo=20 +hi=600 +full=80 +stall=20 | FileCheck %s
+# FAST: {{^}}MATCH 196 cycles in 2000 host cycles, H 10.00
+# CHECK-NOT: %Error
+# CHECK: {{^}}MATCH

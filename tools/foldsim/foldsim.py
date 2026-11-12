@@ -481,6 +481,8 @@ def frame_options(a):
         fold += f' link-hbm-lead={a.link_hbm_lead}'
     if getattr(a, 'page_engines_pp', False):
         fold += ' page-engines-pp'
+    if getattr(a, 'vmem_on_engines', False):
+        fold += ' vmem-on-engines'
     if getattr(a, 'pp_beat_bits', 0):
         fold += f' pp-beat-bits={a.pp_beat_bits}'
     if getattr(a, 'link_hbm_beat_bits', 0):
@@ -1788,6 +1790,10 @@ def build_parser():
     ap.add_argument('--pp-beat-bits', type=int, default=0, metavar='N',
                     help='with --page-engines-pp: streamed PP rows as beats of at most N bits, '
                          'drained from a row buffer (foldsim-fold-static pp-beat-bits)')
+    ap.add_argument('--vmem-on-engines', action='store_true',
+                    help='with --page-engines and --virtual-memories: the target RAMs ride the engines (static '
+                         'ports) at their own positions, no controller or member queue per memory '
+                         '(foldsim-fold-static vmem-on-engines)')
     ap.add_argument('--page-engines-pp', action='store_true',
                     help='with --page-engines and --state-in-ram-pp streamed rows: PP row chunks ride the engines '
                          '(foldsim-fold-static page-engines-pp)')
