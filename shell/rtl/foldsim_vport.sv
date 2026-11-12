@@ -49,7 +49,8 @@
 // simulator; it answers once, tag only (rsp_copied), when the copy's last
 // beat is in the queue. The copy's write slot is taken with the read (wr_free
 // counts it), so the copy leaves in request order and never waits behind a
-// later write. A read with rd_after_copies leaves only once every copy taken
+// later write; ahead of its own cycle's write, or (rd_new: the copy is of the
+// row that write makes) just after it. A read with rd_after_copies leaves only once every copy taken
 // before it has its B (a ring prefetch of the image the copies write).
 //
 // Room: rd_free / wr_free count the requests the port may still take (a copy
@@ -218,6 +219,8 @@ module foldsim_vport #(
     localparam BCW   = $clog2(WRB + 1) + 1;
     localparam DB    = DW / 8;
     localparam GROUP = DB / MW;
+    // Writes' bursts trimmed to their beats with a byte enabled (see intake).
+    localparam TRIM  = (BEATS > 1 && MW > 1 && MB == 0) ? 1 : 0;
     localparam H     = 512 / AXW;               // AXI beats a 512-bit beat
     localparam HB_   = (HZ > 0) ? HZ : 1;
     // Read-after-write by write numbers (the port's table or the sender's).
@@ -275,12 +278,21 @@ module foldsim_vport #(
     // rows in the data memory below (read on the AXI side).
     localparam WQF = OW + LW + 1 + 4 + CW + 1;
     localparam WQW = WQF - ((MAX_BURST > 1) ? 0 : 1);
-    reg  [WQW-1:0] wq_mem [QUEUE];
+    // (TRIM: the write's first beat in its row, stored above the fields.)
+    localparam WQS = WQW + ((TRIM != 0) ? LW : 0);
+    reg  [WQS-1:0] wq_mem [QUEUE];
     reg  [QW:0]    wq_head, wq_tail;
     // Slots the AXI side has read (its rows may be overwritten), in clk.
     wire [QW:0]    w_rel;
-    // A write's slot: after a copy read's slot taken in its cycle.
-    wire [QW-1:0]  ws = wq_tail[QW-1:0] + QW'(take_cp);
+    // A write's slot: after a copy read's slot taken in its cycle -- unless
+    // the read sees that write (rd_new, a write-first pair): its copy then
+    // waits for the write's B, so the copy slot goes after the write (ahead
+    // of it the copy would hold the write back in the queue: a deadlock).
+    wire           cp_late = take_cp && take_wr && rd_new;
+    wire [QW-1:0]  ws = wq_tail[QW-1:0] + QW'(take_cp && !cp_late);
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire [QW-1:0]  cs = wq_tail[QW-1:0] + QW'(cp_late);   // a copy read's slot (COPY)
+    /* verilator lint_on UNUSEDSIGNAL */
 
     // ---- fences
     wire [CW-1:0]  in_wcnt   = w_taken + CW'(rd_new && take_wr);
@@ -339,6 +351,41 @@ module foldsim_vport #(
         else                    rq_unpack = RQF'({q, {(CCW + 3){1'b0}}});
     endfunction
 
+    // ---- write beats (TRIM: rows of several beats with byte enables, no
+    // merging): a write's burst covers only its beats from the first to the
+    // last with a byte enabled (none: its first beat, no byte written), so a
+    // row written in part -- a member's slice of a wide row -- spends W beats
+    // on its part only. Its row keeps its slot whole; the streamer starts at
+    // the first beat (kept with the row) and ends at the last.
+    wire [BEATS-1:0] wr_any;
+    for (genvar j = 0; j < BEATS; j++) begin : g_any
+        wire [63:0] by;
+        for (genvar b = 0; b < 64; b++) begin : g_by
+            if (64 * j + b < DB) begin : g_in
+                assign by[b] = wr_mask[(64 * j + b) / GROUP];
+            end else begin : g_pad
+                assign by[b] = 1'b0;
+            end
+        end
+        if (j == 0) begin : g_j0
+            assign wr_any[j] = |by;
+        end else begin : g_jn
+            assign wr_any[j] = (|by) && (LW'(j) <= wr_len);
+        end
+    end
+    function automatic [LW-1:0] first_of(input [BEATS-1:0] a);
+        first_of = '0;
+        for (int j = BEATS - 1; j >= 0; j--) if (a[j]) first_of = LW'(j);
+    endfunction
+    function automatic [LW-1:0] last_of(input [BEATS-1:0] a);
+        last_of = '0;
+        for (int j = 0; j < BEATS; j++) if (a[j]) last_of = LW'(j);
+    endfunction
+    wire [LW-1:0]  wt_first = (TRIM != 0) ? first_of(wr_any) : '0;
+    wire [LW-1:0]  wt_last  = (TRIM != 0) ? last_of(wr_any) : wr_len;
+    wire [OW-1:0]  wt_addr  = wr_addr + OW'(wt_first);
+    wire [LW-1:0]  wt_len   = wt_last - wt_first;
+
     // ---- intake. A request may join a burst behind the one taken before it
     // (a copy slot between two writes parts them) when its beats follow that
     // one's within its 4 KiB page (requests never cross a page).
@@ -353,10 +400,10 @@ module foldsim_vport #(
             r_end <= rd_addr + OW'(rd_len) + 1'b1;
         end
         if (take_wr) begin
-            wq_mem[ws] <= WQW'({wr_addr, wr_len, wr_pair, epoch, r_in + CW'(take_rd), wr_cont} >> (WQF - WQW));
+            wq_mem[ws] <= WQS'({wt_first, WQW'({wt_addr, wt_len, wr_pair, epoch, r_in + CW'(take_rd), wr_cont} >> (WQF - WQW))});
             w_end <= wr_addr + OW'(wr_len) + 1'b1;
         end
-        if (take_wr) w_end_ok <= 1'b1;
+        if (take_wr && !cp_late) w_end_ok <= 1'b1;
         else if (take_cp) w_end_ok <= 1'b0;
     end
 
@@ -376,8 +423,8 @@ module foldsim_vport #(
         reg                 cq_cancel;
         always @(posedge clk) begin
             if (take_cp) begin
-                cq_mem[cq_tail[QW-1:0]]  <= {wq_tail[QW-1:0], rd_copy_addr, rd_len[LW-1:0]};
-                cq_slot[cq_tail[QW-1:0]] <= wq_tail[QW-1:0];
+                cq_mem[cq_tail[QW-1:0]]  <= {cs, rd_copy_addr, rd_len[LW-1:0]};
+                cq_slot[cq_tail[QW-1:0]] <= cs;
                 cq_tail <= cq_tail + 1'b1;
             end
             if (cq_adv) cq_head <= cq_head + 1'b1;
@@ -504,7 +551,9 @@ module foldsim_vport #(
     // ---- write issue: the next write (pw) behind the head (g), as reads.
     // A copy slot is taken from the copy entries once filled (void after a
     // reset: no byte written); a write's pair condition held when it joined.
-    wire [WQF-1:0] wh = WQF'({wq_mem[wq_head[QW-1:0]], 1'b0} >> ((MAX_BURST > 1) ? 1 : 0));
+    wire [WQS-1:0] whs = wq_mem[wq_head[QW-1:0]];
+    wire [WQF-1:0] wh = WQF'({whs[WQW-1:0], 1'b0} >> ((MAX_BURST > 1) ? 1 : 0));
+    wire [LW-1:0]  wh_first = (TRIM != 0) ? whs[WQS-1 -: LW] : '0;
     wire           wq_any = wq_head != wq_tail;
     wire [OW-1:0]  wl_addr = cs_head ? cs_addr : wh[WQF-1 -: OW];
     wire [LW-1:0]  wl_len  = cs_head ? cs_len  : wh[WQF-OW-1 -: LW];
@@ -524,9 +573,11 @@ module foldsim_vport #(
     wire [CW-1:0]  px_rcnt  = (MB != 0) ? pw_rcnt  : wh[CW:1];
     wire           px_cp    = (MB != 0) ? pw_cp    : cs_head && !cs_void;
     wire           px_vd    = (MB != 0) ? pw_vd    : cs_head && cs_void;
+    wire [LW-1:0]  px_first = cs_head ? '0 : wh_first;   // (TRIM: no merging)
     reg            g_valid, g_ok, g_pair, g_vd;
     reg  [OW-1:0]  g_addr;
     reg  [BLW-1:0] g_blen;
+    reg  [LW-1:0]  g_first;
     reg  [NRW-1:0] g_nreq, g_ncp;
     reg  [3:0]     g_ep;
     reg  [CW-1:0]  g_rcnt;
@@ -571,6 +622,7 @@ module foldsim_vport #(
         if (w_promote) begin
             g_addr <= px_addr;
             g_blen <= BLW'(px_len);
+            g_first <= px_first;
             g_pair <= px_pair;
             g_ep   <= px_ep;
             g_rcnt <= px_rcnt;
@@ -591,7 +643,10 @@ module foldsim_vport #(
     // their request counts wait here for their B.
     wire           d_push = aw_go || fill_aw;
     // (Selected by the fill phase, a register: no write head exists then.)
-    wire [OW+BLW+1:0] d_data = fill_go ? {fill_at, fill_n, 1'b1, 1'b0} : {g_addr, g_blen, 1'b0, g_vd && (CP != 0)};
+    // (TRIM: the row's first beat above them, for the streamer.)
+    localparam DFW = OW + BLW + 2 + ((TRIM != 0) ? LW : 0);
+    wire [DFW-1:0] d_data = fill_go ? DFW'({LW'(0), fill_at, fill_n, 1'b1, 1'b0})
+                                    : DFW'({g_first, g_addr, g_blen, 1'b0, g_vd && (CP != 0)});
     wire           b_ev;                       // a B (in clk)
     wire [NRW-1:0] b_nreq, b_ncp;
     if (BQ != 0) begin : g_bq
@@ -799,7 +854,7 @@ module foldsim_vport #(
     reg               d_aw, d_w;               // taken by AW / by W (ASYNC)
     wire [QW:0]       s_rp;
     /* verilator lint_on UNUSEDSIGNAL */
-    wire [OW+BLW+1:0] dd;
+    wire [DFW-1:0]    dd;
     reg               s_fill, s_nostrb;
     reg  [BLW-1:0]    s_left;
     reg  [LW-1:0]     s_rb;
@@ -809,7 +864,7 @@ module foldsim_vport #(
     wire              aw_can      = !m_awvalid || m_awready;
     wire              aw_take, s_take;
     if (ASYNC != 0) begin : g_d_async
-        foldsim_vport_fifo #(.W(OW + BLW + 2), .LOG(LOGA)) q (
+        foldsim_vport_fifo #(.W(DFW), .LOG(LOGA)) q (
             .w_clk(clk), .w_valid(d_push), .w_ready(aw_rdy), .w_data(d_data),
             .r_clk(m_clk), .r_valid(dv), .r_ready(d_pop), .r_data(dd));
         assign aw_take = dv && !d_aw && aw_can;
@@ -874,7 +929,7 @@ module foldsim_vport #(
         reg  [SWJ+XJ-1:0] mem [QUEUE];
         wire [SWJ+XJ-1:0] din_w;
         if (j == 0 && BEATS > 1) begin : g_x
-            assign din_w = {wr_len, wr_mask, wr_data[SWJ-1:0]};
+            assign din_w = {wt_last, wr_mask, wr_data[SWJ-1:0]};
         end else if (j == 0) begin : g_m
             assign din_w = {wr_mask, wr_data[SWJ-1:0]};
         end else begin : g_d
@@ -910,7 +965,7 @@ module foldsim_vport #(
         if (j == 0) begin : g_x0
             assign row_mask = rd[SWJ +: MW];
             if (BEATS > 1) begin : g_l
-                assign row_len = rd[SWJ+MW +: LW];
+                assign row_len = rd[SWJ+MW +: LW];            // its last beat
             end else begin : g_l1
                 assign row_len = '0;
             end
@@ -965,7 +1020,7 @@ module foldsim_vport #(
             s_left   <= dd[2 +: BLW];
             s_fill   <= dd[1];
             s_nostrb <= dd[0];
-            s_rb     <= '0;
+            s_rb     <= (TRIM != 0) ? dd[DFW-1 -: LW] : '0;
         end
     end
     // The release pointer (rows read), read in clk.

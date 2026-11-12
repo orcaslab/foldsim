@@ -17,6 +17,11 @@
 // memory to go idle, clears memory itself and raises `zero` (the host's
 // clear): the port must then not fill (no AW until it shows room again).
 // +wr=P: percent of issues with a write (50); +cycles=N: run length.
+// +wf=P (not with +far): P percent of a same-row read and write are a write-first pair
+// (rd_new: the read answers the new row; with +copy its copy takes the new row too).
+// +sparse=P: P percent of the writes enable one run of 0-23 mask bits only (a member's slice of a wide
+// row; the port's burst covers only the beats with a byte enabled); +trim=1 fails a burst of several
+// beats that starts or ends with no byte enabled (outside a fill).
 // +edge=P (with +far): P percent of the issues read the row written exactly
 // 3 * 2^FS host cycles before, the least distance class 2 covers.
 //
@@ -55,7 +60,7 @@ module tb;
     always #(mp) m_clk = ~m_clk;
     wire aclk = ASYNC ? m_clk : clk;
 
-    reg rd_valid = 0, wr_valid = 0, wr_pair = 0, rd_copy = 0, rd_after = 0;
+    reg rd_valid = 0, wr_valid = 0, wr_pair = 0, rd_copy = 0, rd_after = 0, rd_new = 0;
     reg [OW-1:0] rd_addr = 0, wr_addr = 0, rd_copy_addr = 0;
     reg [LW-1:0] rd_len = 0, wr_len = 0;
     reg [TW-1:0] rd_tag = 0;
@@ -82,7 +87,7 @@ module tb;
         .WRITES_OUT(WRITES_OUT), .AXI_RD_OUT(AXI_RD_OUT), .AXI_WR_OUT(AXI_WR_OUT), .MAX_BURST(MAX_BURST),
         .FCLASSES(16), .FS(FS), .HZ(HZ), .COPY(COPY), .ASYNC(ASYNC), .BASE_ALIGNED(BASE_ALIGNED), .NEED_IN(NEED_IN)) dut (
         .clk(clk), .reset(reset),
-        .rd_valid(rd_valid), .rd_addr(rd_addr), .rd_len(rd_len), .rd_tag(rd_tag), .rd_fence(rd_fence), .rd_new(1'b0),
+        .rd_valid(rd_valid), .rd_addr(rd_addr), .rd_len(rd_len), .rd_tag(rd_tag), .rd_fence(rd_fence), .rd_new(rd_new),
         .rd_copy(rd_copy), .rd_copy_addr(rd_copy_addr), .rd_after_copies(rd_after),
         .wr_valid(wr_valid), .wr_addr(wr_addr), .wr_len(wr_len), .wr_pair(wr_pair), .wr_data(wr_data), .wr_mask(wr_mask),
         .rsp_valid(rsp_valid), .rsp_tag(rsp_tag), .rsp_beat(rsp_beat), .rsp_last(rsp_last), .rsp_copied(rsp_copied),
@@ -95,7 +100,7 @@ module tb;
         .m_rlast(m_rlast));
 
     reg stop = 0;
-    integer edgep = 0;
+    integer edgep = 0, wf = 0, wfs = 0, sparse = 0, trim = 0;
     integer hi = 40, stall = 0, far = 0, resets = 0, seq = 0, copy = 0, merge = 0, wmerge = 0, clean = 0, wr = 50, cycles = CYCLES;
     integer errors = 0, reads = 0, answered = 0, writes = 0, pairs = 0, copies = 0, img_reads = 0;
     integer ar_beats = 0, aw_beats = 0, ars = 0, aws = 0, ar_out = 0, aw_out = 0, ar_max = 0, aw_max = 0, fill_aws = 0;
@@ -178,6 +183,19 @@ module tb;
             for (int k = 0; k < b.beats; ++k) begin
                 d.push_back(wbuf.pop_front());
                 s.push_back(sbuf.pop_front());
+            end
+            // (+trim=1: a burst of several 512-bit beats starts and ends with a byte enabled.)
+            if (trim && !stop && b.beats > 512 / AXW) begin
+                reg f0, l0, any;
+                f0 = (|s[0]) || (AXW < 512 && (|s[1]));
+                l0 = (|s[b.beats - 1]) || (AXW < 512 && (|s[b.beats - 2]));
+                any = 0;
+                for (int k = 0; k < b.beats; ++k) any = any || (|s[k]);
+                // (A burst with no byte at all is a void copy row after a reset.)
+                if (any && (!f0 || !l0)) begin
+                    if (errors < 5) $display("FAIL: a write burst of %0d beats at %h with no byte enabled at its %s", b.beats, b.addr, f0 ? "end" : "start");
+                    errors = errors + 1;
+                end
             end
             b_at.push_back(t); b_addr.push_back(b.addr); b_beats.push_back(b.beats);
             b_data.push_back(d); b_strb.push_back(s);
@@ -282,12 +300,12 @@ module tb;
                 end
             end
         end
-        rd_valid <= 0; wr_valid <= 0;
+        rd_valid <= 0; wr_valid <= 0; rd_new <= 0;
         h_v[now % 64] = 0;
         // (free does not yet count the last cycle's requests: room for both, and a copy's write.)
         if (!reset && !stop && rd_free >= 3 && wr_free >= 5 && ($urandom % 100) < 70) begin
             int i, r, w, k;
-            reg dr, dw, sq, cp, ir, iw;
+            reg dr, dw, sq, cp, ir, iw, nw;
             sq = ($urandom % 100) < seq;
             i = int'($urandom % INST);
             r = int'($urandom % ((AW > 2) ? 4 : ROWS));
@@ -318,6 +336,11 @@ module tb;
             // (+far image reads: class 2 covers no copy; rd_after_copies orders them. Image rows are
             // written by copies only then.)
             if (far) iw = 0;
+            nw = 0;
+            if (wf != 0 && !far) begin
+                // (Nested: without +wf the random stream is the one before it.)
+                if (dr && dw && !ir && !iw && w == r && ($urandom % 100) < wf) nw = 1;
+            end
             if (!pending[i] && (dr || dw)) begin
                 reg [DW-1:0] d;
                 reg [MW-1:0] m;
@@ -326,6 +349,16 @@ module tb;
                     if (i == INST - 1) seq_r = (seq_r + 1) % 4;
                 end
                 m = ($urandom % 2) ? '1 : MW'({$urandom, $urandom, $urandom, $urandom, $urandom});
+                if (sparse != 0) begin
+                    // (Nested: without +sparse the random stream is the one before it.)
+                    if (($urandom % 100) < sparse) begin
+                        // A member's slice: one run of mask bits (or none), anywhere in the row.
+                        int a, n;
+                        a = int'($urandom % MW); n = int'($urandom % 24);
+                        m = '0;
+                        for (int q = 0; q < n && a + q < MW; ++q) m[a + q] = 1'b1;
+                    end
+                end
                 for (int q = 0; q < DW; q += 32) d[q +: 32] = $urandom;
                 if (dr) begin
                     rd_need <= num[i][ir ? ROWS + k : r];
@@ -334,13 +367,16 @@ module tb;
                     rd_fence <= far ? 4'd2 : 4'd0;
                     rd_copy <= cp; rd_copy_addr <= img_of(i, k); rd_after <= ir;
                     pending[i] = 1; is_copy[i] = cp; beat_at[i] = 0; reads <= reads + 1;
-                    expect_row[i] = ir ? img[i][k] : ram[i][r];
-                    if (cp) begin img[i][k] = ram[i][r]; copies <= copies + 1; last_k[i] = k; end
+                    expect_row[i] = ir ? img[i][k] : nw ? merge_row(ram[i][r], d, m) : ram[i][r];
+                    rd_new <= nw; if (nw) wfs <= wfs + 1;
+                    if (cp) begin img[i][k] = expect_row[i]; copies <= copies + 1; last_k[i] = k; end
                     if (ir) img_reads <= img_reads + 1;
                 end
                 if (dw) begin
                     // Its number: the writes taken so far (one more if last cycle's is taken now) + 1.
                     num[i][iw ? ROWS + k : w] = w_count + 16'(wr_valid) + 16'd1;
+                    // (A write-first read waits for its own cycle's write.)
+                    if (nw) rd_need <= num[i][w];
                     wr_valid <= 1; wr_len <= LW'(BEATS - 1); wr_data <= d; wr_mask <= m;
                     if (iw) begin
                         // A write of an image row (after any copy into it taken before).
@@ -349,8 +385,8 @@ module tb;
                         img[i][k] = merge_row(img[i][k], d, m);
                     end else begin
                         wr_addr <= addr_of(i, w);
-                        wr_pair <= dr && !ir && (w == r);
-                        if (dr && !ir && w == r) pairs <= pairs + 1;
+                        wr_pair <= dr && !ir && (w == r) && !nw;
+                        if (dr && !ir && w == r && !nw) pairs <= pairs + 1;
                         ram[i][w] = merge_row(ram[i][w], d, m);
                         wrote_at[i][w] = now;
                         h_v[now % 64] = 1; h_i[now % 64] = i; h_r[now % 64] = w;
@@ -374,6 +410,9 @@ module tb;
         void'($value$plusargs("stall=%d", stall));
         void'($value$plusargs("far=%d", far));
         void'($value$plusargs("edge=%d", edgep));
+        void'($value$plusargs("wf=%d", wf));
+        void'($value$plusargs("sparse=%d", sparse));
+        void'($value$plusargs("trim=%d", trim));
         for (int q = 0; q < 64; ++q) h_v[q] = 0;
         void'($value$plusargs("resets=%d", resets));
         void'($value$plusargs("seq=%d", seq));
@@ -431,6 +470,7 @@ module tb;
                 $display("FAIL: instance %0d's read never answered", i);
                 errors = errors + 1;
             end
+        $display("%0d write-first pairs", wfs);
         $display("%0d reads (%0d answered), %0d writes, %0d same-row pairs, %0d copies, %0d image reads, hi %0d, stall %0d, far %0d, resets %0d",
                  reads, answered, writes, pairs, copies, img_reads, hi, stall, far, resets);
         $display("AXI: %0d ARs, %0d AWs, at most %0d reads / %0d writes in flight, bursts of up to %0d / %0d beats", ars, aws,
