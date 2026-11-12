@@ -513,6 +513,17 @@ module foldsim_vport #(
     reg  [LW-1:0]  pw_len;
     reg  [3:0]     pw_ep;
     reg  [CW-1:0]  pw_rcnt;
+    // The write the head takes next: without merging (MB == 0) the queue's
+    // head itself, so a write reaches AW a host cycle sooner (no pre-write
+    // stage, as 3dde835's port); with merging the pre-write stage, where the
+    // next write waits to join the head's burst.
+    wire [OW-1:0]  px_addr  = (MB != 0) ? pw_addr  : wl_addr;
+    wire [LW-1:0]  px_len   = (MB != 0) ? pw_len   : wl_len;
+    wire           px_pair  = (MB != 0) ? pw_pair  : !cs_head && wh[CW+5];
+    wire [3:0]     px_ep    = (MB != 0) ? pw_ep    : wh[CW+1 +: 4];
+    wire [CW-1:0]  px_rcnt  = (MB != 0) ? pw_rcnt  : wh[CW:1];
+    wire           px_cp    = (MB != 0) ? pw_cp    : cs_head && !cs_void;
+    wire           px_vd    = (MB != 0) ? pw_vd    : cs_head && cs_void;
     reg            g_valid, g_ok, g_pair, g_vd;
     reg  [OW-1:0]  g_addr;
     reg  [BLW-1:0] g_blen;
@@ -529,17 +540,22 @@ module foldsim_vport #(
         dr = r_done - rc;
         pair_ok = !pr || (ep != epoch) || !dr[CW-1];
     endfunction
-    wire           aw_go     = g_valid && g_ok && w_room && aw_rdy;
+    // (Without merging the head's pair check is its registers' now, as
+    // 3dde835's: a write-after-read pair leaves the host cycle its reads are
+    // back, not a host cycle later.)
+    wire           g_okx     = (MB != 0) ? g_ok : pair_ok(g_pair, g_ep, g_rcnt);
+    wire           aw_go     = g_valid && g_okx && w_room && aw_rdy;
     wire           pw_can    = wq_any && (!cs_head || cs_filled || cs_void);
-    wire           w_promote = pw_valid && (!g_valid || aw_go);
+    wire           px_valid  = (MB != 0) ? pw_valid : pw_can;
+    wire           w_promote = px_valid && (!g_valid || aw_go);
     wire [BLW:0]   w_sum     = (BLW+1)'(g_blen) + (BLW+1)'(pw_len) + 1'b1;
     wire           w_merge   = (MB != 0) && g_valid && pw_valid && !aw_go && !(w_room && aw_rdy) && pw_ok
                             && pw_ct && (w_sum < (BLW+1)'(MAX_BURST));
-    wire           pw_load   = pw_can && (!pw_valid || w_promote || w_merge);
+    wire           pw_load   = (MB != 0) ? pw_can && (!pw_valid || w_promote || w_merge) : w_promote;
     assign cq_adv  = pw_load && cs_head;
 
     always @(posedge clk) begin
-        g_ok  <= w_promote ? pair_ok(pw_pair, pw_ep, pw_rcnt) : pair_ok(g_pair, g_ep, g_rcnt);
+        g_ok  <= w_promote ? pair_ok(px_pair, px_ep, px_rcnt) : pair_ok(g_pair, g_ep, g_rcnt);
         pw_ok <= !pw_load && pair_ok(pw_pair, pw_ep, pw_rcnt);
         w_room <= bq_cnt < BCW'(WRB - 1);
         if (pw_load) begin
@@ -553,14 +569,14 @@ module foldsim_vport #(
             pw_vd    <= cs_head && cs_void;
         end
         if (w_promote) begin
-            g_addr <= pw_addr;
-            g_blen <= BLW'(pw_len);
-            g_pair <= pw_pair;
-            g_ep   <= pw_ep;
-            g_rcnt <= pw_rcnt;
-            g_vd   <= pw_vd;
-            g_nreq <= NRW'(!pw_cp && !pw_vd);
-            g_ncp  <= NRW'(pw_cp || pw_vd);
+            g_addr <= px_addr;
+            g_blen <= BLW'(px_len);
+            g_pair <= px_pair;
+            g_ep   <= px_ep;
+            g_rcnt <= px_rcnt;
+            g_vd   <= px_vd;
+            g_nreq <= NRW'(!px_cp && !px_vd);
+            g_ncp  <= NRW'(px_cp || px_vd);
         end else if (w_merge) begin
             g_blen <= BLW'(w_sum);
             g_nreq <= g_nreq + NRW'(!pw_cp);
@@ -639,7 +655,7 @@ module foldsim_vport #(
         end
         // writes
         if (pw_load) wq_head <= wq_head + 1'b1;
-        if (pw_load) pw_valid <= 1'b1;
+        if (pw_load && MB != 0) pw_valid <= 1'b1;
         else if (w_promote || w_merge) pw_valid <= 1'b0;
         if (w_promote) g_valid <= 1'b1;
         else if (aw_go) g_valid <= 1'b0;
@@ -812,7 +828,7 @@ module foldsim_vport #(
     // promoted, the fill's kept whole, so no adder precedes m_awaddr.)
     reg  [63:0]       g_addr64, f_addr64;
     always @(posedge clk) begin
-        if (w_promote) g_addr64 <= addr_of(pw_addr);
+        if (w_promote) g_addr64 <= addr_of(px_addr);
         if (draining && drained && !fill_go) f_addr64 <= base;
         else if (fill_aw) f_addr64 <= f_addr64 + 64'd4096;      // (every burst but the last is 4 KiB)
     end
@@ -929,7 +945,11 @@ module foldsim_vport #(
         reg [QW:0] rp;
         always @(posedge clk) rp <= rp + (QW+1)'(s_inc);
         assign s_rp  = rp;
-        assign w_rel = rp;
+        // (Without merging, a row's slot is free from the edge its last beat
+        // is read at: the room the simulator sees, registered, counts it a
+        // host cycle on. With merging the release stays registered: room
+        // returning later is what lets writes queue up and merge.)
+        assign w_rel = rp + (QW+1)'(MB == 0 && s_inc);
 `ifdef SIMULATION
         initial rp = '0;
 `endif
