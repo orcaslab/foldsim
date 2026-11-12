@@ -25643,9 +25643,14 @@ LogicalResult StaticFolder::buildSim() {
       return p + 1 >= ii ? 0 : p + 1;   // `next` of position p (ii - 1, ii: 0)
     };
     unsigned aheadCount = 0;
-    // Each lookahead register: its value on an advance (the table at the
-    // position's next's next) and its reset value.
-    DenseMap<Value, std::pair<Value, uint64_t>> aheadOf;
+    // Each lookahead register: its value on an advance within the frame
+    // (the table at the position's next's next) and at a frame's end (the
+    // next frame's first position's, or none's).
+    struct AheadParts {
+      Value step;
+      uint64_t first, idle;
+    };
+    DenseMap<Value, AheadParts> aheadOf;
     auto atNext = [&](ArrayRef<uint64_t> row, unsigned width) -> Value {
       if (!lookaheadTables)
         return table(b, next, row, width);
@@ -25655,10 +25660,11 @@ LogicalResult StaticFolder::buildSim() {
       SmallVector<uint64_t> step(ii + 1, 0);
       for (unsigned p = 0; p <= ii; ++p)
         step[p] = row[nx(nx(p))];       // posD + 1 within the frame
+      Value stepRead = table(b, posD, step, width);
       Value onStep = comb::MuxOp::create(
           b, end, comb::MuxOp::create(b, go, constant(width, row[nx(0)]),
                                       constant(width, row[nx(ii)])),
-          table(b, posD, step, width));
+          stepRead);
       // posD stays without an advance: so does its `next`, and the register
       // already holds the table there (no second table of the position).
       auto self = backedges.get(b.getIntegerType(width));
@@ -25667,7 +25673,7 @@ LogicalResult StaticFolder::buildSim() {
       Value r = resetReg(nextValue, "vready_ahead" + Twine(aheadCount++),
                          row[nx(ii)]);
       self.setValue(r);
-      aheadOf[r] = {onStep, row[nx(ii)]};
+      aheadOf[r] = {stepRead, row[nx(0)], row[nx(ii)]};
       return r;
     };
     SmallVector<Value> terms;
@@ -26333,7 +26339,7 @@ LogicalResult StaticFolder::buildSim() {
           // registers. (Off-chip pages keep their own pending logic.)
           auto ahead = aheadOf.find(inst);
           if (readyAhead && !vm.pages && advance && ahead != aheadOf.end()) {
-            Value onStep = ahead->second.first;
+            auto parts = ahead->second;
             Value issued = copies[c].getResult(vm.firstOutput);
             Value issuedInst = copies[c].getResult(vm.firstOutput + 1);
             Value answered = copies[c].getOperand(vm.firstInput);
@@ -26359,7 +26365,15 @@ LogicalResult StaticFolder::buildSim() {
             };
             // (The copy's pending bits reset with the simulator's hostReset,
             // its reset input: zero at any instance, as this register.)
-            Value next = comb::MuxOp::create(b, advance, nextAt(onStep), nextAt(inst));
+            // (The frame's end and start select among the bits read at the
+            // three indices, after the reads: they and `go` stay off the
+            // select's path, as the decision does.)
+            Value onStepBit = comb::MuxOp::create(
+                b, end,
+                comb::MuxOp::create(b, go, nextAt(constant(iw, parts.first)),
+                                    nextAt(constant(iw, parts.idle))),
+                nextAt(parts.step));
+            Value next = comb::MuxOp::create(b, advance, onStepBit, nextAt(inst));
             bit = resetReg(next, vm.name + "_pending_ahead", 0);
           }
         }
