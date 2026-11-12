@@ -19,4 +19,4 @@
 # SCAN: lane-scan: cell Top_lane_Leaf_r
 # SCAN: lane-scan: Top lanes Leaf_r x8: {{.*}} lane vectors; scans {{.*}}carry 1 {{.*}}stage 1
 
-# CHECK: MATCH
+# CHECK: {{^}}MATCH

@@ -20,24 +20,26 @@
 // FIFO (it issued without the room its free showed).
 module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1},
                           parameter int MDW [N] = '{default: 64}, parameter int RF [N] = '{default: 1},
-                          parameter int MIW [N] = '{default: 4}, parameter int TW [N] = '{default: 0}) (
+                          parameter int MIW [N] = '{default: 4}, parameter int TW [N] = '{default: 0},
+                          parameter int DW = 1024, parameter int MB = (DW + 7) / 8) (
     input logic clk, rst,
     input int cyc, lo, hi, full,
     input logic rd_valid [N], input logic [7:0] rd_inst [N], input logic [7:0] rd_row [N],
     input logic wr_valid [N], input logic [7:0] wr_inst [N], input logic [7:0] wr_row [N],
-    input logic [1023:0] wr_data [N], input logic [127:0] wr_mask [N],
-    output logic rsp_valid [N], output logic [7:0] rsp_inst, output logic [1023:0] rsp_data,
+    input logic [DW-1:0] wr_data [N], input logic [MB-1:0] wr_mask [N],
+    output logic rsp_valid [N], output logic [7:0] rsp_inst, output logic [DW-1:0] rsp_data,
     output logic [15:0] free [N],
     output bit ok);
   localparam DEPTH = 8;
-  typedef struct packed { logic rd, wr; logic [7:0] inst, winst; logic [7:0] rrow, wrow; logic [1023:0] data; logic [127:0] mask; } ent_t;
-  // Rows of up to 1024 bits; instances (the address's) below 256, rows below 64.
-  logic [1023:0] mem [N][256][64];
+  typedef struct packed { logic rd, wr; logic [7:0] inst, winst; logic [7:0] rrow, wrow; logic [DW-1:0] data; logic [MB-1:0] mask; } ent_t;
+  // Rows of up to DW bits (vmem_bind.py: the group's widest member, at least
+  // 1024); instances (the address's) below 256, rows below 64.
+  logic [DW-1:0] mem [N][256][64];
   ent_t fifo [N][DEPTH];
   int head [N], cnt [N];
   bit outstanding [N][256], answered [N][256];
   int due [N][256];
-  logic [1023:0] data [N][256];
+  logic [DW-1:0] data [N][256];
   int last;
   initial begin
     ok = 1; last = 0;
@@ -54,11 +56,12 @@ module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1}
   function automatic int addr(int m, logic [7:0] i);
     return TW[m] != 0 ? int'(i) & ((1 << (MIW[m] - TW[m])) - 1) : int'(i);
   endfunction
-  function automatic logic [1023:0] masked(int m, logic [1023:0] old, logic [1023:0] d, logic [127:0] mask);
-    logic [1023:0] v = old;
-    for (int b = 0; b < 128; b++)
+  localparam logic [DW-1:0] ONE = 1;
+  function automatic logic [DW-1:0] masked(int m, logic [DW-1:0] old, logic [DW-1:0] d, logic [MB-1:0] mask);
+    logic [DW-1:0] v = old;
+    for (int b = 0; b < MB; b++)
       if (MMW[m] == 1 || (b < MMW[m] && mask[b])) v[b*8 +: 8] = d[b*8 +: 8];
-    return v & ((1024'd1 << MDW[m]) - 1);
+    return v & ((ONE << MDW[m]) - 1);
   endfunction
   always @(negedge clk) begin
     automatic bit any = 0;

@@ -21,5 +21,5 @@
 # REPORT-NEXT: modulo search: lower bound 16, 22 periods tried (1238 over the ready-pass search)
 # PLACED: 1024
 # CHECK-NOT: PROTOCOL
-# CHECK: MATCH
+# CHECK: {{^}}MATCH
 # MUT: MISMATCH

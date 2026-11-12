@@ -1,0 +1,37 @@
+# REQUIRES: verilator
+# Virtual memories with rows wider than 1024 bits (Driver/Inputs/vmem_wide:
+# per leaf a write-first 8 x 1,104 RAM, three write-first 400-bit lanes that
+# --vmem-merge-lanes makes one 1,200-bit row of 150 byte enables, and a
+# read-first 8 x 1,040 RAM; the output reads bits above 1,023 of each), served
+# by models of the kernel's controllers (Inputs/tb_vmem_multi.sv) whose rows
+# are as wide as the widest member they serve (vmem_bind.py: DW). The static
+# simulator matches the target at response latencies of 1 to 600 host cycles,
+# with stalled channels, a controller out of room and bubbles: memories apart;
+# lanes merged, answers on rings (--vmem-rings) and a copy's memories behind
+# one controller (--vmem-group copy). (With models of 1024-bit rows, these
+# runs mismatched: the rows' upper bits were cut, a testbench limit, not the
+# compiler's.)
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_wide
+# RUN: foldsim --srcs top.f --top Top --out %t/plain --static --bubbles --virtual-memories 'Leaf:.*' Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/plain/foldsim_sim.json %t/plain
+# RUN: FileCheck %s --check-prefix=PLAIN < %t/plain/vm_decl.svh
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/plain --top-module tb -DBUBBLES -Mdir %t/plain/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/plain/foldsim_sim.sv > %t/plain/build.log 2>&1
+# RUN: %t/plain/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/plain/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RUN: %t/plain/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/group --static --bubbles --virtual-memories 'Leaf:.*' --vmem-merge-lanes --vmem-rings 16 --vmem-group copy --vmem-row-bytes-min 64 --copies Leaf:1 Leaf > /dev/null 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/group/foldsim_sim.json %t/group
+# RUN: FileCheck %s --check-prefix=GROUP < %t/group/vm_decl.svh
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/group --top-module tb -DBUBBLES -Mdir %t/group/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/group/foldsim_sim.sv > %t/group/build.log 2>&1
+# RUN: %t/group/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 | FileCheck %s
+# RUN: %t/group/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RUN: %t/group/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=20 +hi=600 +full=80 +bubble=90 +stall=20 | FileCheck %s
+# Each memory its own model, rows as wide as it.
+# PLAIN: logic [1103:0] vm0_rsp_data;
+# PLAIN-DAG: .DW(1104)) model0
+# PLAIN-DAG: .DW(1040))
+# The write-first RAM and the merged lanes (150 byte enables) behind one
+# controller of 1,200-bit rows.
+# GROUP: logic [1199:0] g0_wr_data [2]; logic [1199:0] g0_rsp_data; logic [149:0] g0_wr_mask [2];
+# GROUP: .DW(1200)) model0
+# CHECK: {{^}}MATCH
