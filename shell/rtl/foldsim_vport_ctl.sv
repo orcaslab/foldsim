@@ -234,9 +234,11 @@ module foldsim_vport_ctl #(
     wire           p_rd   = q2_rd && !z_ans;
 
     // Zero answers waiting for a cycle without the port's answer.
-    localparam ZQ  = 32;
+    // (QUEUE + the two stages' reads + margin: idle, the room is QUEUE, as
+    // foldsim_vmem_group's drain expects of a controller.)
+    localparam ZQ  = 64;
     reg  [IT-1:0]  zq_mem [ZQ];
-    reg  [5:0]     zq_head, zq_tail;
+    reg  [6:0]     zq_head, zq_tail;
     wire           zq_any = zq_head != zq_tail;
 
     foldsim_vport #(
@@ -287,21 +289,21 @@ module foldsim_vport_ctl #(
     end
     always @(posedge clk) begin
         rsp_valid <= (p_rsp_valid && p_rsp_last) || z_emit;
-        rsp_inst  <= z_emit ? zq_mem[zq_head[4:0]] : p_rsp_tag;
+        rsp_inst  <= z_emit ? zq_mem[zq_head[5:0]] : p_rsp_tag;
         if (p_rsp_valid) mid_row <= !p_rsp_last;
         if (z_ans) begin
-            zq_mem[zq_tail[4:0]] <= q2_rtag;
+            zq_mem[zq_tail[5:0]] <= q2_rtag;
             zq_tail <= zq_tail + 1'b1;
         end
         if (z_emit) zq_head <= zq_head + 1'b1;
         if (reset) begin
-            zq_head <= zq_tail + 6'(z_ans);
+            zq_head <= zq_tail + 7'(z_ans);
             mid_row <= 1'b0;
         end
     end
 
     // Room: the port's, less the requests in the input register.
-    wire [5:0]    zq_used  = zq_tail - zq_head;
+    wire [6:0]    zq_used  = zq_tail - zq_head;
     wire [FW-1:0] zq_room  = (KZ != 0) ? FW'(((ZQ - 32'(zq_used) - 3) < QUEUE) ? (ZQ - 32'(zq_used) - 3) : QUEUE) : FW'(QUEUE);
     wire [FW-1:0] rd_room0 = rd_free - FW'(q_rd) - FW'(q2_rd);
     wire [FW-1:0] rd_room  = (rd_room0 < zq_room) ? rd_room0 : zq_room;
