@@ -877,6 +877,11 @@ public:
   bool vmemCost = false;
   /// `vmem-on-engines`: class virtual memories ride the page engines.
   bool vmemEngines = false;
+  /// `port-plan-out`: a JSON file of every HBM member's request positions
+  /// (each page engine member as placed, each class virtual memory's
+  /// instances' state passes and issues): a static-port placement model's
+  /// input. Report only; empty for none.
+  std::string portPlanOut;
   /// A memory of `depth` x `width` in a class of `threads` instances is a
   /// virtual memory by size (vmem-auto-bits / vmem-auto-instance-bits).
   bool vmemBySize(uint64_t depth, uint64_t width, unsigned threads) const {
@@ -1724,6 +1729,24 @@ private:
     /// Report only: each member's (name, row bits, positions read, written)
     /// as it was placed (members take positions no other member holds).
     SmallVector<std::tuple<std::string, unsigned, uint64_t, uint64_t>> traffic;
+    /// Report only (`port-plan-out`): each member's read and write positions
+    /// as placed, in `traffic`'s order (the positions it took: `mark` before
+    /// a member's placement, `placed` after).
+    SmallVector<uint64_t> markR, markW;
+    SmallVector<std::pair<SmallVector<unsigned>, SmallVector<unsigned>>> placedAt;
+    void mark() {
+      markR.assign(reads.begin(), reads.end());
+      markW.assign(writes.begin(), writes.end());
+    }
+    void placed() {
+      auto &[r, w] = placedAt.emplace_back();
+      for (size_t q = 0; q < reads.size(); ++q) {
+        if (reads[q] && (q >= markR.size() || !markR[q]))
+          r.push_back(unsigned(q));
+        if (writes[q] && (q >= markW.size() || !markW[q]))
+          w.push_back(unsigned(q));
+      }
+    }
     uint64_t taken(bool w) const {
       uint64_t n = 0;
       for (auto x : w ? writes : reads)
@@ -1749,6 +1772,7 @@ private:
       pageEngineOf;
   LogicalResult assignPageEngines();
   void reportPageEngines(raw_ostream &os);
+  void writePortPlan();
   unsigned streamRowBits(const LinkStream &s) const {
     return 1 + s.rowIndexBits(classes[s.pcls].threads()) +
            (s.pages > 1 ? llvm::Log2_32_Ceil(s.pages) : 0) + s.beatBits();
@@ -5476,6 +5500,7 @@ LogicalResult StaticFolder::assignPageEngines() {
         }
         auto &eng = pageEngines[e];
         uint64_t r0 = eng.taken(false), w0 = eng.taken(true);
+        eng.mark();
         for (int a : readAt)
           if (a != kNoBeats)
             for (unsigned t = 0; t < run; ++t)
@@ -5485,7 +5510,7 @@ LogicalResult StaticFolder::assignPageEngines() {
             for (unsigned t = 0; t < run; ++t)
               eng.writes[wrap(a + sw + int(t))] = 1;
         eng.members.push_back({c, x});
-        eng.traffic.push_back({cls.name + ":" + vm.name, vm.dataWidth, eng.taken(false) - r0, eng.taken(true) - w0});
+        eng.placed(), eng.traffic.push_back({cls.name + ":" + vm.name, vm.dataWidth, eng.taken(false) - r0, eng.taken(true) - w0});
         eng.dataWidth = std::max(eng.dataWidth, vm.dataWidth);
         eng.instWidth = std::max(eng.instWidth, vm.instWidth);
         eng.addrWidth = std::max(eng.addrWidth, vm.instWidth + vm.rowWidth);
@@ -5539,12 +5564,13 @@ LogicalResult StaticFolder::assignPageEngines() {
         }
         auto &eng = pageEngines[e];
         uint64_t r0 = eng.taken(false), w0 = eng.taken(true);
+        eng.mark();
         for (unsigned q : rq)
           eng.reads[q] = 1;
         for (unsigned q : wr)
           eng.writes[q] = 1;
         eng.members.push_back({unsigned(c), unsigned(k)});
-        eng.traffic.push_back({cls.name + ":" + vm.name, vm.dataWidth, eng.taken(false) - r0, eng.taken(true) - w0});
+        eng.placed(), eng.traffic.push_back({cls.name + ":" + vm.name, vm.dataWidth, eng.taken(false) - r0, eng.taken(true) - w0});
         eng.dataWidth = std::max(eng.dataWidth, vm.dataWidth);
         eng.instWidth = std::max(eng.instWidth, vm.instWidth);
         eng.addrWidth = std::max(eng.addrWidth, vm.instWidth + vm.rowWidth);
@@ -5663,12 +5689,13 @@ LogicalResult StaticFolder::assignPageEngines() {
             wr.push_back(wrap(w + 1 + sw + int(j) * kb + b));
       auto &eng = pageEngines[e];
       uint64_t r0 = eng.taken(false), w0 = eng.taken(true);
+        eng.mark();
       for (unsigned q : rq)
         eng.reads[q] = 1;
       for (unsigned q : wr)
         eng.writes[q] = 1;
       eng.streams.push_back(unsigned(k));
-      eng.traffic.push_back({("link:" + modelOf(st.pcls) + ">" + modelOf(st.rcls)).str(), st.portDW(),
+      eng.placed(), eng.traffic.push_back({("link:" + modelOf(st.pcls) + ">" + modelOf(st.rcls)).str(), st.portDW(),
                              eng.taken(false) - r0, eng.taken(true) - w0});
       eng.dataWidth = std::max(eng.dataWidth, st.portDW());
       eng.instWidth = std::max(eng.instWidth, st.tagBits());
@@ -5715,12 +5742,13 @@ LogicalResult StaticFolder::assignPageEngines() {
     st.slotCount = fit ? slots : 0;
     auto &eng = pageEngines[e];
     uint64_t r0 = eng.taken(false), w0 = eng.taken(true);
+        eng.mark();
     for (unsigned q = 0; q < ii; ++q) {
       eng.reads[q] |= st.reqValid[q];
       eng.writes[q] |= st.writeValid[q];
     }
     eng.streams.push_back(unsigned(k));
-    eng.traffic.push_back({("link:" + modelOf(st.pcls) + ">" + modelOf(st.rcls)).str(), st.portDW(),
+    eng.placed(), eng.traffic.push_back({("link:" + modelOf(st.pcls) + ">" + modelOf(st.rcls)).str(), st.portDW(),
                            eng.taken(false) - r0, eng.taken(true) - w0});
     eng.dataWidth = std::max(eng.dataWidth, st.portDW());
     eng.instWidth = std::max(eng.instWidth, st.tagBits());
@@ -5833,12 +5861,13 @@ LogicalResult StaticFolder::assignPageEngines() {
         continue;
       auto &eng = pageEngines[first + column++];
       uint64_t r0 = eng.taken(false), w0 = eng.taken(true);
+        eng.mark();
       for (unsigned q = 0; q < ii; ++q) {
         eng.reads[q] |= rows.read[q];
         eng.writes[q] |= rows.write[q];
       }
       eng.members.push_back({unsigned(c), unsigned(k)});
-      eng.traffic.push_back({cls.name + ":" + vm.name, vm.dataWidth, eng.taken(false) - r0, eng.taken(true) - w0});
+      eng.placed(), eng.traffic.push_back({cls.name + ":" + vm.name, vm.dataWidth, eng.taken(false) - r0, eng.taken(true) - w0});
       eng.dataWidth = std::max(eng.dataWidth, vm.dataWidth);
       eng.instWidth = std::max(eng.instWidth, vm.instWidth);
       eng.addrWidth = std::max(eng.addrWidth, vm.instWidth + vm.rowWidth);
@@ -5901,10 +5930,11 @@ LogicalResult StaticFolder::assignPageEngines() {
         }
         auto &eng = pageEngines[e];
         uint64_t r0 = eng.taken(false), w0 = eng.taken(true);
+        eng.mark();
         for (unsigned q : at)
           eng.reads[q] = eng.writes[q] = 1;
         eng.members.push_back({unsigned(c), unsigned(k)});
-        eng.traffic.push_back({cls.name + ":" + vm.name, vm.dataWidth, eng.taken(false) - r0,
+        eng.placed(), eng.traffic.push_back({cls.name + ":" + vm.name, vm.dataWidth, eng.taken(false) - r0,
                                eng.taken(true) - w0});
         eng.dataWidth = std::max(eng.dataWidth, vm.dataWidth);
         eng.instWidth = std::max(eng.instWidth, iw);
@@ -5932,7 +5962,71 @@ LogicalResult StaticFolder::assignPageEngines() {
       linkStreams[k].member = eng.members.size() + x;
     }
   }
+  // (The build's placement: a schedule-only run has no class memories yet.)
+  if (!portPlanOut.empty() && !scheduleOnly)
+    writePortPlan();
   return success();
+}
+
+void StaticFolder::writePortPlan() {
+  std::error_code ec;
+  llvm::raw_fd_ostream os(portPlanOut, ec);
+  if (ec) {
+    llvm::errs() << "foldsim-fold-static: port-plan-out: " << ec.message() << "\n";
+    return;
+  }
+  auto list = [&](ArrayRef<unsigned> xs) {
+    os << "[";
+    for (auto [i, x] : llvm::enumerate(xs))
+      os << (i ? "," : "") << x;
+    os << "]";
+  };
+  auto ints = [&](ArrayRef<int> xs) {
+    os << "[";
+    for (auto [i, x] : llvm::enumerate(xs))
+      os << (i ? "," : "") << x;
+    os << "]";
+  };
+  os << "{\"ii\": " << ii << ", \"decision_lead\": " << decisionLead() << ",\n \"engines\": [";
+  for (auto [e, eng] : llvm::enumerate(pageEngines)) {
+    os << (e ? ",\n  " : "\n  ") << "{\"dw\": " << eng.dataWidth << ", \"members\": [";
+    for (auto [m, t] : llvm::enumerate(eng.traffic)) {
+      auto &[name, w, r, wr] = t;
+      os << (m ? ", " : "") << "{\"name\": \"" << name << "\", \"w\": " << w << ", \"r\": ";
+      if (m < eng.placedAt.size()) {
+        list(eng.placedAt[m].first);
+        os << ", \"wr\": ";
+        list(eng.placedAt[m].second);
+      } else {
+        os << "[], \"wr\": []";
+      }
+      os << "}";
+    }
+    os << "]}";
+  }
+  os << "],\n \"classes\": [";
+  bool first = true;
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    if (cls.virtualMemories.empty())
+      continue;
+    os << (first ? "\n  " : ",\n  ") << "{\"name\": \"" << cls.name << "\", \"threads\": " << cls.threads()
+       << ", \"state_gap\": " << cls.stateGap << ", \"state\": ";
+    first = false;
+    ints(cls.slot[kState]);
+    os << ", \"fold_issue\": ";
+    ints(cls.foldIssue);
+    os << ", \"vms\": [";
+    for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
+      auto on = pageEngineOf.find({unsigned(c), unsigned(k)});
+      os << (k ? ", " : "") << "{\"name\": \"" << vm.name << "\", \"w\": " << vm.dataWidth
+         << ", \"mask\": " << vm.maskWidth << ", \"rows\": " << vm.rowWidth
+         << ", \"ring\": " << vm.ring << ", \"pages\": " << vm.pages << ", \"delayed\": " << vm.delayed
+         << ", \"read_first\": " << vm.readFirst << ", \"lanes\": " << vm.lanes.size()
+         << ", \"engine\": " << (on == pageEngineOf.end() ? -1 : int(on->second.first)) << "}";
+    }
+    os << "]}";
+  }
+  os << "]}\n";
 }
 
 void StaticFolder::reportPageEngines(raw_ostream &os) {
@@ -26332,6 +26426,7 @@ void FoldStaticPass::runOnOperation() {
   folder.vmemAutoInstanceBits = vmemAutoInstanceBits;
   folder.vmemCost = vmemCost;
   folder.vmemEngines = vmemEngines;
+  folder.portPlanOut = portPlanOut;
   folder.vmemRingLead = vmemRings;
   folder.foldRingLead = foldStoreRings;
   folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));

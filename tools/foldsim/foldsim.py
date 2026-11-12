@@ -483,6 +483,8 @@ def frame_options(a):
         fold += ' page-engines-pp'
     if getattr(a, 'vmem_on_engines', False):
         fold += ' vmem-on-engines'
+    if getattr(a, 'port_plan_out', None):
+        fold += f' port-plan-out={os.path.abspath(a.port_plan_out)}'
     if getattr(a, 'pp_beat_bits', 0):
         fold += f' pp-beat-bits={a.pp_beat_bits}'
     if getattr(a, 'link_hbm_beat_bits', 0):
@@ -1790,6 +1792,10 @@ def build_parser():
     ap.add_argument('--pp-beat-bits', type=int, default=0, metavar='N',
                     help='with --page-engines-pp: streamed PP rows as beats of at most N bits, '
                          'drained from a row buffer (foldsim-fold-static pp-beat-bits)')
+    ap.add_argument('--port-plan-out', metavar='JSON',
+                    help='report only: every HBM member\'s request positions (page engine members as placed, class '
+                         'virtual memories\' state passes and issues) in this JSON file, a static-port placement '
+                         'model\'s input (foldsim-fold-static port-plan-out)')
     ap.add_argument('--vmem-on-engines', action='store_true',
                     help='with --page-engines and --virtual-memories: the target RAMs ride the engines (static '
                          'ports) at their own positions, no controller or member queue per memory '

@@ -405,6 +405,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "its state pass and keeps each instance's read data from the "
            "responses; a slot whose instance's read has not been answered "
            "waits in a bubble, so the target's cycles never change">,
+    Option<"portPlanOut", "port-plan-out", "std::string", "\"\"",
+           "Report only: write every HBM member's request positions (each page "
+           "engine member's reads and writes as placed; each class virtual "
+           "memory's instances' state passes and folded-store issues, widths "
+           "and kinds) to this JSON file, the input of a static-port placement "
+           "model; empty: none">,
     Option<"vmemEngines", "vmem-on-engines", "bool", "false",
            "With page-engines: the class virtual memories (the target's RAMs; "
            "not page columns, rings or a class with folded-store streams) ride "
