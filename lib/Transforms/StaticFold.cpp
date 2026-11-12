@@ -1714,6 +1714,15 @@ private:
     /// row), the widest.
     unsigned dataWidth = 0, instWidth = 0, addrWidth = 0;
     bool readFirst = false;
+    /// Report only: each member's (name, row bits, positions read, written)
+    /// as it was placed (members take positions no other member holds).
+    SmallVector<std::tuple<std::string, unsigned, uint64_t, uint64_t>> traffic;
+    uint64_t taken(bool w) const {
+      uint64_t n = 0;
+      for (auto x : w ? writes : reads)
+        n += x != 0;
+      return n;
+    }
     unsigned count() const { return members.size() + streams.size(); }
     unsigned memberBits() const {
       return std::max(1u, llvm::Log2_32_Ceil(count()));
@@ -5459,6 +5468,7 @@ LogicalResult StaticFolder::assignPageEngines() {
           newEngine();
         }
         auto &eng = pageEngines[e];
+        uint64_t r0 = eng.taken(false), w0 = eng.taken(true);
         for (int a : readAt)
           if (a != kNoBeats)
             for (unsigned t = 0; t < run; ++t)
@@ -5468,6 +5478,7 @@ LogicalResult StaticFolder::assignPageEngines() {
             for (unsigned t = 0; t < run; ++t)
               eng.writes[wrap(a + sw + int(t))] = 1;
         eng.members.push_back({c, x});
+        eng.traffic.push_back({cls.name + ":" + vm.name, vm.dataWidth, eng.taken(false) - r0, eng.taken(true) - w0});
         eng.dataWidth = std::max(eng.dataWidth, vm.dataWidth);
         eng.instWidth = std::max(eng.instWidth, vm.instWidth);
         eng.addrWidth = std::max(eng.addrWidth, vm.instWidth + vm.rowWidth);
@@ -5520,11 +5531,13 @@ LogicalResult StaticFolder::assignPageEngines() {
           newEngine();
         }
         auto &eng = pageEngines[e];
+        uint64_t r0 = eng.taken(false), w0 = eng.taken(true);
         for (unsigned q : rq)
           eng.reads[q] = 1;
         for (unsigned q : wr)
           eng.writes[q] = 1;
         eng.members.push_back({unsigned(c), unsigned(k)});
+        eng.traffic.push_back({cls.name + ":" + vm.name, vm.dataWidth, eng.taken(false) - r0, eng.taken(true) - w0});
         eng.dataWidth = std::max(eng.dataWidth, vm.dataWidth);
         eng.instWidth = std::max(eng.instWidth, vm.instWidth);
         eng.addrWidth = std::max(eng.addrWidth, vm.instWidth + vm.rowWidth);
@@ -5642,11 +5655,14 @@ LogicalResult StaticFolder::assignPageEngines() {
           for (int b = 0; b < kb; ++b)
             wr.push_back(wrap(w + 1 + sw + int(j) * kb + b));
       auto &eng = pageEngines[e];
+      uint64_t r0 = eng.taken(false), w0 = eng.taken(true);
       for (unsigned q : rq)
         eng.reads[q] = 1;
       for (unsigned q : wr)
         eng.writes[q] = 1;
       eng.streams.push_back(unsigned(k));
+      eng.traffic.push_back({("link:" + modelOf(st.pcls) + ">" + modelOf(st.rcls)).str(), st.portDW(),
+                             eng.taken(false) - r0, eng.taken(true) - w0});
       eng.dataWidth = std::max(eng.dataWidth, st.portDW());
       eng.instWidth = std::max(eng.instWidth, st.tagBits());
       eng.addrWidth = std::max(eng.addrWidth, streamRowBits(st));
@@ -5691,11 +5707,14 @@ LogicalResult StaticFolder::assignPageEngines() {
     setStreamTables(st, requests, writes, collide);
     st.slotCount = fit ? slots : 0;
     auto &eng = pageEngines[e];
+    uint64_t r0 = eng.taken(false), w0 = eng.taken(true);
     for (unsigned q = 0; q < ii; ++q) {
       eng.reads[q] |= st.reqValid[q];
       eng.writes[q] |= st.writeValid[q];
     }
     eng.streams.push_back(unsigned(k));
+    eng.traffic.push_back({("link:" + modelOf(st.pcls) + ">" + modelOf(st.rcls)).str(), st.portDW(),
+                           eng.taken(false) - r0, eng.taken(true) - w0});
     eng.dataWidth = std::max(eng.dataWidth, st.portDW());
     eng.instWidth = std::max(eng.instWidth, st.tagBits());
     eng.addrWidth = std::max(eng.addrWidth, streamRowBits(st));
@@ -5806,11 +5825,13 @@ LogicalResult StaticFolder::assignPageEngines() {
       if (!vm.pages)
         continue;
       auto &eng = pageEngines[first + column++];
+      uint64_t r0 = eng.taken(false), w0 = eng.taken(true);
       for (unsigned q = 0; q < ii; ++q) {
         eng.reads[q] |= rows.read[q];
         eng.writes[q] |= rows.write[q];
       }
       eng.members.push_back({unsigned(c), unsigned(k)});
+      eng.traffic.push_back({cls.name + ":" + vm.name, vm.dataWidth, eng.taken(false) - r0, eng.taken(true) - w0});
       eng.dataWidth = std::max(eng.dataWidth, vm.dataWidth);
       eng.instWidth = std::max(eng.instWidth, vm.instWidth);
       eng.addrWidth = std::max(eng.addrWidth, vm.instWidth + vm.rowWidth);
@@ -5845,8 +5866,16 @@ void StaticFolder::reportPageEngines(raw_ostream &os) {
   os << "  page engines: " << pageEngines.size() << " engines, " << columns
      << " page columns\n";
   for (auto [e, eng] : llvm::enumerate(pageEngines)) {
+    uint64_t nr = 0, nw = 0;
+    for (unsigned q = 0; q < ii && q < eng.reads.size(); ++q)
+      nr += eng.reads[q] != 0;
+    for (unsigned q = 0; q < ii && q < eng.writes.size(); ++q)
+      nw += eng.writes[q] != 0;
     os << "    page engine " << e << " " << eng.dataWidth << " bits, tag "
-       << eng.tagBits() << ", row " << eng.rowBits() << ":";
+       << eng.tagBits() << ", row " << eng.rowBits() << ", reads " << nr
+       << " writes " << nw << " a frame:";
+    for (auto &[name, w, r, wr] : eng.traffic)
+      os << " {" << name << " " << w << " " << r << " " << wr << "}";
     for (auto [c, k] : eng.members)
       os << " " << classes[c].name << ":" << classes[c].virtualMemories[k].name;
     for (unsigned k : eng.streams)
