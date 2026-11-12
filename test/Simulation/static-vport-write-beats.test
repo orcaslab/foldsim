@@ -40,4 +40,4 @@
 # RF: vport-write-beats: 1 written beat by beat
 # RFH: `define FOLDSIM_VPORT1_DW 512
 # RFH: `define FOLDSIM_VPORT1_LMAX 2
-# CHECK: MATCH
+# CHECK: {{^}}MATCH
