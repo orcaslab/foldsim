@@ -1363,7 +1363,7 @@ module foldsim_afu #(
             .rsp_valid (vp``p``_rsp_valid), .rsp_tag (vp``p``_rsp_tag), .rsp_beat (vp``p``_rsp_beat), \
             .rsp_last (vp``p``_rsp_last), .rsp_copied (vp``p``_rsp_copied), .rsp_data (vp``p``_rsp_data), \
             .rd_free (vp``p``_rd_room), .wr_free (vp``p``_wr_room), \
-            .base (`FOLDSIM_VP_BASE(p)), .bytes (64'(`FOLDSIM_VPORT``p``_BYTES)), .zero (vmem_zero), \
+            .base (`FOLDSIM_VP_BASE(p)), .bytes (64'd `FOLDSIM_VPORT``p``_BYTES), .zero (vmem_zero), \
             .move (vmem_move), .busy (vp_busy[p]), .stat (vp``p``_stat), \
             .rd_need (vp``p``_rd_need), .w_count (vp``p``_w_count), \
             .m_clk (`FOLDSIM_VP_MCLK), \
