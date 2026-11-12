@@ -76,7 +76,13 @@ std::string foldsim::beaconMapPipeline(const BeaconTarget &target, bool area,
     pipeline += "hw.module(hw-bypass-inner-symbols,canonicalize,cse,"
                 "comb-balance-mux,";
   pipeline += "foldsim-lower-equality,foldsim-lower-constant-division,"
-              "hw-aggregate-to-comb,cse,foldsim-fold-zero-width,"
+              "hw-aggregate-to-comb,";
+  // For depth, the equalities hw-aggregate-to-comb makes of an array written
+  // at a dynamic index (its element selects) are LUT logic too, as Vivado
+  // decodes an index: foldsim-lower-equality runs again and finds only those.
+  if (!area)
+    pipeline += "foldsim-lower-equality,";
+  pipeline += "cse,foldsim-fold-zero-width,"
               "convert-comb-to-synth{additional-legal-ops=comb.add,comb.sub,"
               "comb.icmp,comb.mul,comb.divu,comb.divs,comb.modu,comb.mods},"
               "cse,canonicalize,synth-lower-word-to-bits,cse,";
