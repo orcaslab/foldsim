@@ -17,6 +17,8 @@
 // memory to go idle, clears memory itself and raises `zero` (the host's
 // clear): the port must then not fill (no AW until it shows room again).
 // +wr=P: percent of issues with a write (50); +cycles=N: run length.
+// +edge=P (with +far): P percent of the issues read the row written exactly
+// 3 * 2^FS host cycles before, the least distance class 2 covers.
 //
 // Version 2 of the port: ASYNC (the AXI side in its own clock, +sp=/+mp= the
 // two half periods in ps: any ratio, 256-bit beats), bursts (MAX_BURST, with
@@ -93,6 +95,7 @@ module tb;
         .m_rlast(m_rlast));
 
     reg stop = 0;
+    integer edgep = 0;
     integer hi = 40, stall = 0, far = 0, resets = 0, seq = 0, copy = 0, merge = 0, wmerge = 0, clean = 0, wr = 50, cycles = CYCLES;
     integer errors = 0, reads = 0, answered = 0, writes = 0, pairs = 0, copies = 0, img_reads = 0;
     integer ar_beats = 0, aw_beats = 0, ars = 0, aws = 0, ar_out = 0, aw_out = 0, ar_max = 0, aw_max = 0, fill_aws = 0;
@@ -108,6 +111,9 @@ module tb;
     reg [15:0]   num [INST][2*ROWS];
     // When each row was last written (host cycle), for +far's reads.
     longint      wrote_at [INST][ROWS];
+    // (+edge) the write issued in each of the last 64 host cycles.
+    reg          h_v [64];
+    int          h_i [64], h_r [64];
     reg [AXW-1:0] mem [longint];
     function automatic [AXW-1:0] line(input longint a);
         line = mem.exists(a) ? mem[a] : '0;
@@ -277,6 +283,7 @@ module tb;
             end
         end
         rd_valid <= 0; wr_valid <= 0;
+        h_v[now % 64] = 0;
         // (free does not yet count the last cycle's requests: room for both, and a copy's write.)
         if (!reset && !stop && rd_free >= 3 && wr_free >= 5 && ($urandom % 100) < 70) begin
             int i, r, w, k;
@@ -290,6 +297,12 @@ module tb;
             dw = ($urandom % 100) < wr;
             if ($urandom % 4 == 0) begin r = int'($urandom % ROWS); w = int'($urandom % ROWS); end
             if ($urandom % 3 == 0) w = r;
+            if (far && edgep != 0) begin
+                // (Nested: without +edge the random stream is the one before it.)
+                if (h_v[(now - 3 * (1 << FS)) % 64] && ($urandom % 100) < edgep) begin
+                    i = h_i[(now - 3 * (1 << FS)) % 64]; r = h_r[(now - 3 * (1 << FS)) % 64]; dr = 1; sq = 0;
+                end
+            end
             if (sq) begin
                 // A sweep: the next instance, the sweep's row (rows follow each other in memory); it
                 // moves on once that instance issues.
@@ -340,6 +353,7 @@ module tb;
                         if (dr && !ir && w == r) pairs <= pairs + 1;
                         ram[i][w] = merge_row(ram[i][w], d, m);
                         wrote_at[i][w] = now;
+                        h_v[now % 64] = 1; h_i[now % 64] = i; h_r[now % 64] = w;
                     end
                     writes <= writes + 1;
                 end
@@ -359,6 +373,8 @@ module tb;
         void'($value$plusargs("hi=%d", hi));
         void'($value$plusargs("stall=%d", stall));
         void'($value$plusargs("far=%d", far));
+        void'($value$plusargs("edge=%d", edgep));
+        for (int q = 0; q < 64; ++q) h_v[q] = 0;
         void'($value$plusargs("resets=%d", resets));
         void'($value$plusargs("seq=%d", seq));
         void'($value$plusargs("copy=%d", copy));

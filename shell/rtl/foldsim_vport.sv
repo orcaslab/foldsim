@@ -624,7 +624,10 @@ module foldsim_vport #(
         tick <= tick + 1'b1;
         if (&tick) begin
             ring_at <= ring_at + 1'b1;
-            w_ring[ring_at + 1'b1] <= w_taken;
+            // (The count after this cycle: a write taken in the sample's
+            // cycle is in it, so a write taken (c+1) 2^FS host cycles before
+            // a class-c read is always waited for, as the class promises.)
+            w_ring[ring_at + 1'b1] <= w_taken + CW'(take_wr);
         end
         // the region clean: `zero` rose since the last write taken
         if (ZERO_FILL != 0) begin
@@ -824,15 +827,20 @@ module foldsim_vport #(
         assign s_take  = d_push;
         assign d_pop   = d_push;
     end
-    // (In clk with a base to add: the write head's address added as it is
-    // promoted, the fill's kept whole, so no adder precedes m_awaddr.)
+    // (In clk with a base to add: with merging the write head's address is
+    // added as it is promoted from the pre-write stage, the fill's kept
+    // whole, so no adder precedes m_awaddr; without merging the head comes
+    // straight from the queue's memory, so its address is added from the
+    // head's register as it leaves -- the queue read and the adder in one
+    // host cycle would be too deep.)
     reg  [63:0]       g_addr64, f_addr64;
     always @(posedge clk) begin
-        if (w_promote) g_addr64 <= addr_of(px_addr);
+        if (w_promote && MB != 0) g_addr64 <= addr_of(px_addr);
         if (draining && drained && !fill_go) f_addr64 <= base;
         else if (fill_aw) f_addr64 <= f_addr64 + 64'd4096;      // (every burst but the last is 4 KiB)
     end
-    wire [63:0]       aw_addr = (ASYNC != 0 || BASE_ALIGNED != 0) ? addr_of(dd[BLW+2 +: OW]) : (fill_go ? f_addr64 : g_addr64);
+    wire [63:0]       aw_addr = (ASYNC != 0 || BASE_ALIGNED != 0) ? addr_of(dd[BLW+2 +: OW])
+                              : fill_go ? f_addr64 : (MB != 0) ? g_addr64 : addr_of(g_addr);
     always @(posedge mclk) begin
         if (m_awvalid && m_awready) m_awvalid <= 1'b0;
         if (aw_take) begin
@@ -845,6 +853,18 @@ module foldsim_vport #(
     // The queue's rows: a memory per 512-bit beat of a row (the first also
     // holds the mask and the row's beats), written in clk by the simulator's
     // writes and the copied beats, read in mclk by the streamer.
+    // Row stage (RS: in clk, without merging): the streamer copies the row it
+    // takes into a register and streams the beats from there, so the row's
+    // slot is free as the burst is taken -- not after its last beat, which
+    // waits on W (a multi-beat row, or W held behind other masters' bursts).
+    // The queue then holds QUEUE rows besides the one on W (a slot more room
+    // under write pressure, for a row of flops). With merging the release
+    // stays late on purpose (room returning later lets writes merge); ASYNC
+    // streams in m_clk from the queue (the clock crossing).
+    localparam RS  = (ASYNC == 0 && MB == 0) ? 1 : 0;
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire           rs_inc;                     // (RS) a row taken by the streamer
+    /* verilator lint_on UNUSEDSIGNAL */
     wire [MW-1:0]  row_mask;
     wire [LW-1:0]  row_len;
     wire [511:0]   sub_rd [BEATS];
@@ -875,7 +895,17 @@ module foldsim_vport #(
         end else begin : g_w
             always @(posedge clk) if (take_wr) mem[ws] <= din_w;
         end
-        wire [SWJ+XJ-1:0] rd = mem[s_rp[QW-1:0]];
+        wire [SWJ+XJ-1:0] rd0 = mem[s_rp[QW-1:0]];
+        wire [SWJ+XJ-1:0] rd;
+        if (RS != 0) begin : g_rs
+            // (Loaded whenever the streamer may take: when it takes, the row
+            // at the release pointer is the one taken.)
+            reg [SWJ+XJ-1:0] q;
+            always @(posedge clk) if (s_can) q <= rd0;
+            assign rd = q;
+        end else begin : g_rq
+            assign rd = rd0;
+        end
         assign sub_rd[j] = 512'(rd[SWJ-1:0]);
         if (j == 0) begin : g_x0
             assign row_mask = rd[SWJ +: MW];
@@ -940,16 +970,18 @@ module foldsim_vport #(
     end
     // The release pointer (rows read), read in clk.
     if (ASYNC != 0) begin : g_rel_async
+        assign rs_inc = 1'b0;
         foldsim_vport_gcnt #(.N(QW + 1)) c (.a_clk(m_clk), .inc(s_inc), .a_cnt(s_rp), .b_clk(clk), .b_cnt(w_rel));
     end else begin : g_rel_sync
         reg [QW:0] rp;
-        always @(posedge clk) rp <= rp + (QW+1)'(s_inc);
+        // (RS: a row is released as the streamer takes it into its register;
+        // a fill burst holds none. With merging, after its last beat.)
+        assign rs_inc = (RS != 0) && s_take && !dd[1];
+        always @(posedge clk) rp <= rp + (QW+1)'((RS != 0) ? rs_inc : s_inc);
         assign s_rp  = rp;
-        // (Without merging, a row's slot is free from the edge its last beat
-        // is read at: the room the simulator sees, registered, counts it a
-        // host cycle on. With merging the release stays registered: room
-        // returning later is what lets writes queue up and merge.)
-        assign w_rel = rp + (QW+1)'(MB == 0 && s_inc);
+        // (The room the simulator sees is registered from w_rel: with RS a
+        // slot counts free a host cycle after the take, as the AW leaves.)
+        assign w_rel = rp;
 `ifdef SIMULATION
         initial rp = '0;
 `endif

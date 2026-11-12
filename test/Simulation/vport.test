@@ -15,6 +15,11 @@
 # RUN: %t/wide/Vtb +verilator+seed+1 +hi=1 | FileCheck %s
 # RUN: %t/wide/Vtb +verilator+seed+2 +hi=600 +stall=30 +cycles=30000 | FileCheck %s
 # RUN: %t/wide/Vtb +verilator+seed+3 +hi=60 +stall=20 +resets=3 | FileCheck %s
+# The write queue under pressure (W held back, nearly every issue a write): a row's slot is free as the streamer
+# takes it into its row stage, so the queue's next writes must not reach the row still on W.
+# RUN: %t/wide/Vtb +verilator+seed+16 +hi=600 +stall=70 +wr=95 +cycles=30000 | FileCheck %s
+# Fence class 2 at its least distance: reads of rows written exactly 3 * 2^FS host cycles before.
+# RUN: %t/wide/Vtb +verilator+seed+17 +hi=40 +far=1 +edge=50 +stall=20 | FileCheck %s
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=512 -GCYCLES=12000 -Mdir %t/beat %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/beat.log 2>&1
 # RUN: %t/beat/Vtb +verilator+seed+4 +hi=100 +far=1 | FileCheck %s
 # RUN: %t/beat/Vtb +verilator+seed+5 +hi=600 +resets=4 +cycles=30000 | FileCheck %s
