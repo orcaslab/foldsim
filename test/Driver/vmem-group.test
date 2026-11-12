@@ -169,3 +169,10 @@
 # VPORT: `define FOLDSIM_VMEM_G0_BYTES 64'h{{[0-9a-f]+}}
 # VPORT-NEXT: `define FOLDSIM_VMEM_G1_BYTES 64'h{{[0-9a-f]+}}
 # VPORT-NEXT: `define FOLDSIM_VMEM_BYTES
+# --vmem-cost: the copies' small memories (2 instances, 8 to 32 rows) cost
+# fewer LUTs on chip than as virtual memories: none stays virtual.
+# RUN: foldsim --srcs top.f --top Top --out %t/cost --static --virtual-memories 'Leaf:.*' --vmem-cost --copies Leaf:2 Leaf 2> %t/cost.log > /dev/null
+# RUN: FileCheck %s --check-prefix=COST < %t/cost.log
+# RUN: FileCheck %s --check-prefix=COSTVH < %t/cost/foldsim_sim.vh
+# COST: vmem-cost: Leaf{{[^:]*}}:{{.*}} kept on chip ({{[0-9]+}} LUT < {{[0-9]+}} as a virtual memory)
+# COSTVH-NOT: FOLDSIM_VMEM_COUNT

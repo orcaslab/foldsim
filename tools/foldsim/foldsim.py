@@ -418,6 +418,8 @@ def frame_options(a):
         fold += f' vmem-auto-bits={a.vmem_auto_bits}'
     if getattr(a, 'vmem_auto_instance_bits', 0):
         fold += f' vmem-auto-instance-bits={a.vmem_auto_instance_bits}'
+    if getattr(a, 'vmem_cost', False):
+        fold += ' vmem-cost'
     if getattr(a, 'vmem_rings', 0):
         fold += f' vmem-rings={a.vmem_rings} vmem-ring-entries={a.vmem_ring_entries}'
     if getattr(a, 'fold_store_rings', 0):
@@ -1668,6 +1670,10 @@ def build_parser():
     ap.add_argument('--vmem-auto-instance-bits', type=int, default=0, metavar='N',
                     help='as --vmem-auto-bits, by one instance\'s image (rows x width) at least N bits: the same '
                          'memories are virtual at every instance count (foldsim-fold-static vmem-auto-instance-bits)')
+    ap.add_argument('--vmem-cost', action='store_true',
+                    help='a memory the virtual-memory rules pick (pattern or size) stays on chip where its '
+                         'threaded image there costs fewer LUTs than as a virtual memory (foldsim-fold-static '
+                         'vmem-cost; each choice reported)')
     ap.add_argument('--vmem-auto-bits', type=int, default=0, metavar='N',
                     help='with --static: every registered-read target memory (one read port, at most one write '
                          'port) whose threaded image is at least N bits is a virtual memory too, whatever storage '
