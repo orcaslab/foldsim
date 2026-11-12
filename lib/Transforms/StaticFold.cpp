@@ -1744,6 +1744,9 @@ private:
     /// `vport-copy`: the ring memories (among `members`) whose images it
     /// keeps, members after the streams (rows {member, instance}).
     SmallVector<std::pair<unsigned, unsigned>> images;
+    /// Each image's prefetches leave this many positions after their plan's
+    /// (rings of one class, whose prefetches share positions, on one port).
+    SmallVector<unsigned> imageShift;
     /// Positions with a request: a read, a write (ii + 1 each).
     SmallVector<uint64_t> reads, writes;
     /// A member's tag bits (a column's instance-and-page, a stream's
@@ -6006,17 +6009,33 @@ LogicalResult StaticFolder::assignPageEngines() {
         // (`vport-copy`: a ring's prefetches, at its plan's positions, read
         // its image on its port: free there too, and not at its own.)
         SmallVector<unsigned> prefAt;
-        bool copyRing = vportEngines && vportCopy && vm.ring && cls.ring;
+        // (Not a write-first memory: its read waits for its own cycle's write
+        // (rd_new), queued in the port after the copy's slot, which waits for
+        // that read: the port would deadlock.)
+        bool copyRing = vportEngines && vportCopy && vm.ring && cls.ring && vm.readFirst;
         if (copyRing)
           for (unsigned p = 0; p < ii; ++p)
             if (cls.ring->prefValid[p])
               prefAt.push_back(p);
+        // (Its prefetches may leave up to `maxShift` positions after their
+        // plan's: still before their uses' decisions, useGap = lead + 2
+        // after. `shift` the least that fits, per engine tried.)
+        unsigned maxShift = copyRing ? unsigned(decisionLead()) : 0, shift = 0;
+        auto prefFree = [&](PageEngine &eng, unsigned d, unsigned t) {
+          return llvm::none_of(prefAt, [&](unsigned p) {
+            unsigned x = (p + t) % ii;
+            return eng.reads[x] || llvm::is_contained(at, unsigned((x + ii - d) % ii));
+          });
+        };
         auto freeAt = [&](PageEngine &eng, unsigned d) {
           if (llvm::any_of(at, [&](unsigned q) { return eng.reads[q + d] || eng.writes[q + d]; }))
             return false;
-          return llvm::none_of(prefAt, [&](unsigned p) {
-            return eng.reads[p] || llvm::is_contained(at, unsigned((p + ii - d) % ii));
-          });
+          for (unsigned t = 0; t <= maxShift; ++t)
+            if (prefFree(eng, d, t)) {
+              shift = t;
+              return true;
+            }
+          return false;
         };
         unsigned iw = vm.instWidth ? vm.instWidth
                                    : std::max(cls.threads() > 1
@@ -6042,15 +6061,49 @@ LogicalResult StaticFolder::assignPageEngines() {
           if (found)
             break;
         }
+        // (A copy ring that no engine takes with its prefetches: on the first
+        // that takes it alone, keeping an image of its own, before a new
+        // engine: a port costs more than its ring's answer path.)
+        if (copyRing && e == pageEngines.size()) {
+          SmallVector<unsigned> keep(prefAt.begin(), prefAt.end());
+          prefAt.clear();
+          unsigned e2 = 0, d2 = 0;
+          for (; e2 < pageEngines.size(); ++e2) {
+            auto &eng = pageEngines[e2];
+            if ((vm.dataWidth + 511) / 512 > (std::max(1u, eng.dataWidth) + 511) / 512)
+              continue;
+            bool found = false;
+            for (unsigned t = 0; t <= most && !found; ++t) {
+              d2 = t < most ? t + 1 : 0;
+              found = freeAt(eng, d2);
+            }
+            if (found)
+              break;
+          }
+          if (e2 < pageEngines.size()) {
+            e = e2;
+            d = d2;
+            copyRing = false;
+          } else {
+            prefAt = keep;
+          }
+        }
         if (e == pageEngines.size())
           d = most ? 1 : 0;
-        // (A ring whose prefetches fall at its own requests' positions cannot
-        // keep its image on its port: it keeps an image of its own.)
-        if (copyRing && e == pageEngines.size() &&
-            llvm::any_of(prefAt, [&](unsigned p) {
-              return llvm::is_contained(at, unsigned((p + ii - d) % ii));
-            }))
-          copyRing = false;
+        // (On a new engine: the least shift off its own positions, else the
+        // ring keeps an image of its own.)
+        if (copyRing && e == pageEngines.size()) {
+          auto selfFree = [&](unsigned t) {
+            return llvm::none_of(prefAt, [&](unsigned p) {
+              return llvm::is_contained(at, unsigned(((p + t) % ii + ii - d) % ii));
+            });
+          };
+          shift = 0;
+          while (shift <= maxShift && !selfFree(shift))
+            ++shift;
+          if (shift > maxShift)
+            copyRing = false;
+        }
         if (e == pageEngines.size()) {
           if (e >= pageEngineCap)
             return netlist.emitError("page engines: ")
@@ -6067,7 +6120,8 @@ LogicalResult StaticFolder::assignPageEngines() {
           eng.reads[q + d] = eng.writes[q + d] = 1;
         if (copyRing) {
           if (getenv("FOLDSIM_COPY_LOG")) {
-            llvm::errs() << "copy: " << cls.name << ":" << vm.name << " engine " << e << " d " << d << " at";
+            llvm::errs() << "copy: " << cls.name << ":" << vm.name << " engine " << e << " d " << d
+                         << " shift " << shift << " at";
             for (unsigned q : at)
               llvm::errs() << " " << q;
             llvm::errs() << " pref";
@@ -6076,8 +6130,10 @@ LogicalResult StaticFolder::assignPageEngines() {
             llvm::errs() << "\n";
           }
           for (unsigned p : prefAt)
-            eng.reads[p] = 1;
+            eng.reads[(p + shift) % ii] = 1;
           eng.images.push_back({unsigned(c), unsigned(k)});
+          eng.imageShift.push_back(shift);
+          eng.delay = std::max(eng.delay, shift);
           eng.instWidth = std::max(eng.instWidth, unsigned(llvm::Log2_32_Ceil(cls.ring->entries)));
         }
         vm.delay = d;
@@ -25974,14 +26030,34 @@ LogicalResult StaticFolder::buildSim() {
         auto when = [&](Value valid, Value x) -> Value {
           return comb::MuxOp::create(b, valid, x, constant(hw::getBitWidth(x.getType()), 0));
         };
-        Value pv = rb.pref0;
+        // (Shifted: the valid, instance and entry through registers stepped
+        // by the positions run, so that the read leaves at its placed
+        // position however many bubbles come between.)
+        Value pv = rb.pref0, pinst = rb.pinst0, pentry = rb.pentry0;
+        unsigned sh = eng.imageShift[j];
+        if (sh) {
+          Value live = notOf(eq(pos0, ii));
+          std::string prefix = classes[ck.first].virtualMemories[ck.second].name + "_ring_pshift";
+          for (unsigned t = 0; t < sh; ++t) {
+            auto step = [&](Value x, const Twine &n, bool reset) -> Value {
+              auto next = backedges.get(x.getType());
+              Value r = reset ? resetReg(next, prefix + n + Twine(t), 0) : reg(next, prefix + n + Twine(t));
+              next.setValue(comb::MuxOp::create(b, live, x, r));
+              return r;
+            };
+            pv = step(pv, "_v", true);
+            pinst = step(pinst, "_i", false);
+            pentry = step(pentry, "_e", false);
+          }
+          pv = comb::AndOp::create(b, pv, live);
+        }
         prefV.push_back(pv);
         rdValid.push_back(pv);
         rdInst.push_back(when(pv, b.createOrFold<comb::ConcatOp>(ValueRange{
-                                      constant(eng.memberBits(), mi), zext(rb.pentry0, eng.instWidth),
+                                      constant(eng.memberBits(), mi), zext(pentry, eng.instWidth),
                                       constant(1, 0)})));
         rdRow.push_back(when(pv, b.createOrFold<comb::ConcatOp>(constant(eng.memberBits(), mi),
-                                                                 zext(rb.pinst0, eng.addrWidth))));
+                                                                 zext(pinst, eng.addrWidth))));
       }
       auto any = [&](SmallVector<Value> &xs) -> Value {
         return xs.size() == 1 ? xs[0] : Value(comb::OrOp::create(b, xs, false));

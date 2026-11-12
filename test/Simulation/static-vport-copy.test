@@ -31,7 +31,24 @@
 # RUN: python3 %S/Inputs/vmem_bind.py %t/own/foldsim_sim.json %t/own
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/own -Mdir %t/own/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/own/foldsim_sim.sv > %t/own/build.log 2>&1
 # RUN: %t/own/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# Read-first rings of one class, one of two-beat rows (vport_rf); write-first rings (vmem_multi) keep their own
+# images (their reads wait for their own cycle's write, queued in the port after the copy's slot).
+# RUN: cd %S/../Driver/Inputs/vport_rf && foldsim --srcs top.f --top Top --out %t/rf --static --modulo --bubbles --min-ii 160 --virtual-memories 'Leaf:.*' --vmem-rings 16 --page-engines 16 --vmem-on-engines --vport-engines --vport-hz 8 --vport-copy Leaf > %t/rf.log 2>&1
+# RUN: FileCheck %s --check-prefix=RF < %t/rf/foldsim_sim.vh
+# RUN: python3 %S/Inputs/vmem_bind.py %t/rf/foldsim_sim.json %t/rf
+# RUN: cd %S/../Driver/Inputs/vport_rf && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/rf -Mdir %t/rf/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/rf/foldsim_sim.sv > %t/rf/build.log 2>&1
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=600 +bubble=90 +stall=20 | FileCheck %s
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/vmem_multi && foldsim --srcs top.f --top Top --out %t/wf --static --modulo --min-ii 160 --virtual-memories 'Leaf:.*' --vmem-rings 16 --page-engines 16 --vmem-on-engines --vport-engines --vport-hz 8 --vport-copy Leaf > %t/wf.log 2>&1
+# RUN: FileCheck %s --check-prefix=WF < %t/wf/foldsim_sim.vh
+# RUN: python3 %S/Inputs/vmem_bind.py %t/wf/foldsim_sim.json %t/wf
+# RUN: cd %S/../Driver/Inputs/vmem_multi && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/wf -Mdir %t/wf/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/wf/foldsim_sim.sv > %t/wf/build.log 2>&1
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=600 +stall=30 | FileCheck %s
 
+# RF: `define FOLDSIM_VPORT0_COPY 1
+# RF: `define FOLDSIM_VPORT1_LMAX 2
+# RF: `define FOLDSIM_VPORT1_COPY 1
+# WF-NOT: _COPY 1
 # VH: `define FOLDSIM_VPORTS 1
 # VH: `define FOLDSIM_VPORT0_COPY 1
 # SV-NOT: ring_flight
