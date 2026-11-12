@@ -1326,10 +1326,11 @@ def write_vmem_engines(sv, info, path, mode, master_bits, names=None):
     at = vmem_engine_groups(sv)
     bits = lambda v: 2 * v['data_width'] + v['row_width'] + v['inst_width']
     if info.get('vmem_groups'):
-        ctrls = [(f'.*/g_vg{g}[./](vmem|group)$', x['members'], sum(bits(info['vmem'][k]) for k in x['members']))
+        ctrls = [(f'.*/g_vg{g}[./](g_vp[./])?(vmem|group|vport)$', x['members'],
+                  sum(bits(info['vmem'][k]) for k in x['members']))
                  for g, x in enumerate(info['vmem_groups'])]
     else:
-        ctrls = [(f'.*/vmem_{k}$', [k], bits(v)) for k, v in enumerate(info['vmem'])]
+        ctrls = [(f'.*/(vmem|vport)_{k}$', [k], bits(v)) for k, v in enumerate(info['vmem'])]
     placed = []
     with open(path, 'a') as f:
         f.write(f'# Virtual-memory controllers with their class copy (--vmem-engines {mode}).\n')
@@ -1441,6 +1442,30 @@ def vmem_slr_map(spec):
             sys.exit(f'--vmem-slr-groups: {x!r} is not <class>:<group>')
         out.append((c, int(g)))
     return out
+
+
+def vmem_slr_of(info, sched, pairs):
+    """Each controller's SLR group under --vmem-slr-groups (`pairs`, [(class,
+    group)]), in the kernel's controller order (info['vmem_groups'], else
+    info['vmem']): a class's own controller, its class's group; a page engine
+    (class `__pages<k>`), its members' (the schedule's `page engine <k> ...:`
+    line: a column or PP row chunk `<class>:<name>`, a link stream
+    `link:<producer>><reader>` its reader's, as fold-static vmem-slr-groups
+    places them), the one most of them name; -1 where none is named."""
+    of = dict(pairs)
+    engines = {}
+    for m in re.finditer(r'^\s+page engine (\d+) \d+ bits, tag \d+, row \d+: (.*)$', sched, re.M):
+        votes = {}
+        for x in m.group(2).split():
+            cls = x[5:].split('>', 1)[-1].split('(')[0] if x.startswith('link:') else x.split(':', 1)[0]
+            if cls in of:
+                votes[of[cls]] = votes.get(of[cls], 0) + 1
+        if len(votes) > 1:
+            print(f'foldsim: warning: --vmem-slr-groups: page engine {m.group(1)} carries the members of groups '
+                  f'{sorted(votes)}', file=sys.stderr)
+        engines[f'__pages{m.group(1)}'] = max(votes, key=lambda g: (votes[g], -g)) if votes else -1
+    ctrls = info.get('vmem_groups') or info.get('vmem') or []
+    return [engines.get(c['class'], of.get(c['class'], -1)) for c in ctrls]
 
 
 def vmem_groups(vmems, choice, weights=None, kz_bits=0):
@@ -2815,6 +2840,14 @@ def main():
         info['vmem_engines'] = {'mode': a.vmem_engines, 'local': [c for c, _ in placed]}
         print(f'foldsim: --vmem-engines {a.vmem_engines}: {len(placed)} controllers with their copies '
               f'in foldsim_floorplan.tcl', file=sys.stderr)
+    if getattr(a, 'vmem_slr_groups', '') and info.get('vmem'):
+        # Each controller's SLR group (foldsim_sim.vh FOLDSIM_VMEM_[G]<k>_SLR), the
+        # kernel's masters by SLR and its floorplan (flow/v80/vmem_ports.py).
+        sched = open(out('schedule.txt')).read() if os.path.exists(out('schedule.txt')) else ''
+        for c, g in zip(info.get('vmem_groups') or info['vmem'], vmem_slr_of(info, sched, vmem_slr_map(a.vmem_slr_groups))):
+            c['slr_group'] = g
+        if region:
+            info['vmem_slr_names'] = [s_['name'] for s_ in json.load(open(region)).get('slrs', [])]
     with open(out('foldsim_sim.json'), 'w') as f:
         json.dump(info, f, indent=1)
     # The kernel's view of it: how many classes report their finishes, bit c
@@ -2882,6 +2915,13 @@ def main():
                     f.write(f'`define FOLDSIM_VMEM_G{g}_KZ_SHIFT {v["kz_shift"]}\n')
                     if 'cache_rows' in v:
                         f.write(f'`define FOLDSIM_VMEM_G{g}_CACHE_ROWS {v["cache_rows"]}\n')
+            ctrls = info.get('vmem_groups') or info['vmem']
+            if 'slr_group' in ctrls[0]:
+                key = 'G' if 'vmem_groups' in info else ''
+                for k, c in enumerate(ctrls):
+                    f.write(f'`define FOLDSIM_VMEM_{key}{k}_SLR {c["slr_group"]}\n')
+                if info.get('vmem_slr_names'):
+                    f.write(f'`define FOLDSIM_VMEM_SLR_NAMES "{" ".join(info["vmem_slr_names"])}"\n')
             if getattr(a, 'vmem_controller', 'vmem') == 'vport':
                 f.write('`define FOLDSIM_VMEM_VPORT\n')
                 for k, v in enumerate(info['vmem']):

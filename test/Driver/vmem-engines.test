@@ -62,7 +62,7 @@
 # LOC: foldsim: --vmem-engines local: 6 controllers with their copies in foldsim_floorplan.tcl
 # LOCP: set_property USER_SLR_ASSIGNMENT fs_slr0 $c }
 # LOCP: # Virtual-memory controllers with their class copy (--vmem-engines local).
-# LOCP-NEXT: set c [get_cells -quiet -hierarchical -regexp {.*/g_vg0[./](vmem|group)$}]
+# LOCP-NEXT: set c [get_cells -quiet -hierarchical -regexp {.*/g_vg0[./](g_vp[./])?(vmem|group|vport)$}]
 # LOCP-NEXT: if {[llength $c] == 1} { set_property USER_SLR_ASSIGNMENT fs_slr0 $c }
 # LOCS: virtual memories (--vmem-engines local): 6 controllers, SLR2 6
 # LOCS: of which virtual memories 0)

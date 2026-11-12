@@ -54,6 +54,20 @@ j) for each master j, and FOLDSIM_VMEM_REPEAT gives each controller its
 master's port. With M = N the header is as without the option. Where no
 master is left beside the memory ports (or with M = 0), controller k shares
 the memory ports' master k mod P with its endpoint: FOLDSIM_VMEM_ON_PORTS.
+
+Masters by SLR (foldsim --vmem-slr-groups: foldsim_sim.vh gives each
+controller's SLR group, FOLDSIM_VMEM_<k>_SLR or FOLDSIM_VMEM_G<g>_SLR, -1 for
+none named): with fewer masters than controllers, the M masters are split over
+the groups by their controllers' port bits (largest remainder, at least one a
+group with controllers: foldsim_sll_check.slr_masters, the split the SLL check
+prices), numbered group by group, and the controllers of a group take its
+masters in turn. The header then also says FOLDSIM_VMEM_MASTER_OF, controller
+k's master for each k (the kernel's sharing follows it instead of k mod M), and
+FOLDSIM_VMEM_MASTER_SLR, each master's group. With --floorplan it prints, in
+place of the header, the Tcl that assigns each controller (g_vg<g>, or vmem_<k>)
+and each master's foldsim_vmem_share (g_vmem_master[j].share) to its group's
+SLR (FOLDSIM_VMEM_SLR_NAMES), for the implementation's floorplan
+(foldsim_floorplan.tcl, flow floorplan.tcl).
 """
 
 import argparse
@@ -102,6 +116,101 @@ def vmem_widths(sim_vh):
         return {k: int(w) for k, w in re.findall(r'^`define FOLDSIM_VMEM_(G?\d+)_DW (\d+)\s*$', f.read(), re.M)}
 
 
+def vmem_slr(sim_vh, groups):
+    """Each controller's SLR group from foldsim_sim.vh (FOLDSIM_VMEM_<k>_SLR, or
+    FOLDSIM_VMEM_G<g>_SLR with groups; -1: none named) and the groups' SLR
+    names (FOLDSIM_VMEM_SLR_NAMES); (None, None) without them."""
+    with open(sim_vh) as f:
+        text = f.read()
+    key = 'G' if groups is not None else ''
+    at = {int(k): int(s) for k, s in re.findall(rf'^`define FOLDSIM_VMEM_{key}(\d+)_SLR (-?\d+)\s*$', text, re.M)}
+    if not at:
+        return None, None
+    m = re.search(r'^`define FOLDSIM_VMEM_SLR_NAMES "([^"]*)"\s*$', text, re.M)
+    return at, (m.group(1).split() if m else None)
+
+
+def port_bits(sim_vh, groups, n):
+    """Each controller's port bits (its members' read and write data, row and
+    instance: foldsim_sll_check's weight)."""
+    with open(sim_vh) as f:
+        d = dict(re.findall(r'^`define FOLDSIM_VMEM_(\w+) (\d+)\s*$', f.read(), re.M))
+    bits = lambda k: 2 * int(d.get(f'{k}_DW', 0)) + int(d.get(f'{k}_AW', 0)) + int(d.get(f'{k}_IW', 0))
+    return [sum(bits(str(k)) for k in groups[c]) if groups is not None else bits(str(c)) for c in range(n)]
+
+
+def split_masters(weights, total):
+    """Masters per group: `total` split by `weights` (largest remainder), at
+    least one where a weight is positive (foldsim_sll_check.slr_masters)."""
+    live = [i for i, w in enumerate(weights) if w > 0]
+    if not live:
+        return [0] * len(weights)
+    total = max(total, len(live))
+    tw = sum(weights[i] for i in live)
+    out = [0] * len(weights)
+    for i in live:
+        out[i] = max(1, int(total * weights[i] / tw))
+    while sum(out) > total:
+        i = max((i for i in live if out[i] > 1), key=lambda i: out[i] - total * weights[i] / tw, default=None)
+        if i is None:
+            break
+        out[i] -= 1
+    while sum(out) < total:
+        i = max(live, key=lambda i: total * weights[i] / tw - out[i])
+        out[i] += 1
+    return out
+
+
+def masters_by_slr(slr, bits, n, m):
+    """([master of controller k], [group of master j]): the m masters split over
+    the controllers' SLR groups by port bits, numbered group by group (the
+    named groups in order, then the unnamed), each group's controllers on its
+    masters in turn. A group never takes more masters than controllers."""
+    keys = sorted({slr.get(k, -1) for k in range(n)}, key=lambda g: (g < 0, g))
+    weights = [sum(max(1, bits[k]) for k in range(n) if slr.get(k, -1) == g) for g in keys]
+    count = [sum(1 for k in range(n) if slr.get(k, -1) == g) for g in keys]
+    per = split_masters(weights, m)
+    # (No group past its controllers: the rest to the next by weight.)
+    spare = sum(max(0, p - c) for p, c in zip(per, count))
+    per = [min(p, c) for p, c in zip(per, count)]
+    while spare:
+        i = max((i for i in range(len(keys)) if per[i] < count[i]), key=lambda i: weights[i] / per[i])
+        per[i] += 1
+        spare -= 1
+    first, at = {}, 0
+    for g, p in zip(keys, per):
+        first[g] = at
+        at += p
+    seen = {g: 0 for g in keys}
+    of = []
+    for k in range(n):
+        g = slr.get(k, -1)
+        of.append(first[g] + seen[g] % per[keys.index(g)])
+        seen[g] += 1
+    return of, [g for g, p in zip(keys, per) for _ in range(p)]
+
+
+def floorplan(slr, names, of, mslr, groups):
+    """The Tcl assigning each controller and each master's share to its
+    group's SLR (names: the groups' SLRs, else fs_slr<g>, the placer's
+    choice); an unnamed group's are left to the placer."""
+    where = lambda g: (names[g] if names and g < len(names) else f'fs_slr{g}')
+    # (Group g's controller: g_vg<g>'s foldsim_vmem_group, foldsim_vmem or, with
+    # vport controllers, g_vp's foldsim_vport_ctl; memory k's: vmem_<k> or vport_<k>.)
+    cell = ((lambda k: f'.*/g_vg{k}[./](g_vp[./])?(vmem|group|vport)$') if groups is not None
+            else (lambda k: f'.*/(vmem|vport)_{k}$'))
+    out = ['# Virtual-memory controllers and their masters\' shares in their SLR group (vmem_ports.py --floorplan).']
+    for k in range(len(of)):
+        if slr.get(k, -1) >= 0:
+            out += [f'set c [get_cells -quiet -hierarchical -regexp {{{cell(k)}}}]',
+                    f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT {where(slr[k])} $c }}']
+    for j, g in enumerate(mslr):
+        if g >= 0:
+            out += [f'set c [get_cells -quiet -hierarchical -regexp {{.*/g_vmem_master\\[{j}\\][./]share$}}]',
+                    f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT {where(g)} $c }}']
+    return '\n'.join(out)
+
+
 def layout_defaults(name, dw):
     """The v6 layout's row bytes and a known-zero bit per row, where the
     compiler gave none."""
@@ -121,6 +230,8 @@ def main():
     ap.add_argument('--vmem-masters', type=int, default=None,
                     help="the controllers' own masters (default: one each, or as many as fit; "
                          "0: none, on the memory ports' masters)")
+    ap.add_argument('--floorplan', action='store_true',
+                    help="print the floorplan Tcl of the controllers and their masters' shares (SLR groups)")
     a = ap.parse_args()
     groups = vmem_groups(a.sim_vh)
     n = len(groups) if groups is not None else vmem_count(a.sim_vh)
@@ -134,6 +245,17 @@ def main():
                  f'need {p + m} device-memory masters; the kernel has at most {MAX_MASTERS}')
     if a.cache_rows and (a.cache_rows < 2 or a.cache_rows & (a.cache_rows - 1)):
         sys.exit('vmem_ports.py: --cache-rows is 0 or a power of two of at least 2')
+    slr, names = vmem_slr(a.sim_vh, groups) if n else (None, None)
+    of = mslr = None
+    if slr is not None and 0 < m < n:
+        # (A master at least for each group with controllers: m grows to the groups.)
+        of, mslr = masters_by_slr(slr, port_bits(a.sim_vh, groups, n), n, m)
+        m = len(mslr)
+        if m > room:
+            sys.exit(f'vmem_ports.py: {m} SLR groups of controllers need a master each beside {p} memory-port '
+                     f'masters; the kernel has at most {MAX_MASTERS}')
+        if m == n:
+            of = mslr = None
     if a.port_masters:
         print(p)
         return
@@ -142,7 +264,15 @@ def main():
         return
     if n == 0:
         return
-    port = (lambda k: k % p) if m == 0 else (lambda k: p + k % m)
+    if a.floorplan:
+        if slr is None:
+            sys.exit('vmem_ports.py: --floorplan: foldsim_sim.vh gives no SLR group (foldsim --vmem-slr-groups)')
+        print(floorplan(slr, names, of or list(range(n)), mslr or [], groups))
+        return
+    if of is not None:
+        port = lambda k: p + of[k]
+    else:
+        port = (lambda k: k % p) if m == 0 else (lambda k: p + k % m)
     print('`define FOLDSIM_VMEM_REPEAT(f,s) ' + ' `s '.join(f'`f({port(k)}, {k})' for k in range(n)))
     # The same in parts of PART_SIZE, each a line of its own where the kernel
     # instantiates the controllers (a part after the first led by `s unless
@@ -160,6 +290,9 @@ def main():
         print(f'`define FOLDSIM_VMEM_MASTERS {m}')
         print('`define FOLDSIM_VMEM_MASTER_REPEAT(f,s) '
               + ' `s '.join(f'`f({p + j}, {j})' for j in range(m)))
+        if of is not None:
+            print('`define FOLDSIM_VMEM_MASTER_OF ' + ', '.join(str(j) for j in of))
+            print('`define FOLDSIM_VMEM_MASTER_SLR ' + ', '.join(str(g) for g in mslr))
     if a.cache_rows:
         print(f'`define FOLDSIM_VMEM_CACHE_ROWS {a.cache_rows}')
     print('`define FOLDSIM_VMEM_PER_MEMORY_ROWS')
