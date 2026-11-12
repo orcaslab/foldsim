@@ -485,6 +485,12 @@ def frame_options(a):
         fold += ' vmem-on-engines'
     if getattr(a, 'vmem_stagger', 0):
         fold += f' vmem-stagger={a.vmem_stagger}'
+    if getattr(a, 'vport_engines', False):
+        fold += ' vport-engines'
+        if a.vport_fence_shift != 4:
+            fold += f' vport-fence-shift={a.vport_fence_shift}'
+        if a.vport_hz:
+            fold += f' vport-hz={a.vport_hz}'
     if getattr(a, 'port_plan_out', None):
         fold += f' port-plan-out={os.path.abspath(a.port_plan_out)}'
     if getattr(a, 'pp_beat_bits', 0):
@@ -1798,6 +1804,15 @@ def build_parser():
                     help='with --vmem-on-engines: a target RAM\'s requests may leave up to D positions after its '
                          'pass (held in registers) so a copy\'s memories share engines at successive positions '
                          '(foldsim-fold-static vmem-stagger; 0: at the pass)')
+    ap.add_argument('--vport-engines', action='store_true',
+                    help='with --page-engines: each page engine a static port (foldsim_vport, vp<p>_* simulator '
+                         'ports, FOLDSIM_VPORT<p>_* in foldsim_sim.vh; foldsim-fold-static vport-engines)')
+    ap.add_argument('--vport-hz', type=int, default=0, metavar='N',
+                    help='with --vport-engines: read after write by a 2^N-entry table of write numbers a port '
+                         '(by a hash of the row) instead of fence classes (0)')
+    ap.add_argument('--vport-fence-shift', type=int, default=4, metavar='FS',
+                    help='with --vport-engines: the ports\' fence sample interval\'s log2 (0: every read waits for '
+                         'every earlier write)')
     ap.add_argument('--port-plan-out', metavar='JSON',
                     help='report only: every HBM member\'s request positions (page engine members as placed, class '
                          'virtual memories\' state passes and issues) in this JSON file, a static-port placement '
@@ -2640,6 +2655,13 @@ def main():
     }
     for name, n in info['threads'].items():
         info['threads'][name] = int(n)
+    # Static ports (fold-static vport-engines), in the simulator's vp<p>_ order:
+    # each its FOLDSIM_VPORT<p>_* parameters (VBa/STATUS 5 item 9).
+    vps = re.search(r'foldsim\.vports = \[(.*?)\]', sim_text)
+    info['vports'] = []
+    for entry in re.findall(r'"([^"]*)"', vps.group(1)) if vps else []:
+        info['vports'].append(dict(zip(('DW', 'MW', 'TW', 'OW', 'LMAX', 'COPY', 'NEED_IN', 'HZ', 'BYTES', 'ZERO', 'FS', 'KS'),
+                                       (int(x) for x in entry.split(':')))))
     # Virtual memories, in the simulator's vm<k>_ port order.
     vmems = re.search(r'foldsim\.vmems = \[(.*?)\]', sim_text)
     info['vmem'] = []
@@ -2751,6 +2773,11 @@ def main():
                 for x in pf[kind]:
                     f.write(f'`define FOLDSIM_PORTS_{kind.upper()}_{x["name"].upper()}_LO {x["lo"]}\n')
                     f.write(f'`define FOLDSIM_PORTS_{kind.upper()}_{x["name"].upper()}_W {x["width"]}\n')
+        if info.get('vports'):
+            f.write(f'`define FOLDSIM_VPORTS {len(info["vports"])}\n')
+            for p, q in enumerate(info['vports']):
+                for k, v in q.items():
+                    f.write(f'`define FOLDSIM_VPORT{p}_{k} {v}\n')
         if info['vmem']:
             f.write(f'`define FOLDSIM_VMEM_COUNT {len(info["vmem"])}\n')
             if not a.vmem_forward:

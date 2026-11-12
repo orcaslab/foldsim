@@ -414,6 +414,26 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "entries) and the frame's end. Classes whose folded stores stream "
            "take part too (their folded stores keep their controllers). 0: "
            "every request at its pass">,
+    Option<"vportEngines", "vport-engines", "bool", "false",
+           "With page-engines: each page engine is a static port (the kernel's "
+           "foldsim_vport, contract VB/STATUS 5.1): the simulator's vp<p>_* "
+           "ports instead of an engine's vm<k>_* row interface and its "
+           "controller. A request's address is its row's beat offset in the "
+           "port's region ({member, instance, row} x the row's beats), its "
+           "tag the engine's; a row of several 512-bit beats is answered beat "
+           "by beat into a register of the row. Read after write by a fence "
+           "class a member (vport-fence-shift), from the schedule's least "
+           "distance from any write of the member to a later read; read-first "
+           "members' writes wait for the reads before them (wr_pair)">,
+    Option<"vportHz", "vport-hz", "unsigned", "0",
+           "With vport-engines: read after write by each port's table of "
+           "write numbers by a hash of the row (2^N entries; the fences "
+           "unused) instead of fence classes; 0: fence classes">,
+    Option<"vportFenceShift", "vport-fence-shift", "unsigned", "4",
+           "With vport-engines: the ports' fence sample interval's log2 (FS): "
+           "a member whose writes precede its reads by at least (c + 1) x 2^FS "
+           "positions reads in fence class c (at most 15); 0 waits for every "
+           "earlier write's B">,
     Option<"portPlanOut", "port-plan-out", "std::string", "\"\"",
            "Report only: write every HBM member's request positions (each page "
            "engine member's reads and writes as placed; each class virtual "

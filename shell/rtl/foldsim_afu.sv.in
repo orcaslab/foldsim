@@ -1227,7 +1227,9 @@ module foldsim_afu #(
             .AXI_RD_OUT   (16), \
             .AXI_WR_OUT   (16), \
             .MAX_BURST    (8), \
+            .FS           (`FOLDSIM_VPORT``p``_FS), \
             .HZ           (`FOLDSIM_VPORT``p``_HZ), \
+            .KS           (`FOLDSIM_VPORT``p``_KS), \
             .NEED_IN      (`FOLDSIM_VPORT``p``_NEED_IN), \
             .COPY         (`FOLDSIM_VPORT``p``_COPY), \
             .ZERO_FILL    (`FOLDSIM_VPORT``p``_ZERO), \

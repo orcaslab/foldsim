@@ -1,0 +1,69 @@
+# REQUIRES: verilator
+# Static ports in the simulator (--vport-engines): each page engine is the
+# kernel's foldsim_vport itself, the simulator's side the contract's vp<p>_*
+# ports (VBa/STATUS 5 item 9): a request's address its row's beat offset in
+# the port's region, its tag the engine's {member, instance}, whole rows of
+# 512-bit beats; foldsim_sim.vh declares FOLDSIM_VPORTS and each port's
+# FOLDSIM_VPORT<p>_* parameters. Read after write by fence classes (from each
+# member's least write-to-read distance; write-first members at distance 0
+# see their own cycle's write, rd_new) or by the port's table of write
+# numbers (--vport-hz). Each run against the target from zero state
+# (tb_vmem_multi.sv): every static port a real foldsim_vport (SYNC) on an
+# AXI memory that applies a write only at its B and reads at AR
+# (vport_axi_model.sv: a read the port lets out early answers the old row),
+# 1 to 600 host cycles, ready stalls, bubbles. Target RAMs on engines
+# (vmem_multi: write-first pairs, fence class 0 + rd_new), PP rows as beats
+# (paged16: read-first engines, wr_pair) with the table (HZ 8) and with
+# fences.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_multi
+# RUN: foldsim --srcs top.f --top Top --out %t/vm --static --virtual-memories 'Leaf:.*' --page-engines 16 --vmem-on-engines --vport-engines Leaf 2>&1 | FileCheck %s --check-prefix=VM
+# RUN: FileCheck %s --check-prefix=VH < %t/vm/foldsim_sim.vh
+# RUN: FileCheck %s --check-prefix=SV < %t/vm/foldsim_sim.sv
+# RUN: python3 %S/Inputs/vmem_bind.py %t/vm/foldsim_sim.json %t/vm
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/vm -Mdir %t/vm/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/vm/foldsim_sim.sv > %t/vm/build.log 2>&1
+# RUN: %t/vm/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/vm/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: %t/vm/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/paged16 && env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/pp --static --nest --modulo --bubbles --state-in-ram Leaf::4 --state-scratch-bits 4000 --state-in-ram-pp --page-engines 4 --page-engines-pp --pp-beat-bits 144 --vport-engines --vport-hz 8 Leaf > %t/pp.log 2>&1
+# RUN: FileCheck %s --check-prefix=HZ < %t/pp/foldsim_sim.vh
+# RUN: python3 %S/Inputs/vmem_bind.py %t/pp/foldsim_sim.json %t/pp
+# RUN: cd %S/../Driver/Inputs/paged16 && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/pp -Mdir %t/pp/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/pp/foldsim_sim.sv > %t/pp/build.log 2>&1
+# RUN: %t/pp/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=30 +bubble=30 +stall=10 | FileCheck %s
+# RUN: %t/pp/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=600 +bubble=90 +stall=20 | FileCheck %s
+# RUN: %t/pp/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=20 +hi=600 +full=80 +stall=20 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/paged16 && env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/pf --static --nest --modulo --state-in-ram Leaf::4 --state-scratch-bits 4000 --state-in-ram-pp --page-engines 4 --page-engines-pp --pp-beat-bits 144 --vport-engines --vport-fence-shift 1 Leaf > %t/pf.log 2>&1
+# RUN: python3 %S/Inputs/vmem_bind.py %t/pf/foldsim_sim.json %t/pf
+# RUN: cd %S/../Driver/Inputs/paged16 && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/pf -Mdir %t/pf/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/pf/foldsim_sim.sv > %t/pf/build.log 2>&1
+# RUN: %t/pf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+
+# Read-first target RAMs (same-row pairs: wr_pair), one of two-beat rows (a port of 1,024 bits: the answer's
+# beats into a row register).
+# RUN: cd %S/../Driver/Inputs/vport_rf && foldsim --srcs top.f --top Top --out %t/rf --static --virtual-memories 'Leaf:.*' --page-engines 16 --vmem-on-engines --vport-engines Leaf > %t/rf.log 2>&1
+# RUN: FileCheck %s --check-prefix=RF < %t/rf/foldsim_sim.vh
+# RUN: python3 %S/Inputs/vmem_bind.py %t/rf/foldsim_sim.json %t/rf
+# RUN: cd %S/../Driver/Inputs/vport_rf && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/rf -Mdir %t/rf/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/rf/foldsim_sim.sv > %t/rf/build.log 2>&1
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RF: `define FOLDSIM_VPORT1_DW 600
+# RF: `define FOLDSIM_VPORT1_LMAX 2
+# HBM link streams on the ports (fence classes from the streams' write-to-request distances).
+# RUN: cd %S/../Driver/Inputs/linkshare && foldsim --srcs top.f --top Top --out %t/lk --static --nest --modulo --bubbles --min-ii 160 --page Unit:3,Vnit:3,Reader:3,Sink:3 --page-engines auto --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Unit:Sink:hbm --vport-engines --vport-fence-shift 2 Unit Vnit Reader Sink > %t/lk.log 2>&1
+# RUN: FileCheck %s --check-prefix=LK < %t/lk/foldsim_sim.sv
+# RUN: python3 %S/Inputs/vmem_bind.py %t/lk/foldsim_sim.json %t/lk
+# RUN: cd %S/../Driver/Inputs/linkshare && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRST -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/lk -Mdir %t/lk/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/lk/foldsim_sim.sv > %t/lk/build.log 2>&1
+# RUN: %t/lk/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RUN: %t/lk/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=20 +hi=600 +full=80 +stall=20 +bubble=30 | FileCheck %s
+# RUN: %t/lk/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=60 +full=50 | FileCheck %s
+# LK: assign vp0_rd_fence = {{.*}} ? 4'hE : 4'h0;
+# VM: vmem-on-engines: 8 virtual memories on page engines
+# VH: `define FOLDSIM_VPORTS 8
+# VH: `define FOLDSIM_VPORT0_DW 8
+# VH: `define FOLDSIM_VPORT0_LMAX 1
+# VH: `define FOLDSIM_VPORT0_HZ 0
+# VH: `define FOLDSIM_VPORT0_FS 4
+# SV: output {{.*}}vp0_rd_valid
+# SV: assign vp0_rd_fence = 4'h0;
+# SV: assign vp0_rd_new = {{.*}}rd_valid;
+# HZ: `define FOLDSIM_VPORT0_HZ 8
+# CHECK: MATCH 196 cycles

@@ -136,19 +136,29 @@ module tb;
   bit ref_done = 0;
 `ifdef TOP8
   Top8 target(.clk(rclk), .x(rx), .y(ry));
+`elsif RST
+  // (A target with a reset input: high its first two cycles, a token stream
+  // of the simulator's too.)
+  logic rrst;
+  Top target(.clk(rclk), .rst(rrst), .x(rx), .y(ry));
 `else
   Top target(.clk(rclk), .x(rx), .y(ry));
 `endif
   initial begin
     for (int t = 0; t < T; t++) begin
       rx = stim_x(t);
+`ifdef RST
+      rrst = t < 2;
+`endif
       #1; ref_y[t] = ry; rclk = 1; #1; rclk = 0;
     end
     ref_done = 1;
   end
   logic clk = 0, rst = 1;
   always #5 clk = ~clk;
-  int ix = 0, iy = 0, cyc = 0;
+  int ix = 0, iy = 0, ir = 0, cyc = 0;
+  logic vr;
+  wire rr;
   logic [7:0] sim_y [T];
   logic vx, yr, adv;
   wire xr, yv;
@@ -162,6 +172,9 @@ module tb;
 `include "vm_decl.svh"
   foldsim_sim dut(.hostClock(clk), .hostReset(rst),
     .x_valid(vx), .x_bits(stim_x(ix)), .x_ready(xr),
+`ifdef RST
+    .rst_valid(vr), .rst_bits(ir < 2), .rst_ready(rr),
+`endif
     .y_ready(yr), .y_valid(yv), .y_bits(yb),
 `ifdef BUBBLES
     .advance(adv),
@@ -170,6 +183,7 @@ module tb;
     .profile_finish());
   always @(negedge clk) begin
     vx = ix < T && ($urandom % 100 >= stall);
+    vr = ir < T && ($urandom % 100 >= stall);
     yr = $urandom % 100 >= stall;
     adv = $urandom % 100 >= bubble;
   end
@@ -177,12 +191,15 @@ module tb;
     cyc <= cyc + 1; rst <= 0;
     if (!rst) begin
       if (vx && xr) ix <= ix + 1;
+`ifdef RST
+      if (vr && rr) ir <= ir + 1;
+`endif
       if (yv && yr && iy < T) begin sim_y[iy] <= yb; iy <= iy + 1; end
     end
   end
   initial begin
     automatic bit ok = 1;
-    do @(posedge clk); while (iy < T && cyc < 400000);
+    do @(posedge clk); while (iy < T && cyc < 4000000);
     wait (ref_done);
     if (iy < T) begin $display("TIMEOUT at %0d tokens", iy); $finish; end
     for (int t = W; t < T; t++)

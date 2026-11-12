@@ -128,7 +128,7 @@ def sim_defines(a):
 # HBM_AXI_<k>'s aperture: a pseudo-channel pair's GiB at 0x40_0000_0000 + (k / 2) GiB
 # (the shell's slash_base); the pair's two ports take a half (512 MiB) each.
 HBM_BASE = 0x40_0000_0000
-VPORT_PARAMS = ('DW', 'MW', 'TW', 'OW', 'LMAX', 'COPY', 'NEED_IN', 'HZ', 'BYTES', 'ZERO')
+VPORT_PARAMS = ('DW', 'MW', 'TW', 'OW', 'LMAX', 'COPY', 'NEED_IN', 'HZ', 'BYTES', 'ZERO', 'FS', 'KS')
 
 
 def vports(a, m):

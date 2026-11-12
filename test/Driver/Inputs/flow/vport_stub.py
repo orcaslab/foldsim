@@ -12,7 +12,7 @@ os.makedirs(out, exist_ok=True)
 
 
 def params(p):
-    q = dict(DW=512, MW=64, TW=8, OW=22, LMAX=1, COPY=0, NEED_IN=0, HZ=0, BYTES=1 << 28, ZERO=1)
+    q = dict(DW=512, MW=64, TW=8, OW=22, LMAX=1, COPY=0, NEED_IN=0, HZ=0, BYTES=1 << 28, ZERO=1, FS=8, KS=0)
     if p == 0:
         q['COPY'] = 1
     if p == 1:
