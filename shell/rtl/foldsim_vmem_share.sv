@@ -103,6 +103,12 @@ module foldsim_vmem_share #(
     function automatic [N-1:0] first_one(input [N-1:0] v);
         first_one = v & (~v + 1'b1);
     endfunction
+    // The bits above `v`'s lowest set bit (v ^ (v - 1): that bit and those
+    // below it): first_one's carry and this one side by side, not one after
+    // the other as from its one-hot result.
+    function automatic [N-1:0] above_first(input [N-1:0] v);
+        above_first = ~(v ^ (v - 1'b1));
+    endfunction
     function automatic [SW-1:0] index_of(input [N-1:0] oh);
         index_of = '0;
         for (integer i = 0; i < N; ++i)
@@ -207,6 +213,7 @@ module foldsim_vmem_share #(
     // nothing: to the next one after it that does, round robin.
     wire [N-1:0] ar_later = ar_want & ar_above;
     wire [N-1:0] ar_next  = (|ar_later) ? first_one(ar_later) : first_one(ar_want);
+    wire [N-1:0] ar_up    = (|ar_later) ? above_first(ar_later) : above_first(ar_want);
     wire         ar_move  = (ar_take | ~(|ar_hit)) & (|ar_next);
     always @(posedge clk) begin
         if (ar_take) begin
@@ -220,7 +227,7 @@ module foldsim_vmem_share #(
             m_arvalid <= 1'b0;
         if (ar_move) begin
             ar_goh   <= ar_next;
-            ar_above <= ~((ar_next << 1) - 1'b1);
+            ar_above <= ar_up;
             ar_g     <= index_of(ar_next);
         end
     end
@@ -253,6 +260,7 @@ module foldsim_vmem_share #(
     end
     wire [N-1:0] aw_later = aw_want & aw_above;
     wire [N-1:0] aw_next  = (|aw_later) ? first_one(aw_later) : first_one(aw_want);
+    wire [N-1:0] aw_up    = (|aw_later) ? above_first(aw_later) : above_first(aw_want);
     wire         aw_move  = (aw_take | ~(|aw_hit)) & (|aw_next);
     always @(posedge clk) begin
         if (aw_take) begin
@@ -266,7 +274,7 @@ module foldsim_vmem_share #(
             m_awvalid <= 1'b0;
         if (aw_move) begin
             aw_goh   <= aw_next;
-            aw_above <= ~((aw_next << 1) - 1'b1);
+            aw_above <= aw_up;
             aw_g     <= index_of(aw_next);
         end
     end

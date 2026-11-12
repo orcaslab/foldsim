@@ -1,0 +1,20 @@
+# REQUIRES: verilator
+# foldsim_vmem_share: N controllers on one AXI master (Inputs/tb_vmem_share.sv: random single-beat reads and writes,
+# each controller's own addresses; read answers routed back in order per id, W's matched to their AW's, B's to their
+# writer, nothing left). 21 controllers is the 64-SM A100 image's most crowded master (y64c2, SLR0). The round
+# robin's next mask (the controllers above the grant) comes from the request vector beside the grant (v ^ (v - 1)),
+# not from the one-hot grant after it (Beacon at N 21: 12 -> 11 levels); the grants are the same cycle for cycle:
+# the trace checksums below are the previous arbiter's (~((grant << 1) - 1)) on the same seeds.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -Mdir %t/n21 %S/Inputs/tb_vmem_share.sv %S/../../shell/rtl/foldsim_vmem_share.sv > %t/n21.log 2>&1
+# RUN: %t/n21/Vtb +verilator+seed+7 | FileCheck %s --check-prefix=N21
+# RUN: %t/n21/Vtb +verilator+seed+8 +issue=90 +mready=20 | FileCheck %s
+# RUN: %t/n21/Vtb +verilator+seed+9 +issue=10 +mready=90 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GN=5 -Mdir %t/n5 %S/Inputs/tb_vmem_share.sv %S/../../shell/rtl/foldsim_vmem_share.sv > %t/n5.log 2>&1
+# RUN: %t/n5/Vtb +verilator+seed+3 | FileCheck %s --check-prefix=N5
+# N21: reads 10299 writes 10065 answered 10299/10065 trace 79f4731c2f37bfa7
+# N21-NEXT: PASS
+# N5: reads 9953 writes 9974 answered 9953/9974 trace 7c0204e5314dc4d4
+# N5-NEXT: PASS
+# CHECK-NOT: FAIL
+# CHECK: PASS
