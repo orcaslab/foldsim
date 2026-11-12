@@ -411,6 +411,8 @@ def frame_options(a):
         fold += ' short-lead'
     if a.bubbles:
         fold += ' bubbles'
+    if getattr(a, 'ready_ahead', False):
+        fold += ' ready-ahead'
     if getattr(a, 'virtual_memories', None):
         if re.search(r'[\s{}]', a.virtual_memories):
             sys.exit('--virtual-memories: a regex without spaces or braces')
@@ -2016,6 +2018,10 @@ def build_parser():
     ap.add_argument('--short-lead', action='store_true',
                     help='with --static: decide a frame three host cycles before its first slot, '
                          'not four (the slot tables read the decided position combinationally)')
+    ap.add_argument('--ready-ahead', action='store_true',
+                    help='with --static and virtual memories: the pending-read bits the frame decision waits '
+                         'on read a host cycle ahead into registers (the decision an AND of registers), each '
+                         'class\'s bubble register kept apart; the same values (fold-static ready-ahead)')
     ap.add_argument('--bubbles', action='store_true',
                     help='with --static: an input `advance`; a host cycle it is low puts an idle '
                          'slot in the frame (for slots that wait on data, e.g. memories off-chip)')

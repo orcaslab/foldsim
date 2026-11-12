@@ -1004,6 +1004,9 @@ public:
   /// `lookahead-tables`: the virtual-memory readiness reads its slot tables
   /// from registers loaded a host cycle before (the same values).
   bool lookaheadTables = true;
+  /// `ready-ahead`: the readiness's pending bits read a host cycle ahead
+  /// into registers; the classes' bubble registers kept apart.
+  bool readyAhead = false;
   unsigned deadInputs = 0, partlyDeadInputs = 0;
   uint64_t deadInputBits = 0;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
@@ -21314,8 +21317,15 @@ LogicalResult StaticFolder::buildSim() {
   // The position the slot tables read: `ii` in a bubble. With a short lead
   // the tables read a position as it is decided, so a bubble is this host
   // cycle's; else the decision's register's, so it is the host cycle after.
+  // (`ready-ahead`: each a register of its own, kept apart from the equal
+  // ones of the other classes, so that each sits by its own slot tables.)
   auto bubbleOf = [&](const Twine &regName) -> Value {
-    return shortLead ? notOf(advance) : resetReg(notOf(advance), regName, 0);
+    if (shortLead)
+      return notOf(advance);
+    Value r = resetReg(notOf(advance), regName, 0);
+    if (readyAhead)
+      keep(cast<seq::FirRegOp>(r.getDefiningOp()));
+    return r;
   };
   auto shown = [&](Value pos, Value bubble) -> Value {
     if (!advance)
@@ -25633,6 +25643,9 @@ LogicalResult StaticFolder::buildSim() {
       return p + 1 >= ii ? 0 : p + 1;   // `next` of position p (ii - 1, ii: 0)
     };
     unsigned aheadCount = 0;
+    // Each lookahead register: its value on an advance (the table at the
+    // position's next's next) and its reset value.
+    DenseMap<Value, std::pair<Value, uint64_t>> aheadOf;
     auto atNext = [&](ArrayRef<uint64_t> row, unsigned width) -> Value {
       if (!lookaheadTables)
         return table(b, next, row, width);
@@ -25654,6 +25667,7 @@ LogicalResult StaticFolder::buildSim() {
       Value r = resetReg(nextValue, "vready_ahead" + Twine(aheadCount++),
                          row[nx(ii)]);
       self.setValue(r);
+      aheadOf[r] = {onStep, row[nx(ii)]};
       return r;
     };
     SmallVector<Value> terms;
@@ -26311,6 +26325,43 @@ LogicalResult StaticFolder::buildSim() {
                                   : inst;
           bit = b.createOrFold<comb::ExtractOp>(
               i1, comb::ShrUOp::create(b, pending, shift), 0);
+          // `ready-ahead`: the bit read a host cycle ahead, at the instance
+          // the lookahead register takes next, from the pending bits' next
+          // value (as the copy computes it: set by this host cycle's issue,
+          // cleared by its answer, zero after a reset), so the register
+          // holds the bit above every host cycle and the decision ANDs
+          // registers. (Off-chip pages keep their own pending logic.)
+          auto ahead = aheadOf.find(inst);
+          if (readyAhead && !vm.pages && advance && ahead != aheadOf.end()) {
+            Value onStep = ahead->second.first;
+            Value issued = copies[c].getResult(vm.firstOutput);
+            Value issuedInst = copies[c].getResult(vm.firstOutput + 1);
+            Value answered = copies[c].getOperand(vm.firstInput);
+            Value answeredInst = copies[c].getOperand(vm.firstInput + 1);
+            auto fit = [&](Value v, unsigned w) -> Value {
+              unsigned have = hw::getBitWidth(v.getType());
+              return have == w ? v
+                     : have < w ? b.createOrFold<comb::ConcatOp>(constant(w - have, 0), v)
+                                : b.createOrFold<comb::ExtractOp>(b.getIntegerType(w), v, 0);
+            };
+            unsigned cw = std::max({pw, iw, (unsigned)hw::getBitWidth(issuedInst.getType()),
+                                    (unsigned)hw::getBitWidth(answeredInst.getType())});
+            auto nextAt = [&](Value idx) -> Value {
+              Value cur = b.createOrFold<comb::ExtractOp>(
+                  i1, comb::ShrUOp::create(b, pending, fit(idx, pw)), 0);
+              Value set = comb::AndOp::create(
+                  b, issued, comb::ICmpOp::create(b, comb::ICmpPredicate::eq,
+                                                  fit(issuedInst, cw), fit(idx, cw)));
+              Value cleared = comb::AndOp::create(
+                  b, answered, comb::ICmpOp::create(b, comb::ICmpPredicate::eq,
+                                                    fit(answeredInst, cw), fit(idx, cw)));
+              return comb::AndOp::create(b, comb::OrOp::create(b, cur, set), notOf(cleared));
+            };
+            // (The copy's pending bits reset with the simulator's hostReset,
+            // its reset input: zero at any instance, as this register.)
+            Value next = comb::MuxOp::create(b, advance, nextAt(onStep), nextAt(inst));
+            bit = resetReg(next, vm.name + "_pending_ahead", 0);
+          }
         }
         terms.push_back(comb::OrOp::create(b, notOf(used), notOf(bit)));
       }
@@ -28241,6 +28292,7 @@ void FoldStaticPass::runOnOperation() {
   folder.stagedLinkDirect = stagedLinks && stagedLinkDirect;
   folder.dropDeadInputs = dropDeadInputs;
   folder.lookaheadTables = lookaheadTables;
+  folder.readyAhead = readyAhead;
   folder.affineSlots = affineSlots;
   folder.affineAuto = affineAuto;
   folder.affineAutoBits = affineAutoBits;

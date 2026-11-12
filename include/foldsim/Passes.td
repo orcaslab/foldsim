@@ -1139,6 +1139,16 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "decision's host cycle (the same values: no schedule or host cycle "
            "moves; Beacon, 16 SMs: 13 levels on the position, sequencers, "
            "bubbles and output dues)">,
+    Option<"readyAhead", "ready-ahead", "bool", "false",
+           "With virtual memories and lookahead-tables: each pending-read bit "
+           "the decision waits on is read a host cycle ahead too, into a "
+           "register: the pending bits' next value (this host cycle's issue "
+           "set, answer cleared, reset) at the next position's instance, "
+           "chosen by the decision. The decision is then an AND of registers, "
+           "not a select over a copy's pending bits; and each class's bubble "
+           "register is kept apart (not merged with the other classes'), "
+           "next to its slot tables. The same values: no schedule or host "
+           "cycle moves">,
     Option<"dropDeadInputs", "drop-dead-inputs", "bool", "true",
            "A model input its body never reads (left over from a class cut: "
            "its bits go to a sibling class directly) takes no link, no "
