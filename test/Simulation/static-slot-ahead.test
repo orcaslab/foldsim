@@ -1,0 +1,54 @@
+# REQUIRES: verilator
+# --slot-ahead: a position table read through a class's pass sequence (the
+# sequence's pass and instance at the position, then a table of the
+# instance) takes the pass and the instance from registers beside the
+# position registers (slotahead<k>), loaded a host cycle before with the
+# table at the position's next: held without an advance, the rows shifted by
+# one decoded at the position, or a frame's end's constants by `go`. The
+# instance's decoder and the instance's table then no longer chain in one
+# host cycle. The same values: FOLDSIM_SLOT_CHECK builds each table beside
+# its registers and stops the simulation where they differ (a mutation that
+# loads the unshifted rows stops it at the first pass); exact against the
+# target with bubbles and nested sequencers (the sequencers are copies of the
+# decision's register: a hold keeps the register), two seeds.
+# (Driver/Inputs/fixedscratch, 128 leaves, K 2: the PP class's pass values
+# read through the rank (posrank) and its pass-sequence tables.)
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/fixedscratch
+# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_PP_ROWS=balanced foldsim --srcs top128.f --top Top --out %t/a --static --nest --modulo --bubbles --slot-segments 2 --slot-ahead 1 --state-in-ram Leaf::8 --state-in-ram-pp --storage Leaf:sir=block --state-scratch-bits 40000 --state-scratch-fixed Leaf > %t/a.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/a.log
+# RUN: FileCheck %s --check-prefix=SIM < %t/a/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/a -DBUBBLES -Mdir %t/a/obj %S/Inputs/tb_pages.sv leaf.sv top128.sv %t/a/foldsim_sim.sv > %t/a/build.log 2>&1
+# RUN: %t/a/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# RUN: %t/a/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=30 +bubble=20 +full=20 | FileCheck %s
+# K 2 (and segments 4): every position table decoded in two segments or more
+# is such a register too (its decoder at the position's next); checked and
+# exact.
+# RUN: env FOLDSIM_SLOT_CHECK=1 FOLDSIM_PP_ROWS=balanced foldsim --srcs top128.f --top Top --out %t/k --static --nest --modulo --bubbles --slot-segments 4 --slot-ahead 2 --state-in-ram Leaf::8 --state-in-ram-pp --storage Leaf:sir=block --state-scratch-bits 40000 --state-scratch-fixed Leaf > %t/k.log 2>&1
+# RUN: FileCheck %s --check-prefix=SIM < %t/k/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/k -DBUBBLES -Mdir %t/k/obj %S/Inputs/tb_pages.sv leaf.sv top128.sv %t/k/foldsim_sim.sv > %t/k/build.log 2>&1
+# RUN: %t/k/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=40 +bubble=30 +full=10 | FileCheck %s
+# Virtual memories (the readiness's lookahead reads a NextFree position),
+# nested sequencers with bubbles, and without bubbles: checked and exact.
+# RUN: cd %S/../Driver/Inputs/vmem
+# RUN: env FOLDSIM_SLOT_CHECK=1 foldsim --srcs top.f --top Top --out %t/vb --static --modulo --min-ii 160 --virtual-memories ram --nest --bubbles --slot-segments 8 --slot-ahead 2 Leaf > %t/vb.log 2>&1
+# RUN: FileCheck %s --check-prefix=VSIM < %t/vb/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -Mdir %t/vb/obj %S/Inputs/tb_vmem.sv top.sv %t/vb/foldsim_sim.sv > %t/vb/build.log 2>&1
+# RUN: %t/vb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +bubble=60 +burst=8 +stall=10 | FileCheck %s
+# RUN: env FOLDSIM_SLOT_CHECK=1 foldsim --srcs top.f --top Top --out %t/va --static --modulo --min-ii 160 --virtual-memories ram --slot-segments 8 --slot-ahead 1 Leaf > %t/va.log 2>&1
+# RUN: FileCheck %s --check-prefix=VSIM < %t/va/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/va/obj %S/Inputs/tb_vmem.sv top.sv %t/va/foldsim_sim.sv > %t/va/build.log 2>&1
+# RUN: %t/va/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/fixedscratch
+# Without the option: no such register (the same frame).
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top128.f --top Top --out %t/b --static --nest --modulo --bubbles --slot-segments 2 --state-in-ram Leaf::8 --state-in-ram-pp --storage Leaf:sir=block --state-scratch-bits 40000 --state-scratch-fixed Leaf > %t/b.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/b.log
+# RUN: FileCheck %s --check-prefix=OFF < %t/b/foldsim_sim.mlir
+# LOG: foldsim-fold-static: II = 1158
+# LOG: {{[1-9][0-9]*}} read through a class's passes
+# SIM-DAG: %slotahead{{[0-9]+}} = seq.firreg
+# SIM-DAG: %posrank{{[0-9]+}} = seq.firreg
+# VSIM: %slotahead{{[0-9]+}} = seq.firreg
+# OFF-NOT: slotahead
+# CHECK-NOT: slot-ahead
+# CHECK-NOT: MISMATCH
+# CHECK: {{^}}MATCH

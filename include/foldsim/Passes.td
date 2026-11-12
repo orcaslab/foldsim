@@ -970,6 +970,18 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "(an instance decoded from the position) that does not decode is "
            "read through the inner table's position instead (its rows "
            "composed), where the position's decoders and counters take it">,
+    Option<"slotAhead", "slot-ahead", "unsigned", "0",
+           "With slot-segments, K (0: off): a position table read through a "
+           "class's pass sequence (a table per instance at the instance "
+           "passing there) takes the sequence's pass and instance at the "
+           "position, and a position table decoded in K segments or more "
+           "takes its value, from registers beside the position registers, "
+           "loaded a host cycle before with the table at the position's next "
+           "(held, the rows shifted by one decoded at the position, or a "
+           "frame's end's constants), instead of through the decoder in the "
+           "reader's host cycle: the same values, no schedule or host cycle "
+           "moves (Beacon, 64/128 SMs: the rank counters, the PP slot sets "
+           "and the mailbox rows of a switch network's classes)">,
     Option<"slotSegments", "slot-segments", "unsigned", "0",
            "Slot tables (constants read by the frame's position or an "
            "instance) of at most this many affine segments of nonzero rows "

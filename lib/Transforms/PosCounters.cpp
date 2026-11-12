@@ -39,6 +39,8 @@ void PosCounters::begin(unsigned ii_, unsigned posWidth_, Value clock_,
   known.clear();
   cache.clear();
   rankCache.clear();
+  aheadCache.clear();
+  aheadCount = 0;
 }
 
 void PosCounters::addReg(Value reg, Value next) {
@@ -193,6 +195,118 @@ Value PosCounters::rank(ImplicitLocOpBuilder &b, Value v, ArrayRef<uint64_t> set
     break;
   }
   rankCache[ck] = out;
+  return out;
+}
+
+bool PosCounters::sameAssuming(
+    Value x, Value y, SmallVectorImpl<std::pair<Value, Value>> &assumed) {
+  if (x == y)
+    return true;
+  auto ix = known.find(x), iy = known.find(y);
+  if (ix == known.end() || iy == known.end())
+    return false;
+  Node nx = ix->second, ny = iy->second;
+  if (nx.kind != ny.kind)
+    return false;
+  switch (nx.kind) {
+  case Reg:
+    // (Coinductive: equal resets, equal next values under the assumption.)
+    for (auto &[a, c] : assumed)
+      if ((a == x && c == y) || (a == y && c == x))
+        return true;
+    assumed.push_back({x, y});
+    return sameAssuming(nx.a, ny.a, assumed);
+  case Next:
+  case NextFree:
+    return sameAssuming(nx.a, ny.a, assumed);
+  case Shown:
+    return nx.bubble == ny.bubble && sameAssuming(nx.a, ny.a, assumed);
+  }
+  return false;
+}
+
+bool PosCounters::same(Value x, Value y) {
+  SmallVector<std::pair<Value, Value>> assumed;
+  return sameAssuming(x, y, assumed);
+}
+
+Value PosCounters::ahead(
+    ImplicitLocOpBuilder &b, Value v, ArrayRef<uint64_t> rows, unsigned width,
+    uint64_t key,
+    function_ref<Value(Value, ArrayRef<uint64_t>, ArrayRef<uint8_t>)> decode,
+    ArrayRef<uint8_t> care) {
+  auto ck = std::make_pair(v.getAsOpaquePointer(), key);
+  auto it = aheadCache.find(ck);
+  if (it != aheadCache.end())
+    return it->second;
+  width = std::max(1u, width);
+  auto type = b.getIntegerType(width);
+  uint64_t mask = width >= 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
+  auto row = [&](uint64_t p) -> uint64_t {
+    return p < rows.size() ? rows[p] & mask : 0;
+  };
+  auto c = [&](uint64_t x) -> Value { return hw::ConstantOp::create(b, type, x); };
+  auto eqc = [&](Value x, uint64_t k) -> Value {
+    return comb::ICmpOp::create(b, comb::ICmpPredicate::eq, x,
+                                hw::ConstantOp::create(b, x.getType(), k));
+  };
+  // The table at `pos` + 1 within the frame, read at `pos` (its last two
+  // rows, a frame's end, never read: the end's constants are).
+  auto stepped = [&](Value pos) -> Value {
+    SmallVector<uint64_t> shifted(ii + 1, 0);
+    SmallVector<uint8_t> read(ii + 1, 0);
+    for (unsigned p = 0; p + 1 < ii; ++p) {
+      shifted[p] = row(p + 1);
+      read[p] = care.empty() || (p + 1 < care.size() && care[p + 1]);
+    }
+    return decode(pos, shifted, read);
+  };
+  // The table at a Next node of `pos`: held (`hold`), stepped, or a frame's
+  // end's 0 (the next frame starting) or `ii`.
+  auto atNext = [&](Value pos, Value hold) -> Value {
+    Value end = comb::OrOp::create(b, eqc(pos, ii - 1), eqc(pos, ii));
+    Value step = comb::MuxOp::create(
+        b, end, comb::MuxOp::create(b, go, c(row(0)), c(row(ii))), stepped(pos));
+    return advance ? Value(comb::MuxOp::create(b, advance, step, hold)) : step;
+  };
+  auto node = known.find(v);
+  assert(node != known.end() && "a position the counters do not know");
+  Node n = node->second;
+  Value out;
+  switch (n.kind) {
+  case Reg: {
+    auto reg = seq::FirRegOp::create(
+        b, c(row(ii)), clock, b.getStringAttr("slotahead" + std::to_string(aheadCount++)),
+        reset, c(row(ii)), hw::InnerSymAttr{}, /*isAsync=*/false,
+        b.getIntegerAttr(type, row(ii)));
+    aheadCache[ck] = reg;
+    // Its next: the table at the register's next. Where that is the next of
+    // a position equal to this register (the decision's register's own
+    // next, a sequencer's parent's), a hold keeps this register.
+    Value next;
+    auto nn = known.find(n.a);
+    assert(nn != known.end() && "a position register loaded with an unknown value");
+    if (nn->second.kind == Next && same(nn->second.a, v))
+      next = atNext(nn->second.a, reg);
+    else
+      next = ahead(b, n.a, rows, width, key, decode, care);
+    reg.getNextMutable().assign(next);
+    return reg;
+  }
+  case Next:
+    out = atNext(n.a, advance ? ahead(b, n.a, rows, width, key, decode, care) : Value());
+    break;
+  case NextFree: {
+    Value end = comb::OrOp::create(b, eqc(n.a, ii - 1), eqc(n.a, ii));
+    out = comb::MuxOp::create(b, end, c(row(0)), stepped(n.a));
+    break;
+  }
+  case Shown:
+    out = comb::MuxOp::create(b, n.bubble, c(row(ii)),
+                              ahead(b, n.a, rows, width, key, decode, care));
+    break;
+  }
+  aheadCache[ck] = out;
   return out;
 }
 

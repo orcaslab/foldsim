@@ -382,6 +382,8 @@ def frame_options(a):
         fold += ' slot-column-affine'
     if getattr(a, 'slot_table_compose', False):
         fold += ' slot-table-compose'
+    if getattr(a, 'slot_ahead', 0):
+        fold += f' slot-ahead={a.slot_ahead}'
     if getattr(a, 'modulo_linear', None) is not None:
         fold += f' modulo-linear={a.modulo_linear}'
     if getattr(a, 'ready_choice', ''):
@@ -1604,6 +1606,11 @@ def build_parser():
                     help='with --slot-segments: a table read at a position table\'s value that does not decode is '
                          'read through the inner table\'s position (composed rows) (foldsim-fold-static '
                          'slot-table-compose)')
+    ap.add_argument('--slot-ahead', type=int, default=0, metavar='K',
+                    help='with --slot-segments: position tables read through a class\'s pass sequence, and '
+                         'position tables decoded in K segments or more, from registers beside the position '
+                         'registers loaded a host cycle ahead (same values; Beacon) (foldsim-fold-static '
+                         'slot-ahead)')
     ap.add_argument('--slot-column-affine', action='store_true',
                     help='with --slot-segments: instance tables the segments do not decode cut into column-affine '
                          'pieces (a period\'s rows plus a few slopes times the quotient, by a constant division) '

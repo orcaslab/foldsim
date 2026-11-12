@@ -11683,6 +11683,14 @@ static unsigned gPassII = 0;
 static bool gFactoring = false;
 /// A table built as a constant whatever slot-segments could make of it.
 static bool gTableRaw = false;
+/// `slot-ahead` K (0: off): a position table read through a class's pass
+/// sequence takes the sequence's pass and instance at the position from
+/// registers loaded a host cycle ahead (PosCounters::ahead), and a position
+/// table decoded in K segments or more is such a register itself.
+/// gAheadBusy while a register's next value's decoder is built (that one is
+/// a decoder, read a host cycle earlier).
+static unsigned gSlotAhead = 0;
+static bool gAheadBusy = false;
 /// `slot-column-affine`: a table of an index the position counters do not
 /// know (an instance) cut into column-affine pieces (findColumnAffine),
 /// its quotient and remainder by a constant division; `gColumnAffine`
@@ -18718,6 +18726,9 @@ static DenseMap<Value, TableSource> gTableSource;
 
 static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                        unsigned width, unsigned site, ArrayRef<uint8_t> care);
+static Value tableCare(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+                       ArrayRef<uint8_t> care, unsigned width,
+                       unsigned site = __builtin_LINE());
 
 static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                    unsigned width, unsigned site) {
@@ -18742,6 +18753,44 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     }
   }
   return v;
+}
+
+/// FOLDSIM_SLOT_CHECK: the simulation stops (`what`) at a host clock edge
+/// where `ne` is high.
+static void slotCheckFatal(ImplicitLocOpBuilder &b, Value clk, Value ne, const std::string &what) {
+  Value clock = seq::FromClockOp::create(b, clk);
+  sv::AlwaysOp::create(b, ArrayRef{sv::EventControl::AtPosEdge}, ArrayRef{clock}, [&] {
+    sv::IfOp::create(b, ne, [&] { sv::FatalProceduralOp::create(b, 1, b.getStringAttr(what)); });
+  });
+}
+
+/// The host clock of the module `v` is built in (null if none).
+static Value hostClockOf(Value v) {
+  auto mod = v.getParentBlock()->getParentOp();
+  if (auto hm = dyn_cast<hw::HWModuleOp>(mod))
+    for (auto [k, name] : llvm::enumerate(hm.getInputNames()))
+      if (cast<StringAttr>(name).getValue() == "hostClock")
+        return hm.getBodyBlock()->getArgument(k);
+  return {};
+}
+
+/// slot-ahead: `rows[index]` (index a position the counters know) from a
+/// register beside each position register, its next value's decoder read at
+/// the position a host cycle before (PosCounters::ahead).
+static Value tableAhead(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+                        unsigned width, ArrayRef<uint8_t> care) {
+  auto *pc = foldsim::currentPosCounters();
+  auto decode = [&](Value pos, ArrayRef<uint64_t> rr, ArrayRef<uint8_t> rc) -> Value {
+    bool outer = gAheadBusy;
+    gAheadBusy = true;
+    Value v = tableCare(b, pos, rr, rc, width);
+    gAheadBusy = outer;
+    return v;
+  };
+  uint64_t key = llvm::hash_combine(llvm::hash_combine_range(rows.begin(), rows.end()),
+                                    llvm::hash_combine_range(care.begin(), care.end()), width,
+                                    uint64_t(0xa4eadull));
+  return pc->ahead(b, index, rows, width, key, decode, care);
 }
 
 /// `reg1(table(index, rows))`, the table's decoder free to take that
@@ -18779,6 +18828,31 @@ static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> 
     bool counted = pc && pc->knows(index);
     uint64_t segsBefore = foldsim::slotSequencerStats().segments;
     if (Value decoded = tryDecodeTable(b, index, rows, width, care)) {
+      // slot-ahead: a decoder of K segments or more at a position read from
+      // a register loaded a host cycle ahead instead (this decoder dies).
+      uint64_t segs = foldsim::slotSequencerStats().segments - segsBefore;
+      if (gSlotAhead && !gAheadBusy && counted && segs >= gSlotAhead) {
+        if (getenv("FOLDSIM_TABLE_SITES"))
+          llvm::errs() << "table-ahead " << site << " " << rows.size() << " " << width << " "
+                       << segs << "\n";
+        Value r = tableAhead(b, index, rows, width, care);
+        if (getenv("FOLDSIM_SLOT_CHECK"))
+          if (Value clk = hostClockOf(index)) {
+            Value ne = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, r, decoded);
+            if (!care.empty()) {
+              SmallVector<uint64_t> careRows(care.begin(), care.end());
+              gTableRaw = true;
+              Value read = table(b, index, careRows, 1, site);
+              gTableRaw = false;
+              ne = comb::AndOp::create(b, ne, read);
+            }
+            slotCheckFatal(b, clk, ne,
+                           ("foldsim: slot-ahead: a register differs from its decoder (line " +
+                            Twine(site) + ", " + Twine(rows.size()) + " x " + Twine(width) + ")")
+                               .str());
+          }
+        return r;
+      }
       if (getenv("FOLDSIM_TABLE_SITES"))
         llvm::errs() << "table-dec " << site << " " << rows.size() << " " << width << " "
                      << foldsim::slotSequencerStats().segments - segsBefore << "\n";
@@ -18810,15 +18884,10 @@ static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> 
             gTableRaw = false;
             ne = comb::AndOp::create(b, ne, read);
           }
-          Value clock = seq::FromClockOp::create(b, clk);
-          std::string what = ("foldsim: slot-sequencer: decoder differs from its table (line " + Twine(site) + ", " +
-                              Twine(rows.size()) + " x " + Twine(width) + ")").str();
-          sv::AlwaysOp::create(b, ArrayRef{sv::EventControl::AtPosEdge},
-                               ArrayRef{clock}, [&] {
-            sv::IfOp::create(b, ne, [&] {
-              sv::FatalProceduralOp::create(b, 1, b.getStringAttr(what));
-            });
-          });
+          slotCheckFatal(b, clk, ne,
+                         ("foldsim: slot-sequencer: decoder differs from its table (line " +
+                          Twine(site) + ", " + Twine(rows.size()) + " x " + Twine(width) + ")")
+                             .str());
         }
       }
       return decoded;
@@ -18843,8 +18912,35 @@ static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> 
           inst[p] = unsigned(i);
         }
       }
-      Value hit = table(b, index, valid, 1);
-      Value at = table(b, index, inst, iw);
+      // slot-ahead: the sequence's pass and instance at the position from
+      // registers beside the position's (PosCounters::ahead), loaded a host
+      // cycle before: the instance's decoder (a segment per run of the
+      // sequence: tens at hundreds of instances) and the per-instance
+      // table no longer chain in one host cycle.
+      auto *posCtrs = foldsim::currentPosCounters();
+      bool ahead = gSlotAhead && !gAheadBusy && posCtrs && posCtrs->knows(index);
+      auto byAhead = [&](ArrayRef<uint64_t> r, unsigned w) -> Value {
+        return tableAhead(b, index, r, w, {});
+      };
+      Value hit = ahead ? byAhead(valid, 1) : table(b, index, valid, 1);
+      Value at = ahead ? byAhead(inst, iw) : table(b, index, inst, iw);
+      // (FOLDSIM_SLOT_CHECK: the tables built beside the registers; the
+      // simulation stops where they differ, the instance where it is read.)
+      if (ahead && getenv("FOLDSIM_SLOT_CHECK"))
+        if (Value clk = hostClockOf(index)) {
+          gTableRaw = true;
+          Value rawHit = table(b, index, valid, 1);
+          Value rawAt = table(b, index, inst, iw);
+          gTableRaw = false;
+          Value ne = comb::OrOp::create(
+              b, comb::ICmpOp::create(b, comb::ICmpPredicate::ne, hit, rawHit),
+              comb::AndOp::create(b, rawHit,
+                                  comb::ICmpOp::create(b, comb::ICmpPredicate::ne, at, rawAt)));
+          slotCheckFatal(b, clk, ne,
+                         ("foldsim: slot-ahead: a register differs from its table (line " +
+                          Twine(site) + ", " + Twine(rows.size()) + " rows)")
+                             .str());
+        }
       Value v = table(b, at, fac.perInstance, width);
       gFactoring = false;
       auto &st = foldsim::slotSequencerStats();
@@ -19338,8 +19434,7 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
 /// table() of a value read only where `care` (a valid bit beside it): the
 /// other rows take whatever value decodes in the fewest segments.
 static Value tableCare(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
-                       ArrayRef<uint8_t> care, unsigned width,
-                       unsigned site = __builtin_LINE()) {
+                       ArrayRef<uint8_t> care, unsigned width, unsigned site) {
   if (!getenv("FOLDSIM_NO_CARE"))
     gCare = care;
   Value v = table(b, index, rows, width, site);
@@ -26168,6 +26263,7 @@ void FoldStaticPass::runOnOperation() {
   gSlotSegments = slotSegments;
   gSlotColumnAffine = slotColumnAffine;
   gSlotTableCompose = slotTableCompose;
+  gSlotAhead = slotAhead;
   // (FOLDSIM_SLOT_COLUMN_AFFINE, a test hook: the whole suite with both.)
   if (getenv("FOLDSIM_SLOT_COLUMN_AFFINE"))
     gSlotColumnAffine = gSlotTableCompose = true;
