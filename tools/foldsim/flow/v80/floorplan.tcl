@@ -17,7 +17,8 @@ if {[info exists ::env(FOLDSIM_FLOORPLAN)] && $::env(FOLDSIM_FLOORPLAN) ne ""} {
     set fs_groups [regexp -all {hierarchical foldsim_slr} [read $fp]]
     close $fp
     source $fs_floorplan
-    set fs_cells [get_cells -quiet -hierarchical -filter {USER_SLR_ASSIGNMENT =~ "fs_*"}]
+    # (A floorplan names either placer-chosen groups, fs_slr<g>, or the region's SLRs by name, SLR<n>, with --slr-region.)
+    set fs_cells [get_cells -quiet -hierarchical -filter {USER_SLR_ASSIGNMENT =~ "fs_*" || USER_SLR_ASSIGNMENT =~ "SLR*"}]
     set fp [open floorplan.txt w]
     foreach c $fs_cells { puts $fp "$c [get_property USER_SLR_ASSIGNMENT $c]" }
     close $fp
