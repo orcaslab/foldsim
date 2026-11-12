@@ -10,7 +10,11 @@
                masters (one per port, or one where the simulator folds its
                ports), the masters' repeat macros (8 a line: Verilator takes at
                most 40000 tokens on a line), the AXI speculation depth, then the
-               virtual memories' masters (flow/v80/vmem_ports.py).
+               virtual memories' masters (flow/v80/vmem_ports.py). A simulator
+               with static ports (FOLDSIM_VPORTS in foldsim_sim.vh) binds them
+               straight to HBM channels, one a port ([platform] hbm_direct, a
+               channel list: the flag; without it nothing changes): their
+               channels, aperture addresses and repeat macro.
   afu          the kernel's top (rtl/kernel/foldsim_afu.sv.in) with the
                manifest's control binding: [platform.control] names the target
                ports the control endpoint (foldsim_ctrl) drives (reset, start,
@@ -23,7 +27,9 @@
                folded endpoint and the threaded one (--threaded: a
                flow/v80/portfold_gen.sh snapshot).
   cfg          the V80 linker config (flow/platform/gen_platform.py): one
-               device-memory master per kernel master, the kernel clock.
+               device-memory master per kernel master, the kernel clock; the
+               direct static ports m_axi_hbm_<p> on their HBM channels with
+               hbm_clk on the static region clock (--hbm-direct).
   ooc-xdc      the kernel clock's constraint for out-of-context synthesis.
 
 The design's own steps (generating its sources: Vortex's gen_sources.sh with its
@@ -109,6 +115,55 @@ def vmem_ports(a, ports, *extra):
     return subprocess.run(cmd + list(extra), check=True, text=True, capture_output=True).stdout
 
 
+def sim_defines(a):
+    """foldsim_sim.vh's `define NAME VALUE lines (the last value of a name)."""
+    out = {}
+    for ln in open(sim_vh(a)):
+        mm = re.match(r'\s*`define\s+(\w+)\s*(.*?)\s*(//.*)?$', ln)
+        if mm:
+            out[mm.group(1)] = mm.group(2)
+    return out
+
+
+# HBM_AXI_<k>'s aperture: a pseudo-channel pair's GiB at 0x40_0000_0000 + (k / 2) GiB
+# (the shell's slash_base); the pair's two ports take a half (512 MiB) each.
+HBM_BASE = 0x40_0000_0000
+VPORT_PARAMS = ('DW', 'MW', 'TW', 'OW', 'LMAX', 'COPY', 'NEED_IN', 'HZ', 'BYTES', 'ZERO')
+
+
+def vports(a, m):
+    """The simulator's static ports bound to direct HBM channels: [(port, channel, params)], or [] without
+    them. The simulator declares them (FOLDSIM_VPORTS P, FOLDSIM_VPORT<p>_<param>); [platform] hbm_direct
+    binds each to a channel (no MEM binding of static ports is built)."""
+    d = sim_defines(a)
+    chans = m.get('platform.hbm_direct')
+    if 'FOLDSIM_VPORTS' not in d:
+        if chans:
+            sys.exit('foldsim_flow: [platform] hbm_direct, and the simulator has no static ports (FOLDSIM_VPORTS)')
+        return []
+    n = int(d['FOLDSIM_VPORTS'], 0)
+    if not isinstance(chans, list) or len(chans) != n:
+        sys.exit(f'foldsim_flow: the simulator has {n} static ports: [platform] hbm_direct lists an HBM channel '
+                 f'for each (got {chans!r})')
+    if len(set(chans)) != n or any(not isinstance(c, int) or not 0 <= c < 64 for c in chans):
+        sys.exit(f'foldsim_flow: [platform] hbm_direct {chans}: distinct HBM channels 0-63')
+    if n > 64:
+        sys.exit(f'foldsim_flow: {n} static ports: at most 64 (one an HBM port)')
+    out = []
+    for p, k in enumerate(chans):
+        pp = {}
+        for q in VPORT_PARAMS:
+            v = d.get(f'FOLDSIM_VPORT{p}_{q}')
+            if v is None:
+                sys.exit(f'foldsim_flow: foldsim_sim.vh has no FOLDSIM_VPORT{p}_{q}')
+            pp[q] = int(v.replace("'d", '').replace("64'", ''), 0)
+        if pp['OW'] + 6 > 29 or pp['BYTES'] > (1 << 29):
+            sys.exit(f'foldsim_flow: static port {p}: its region ({pp["BYTES"]} bytes, OW {pp["OW"]}) passes the '
+                     '512 MiB of its half of the channel pair')
+        out.append((p, k, pp))
+    return out
+
+
 def mem_ports(m):
     ports = m.get('platform.mem_ports')
     if ports not in (1, 2, 4, 8, 16, 32):
@@ -136,6 +191,15 @@ def kernel_vh(a, m):
     lines += [f'`define FOLDSIM_MEM_REPEAT{q}(f,s) {mem_repeat(q, masters)}' for q in range(4)]
     if spec:
         lines.append(f'`define FOLDSIM_MEM_SPEC {spec}')
+    vp = vports(a, m)
+    if vp:
+        # Direct static ports: port p on HBM_AXI_<k>, its region the k's half of the pair's aperture.
+        lines += ['`define FOLDSIM_VPORT_DIRECT', f'`define FOLDSIM_VPORT_BYTES {sum(pp["BYTES"] for _, _, pp in vp)}']
+        for p, k, _ in vp:
+            lines += [f'`define FOLDSIM_VPORT{p}_HBM {k}',
+                      f"`define FOLDSIM_VPORT{p}_ADDR 64'h{HBM_BASE + (k >> 1) * (1 << 30) + (k & 1) * (1 << 29):x}"]
+        # (8 a line, as the memory ports': at most 64 ports.)
+        lines += [f'`define FOLDSIM_VPORT_REPEAT{q}(f,s) {mem_repeat(q, len(vp))}' for q in range(8)]
     return '\n'.join(lines) + '\n' + vmem_ports(a, ports)
 
 
@@ -224,6 +288,8 @@ def kernel_srcs(a):
         if not os.path.exists(thr):
             sys.exit(f'kernel-srcs: the simulator folds its memory ports, and there is no {thr} (portfold_gen.sh)')
         files += [thr, os.path.join(d, 'foldsim_mem_fold.sv')]
+    if re.search(r'^`define FOLDSIM_VPORTS ', open(sim_vh(a)).read(), re.M):
+        files.append(os.path.join(d, 'foldsim_vport.sv'))
     files += [os.path.join(d, 'foldsim_ctrl.sv'), os.path.abspath(a.afu or os.path.join(gen, 'foldsim_afu.sv'))]
     return '\n'.join([f'+incdir+{d}', f'+incdir+{gen}', os.path.join(gen, 'foldsim_sim.sv')] + files) + '\n'
 
@@ -240,6 +306,9 @@ def cfg(a, m):
     cmd = [sys.executable, os.path.join(FLOW, 'platform', 'gen_platform.py'), '--flow=aved',
            f'--device={m.get("platform.device", DEVICE)}', '--emit=cfg', '--kernel=foldsim_afu', '--no-host',
            f'--mem-ports={masters}', f'--kernel-mhz={freq(a, m)}']
+    vp = vports(a, m)
+    if vp:
+        cmd.append('--hbm-direct=' + ','.join(str(k) for _, k, _ in vp))
     return subprocess.run(cmd, check=True, text=True, capture_output=True).stdout
 
 
