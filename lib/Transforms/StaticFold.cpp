@@ -549,10 +549,10 @@ public:
   /// memory's read address is registered a stage early and replicated, a
   /// copy per bank of at most this many RAM primitives.
   unsigned ppAddressFanout = 96;
-  /// `pp-sync-banks`: a banked combinational read (state-in-ram-pp-fanout)
-  /// is a registered read of its address, enable and instance registers'
-  /// next values.
-  bool ppSyncBanks = false;
+  /// `pp-sync-banks` R (0: off): a combinational read of a memory of more
+  /// than R threaded rows is banked and registered from its address,
+  /// enable and instance registers' next values.
+  unsigned ppSyncRows = 0;
   /// `zero-chain-levels`: the most estimated levels a chain of zero-latency
   /// links may reach into a reader's state (0: no bound).
   unsigned zeroChainLevels = 0;
@@ -11828,9 +11828,10 @@ static seq::FirRegOp keep(seq::FirRegOp reg) {
 /// the row lands between (the row is the evaluated instance's, written only
 /// by its own state pass, at or after the read's stage).
 static constexpr StringLiteral kHostSyncRead = "foldsim.host_sync_read";
-/// pp-sync-banks: a PP memory read combinationally is banked (and read registered) when
-/// its threaded rows pass this many, whatever its fanout.
-static constexpr uint64_t kSyncBankRows = 1024;
+/// pp-sync-banks: a deep read is registered only where at least this many
+/// estimated levels of logic follow it (a read whose data a register takes
+/// at once would only move its LUT RAM into a block RAM).
+static constexpr int kSyncAfterLevels = 16;
 
 /// The SLR group an op of the simulator is built in, until `extractGroups`
 /// moves it into the group's module.
@@ -12971,11 +12972,14 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
 
   // Comb-read memories to bank: their read ports' LUT RAM primitives past
   // the fanout (threaded: entries x depth rows, 64 a primitive).
-  DenseSet<Operation *> early, deepOnly;
-  // (FOLDSIM_SYNC_BANK_ROWS, a test hook: another row bound.)
-  static const uint64_t syncBankRows = [] {
-    const char *env = getenv("FOLDSIM_SYNC_BANK_ROWS");
-    return env ? uint64_t(atoll(env)) : kSyncBankRows;
+  DenseSet<Operation *> early, deepOnly, syncDeep;
+  const bool ppSyncBanks = ppSyncRows > 0;
+  const uint64_t syncBankRows = ppSyncRows;
+  // (FOLDSIM_SYNC_AFTER_LEVELS, a test hook: another bound on the logic
+  // after the read.)
+  static const int syncAfterLevels = [] {
+    const char *env = getenv("FOLDSIM_SYNC_AFTER_LEVELS");
+    return env ? atoi(env) : kSyncAfterLevels;
   }();
   {
     DenseSet<Operation *> memories;
@@ -12988,15 +12992,40 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
     for (auto *op : memories) {
       auto memory = cast<seq::FirMemOp>(op);
       uint64_t deep = llvm::divideCeil(uint64_t(memory.getType().getDepth()) * entries, 64);
+      // pp-sync-banks: the estimated logic after the memory's reads (to the
+      // state or a register), for whether a registered read is worth it.
+      int after = 0;
+      if (ppSyncBanks) {
+        DenseMap<Value, int> memo;
+        auto edges = [](Value value, SmallVectorImpl<std::pair<Value, int>> &out) {
+          for (auto &use : value.getUses()) {
+            auto *user = use.getOwner();
+            if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp,
+                    seq::FirMemWriteOp, seq::FirMemReadOp, hw::InstanceOp, hw::OutputOp>(user))
+              continue;
+            for (auto result : user->getResults())
+              out.push_back({result, logicLevels(user)});
+          }
+        };
+        for (auto *u : memory->getUsers())
+          if (auto r = dyn_cast<seq::FirMemReadOp>(u))
+            after = std::max(after, longestPath(r.getData(), memo, edges));
+        if (deep * 64 > syncBankRows && after >= syncAfterLevels)
+          syncDeep.insert(memory);
+      }
       if (uint64_t(memory.getType().getWidth()) * deep > ppAddressFanout)
         early.insert(memory);
-      // pp-sync-banks: also a memory whose threaded rows make its
-      // combinational read deep (past kSyncBankRows: a LUT RAM's
-      // multiplexers past 5 levels), banked and read registered.
-      else if (ppSyncBanks && deep * 64 > syncBankRows) {
+      // pp-sync-banks: also a memory whose read is deep (past the row
+      // bound: a LUT RAM's multiplexers, Beacon 1 + log2(rows) - 6 levels)
+      // and feeds deep logic, banked and read registered.
+      else if (syncDeep.contains(memory)) {
         early.insert(memory);
         deepOnly.insert(memory);
       }
+      if (ppSyncBanks && getenv("FOLDSIM_SYNC_DEBUG"))
+        llvm::errs() << "pp-sync-banks: " << cls.name << " " << memory.getName().value_or("?")
+                     << " rows " << deep * 64 << " width " << memory.getType().getWidth()
+                     << " after " << after << (syncDeep.contains(memory) ? " registered" : "") << "\n";
     }
   }
   auto isEarly = [&](Operation *op) {
@@ -13661,8 +13690,7 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
         };
         // (pp-sync-banks: the threaded bank read registered, from these
         // registers' next values: see kHostSyncRead.)
-        if (ppSyncBanks && getenv("FOLDSIM_SYNC_DEBUG") &&
-            uint64_t(memory.getType().getDepth()) * entries > syncBankRows &&
+        if (ppSyncBanks && getenv("FOLDSIM_SYNC_DEBUG") && syncDeep.contains(memory) &&
             !(isCE(addr) && isCE(en) && isCE(instReg))) {
           llvm::errs() << "pp-sync-banks: " << cls.name << " " << base << " not registered: addr "
                        << isCE(addr) << " stage " << stageAt(read.getAddress()) << " en " << isCE(en)
@@ -13674,8 +13702,9 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
           llvm::errs() << "\n";
         }
         // (Only a deep read, past the row bound: a shallow bank's read is
-        // a few levels, and registered it would take a block RAM.)
-        bool deepRead = uint64_t(memory.getType().getDepth()) * entries > syncBankRows;
+        // a few levels, and registered it would only move its LUT RAM into
+        // a block RAM.)
+        bool deepRead = syncDeep.contains(memory);
         if (ppSyncBanks && deepRead && isCE(addr) && isCE(en) && isCE(instReg)) {
           bank.memory->setAttr(kHostSyncRead, UnitAttr::get(context));
           ++syncBanks;
@@ -26319,7 +26348,7 @@ void FoldStaticPass::runOnOperation() {
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.stateInRamPP = stateInRamPP;
   folder.ppAddressFanout = std::max(1u, unsigned(stateInRamPPFanout));
-  folder.ppSyncBanks = ppSyncBanks;
+  folder.ppSyncRows = ppSyncBanks;
   folder.zeroChainLevels = zeroChainLevels;
   folder.ppPackStores = stateInRamPPPack;
   folder.ppReplicaDepth = stateInRamPPReplicas;

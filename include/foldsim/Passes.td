@@ -1126,14 +1126,16 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "ultra), read at the instance two host cycles ahead and written a "
            "host cycle after the state pass, as state-in-ram P = 1's rows; "
            "given a state gap of 4, else (or false) a store each">,
-    Option<"ppSyncBanks", "pp-sync-banks", "bool", "false",
-           "With state-in-ram-pp: a memory read combinationally and banked "
-           "past state-in-ram-pp-fanout (each bank's address, enable and "
-           "instance registered at the stage before the read) is a registered "
-           "read of those registers' next values instead: the same data (the "
-           "row is the evaluated instance's, written only by its own state "
-           "pass), and a deep LUT RAM's read (entries x instances rows) ends "
-           "in the RAM's register or a block RAM, not in the logic after it">,
+    Option<"ppSyncBanks", "pp-sync-banks", "unsigned", "0",
+           "With state-in-ram-pp, R (0: off): a memory read combinationally "
+           "whose threaded rows (entries x instances) pass R is banked (each "
+           "bank's address, enable and instance registered at the stage "
+           "before the read) and threaded as a registered read of those "
+           "registers' next values: the same data (the row is the evaluated "
+           "instance's, written only by its own state pass), and the deep "
+           "LUT RAM's read (Beacon 1 + log2(rows) - 6 levels) ends in the "
+           "RAM's register, a block RAM, not in the logic after it; banks "
+           "past state-in-ram-pp-fanout of fewer rows stay combinational">,
     Option<"stateInRamPPFanout", "state-in-ram-pp-fanout", "unsigned", "96",
            "With state-in-ram-pp: the most RAM primitives a combinationally "
            "read memory's address register drives (the memory is banked by "

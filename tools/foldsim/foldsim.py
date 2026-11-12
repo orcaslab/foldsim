@@ -382,8 +382,8 @@ def frame_options(a):
         fold += ' slot-column-affine'
     if getattr(a, 'slot_table_compose', False):
         fold += ' slot-table-compose'
-    if getattr(a, 'pp_sync_banks', False):
-        fold += ' pp-sync-banks'
+    if getattr(a, 'pp_sync_banks', 0):
+        fold += f' pp-sync-banks={a.pp_sync_banks}'
     if getattr(a, 'slot_ahead', 0):
         fold += f' slot-ahead={a.slot_ahead}'
     if getattr(a, 'modulo_linear', None) is not None:
@@ -1610,9 +1610,9 @@ def build_parser():
                     help='with --slot-segments: a table read at a position table\'s value that does not decode is '
                          'read through the inner table\'s position (composed rows) (foldsim-fold-static '
                          'slot-table-compose)')
-    ap.add_argument('--pp-sync-banks', action='store_true',
-                    help='with --state-in-ram-pp: a banked combinational read is a registered read of its '
-                         'address/enable/instance registers\' next values (same data; Beacon) '
+    ap.add_argument('--pp-sync-banks', type=int, default=0, metavar='ROWS',
+                    help='with --state-in-ram-pp: a combinational read of a memory of more than ROWS threaded rows '
+                         'is banked and registered from its registers\' next values (same data; Beacon) '
                          '(foldsim-fold-static pp-sync-banks)')
     ap.add_argument('--slot-ahead', type=int, default=0, metavar='K',
                     help='with --slot-segments: position tables read through a class\'s pass sequence, and '
