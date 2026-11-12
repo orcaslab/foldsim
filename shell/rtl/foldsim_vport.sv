@@ -112,6 +112,9 @@ module foldsim_vport #(
     /* verilator lint_on UNUSEDSIGNAL */
     input  wire                 move,
     output wire                 busy,
+    // Telemetry: this cycle the head read waits on its fence or AXI room;
+    // the head write waits (pair, room, AW); a read is on AXI.
+    output wire [2:0]           stat,
 
     output reg                  m_awvalid,
     input  wire                 m_awready,
@@ -370,6 +373,7 @@ module foldsim_vport #(
 
     assign m_bready = 1'b1;
     assign busy     = draining;
+    assign stat     = {r_out != 0, g_valid && !aw_go && !w_busy && !fill_w, h_valid && !ar_go};
 
     always @(posedge clk) begin
         if (g_load) begin

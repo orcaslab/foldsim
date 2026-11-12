@@ -32,8 +32,10 @@
 // `zero` it behaves as foldsim_vmem without the bits.
 //
 // `moving` is high from `move` until the drain ends; the new base takes
-// effect then. Telemetry: [0] reads taken, [1] writes taken, [5] host cycles
-// with no room; the others read zero.
+// effect then. Telemetry: [0] reads taken, [1] writes taken, [2] reads
+// answered on chip (known-zero), [3] host cycles the head read waited (fence
+// or AXI room), [4] host cycles the head write waited (its pair's read, AXI
+// room, AW), [5] host cycles with no room, [6] host cycles with a read on AXI.
 module foldsim_vport_ctl #(
     parameter IW             = 8,
     parameter AW             = 10,
@@ -188,6 +190,7 @@ module foldsim_vport_ctl #(
     /* verilator lint_on UNUSEDSIGNAL */
     wire [511:0]   p_rsp_data;
     wire           busy;
+    wire [2:0]     p_stat;
 
     // ---- Known-zero blocks: looked up at the input register, the read
     // decided a host cycle later (q2): an untouched block (and `zero`) is
@@ -260,7 +263,7 @@ module foldsim_vport_ctl #(
         .wr_data(DB'(q2_wdata)), .wr_mask(q2_wmask),
         .rsp_valid(p_rsp_valid), .rsp_tag(p_rsp_tag), .rsp_beat(p_rsp_beat), .rsp_last(p_rsp_last), .rsp_data(p_rsp_data),
         .rd_free(rd_free), .wr_free(wr_free),
-        .base(base), .bytes(zero ? 64'(BYTES) : 64'd0), .move(move), .busy(busy),
+        .base(base), .bytes(zero ? 64'(BYTES) : 64'd0), .move(move), .busy(busy), .stat(p_stat),
         .m_awvalid(m_awvalid), .m_awready(m_awready), .m_awaddr(m_awaddr), .m_awlen(m_awlen),
         .m_wvalid(m_wvalid), .m_wready(m_wready), .m_wdata(m_wdata), .m_wstrb(m_wstrb), .m_wlast(m_wlast),
         .m_bvalid(m_bvalid), .m_bready(m_bready), .m_arvalid(m_arvalid), .m_arready(m_arready),
@@ -329,17 +332,21 @@ module foldsim_vport_ctl #(
     end
 
     // Telemetry.
-    reg [TEL_W-1:0] t_rd, t_wr, t_full;
+    reg [TEL_W-1:0] t_rd, t_wr, t_zero, t_rwait, t_wwait, t_full, t_busy;
     always @(posedge clk) begin
         if (reset) begin
-            t_rd <= '0; t_wr <= '0; t_full <= '0;
+            t_rd <= '0; t_wr <= '0; t_zero <= '0; t_rwait <= '0; t_wwait <= '0; t_full <= '0; t_busy <= '0;
         end else if (TELEMETRY != 0) begin
-            t_rd   <= t_rd + TEL_W'(q_rd);
-            t_wr   <= t_wr + TEL_W'(q_wr);
-            t_full <= t_full + TEL_W'(free == 0);
+            t_rd    <= t_rd + TEL_W'(q_rd);
+            t_wr    <= t_wr + TEL_W'(q_wr);
+            t_zero  <= t_zero + TEL_W'(z_ans);
+            t_rwait <= t_rwait + TEL_W'(p_stat[0]);
+            t_wwait <= t_wwait + TEL_W'(p_stat[1]);
+            t_full  <= t_full + TEL_W'(free == 0);
+            t_busy  <= t_busy + TEL_W'(p_stat[2]);
         end
     end
-    assign tel = {TEL_W'(0), t_full, TEL_W'(0), TEL_W'(0), TEL_W'(0), t_wr, t_rd};
+    assign tel = {t_busy, t_full, t_wwait, t_rwait, t_zero, t_wr, t_rd};
 
 `ifdef SIMULATION
     initial begin
