@@ -1,0 +1,26 @@
+# REQUIRES: verilator
+# The static port behind a controller's contract (foldsim_vport_ctl) keeps the
+# old controller's latency (foldsim_vmem) where a class copy sweeps its
+# instances, a read-first pair of each a host cycle (Inputs/tb_vport_probe.sv,
+# the Verilator emulator's memory: every channel ready, answers and B's 100
+# host cycles on): read-after-write by a table of write numbers, 2^HZ entries
+# by a hash of the row above its alignment bits. With 64 buckets (HZ 6) the
+# reads of instance i+64 waited for instance i's write (average 295 host
+# cycles); with the old controller's 2^11 entries, 112 (foldsim_vmem: 112).
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION -DVPORT_CTL --top-module tb -GIW=8 -GAW=4 -Mdir %t/t %S/Inputs/tb_vport_probe.sv %S/../../shell/rtl/foldsim_vport_ctl.sv %S/../../shell/rtl/foldsim_vport.sv > %t/t.log 2>&1
+# RUN: %t/t/Vtb +mode=4 +ni=256 +n=40 +maxavg=120 | FileCheck %s
+# RUN: %t/t/Vtb +mode=4 +ni=64 +n=40 +maxavg=120 | FileCheck %s
+# RUN: %t/t/Vtb +mode=0 +n=50 +maxavg=112 | FileCheck %s
+# A table of 4 entries (HZ 2): rows share entries, reads wait longer, answers stay exact.
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION -DVPORT_CTL --top-module tb -GIW=8 -GAW=4 -GHZ=2 -Mdir %t/s %S/Inputs/tb_vport_probe.sv %S/../../shell/rtl/foldsim_vport_ctl.sv %S/../../shell/rtl/foldsim_vport.sv > %t/s.log 2>&1
+# RUN: %t/s/Vtb +mode=4 +ni=256 +n=40 | FileCheck %s
+# The 64-bucket case fails the latency bound (the regression this test guards).
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION -DVPORT_CTL --top-module tb -GIW=8 -GAW=4 -GHZ=6 -Mdir %t/b %S/Inputs/tb_vport_probe.sv %S/../../shell/rtl/foldsim_vport_ctl.sv %S/../../shell/rtl/foldsim_vport.sv > %t/b.log 2>&1
+# RUN: %t/b/Vtb +mode=4 +ni=256 +n=40 +maxavg=120 | FileCheck %s --check-prefix=SLOW
+# RUN: %t/s/Vtb +mode=1 +d=20 +n=40 | FileCheck %s
+# CHECK-NOT: FAIL
+# CHECK-NOT: %Error
+# CHECK: avg latency
+# CHECK: PASS
+# SLOW: FAIL: average latency above 120

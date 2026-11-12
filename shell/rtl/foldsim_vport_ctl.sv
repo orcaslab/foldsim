@@ -16,7 +16,7 @@
 // vport): the same parameters (those of a host cache, forwarding and the
 // hazard table are accepted and unused) and the same guarantees per
 // (tag, instance, row) -- a read observes every earlier write of its row
-// (it waits for the B of every earlier write in its row's bucket, HZ), a read-first
+// (it waits for the B of the newest earlier write of its row's hash entry, HZ), a read-first
 // pair's read the row before its write (the write waits for the read), a
 // write-first pair's read the row after it (the read waits for the write's
 // B); answers tagged with the instance, here in request order.
@@ -62,8 +62,10 @@ module foldsim_vport_ctl #(
     parameter TAGW           = 0,
     parameter WRITES_OUT     = 128,
     parameter TELEMETRY      = 1,
-    // Read-after-write by 2^HZ row buckets (foldsim_vport HZ), not every earlier write.
-    parameter HZ             = 6,
+    // Read-after-write by a table of 2^HZ write numbers indexed by a hash of
+    // the row (foldsim_vport HZ), not every earlier write: as foldsim_vmem's
+    // hazard table (HAZARD_BITS), at most the image's rows.
+    parameter HZ             = 11,
     // The image's bytes (the zero fill's extent; the compiler's, from
     // foldsim_sim.json: its rows times INSTANCES times ROW_BYTES).
     parameter longint BYTES  = 0,
@@ -254,7 +256,7 @@ module foldsim_vport_ctl #(
 
     foldsim_vport #(
         .DW(DB), .MW(MW), .TW(IT), .OW(OW), .QUEUE(QUEUE), .OUTSTANDING(OUTSTANDING), .WRITES_OUT(WRITES_OUT),
-        .ZERO_FILL(KNOWN_ZERO), .HZ(HZ)
+        .ZERO_FILL(KNOWN_ZERO), .HZ((HZ < AW + KB) ? HZ : AW + KB), .KS(RB - 6)
     ) port (
         .clk(clk), .reset(reset),
         .rd_valid(p_rd), .rd_addr(q2_raddr), .rd_len(LW'(BEATS - 1)), .rd_tag(q2_rtag), .rd_fence(4'd0),
@@ -331,8 +333,10 @@ module foldsim_vport_ctl #(
             free <= room_min;
     end
 
-    // Telemetry.
+    // Telemetry (the port's status registered first: counted a cycle late).
     reg [TEL_W-1:0] t_rd, t_wr, t_zero, t_rwait, t_wwait, t_full, t_busy;
+    reg [2:0]       stat_q;
+    always @(posedge clk) stat_q <= p_stat;
     always @(posedge clk) begin
         if (reset) begin
             t_rd <= '0; t_wr <= '0; t_zero <= '0; t_rwait <= '0; t_wwait <= '0; t_full <= '0; t_busy <= '0;
@@ -340,10 +344,10 @@ module foldsim_vport_ctl #(
             t_rd    <= t_rd + TEL_W'(q_rd);
             t_wr    <= t_wr + TEL_W'(q_wr);
             t_zero  <= t_zero + TEL_W'(z_ans);
-            t_rwait <= t_rwait + TEL_W'(p_stat[0]);
-            t_wwait <= t_wwait + TEL_W'(p_stat[1]);
+            t_rwait <= t_rwait + TEL_W'(stat_q[0]);
+            t_wwait <= t_wwait + TEL_W'(stat_q[1]);
             t_full  <= t_full + TEL_W'(free == 0);
-            t_busy  <= t_busy + TEL_W'(p_stat[2]);
+            t_busy  <= t_busy + TEL_W'(stat_q[2]);
         end
     end
     assign tel = {t_busy, t_full, t_wwait, t_rwait, t_zero, t_wr, t_rd};
