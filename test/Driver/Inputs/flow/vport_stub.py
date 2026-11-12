@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-"""vport_stub.py <N> <out dir> [<M>]: a stand-in for a generated simulator with N static ports (foldsim_sim.sv/.vh/.json), for
+"""vport_stub.py <N> <out dir> [<M> [<BYTES>]]: a stand-in for a generated simulator with N static ports (foldsim_sim.sv/.vh/.json), for
 the static ports' kernel flow tests (direct HBM, vmem masters): the target ports the kernel top connects (one AXI4 memory port, the control
 endpoint's channels by its own names, profile_finish) and, per static port p, the simulator's side of foldsim_vport
 (vp<p>_*, the 5.1 contract's signals) with FOLDSIM_VPORT<p>_* in foldsim_sim.vh. Its logic only keeps every input
 observable (no behaviour). Ports differ: port 0 copies (COPY), port 1 has 1024-bit rows of two beats, port 2 takes its
 write numbers from its sender (NEED_IN), port 3 keeps a write-number table (HZ 4); the rest 512-bit rows. With M, also
 M virtual memories (vm<k>_*, FOLDSIM_VMEM_*: 512-bit rows, 16 of them, 2 instances; memory 1 read-first), whose
-regions come first in the kernel's vmem space."""
+regions come first in the kernel's vmem space. BYTES: each port's region (default 2^28)."""
 import json, os, sys
 
 n, out = int(sys.argv[1]), sys.argv[2]
 nvm = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+port_bytes = int(sys.argv[4]) if len(sys.argv) > 4 else 1 << 28
 os.makedirs(out, exist_ok=True)
 
 
 def params(p):
-    q = dict(DW=512, MW=64, TW=8, OW=22, LMAX=1, COPY=0, NEED_IN=0, HZ=0, BYTES=1 << 28, ZERO=1, FS=8, KS=0)
+    q = dict(DW=512, MW=64, TW=8, OW=(port_bytes // 64).bit_length() - 1, LMAX=1, COPY=0, NEED_IN=0, HZ=0, BYTES=port_bytes, ZERO=1, FS=8, KS=0)
     if p == 0:
         q['COPY'] = 1
     if p == 1:

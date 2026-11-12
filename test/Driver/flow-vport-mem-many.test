@@ -1,0 +1,33 @@
+# REQUIRES: verilator
+# More than 64 static ports on the virtual memories' masters (the MEM binding; the 64-SM A100 netlist
+# y64c1 has 95): the 64-port limit is the direct binding's (one HBM channel a port), not this one's.
+# kernel-vh lists the ports 8 a part, parts 0-7 always and parts 8 and up as far as the ports go (here
+# 70 ports of 16 MiB: parts 0-8, the last with ports 64-69); the kernel top instantiates and connects the parts
+# past 7 where they are defined. Lint: only the kernel's own two warnings; CIRCT: 70 ports on 8 shares.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: grep -v hbm_direct %S/Inputs/flow/vport32.toml > %t/plain.toml
+# RUN: python3 %S/Inputs/flow/vport_stub.py 70 %t/gen 1 16777216
+# RUN: python3 %foldsim_tools/foldsim_flow.py kernel-vh --manifest %t/plain.toml --gen %t/gen --vmem-masters 8 -o %t/gen/foldsim_kernel.vh
+# RUN: FileCheck %s --check-prefix=VH < %t/gen/foldsim_kernel.vh
+# RUN: python3 %foldsim_tools/foldsim_flow.py afu --manifest %t/plain.toml --gen %t/gen --rtl-dir %S/../../shell/rtl -o %t/gen/foldsim_afu.sv
+# RUN: python3 %foldsim_tools/foldsim_flow.py kernel-srcs --gen %t/gen --rtl-dir %S/../../shell/rtl -o %t/srcs.f
+# RUN: %verilator --lint-only -Wall -Wno-fatal -DSIMULATION --top-module foldsim_afu -f %t/srcs.f > %t/lint.log 2>&1
+# RUN: grep -E '^%%(Warning|Error)' %t/lint.log | sed -E 's#^(%%[A-Za-z-]+): [^ ]+:[0-9]+:[0-9]+: #\1: #' | FileCheck %s --check-prefix=LINT
+# RUN: circt-verilog --ir-hw --allow-use-before-declare -DSYNTHESIS -I %S/../../shell/rtl -I %t/gen --top foldsim_afu %t/gen/foldsim_sim.sv %S/../../shell/rtl/foldsim_token.sv %S/../../shell/rtl/foldsim_mem_bmap.sv %S/../../shell/rtl/foldsim_mem_bank.sv %S/../../shell/rtl/foldsim_mem.sv %S/../../shell/rtl/foldsim_vmem.sv %S/../../shell/rtl/foldsim_vmem_share.sv %S/../../shell/rtl/foldsim_vmem_group.sv %S/../../shell/rtl/foldsim_vport.sv %S/../../shell/rtl/foldsim_ctrl.sv %t/gen/foldsim_afu.sv -o %t/afu.mlir 2> /dev/null
+# RUN: grep -o 'hw.instance "vport[0-9]*" @foldsim_vport' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=N70
+# RUN: grep -o 'hw.instance "vport69" @foldsim_vport' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=ONE
+# RUN: grep -o 'hw.instance "g_vmem_master_[0-9]*.share" @foldsim_vmem_share' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=N8
+# Past the kernel's 256 (32 parts): refused.
+# RUN: python3 %S/Inputs/flow/vport_stub.py 257 %t/g257
+# RUN: not python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %t/g257/foldsim_sim.vh --mem-ports 1 --vmem-masters 8 2>&1 | FileCheck %s --check-prefix=MAX
+# VH: {{^}}`define FOLDSIM_VMEM_MASTERS 8{{$}}
+# VH: {{^}}`define FOLDSIM_VPORT_REPEAT7(f,s) `s `f(56) `s `f(57) `s `f(58) `s `f(59) `s `f(60) `s `f(61) `s `f(62) `s `f(63){{$}}
+# VH-NEXT: {{^}}`define FOLDSIM_VPORT_REPEAT8(f,s) `s `f(64) `s `f(65) `s `f(66) `s `f(67) `s `f(68) `s `f(69){{$}}
+# VH-NOT: FOLDSIM_VPORT_REPEAT9
+# LINT: %Warning-DECLFILENAME: Filename 'foldsim_token'
+# LINT-NEXT: %Warning-UNUSEDSIGNAL: Signal is not used: 'advance'
+# LINT-NOT: %
+# N70: {{^}}70{{$}}
+# ONE: {{^}}1{{$}}
+# N8: {{^}}8{{$}}
+# MAX: vmem_ports.py: 257 static ports; the kernel lists at most 256

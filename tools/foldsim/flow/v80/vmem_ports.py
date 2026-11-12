@@ -91,6 +91,8 @@ MAX_MASTERS = 32
 # FOLDSIM_VMEM_REPEAT_P<q>: the controllers in parts of PART_SIZE, PARTS of them.
 PART_SIZE = 8
 PARTS = 16
+# FOLDSIM_VPORT_REPEAT<q>: the static ports on these masters, 8 a part, at most VPORT_PARTS parts.
+VPORT_PARTS = 32
 
 
 def vmem_count(sim_vh):
@@ -317,12 +319,13 @@ def main():
             if of is not None:
                 print('`define FOLDSIM_VMEM_MASTER_OF ' + ', '.join(str(j) for j in of))
                 print('`define FOLDSIM_VMEM_MASTER_SLR ' + ', '.join(str(g) for g in mslr))
-        # The static ports, 8 a line (as the direct binding's): `f(p).
-        for q in range(8) if nv else ():
+        # The static ports, 8 a line (as the direct binding's): `f(p); parts 0-7 always, parts 8 and
+        # up only for ports past 64 (the kernel instantiates those parts where they are defined).
+        for q in range(max(8, -(-nv // 8))) if nv else ():
             xs = [f'`f({v})' for v in range(8 * q, min(8 * q + 8, nv))]
             print(f'`define FOLDSIM_VPORT_REPEAT{q}(f,s) ' + ('`s ' if q and xs else '') + ' `s '.join(xs))
-        if nv > 64:
-            sys.exit(f'vmem_ports.py: {nv} static ports; the kernel lists at most 64')
+        if nv > 8 * VPORT_PARTS:
+            sys.exit(f'vmem_ports.py: {nv} static ports; the kernel lists at most {8 * VPORT_PARTS}')
     if nm == 0:
         masters()
         return
