@@ -5866,16 +5866,8 @@ void StaticFolder::reportPageEngines(raw_ostream &os) {
   os << "  page engines: " << pageEngines.size() << " engines, " << columns
      << " page columns\n";
   for (auto [e, eng] : llvm::enumerate(pageEngines)) {
-    uint64_t nr = 0, nw = 0;
-    for (unsigned q = 0; q < ii && q < eng.reads.size(); ++q)
-      nr += eng.reads[q] != 0;
-    for (unsigned q = 0; q < ii && q < eng.writes.size(); ++q)
-      nw += eng.writes[q] != 0;
     os << "    page engine " << e << " " << eng.dataWidth << " bits, tag "
-       << eng.tagBits() << ", row " << eng.rowBits() << ", reads " << nr
-       << " writes " << nw << " a frame:";
-    for (auto &[name, w, r, wr] : eng.traffic)
-      os << " {" << name << " " << w << " " << r << " " << wr << "}";
+       << eng.tagBits() << ", row " << eng.rowBits() << ":";
     for (auto [c, k] : eng.members)
       os << " " << classes[c].name << ":" << classes[c].virtualMemories[k].name;
     for (unsigned k : eng.streams)
@@ -5908,6 +5900,15 @@ void StaticFolder::reportPageEngines(raw_ostream &os) {
     for (auto &st : linkStreams)
       if (st.kept)
         os << " " << st.slots();
+    os << "\n";
+  }
+  // Each engine's traffic a frame: positions read and written, and each
+  // member's {name, row bits, positions read, written} as placed.
+  for (auto [e, eng] : llvm::enumerate(pageEngines)) {
+    os << "  page engine traffic " << e << ": reads " << eng.taken(false) << " writes "
+       << eng.taken(true) << ";";
+    for (auto &[name, w, r, wr] : eng.traffic)
+      os << " {" << name << " " << w << " " << r << " " << wr << "}";
     os << "\n";
   }
 }
