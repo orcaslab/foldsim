@@ -32,7 +32,8 @@
 // `zero` it behaves as foldsim_vmem without the bits. The fill is skipped
 // while the image is clean: `zero` rose (the host cleared the region and
 // said so) and no write was taken since, as on the reset a runtime gives
-// right after its clear (the port keeps that state).
+// right after its clear (the port keeps that state for its fill); so is
+// the known-zero bits' sweep.
 //
 // `moving` is high from `move` until the drain ends; the new base takes
 // effect then. Telemetry: [0] reads taken, [1] writes taken, [2] reads
@@ -187,6 +188,15 @@ module foldsim_vport_ctl #(
         q_wmask <= wr_mask;
     end
 
+    // The image clean: `zero` rose since the last write taken.
+    reg            z_q, clean;
+    always @(posedge clk) begin
+        z_q <= zero;
+        if (q_wr)
+            clean <= 1'b0;
+        else if (zero && !z_q)
+            clean <= 1'b1;
+    end
     wire [FW-1:0]  rd_free, wr_free;
     wire           p_rsp_valid, p_rsp_last;
     /* verilator lint_off UNUSEDSIGNAL */
@@ -242,8 +252,10 @@ module foldsim_vport_ctl #(
         q2_wmask <= q_wmask;
         q2_raddr <= q_raddr;
         q2_rtag  <= q_rtag;
+        // (A clean image skips the sweep too: a block's stale bit then only
+        // sends its reads to memory, which holds zero.)
         if (KZ != 0) begin
-            if (reset || move)
+            if (move || (reset && !clean))
                 kz_sweep <= (KZB+1)'(NBLK);
             else if (sweeping)
                 kz_sweep <= kz_sweep - 1'b1;
@@ -369,6 +381,8 @@ module foldsim_vport_ctl #(
         q2_rd = 1'b0;
         q2_wr = 1'b0;
         kz_sweep = '0;
+        z_q = 1'b0;
+        clean = 1'b0;
         kz_rd = 1'b1;
         kz_same = 1'b0;
         zq_head = '0;
