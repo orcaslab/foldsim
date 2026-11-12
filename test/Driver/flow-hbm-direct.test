@@ -1,0 +1,15 @@
+# gen_platform.py --emit cfg --hbm-direct: the kernel's direct static ports
+# m_axi_hbm_<i> bound one a channel to HBM<k> with :DIRECT (slashkit wires them
+# straight to HBM_AXI_<k>, no SmartConnect) and hbm_clk on the static region
+# clock; without the flag nothing changes; a channel twice fails.
+# RUN: python3 %foldsim_tools/flow/platform/gen_platform.py --card v80 --emit cfg --kernel foldsim_afu --no-host --hbm-direct 10,11,12 | FileCheck %s
+# RUN: python3 %foldsim_tools/flow/platform/gen_platform.py --card v80 --emit cfg --kernel foldsim_afu --no-host | FileCheck %s --check-prefix=PLAIN
+# RUN: not python3 %foldsim_tools/flow/platform/gen_platform.py --card v80 --emit cfg --kernel foldsim_afu --no-host --hbm-direct 10,10 2>&1 | FileCheck %s --check-prefix=TWICE
+# CHECK: shell=compute
+# CHECK: sp=foldsim_afu_0.m_axi_mem_0:MEM
+# CHECK-NEXT: sp=foldsim_afu_0.m_axi_hbm_0:HBM10:DIRECT
+# CHECK-NEXT: sp=foldsim_afu_0.m_axi_hbm_1:HBM11:DIRECT
+# CHECK-NEXT: sp=foldsim_afu_0.m_axi_hbm_2:HBM12:DIRECT
+# CHECK-NEXT: clk=foldsim_afu_0.hbm_clk:STATIC
+# PLAIN-NOT: hbm
+# TWICE: distinct HBM channels
