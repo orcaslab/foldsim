@@ -25595,32 +25595,58 @@ LogicalResult StaticFolder::buildSim() {
         auto &vm = classes[c].virtualMemories[k];
         auto copyOut = [&](unsigned j) { return copies[c].getResult(vm.firstOutput + j); };
         // `vmem-stagger`: its requests `delay` positions after the pass: the
-        // fields held from the pass (the class's next pass is further), the
         // valids a chain stepped by the positions run (none in a bubble), so
         // that a request leaves at its placed position however many bubbles
-        // come between.
+        // come between; the fields held from the pass (the class's next pass
+        // is further) and shown by registers loaded at the position before
+        // the request's and zero at every other (a reset pin and an enable,
+        // no select: the engine ORs them as idle-zero fields).
         SmallVector<Value, 8> held;
         if (vm.delay) {
           Value live = notOf(eq(pos0, ii));
           Value load = comb::OrOp::create(b, copyOut(0), copyOut(3));
           std::string prefix = classes[c].name + "_" + vm.name + "_stag";
+          SmallVector<Value, 2> chain[2];
+          for (unsigned j : {0u, 3u}) {
+            Value v = copyOut(j);
+            for (unsigned t = 0; t < vm.delay; ++t) {
+              auto next = backedges.get(i1);
+              Value r = resetReg(next, prefix + (j ? "_wv" : "_rv") + Twine(t), 0);
+              next.setValue(comb::MuxOp::create(b, live, v, r));
+              chain[j ? 1 : 0].push_back(r);
+              v = r;
+            }
+          }
+          // The position before the request's: the pass itself (d = 1), else
+          // the chain's stage before the last.
+          Value pre = vm.delay == 1
+                          ? load
+                          : Value(comb::OrOp::create(b, chain[0][vm.delay - 2],
+                                                     chain[1][vm.delay - 2]));
+          Value clearShown = comb::AndOp::create(b, live, notOf(pre));
           for (unsigned j = 0; j < 8; ++j) {
-            Value x = copyOut(j);
             if (j == 0 || j == 3) {
-              Value v = x;
-              for (unsigned t = 0; t < vm.delay; ++t) {
-                auto next = backedges.get(i1);
-                Value r = resetReg(next, prefix + (j ? "_wv" : "_rv") + Twine(t), 0);
-                next.setValue(comb::MuxOp::create(b, live, v, r));
-                v = r;
-              }
-              held.push_back(comb::AndOp::create(b, v, live));
+              held.push_back(comb::AndOp::create(b, chain[j ? 1 : 0].back(), live));
               continue;
             }
+            Value x = copyOut(j);
+            Value src = x;
+            if (vm.delay > 1) {
+              auto next = backedges.get(x.getType());
+              src = reg(next, prefix + "_f" + Twine(j));
+              next.setValue(comb::MuxOp::create(b, load, x, src));
+            }
+            // (Loaded on the positions run, reset to zero (synchronously) on
+            // those that are not the one before the request: an enable and a
+            // reset pin.)
+            Value zeroX = constant(hw::getBitWidth(x.getType()), 0);
             auto next = backedges.get(x.getType());
-            Value r = reg(next, prefix + "_f" + Twine(j));
-            next.setValue(comb::MuxOp::create(b, load, x, r));
-            held.push_back(r);
+            Value shown = seq::FirRegOp::create(
+                b, next, hostClock, b.getStringAttr(prefix + "_o" + Twine(j)), clearShown,
+                zeroX, hw::InnerSymAttr{}, /*isAsync=*/false,
+                b.getIntegerAttr(x.getType(), 0));
+            next.setValue(comb::MuxOp::create(b, live, src, shown));
+            held.push_back(shown);
           }
         }
         auto out = [&](unsigned j) -> Value { return held.empty() ? copyOut(j) : held[j]; };
@@ -25646,9 +25672,9 @@ LogicalResult StaticFolder::buildSim() {
         wrInst.push_back(when(wv, b.createOrFold<comb::ConcatOp>(
                                       tagOf(out(4)), constant(1, 0))));
         wrRow.push_back(when(wv, rowOf(out(4), out(5))));
-        // (A member whose idle write fields are zero: ORed as they are; not
-        // held ones, `vmem-stagger`.)
-        wrData.push_back(vm.idleZero && !vm.delay ? zext(out(6), dw) : when(wv, zext(out(6), dw)));
+        // (A member whose idle write fields are zero, or held (`vmem-stagger`,
+        // zero but at its requests): ORed as they are.)
+        wrData.push_back(vm.idleZero || vm.delay ? zext(out(6), dw) : when(wv, zext(out(6), dw)));
         // Its mask as the engine's byte enables: a bit per byte already (a
         // page column), else each bit over its share of the row's bytes
         // (a target RAM's whole-row or lane enables, `vmem-on-engines`).
@@ -25666,7 +25692,7 @@ LogicalResult StaticFolder::buildSim() {
                 b.createOrFold<comb::ExtractOp>(b.getIntegerType(1), mask, j)));
           mask = b.createOrFold<comb::ConcatOp>(parts);
         }
-        wrMask.push_back(vm.idleZero && !vm.delay ? zext(mask, dw / 8) : when(wv, zext(mask, dw / 8)));
+        wrMask.push_back(vm.idleZero || vm.delay ? zext(mask, dw / 8) : when(wv, zext(mask, dw / 8)));
       }
       // Its link streams': a read's member tag its slot, a write's the top
       // bit (the stream's own {tag, instance} without the instance bit); its
