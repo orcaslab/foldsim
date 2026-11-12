@@ -549,6 +549,13 @@ public:
   /// memory's read address is registered a stage early and replicated, a
   /// copy per bank of at most this many RAM primitives.
   unsigned ppAddressFanout = 96;
+  /// `pp-sync-banks`: a banked combinational read (state-in-ram-pp-fanout)
+  /// is a registered read of its address, enable and instance registers'
+  /// next values.
+  bool ppSyncBanks = false;
+  /// `zero-chain-levels`: the most estimated levels a chain of zero-latency
+  /// links may reach into a reader's state (0: no bound).
+  unsigned zeroChainLevels = 0;
   /// `state-in-ram-pp-pack`: a PP class's stored registers packed into
   /// columns of an instance's row each.
   bool ppPackStores = true;
@@ -5919,7 +5926,7 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
 void StaticFolder::chainCuts() {
   lateReads.clear();
   cutLinks.clear();
-  if (!zeroLatencyLinks || !zeroLatencyChains || !zeroChainHops)
+  if (!zeroLatencyLinks || !zeroLatencyChains || (!zeroChainHops && !zeroChainLevels))
     return;
   // Instance by instance: a late output's hops, the most zero-latency links
   // on a path into it within its host cycle (each adds its reader's choice
@@ -5955,7 +5962,7 @@ void StaticFolder::chainCuts() {
               edges.end());
   // Hops per (producer, instance), to a fixed point, held at the bound plus
   // one where port-level dependences make a loop.
-  int cap = int(zeroChainHops) + 1;
+  int cap = zeroChainHops ? int(zeroChainHops) + 1 : 1 << 20;
   std::map<std::pair<unsigned, unsigned>, int> hops;
   auto settle = [&] {
     hops.clear();
@@ -5992,6 +5999,8 @@ void StaticFolder::chainCuts() {
   // Cut the links where a chain first passes the bound, then again, until
   // none does.
   for (;;) {
+    if (!zeroChainHops)
+      break;
     settle();
     std::set<std::tuple<unsigned, unsigned, unsigned>> cut;
     for (auto &e : edges)
@@ -6009,6 +6018,97 @@ void StaticFolder::chainCuts() {
                      << " -> " << classes[c].name << "."
                      << classes[c].inputNames[input] << "\n";
   }
+  // `zero-chain-levels`: the estimated levels a chain reaches (outputDepth,
+  // inputDepth: the class's logic before its outputs and after its inputs),
+  // each link's choice of source and read bypass 3 more, instance by
+  // instance; a link whose reader's state would end a chain past the bound
+  // is cut, the first such on each chain, until none is.
+  if (!zeroChainLevels)
+    return;
+  const int bound = int(zeroChainLevels);
+  std::map<std::pair<unsigned, unsigned>, int> lev;
+  auto settleLevels = [&] {
+    lev.clear();
+    std::map<std::tuple<unsigned, unsigned, unsigned>, int> in;
+    for (unsigned round = 0;; ++round) {
+      bool changed = false;
+      for (auto &e : edges) {
+        if (cutLinks.count({e.p, e.c, e.input}))
+          continue;
+        auto it = lev.find({e.p, e.pinst});
+        int at = (it != lev.end() ? it->second
+                                  : classes[producers[e.p].cls].outputDepth[producers[e.p].port]) + 3;
+        int &slot = in[{e.c, e.cinst, e.input}];
+        slot = std::max(slot, at);
+      }
+      for (auto [p, producer] : llvm::enumerate(producers)) {
+        if (producer.cls < 0 || !producer.late)
+          continue;
+        auto &cls = classes[producer.cls];
+        int own = cls.outputDepth[producer.port];
+        for (unsigned i = 0; i < cls.threads(); ++i) {
+          int at = own;
+          for (auto input : cls.deps[producer.port].set_bits())
+            if (auto it = in.find({unsigned(producer.cls), i, unsigned(input)}); it != in.end())
+              at = std::max(at, it->second + own);
+          at = std::min(at, 1 << 20);
+          auto [it, fresh] = lev.try_emplace({unsigned(p), i}, at);
+          if (!fresh && at > it->second) {
+            it->second = at;
+            changed = true;
+          } else if (fresh) {
+            changed = true;
+          }
+        }
+      }
+      // (A loop of late outputs keeps growing: held at the cap above.)
+      if (!changed || round > 64)
+        break;
+    }
+  };
+  auto levelOf = [&](unsigned p, unsigned inst) {
+    auto it = lev.find({p, inst});
+    return it != lev.end() ? it->second : classes[producers[p].cls].outputDepth[producers[p].port];
+  };
+  unsigned cutByLevels = 0;
+  for (;;) {
+    settleLevels();
+    std::set<std::tuple<unsigned, unsigned, unsigned>> over;
+    for (auto &e : edges)
+      if (!cutLinks.count({e.p, e.c, e.input}) &&
+          levelOf(e.p, e.pinst) + 3 + classes[e.c].inputDepth[e.input] > bound)
+        over.insert({e.p, e.c, e.input});
+    if (over.empty())
+      break;
+    // The first on each chain: a link none of whose producer's own inputs
+    // came over a link past the bound (else all of them, for a loop).
+    std::set<std::tuple<unsigned, unsigned, unsigned>> cut;
+    for (auto &e : edges) {
+      if (!over.count({e.p, e.c, e.input}))
+        continue;
+      auto &pc = producers[e.p];
+      bool upstream = false;
+      for (auto &f : edges)
+        if (f.c == unsigned(pc.cls) && f.cinst == e.pinst &&
+            classes[pc.cls].deps[pc.port].test(f.input) && over.count({f.p, f.c, f.input})) {
+          upstream = true;
+          break;
+        }
+      if (!upstream)
+        cut.insert({e.p, e.c, e.input});
+    }
+    if (cut.empty())
+      cut = over;
+    cutByLevels += cut.size();
+    cutLinks.insert(cut.begin(), cut.end());
+    if (getenv("FOLDSIM_CHAIN_DEBUG"))
+      for (auto &[p, c, input] : cut)
+        llvm::errs() << "chain level cut " << classes[producers[p].cls].name << "."
+                     << classes[producers[p].cls].outputNames[producers[p].port] << " -> "
+                     << classes[c].name << "." << classes[c].inputNames[input] << "\n";
+  }
+  llvm::errs() << "foldsim-fold-static: zero-chain-levels " << bound << ": " << cutByLevels
+               << " links cut\n";
 }
 
 void StaticFolder::linkUses(std::vector<LinkUse> &uses) const {
@@ -11721,6 +11821,17 @@ static seq::FirRegOp keep(seq::FirRegOp reg) {
   return reg;
 }
 
+/// `pp-sync-banks`: a PP bank (a memory read combinationally, its only read's
+/// address, enable and instance clock-enabled registers) whose threaded read
+/// is registered from those registers' next values: the data a host cycle
+/// later is the combinational read of the registers, as long as no write to
+/// the row lands between (the row is the evaluated instance's, written only
+/// by its own state pass, at or after the read's stage).
+static constexpr StringLiteral kHostSyncRead = "foldsim.host_sync_read";
+/// pp-sync-banks: a PP memory read combinationally is banked (and read registered) when
+/// its threaded rows pass this many, whatever its fanout.
+static constexpr uint64_t kSyncBankRows = 1024;
+
 /// The SLR group an op of the simulator is built in, until `extractGroups`
 /// moves it into the group's module.
 static constexpr StringLiteral kSlrAttr = "foldsim.slr";
@@ -12860,7 +12971,12 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
 
   // Comb-read memories to bank: their read ports' LUT RAM primitives past
   // the fanout (threaded: entries x depth rows, 64 a primitive).
-  DenseSet<Operation *> early;
+  DenseSet<Operation *> early, deepOnly;
+  // (FOLDSIM_SYNC_BANK_ROWS, a test hook: another row bound.)
+  static const uint64_t syncBankRows = [] {
+    const char *env = getenv("FOLDSIM_SYNC_BANK_ROWS");
+    return env ? uint64_t(atoll(env)) : kSyncBankRows;
+  }();
   {
     DenseSet<Operation *> memories;
     for (auto *op : topo)
@@ -12874,6 +12990,13 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
       uint64_t deep = llvm::divideCeil(uint64_t(memory.getType().getDepth()) * entries, 64);
       if (uint64_t(memory.getType().getWidth()) * deep > ppAddressFanout)
         early.insert(memory);
+      // pp-sync-banks: also a memory whose threaded rows make its
+      // combinational read deep (past kSyncBankRows: a LUT RAM's
+      // multiplexers past 5 levels), banked and read registered.
+      else if (ppSyncBanks && deep * 64 > syncBankRows) {
+        early.insert(memory);
+        deepOnly.insert(memory);
+      }
     }
   }
   auto isEarly = [&](Operation *op) {
@@ -13224,6 +13347,14 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
         hazards.insert(k);
         more = true;
       }
+    // (A read banked for its depth alone that a stage more puts past the
+    // state pass stays combinational.)
+    for (auto *op : topo)
+      if (isEarly(op) && deepOnly.contains(memoryOf(cast<seq::FirMemReadOp>(op))) &&
+          stageOfValue.lookup(op->getResult(0)) > int(last)) {
+        early.erase(memoryOf(cast<seq::FirMemReadOp>(op)));
+        more = true;
+      }
     if (!more)
       break;
   }
@@ -13452,7 +13583,7 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
   }
 
   // The logic: each op's operands at its stage.
-  unsigned bankedReads = 0, bankCount = 0;
+  unsigned bankedReads = 0, bankCount = 0, syncBanks = 0;
   for (auto *op : topo) {
     int stage = stageOfValue.lookup(op->getResult(0));
     if (stage < 0)
@@ -13513,12 +13644,29 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
         Value addr = reg(read.getAddress(), "pp_" + base + "_addr");
         Value en = read.getEnable() ? reg(read.getEnable(), "pp_" + base + "_en")
                                     : Value();
+        // The instance: the stage registers' (any evaluation's) at k - 1.
+        Value instReg = rinst ? keepReg(pipe(rinst, k - 1), liveNow(), "pp_" + base + "_inst")
+                              : Value();
+        // `pp-sync-banks`: the bank read registered (its address, enable and
+        // instance the registers' next values: the stage k - 1 value where
+        // the register loads, else the register's own), its data the read
+        // of the registers as a combinational read of them gives: the row is
+        // the evaluated instance's, which only its own state pass (at stage
+        // P >= k) writes. A deep LUT RAM's multiplexers then end in the
+        // RAM's register (or a block RAM) instead of the logic after it.
+        auto isCE = [](Value r) {
+          return !r || r.getDefiningOp<seq::CompRegClockEnabledOp>();
+        };
+        // (pp-sync-banks: the threaded bank read registered, from these
+        // registers' next values: see kHostSyncRead.)
+        if (ppSyncBanks && isCE(addr) && isCE(en) && isCE(instReg)) {
+          bank.memory->setAttr(kHostSyncRead, UnitAttr::get(context));
+          ++syncBanks;
+        }
         auto bankRead = seq::FirMemReadOp::create(b, bank.memory, addr,
                                                   read.getClk(), en);
-        // The instance: the stage registers' (any evaluation's) at k - 1.
         if (rinst)
-          readInst[bankRead] =
-              keepReg(pipe(rinst, k - 1), liveNow(), "pp_" + base + "_inst");
+          readInst[bankRead] = instReg;
         datas.push_back(bankRead.getData());
         ++bankCount;
       }
@@ -13667,7 +13815,8 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
        << " constant leading bits left out), " << holdBits
        << " hold bits (" << rawBits << " of them a row's register values), " << pipeBits << " stage register bits (ready cone, "
        << lateCone.size() << " ops); " << bankedReads << " banked reads, "
-       << bankCount << " bank address copies; captures by need:";
+       << bankCount << " bank address copies (" << syncBanks
+       << " registered reads, pp-sync-banks); captures by need:";
     for (auto &[w, n] : whyBits)
       os << " " << w << " " << n << ";";
     os << " by pass:";
@@ -17078,16 +17227,18 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       memory.erase();
       continue;
     }
+    bool hostSync = memory->hasAttr(kHostSyncRead) && memory.getReadLatency() == 0;
     auto threadedMemory = seq::FirMemOp::create(
-        b, threadedType, memory.getReadLatency(), memory.getWriteLatency(),
-        memory.getRuw(), memory.getWuw(), memory.getNameAttr(),
+        b, threadedType, hostSync ? 1 : memory.getReadLatency(), memory.getWriteLatency(),
+        hostSync ? seq::RUW::Old : memory.getRuw(), memory.getWuw(), memory.getNameAttr(),
         hw::InnerSymAttr{}, seq::FirMemInitAttr{}, memory.getPrefixAttr(),
         memory.getOutputFileAttr());
     threadedMemory->setDialectAttrs(memory->getDialectAttrs());
+    threadedMemory->removeAttr(kHostSyncRead);
     if (auto *rule = storageFor(cls, memory.getName().value_or(""),
                                 /*reg=*/false, memType.getWidth())) {
       if ((rule->kind == "block" || rule->kind == "ultra") &&
-          memory.getReadLatency() == 0)
+          memory.getReadLatency() == 0 && !hostSync)
         return memory.emitError("storage: '")
                << rule->kind << "' RAM for '" << rule->store
                << "', which reads combinationally";
@@ -17125,7 +17276,24 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       }
       auto read = cast<seq::FirMemReadOp>(user);
       Value data;
-      if (memory.getReadLatency() == 0) {
+      if (hostSync) {
+        // pp-sync-banks: a host cycle ahead, from the registers' next values.
+        auto nextOf = [&](Value r) -> Value {
+          auto ce = r ? r.getDefiningOp<seq::CompRegClockEnabledOp>() : nullptr;
+          return ce ? Value(comb::MuxOp::create(b, ce.getClockEnable(), ce.getInput(), r)) : r;
+        };
+        Value inst = readInst.lookup(read);
+        Value addr = nextOf(read.getAddress());
+        Value full = addr;
+        if (idxWidth) {
+          Value i = nextOf(inst ? inst : region.inst);
+          full = !addrWidth ? i
+                            : b.createOrFold<comb::ConcatOp>(
+                                  b.createOrFold<comb::ExtractOp>(b.getIntegerType(addrWidth), addr, 0), i);
+        }
+        data = seq::FirMemReadOp::create(b, threadedMemory, full, hostClock,
+                                         nextOf(read.getEnable()));
+      } else if (memory.getReadLatency() == 0) {
         data = seq::FirMemReadOp::create(b, threadedMemory,
                                          addressOf(read.getAddress(), read),
                                          hostClock, read.getEnable());
@@ -26133,6 +26301,8 @@ void FoldStaticPass::runOnOperation() {
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.stateInRamPP = stateInRamPP;
   folder.ppAddressFanout = std::max(1u, unsigned(stateInRamPPFanout));
+  folder.ppSyncBanks = ppSyncBanks;
+  folder.zeroChainLevels = zeroChainLevels;
   folder.ppPackStores = stateInRamPPPack;
   folder.ppReplicaDepth = stateInRamPPReplicas;
   folder.stateScratchBits = stateScratchBits;
