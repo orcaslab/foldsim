@@ -49,7 +49,8 @@
 // simulator; it answers once, tag only (rsp_copied), when the copy's last
 // beat is in the queue. The copy's write slot is taken with the read (wr_free
 // counts it), so the copy leaves in request order and never waits behind a
-// later write. A read with rd_after_copies leaves only once every copy taken
+// later write; ahead of its own cycle's write, or (rd_new: the copy is of the
+// row that write makes) just after it. A read with rd_after_copies leaves only once every copy taken
 // before it has its B (a ring prefetch of the image the copies write).
 //
 // Room: rd_free / wr_free count the requests the port may still take (a copy
@@ -279,8 +280,15 @@ module foldsim_vport #(
     reg  [QW:0]    wq_head, wq_tail;
     // Slots the AXI side has read (its rows may be overwritten), in clk.
     wire [QW:0]    w_rel;
-    // A write's slot: after a copy read's slot taken in its cycle.
-    wire [QW-1:0]  ws = wq_tail[QW-1:0] + QW'(take_cp);
+    // A write's slot: after a copy read's slot taken in its cycle -- unless
+    // the read sees that write (rd_new, a write-first pair): its copy then
+    // waits for the write's B, so the copy slot goes after the write (ahead
+    // of it the copy would hold the write back in the queue: a deadlock).
+    wire           cp_late = take_cp && take_wr && rd_new;
+    wire [QW-1:0]  ws = wq_tail[QW-1:0] + QW'(take_cp && !cp_late);
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire [QW-1:0]  cs = wq_tail[QW-1:0] + QW'(cp_late);   // a copy read's slot (COPY)
+    /* verilator lint_on UNUSEDSIGNAL */
 
     // ---- fences
     wire [CW-1:0]  in_wcnt   = w_taken + CW'(rd_new && take_wr);
@@ -356,7 +364,7 @@ module foldsim_vport #(
             wq_mem[ws] <= WQW'({wr_addr, wr_len, wr_pair, epoch, r_in + CW'(take_rd), wr_cont} >> (WQF - WQW));
             w_end <= wr_addr + OW'(wr_len) + 1'b1;
         end
-        if (take_wr) w_end_ok <= 1'b1;
+        if (take_wr && !cp_late) w_end_ok <= 1'b1;
         else if (take_cp) w_end_ok <= 1'b0;
     end
 
@@ -376,8 +384,8 @@ module foldsim_vport #(
         reg                 cq_cancel;
         always @(posedge clk) begin
             if (take_cp) begin
-                cq_mem[cq_tail[QW-1:0]]  <= {wq_tail[QW-1:0], rd_copy_addr, rd_len[LW-1:0]};
-                cq_slot[cq_tail[QW-1:0]] <= wq_tail[QW-1:0];
+                cq_mem[cq_tail[QW-1:0]]  <= {cs, rd_copy_addr, rd_len[LW-1:0]};
+                cq_slot[cq_tail[QW-1:0]] <= cs;
                 cq_tail <= cq_tail + 1'b1;
             end
             if (cq_adv) cq_head <= cq_head + 1'b1;

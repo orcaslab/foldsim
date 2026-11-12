@@ -42,6 +42,8 @@
 # RUN: %t/merge/Vtb +verilator+seed+12 +hi=600 +seq=99 +wr=100 +far=1 +wmerge=1 | FileCheck %s
 # RUN: %t/merge/Vtb +verilator+seed+13 +hi=60 +seq=70 +stall=10 +copy=30 | FileCheck %s
 # RUN: %t/merge/Vtb +verilator+seed+14 +hi=100 +seq=60 +stall=20 +resets=3 | FileCheck %s
+# Write-first pairs whose read copies (rd_new + rd_copy): the copy slot goes after the write (else a deadlock).
+# RUN: %t/merge/Vtb +verilator+seed+16 +hi=60 +copy=40 +wf=50 +stall=10 | FileCheck %s
 #
 # The AXI side in its own clock at 256 bits (ASYNC, as on the shell's direct
 # HBM ports), clock ratios 2:1, 1:2, 2511:1777, 1:3 and 3:1, with ring copies
@@ -56,6 +58,7 @@
 # RUN: %t/async/Vtb +verilator+seed+23 +sp=1000 +mp=3000 +hi=60 +copy=30 +seq=60 +stall=10 | FileCheck %s
 # RUN: %t/async/Vtb +verilator+seed+24 +sp=3000 +mp=1000 +hi=1 +stall=20 | FileCheck %s
 # RUN: %t/async/Vtb +verilator+seed+25 +sp=2500 +mp=1250 +hi=150 +copy=40 +resets=2 +clean=1 | FileCheck %s
+# RUN: %t/async/Vtb +verilator+seed+26 +sp=2511 +mp=1777 +hi=80 +copy=40 +wf=50 +stall=20 +resets=3 | FileCheck %s
 # Three-beat rows, a write-number table, image reads at fence class 2 (only
 # rd_after_copies orders them after the copies).
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=1040 -GASYNC=1 -GCOPY=1 -GHZ=3 -GCYCLES=12000 -Mdir %t/acopy %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/acopy.log 2>&1
