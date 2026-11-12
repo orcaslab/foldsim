@@ -25,6 +25,16 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/one --static --copies Cam:1 --memory-registers 'Cam:tag' Cam > /dev/null 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal --x-initial 0 --top-module tb -Mdir %t/one/obj %S/Inputs/storage/tb.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
 # RUN: %t/one/obj/Vtb | FileCheck %s
+# Static without --copies: every instance in one copy, the only shape priced (a
+# one-instance copy never exists: a memory read at many constant addresses, as
+# a cache's MSHR tables, is kept as registers once the copy of all instances
+# is cheaper so, whatever one instance would cost).
+# RUN: foldsim --srcs top.f --top Top --out %t/onecopy --static --memory-registers auto Cam 2>&1 | FileCheck %s --check-prefix=LOG
+# RUN: FileCheck %s --check-prefix=ONECOPY < %t/onecopy/memory_registers.txt
+# RUN: %verilator --binary --timing -Wno-fatal --x-initial 0 --top-module tb -Mdir %t/onecopy/obj %S/Inputs/storage/tb.sv top.sv %t/onecopy/foldsim_sim.sv > %t/onecopy/build.log 2>&1
+# RUN: %t/onecopy/obj/Vtb | FileCheck %s
+# ONECOPY: registers Cam:tags: 16x8 reads 17 (16 constant) writes 1, 4 instances; LUT sites as memory / registers: 4 instances 633 / 386
+# ONECOPY-NOT: 1 instances
 # With --storage auto (and --copies auto), auto is the default.
 # RUN: foldsim --srcs top.f --top Top --out %t/auto --static --copies auto --storage auto Cam 2>&1 | FileCheck %s --check-prefix=LOG
 # RUN: %verilator --binary --timing -Wno-fatal --x-initial 0 --top-module tb -Mdir %t/auto/obj %S/Inputs/storage/tb.sv top.sv %t/auto/foldsim_sim.sv > %t/auto/build.log 2>&1

@@ -708,7 +708,10 @@ def memory_registers(a, flat, out):
                       file=sys.stderr)
             continue
         if rx is None:
-            take, rows = foldsim_storage.memory_as_registers(m, instances[m['module']])
+            # (Static, no copies asked for: each module's instances in one
+            # copy, the only shape to price.)
+            take, rows = foldsim_storage.memory_as_registers(
+                m, instances[m['module']], one_copy=bool(a.static) and not a.copies)
             price = '; LUT sites as memory / registers: ' + ', '.join(
                 f'{t} instances {mem:.0f} / {reg:.0f}' for t, mem, reg in rows)
         else:
