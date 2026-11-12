@@ -902,7 +902,7 @@ public:
   /// `vport-engines`: each page engine a static port (vp<p>_* ports);
   /// `vport-fence-shift`: its fence sample interval's log2.
   bool vportEngines = false, vportCopy = false;
-  unsigned vportFS = 4, vportHz = 0;
+  unsigned vportFS = 4, vportHz = 0, vportShare = 0;
   /// `vport-write-beats`: wide target RAM rows written beat by beat.
   bool vportWriteBeats = false;
   /// `vmem-fold-on-engines`: streamed folded stores on page engines too.
@@ -6194,6 +6194,44 @@ LogicalResult StaticFolder::assignPageEngines() {
           continue;
         }
         unsigned e = 0, d = 0;
+        // `vport-share`: of the ports with its positions free and room for
+        // its beats (R and W each, within vportShare % of a frame's host
+        // cycles: a beat a cycle; a copy ring's prefetches read, its copies
+        // write), the one whose row grows least (a port costs ~0.8 LUT a row
+        // bit: widening one is cheaper than a new one), the first of those.
+        if (vportEngines && vportShare) {
+          unsigned beats = (vm.dataWidth + 511) / 512;
+          uint64_t addR = uint64_t(at.size() + prefAt.size()) * beats;
+          uint64_t addW = uint64_t(at.size() + (copyRing ? at.size() : 0)) * beats;
+          uint64_t cap = uint64_t(ii) * vportShare / 100;
+          unsigned bestE = pageEngines.size(), bestD = 0, bestShift = 0, bestGrow = ~0u;
+          for (unsigned e2 = 0; e2 < pageEngines.size(); ++e2) {
+            auto &eng = pageEngines[e2];
+            if (!own(e2))
+              continue;
+            uint64_t r = 0, w = 0;
+            for (auto &[name, width, nr, nw] : eng.traffic) {
+              r += nr * ((width + 511) / 512);
+              w += nw * ((width + 511) / 512);
+            }
+            if (r + addR > cap || w + addW > cap)
+              continue;
+            unsigned grow = vm.dataWidth > eng.writeWidth ? vm.dataWidth - eng.writeWidth : 0;
+            if (grow >= bestGrow)
+              continue;
+            unsigned d2 = 0;
+            bool found = false;
+            for (unsigned t = 0; t <= most && !found; ++t) {
+              d2 = t < most ? t + 1 : 0;
+              found = freeAt(eng, d2);
+            }
+            if (found)
+              bestE = e2, bestD = d2, bestShift = shift, bestGrow = grow;
+          }
+          e = bestE;
+          d = bestD;
+          shift = bestShift;
+        } else
         for (; e < pageEngines.size(); ++e) {
           auto &eng = pageEngines[e];
           if (!own(e))
@@ -27605,6 +27643,7 @@ void FoldStaticPass::runOnOperation() {
   folder.vportEngines = vportEngines;
   folder.vportFS = vportFenceShift;
   folder.vportHz = vportHz;
+  folder.vportShare = vportShare;
   folder.vportCopy = vportCopy;
   folder.vportWriteBeats = vportWriteBeats;
   folder.vmemFoldEngines = vmemFoldEngines;

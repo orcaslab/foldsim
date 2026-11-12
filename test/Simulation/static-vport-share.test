@@ -1,0 +1,36 @@
+# REQUIRES: verilator
+# Port sharing by cost (--vport-share PCT): two classes' target RAMs, Narrow's
+# 16 x 8 and Wide's 8 x 600 (two beats), at different positions. First fit
+# gives Wide a port of its own (no port of rows at least as wide); with
+# vport-share the narrow port takes it, its rows widened to 600 bits (a wider
+# row costs less than a new port), its beats within PCT % of the frame. A cap
+# below the members' beats keeps them apart. Against the target from zero state
+# (tb_vmem_multi.sv, a real foldsim_vport on vport_axi_model.sv), 1 to 600 host
+# cycles, stalls, bubbles; also with ring copies on the shared port.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vport_share
+# RUN: foldsim --srcs top.f --top Top --out %t/ff --static --modulo --min-ii 160 --virtual-memories '(Narrow|Wide):.*' --page-engines 16 --vmem-on-engines --vport-engines --vport-hz 8 Narrow Wide > %t/ff.log 2>&1
+# RUN: FileCheck %s --check-prefix=FF < %t/ff/foldsim_sim.vh
+# RUN: foldsim --srcs top.f --top Top --out %t/cap --static --modulo --min-ii 160 --virtual-memories '(Narrow|Wide):.*' --page-engines 16 --vmem-on-engines --vport-engines --vport-hz 8 --vport-share 1 Narrow Wide > %t/cap.log 2>&1
+# RUN: FileCheck %s --check-prefix=FF < %t/cap/foldsim_sim.vh
+# RUN: foldsim --srcs top.f --top Top --out %t/s --static --modulo --bubbles --min-ii 160 --virtual-memories '(Narrow|Wide):.*' --page-engines 16 --vmem-on-engines --vport-engines --vport-hz 8 --vport-share 75 Narrow Wide > %t/s.log 2>&1
+# RUN: FileCheck %s --check-prefix=SH < %t/s/foldsim_sim.vh
+# RUN: python3 %S/Inputs/vmem_bind.py %t/s/foldsim_sim.json %t/s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/s -Mdir %t/s/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/s/foldsim_sim.sv > %t/s/build.log 2>&1
+# RUN: %t/s/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/s/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RUN: %t/s/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=600 +bubble=90 +burst=8 +stall=20 | FileCheck %s
+# RUN: %t/s/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=20 +hi=600 +full=80 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/c --static --modulo --bubbles --min-ii 160 --virtual-memories '(Narrow|Wide):.*' --vmem-rings 16 --page-engines 16 --vmem-on-engines --vport-engines --vport-hz 8 --vport-copy --vport-share 75 Narrow Wide > %t/c.log 2>&1
+# RUN: FileCheck %s --check-prefix=SC < %t/c/foldsim_sim.vh
+# RUN: python3 %S/Inputs/vmem_bind.py %t/c/foldsim_sim.json %t/c
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/c -Mdir %t/c/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/c/foldsim_sim.sv > %t/c/build.log 2>&1
+# RUN: %t/c/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: %t/c/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=1 +hi=600 +bubble=90 +burst=8 +stall=20 | FileCheck %s
+# FF: {{^}}`define FOLDSIM_VPORTS 2{{$}}
+# FF: {{^}}`define FOLDSIM_VPORT0_DW 8{{$}}
+# FF: {{^}}`define FOLDSIM_VPORT1_DW 600{{$}}
+# SH: {{^}}`define FOLDSIM_VPORTS 1{{$}}
+# SH-NEXT: {{^}}`define FOLDSIM_VPORT0_DW 600{{$}}
+# SC: {{^}}`define FOLDSIM_VPORTS 1{{$}}
+# SC: {{^}}`define FOLDSIM_VPORT0_COPY 1{{$}}
+# CHECK: {{^}}MATCH 196 cycles

@@ -497,6 +497,8 @@ def frame_options(a):
             fold += f' vport-fence-shift={a.vport_fence_shift}'
         if a.vport_hz:
             fold += f' vport-hz={a.vport_hz}'
+        if a.vport_share:
+            fold += f' vport-share={a.vport_share}'
         if a.vport_copy:
             fold += ' vport-copy'
         if a.vport_write_beats:
@@ -1869,6 +1871,10 @@ def build_parser():
                     help='with --vport-engines, --vmem-on-engines, --vmem-stagger and --vport-hz: target RAM rows '
                          'wider than a 512-bit beat written beat by beat at successive positions (one-beat port '
                          'write rows; foldsim-fold-static vport-write-beats)')
+    ap.add_argument('--vport-share', type=int, default=0, metavar='PCT',
+                    help='with --vport-engines and --vmem-on-engines: a target RAM on the port (positions free, its '
+                         'beats within PCT %% of a frame) whose row grows least, not the first of wide-enough rows '
+                         '(foldsim-fold-static vport-share; 0: first fit)')
     ap.add_argument('--vport-hz', type=int, default=0, metavar='N',
                     help='with --vport-engines: read after write by a 2^N-entry table of write numbers a port '
                          '(by a hash of the row) instead of fence classes (0)')

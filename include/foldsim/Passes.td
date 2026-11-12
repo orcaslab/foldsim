@@ -454,6 +454,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "member's read at its last beat), so its port's write rows are one "
            "beat; the row held in the simulator until its last beat (before "
            "the class's next pass). Reads stay whole rows. Not for copy rings">,
+    Option<"vportShare", "vport-share", "unsigned", "0",
+           "With vport-engines and vmem-on-engines: a target RAM (or copy "
+           "ring) goes on the port, of those with its positions free and its "
+           "beats within N percent of the port's R and W beats a frame, whose "
+           "row grows least (a member wider than the port's rows widens it: "
+           "cheaper than a new port), instead of the first port of rows at "
+           "least as wide; 0: first fit">,
     Option<"vportHz", "vport-hz", "unsigned", "0",
            "With vport-engines: read after write by each port's table of "
            "write numbers by a hash of the row (2^N entries; the fences "
