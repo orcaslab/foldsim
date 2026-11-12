@@ -13654,12 +13654,29 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
         // the evaluated instance's, which only its own state pass (at stage
         // P >= k) writes. A deep LUT RAM's multiplexers then end in the
         // RAM's register (or a block RAM) instead of the logic after it.
+        // (A constant is its own next value: an entry's fixed row.)
         auto isCE = [](Value r) {
-          return !r || r.getDefiningOp<seq::CompRegClockEnabledOp>();
+          return !r || r.getDefiningOp<seq::CompRegClockEnabledOp>() ||
+                 r.getDefiningOp<hw::ConstantOp>();
         };
         // (pp-sync-banks: the threaded bank read registered, from these
         // registers' next values: see kHostSyncRead.)
-        if (ppSyncBanks && isCE(addr) && isCE(en) && isCE(instReg)) {
+        if (ppSyncBanks && getenv("FOLDSIM_SYNC_DEBUG") &&
+            uint64_t(memory.getType().getDepth()) * entries > syncBankRows &&
+            !(isCE(addr) && isCE(en) && isCE(instReg))) {
+          llvm::errs() << "pp-sync-banks: " << cls.name << " " << base << " not registered: addr "
+                       << isCE(addr) << " stage " << stageAt(read.getAddress()) << " en " << isCE(en)
+                       << " inst " << isCE(instReg) << " k " << k << "; addr ";
+          if (auto *d = read.getAddress().getDefiningOp())
+            d->print(llvm::errs());
+          else
+            llvm::errs() << "argument";
+          llvm::errs() << "\n";
+        }
+        // (Only a deep read, past the row bound: a shallow bank's read is
+        // a few levels, and registered it would take a block RAM.)
+        bool deepRead = uint64_t(memory.getType().getDepth()) * entries > syncBankRows;
+        if (ppSyncBanks && deepRead && isCE(addr) && isCE(en) && isCE(instReg)) {
           bank.memory->setAttr(kHostSyncRead, UnitAttr::get(context));
           ++syncBanks;
         }
@@ -17277,7 +17294,8 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       auto read = cast<seq::FirMemReadOp>(user);
       Value data;
       if (hostSync) {
-        // pp-sync-banks: a host cycle ahead, from the registers' next values.
+        // pp-sync-banks: a host cycle ahead, from the registers' next values
+        // (a constant address its own).
         auto nextOf = [&](Value r) -> Value {
           auto ce = r ? r.getDefiningOp<seq::CompRegClockEnabledOp>() : nullptr;
           return ce ? Value(comb::MuxOp::create(b, ce.getClockEnable(), ce.getInput(), r)) : r;

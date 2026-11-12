@@ -1,6 +1,6 @@
 // REQUIRES: verilator
-// pp-sync-banks (state-in-ram-pp): a memory read combinationally and banked past
-// state-in-ram-pp-fanout (each bank's address, enable and instance clock-enabled registers loaded
+// pp-sync-banks (state-in-ram-pp): a deep memory (threaded rows past 1,024) read combinationally and banked
+// past state-in-ram-pp-fanout (each bank's address, enable and instance clock-enabled registers loaded
 // at the stage before the read) is threaded as a registered read of those registers' next values
 // (the register's input where it loads, else its own value): its data a host cycle later is what
 // the combinational read of the registers gave, so the threaded store's multiplexers (entries x
@@ -11,22 +11,27 @@
 // themselves a host cycle late (a mutation) mismatches at cycle 9.
 // RUN: rm -rf %t && mkdir -p %t
 // RUN: firtool --format=mlir %S/Inputs/pp_model.mlir -o %t/target.sv
-// RUN: mkdir -p %t/a && env FOLDSIM_PP_ROWS=balanced foldsim-opt %S/Inputs/pp_model.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top state-in-ram=Model::4 state-in-ram-pp state-in-ram-pp-fanout=1 pp-sync-banks})" -o %t/a/sim.mlir 2> %t/a/fold.log
+// RUN: mkdir -p %t/a && env FOLDSIM_SYNC_BANK_ROWS=16 FOLDSIM_PP_ROWS=balanced foldsim-opt %S/Inputs/pp_model.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top state-in-ram=Model::4 state-in-ram-pp state-in-ram-pp-fanout=1 pp-sync-banks})" -o %t/a/sim.mlir 2> %t/a/fold.log
 // RUN: FileCheck %s --check-prefix=LOG < %t/a/fold.log
 // RUN: FileCheck %s --check-prefix=SIM < %t/a/sim.mlir
 // RUN: firtool --format=mlir %t/a/sim.mlir -o %t/a/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/a/obj %S/Inputs/tb_fold.sv %S/Inputs/xbox.sv %t/target.sv %t/a/sim.sv > %t/a/build.log 2>&1
 // RUN: %t/a/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 | FileCheck %s
 // RUN: %t/a/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 | FileCheck %s
-// RUN: mkdir -p %t/c2 && env FOLDSIM_PP_ROWS=balanced foldsim-opt %S/Inputs/pp_model.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top copies=Model:2 state-in-ram=Model::4 state-in-ram-pp state-in-ram-pp-fanout=1 pp-sync-banks})" -o %t/c2/sim.mlir 2> %t/c2/fold.log
+// RUN: mkdir -p %t/c2 && env FOLDSIM_SYNC_BANK_ROWS=8 FOLDSIM_PP_ROWS=balanced foldsim-opt %S/Inputs/pp_model.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top copies=Model:2 state-in-ram=Model::4 state-in-ram-pp state-in-ram-pp-fanout=1 pp-sync-banks})" -o %t/c2/sim.mlir 2> %t/c2/fold.log
 // RUN: FileCheck %s --check-prefix=LOG < %t/c2/fold.log
 // RUN: firtool --format=mlir %t/c2/sim.mlir -o %t/c2/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/c2/obj %S/Inputs/tb_fold.sv %S/Inputs/xbox.sv %t/target.sv %t/c2/sim.sv > %t/c2/build.log 2>&1
 // RUN: %t/c2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 | FileCheck %s
 // RUN: %t/c2/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 | FileCheck %s
-// A memory banked for its threaded rows alone (past the row bound; FOLDSIM_SYNC_BANK_ROWS=16 here,
+// Only a deep read is registered (threaded rows past the bound, 1,024 by default; FOLDSIM_SYNC_BANK_ROWS=16 / 8
+// above): at the default bound these shallow banks stay combinational (a registered shallow bank would
+// only move LUT RAM into block RAM).
+// RUN: mkdir -p %t/s && env FOLDSIM_PP_ROWS=balanced foldsim-opt %S/Inputs/pp_model.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top state-in-ram=Model::4 state-in-ram-pp state-in-ram-pp-fanout=1 pp-sync-banks})" -o %t/s/sim.mlir 2> %t/s/fold.log
+// RUN: FileCheck %s --check-prefix=SLOG < %t/s/fold.log
+// A memory banked for its threaded rows alone (past the row bound; FOLDSIM_SYNC_BANK_ROWS=8 here,
 // 1,024 by default), at the default fanout: one bank, registered; exact.
-// RUN: mkdir -p %t/d && env FOLDSIM_SYNC_BANK_ROWS=16 FOLDSIM_PP_ROWS=balanced foldsim-opt %S/Inputs/pp_model.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top copies=Model:2 state-in-ram=Model::4 state-in-ram-pp pp-sync-banks})" -o %t/d/sim.mlir 2> %t/d/fold.log
+// RUN: mkdir -p %t/d && env FOLDSIM_SYNC_BANK_ROWS=8 FOLDSIM_PP_ROWS=balanced foldsim-opt %S/Inputs/pp_model.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=Model netlist},foldsim-fold-static{module=Top copies=Model:2 state-in-ram=Model::4 state-in-ram-pp pp-sync-banks})" -o %t/d/sim.mlir 2> %t/d/fold.log
 // RUN: FileCheck %s --check-prefix=DLOG < %t/d/fold.log
 // RUN: firtool --format=mlir %t/d/sim.mlir -o %t/d/sim.sv
 // RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/d/obj %S/Inputs/tb_fold.sv %S/Inputs/xbox.sv %t/target.sv %t/d/sim.sv > %t/d/build.log 2>&1
@@ -35,6 +40,7 @@
 
 // CHECK: {{^}}MATCH 4 outputs x 88 cycles
 // LOG: state-in-ram-pp: Model: P 4, {{.*}} 1 banked reads, 16 bank address copies (16 registered reads, pp-sync-banks)
+// SLOG: state-in-ram-pp: Model: P 4, {{.*}} 1 banked reads, 16 bank address copies (0 registered reads, pp-sync-banks)
 // DLOG: state-in-ram-pp: Model: P 4, {{.*}} 1 banked reads, 1 bank address copies (1 registered reads, pp-sync-banks)
 // SIM: %ram = seq.firmem 1, 1, old, undefined : <32 x 1>
 // SIM: seq.firmem.read_port %ram{{(_[0-9]+)?}}[{{.*}}], clock %hostClock
