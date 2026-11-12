@@ -1607,6 +1607,18 @@ def write_vmem_engines(sv, info, path, mode, master_bits, names=None):
     if mode not in ('local', 'auto') or not info.get('vmem'):
         return []
     at = vmem_engine_groups(sv)
+    # A memory whose ports the simulator merges before they leave (vmem groups: a group's
+    # members ORed onto one port) is not wired to one SLR group's port: its class copy's
+    # group, from the schedule report's `slr<g> (<sites> sites): <classes>` lines.
+    of_class = {}
+    sched = os.path.join(os.path.dirname(path), 'schedule.txt')
+    if os.path.exists(sched):
+        for m in re.finditer(r'^\s+slr(\d+) \(\d+ sites\): (.*)$', open(sched).read(), re.M):
+            for c in m.group(2).split():
+                of_class.setdefault(c, f'foldsim_slr{m.group(1)}')
+    for k, v in enumerate(info['vmem']):
+        if k not in at and v.get('class') in of_class:
+            at[k] = of_class[v['class']]
     bits = lambda v: 2 * v['data_width'] + v['row_width'] + v['inst_width']
     if info.get('vmem_groups'):
         ctrls = [(f'.*/g_vg{g}[./](g_vp[./])?(vmem|group|vport)$', x['members'],
