@@ -264,15 +264,18 @@ KERNEL = {}
 
 def ctl_scaled(path, k):
     """The netlist's controllers (foldsim_degree.read_built: foldsim_storage.ctl_cost) at the kernel fit's
-    synthesized scales: `ctl_lut_scale` by kind (vmem of one memory, vmem_group of several, engine) for logic
-    and LUTRAM, `ctl_bram_scale` for RAMB36."""
+    synthesized scales: `ctl_lut_scale` by kind (vmem of one memory, vmem_group of several, engine; a static
+    port `vport`, else engine's) for logic and LUTRAM, `ctl_bram_scale` for RAMB36."""
     j = json.load(open(path))
     sizes = [g.get('size') or len(g.get('members', [])) or 1 for g in j['vmem_groups']] if j.get('vmem_groups') \
         else [1] * len(j.get('vmem', []))
+    sizes += [1] * len(j.get('vports') or [])   # (static ports: read_built lists them last; scale `vport`, else engine's)
     sc = k['ctl_lut_scale']
     out = []
     for c, n in zip(foldsim_degree.read_built(path)['controllers'], sizes):
-        key = 'engine' if c['kind'] == 'engine' else ('vmem_group' if n > 1 else 'vmem')
+        key = c['kind'] if c['kind'] in ('engine', 'vport') else ('vmem_group' if n > 1 else 'vmem')
+        if key == 'vport' and isinstance(sc, dict) and 'vport' not in sc:
+            key = 'engine'
         f = sc.get(key, sc.get('vmem', 1.0)) if isinstance(sc, dict) else sc
         out.append(dict(c, logic=c['logic'] * f, lutram=c['lutram'] * f, bram=c['bram'] * k.get('ctl_bram_scale', 1.0)))
     return out
@@ -627,11 +630,15 @@ def vmem_controllers(gdir, stext=''):
             engines[f'__pages{mm.group(1)}'] = dict(w)
     def members(cls):
         return engines.get(cls) or {cls: 1.0}
+    # Static ports (vport-engines): port p is page engine p's, controllers after the memories' (as the kernel and
+    # read_built number them), its bits 2 DW + OW (flow/v80/vmem_ports.py port_bits).
+    ports = [dict(name=f'P{p}', cls=f'__pages{p}', members=members(f'__pages{p}'), port_bits=2 * v['DW'] + v['OW'])
+             for p, v in enumerate(j.get('vports') or [])]
     if j.get('vmem_groups'):
         return [dict(name=f'G{g}', cls=x['class'], members=members(x['class']),
-                     port_bits=sum(bits(vm[k]) for k in x['members'])) for g, x in enumerate(j['vmem_groups'])]
+                     port_bits=sum(bits(vm[k]) for k in x['members'])) for g, x in enumerate(j['vmem_groups'])] + ports
     return [dict(name=str(k), cls=v['class'], members=members(v['class']), port_bits=bits(v))
-            for k, v in enumerate(vm)]
+            for k, v in enumerate(vm)] + ports
 
 
 # --vmem-engines: where each controller (its engine) sits. placer (default) and auto: where it crosses the fewest

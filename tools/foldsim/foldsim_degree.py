@@ -442,6 +442,15 @@ def read_built(path):
         out['counts'][kind] = out['counts'].get(kind, 0) + 1
         for key in ('logic', 'lutram', 'bram'):
             out[key] += x[key]
+    # Static ports (vport-engines: foldsim_sim.json `vports`, after the controllers above in this order): each a
+    # foldsim_vport in the kernel, priced as a page engine's controller of its row width (kind 'vport'; no fit of
+    # its own yet, and an engine's carries the drop-in controller too: an upper bound).
+    for v in j.get('vports') or []:
+        x = storage.ctl_cost('engine', v['DW'])
+        out['controllers'].append(dict(kind='vport', dw=v['DW'], cache_rows=0, **x))
+        out['counts']['vport'] = out['counts'].get('vport', 0) + 1
+        for key in ('logic', 'lutram', 'bram'):
+            out[key] += x[key]
     storage.CTL_FORWARD = save
     return out
 

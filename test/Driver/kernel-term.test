@@ -4,10 +4,15 @@
 # times the synthesized scale of their kind for the current controller RTL (vmem 1.60, a vmem group 2.44, a page engine
 # 0.77; RAMB36 1.08): the 5 calibration builds' measured controllers carried to C1's RTL by the yosys proxy and anchored
 # on the A100-32 netlists' own controllers (foldsim_v80_slr.json kernel.about). A region without the fit keeps the flat
-# 11-07 term.
+# 11-07 term. Static ports (vport-engines, foldsim_sim.json `vports`; 11-12 a32-S64c: the fit gate counted none of
+# y64c1's 95) count as controllers after the memories': a page engine's controller of the row width at the engine
+# scale (no fit of their own: an upper bound), and in the SLR check's placement as page engine p's (2 DW + OW bits).
 # RUN: rm -rf %t && mkdir -p %t
 # RUN: python3 %S/Inputs/kernel-term/kernel.py %foldsim_tools %t | FileCheck %s
 # CHECK: scales {'engine': 0.77, 'vmem': 1.6, 'vmem_group': 2.44} 1.08
 # CHECK-NEXT: fold {'base': 4200, 'folded memory endpoint': 94600, '3 controllers': 9819, 'controller RAMB36': 0} 108619 0.0
 # CHECK-NEXT: ports {'base': 4200, '4 memory port endpoints': 122400, '0 controllers': 0, 'controller RAMB36': 0} 126600 0
+# CHECK-NEXT: vports {'base': 4200, 'folded memory endpoint': 94600, '3 controllers': 11402, 'controller RAMB36': 0} 110202 0.0
 # CHECK-NEXT: flat 155000 65000
+# CHECK-NEXT: vport ctrls [('0', 'B', 140, [('B', 1.0)]), ('P0', '__pages0', 883, [('__pages0', 1.0)]), ('P1', '__pages1', 5465, [('C', 1.0), ('D', 0.5), ('E', 0.5)])]
+# CHECK-NEXT: vport term = engine scale x ctl_cost True
