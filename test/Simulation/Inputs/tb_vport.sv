@@ -16,7 +16,7 @@
 // mismatches.
 `timescale 1ns/1ps
 module tb;
-    parameter IW = 3, AW = 4, DW = 1040, QUEUE = 16, OUTSTANDING = 16, WRITES_OUT = 8, CYCLES = 30000, FS = 4;
+    parameter IW = 3, AW = 4, DW = 1040, QUEUE = 16, OUTSTANDING = 16, WRITES_OUT = 8, CYCLES = 30000, FS = 4, HZ = 0;
     localparam INST = 1 << IW, ROWS = 1 << AW, MW = DW / 8;
     localparam BEATS = (DW + 511) / 512, LW = (BEATS > 1) ? $clog2(BEATS) : 1;
     localparam FW = $clog2(QUEUE + 1), OW = 20, TW = IW, FCW = 4;
@@ -47,7 +47,7 @@ module tb;
     reg [511:0] m_rdata = 0;
 
     foldsim_vport #(.DW(DW), .MW(MW), .TW(TW), .OW(OW), .QUEUE(QUEUE), .OUTSTANDING(OUTSTANDING),
-        .WRITES_OUT(WRITES_OUT), .FCLASSES(16), .FS(FS)) dut (
+        .WRITES_OUT(WRITES_OUT), .FCLASSES(16), .FS(FS), .HZ(HZ)) dut (
         .clk(clk), .reset(reset),
         .rd_valid(rd_valid), .rd_addr(rd_addr), .rd_len(rd_len), .rd_tag(rd_tag), .rd_fence(rd_fence),
         .wr_valid(wr_valid), .wr_addr(wr_addr), .wr_len(wr_len), .wr_pair(wr_pair), .wr_data(wr_data), .wr_mask(wr_mask),

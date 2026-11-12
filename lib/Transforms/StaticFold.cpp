@@ -873,6 +873,8 @@ public:
   uint64_t vmemAutoBits = 0;
   /// `vmem-auto-instance-bits`: by one instance's image instead.
   uint64_t vmemAutoInstanceBits = 0;
+  /// `vmem-cost`: a picked memory stays on chip where that is cheaper.
+  bool vmemCost = false;
   /// A memory of `depth` x `width` in a class of `threads` instances is a
   /// virtual memory by size (vmem-auto-bits / vmem-auto-instance-bits).
   bool vmemBySize(uint64_t depth, uint64_t width, unsigned threads) const {
@@ -13757,6 +13759,24 @@ static unsigned ppChunkMoveBits(unsigned n) {
   return std::max(32u, unsigned(llvm::PowerOf2Ceil(n * 72)));
 }
 
+/// `vmem-cost`: the LUTs of a memory of `threads` instances as a virtual
+/// memory (its row on a port select at the level's 0.73 scale, a read ring
+/// of 16 entries in LUTRAM, its ring and request control) against its threaded
+/// image kept on chip (LUTRAM up to 64 rows an instance, else block RAM: no
+/// LUTs, so only where its RAMB36 stay under one a bit-row of LUTs). True:
+/// keep it on chip.
+static bool vmemOnChipCheaper(uint64_t depth, unsigned width, unsigned threads,
+                              uint64_t &memberLut, uint64_t &chipLut) {
+  memberLut = uint64_t(0.73 * width / 3) + 8 * ((width + 13) / 14) + 150;
+  uint64_t entries = uint64_t(threads) * depth;
+  if (depth > 64) {
+    chipLut = ~uint64_t(0);
+    return false;
+  }
+  chipLut = 8 * ((width + 13) / 14) * ((entries + 31) / 32);
+  return chipLut < memberLut;
+}
+
 /// `vmem-auto-bits`' form rule: a registered read, one read port, at most one
 /// write port, mask lanes that divide the row. (buildCopy also asks for the
 /// state gap, which minStateGap gives such a memory.)
@@ -15580,6 +15600,13 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
           autoKeptBits += image;
           continue;
         }
+        if (vmemCost) {
+          uint64_t ml = 0, cl = 0;
+          if (vmemOnChipCheaper(type.getDepth(), type.getWidth(), threads, ml, cl)) {
+            llvm::errs() << "foldsim-fold-static: vmem-cost: " << cls.name << ":" << memName << " kept on chip (" << cl << " LUT < " << ml << " as a virtual memory)\n";
+            continue;
+          }
+        }
         // A storage rule naming it is overridden (and so used).
         storageFor(cls, memName, /*reg=*/false, type.getWidth());
         candidates.push_back(memory);
@@ -15614,6 +15641,13 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       // than whole bytes is padded to them (laneBits).
       if (maskWidth > 1 && width % maskWidth)
         return memory.emitError("a virtual memory's mask lanes are not equal");
+      if (vmemCost) {
+        uint64_t ml = 0, cl = 0;
+        if (vmemOnChipCheaper(type.getDepth(), width, threads, ml, cl)) {
+          llvm::errs() << "foldsim-fold-static: vmem-cost: " << cls.name << ":" << memName << " kept on chip (" << cl << " LUT < " << ml << " as a virtual memory)\n";
+          continue;
+        }
+      }
       candidates.push_back(memory);
     }
   }
@@ -26143,6 +26177,7 @@ void FoldStaticPass::runOnOperation() {
   }
   folder.vmemAutoBits = vmemAutoBits;
   folder.vmemAutoInstanceBits = vmemAutoInstanceBits;
+  folder.vmemCost = vmemCost;
   folder.vmemRingLead = vmemRings;
   folder.foldRingLead = foldStoreRings;
   folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));

@@ -20,6 +20,10 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=64 -GCYCLES=12000 -Mdir %t/narrow %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/narrow.log 2>&1
 # RUN: %t/narrow/Vtb +verilator+seed+6 +hi=20 +far=1 +stall=30 | FileCheck %s
 # RUN: %t/narrow/Vtb +verilator+seed+7 +hi=600 +stall=10 +resets=2 | FileCheck %s
+# Row buckets (HZ 3: 8 buckets, so rows share them) in place of fence classes.
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=1040 -GHZ=3 -GCYCLES=12000 -Mdir %t/hz %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/hz.log 2>&1
+# RUN: %t/hz/Vtb +verilator+seed+8 +hi=600 +stall=20 +resets=2 | FileCheck %s
+# RUN: %t/hz/Vtb +verilator+seed+9 +hi=40 | FileCheck %s
 # CHECK-NOT: FAIL
 # CHECK-NOT: %Error
 # CHECK: {{[0-9]+}} reads ({{[0-9]+}} answered), {{[0-9]+}} writes

@@ -445,6 +445,7 @@ module foldsim_afu #(
             .WRITES_OUT     (VMEM_WRITES_OUT), \
             .INSTANCES      (`FOLDSIM_VMEM_``k``_INSTANCES), \
             .KNOWN_ZERO     (VMEM_KNOWN_ZERO & `FOLDSIM_VMEM_KZ(k)), \
+            .KZ_SHIFT       (`FOLDSIM_VMEM_KZS(k)), \
             .ROW_BYTES      (`FOLDSIM_VMEM_RB(k)) \
         ) vport_``k ( \
             .clk       (ap_clk), \
@@ -658,6 +659,7 @@ module foldsim_afu #(
             .WRITES_OUT     (VMEM_WRITES_OUT), \
             .INSTANCES      (VG``g``_IN), \
             .KNOWN_ZERO     (VMEM_KNOWN_ZERO & `FOLDSIM_VMEM_KZ(g)), \
+            .KZ_SHIFT       (`FOLDSIM_VMEM_KZS(g)), \
             .ROW_BYTES      (`FOLDSIM_VMEM_RB(g)) \
         ) vport ( \
             .clk       (ap_clk), \

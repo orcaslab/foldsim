@@ -13,7 +13,7 @@
 `timescale 1ns/1ps
 module tb;
     parameter IW = 3, AW = 4, DW = 1040, MW = 1, RDW_READ_FIRST = 1, QUEUE = 16, OUTSTANDING = 16,
-              CACHE_ROWS = 0, KNOWN_ZERO = 0, FORWARD = 0, WRITES_OUT = 8, ROW_BYTES = 0, CYCLES = 30000;
+              CACHE_ROWS = 0, KNOWN_ZERO = 0, FORWARD = 0, WRITES_OUT = 8, ROW_BYTES = 0, CYCLES = 30000, KZ_SHIFT = 0;
     localparam INST = 1 << IW, ROWS = 1 << AW, DB = (DW + 7) / 8 * 8, BYTES = DB / 8;
     localparam RB = ROW_BYTES ? ROW_BYTES : ((BYTES > 64) ? (1 << $clog2(BYTES)) : 64);
     localparam FW = $clog2(QUEUE + 1), GROUP = BYTES / MW;
@@ -48,7 +48,7 @@ module tb;
     foldsim_vmem #(.IW(IW),
 `endif .AW(AW), .DW(DW), .MW(MW), .RDW_READ_FIRST(RDW_READ_FIRST), .QUEUE(QUEUE), .AXI_ID_W(1),
         .OUTSTANDING(OUTSTANDING), .INSTANCES(INST), .CACHE_ROWS(CACHE_ROWS), .KNOWN_ZERO(KNOWN_ZERO), .ROW_BYTES(RB),
-        .WRITES_OUT(WRITES_OUT), .FORWARD(FORWARD)) dut (
+        .WRITES_OUT(WRITES_OUT), .FORWARD(FORWARD), .KZ_SHIFT(KZ_SHIFT)) dut (
         .clk(clk), .reset(reset), .rd_valid(rd_valid), .rd_inst(rd_inst), .rd_row(rd_row), .wr_valid(wr_valid),
         .wr_inst(wr_inst), .wr_row(wr_row), .wr_data(wr_data), .wr_mask(wr_mask), .rsp_valid(rsp_valid),
         .rsp_inst(rsp_inst), .rsp_data(rsp_data), .free(free), .base(64'h1000_0000), .zero(1'b1), .move(1'b0),

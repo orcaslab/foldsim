@@ -405,6 +405,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "its state pass and keeps each instance's read data from the "
            "responses; a slot whose instance's read has not been answered "
            "waits in a bubble, so the target's cycles never change">,
+    Option<"vmemCost", "vmem-cost", "bool", "false",
+           "A memory the virtual-memory rules pick (pattern or size) stays a "
+           "virtual memory only where that costs fewer LUTs than keeping its "
+           "threaded image on chip in the copy: a member's select leaves (a "
+           "third of a LUT a bit of its row, at the fit's level scale), its "
+           "read ring (a row of LUTRAM per 32 entries) and its control, "
+           "against the image in LUTRAM (instances x rows <= 64 entries a "
+           "LUT6 column, 8 LUTs per 32 x 14 bits) or block RAM; the choices "
+           "in the report">,
     Option<"vmemMergeLanes", "vmem-merge-lanes", "bool", "false",
            "With virtual-memories, the arrays a front end split from one "
            "target RAM (byte lanes, ways: the same depth, read-during-write "

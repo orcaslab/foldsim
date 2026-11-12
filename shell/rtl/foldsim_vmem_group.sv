@@ -428,6 +428,7 @@ module foldsim_vmem_group #(
         .OUTSTANDING    (OUTSTANDING),
         .INSTANCES      (INSTANCES),
         .KNOWN_ZERO     (KNOWN_ZERO),
+        .KZ_SHIFT       (KZ_SHIFT),
         .ROW_BYTES      (ROW_BYTES),
         .TAGW           (TW),
         .WRITES_OUT     (WRITES_OUT),

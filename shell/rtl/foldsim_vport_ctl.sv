@@ -16,7 +16,7 @@
 // vport): the same parameters (those of a host cache, forwarding and the
 // hazard table are accepted and unused) and the same guarantees per
 // (tag, instance, row) -- a read observes every earlier write of its row
-// (fence class 0: every write taken before it has its B), a read-first
+// (it waits for the B of every earlier write in its row's bucket, HZ), a read-first
 // pair's read the row before its write (the write waits for the read), a
 // write-first pair's read the row after it (the read waits for the write's
 // B); answers tagged with the instance, here in request order.
@@ -46,16 +46,22 @@ module foldsim_vport_ctl #(
     parameter INSTANCES      = 1 << IW,
     /* verilator lint_off UNUSEDPARAM */
     parameter CACHE_ROWS     = 0,
-    parameter KZ_SHIFT       = 0,
     parameter HAZARD_BITS    = 8,
     parameter SEQ_W          = 16,
     parameter FORWARD        = 1,
     /* verilator lint_on UNUSEDPARAM */
     parameter KNOWN_ZERO     = 1,
+    // Known-zero blocks (KNOWN_ZERO): a bit per block of 2^KZ_SHIFT rows of
+    // the image (row * INSTANCES + inst) says whether a write took it since
+    // the reset; while `zero` is high a read of an untouched block is
+    // answered zero on chip (no memory read), as foldsim_vmem's bits do.
+    parameter KZ_SHIFT       = 0,
     parameter ROW_BYTES      = (((DW + 7) / 8) > 64) ? (1 << $clog2((DW + 7) / 8)) : 64,
     parameter TAGW           = 0,
     parameter WRITES_OUT     = 128,
     parameter TELEMETRY      = 1,
+    // Read-after-write by 2^HZ row buckets (foldsim_vport HZ), not every earlier write.
+    parameter HZ             = 6,
     // The image's bytes (the zero fill's extent; the compiler's, from
     // foldsim_sim.json: its rows times INSTANCES times ROW_BYTES).
     parameter longint BYTES  = 0,
@@ -143,10 +149,20 @@ module foldsim_vport_ctl #(
             offset_of = OW'((OW'(row) * OW'(INSTANCES) + OW'(inst)) << (RB - 6));
     endfunction
 
-    // Inputs registered (the multiply, where INSTANCES is not a power of two,
-    // has its cycle); a read and a write of one row of one instance in a
-    // host cycle are a pair.
+    // Inputs registered twice (q: the multiply, where INSTANCES is not a
+    // power of two, and the known-zero lookup; q2: the decision), a read and
+    // its pair's write together; a read and a write of one row of one
+    // instance in a host cycle are a pair.
+    localparam LWID  = AW + KB;                  // a row's index in the image
+    localparam KZB   = (KNOWN_ZERO != 0) ? ((LWID > KZ_SHIFT) ? LWID - KZ_SHIFT : 1) : 1;
+    function automatic [LWID-1:0] index_of(input [AW-1:0] row, input [IW-1:0] inst);
+        if (POW2 != 0)
+            index_of = (LWID'(row) << KB) | (LWID'(inst) & LWID'(INSTANCES - 1));
+        else
+            index_of = LWID'(LWID'(row) * LWID'(INSTANCES) + LWID'(inst));
+    endfunction
     reg            q_rd, q_wr, q_pair;
+    reg  [KZB-1:0] q_rblk, q_wblk;
     reg  [OW-1:0]  q_raddr, q_waddr;
     reg  [IT-1:0]  q_rtag;
     reg  [DW-1:0]  q_wdata;
@@ -156,6 +172,8 @@ module foldsim_vport_ctl #(
         q_wr    <= wr_valid && !reset;
         q_pair  <= rd_valid && wr_valid && rd_inst == wr_inst && rd_row == wr_row;
         q_raddr <= offset_of(rd_row, rd_inst[IW-1:0]);
+        q_rblk  <= KZB'(index_of(rd_row, rd_inst[IW-1:0]) >> KZ_SHIFT);
+        q_wblk  <= KZB'(index_of(wr_row, wr_inst[IW-1:0]) >> KZ_SHIFT);
         q_waddr <= offset_of(wr_row, wr_inst[IW-1:0]);
         q_rtag  <= rd_inst;
         q_wdata <= wr_data;
@@ -171,15 +189,65 @@ module foldsim_vport_ctl #(
     wire [511:0]   p_rsp_data;
     wire           busy;
 
+    // ---- Known-zero blocks: looked up at the input register, the read
+    // decided a host cycle later (q2): an untouched block (and `zero`) is
+    // answered on chip, else the read goes to the port. A write sets its
+    // block's bit as it is taken; the bits are cleared after a reset or a
+    // move, a block a host cycle, while the room stays 0.
+    localparam KZ    = (KNOWN_ZERO != 0) ? 1 : 0;
+    localparam NBLK  = 1 << KZB;
+    reg            kz_bits [NBLK];
+    reg            kz_hit;                   // the q read's block untouched
+    reg            q2_rd, q2_new, q2_wr, q2_pair;
+    reg  [OW-1:0]  q2_waddr;
+    reg  [DW-1:0]  q2_wdata;
+    reg  [MW-1:0]  q2_wmask;
+    reg  [OW-1:0]  q2_raddr;
+    reg  [IT-1:0]  q2_rtag;
+    reg  [KZB:0]   kz_sweep;                 // blocks left to clear (+1: busy)
+    wire           sweeping = (KZ != 0) && kz_sweep != 0;
+    always @(posedge clk) begin
+        if (KZ != 0) begin
+            kz_hit <= !kz_bits[q_rblk] && !(q_wr && q_wblk == q_rblk && RDW_READ_FIRST == 0);
+            if (sweeping)
+                kz_bits[KZB'(kz_sweep - 1'b1)] <= 1'b0;
+            else if (q_wr)
+                kz_bits[q_wblk] <= 1'b1;
+        end
+        q2_rd    <= q_rd;
+        q2_new   <= q_pair && (RDW_READ_FIRST == 0);
+        q2_wr    <= q_wr;
+        q2_pair  <= q_pair && (RDW_READ_FIRST != 0);
+        q2_waddr <= q_waddr;
+        q2_wdata <= q_wdata;
+        q2_wmask <= q_wmask;
+        q2_raddr <= q_raddr;
+        q2_rtag  <= q_rtag;
+        if (KZ != 0) begin
+            if (reset || move)
+                kz_sweep <= (KZB+1)'(NBLK);
+            else if (sweeping)
+                kz_sweep <= kz_sweep - 1'b1;
+        end
+    end
+    wire           z_ans  = (KZ != 0) && q2_rd && kz_hit && zero;
+    wire           p_rd   = q2_rd && !z_ans;
+
+    // Zero answers waiting for a cycle without the port's answer.
+    localparam ZQ  = 32;
+    reg  [IT-1:0]  zq_mem [ZQ];
+    reg  [5:0]     zq_head, zq_tail;
+    wire           zq_any = zq_head != zq_tail;
+
     foldsim_vport #(
         .DW(DB), .MW(MW), .TW(IT), .OW(OW), .QUEUE(QUEUE), .OUTSTANDING(OUTSTANDING), .WRITES_OUT(WRITES_OUT),
-        .ZERO_FILL(KNOWN_ZERO)
+        .ZERO_FILL(KNOWN_ZERO), .HZ(HZ)
     ) port (
         .clk(clk), .reset(reset),
-        .rd_valid(q_rd), .rd_addr(q_raddr), .rd_len(LW'(BEATS - 1)), .rd_tag(q_rtag), .rd_fence(4'd0),
-        .rd_new(q_pair && (RDW_READ_FIRST == 0)),
-        .wr_valid(q_wr), .wr_addr(q_waddr), .wr_len(LW'(BEATS - 1)), .wr_pair(q_pair && (RDW_READ_FIRST != 0)),
-        .wr_data(DB'(q_wdata)), .wr_mask(q_wmask),
+        .rd_valid(p_rd), .rd_addr(q2_raddr), .rd_len(LW'(BEATS - 1)), .rd_tag(q2_rtag), .rd_fence(4'd0),
+        .rd_new(q2_new),
+        .wr_valid(q2_wr), .wr_addr(q2_waddr), .wr_len(LW'(BEATS - 1)), .wr_pair(q2_pair && p_rd),
+        .wr_data(DB'(q2_wdata)), .wr_mask(q2_wmask),
         .rsp_valid(p_rsp_valid), .rsp_tag(p_rsp_tag), .rsp_beat(p_rsp_beat), .rsp_last(p_rsp_last), .rsp_data(p_rsp_data),
         .rd_free(rd_free), .wr_free(wr_free),
         .base(base), .bytes(zero ? 64'(BYTES) : 64'd0), .move(move), .busy(busy),
@@ -190,15 +258,20 @@ module foldsim_vport_ctl #(
         .m_rlast(m_rlast));
     assign m_awid = '0;
     assign m_arid = '0;
-    assign moving = busy;
+    assign moving = busy || sweeping;
 
-    // The answer's beats put together into its row.
+    // The answer's beats put together into its row; a zero answer (in a
+    // cycle without a beat, between rows) clears the row.
+    reg            mid_row;
+    wire           z_emit = zq_any && !p_rsp_valid && !mid_row;
     if (BEATS > 1) begin : g_rows
         /* verilator lint_off UNUSEDSIGNAL */
         reg [BEATS*512-1:0] row_q;
         /* verilator lint_on UNUSEDSIGNAL */
         always @(posedge clk)
-            if (p_rsp_valid)
+            if (z_emit)
+                row_q <= '0;
+            else if (p_rsp_valid)
                 row_q[32'(p_rsp_beat) * 512 +: 512] <= p_rsp_data;
         assign rsp_data = row_q[DW-1:0];
     end else begin : g_beat
@@ -206,20 +279,36 @@ module foldsim_vport_ctl #(
         reg [511:0] row_q;
         /* verilator lint_on UNUSEDSIGNAL */
         always @(posedge clk)
-            if (p_rsp_valid) row_q <= p_rsp_data;
+            if (z_emit)
+                row_q <= '0;
+            else if (p_rsp_valid)
+                row_q <= p_rsp_data;
         assign rsp_data = row_q[DW-1:0];
     end
     always @(posedge clk) begin
-        rsp_valid <= p_rsp_valid && p_rsp_last;
-        rsp_inst  <= p_rsp_tag;
+        rsp_valid <= (p_rsp_valid && p_rsp_last) || z_emit;
+        rsp_inst  <= z_emit ? zq_mem[zq_head[4:0]] : p_rsp_tag;
+        if (p_rsp_valid) mid_row <= !p_rsp_last;
+        if (z_ans) begin
+            zq_mem[zq_tail[4:0]] <= q2_rtag;
+            zq_tail <= zq_tail + 1'b1;
+        end
+        if (z_emit) zq_head <= zq_head + 1'b1;
+        if (reset) begin
+            zq_head <= zq_tail + 6'(z_ans);
+            mid_row <= 1'b0;
+        end
     end
 
     // Room: the port's, less the requests in the input register.
-    wire [FW-1:0] rd_room  = rd_free - FW'(q_rd);
-    wire [FW-1:0] wr_room  = wr_free - FW'(q_wr);
+    wire [5:0]    zq_used  = zq_tail - zq_head;
+    wire [FW-1:0] zq_room  = (KZ != 0) ? FW'(((ZQ - 32'(zq_used) - 3) < QUEUE) ? (ZQ - 32'(zq_used) - 3) : QUEUE) : FW'(QUEUE);
+    wire [FW-1:0] rd_room0 = rd_free - FW'(q_rd) - FW'(q2_rd);
+    wire [FW-1:0] rd_room  = (rd_room0 < zq_room) ? rd_room0 : zq_room;
+    wire [FW-1:0] wr_room  = wr_free - FW'(q_wr) - FW'(q2_wr);
     wire [FW-1:0] room_min = (rd_room < wr_room) ? rd_room : wr_room;
     always @(posedge clk) begin
-        if (reset)
+        if (reset || sweeping)
             free <= '0;
         else
             free <= room_min;
@@ -244,6 +333,14 @@ module foldsim_vport_ctl #(
         free = '0;
         q_rd = 1'b0;
         q_wr = 1'b0;
+        q2_rd = 1'b0;
+        q2_wr = 1'b0;
+        kz_sweep = '0;
+        kz_hit = 1'b0;
+        zq_head = '0;
+        zq_tail = '0;
+        mid_row = 1'b0;
+        for (int i = 0; i < NBLK; i++) kz_bits[i] = 1'b0;
     end
 `endif
 endmodule
