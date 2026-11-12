@@ -5939,7 +5939,7 @@ LogicalResult StaticFolder::assignPageEngines() {
                  << cls.name << ":" << vm.name << " requests twice at a position";
         // `vmem-stagger`: d positions after the pass, 0 <= d <= the class's
         // bound (a held read takes none), within the frame; the first engine
-        // with every position free at some d, the least d.
+        // with every position free at some d, the least d >= 1, else 0.
         unsigned most = vm.delayed ? 0
                                    : std::min<unsigned>(cls.staggerMax,
                                                         unsigned(std::max(int(ii) - 1 - last, 0)));
@@ -5956,13 +5956,18 @@ LogicalResult StaticFolder::assignPageEngines() {
           auto &eng = pageEngines[e];
           if (eng.readFirst != vm.readFirst || rowBytes(eng.dataWidth) != rowBytes(vm.dataWidth))
             continue;
-          for (d = 0; d <= most && !freeAt(eng, d); ++d) {
+          // (d = 1 first: a held member's fields are idle-zero registers,
+          // ORed on the engine without a select; d = 0 last.)
+          bool found = false;
+          for (unsigned t = 0; t <= most && !found; ++t) {
+            d = t < most ? t + 1 : 0;
+            found = freeAt(eng, d);
           }
-          if (d <= most)
+          if (found)
             break;
         }
         if (e == pageEngines.size())
-          d = 0;
+          d = most ? 1 : 0;
         if (e == pageEngines.size()) {
           if (e >= pageEngineCap)
             return netlist.emitError("page engines: ")
