@@ -5,25 +5,58 @@
 # write of its row would answer the old row; answers checked against a
 # reference RAM. Reads carry fence class 0 (every earlier write) or (+far)
 # class 2 for rows not written within that distance; read-first pairs (the
-# write waits for the reads taken up to its cycle). HBM latency 1 to 600 host
-# cycles, channels stalled at random, resets with requests in flight (no
-# pre-reset answer delivered, memory zero-filled before room returns); rows of
-# three beats, one beat and 64 bits.
+# write waits for the reads taken up to its cycle). HBM latency 1 to 600
+# memory cycles, channels stalled at random, resets with requests in flight
+# (no pre-reset answer delivered, memory zero-filled before room returns), a
+# reset of a region the host cleared (+clean: no fill); rows of three beats,
+# one beat and 64 bits.
 # RUN: rm -rf %t && mkdir -p %t
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=1040 -GCYCLES=12000 -Mdir %t/wide %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/wide.log 2>&1
 # RUN: %t/wide/Vtb +verilator+seed+1 +hi=1 | FileCheck %s
-# RUN: %t/wide/Vtb +verilator+seed+2 +hi=600 +stall=30 | FileCheck %s
+# RUN: %t/wide/Vtb +verilator+seed+2 +hi=600 +stall=30 +cycles=30000 | FileCheck %s
 # RUN: %t/wide/Vtb +verilator+seed+3 +hi=60 +stall=20 +resets=3 | FileCheck %s
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=512 -GCYCLES=12000 -Mdir %t/beat %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/beat.log 2>&1
 # RUN: %t/beat/Vtb +verilator+seed+4 +hi=100 +far=1 | FileCheck %s
-# RUN: %t/beat/Vtb +verilator+seed+5 +hi=600 +resets=4 | FileCheck %s
+# RUN: %t/beat/Vtb +verilator+seed+5 +hi=600 +resets=4 +cycles=30000 | FileCheck %s
+# RUN: %t/beat/Vtb +verilator+seed+15 +hi=200 +stall=10 +resets=2 +clean=1 | FileCheck %s
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=64 -GCYCLES=12000 -Mdir %t/narrow %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/narrow.log 2>&1
 # RUN: %t/narrow/Vtb +verilator+seed+6 +hi=20 +far=1 +stall=30 | FileCheck %s
-# RUN: %t/narrow/Vtb +verilator+seed+7 +hi=600 +stall=10 +resets=2 | FileCheck %s
+# RUN: %t/narrow/Vtb +verilator+seed+7 +hi=600 +stall=10 +resets=2 +cycles=30000 | FileCheck %s
 # A write-number table (HZ 3: 8 entries, so rows share them) in place of fence classes.
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=1040 -GHZ=3 -GCYCLES=12000 -Mdir %t/hz %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/hz.log 2>&1
-# RUN: %t/hz/Vtb +verilator+seed+8 +hi=600 +stall=20 +resets=2 | FileCheck %s
+# RUN: %t/hz/Vtb +verilator+seed+8 +hi=600 +stall=20 +resets=2 +cycles=30000 | FileCheck %s
 # RUN: %t/hz/Vtb +verilator+seed+9 +hi=40 | FileCheck %s
+#
+# Bursts (MAX_BURST 8) under AXI credit (4 reads / 4 writes in flight, checked
+# never exceeded): 32 instances sweep their rows so that requests follow each
+# other in memory; fewer ARs than reads (+merge) and fewer AWs than writes
+# (+wmerge); no burst over 8 beats or across a 4 KiB page; ordering exact.
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GIW=5 -GDW=512 -GCOPY=1 -GMAX_BURST=8 -GAXI_RD_OUT=4 -GAXI_WR_OUT=4 -GCYCLES=12000 -Mdir %t/merge %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/merge.log 2>&1
+# RUN: %t/merge/Vtb +verilator+seed+10 +hi=200 +seq=90 +far=1 +wr=10 +merge=1 | FileCheck %s
+# RUN: %t/merge/Vtb +verilator+seed+11 +hi=600 +seq=98 +far=1 +wr=0 +merge=1 | FileCheck %s
+# RUN: %t/merge/Vtb +verilator+seed+12 +hi=600 +seq=99 +wr=100 +far=1 +wmerge=1 | FileCheck %s
+# RUN: %t/merge/Vtb +verilator+seed+13 +hi=60 +seq=70 +stall=10 +copy=30 | FileCheck %s
+# RUN: %t/merge/Vtb +verilator+seed+14 +hi=100 +seq=60 +stall=20 +resets=3 | FileCheck %s
+#
+# The AXI side in its own clock at 256 bits (ASYNC, as on the shell's direct
+# HBM ports), clock ratios 2:1, 1:2, 2511:1777, 1:3 and 3:1, with ring copies
+# (COPY: a read's beats into the port's write queue, answered once with
+# rsp_copied; image reads with rd_after_copies see every earlier copy), bursts
+# under 16 credits, an aligned base; resets with copies in flight (the
+# unfilled ones are written with no byte enabled).
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GIW=5 -GDW=512 -GASYNC=1 -GCOPY=1 -GMAX_BURST=8 -GAXI_RD_OUT=16 -GAXI_WR_OUT=16 -GBASE_ALIGNED=1 -GOUTSTANDING=32 -GWRITES_OUT=16 -GCYCLES=12000 -Mdir %t/async %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/async.log 2>&1
+# RUN: %t/async/Vtb +verilator+seed+20 +sp=2500 +mp=1250 +hi=50 +copy=40 | FileCheck %s
+# RUN: %t/async/Vtb +verilator+seed+21 +sp=1250 +mp=2500 +hi=600 +copy=30 +stall=30 +cycles=30000 | FileCheck %s
+# RUN: %t/async/Vtb +verilator+seed+22 +sp=2511 +mp=1777 +hi=80 +copy=40 +stall=20 +resets=3 | FileCheck %s
+# RUN: %t/async/Vtb +verilator+seed+23 +sp=1000 +mp=3000 +hi=60 +copy=30 +seq=60 +stall=10 | FileCheck %s
+# RUN: %t/async/Vtb +verilator+seed+24 +sp=3000 +mp=1000 +hi=1 +stall=20 | FileCheck %s
+# RUN: %t/async/Vtb +verilator+seed+25 +sp=2500 +mp=1250 +hi=150 +copy=40 +resets=2 +clean=1 | FileCheck %s
+# Three-beat rows, a write-number table, image reads at fence class 2 (only
+# rd_after_copies orders them after the copies).
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=1040 -GASYNC=1 -GCOPY=1 -GHZ=3 -GCYCLES=12000 -Mdir %t/acopy %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/acopy.log 2>&1
+# RUN: %t/acopy/Vtb +verilator+seed+30 +sp=2500 +mp=1250 +hi=80 +copy=40 +stall=20 +resets=3 +far=1 | FileCheck %s
+# RUN: %t/acopy/Vtb +verilator+seed+31 +sp=2511 +mp=1777 +hi=60 +copy=30 +seq=60 +stall=10 +far=1 | FileCheck %s
+# RUN: %t/acopy/Vtb +verilator+seed+32 +sp=1000 +mp=3000 +hi=600 +copy=30 +stall=30 +cycles=30000 | FileCheck %s
 # CHECK-NOT: FAIL
 # CHECK-NOT: %Error
 # CHECK: {{[0-9]+}} reads ({{[0-9]+}} answered), {{[0-9]+}} writes

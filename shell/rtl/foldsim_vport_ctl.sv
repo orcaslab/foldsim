@@ -32,7 +32,7 @@
 // `zero` it behaves as foldsim_vmem without the bits. The fill is skipped
 // while the image is clean: `zero` rose (the host cleared the region and
 // said so) and no write was taken since, as on the reset a runtime gives
-// right after its clear.
+// right after its clear (the port keeps that state).
 //
 // `moving` is high from `move` until the drain ends; the new base takes
 // effect then. Telemetry: [0] reads taken, [1] writes taken, [2] reads
@@ -189,6 +189,9 @@ module foldsim_vport_ctl #(
 
     wire [FW-1:0]  rd_free, wr_free;
     wire           p_rsp_valid, p_rsp_last;
+    /* verilator lint_off UNUSEDSIGNAL */
+    wire           p_rsp_copied;         // (no copies)
+    /* verilator lint_on UNUSEDSIGNAL */
     wire [IT-1:0]  p_rsp_tag;
     /* verilator lint_off UNUSEDSIGNAL */
     wire [LW-1:0]  p_rsp_beat;            // (unused with one-beat rows)
@@ -247,15 +250,6 @@ module foldsim_vport_ctl #(
         end
     end
     wire           z_ans  = (KZ != 0) && q2_rd && kz_hit && zero;
-    // The image clean: `zero` rose since the last write taken.
-    reg            z_q, clean;
-    always @(posedge clk) begin
-        z_q <= zero;
-        if (q_wr)
-            clean <= 1'b0;
-        else if (zero && !z_q)
-            clean <= 1'b1;
-    end
     wire           p_rd   = q2_rd && !z_ans;
 
     // Zero answers waiting for a cycle without the port's answer.
@@ -268,16 +262,18 @@ module foldsim_vport_ctl #(
 
     foldsim_vport #(
         .DW(DB), .MW(MW), .TW(IT), .OW(OW), .QUEUE(QUEUE), .OUTSTANDING(OUTSTANDING), .WRITES_OUT(WRITES_OUT),
+        .AXI_RD_OUT(0), .AXI_WR_OUT(0), .MAX_BURST(1),
         .ZERO_FILL(KNOWN_ZERO), .HZ((HZ < AW + KB) ? HZ : AW + KB), .KS(RB - 6)
     ) port (
         .clk(clk), .reset(reset),
         .rd_valid(p_rd), .rd_addr(q2_raddr), .rd_len(LW'(BEATS - 1)), .rd_tag(q2_rtag), .rd_fence(4'd0),
-        .rd_new(q2_new),
+        .rd_new(q2_new), .rd_copy(1'b0), .rd_copy_addr({OW{1'b0}}), .rd_after_copies(1'b0),
         .wr_valid(q2_wr), .wr_addr(q2_waddr), .wr_len(LW'(BEATS - 1)), .wr_pair(q2_pair && p_rd),
         .wr_data(DB'(q2_wdata)), .wr_mask(q2_wmask),
-        .rsp_valid(p_rsp_valid), .rsp_tag(p_rsp_tag), .rsp_beat(p_rsp_beat), .rsp_last(p_rsp_last), .rsp_data(p_rsp_data),
+        .rsp_valid(p_rsp_valid), .rsp_tag(p_rsp_tag), .rsp_beat(p_rsp_beat), .rsp_last(p_rsp_last), .rsp_copied(p_rsp_copied),
+        .rsp_data(p_rsp_data),
         .rd_free(rd_free), .wr_free(wr_free),
-        .base(base), .bytes((zero && !clean) ? 64'(BYTES) : 64'd0), .move(move), .busy(busy), .stat(p_stat),
+        .base(base), .bytes(64'(BYTES)), .zero(zero), .move(move), .busy(busy), .stat(p_stat), .m_clk(clk),
         .m_awvalid(m_awvalid), .m_awready(m_awready), .m_awaddr(m_awaddr), .m_awlen(m_awlen),
         .m_wvalid(m_wvalid), .m_wready(m_wready), .m_wdata(m_wdata), .m_wstrb(m_wstrb), .m_wlast(m_wlast),
         .m_bvalid(m_bvalid), .m_bready(m_bready), .m_arvalid(m_arvalid), .m_arready(m_arready),
@@ -373,8 +369,6 @@ module foldsim_vport_ctl #(
         q2_rd = 1'b0;
         q2_wr = 1'b0;
         kz_sweep = '0;
-        z_q = 1'b0;
-        clean = 1'b0;
         kz_rd = 1'b1;
         kz_same = 1'b0;
         zq_head = '0;
