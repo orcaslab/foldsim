@@ -59,7 +59,7 @@
 # TOP-NEXT: {{^}}assign vmc_arid[VMEM_MEMS + 0] = '0;
 # TOP-NEXT: {{^}}assign vmem_moving[VMEM_MEMS + 0] = vp_busy[0];
 # TOP-NEXT: {{^}}assign vmem_tel[VMEM_MEMS + 0] = '0;
-# TOP: {{^}}.base (vp0_base), .bytes (64'(268435456)), .zero (vmem_zero),
+# TOP: {{^}}.base (vp0_base), .bytes (64'd 268435456), .zero (vmem_zero),
 # TOP: {{^}}.m_clk (ap_clk),
 # TOP-NEXT: {{^}}.m_awvalid (vmc_awvalid[VMEM_MEMS + 0]), .m_awready (vmc_awready[VMEM_MEMS + 0]),
 # TOP: {{^}}vp1_base <= vmem_base + VMEM_MEM_BYTES + 64'h10000000;
