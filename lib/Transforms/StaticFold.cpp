@@ -11931,16 +11931,33 @@ static std::pair<double, unsigned> landingPrices(uint64_t depth, unsigned width,
   return {lut, std::max(bram, 1u)};
 }
 
-/// Sets an operation's Vivado ram_style, replacing any it has.
+/// Sets an operation's Vivado ram_style, replacing any it has. An ultra RAM
+/// deeper than one URAM288 (4,096 rows of 72 bits) also states its cascade
+/// height, one URAM288 a 4,096 rows: without it Vivado infers the memory at
+/// a cascade height of 1 and builds it of more primitives than its rows need
+/// (measured 11-12, Vivado 2025.2 on the V80, byte-masked 72-bit memories:
+/// 8K rows in 3 URAM288 and 24K in 9, against 2 and 6 cascaded, no LUTs
+/// either way; every copy of the A100-32 fold with such memories 1.48x its
+/// counted URAM).
 static void setRamStyle(Operation *op, StringRef kind) {
   auto *context = op->getContext();
+  unsigned cascade = 0;
+  if (kind == "ultra")
+    if (auto mem = dyn_cast<seq::FirMemOp>(op))
+      if (mem.getType().getDepth() > 4096)
+        cascade = unsigned(llvm::divideCeil(mem.getType().getDepth(), 4096));
   sv::modifySVAttributes(op, [&](SmallVectorImpl<sv::SVAttributeAttr> &attrs) {
     llvm::erase_if(attrs, [](sv::SVAttributeAttr attr) {
-      return attr.getName().getValue() == "ram_style";
+      return attr.getName().getValue() == "ram_style" ||
+             attr.getName().getValue() == "cascade_height";
     });
     attrs.push_back(sv::SVAttributeAttr::get(
         context, "ram_style", ("\"" + kind + "\"").str(),
         /*emitAsComment=*/false));
+    if (cascade)
+      attrs.push_back(sv::SVAttributeAttr::get(context, "cascade_height",
+                                               std::to_string(cascade),
+                                               /*emitAsComment=*/false));
   });
 }
 

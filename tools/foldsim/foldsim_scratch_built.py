@@ -61,7 +61,7 @@ def built(path):
     def walk(name):
         m = mods[name]
         for rec in m.mems:
-            mm = foldsim_fitdb.memory(rec)
+            mm = foldsim_fitdb.memory(rec, built=False)
             kind = 'scratch' if scratch_memory(rec[0]) else 'other'
             for r in ('uram', 'bram'):
                 out[kind][r] += mm[r]

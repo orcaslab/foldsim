@@ -50,7 +50,7 @@ def links(path):
         for rec in m.mems:
             if not is_link(rec[0]):
                 continue
-            mm = foldsim_fitdb.memory(rec)
+            mm = foldsim_fitdb.memory(rec, built=False)
             for r in ('uram', 'bram', 'lutram'):
                 out[r] += mm[r]
             out['memories'] += 1
@@ -96,7 +96,7 @@ def groups(path):
         def walk(name):
             for rec in mods[name].mems:
                 if is_link(rec[0]):
-                    mm = foldsim_fitdb.memory(rec)
+                    mm = foldsim_fitdb.memory(rec, built=False)
                     for r in lk:
                         lk[r] += mm[r]
             for child, _ in mods[name].insts:

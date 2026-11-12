@@ -65,18 +65,27 @@ def lutram_primitives(d, w, r):
     return w * math.ceil(d / 64) * r * 8 / 7
 
 
-def memory(rec):
-    """{lutram, lutram_lb, uram, bram} of one foldsim_cost memory record as Vivado builds it by its ram_style
+def memory(rec, built=True):
+    """{lutram, lutram_lb, uram, bram, mlogic} of one foldsim_cost memory record as Vivado builds it by its ram_style
     (foldsim_sll_check.mem_ram: URAM288 in 72-bit columns of 4,096 rows, a read port beyond the first of a
-    memory without a read-write port a copy; else foldsim_cost.mem_cost's block or distributed RAM)."""
+    memory without a read-write port a copy; else foldsim_cost.mem_parts's block or distributed RAM, its read select
+    and write enables in `mlogic`). `built=False`: as the compiler's planner prices it (foldsim_cost.mem_cost: the
+    driver's state-scratch check, foldsim_scratch_built)."""
     _, d, w, r, wr, rl, st, mk, *_ = rec
-    out = dict(lutram=0.0, lutram_lb=0.0, lutram_forced=0.0, uram=0.0, bram=0.0)
+    out = dict(lutram=0.0, lutram_lb=0.0, lutram_forced=0.0, uram=0.0, bram=0.0, mlogic=0.0)
     if st == 'ultra':
-        copies = max(1, r if wr else math.ceil(r / 2))
-        out['uram'] = math.ceil(w / URAM_WIDTH) * math.ceil(d / URAM_DEPTH) * copies
+        if built:
+            # (A deep one without its cascade_height at Vivado's default build: foldsim_cost.uram_count.)
+            out['uram'] = foldsim_cost.uram_count(d, w, r, wr, mk, rec[9] if len(rec) > 9 else None)
+        else:
+            copies = max(1, r if wr else math.ceil(r / 2))
+            out['uram'] = math.ceil(w / URAM_WIDTH) * math.ceil(d / URAM_DEPTH) * copies
         return out
-    lr, br = foldsim_cost.mem_cost(d, w, r, rl, st, mk)
+    # (`mlogic`: the distributed RAM's read select and write enables, logic LUTs as Vivado reports them.)
+    lr, lg, br = foldsim_cost.mem_parts(d, w, r, rl, st, mk) if built else \
+        (*foldsim_cost.mem_cost(d, w, r, rl, st, mk)[:1], 0.0, foldsim_cost.mem_cost(d, w, r, rl, st, mk)[1])
     out['bram'] = br
+    out['mlogic'] = lg
     if lr:
         out['lutram'] = lr
         out['lutram_lb'] = lutram_primitives(d, w, r)
@@ -106,10 +115,12 @@ def subtree(mods, name, stop, acc):
     acc['lut'] += lg
     acc['ff'] += m.ff
     acc['dsp'] += m.dsp
+    acc['bram'] += m.bram
     for rec in m.mems:
         mm = memory(rec)
         add(acc, mm)
-        acc['lut'] += mm['lutram']
+        acc['lut'] += mm['lutram'] + mm['mlogic']
+        acc['logic'] += mm['mlogic']
     for child, _ in m.insts:
         if child in stop:
             continue
@@ -136,7 +147,7 @@ def sim_path(gen):
 def count(gen):
     """{'copies': {copy: counted, its own module's}, 'links': {copy: the link memories and registers read into
     it}, 'level': the simulator level's rest, 'sim': the whole simulator} of a generated simulator."""
-    mods, _ = foldsim_cost.parse(sim_path(gen))
+    mods, _ = foldsim_cost.parse(sim_path(gen), count=True)
     statics = {m for m in mods if m.endswith('_static')}
     if 'foldsim_sim' not in mods:
         sys.exit(f'{gen}: no foldsim_sim module')
@@ -168,7 +179,8 @@ def count(gen):
             o = owner(rec[0])
             tgt = links[o] if o else rest
             add(tgt, mm)
-            tgt['lut'] += mm['lutram']
+            tgt['lut'] += mm['lutram'] + mm['mlogic']
+            tgt['logic'] += mm['mlogic']
         for child, _ in m.insts:
             if child not in statics and child not in level and child in mods:
                 subtree(mods, child, statics, rest)
