@@ -405,6 +405,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "its state pass and keeps each instance's read data from the "
            "responses; a slot whose instance's read has not been answered "
            "waits in a bubble, so the target's cycles never change">,
+    Option<"vmemStagger", "vmem-stagger", "unsigned", "0",
+           "With vmem-on-engines: the most positions a class virtual memory's "
+           "requests may leave after its pass (held in registers, the valids "
+           "stepped by the positions run), so that a copy's memories at one "
+           "pass share engines at successive positions; bounded by the "
+           "class's least gap between passes, the room (a controller's 32 "
+           "entries) and the frame's end. Classes whose folded stores stream "
+           "take part too (their folded stores keep their controllers). 0: "
+           "every request at its pass">,
     Option<"portPlanOut", "port-plan-out", "std::string", "\"\"",
            "Report only: write every HBM member's request positions (each page "
            "engine member's reads and writes as placed; each class virtual "

@@ -23,16 +23,26 @@ module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1}
                           parameter int MIW [N] = '{default: 4}, parameter int TW [N] = '{default: 0}) (
     input logic clk, rst,
     input int cyc, lo, hi, full,
-    input logic rd_valid [N], input logic [7:0] rd_inst [N], input logic [7:0] rd_row [N],
-    input logic wr_valid [N], input logic [7:0] wr_inst [N], input logic [7:0] wr_row [N],
+    input logic rd_valid [N], input logic [7:0] rd_inst [N], input logic [15:0] rd_row [N],
+    input logic wr_valid [N], input logic [7:0] wr_inst [N], input logic [15:0] wr_row [N],
     input logic [1023:0] wr_data [N], input logic [127:0] wr_mask [N],
     output logic rsp_valid [N], output logic [7:0] rsp_inst, output logic [1023:0] rsp_data,
     output logic [15:0] free [N],
     output bit ok);
+`ifdef VMEM_DEPTH
+  localparam DEPTH = `VMEM_DEPTH;  // (vmem-stagger: a larger room)
+`else
   localparam DEPTH = 8;
-  typedef struct packed { logic rd, wr; logic [7:0] inst, winst; logic [7:0] rrow, wrow; logic [1023:0] data; logic [127:0] mask; } ent_t;
-  // Rows of up to 1024 bits; instances (the address's) below 256, rows below 256 (a page engine's rows {member, instance, row}).
-  logic [1023:0] mem [N][256][256];
+`endif
+  typedef struct packed { logic rd, wr; logic [7:0] inst, winst; logic [15:0] rrow, wrow; logic [1023:0] data; logic [127:0] mask; } ent_t;
+  // Rows of up to 1024 bits; instances (the address's) below 256, rows below ROWS (a page engine's rows {member,
+  // instance, row}; VMEM_ROWS for wider ones, vmem-stagger's engines of more members).
+`ifdef VMEM_ROWS
+  localparam ROWS = `VMEM_ROWS;
+`else
+  localparam ROWS = 256;
+`endif
+  logic [1023:0] mem [N][256][ROWS];
   ent_t fifo [N][DEPTH];
   int head [N], cnt [N];
   bit outstanding [N][256], answered [N][256];
@@ -45,7 +55,7 @@ module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1}
       head[m] = 0; cnt[m] = 0;
       for (int i = 0; i < 256; i++) begin
         outstanding[m][i] = 0; answered[m][i] = 0;
-        for (int r = 0; r < 256; r++) mem[m][i][r] = 0;
+        for (int r = 0; r < ROWS; r++) mem[m][i][r] = 0;
       end
     end
   end

@@ -317,6 +317,11 @@ struct Class {
     /// `vmem-rings`: its read buffer a ring (the class's `ring` plan), its
     /// answers written to an image read back a lead before each use.
     bool ring = false;
+    /// A folded store's (hbmFold): its requests leave at the fold's issues.
+    bool fold = false;
+    /// `vmem-stagger`: its requests leave this many positions after its pass
+    /// (held in registers by the simulator; its engine placement's choice).
+    unsigned delay = 0;
     /// Its write data and mask outputs are zero while its write valid is
     /// low (registers reset by it): a page engine ORs them without a select.
     bool idleZero = false;
@@ -330,6 +335,10 @@ struct Class {
   /// the latest (the ring plan's issue; empty: its state pass).
   unsigned foldLandL = 0;
   SmallVector<int> foldIssue;
+  /// `vmem-stagger`: the most positions a member of its virtual memories may
+  /// leave after its pass on a page engine (vmem-on-engines; the ring plan's
+  /// issues are this much later).
+  unsigned staggerMax = 0;
   /// With virtual memories, the copy's host reset input (their pending reads
   /// clear with the controllers').
   unsigned resetInput = 0;
@@ -877,6 +886,9 @@ public:
   bool vmemCost = false;
   /// `vmem-on-engines`: class virtual memories ride the page engines.
   bool vmemEngines = false;
+  /// `vmem-stagger`: with vmem-on-engines, the most positions a class virtual
+  /// memory's requests may leave after its pass (0: at the pass).
+  unsigned vmemStagger = 0;
   /// `port-plan-out`: a JSON file of every HBM member's request positions
   /// (each page engine member as placed, each class virtual memory's
   /// instances' state passes and issues): a static-port placement model's
@@ -1039,8 +1051,17 @@ private:
   /// flight (one a host cycle, decisionLead() of them) nor those of its own
   /// decision, each at most a read and a write; a memory whose requests leave
   /// a host cycle after the pass (`delayed`) has one decision more in flight.
-  unsigned virtualRoom(bool delayed = false) const {
-    return 2 * (decisionLead() + 1 + (delayed ? 1 : 0));
+  unsigned virtualRoom(unsigned later = 0) const {
+    return 2 * (decisionLead() + 1 + later);
+  }
+  /// `vmem-stagger`: the most positions a request may leave after its pass
+  /// with the room (virtualRoom) still at most kStaggerRoom, what a
+  /// controller of 16 entries or more shows idle (foldsim_vmem and
+  /// foldsim_vport_ctl: QUEUE 32).
+  static constexpr unsigned kStaggerRoom = 30;
+  unsigned staggerRoomCap() const {
+    int cap = int(kStaggerRoom / 2) - (decisionLead() + 1);
+    return cap > 0 ? unsigned(cap) : 0;
   }
 
   void inlineNetlists();
@@ -1726,6 +1747,9 @@ private:
     /// A member's requests leave a host cycle after its pass (a held read,
     /// `vmem-on-engines`): the room counts one decision more.
     bool delayed = false;
+    /// `vmem-stagger`: the most positions a member's requests leave after its
+    /// pass (from registers): the room counts as many decisions more.
+    unsigned delay = 0;
     /// Report only: each member's (name, row bits, positions read, written)
     /// as it was placed (members take positions no other member holds).
     SmallVector<std::tuple<std::string, unsigned, uint64_t, uint64_t>> traffic;
@@ -5887,11 +5911,14 @@ LogicalResult StaticFolder::assignPageEngines() {
       return std::max<uint64_t>(64, llvm::PowerOf2Ceil((bits + 7) / 8));
     };
     unsigned placed = 0, made = 0;
+    unsigned staggered = 0;
     for (auto [c, cls] : llvm::enumerate(classes)) {
-      if (!cls.foldIssue.empty())
+      // (A class whose folded stores stream: its other memories, at their
+      // passes, with vmem-stagger; the folded stores keep their own.)
+      if (!cls.foldIssue.empty() && !vmemStagger)
         continue;
       for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
-        if (vm.pages || pageEngineOf.count({unsigned(c), unsigned(k)}))
+        if (vm.pages || vm.fold || pageEngineOf.count({unsigned(c), unsigned(k)}))
           continue;
         bool taken = false;
         for (auto &eng : pageEngines)
@@ -5900,25 +5927,42 @@ LogicalResult StaticFolder::assignPageEngines() {
         if (taken)
           continue;
         SmallVector<unsigned> at;
-        for (unsigned i = 0; i < cls.threads(); ++i)
-          at.push_back(wrap(cls.slot[kState][i] + (vm.delayed ? 1 : 0)));
+        int last = 0;
+        for (unsigned i = 0; i < cls.threads(); ++i) {
+          int q = cls.slot[kState][i] + (vm.delayed ? 1 : 0);
+          at.push_back(wrap(q));
+          last = std::max(last, int(wrap(q)));
+        }
         llvm::sort(at);
         if (std::adjacent_find(at.begin(), at.end()) != at.end())
           return netlist.emitError("vmem-on-engines: ")
                  << cls.name << ":" << vm.name << " requests twice at a position";
+        // `vmem-stagger`: d positions after the pass, 0 <= d <= the class's
+        // bound (a held read takes none), within the frame; the first engine
+        // with every position free at some d, the least d.
+        unsigned most = vm.delayed ? 0
+                                   : std::min<unsigned>(cls.staggerMax,
+                                                        unsigned(std::max(int(ii) - 1 - last, 0)));
+        auto freeAt = [&](PageEngine &eng, unsigned d) {
+          return llvm::none_of(at, [&](unsigned q) { return eng.reads[q + d] || eng.writes[q + d]; });
+        };
         unsigned iw = vm.instWidth ? vm.instWidth
                                    : std::max(cls.threads() > 1
                                                   ? llvm::Log2_32_Ceil(cls.threads())
                                                   : 0u,
                                               1u);
-        unsigned e = 0;
+        unsigned e = 0, d = 0;
         for (; e < pageEngines.size(); ++e) {
           auto &eng = pageEngines[e];
           if (eng.readFirst != vm.readFirst || rowBytes(eng.dataWidth) != rowBytes(vm.dataWidth))
             continue;
-          if (llvm::none_of(at, [&](unsigned q) { return eng.reads[q] || eng.writes[q]; }))
+          for (d = 0; d <= most && !freeAt(eng, d); ++d) {
+          }
+          if (d <= most)
             break;
         }
+        if (e == pageEngines.size())
+          d = 0;
         if (e == pageEngines.size()) {
           if (e >= pageEngineCap)
             return netlist.emitError("page engines: ")
@@ -5932,7 +5976,10 @@ LogicalResult StaticFolder::assignPageEngines() {
         uint64_t r0 = eng.taken(false), w0 = eng.taken(true);
         eng.mark();
         for (unsigned q : at)
-          eng.reads[q] = eng.writes[q] = 1;
+          eng.reads[q + d] = eng.writes[q + d] = 1;
+        vm.delay = d;
+        eng.delay = std::max(eng.delay, d);
+        staggered += d > 0;
         eng.members.push_back({unsigned(c), unsigned(k)});
         eng.placed(), eng.traffic.push_back({cls.name + ":" + vm.name, vm.dataWidth, eng.taken(false) - r0,
                                eng.taken(true) - w0});
@@ -5945,7 +5992,10 @@ LogicalResult StaticFolder::assignPageEngines() {
     }
     llvm::errs() << "foldsim-fold-static: vmem-on-engines: " << placed
                  << " virtual memories on page engines (" << made << " new, "
-                 << pageEngines.size() << " engines)\n";
+                 << pageEngines.size() << " engines)";
+    if (vmemStagger)
+      llvm::errs() << "; vmem-stagger: " << staggered << " leave after their pass";
+    llvm::errs() << "\n";
   }
   // An engine's row is whole bytes (foldsim_vmem: a byte mask of DW/8 bits
   // covers DW only when DW is a multiple of 8): a link stream's row of any
@@ -15574,9 +15624,10 @@ void StaticFolder::planClassRing(
   SmallVector<foldsim::RingInstance> insts(cls.threads());
   for (unsigned i = 0; i < cls.threads(); ++i) {
     // (`fold-store-stream`: its folded stores' requests leave later.)
-    insts[i].issue = cls.foldIssue.empty()
-                         ? cls.slot[kState][i]
-                         : std::max(cls.slot[kState][i], cls.foldIssue[i]);
+    insts[i].issue = (cls.foldIssue.empty()
+                          ? cls.slot[kState][i]
+                          : std::max(cls.slot[kState][i], cls.foldIssue[i])) +
+                     int(cls.staggerMax);
     // Its evaluations of the next frame read at their read positions.
     insts[i].uses.push_back(cls.readSlot(kState, 0, i) + int(ii));
     if (cls.hasReady)
@@ -15875,6 +15926,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       vm.maskWidth = maskWidth * laneBytes;
     }
     vm.readFirst = memory.getRuw() != seq::RUW::New;
+    vm.fold = hbmFold(memory) != nullptr;
     vm.lanes.push_back(memory);
     vm.laneOffset.push_back(0);
     if (mergeLanes && !vm.laneBits) {
@@ -15922,6 +15974,19 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                  << " bits: read combinationally, more ports or a short state gap)\n";
   if (foldStoreStream)
     planFoldLanding(cls);
+  // `vmem-stagger`: the class's least gap between passes (less one) bounds
+  // how late a member may leave, as do the room and the frame's end.
+  if (vmemEngines && vmemStagger && threads > 1) {
+    SmallVector<int> at;
+    for (unsigned i = 0; i < threads; ++i)
+      at.push_back(((cls.slot[kState][i] % int(ii)) + int(ii)) % int(ii));
+    llvm::sort(at);
+    int gap = at.front() + int(ii) - at.back();
+    for (size_t i = 1; i < at.size(); ++i)
+      gap = std::min(gap, at[i] - at[i - 1]);
+    cls.staggerMax = std::min<unsigned>({vmemStagger, unsigned(std::max(gap - 1, 0)),
+                                         staggerRoomCap()});
+  }
   if (vmemRingLead && threads > 1)
     planClassRing(cls, [&](const Class::VirtualMemory &vm) {
       Fold *fold = hbmFold(vm.lanes.front());
@@ -25389,7 +25454,8 @@ LogicalResult StaticFolder::buildSim() {
       terms.push_back(comb::ICmpOp::create(
           b, comb::ICmpPredicate::uge, body->getArgument(v.firstInput + 3),
           constant(kVirtualFreeWidth,
-                   virtualRoom(v.engine ? pageEngines[v.k].delayed
+                   virtualRoom(v.engine ? std::max<unsigned>(pageEngines[v.k].delayed ? 1 : 0,
+                                                             pageEngines[v.k].delay)
                                : !v.stream && classes[v.cls].virtualMemories[v.k].delayed))));
     }
     // An HBM link stream's landing at the position: the next slots to land
@@ -25527,7 +25593,37 @@ LogicalResult StaticFolder::buildSim() {
       for (auto [m, member] : llvm::enumerate(eng.members)) {
         auto [c, k] = member;
         auto &vm = classes[c].virtualMemories[k];
-        auto out = [&](unsigned j) { return copies[c].getResult(vm.firstOutput + j); };
+        auto copyOut = [&](unsigned j) { return copies[c].getResult(vm.firstOutput + j); };
+        // `vmem-stagger`: its requests `delay` positions after the pass: the
+        // fields held from the pass (the class's next pass is further), the
+        // valids a chain stepped by the positions run (none in a bubble), so
+        // that a request leaves at its placed position however many bubbles
+        // come between.
+        SmallVector<Value, 8> held;
+        if (vm.delay) {
+          Value live = notOf(eq(pos0, ii));
+          Value load = comb::OrOp::create(b, copyOut(0), copyOut(3));
+          std::string prefix = classes[c].name + "_" + vm.name + "_stag";
+          for (unsigned j = 0; j < 8; ++j) {
+            Value x = copyOut(j);
+            if (j == 0 || j == 3) {
+              Value v = x;
+              for (unsigned t = 0; t < vm.delay; ++t) {
+                auto next = backedges.get(i1);
+                Value r = resetReg(next, prefix + (j ? "_wv" : "_rv") + Twine(t), 0);
+                next.setValue(comb::MuxOp::create(b, live, v, r));
+                v = r;
+              }
+              held.push_back(comb::AndOp::create(b, v, live));
+              continue;
+            }
+            auto next = backedges.get(x.getType());
+            Value r = reg(next, prefix + "_f" + Twine(j));
+            next.setValue(comb::MuxOp::create(b, load, x, r));
+            held.push_back(r);
+          }
+        }
+        auto out = [&](unsigned j) -> Value { return held.empty() ? copyOut(j) : held[j]; };
         auto tagOf = [&](Value inst) -> Value {
           return b.createOrFold<comb::ConcatOp>(
               constant(eng.memberBits(), m), zext(inst, eng.instWidth));
@@ -25550,8 +25646,9 @@ LogicalResult StaticFolder::buildSim() {
         wrInst.push_back(when(wv, b.createOrFold<comb::ConcatOp>(
                                       tagOf(out(4)), constant(1, 0))));
         wrRow.push_back(when(wv, rowOf(out(4), out(5))));
-        // (A member whose idle write fields are zero: ORed as they are.)
-        wrData.push_back(vm.idleZero ? zext(out(6), dw) : when(wv, zext(out(6), dw)));
+        // (A member whose idle write fields are zero: ORed as they are; not
+        // held ones, `vmem-stagger`.)
+        wrData.push_back(vm.idleZero && !vm.delay ? zext(out(6), dw) : when(wv, zext(out(6), dw)));
         // Its mask as the engine's byte enables: a bit per byte already (a
         // page column), else each bit over its share of the row's bytes
         // (a target RAM's whole-row or lane enables, `vmem-on-engines`).
@@ -25569,7 +25666,7 @@ LogicalResult StaticFolder::buildSim() {
                 b.createOrFold<comb::ExtractOp>(b.getIntegerType(1), mask, j)));
           mask = b.createOrFold<comb::ConcatOp>(parts);
         }
-        wrMask.push_back(vm.idleZero ? zext(mask, dw / 8) : when(wv, zext(mask, dw / 8)));
+        wrMask.push_back(vm.idleZero && !vm.delay ? zext(mask, dw / 8) : when(wv, zext(mask, dw / 8)));
       }
       // Its link streams': a read's member tag its slot, a write's the top
       // bit (the stream's own {tag, instance} without the instance bit); its
@@ -26427,6 +26524,7 @@ void FoldStaticPass::runOnOperation() {
   folder.vmemCost = vmemCost;
   folder.vmemEngines = vmemEngines;
   folder.portPlanOut = portPlanOut;
+  folder.vmemStagger = vmemStagger;
   folder.vmemRingLead = vmemRings;
   folder.foldRingLead = foldStoreRings;
   folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));
