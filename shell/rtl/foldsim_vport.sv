@@ -221,6 +221,11 @@ module foldsim_vport #(
     localparam GROUP = DB / MW;
     // Writes' bursts trimmed to their beats with a byte enabled (see intake).
     localparam TRIM  = (BEATS > 1 && MW > 1 && MB == 0) ? 1 : 0;
+    // Copied beats in a beat queue of their own (COPY with rows of several
+    // beats): 512 bits whatever the row, instead of a second write source on
+    // every beat of the row memory (see the copy beats below).
+    localparam CB    = (CP != 0 && BEATS > 1) ? 1 : 0;
+    localparam CBL   = 5;                       // its entries' log2 (a LUTRAM's depth)
     localparam H     = 512 / AXW;               // AXI beats a 512-bit beat
     localparam HB_   = (HZ > 0) ? HZ : 1;
     // Read-after-write by write numbers (the port's table or the sender's).
@@ -534,7 +539,8 @@ module foldsim_vport #(
     wire [TW-1:0]  oh_tag = oh[TW+LRW -: TW];
     wire [LRW-1:0] oh_len = oh[LRW:1];
     wire           oh_cp  = oh[0] && (CP != 0) && (stale == 0);
-    wire           rb_ready = !(oh_cp && take_wr);
+    wire           cb_full;                    // (CB) the copy beat queue is full
+    wire           rb_ready = !(oh_cp && ((CB != 0) ? cb_full : take_wr));
     wire           rb_fire  = rb_valid && rb_ready;
     wire           r_last_beat = rb_fire && (r_beat == oh_len);
     assign cw_en   = rb_fire && oh_cp && !reset;
@@ -574,7 +580,7 @@ module foldsim_vport #(
     wire           px_cp    = (MB != 0) ? pw_cp    : cs_head && !cs_void;
     wire           px_vd    = (MB != 0) ? pw_vd    : cs_head && cs_void;
     wire [LW-1:0]  px_first = cs_head ? '0 : wh_first;   // (TRIM: no merging)
-    reg            g_valid, g_ok, g_pair, g_vd;
+    reg            g_valid, g_ok, g_pair, g_vd, g_cpf;
     reg  [OW-1:0]  g_addr;
     reg  [BLW-1:0] g_blen;
     reg  [LW-1:0]  g_first;
@@ -627,6 +633,7 @@ module foldsim_vport #(
             g_ep   <= px_ep;
             g_rcnt <= px_rcnt;
             g_vd   <= px_vd;
+            g_cpf  <= px_cp;
             g_nreq <= NRW'(!px_cp && !px_vd);
             g_ncp  <= NRW'(px_cp || px_vd);
         end else if (w_merge) begin
@@ -644,9 +651,14 @@ module foldsim_vport #(
     wire           d_push = aw_go || fill_aw;
     // (Selected by the fill phase, a register: no write head exists then.)
     // (TRIM: the row's first beat above them, for the streamer.)
-    localparam DFW = OW + BLW + 2 + ((TRIM != 0) ? LW : 0);
-    wire [DFW-1:0] d_data = fill_go ? DFW'({LW'(0), fill_at, fill_n, 1'b1, 1'b0})
-                                    : DFW'({g_first, g_addr, g_blen, 1'b0, g_vd && (CP != 0)});
+    // (CB: above it, a filled copy's flag: its beats come from the copy beat queue.)
+    localparam DTB = OW + BLW + 2;
+    localparam DLT = (TRIM != 0) ? LW : 0;
+    localparam DFW = DTB + DLT + ((CB != 0) ? 1 : 0);
+    wire [DFW-1:0] d_data = fill_go ? DFW'({fill_at, fill_n, 1'b1, 1'b0})
+                                    : DFW'({g_addr, g_blen, 1'b0, g_vd && (CP != 0)})
+                                      | ((TRIM != 0) ? DFW'(g_first) << DTB : '0)
+                                      | ((CB != 0) ? DFW'(g_cpf) << (DTB + DLT) : '0);
     wire           b_ev;                       // a B (in clk)
     wire [NRW-1:0] b_nreq, b_ncp;
     if (BQ != 0) begin : g_bq
@@ -855,7 +867,10 @@ module foldsim_vport #(
     wire [QW:0]       s_rp;
     /* verilator lint_on UNUSEDSIGNAL */
     wire [DFW-1:0]    dd;
-    reg               s_fill, s_nostrb;
+    wire [DFW+LW:0]   ddx = (DFW+LW+1)'(dd);
+    wire [LW-1:0]     dd_first = (TRIM != 0) ? ddx[DTB +: LW] : '0;
+    wire              dd_cp    = (CB != 0) && ddx[DTB + DLT];
+    reg               s_fill, s_nostrb, s_cp;
     reg  [BLW-1:0]    s_left;
     reg  [LW-1:0]     s_rb;
     reg               s_half;
@@ -935,7 +950,7 @@ module foldsim_vport #(
         end else begin : g_d
             assign din_w = wr_data[512*j +: SWJ];
         end
-        if (CP != 0) begin : g_cw
+        if (CP != 0 && CB == 0) begin : g_cw
             // (A copied beat: its row's beats and a full mask with the first.)
             wire [SWJ+XJ-1:0] din_c;
             if (j == 0 && BEATS > 1) begin : g_x
@@ -986,16 +1001,70 @@ module foldsim_vport #(
     end else begin : g_bd1
         assign beat_d = sub_rd[0];
     end
-    wire [63:0]    beat_s = wbytes[32'(s_rb) * 64 +: 64];
-    wire           row_end = !s_nostrb && (s_rb == row_len);
+    wire [63:0]    beat_s0 = wbytes[32'(s_rb) * 64 +: 64];
+    // ---- copy beats (CB): copied beats queue here in the order they come
+    // (the copies' order: answers come in read order), not in the row
+    // memory; a filled copy's burst streams them from the queue's head with
+    // every byte of its row enabled. The queue is not reserved: when it is
+    // full the next copied beat waits on R (it drains: the copies in it are
+    // ahead of every later copy in the write queue, and nothing they wait for
+    // comes after them on R). After a reset a copy's beats not all in (a void
+    // copy) are dropped from it.
+    wire [511:0]   cb_d;
+    wire [63:0]    cb_s;
+    if (CB != 0) begin : g_cb
+        (* ram_style = "distributed" *) reg [511:0] cb_mem [1 << CBL];
+        reg  [CBL:0]   cb_w, cb_c;                 // beats in (clk), whole copies in
+        /* verilator lint_off UNUSEDSIGNAL */
+        wire [CBL:0]   cb_r;                       // beats streamed (mclk)
+        /* verilator lint_on UNUSEDSIGNAL */
+        wire [CBL:0]   cb_rc;                      // the same, seen in clk
+        always @(posedge clk) begin
+            if (cw_en) cb_mem[cb_w[CBL-1:0]] <= rb_data;
+            if (reset) cb_w <= cb_c;
+            else if (cw_en) cb_w <= cb_w + 1'b1;
+            if (cw_done) cb_c <= cb_w + 1'b1;
+        end
+        assign cb_full = (cb_w - cb_rc) == (CBL+1)'(1 << CBL);
+        assign cb_d = cb_mem[cb_r[CBL-1:0]];
+        wire cb_inc = s_beat_end && s_cp;
+        if (ASYNC != 0) begin : g_cba
+            foldsim_vport_gcnt #(.N(CBL + 1)) c (.a_clk(m_clk), .inc(cb_inc), .a_cnt(cb_r), .b_clk(clk), .b_cnt(cb_rc));
+        end else begin : g_cbs
+            reg [CBL:0] r;
+            always @(posedge clk) r <= r + (CBL+1)'(cb_inc);
+            assign cb_r  = r;
+            assign cb_rc = r;
+`ifdef SIMULATION
+            initial r = '0;
+`endif
+        end
+        // (A row's bytes, every one enabled: a copy's.)
+        wire [BEATS*64-1:0] cbytes;
+        for (genvar j = 0; j < BEATS * 64; j++) begin : g_cby
+            assign cbytes[j] = (j < DB);
+        end
+        assign cb_s = cbytes[32'(s_rb) * 64 +: 64];
+`ifdef SIMULATION
+        initial begin cb_w = '0; cb_c = '0; end
+`endif
+    end else begin : g_no_cb
+        assign cb_full = 1'b0;
+        assign cb_d = '0;
+        assign cb_s = '0;
+    end
+    wire [511:0]   beat_dx = s_cp ? cb_d : beat_d;
+    wire [63:0]    beat_s  = s_cp ? cb_s : beat_s0;
+    // (A copy's burst is one row: it ends with the burst.)
+    wire           row_end = !s_nostrb && !s_cp && (s_rb == row_len);
     // The AXI beat of the 512-bit beat (ASYNC: its half).
     wire [AXW-1:0]   ax_d;
     wire [AXW/8-1:0] ax_s;
     if (H > 1) begin : g_half
-        assign ax_d = s_half ? beat_d[511:256] : beat_d[255:0];
+        assign ax_d = s_half ? beat_dx[511:256] : beat_dx[255:0];
         assign ax_s = s_half ? beat_s[63:32] : beat_s[31:0];
     end else begin : g_full
-        assign ax_d = beat_d;
+        assign ax_d = beat_dx;
         assign ax_s = beat_s;
     end
     // A row ends at its last beat (or the burst's, for a void row); then the
@@ -1020,7 +1089,8 @@ module foldsim_vport #(
             s_left   <= dd[2 +: BLW];
             s_fill   <= dd[1];
             s_nostrb <= dd[0];
-            s_rb     <= (TRIM != 0) ? dd[DFW-1 -: LW] : '0;
+            s_rb     <= dd_first;
+            s_cp     <= dd_cp;
         end
     end
     // The release pointer (rows read), read in clk.
@@ -1057,7 +1127,7 @@ module foldsim_vport #(
         m_arvalid = 1'b0; m_awvalid = 1'b0; m_wvalid = 1'b0; rsp_valid = 1'b0; rsp_copied = 1'b0;
         rd_free = '0; wr_free = '0;
         d_aw = 1'b0; d_w = 1'b0; s_busy = 1'b0; s_left = '0; s_rb = '0; s_half = 1'b0;
-        s_fill = 1'b0; s_nostrb = 1'b0;
+        s_fill = 1'b0; s_nostrb = 1'b0; s_cp = 1'b0;
     end
     // Without bursts the in-flight table holds the reads on AXI: the credit fits it.
     initial if (MB == 0 && RDB > OFD) $error("foldsim_vport: %0d reads on AXI, %0d in-flight entries", RDB, OFD);
