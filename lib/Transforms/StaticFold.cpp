@@ -6083,10 +6083,11 @@ LogicalResult StaticFolder::assignPageEngines() {
         // (`vport-copy`: a ring's prefetches, at its plan's positions, read
         // its image on its port: free there too, and not at its own.)
         SmallVector<unsigned> prefAt;
-        // (Not a write-first memory: its read waits for its own cycle's write
-        // (rd_new), queued in the port after the copy's slot, which waits for
-        // that read: the port would deadlock.)
-        bool copyRing = vportEngines && vportCopy && vm.ring && cls.ring && vm.readFirst;
+        // (A write-first memory's copy read waits for its own cycle's write
+        // (rd_new): the port queues the copy's write slot after that write
+        // (foldsim_vport, contract request 11).)
+        bool copyRing = vportEngines && vportCopy && vm.ring && cls.ring;
+        bool copyAsked = copyRing;
         if (copyRing)
           for (unsigned p = 0; p < ii; ++p)
             if (cls.ring->prefValid[p])
@@ -6270,6 +6271,10 @@ LogicalResult StaticFolder::assignPageEngines() {
         eng.mark();
         for (unsigned q : at)
           eng.reads[q + d] = eng.writes[q + d] = 1;
+        if (copyAsked && !copyRing && getenv("FOLDSIM_COPY_LOG"))
+          llvm::errs() << "copy: " << cls.name << ":" << vm.name << " keeps its image: engine " << e
+                       << (e + 1 == pageEngines.size() && made ? " (new)" : "") << " max shift "
+                       << maxShift << ", " << prefAt.size() << " prefetches\n";
         if (copyRing) {
           if (getenv("FOLDSIM_COPY_LOG")) {
             llvm::errs() << "copy: " << cls.name << ":" << vm.name << " engine " << e << " d " << d

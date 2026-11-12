@@ -44,11 +44,17 @@
 # RUN: python3 %S/Inputs/vmem_bind.py %t/wf/foldsim_sim.json %t/wf
 # RUN: cd %S/../Driver/Inputs/vmem_multi && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/wf -Mdir %t/wf/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/wf/foldsim_sim.sv > %t/wf/build.log 2>&1
 # RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+10 +lo=1 | FileCheck %s
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +lo=20 +hi=600 +full=80 +stall=20 | FileCheck %s
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+12 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
 
 # RF: `define FOLDSIM_VPORT0_COPY 1
 # RF: `define FOLDSIM_VPORT1_LMAX 2
 # RF: `define FOLDSIM_VPORT1_COPY 1
-# WF-NOT: _COPY 1
+# (Write-first rings copy too: the copy read waits for its own cycle's write, rd_new, and the port
+# queues the copy's write slot after that write.)
+# WF: {{^}}`define FOLDSIM_VPORT0_COPY 1{{$}}
+# WF: {{^}}`define FOLDSIM_VPORT7_COPY 1{{$}}
 # VH: `define FOLDSIM_VPORTS 1
 # VH: `define FOLDSIM_VPORT0_COPY 1
 # SV-NOT: ring_flight
