@@ -9,7 +9,8 @@
 # on the static region clock. The kernel elaborates in Verilator (lint -Wall:
 # nothing about the static ports) and in CIRCT: 32 foldsim_vport instances,
 # their AXI side on hbm_clk. Without hbm_direct (a simulator without static
-# ports) nothing changes; a mismatched binding fails.
+# ports) nothing changes; a mismatched binding fails. (Static ports without
+# hbm_direct go on the virtual memories' masters: flow-vport-mem.test.)
 # RUN: rm -rf %t && mkdir -p %t
 # RUN: python3 %S/Inputs/flow/vport_stub.py 32 %t/gen
 # RUN: python3 %foldsim_tools/foldsim_flow.py kernel-vh --manifest %S/Inputs/flow/vport32.toml --gen %t/gen -o %t/gen/foldsim_kernel.vh
@@ -36,7 +37,6 @@
 # RUN: %verilator -E -P -DSIMULATION -I%S/../../shell/rtl -I%t/g0 %t/g0/foldsim_afu.sv | FileCheck %s --check-prefix=PLAIN
 # RUN: FileCheck %s --check-prefix=PLAIN < %t/g0/foldsim_kernel.vh
 # A binding that does not match the simulator's ports fails.
-# RUN: not python3 %foldsim_tools/foldsim_flow.py kernel-vh --manifest %t/plain.toml --gen %t/gen 2>&1 | FileCheck %s --check-prefix=UNBOUND
 # RUN: not python3 %foldsim_tools/foldsim_flow.py kernel-vh --manifest %S/Inputs/flow/vport32.toml --gen %t/g0 2>&1 | FileCheck %s --check-prefix=NOPORTS
 # RUN: not python3 %foldsim_tools/foldsim_flow.py cfg --manifest %S/Inputs/flow/vport32.toml --set 'platform.hbm_direct=[0,2,2]' --gen %t/gen 2>&1 | FileCheck %s --check-prefix=UNBOUND
 # VH: `define FOLDSIM_VPORT_DIRECT
@@ -60,7 +60,8 @@
 # TOP: input wire hbm_clk,
 # TOP: output wire m_axi_hbm_0_awvalid,
 # TOP: output wire [255:0] m_axi_hbm_31_wdata,
-# TOP: .ASYNC (1),
+# TOP: localparam VP_ASYNC = 1, VP_ALIGNED = 1, VP_BURST = 8, VP_RD_OUT = 16, VP_WR_OUT = 16, VP_WRITES = 64;
+# TOP: .ASYNC (VP_ASYNC),
 # TOP: .m_clk (hbm_clk),
 # (Only the kernel's own two warnings, none of the static ports'.)
 # LINT: %Warning-DECLFILENAME: Filename 'foldsim_token'

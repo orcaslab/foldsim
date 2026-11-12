@@ -1,0 +1,80 @@
+# REQUIRES: verilator
+# The MEM binding of static ports: a simulator with 4 static ports and 2 virtual memories
+# (Inputs/flow/vport_stub.py 4 <dir> 2) and a manifest without [platform] hbm_direct puts the ports
+# on the virtual memories' device-memory masters, as controllers 2..5 after the memories' 0..1.
+# kernel-vh (--vmem-masters 3): the masters shared (FOLDSIM_VMEM_MASTERS, also where every
+# controller would have a master: ports never sit on a bare master), the memories alone in
+# FOLDSIM_VMEM_REPEAT, the ports in FOLDSIM_VPORT_REPEAT<q>; cfg: one m_axi_mem a master, no
+# hbm_clk. afu: each foldsim_vport SYNC (512 bits in ap_clk, one beat a burst) on vmc_*[VMEM_MEMS + p],
+# id 0, its busy in vmem_moving, its region after the memories' (vmem_base + VMEM_MEM_BYTES +
+# FOLDSIM_VPORT<p>_BASE), the region the runtime places grown by FOLDSIM_VPORT_REGION_BYTES. Lint:
+# only the kernel's own two warnings; CIRCT: 4 ports and 3 sharings. Ports alone (no memories):
+# the same binding, no memory controller. Ports with hbm_direct stay direct (flow-vport-direct.test).
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: grep -v hbm_direct %S/Inputs/flow/vport32.toml > %t/plain.toml
+# RUN: python3 %S/Inputs/flow/vport_stub.py 4 %t/gen 2
+# RUN: python3 %foldsim_tools/foldsim_flow.py kernel-vh --manifest %t/plain.toml --gen %t/gen --vmem-masters 3 -o %t/gen/foldsim_kernel.vh
+# RUN: FileCheck %s --check-prefix=VH < %t/gen/foldsim_kernel.vh
+# RUN: python3 %foldsim_tools/foldsim_flow.py afu --manifest %t/plain.toml --gen %t/gen --rtl-dir %S/../../shell/rtl -o %t/gen/foldsim_afu.sv
+# RUN: python3 %foldsim_tools/foldsim_flow.py kernel-srcs --gen %t/gen --rtl-dir %S/../../shell/rtl -o %t/srcs.f
+# RUN: python3 %foldsim_tools/foldsim_flow.py cfg --manifest %t/plain.toml --gen %t/gen --vmem-masters 3 -o %t/link.cfg
+# RUN: FileCheck %s --check-prefix=CFG < %t/link.cfg
+# RUN: %verilator -E -P -DSIMULATION -I%S/../../shell/rtl -I%t/gen %t/gen/foldsim_afu.sv | sed -E 's/^ +//' > %t/top.sv
+# RUN: FileCheck %s --check-prefix=TOP < %t/top.sv
+# RUN: %verilator --lint-only -Wall -Wno-fatal -DSIMULATION --top-module foldsim_afu -f %t/srcs.f > %t/lint.log 2>&1
+# RUN: grep -E '^%%(Warning|Error)' %t/lint.log | sed -E 's#^(%%[A-Za-z-]+): [^ ]+:[0-9]+:[0-9]+: #\1: #' | FileCheck %s --check-prefix=LINT
+# RUN: circt-verilog --ir-hw --allow-use-before-declare -DSYNTHESIS -I %S/../../shell/rtl -I %t/gen --top foldsim_afu %t/gen/foldsim_sim.sv %S/../../shell/rtl/foldsim_token.sv %S/../../shell/rtl/foldsim_mem_bmap.sv %S/../../shell/rtl/foldsim_mem_bank.sv %S/../../shell/rtl/foldsim_mem.sv %S/../../shell/rtl/foldsim_vmem.sv %S/../../shell/rtl/foldsim_vmem_share.sv %S/../../shell/rtl/foldsim_vmem_group.sv %S/../../shell/rtl/foldsim_vport.sv %S/../../shell/rtl/foldsim_ctrl.sv %t/gen/foldsim_afu.sv -o %t/afu.mlir 2> /dev/null
+# RUN: grep -o 'hw.instance "vport[0-9]*" @foldsim_vport' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=N4
+# RUN: grep -o 'hw.instance "g_vmem_master_[0-9]*.share" @foldsim_vmem_share' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=N3
+# RUN: not grep -q hbm_clk %t/afu.mlir
+# Ports alone.
+# RUN: python3 %S/Inputs/flow/vport_stub.py 2 %t/g2
+# RUN: python3 %foldsim_tools/foldsim_flow.py kernel-vh --manifest %t/plain.toml --gen %t/g2 -o %t/g2/foldsim_kernel.vh
+# RUN: FileCheck %s --check-prefix=VH2 < %t/g2/foldsim_kernel.vh
+# RUN: python3 %foldsim_tools/foldsim_flow.py afu --manifest %t/plain.toml --gen %t/g2 --rtl-dir %S/../../shell/rtl -o %t/g2/foldsim_afu.sv
+# RUN: python3 %foldsim_tools/foldsim_flow.py kernel-srcs --gen %t/g2 --rtl-dir %S/../../shell/rtl -o %t/srcs2.f
+# RUN: %verilator -E -P -DSIMULATION -I%S/../../shell/rtl -I%t/g2 %t/g2/foldsim_afu.sv | sed -E 's/^ +//' > %t/top2.sv
+# RUN: FileCheck %s --check-prefix=TOP2 < %t/top2.sv
+# RUN: %verilator --lint-only -Wall -Wno-fatal -DSIMULATION --top-module foldsim_afu -f %t/srcs2.f > %t/lint2.log 2>&1
+# RUN: grep -E '^%%(Warning|Error)' %t/lint2.log | sed -E 's#^(%%[A-Za-z-]+): [^ ]+:[0-9]+:[0-9]+: #\1: #' | FileCheck %s --check-prefix=LINT
+# VH: {{^}}`define FOLDSIM_VMEM_REPEAT(f,s) `f(1, 0) `s `f(2, 1){{$}}
+# VH: {{^}}`define FOLDSIM_VMEM_MASTERS 3{{$}}
+# VH-NEXT: {{^}}`define FOLDSIM_VMEM_MASTER_REPEAT(f,s) `f(1, 0) `s `f(2, 1) `s `f(3, 2){{$}}
+# VH-NEXT: {{^}}`define FOLDSIM_VPORT_REPEAT0(f,s) `f(0) `s `f(1) `s `f(2) `s `f(3){{$}}
+# VH-NEXT: {{^}}`define FOLDSIM_VPORT_REPEAT1(f,s) {{$}}
+# VH-NOT: DIRECT
+# CFG: {{^}}sp=foldsim_afu_0.m_axi_mem_3:MEM{{$}}
+# CFG-NOT: {{m_axi_mem_4|hbm}}
+# TOP: {{^}}localparam [63:0] VMEM_BYTES = VMEM_MEM_BYTES + 64'h40000000;
+# TOP: {{^}}localparam VMEM_MEMS = 2;
+# TOP-NEXT: {{^}}localparam VMEM_CTRLS = VMEM_MEMS + 4;
+# TOP: {{^}}localparam VP_ASYNC = 0, VP_ALIGNED = 0, VP_BURST = 1, VP_RD_OUT = 0, VP_WR_OUT = 0, VP_WRITES = VMEM_WRITES_OUT;
+# TOP: {{^}}vp0_base <= vmem_base + VMEM_MEM_BYTES + 64'h0;
+# TOP-NEXT: {{^}}assign vmc_awid[VMEM_MEMS + 0] = '0;
+# TOP-NEXT: {{^}}assign vmc_arid[VMEM_MEMS + 0] = '0;
+# TOP-NEXT: {{^}}assign vmem_moving[VMEM_MEMS + 0] = vp_busy[0];
+# TOP-NEXT: {{^}}assign vmem_tel[VMEM_MEMS + 0] = '0;
+# TOP: {{^}}.base (vp0_base), .bytes (64'(268435456)), .zero (vmem_zero),
+# TOP: {{^}}.m_clk (ap_clk),
+# TOP-NEXT: {{^}}.m_awvalid (vmc_awvalid[VMEM_MEMS + 0]), .m_awready (vmc_awready[VMEM_MEMS + 0]),
+# TOP: {{^}}vp1_base <= vmem_base + VMEM_MEM_BYTES + 64'h10000000;
+# TOP: {{^}}vp3_base <= vmem_base + VMEM_MEM_BYTES + 64'h30000000;
+# TOP: {{^}}.m_rdata (vmc_rdata[VMEM_MEMS + 3]), .m_rlast (vmc_rlast[VMEM_MEMS + 3])
+# TOP: {{^}}.VMEM_BYTES (VMEM_BYTES),
+# TOP: {{^}}.vmem_moving (|vmem_moving),
+# TOP-NOT: hbm_clk
+# VH2-NOT: FOLDSIM_VMEM_REPEAT
+# VH2: {{^}}`define FOLDSIM_VMEM_MASTERS 2{{$}}
+# VH2-NEXT: {{^}}`define FOLDSIM_VMEM_MASTER_REPEAT(f,s) `f(1, 0) `s `f(2, 1){{$}}
+# VH2-NEXT: {{^}}`define FOLDSIM_VPORT_REPEAT0(f,s) `f(0) `s `f(1){{$}}
+# TOP2: {{^}}localparam [63:0] VMEM_MEM_BYTES = 64'd0;
+# TOP2: {{^}}localparam VMEM_MEMS = 0;
+# TOP2-NEXT: {{^}}localparam VMEM_CTRLS = VMEM_MEMS + 2;
+# TOP2-NOT: {{foldsim_vmem |foldsim_vport_ctl}}
+# TOP2: {{^}}vp1_base <= vmem_base + VMEM_MEM_BYTES + 64'h10000000;
+# (Only the kernel's own two warnings.)
+# LINT: %Warning-DECLFILENAME: Filename 'foldsim_token'
+# LINT-NEXT: %Warning-UNUSEDSIGNAL: Signal is not used: 'advance'
+# LINT-NOT: %
+# N4: {{^}}4{{$}}
+# N3: {{^}}3{{$}}

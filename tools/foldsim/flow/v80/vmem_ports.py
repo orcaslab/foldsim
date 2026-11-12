@@ -54,6 +54,16 @@ j) for each master j, and FOLDSIM_VMEM_REPEAT gives each controller its
 master's port. With M = N the header is as without the option. Where no
 master is left beside the memory ports (or with M = 0), controller k shares
 the memory ports' master k mod P with its endpoint: FOLDSIM_VMEM_ON_PORTS.
+
+Static ports (foldsim --vport-engines: FOLDSIM_VPORTS in foldsim_sim.vh) not
+bound straight to HBM channels (--direct-vports: the kernel flow's [platform]
+hbm_direct) are controllers too, numbered after the virtual memories' (port p
+is controller N + p, N the memories' or groups' controllers): they count in
+the masters above and always share them (the header then says
+FOLDSIM_VMEM_MASTERS, or FOLDSIM_VMEM_ON_PORTS), so that the kernel puts each
+port on its master's foldsim_vmem_share by its controller number alone.
+FOLDSIM_VMEM_REPEAT and its parts list the virtual memories' controllers only
+(nothing of them without any).
 """
 
 import argparse
@@ -79,6 +89,12 @@ def port_masters(sim_vh, mem_ports):
     with open(sim_vh) as f:
         folded = re.search(r'^`define FOLDSIM_PORTS \d+\s*$', f.read(), re.M)
     return 1 if folded else mem_ports
+
+
+def vport_count(sim_vh):
+    with open(sim_vh) as f:
+        m = re.search(r'^`define FOLDSIM_VPORTS (\d+)\s*$', f.read(), re.M)
+    return int(m.group(1)) if m else 0
 
 
 def vmem_groups(sim_vh):
@@ -118,12 +134,16 @@ def main():
     ap.add_argument('--cache-rows', type=int, default=0, help='host-cache rows per controller (0: none)')
     ap.add_argument('--masters', action='store_true', help='print the device-memory masters')
     ap.add_argument('--port-masters', action='store_true', help="print the memory ports' masters")
+    ap.add_argument('--direct-vports', action='store_true',
+                    help='the static ports are bound straight to HBM channels: not on these masters')
     ap.add_argument('--vmem-masters', type=int, default=None,
                     help="the controllers' own masters (default: one each, or as many as fit; "
                          "0: none, on the memory ports' masters)")
     a = ap.parse_args()
     groups = vmem_groups(a.sim_vh)
-    n = len(groups) if groups is not None else vmem_count(a.sim_vh)
+    nm = len(groups) if groups is not None else vmem_count(a.sim_vh)
+    nv = 0 if a.direct_vports else vport_count(a.sim_vh)
+    n = nm + nv
     p = port_masters(a.sim_vh, a.mem_ports)
     room = MAX_MASTERS - p
     m = min(n, room if a.vmem_masters is None else a.vmem_masters)
@@ -143,23 +163,36 @@ def main():
     if n == 0:
         return
     port = (lambda k: k % p) if m == 0 else (lambda k: p + k % m)
-    print('`define FOLDSIM_VMEM_REPEAT(f,s) ' + ' `s '.join(f'`f({port(k)}, {k})' for k in range(n)))
+
+    def masters():
+        if m == 0:
+            print('`define FOLDSIM_VMEM_ON_PORTS')
+        # (Static ports on the masters: always shared, even one controller a master.)
+        if 0 < m < n or (m and nv):
+            print(f'`define FOLDSIM_VMEM_MASTERS {m}')
+            print('`define FOLDSIM_VMEM_MASTER_REPEAT(f,s) '
+                  + ' `s '.join(f'`f({p + j}, {j})' for j in range(m)))
+        # The static ports, 8 a line (as the direct binding's): `f(p).
+        for q in range(8) if nv else ():
+            xs = [f'`f({v})' for v in range(8 * q, min(8 * q + 8, nv))]
+            print(f'`define FOLDSIM_VPORT_REPEAT{q}(f,s) ' + ('`s ' if q and xs else '') + ' `s '.join(xs))
+        if nv > 64:
+            sys.exit(f'vmem_ports.py: {nv} static ports; the kernel lists at most 64')
+    if nm == 0:
+        masters()
+        return
+    print('`define FOLDSIM_VMEM_REPEAT(f,s) ' + ' `s '.join(f'`f({port(k)}, {k})' for k in range(nm)))
     # The same in parts of PART_SIZE, each a line of its own where the kernel
     # instantiates the controllers (a part after the first led by `s unless
     # it is empty): Verilator takes at most 40000 tokens on a line.
     print(f'`define FOLDSIM_VMEM_PARTS {PARTS}')
     for q in range(PARTS):
-        ks = range(q * PART_SIZE, min(n, (q + 1) * PART_SIZE))
+        ks = range(q * PART_SIZE, min(nm, (q + 1) * PART_SIZE))
         print(f'`define FOLDSIM_VMEM_REPEAT_P{q}(f,s) ' + ('`s ' if q and ks else '')
               + ' `s '.join(f'`f({port(k)}, {k})' for k in ks))
-    if n > PARTS * PART_SIZE:
-        sys.exit(f'vmem_ports.py: {n} controllers; the kernel lists at most {PARTS * PART_SIZE}')
-    if m == 0:
-        print('`define FOLDSIM_VMEM_ON_PORTS')
-    if 0 < m < n:
-        print(f'`define FOLDSIM_VMEM_MASTERS {m}')
-        print('`define FOLDSIM_VMEM_MASTER_REPEAT(f,s) '
-              + ' `s '.join(f'`f({p + j}, {j})' for j in range(m)))
+    if nm > PARTS * PART_SIZE:
+        sys.exit(f'vmem_ports.py: {nm} controllers; the kernel lists at most {PARTS * PART_SIZE}')
+    masters()
     if a.cache_rows:
         print(f'`define FOLDSIM_VMEM_CACHE_ROWS {a.cache_rows}')
     print('`define FOLDSIM_VMEM_PER_MEMORY_ROWS')
@@ -174,7 +207,7 @@ def main():
             print(f'`ifndef FOLDSIM_VMEM_G{g}_CACHE_ROWS\n`define FOLDSIM_VMEM_G{g}_CACHE_ROWS {a.cache_rows}\n`endif')
             print(layout_defaults(f'G{g}', widths[f'G{g}']))
         return
-    for k in range(n):
+    for k in range(nm):
         print(f'`ifndef FOLDSIM_VMEM_{k}_CACHE_ROWS\n`define FOLDSIM_VMEM_{k}_CACHE_ROWS {a.cache_rows}\n`endif')
         print(layout_defaults(str(k), widths[str(k)]))
 

@@ -2724,6 +2724,15 @@ def main():
     for entry in re.findall(r'"([^"]*)"', vps.group(1)) if vps else []:
         info['vports'].append(dict(zip(('DW', 'MW', 'TW', 'OW', 'LMAX', 'COPY', 'NEED_IN', 'HZ', 'BYTES', 'ZERO', 'FS', 'KS'),
                                        (int(x) for x in entry.split(':')))))
+    # Each port's region where the kernel binds the ports to its device-memory
+    # masters (no direct HBM channels): after the virtual memories' regions in
+    # the kernel's vmem space, at FOLDSIM_VPORT<p>_BASE of the ports' part,
+    # 4 KiB aligned; FOLDSIM_VPORT_REGION_BYTES in all.
+    info['vport_bases'], off = [], 0
+    for q in info['vports']:
+        info['vport_bases'].append(off)
+        off += -(-q['BYTES'] // 4096) * 4096
+    info['vport_region_bytes'] = off
     # Virtual memories, in the simulator's vm<k>_ port order.
     vmems = re.search(r'foldsim\.vmems = \[(.*?)\]', sim_text)
     info['vmem'] = []
@@ -2840,6 +2849,8 @@ def main():
             for p, q in enumerate(info['vports']):
                 for k, v in q.items():
                     f.write(f'`define FOLDSIM_VPORT{p}_{k} {v}\n')
+                f.write(f'`define FOLDSIM_VPORT{p}_BASE 64\'h{info["vport_bases"][p]:x}\n')
+            f.write(f'`define FOLDSIM_VPORT_REGION_BYTES 64\'h{info["vport_region_bytes"]:x}\n')
         if info['vmem']:
             f.write(f'`define FOLDSIM_VMEM_COUNT {len(info["vmem"])}\n')
             if not a.vmem_forward:

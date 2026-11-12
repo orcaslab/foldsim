@@ -62,6 +62,11 @@
 # VH: `define FOLDSIM_VPORT0_LMAX 1
 # VH: `define FOLDSIM_VPORT0_HZ 0
 # VH: `define FOLDSIM_VPORT0_FS 4
+# (Each port's region where the kernel puts the ports on its vmem masters: 4 KiB aligned, in port order.)
+# VH: {{^}}`define FOLDSIM_VPORT6_BASE 64'hc000{{$}}
+# VH: {{^}}`define FOLDSIM_VPORT7_BYTES 4096{{$}}
+# VH: {{^}}`define FOLDSIM_VPORT7_BASE 64'h10000{{$}}
+# VH-NEXT: {{^}}`define FOLDSIM_VPORT_REGION_BYTES 64'h11000{{$}}
 # SV: output {{.*}}vp0_rd_valid
 # SV: assign vp0_rd_fence = 4'h0;
 # SV: assign vp0_rd_new = {{.*}}rd_valid;

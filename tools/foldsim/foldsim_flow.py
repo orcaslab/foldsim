@@ -13,8 +13,10 @@
                virtual memories' masters (flow/v80/vmem_ports.py). A simulator
                with static ports (FOLDSIM_VPORTS in foldsim_sim.vh) binds them
                straight to HBM channels, one a port ([platform] hbm_direct, a
-               channel list: the flag; without it nothing changes): their
-               channels, aperture addresses and repeat macro.
+               channel list): their channels, aperture addresses and repeat
+               macro; without hbm_direct they go on the virtual memories'
+               masters as controllers after the memories' (vmem_ports.py),
+               each its region after theirs in the kernel's vmem space.
   afu          the kernel's top (rtl/kernel/foldsim_afu.sv.in) with the
                manifest's control binding: [platform.control] names the target
                ports the control endpoint (foldsim_ctrl) drives (reset, start,
@@ -108,6 +110,8 @@ def sim_vh(a):
 
 def vmem_ports(a, ports, *extra):
     cmd = [sys.executable, os.path.join(FLOW, 'v80', 'vmem_ports.py'), '--sim-vh', sim_vh(a), '--mem-ports', str(ports)]
+    if getattr(a, 'direct_vports', False):
+        cmd.append('--direct-vports')
     if a.cache_rows:
         cmd += ['--cache-rows', str(a.cache_rows)]
     if a.vmem_masters:
@@ -134,12 +138,15 @@ VPORT_PARAMS = ('DW', 'MW', 'TW', 'OW', 'LMAX', 'COPY', 'NEED_IN', 'HZ', 'BYTES'
 def vports(a, m):
     """The simulator's static ports bound to direct HBM channels: [(port, channel, params)], or [] without
     them. The simulator declares them (FOLDSIM_VPORTS P, FOLDSIM_VPORT<p>_<param>); [platform] hbm_direct
-    binds each to a channel (no MEM binding of static ports is built)."""
+    binds each to a channel. Without hbm_direct they are on the virtual memories' masters (the MEM
+    binding: vmem_ports.py counts them, the kernel's top puts each on its master's sharing): []."""
     d = sim_defines(a)
     chans = m.get('platform.hbm_direct')
     if 'FOLDSIM_VPORTS' not in d:
         if chans:
             sys.exit('foldsim_flow: [platform] hbm_direct, and the simulator has no static ports (FOLDSIM_VPORTS)')
+        return []
+    if chans is None:
         return []
     n = int(d['FOLDSIM_VPORTS'], 0)
     if not isinstance(chans, list) or len(chans) != n:
@@ -185,6 +192,7 @@ def kernel_vh(a, m):
         sys.exit('kernel-vh: [platform] mem_id_width is the AXI id width of the target\'s memory ports')
     shift = m.get('platform.mem_channel_shift', 0)
     spec = next((v for v in (m.get(f'{s}.axi_spec') for s in ('platform', 'options', 'memory')) if v), 0)
+    a.direct_vports = bool(vports(a, m))
     masters = int(vmem_ports(a, ports, '--port-masters').strip())
     lines = [a.banner, f'`define FOLDSIM_MEM_PORTS {ports}', f'`define FOLDSIM_MEM_CH_SHIFT {shift}',
              f'`define FOLDSIM_MEM_ID_W {id_w}', f'`define FOLDSIM_MEM_MASTERS {masters}']
@@ -288,8 +296,14 @@ def kernel_srcs(a):
         if not os.path.exists(thr):
             sys.exit(f'kernel-srcs: the simulator folds its memory ports, and there is no {thr} (portfold_gen.sh)')
         files += [thr, os.path.join(d, 'foldsim_mem_fold.sv')]
-    if re.search(r'^`define FOLDSIM_VPORTS ', open(sim_vh(a)).read(), re.M):
+    # Static ports (FOLDSIM_VPORTS), or static ports in the virtual memories'
+    # controllers' place (FOLDSIM_VMEM_VPORT: foldsim_vport_ctl around one).
+    text = open(sim_vh(a)).read()
+    ctl = re.search(r'^`define FOLDSIM_VMEM_VPORT\s*$', text, re.M)
+    if ctl or re.search(r'^`define FOLDSIM_VPORTS ', text, re.M):
         files.append(os.path.join(d, 'foldsim_vport.sv'))
+    if ctl:
+        files.append(os.path.join(d, 'foldsim_vport_ctl.sv'))
     files += [os.path.join(d, 'foldsim_ctrl.sv'), os.path.abspath(a.afu or os.path.join(gen, 'foldsim_afu.sv'))]
     return '\n'.join([f'+incdir+{d}', f'+incdir+{gen}', os.path.join(gen, 'foldsim_sim.sv')] + files) + '\n'
 
@@ -302,6 +316,7 @@ def freq(a, m):
 
 
 def cfg(a, m):
+    a.direct_vports = bool(vports(a, m))
     masters = vmem_ports(a, mem_ports(m), '--masters').strip()
     cmd = [sys.executable, os.path.join(FLOW, 'platform', 'gen_platform.py'), '--flow=aved',
            f'--device={m.get("platform.device", DEVICE)}', '--emit=cfg', '--kernel=foldsim_afu', '--no-host',

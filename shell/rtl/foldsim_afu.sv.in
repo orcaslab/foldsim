@@ -20,6 +20,21 @@
 
 `define FOLDSIM_COMMA ,
 `define FOLDSIM_SEMI  ;
+`ifdef FOLDSIM_VPORTS
+`ifndef FOLDSIM_VPORT_DIRECT
+`define FOLDSIM_VPORT_MEM
+`endif
+`endif
+// The region the runtime places: the virtual memories', and the static ports'
+// on their masters.
+`ifdef FOLDSIM_VMEM_COUNT
+`define FOLDSIM_VMEM_REGION
+`endif
+`ifdef FOLDSIM_VPORT_MEM
+`ifndef FOLDSIM_VMEM_REGION
+`define FOLDSIM_VMEM_REGION
+`endif
+`endif
 
 // The foldsim kernel: the simulator CIRCT composes of Vortex (foldsim_sim, of
 // the target foldsim_target), a memory endpoint on each of its AXI4 ports and
@@ -43,6 +58,12 @@
 // foldsim_kernel.vh: [platform] hbm_direct) has a foldsim_vport for each, its
 // AXI side 256 bits wide in hbm_clk (the static region clock) on its own
 // master m_axi_hbm_<p>, wired by the linker to its channel's HBM_AXI port.
+// Static ports without that binding (FOLDSIM_VPORTS alone: FOLDSIM_VPORT_MEM)
+// are on the virtual memories' masters instead: port p is controller N + p
+// (N the memories' controllers), its AXI side 512 bits in ap_clk, on its
+// master's foldsim_vmem_share (foldsim_kernel.vh then always shares them:
+// FOLDSIM_VMEM_MASTERS or FOLDSIM_VMEM_ON_PORTS), its region at
+// FOLDSIM_VPORT<p>_BASE after the memories' in the region the runtime places.
 module foldsim_afu #(
     parameter C_S_AXI_CONTROL_ADDR_WIDTH = 16,
     parameter C_S_AXI_CONTROL_DATA_WIDTH = 32,
@@ -93,7 +114,7 @@ module foldsim_afu #(
     `FOLDSIM_MEM_REPEAT1(FOLDSIM_AXI_MEM, FOLDSIM_COMMA)
     `FOLDSIM_MEM_REPEAT2(FOLDSIM_AXI_MEM, FOLDSIM_COMMA)
     `FOLDSIM_MEM_REPEAT3(FOLDSIM_AXI_MEM, FOLDSIM_COMMA),
-`ifdef FOLDSIM_VMEM_COUNT
+`ifdef FOLDSIM_VMEM_REGION
 `ifndef FOLDSIM_VMEM_ON_PORTS
 `define FOLDSIM_AXI_VMEM(p, k) `FOLDSIM_AXI_MEM(p)
 `ifdef FOLDSIM_VMEM_MASTERS
@@ -317,11 +338,25 @@ module foldsim_afu #(
         end
     end
 
-`ifdef FOLDSIM_VMEM_COUNT
+`ifdef FOLDSIM_VMEM_REGION
     // ---- The virtual memories: a controller each, on its own master ----
     // The simulator issues them nothing while vmem_on is low: until the
     // runtime has placed their region (FOLDSIM_REG_VMEM_BASE), it sees no room.
-    localparam [63:0] VMEM_BYTES = `FOLDSIM_VMEM_BYTES;
+    // The static ports on these masters have theirs after the memories'.
+`ifdef FOLDSIM_VMEM_COUNT
+    localparam [63:0] VMEM_MEM_BYTES = `FOLDSIM_VMEM_BYTES;
+`else
+    localparam [63:0] VMEM_MEM_BYTES = 64'd0;
+`endif
+`ifdef FOLDSIM_VPORT_MEM
+    localparam [63:0] VMEM_BYTES = VMEM_MEM_BYTES + `FOLDSIM_VPORT_REGION_BYTES;
+`else
+    localparam [63:0] VMEM_BYTES = VMEM_MEM_BYTES;
+`endif
+`ifndef FOLDSIM_VMEM_COUNT
+    // (Static ports alone: the memories' controllers' parameters unused.)
+    /* verilator lint_off UNUSEDPARAM */
+`endif
     localparam VMEM_QUEUE       = 32;
     // The controllers: foldsim_vmem, or static ports in their place
     // (FOLDSIM_VMEM_VPORT, foldsim --vmem-controller vport), each zero-filling
@@ -364,6 +399,9 @@ module foldsim_afu #(
 `else
     localparam VMEM_KNOWN_ZERO  = 1;
 `endif
+`ifndef FOLDSIM_VMEM_COUNT
+    /* verilator lint_on UNUSEDPARAM */
+`endif
     // Controller k's row bytes in memory, known-zero bits (on or off) and
     // their block (log2 rows): the compiler's (foldsim_sim.vh, or vmem_ports.py's
     // defaults in foldsim_kernel.vh: the v6 layout, a bit per row); a
@@ -394,10 +432,19 @@ module foldsim_afu #(
     wire [63:0] vmem_base;
     wire        vmem_on, vmem_zero, vmem_move;
     // Each controller is still moving its region (foldsim_vmem `moving`).
+    // The memories' controllers (VMEM_MEMS), then the static ports on these
+    // masters.
 `ifdef FOLDSIM_VMEM_GROUPS
-    localparam VMEM_CTRLS = `FOLDSIM_VMEM_GROUPS;
+    localparam VMEM_MEMS  = `FOLDSIM_VMEM_GROUPS;
+`elsif FOLDSIM_VMEM_COUNT
+    localparam VMEM_MEMS  = `FOLDSIM_VMEM_COUNT;
 `else
-    localparam VMEM_CTRLS = `FOLDSIM_VMEM_COUNT;
+    localparam VMEM_MEMS  = 0;
+`endif
+`ifdef FOLDSIM_VPORT_MEM
+    localparam VMEM_CTRLS = VMEM_MEMS + `FOLDSIM_VPORTS;
+`else
+    localparam VMEM_CTRLS = VMEM_MEMS;
 `endif
     wire [VMEM_CTRLS-1:0] vmem_moving;
     // Each controller's telemetry counters (foldsim_vmem `tel`); the one the
@@ -420,6 +467,13 @@ module foldsim_afu #(
 `endif
 `ifdef FOLDSIM_VMEM_MASTERS
 `define FOLDSIM_VMEM_SHARED
+`endif
+`ifndef FOLDSIM_VMEM_SHARED
+`ifdef FOLDSIM_VPORT_MEM
+    if (1) begin : g_vport_mem
+        $error("foldsim_afu: static ports on the virtual memories' masters, and foldsim_kernel.vh shares none");
+    end
+`endif
 `endif
 `ifdef FOLDSIM_VMEM_SHARED
     localparam VMEM_N = VMEM_CTRLS;
@@ -845,6 +899,7 @@ module foldsim_afu #(
     // A member's FIFO: entries for the simulator's lead (five) and a burst.
     localparam VMEM_GROUP_FIFO = 16;
 `endif
+`ifdef FOLDSIM_VMEM_COUNT
 `ifdef FOLDSIM_VMEM_PARTS
     // A line per part: Verilator takes at most 40000 tokens on a line.
     `FOLDSIM_VMEM_REPEAT_P0(FOLDSIM_VMEM, FOLDSIM_SEMI)
@@ -865,6 +920,7 @@ module foldsim_afu #(
     `FOLDSIM_VMEM_REPEAT_P15(FOLDSIM_VMEM, FOLDSIM_SEMI);
 `else
     `FOLDSIM_VMEM_REPEAT(FOLDSIM_VMEM, FOLDSIM_SEMI);
+`endif
 `endif
 `undef FOLDSIM_VMEM
 `undef FOLDSIM_VMEM_ROWS
@@ -1182,14 +1238,19 @@ module foldsim_afu #(
     .vm``k``_wr_data (vm``k``_wr_data), .vm``k``_wr_mask (vm``k``_wr_mask)
 `endif
 
-`ifdef FOLDSIM_VPORT_DIRECT
-    // ---- The direct static ports: a foldsim_vport each (ASYNC: its AXI side
-    // in hbm_clk at 256 bits; its region its channel's half of the pair's
-    // aperture, FOLDSIM_VPORT<p>_ADDR, aligned: no adder). They take the
+`ifdef FOLDSIM_VPORTS
+    // ---- The static ports: a foldsim_vport each. Direct (FOLDSIM_VPORT_DIRECT):
+    // ASYNC, its AXI side in hbm_clk at 256 bits; its region its channel's
+    // half of the pair's aperture, FOLDSIM_VPORT<p>_ADDR, aligned: no adder.
+    // On the virtual memories' masters (FOLDSIM_VPORT_MEM): controller
+    // VMEM_MEMS + p of their sharing, its AXI side 512 bits in ap_clk, one id
+    // (0), one beat a burst (as foldsim_vport_ctl's port); its region at
+    // FOLDSIM_VPORT<p>_BASE after the memories' (base registered: static
+    // while requests flow). They take the
     // virtual memories' region protocol: no room until the runtime has
     // placed the region (vmem_on), the zero fill after a reset with `zero`,
     // a move drains them; STATUS's busy bit holds while one drains.
-`ifndef FOLDSIM_VMEM_COUNT
+`ifndef FOLDSIM_VMEM_REGION
     /* verilator lint_off UNUSEDSIGNAL */
     wire [63:0] vmem_base;
     /* verilator lint_on UNUSEDSIGNAL */
@@ -1197,9 +1258,31 @@ module foldsim_afu #(
 `endif
     localparam VPORTS = `FOLDSIM_VPORTS;
     wire [VPORTS-1:0] vp_busy;
+`ifdef FOLDSIM_VPORT_DIRECT
+    localparam VP_ASYNC = 1, VP_ALIGNED = 1, VP_BURST = 8, VP_RD_OUT = 16, VP_WR_OUT = 16, VP_WRITES = 64;
+`define FOLDSIM_VP_AXI(p, s) m_axi_hbm_``p``_``s
+`define FOLDSIM_VP_BASE(p) `FOLDSIM_VPORT``p``_ADDR
+`define FOLDSIM_VP_MCLK hbm_clk
+`define FOLDSIM_VP_MEM(p)
+`else
+    localparam VP_ASYNC = 0, VP_ALIGNED = 0, VP_BURST = 1, VP_RD_OUT = 0, VP_WR_OUT = 0, VP_WRITES = VMEM_WRITES_OUT;
+`define FOLDSIM_VP_AXI(p, s) vmc_``s[VMEM_MEMS + p]
+`define FOLDSIM_VP_BASE(p) vp``p``_base
+`define FOLDSIM_VP_MCLK ap_clk
+`define FOLDSIM_VP_MEM(p) \
+    reg  [63:0]                          vp``p``_base; \
+    always @(posedge ap_clk) \
+        vp``p``_base <= vmem_base + VMEM_MEM_BYTES + `FOLDSIM_VPORT``p``_BASE; \
+    assign vmc_awid[VMEM_MEMS + p]    = '0; \
+    assign vmc_arid[VMEM_MEMS + p]    = '0; \
+    assign vmem_moving[VMEM_MEMS + p] = vp_busy[p]; \
+    assign vmem_tel[VMEM_MEMS + p]    = '0; \
+    wire vp``p``_ids_unused = (|vmc_bid[VMEM_MEMS + p]) | (|vmc_rid[VMEM_MEMS + p]);
+`endif
 `define FOLDSIM_VP_LRW(p) ((`FOLDSIM_VPORT``p``_LMAX > 1) ? $clog2(`FOLDSIM_VPORT``p``_LMAX) : 1)
 `define FOLDSIM_VP_LW(p)  (((`FOLDSIM_VPORT``p``_DW + 511) / 512 > 1) ? $clog2((`FOLDSIM_VPORT``p``_DW + 511) / 512) : 1)
 `define FOLDSIM_VPORT_INST(p) \
+    `FOLDSIM_VP_MEM(p) \
     wire                                 vp``p``_rd_valid, vp``p``_rd_new, vp``p``_rd_copy, vp``p``_rd_after; \
     wire                                 vp``p``_wr_valid, vp``p``_wr_pair; \
     wire [`FOLDSIM_VPORT``p``_OW-1:0]    vp``p``_rd_addr, vp``p``_rd_copy_addr, vp``p``_wr_addr; \
@@ -1224,17 +1307,18 @@ module foldsim_afu #(
             .LMAX         (`FOLDSIM_VPORT``p``_LMAX), \
             .QUEUE        (32), \
             .OUTSTANDING  (128), \
-            .AXI_RD_OUT   (16), \
-            .AXI_WR_OUT   (16), \
-            .MAX_BURST    (8), \
+            .WRITES_OUT   (VP_WRITES), \
+            .AXI_RD_OUT   (VP_RD_OUT), \
+            .AXI_WR_OUT   (VP_WR_OUT), \
+            .MAX_BURST    (VP_BURST), \
             .FS           (`FOLDSIM_VPORT``p``_FS), \
             .HZ           (`FOLDSIM_VPORT``p``_HZ), \
             .KS           (`FOLDSIM_VPORT``p``_KS), \
             .NEED_IN      (`FOLDSIM_VPORT``p``_NEED_IN), \
             .COPY         (`FOLDSIM_VPORT``p``_COPY), \
             .ZERO_FILL    (`FOLDSIM_VPORT``p``_ZERO), \
-            .ASYNC        (1), \
-            .BASE_ALIGNED (1) \
+            .ASYNC        (VP_ASYNC), \
+            .BASE_ALIGNED (VP_ALIGNED) \
         ) vport``p ( \
             .clk (ap_clk), .reset (reset), \
             .rd_valid (vp``p``_rd_valid), .rd_addr (vp``p``_rd_addr), .rd_len (vp``p``_rd_len), \
@@ -1245,19 +1329,19 @@ module foldsim_afu #(
             .rsp_valid (vp``p``_rsp_valid), .rsp_tag (vp``p``_rsp_tag), .rsp_beat (vp``p``_rsp_beat), \
             .rsp_last (vp``p``_rsp_last), .rsp_copied (vp``p``_rsp_copied), .rsp_data (vp``p``_rsp_data), \
             .rd_free (vp``p``_rd_room), .wr_free (vp``p``_wr_room), \
-            .base (`FOLDSIM_VPORT``p``_ADDR), .bytes (64'(`FOLDSIM_VPORT``p``_BYTES)), .zero (vmem_zero), \
+            .base (`FOLDSIM_VP_BASE(p)), .bytes (64'(`FOLDSIM_VPORT``p``_BYTES)), .zero (vmem_zero), \
             .move (vmem_move), .busy (vp_busy[p]), .stat (vp``p``_stat), \
             .rd_need (vp``p``_rd_need), .w_count (vp``p``_w_count), \
-            .m_clk (hbm_clk), \
-            .m_awvalid (m_axi_hbm_``p``_awvalid), .m_awready (m_axi_hbm_``p``_awready), \
-            .m_awaddr (m_axi_hbm_``p``_awaddr), .m_awlen (m_axi_hbm_``p``_awlen), \
-            .m_wvalid (m_axi_hbm_``p``_wvalid), .m_wready (m_axi_hbm_``p``_wready), \
-            .m_wdata (m_axi_hbm_``p``_wdata), .m_wstrb (m_axi_hbm_``p``_wstrb), .m_wlast (m_axi_hbm_``p``_wlast), \
-            .m_bvalid (m_axi_hbm_``p``_bvalid), .m_bready (m_axi_hbm_``p``_bready), \
-            .m_arvalid (m_axi_hbm_``p``_arvalid), .m_arready (m_axi_hbm_``p``_arready), \
-            .m_araddr (m_axi_hbm_``p``_araddr), .m_arlen (m_axi_hbm_``p``_arlen), \
-            .m_rvalid (m_axi_hbm_``p``_rvalid), .m_rready (m_axi_hbm_``p``_rready), \
-            .m_rdata (m_axi_hbm_``p``_rdata), .m_rlast (m_axi_hbm_``p``_rlast) \
+            .m_clk (`FOLDSIM_VP_MCLK), \
+            .m_awvalid (`FOLDSIM_VP_AXI(p, awvalid)), .m_awready (`FOLDSIM_VP_AXI(p, awready)), \
+            .m_awaddr (`FOLDSIM_VP_AXI(p, awaddr)), .m_awlen (`FOLDSIM_VP_AXI(p, awlen)), \
+            .m_wvalid (`FOLDSIM_VP_AXI(p, wvalid)), .m_wready (`FOLDSIM_VP_AXI(p, wready)), \
+            .m_wdata (`FOLDSIM_VP_AXI(p, wdata)), .m_wstrb (`FOLDSIM_VP_AXI(p, wstrb)), .m_wlast (`FOLDSIM_VP_AXI(p, wlast)), \
+            .m_bvalid (`FOLDSIM_VP_AXI(p, bvalid)), .m_bready (`FOLDSIM_VP_AXI(p, bready)), \
+            .m_arvalid (`FOLDSIM_VP_AXI(p, arvalid)), .m_arready (`FOLDSIM_VP_AXI(p, arready)), \
+            .m_araddr (`FOLDSIM_VP_AXI(p, araddr)), .m_arlen (`FOLDSIM_VP_AXI(p, arlen)), \
+            .m_rvalid (`FOLDSIM_VP_AXI(p, rvalid)), .m_rready (`FOLDSIM_VP_AXI(p, rready)), \
+            .m_rdata (`FOLDSIM_VP_AXI(p, rdata)), .m_rlast (`FOLDSIM_VP_AXI(p, rlast)) \
         )
     // (A port's telemetry status is not read here.)
     /* verilator lint_off UNUSEDSIGNAL */
@@ -1273,6 +1357,10 @@ module foldsim_afu #(
 `undef FOLDSIM_VPORT_INST
 `undef FOLDSIM_VP_LRW
 `undef FOLDSIM_VP_LW
+`undef FOLDSIM_VP_AXI
+`undef FOLDSIM_VP_BASE
+`undef FOLDSIM_VP_MCLK
+`undef FOLDSIM_VP_MEM
     // The simulator's side of port p (its vp<p>_* ports).
 `define FOLDSIM_SIM_VPORT(p) \
     .vp``p``_rd_valid (vp``p``_rd_valid), .vp``p``_rd_addr (vp``p``_rd_addr), .vp``p``_rd_len (vp``p``_rd_len), \
@@ -1315,7 +1403,7 @@ module foldsim_afu #(
 `endif
 `undef FOLDSIM_SIM_VMEM
 `endif
-`ifdef FOLDSIM_VPORT_DIRECT
+`ifdef FOLDSIM_VPORTS
         `FOLDSIM_VPORT_REPEAT0(FOLDSIM_SIM_VPORT, FOLDSIM_COMMA)
         `FOLDSIM_VPORT_REPEAT1(FOLDSIM_SIM_VPORT, FOLDSIM_COMMA)
         `FOLDSIM_VPORT_REPEAT2(FOLDSIM_SIM_VPORT, FOLDSIM_COMMA)
@@ -1532,7 +1620,7 @@ module foldsim_afu #(
         .NUM_CLASSES (`FOLDSIM_NUM_CLASSES),
         .MEM_PORTS   (PORTS),
         .MEM_CAPS    (MEM_CAPS),
-`ifdef FOLDSIM_VMEM_COUNT
+`ifdef FOLDSIM_VMEM_REGION
         .VMEM_BYTES  (VMEM_BYTES),
         .VMEM_TEL_N  (VMEM_CTRLS),
 `elsif FOLDSIM_VPORT_DIRECT
@@ -1570,7 +1658,7 @@ module foldsim_afu #(
         .mem_refi          (mem_refi),
         .mem_rfc           (mem_rfc),
         .bubble            (bubble),
-`ifdef FOLDSIM_VMEM_COUNT
+`ifdef FOLDSIM_VMEM_REGION
         .vmem_base         (vmem_base),
         .vmem_on           (vmem_on),
         .vmem_zero         (vmem_zero),
@@ -1625,3 +1713,9 @@ endmodule
 
 `undef FOLDSIM_COMMA
 `undef FOLDSIM_SEMI
+`ifdef FOLDSIM_VPORT_MEM
+`undef FOLDSIM_VPORT_MEM
+`endif
+`ifdef FOLDSIM_VMEM_REGION
+`undef FOLDSIM_VMEM_REGION
+`endif
