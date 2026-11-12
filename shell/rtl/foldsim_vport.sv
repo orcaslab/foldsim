@@ -236,6 +236,7 @@ module foldsim_vport #(
     /* verilator lint_on UNUSEDSIGNAL */
     wire           rb_valid, rb_last;          // read beats from the AXI side
     wire [511:0]   rb_data;
+    reg            s_busy;                     // the AXI side streams a burst's rows
     wire           take_rd = rd_valid && !draining && !reset;
     wire           take_wr = wr_valid && !draining && !reset;
     wire           take_cp = take_rd && rd_copy && (CP != 0);
@@ -258,17 +259,22 @@ module foldsim_vport #(
     // The zero fill: the next burst's beat offset and the beats left.
     reg  [OW-1:0]  fill_at;
     reg  [OW:0]    fill_left;
-    wire           fill_more = fill_left != '0;
+    wire           fill_more = (ZERO_FILL != 0) && fill_left != '0;
     wire [BLW-1:0] fill_n    = (|fill_left[OW:6]) ? BLW'(63) : BLW'(fill_left[5:0] - 6'd1);
 
     // ---- read queue: {addr, len, tag, need, copy, after, copies before,
     // contiguous with the read before it in one page}
-    localparam RQW = OW + LRW + TW + CW + 3 + CCW;
+    // (The fields of a request as below, RQF bits; the queue keeps only the
+    // fields its features use: copies' with COPY, the contiguity bit with
+    // MAX_BURST > 1.)
+    localparam RQF = OW + LRW + TW + CW + 3 + CCW;
+    localparam RQW = OW + LRW + TW + CW + ((COPY != 0) ? 2 + CCW : 0) + ((MAX_BURST > 1) ? 1 : 0);
     reg  [RQW-1:0] rq_mem [QUEUE];
     reg  [QW:0]    rq_head, rq_tail;
     // ---- write queue: meta {addr, len, pair, epoch, reads taken by it};
     // rows in the data memory below (read on the AXI side).
-    localparam WQW = OW + LW + 1 + 4 + CW + 1;
+    localparam WQF = OW + LW + 1 + 4 + CW + 1;
+    localparam WQW = WQF - ((MAX_BURST > 1) ? 0 : 1);
     reg  [WQW-1:0] wq_mem [QUEUE];
     reg  [QW:0]    wq_head, wq_tail;
     // Slots the AXI side has read (its rows may be overwritten), in clk.
@@ -319,6 +325,20 @@ module foldsim_vport #(
         after_ok = !af || !dc[CCW-1];
     endfunction
 
+    // A request's fields in the read queue and back.
+    function automatic [RQW-1:0] rq_pack(input [RQF-1:0] f);
+        if (CP != 0 && MB != 0) rq_pack = RQW'(f);
+        else if (CP != 0)       rq_pack = RQW'(f >> 1);
+        else if (MB != 0)       rq_pack = RQW'({f[RQF-1:CCW+3], f[0]});
+        else                    rq_pack = RQW'(f >> (CCW + 3));
+    endfunction
+    function automatic [RQF-1:0] rq_unpack(input [RQW-1:0] q);
+        if (CP != 0 && MB != 0) rq_unpack = RQF'(q);
+        else if (CP != 0)       rq_unpack = RQF'({q, 1'b0});
+        else if (MB != 0)       rq_unpack = RQF'({q[RQW-1:1], {(CCW + 2){1'b0}}, q[0]});
+        else                    rq_unpack = RQF'({q, {(CCW + 3){1'b0}}});
+    endfunction
+
     // ---- intake. A request may join a burst behind the one taken before it
     // (a copy slot between two writes parts them) when its beats follow that
     // one's within its 4 KiB page (requests never cross a page).
@@ -328,12 +348,12 @@ module foldsim_vport #(
     wire           wr_cont = (MB != 0) && w_end_ok && !take_cp && wr_addr == w_end && wr_addr[5:0] != 6'd0;
     always @(posedge clk) begin
         if (take_rd) begin
-            rq_mem[rq_tail[QW-1:0]] <= {rd_addr, rd_len, rd_tag, in_need, take_cp,
-                                        rd_after_copies && (CP != 0), c_in, rd_cont};
+            rq_mem[rq_tail[QW-1:0]] <= rq_pack({rd_addr, rd_len, rd_tag, in_need, take_cp,
+                                                rd_after_copies && (CP != 0), c_in, rd_cont});
             r_end <= rd_addr + OW'(rd_len) + 1'b1;
         end
         if (take_wr) begin
-            wq_mem[ws] <= {wr_addr, wr_len, wr_pair, epoch, r_in + CW'(take_rd), wr_cont};
+            wq_mem[ws] <= WQW'({wr_addr, wr_len, wr_pair, epoch, r_in + CW'(take_rd), wr_cont} >> (WQF - WQW));
             w_end <= wr_addr + OW'(wr_len) + 1'b1;
         end
         if (take_wr) w_end_ok <= 1'b1;
@@ -384,10 +404,10 @@ module foldsim_vport #(
     // burst being formed (its first request's fence; a joining request's own
     // fence held when it joined). Fences are computed from registers, a
     // cycle late (B's only add: conservative).
-    wire [RQW-1:0] rh = rq_mem[rq_head[QW-1:0]];
-    wire [OW-1:0]  rh_addr = rh[RQW-1 -: OW];
-    wire [LRW-1:0] rh_len  = rh[RQW-OW-1 -: LRW];
-    wire [TW-1:0]  rh_tag  = rh[RQW-OW-LRW-1 -: TW];
+    wire [RQF-1:0] rh = rq_unpack(rq_mem[rq_head[QW-1:0]]);
+    wire [OW-1:0]  rh_addr = rh[RQF-1 -: OW];
+    wire [LRW-1:0] rh_len  = rh[RQF-OW-1 -: LRW];
+    wire [TW-1:0]  rh_tag  = rh[RQF-OW-LRW-1 -: TW];
     wire [CW-1:0]  rh_need = rh[CCW+3 +: CW];
     wire           rh_cp   = rh[CCW+2];
     wire           rh_af   = rh[CCW+1];
@@ -399,7 +419,8 @@ module foldsim_vport #(
     reg  [TW-1:0]  p_tag;
     reg  [CW-1:0]  p_need;
     reg  [CCW-1:0] p_cn;
-    reg            h_valid, h_ok, h_af;
+    reg            h_valid, h_ok, h_af, h_cp;
+    reg  [TW-1:0]  h_tag;
     reg  [OW-1:0]  h_addr;
     reg  [BLW-1:0] h_blen;
     reg  [CW-1:0]  h_need;
@@ -407,13 +428,17 @@ module foldsim_vport #(
     reg            r_room, of_room;
     wire           ar_rdy;
     // In-flight reads: their tags, beats and copy flags, in order.
-    (* ram_style = "distributed" *) reg  [TW+LRW:0] of_mem [OFD];
+    localparam OQW = TW + LRW + ((COPY != 0) ? 1 : 0);
+    (* ram_style = "distributed" *) reg  [OQW-1:0] of_mem [OFD];
     reg  [OFW:0]    of_head, of_tail, of_iss;
     reg  [LRW-1:0]  r_beat;
     reg  [ACW-1:0]  ar_cnt;                    // read bursts on AXI
     wire           ar_go   = h_valid && h_ok && r_room && ar_rdy && !reset;
     wire           rq_any  = rq_head != rq_tail;
-    wire           promote = p_valid && (!h_valid || ar_go) && of_room;
+    // (Bursts: a request takes its in-flight entry as it joins the head, and
+    // a reset drops those not issued; without bursts the head is one request,
+    // entered as it issues, and the AXI credit bounds the entries.)
+    wire           promote = p_valid && (!h_valid || ar_go) && (of_room || MB == 0);
     wire [BLW:0]   r_sum   = (BLW+1)'(h_blen) + (BLW+1)'(p_len) + 1'b1;
     wire           merge   = (MB != 0) && h_valid && p_valid && !ar_go && !(r_room && ar_rdy) && p_ok && of_room
                           && p_ct && (r_sum < (BLW+1)'(MAX_BURST));
@@ -436,6 +461,8 @@ module foldsim_vport #(
         end
         if (promote) begin
             h_addr <= p_addr;
+            h_tag  <= p_tag;
+            h_cp   <= p_cp;
             h_blen <= BLW'(p_len);
             h_need <= p_need;
             h_af   <= p_af;
@@ -443,14 +470,20 @@ module foldsim_vport #(
         end else if (merge) begin
             h_blen <= BLW'(r_sum);
         end
-        if (promote || merge)
-            of_mem[of_tail[OFW-1:0]] <= {p_tag, p_len, p_cp};
+        if ((MB != 0) ? (promote || merge) : ar_go)
+            of_mem[of_tail[OFW-1:0]] <= (MB != 0) ? OQW'({p_tag, p_len, p_cp} >> ((COPY != 0) ? 0 : 1))
+                                                  : OQW'({h_tag, LRW'(h_blen), h_cp} >> ((COPY != 0) ? 0 : 1));
     end
 
     // ---- read beats (from the AXI side): to the simulator, or (a copy)
     // into the write queue -- not in a cycle the simulator writes (the
     // queue's one write port): the beat waits.
-    wire [TW+LRW:0] oh = of_mem[of_head[OFW-1:0]];
+    wire [TW+LRW:0] oh;
+    if (COPY != 0) begin : g_oh_cp
+        assign oh = of_mem[of_head[OFW-1:0]];
+    end else begin : g_oh
+        assign oh = {of_mem[of_head[OFW-1:0]], 1'b0};
+    end
     wire [TW-1:0]  oh_tag = oh[TW+LRW -: TW];
     wire [LRW-1:0] oh_len = oh[LRW:1];
     wire           oh_cp  = oh[0] && (CP != 0) && (stale == 0);
@@ -471,10 +504,10 @@ module foldsim_vport #(
     // ---- write issue: the next write (pw) behind the head (g), as reads.
     // A copy slot is taken from the copy entries once filled (void after a
     // reset: no byte written); a write's pair condition held when it joined.
-    wire [WQW-1:0] wh = wq_mem[wq_head[QW-1:0]];
+    wire [WQF-1:0] wh = WQF'({wq_mem[wq_head[QW-1:0]], 1'b0} >> ((MAX_BURST > 1) ? 1 : 0));
     wire           wq_any = wq_head != wq_tail;
-    wire [OW-1:0]  wl_addr = cs_head ? cs_addr : wh[WQW-1 -: OW];
-    wire [LW-1:0]  wl_len  = cs_head ? cs_len  : wh[WQW-OW-1 -: LW];
+    wire [OW-1:0]  wl_addr = cs_head ? cs_addr : wh[WQF-1 -: OW];
+    wire [LW-1:0]  wl_len  = cs_head ? cs_len  : wh[WQF-OW-1 -: LW];
     reg            pw_valid, pw_ok, pw_pair, pw_cp, pw_vd, pw_ct;
     reg  [OW-1:0]  pw_addr;
     reg  [LW-1:0]  pw_len;
@@ -578,9 +611,11 @@ module foldsim_vport #(
             w_ring[ring_at + 1'b1] <= w_taken;
         end
         // the region clean: `zero` rose since the last write taken
-        z_q <= zero;
-        if (take_wr || take_cp) clean <= 1'b0;
-        else if (zero && !z_q) clean <= 1'b1;
+        if (ZERO_FILL != 0) begin
+            z_q <= zero;
+            if (take_wr || take_cp) clean <= 1'b0;
+            else if (zero && !z_q) clean <= 1'b1;
+        end
         if (take_rd) begin rq_tail <= rq_tail + 1'b1; r_in <= r_in + 1'b1; end
         if (take_cp) c_in <= c_in + 1'b1;
         wq_tail <= wq_tail + (QW+1)'(take_wr) + (QW+1)'(take_cp);
@@ -591,7 +626,7 @@ module foldsim_vport #(
         else if (promote || merge) p_valid <= 1'b0;
         if (promote) h_valid <= 1'b1;
         else if (ar_go) h_valid <= 1'b0;
-        if (promote || merge) of_tail <= of_tail + 1'b1;
+        if ((MB != 0) ? (promote || merge) : ar_go) of_tail <= of_tail + 1'b1;
         if (ar_go) of_iss <= of_tail;
         ar_cnt <= ar_cnt + ACW'(ar_go) - ACW'(rb_fire && rb_last);
         if (rb_fire) begin
@@ -631,6 +666,9 @@ module foldsim_vport #(
         end
         // Room, from registers (a cycle conservative).
         rd_free <= draining ? '0 : FW'(QUEUE - 32'((QW+1)'(rq_tail - rq_head)) - 32'(h_valid) - 32'(p_valid) - 32'(take_rd));
+        // (A slot returns once the AXI side has read its row: in clk the
+        // release pointer is the streamer's read pointer itself, exact and
+        // cheaper than counting the head stages.)
         wr_free <= draining ? '0 : FW'(QUEUE - 32'((QW+1)'(wq_tail - w_rel)) - 32'(take_wr) - 32'(take_cp));
         // Reset: drop the reads not yet on AXI (and the answers to those on
         // it), keep the writes; a move keeps everything and only drains.
@@ -638,9 +676,9 @@ module foldsim_vport #(
             rq_head   <= rq_tail;
             h_valid   <= 1'b0;
             p_valid   <= 1'b0;
-            of_tail   <= of_iss;
-            stale     <= (OFW+1)'(of_iss - of_head) - (OFW+1)'(r_last_beat);
-            r_in      <= r_done + CW'((OFW+1)'(of_iss - of_head));
+            if (MB != 0) of_tail <= of_iss;
+            stale     <= (OFW+1)'(((MB != 0) ? of_iss : of_tail) - of_head) - (OFW+1)'(r_last_beat);
+            r_in      <= r_done + CW'((OFW+1)'(((MB != 0) ? of_iss : of_tail) - of_head));
             epoch     <= epoch + 1'b1;
             draining  <= 1'b1;
             fill_go   <= 1'b0;
@@ -743,7 +781,7 @@ module foldsim_vport #(
     wire [QW:0]       s_rp;
     /* verilator lint_on UNUSEDSIGNAL */
     wire [OW+BLW+1:0] dd;
-    reg               s_busy, s_fill, s_nostrb;
+    reg               s_fill, s_nostrb;
     reg  [BLW-1:0]    s_left;
     reg  [LW-1:0]     s_rb;
     reg               s_half;
@@ -914,6 +952,8 @@ module foldsim_vport #(
         d_aw = 1'b0; d_w = 1'b0; s_busy = 1'b0; s_left = '0; s_rb = '0; s_half = 1'b0;
         s_fill = 1'b0; s_nostrb = 1'b0;
     end
+    // Without bursts the in-flight table holds the reads on AXI: the credit fits it.
+    initial if (MB == 0 && RDB > OFD) $error("foldsim_vport: %0d reads on AXI, %0d in-flight entries", RDB, OFD);
     // The contract's preconditions.
     always @(posedge clk) begin
         if (take_rd && 32'(rd_addr[5:0]) + 32'(rd_len) > 63)
