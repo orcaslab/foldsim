@@ -549,6 +549,13 @@ public:
   /// memory's read address is registered a stage early and replicated, a
   /// copy per bank of at most this many RAM primitives.
   unsigned ppAddressFanout = 96;
+  /// `pp-sync-banks` R (0: off): a combinational read of a memory of more
+  /// than R threaded rows is banked and registered from its address,
+  /// enable and instance registers' next values.
+  unsigned ppSyncRows = 0;
+  /// `zero-chain-levels`: the most estimated levels a chain of zero-latency
+  /// links may reach into a reader's state (0: no bound).
+  unsigned zeroChainLevels = 0;
   /// `state-in-ram-pp-pack`: a PP class's stored registers packed into
   /// columns of an instance's row each.
   bool ppPackStores = true;
@@ -5919,7 +5926,7 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
 void StaticFolder::chainCuts() {
   lateReads.clear();
   cutLinks.clear();
-  if (!zeroLatencyLinks || !zeroLatencyChains || !zeroChainHops)
+  if (!zeroLatencyLinks || !zeroLatencyChains || (!zeroChainHops && !zeroChainLevels))
     return;
   // Instance by instance: a late output's hops, the most zero-latency links
   // on a path into it within its host cycle (each adds its reader's choice
@@ -5955,7 +5962,7 @@ void StaticFolder::chainCuts() {
               edges.end());
   // Hops per (producer, instance), to a fixed point, held at the bound plus
   // one where port-level dependences make a loop.
-  int cap = int(zeroChainHops) + 1;
+  int cap = zeroChainHops ? int(zeroChainHops) + 1 : 1 << 20;
   std::map<std::pair<unsigned, unsigned>, int> hops;
   auto settle = [&] {
     hops.clear();
@@ -5992,6 +5999,8 @@ void StaticFolder::chainCuts() {
   // Cut the links where a chain first passes the bound, then again, until
   // none does.
   for (;;) {
+    if (!zeroChainHops)
+      break;
     settle();
     std::set<std::tuple<unsigned, unsigned, unsigned>> cut;
     for (auto &e : edges)
@@ -6009,6 +6018,97 @@ void StaticFolder::chainCuts() {
                      << " -> " << classes[c].name << "."
                      << classes[c].inputNames[input] << "\n";
   }
+  // `zero-chain-levels`: the estimated levels a chain reaches (outputDepth,
+  // inputDepth: the class's logic before its outputs and after its inputs),
+  // each link's choice of source and read bypass 3 more, instance by
+  // instance; a link whose reader's state would end a chain past the bound
+  // is cut, the first such on each chain, until none is.
+  if (!zeroChainLevels)
+    return;
+  const int bound = int(zeroChainLevels);
+  std::map<std::pair<unsigned, unsigned>, int> lev;
+  auto settleLevels = [&] {
+    lev.clear();
+    std::map<std::tuple<unsigned, unsigned, unsigned>, int> in;
+    for (unsigned round = 0;; ++round) {
+      bool changed = false;
+      for (auto &e : edges) {
+        if (cutLinks.count({e.p, e.c, e.input}))
+          continue;
+        auto it = lev.find({e.p, e.pinst});
+        int at = (it != lev.end() ? it->second
+                                  : classes[producers[e.p].cls].outputDepth[producers[e.p].port]) + 3;
+        int &slot = in[{e.c, e.cinst, e.input}];
+        slot = std::max(slot, at);
+      }
+      for (auto [p, producer] : llvm::enumerate(producers)) {
+        if (producer.cls < 0 || !producer.late)
+          continue;
+        auto &cls = classes[producer.cls];
+        int own = cls.outputDepth[producer.port];
+        for (unsigned i = 0; i < cls.threads(); ++i) {
+          int at = own;
+          for (auto input : cls.deps[producer.port].set_bits())
+            if (auto it = in.find({unsigned(producer.cls), i, unsigned(input)}); it != in.end())
+              at = std::max(at, it->second + own);
+          at = std::min(at, 1 << 20);
+          auto [it, fresh] = lev.try_emplace({unsigned(p), i}, at);
+          if (!fresh && at > it->second) {
+            it->second = at;
+            changed = true;
+          } else if (fresh) {
+            changed = true;
+          }
+        }
+      }
+      // (A loop of late outputs keeps growing: held at the cap above.)
+      if (!changed || round > 64)
+        break;
+    }
+  };
+  auto levelOf = [&](unsigned p, unsigned inst) {
+    auto it = lev.find({p, inst});
+    return it != lev.end() ? it->second : classes[producers[p].cls].outputDepth[producers[p].port];
+  };
+  unsigned cutByLevels = 0;
+  for (;;) {
+    settleLevels();
+    std::set<std::tuple<unsigned, unsigned, unsigned>> over;
+    for (auto &e : edges)
+      if (!cutLinks.count({e.p, e.c, e.input}) &&
+          levelOf(e.p, e.pinst) + 3 + classes[e.c].inputDepth[e.input] > bound)
+        over.insert({e.p, e.c, e.input});
+    if (over.empty())
+      break;
+    // The first on each chain: a link none of whose producer's own inputs
+    // came over a link past the bound (else all of them, for a loop).
+    std::set<std::tuple<unsigned, unsigned, unsigned>> cut;
+    for (auto &e : edges) {
+      if (!over.count({e.p, e.c, e.input}))
+        continue;
+      auto &pc = producers[e.p];
+      bool upstream = false;
+      for (auto &f : edges)
+        if (f.c == unsigned(pc.cls) && f.cinst == e.pinst &&
+            classes[pc.cls].deps[pc.port].test(f.input) && over.count({f.p, f.c, f.input})) {
+          upstream = true;
+          break;
+        }
+      if (!upstream)
+        cut.insert({e.p, e.c, e.input});
+    }
+    if (cut.empty())
+      cut = over;
+    cutByLevels += cut.size();
+    cutLinks.insert(cut.begin(), cut.end());
+    if (getenv("FOLDSIM_CHAIN_DEBUG"))
+      for (auto &[p, c, input] : cut)
+        llvm::errs() << "chain level cut " << classes[producers[p].cls].name << "."
+                     << classes[producers[p].cls].outputNames[producers[p].port] << " -> "
+                     << classes[c].name << "." << classes[c].inputNames[input] << "\n";
+  }
+  llvm::errs() << "foldsim-fold-static: zero-chain-levels " << bound << ": " << cutByLevels
+               << " links cut\n";
 }
 
 void StaticFolder::linkUses(std::vector<LinkUse> &uses) const {
@@ -11683,6 +11783,14 @@ static unsigned gPassII = 0;
 static bool gFactoring = false;
 /// A table built as a constant whatever slot-segments could make of it.
 static bool gTableRaw = false;
+/// `slot-ahead` K (0: off): a position table read through a class's pass
+/// sequence takes the sequence's pass and instance at the position from
+/// registers loaded a host cycle ahead (PosCounters::ahead), and a position
+/// table decoded in K segments or more is such a register itself.
+/// gAheadBusy while a register's next value's decoder is built (that one is
+/// a decoder, read a host cycle earlier).
+static unsigned gSlotAhead = 0;
+static bool gAheadBusy = false;
 /// `slot-column-affine`: a table of an index the position counters do not
 /// know (an instance) cut into column-affine pieces (findColumnAffine),
 /// its quotient and remainder by a constant division; `gColumnAffine`
@@ -11712,6 +11820,18 @@ static seq::FirRegOp keep(seq::FirRegOp reg) {
   reg->setAttr(foldsim::kControlAttrName, UnitAttr::get(reg.getContext()));
   return reg;
 }
+
+/// `pp-sync-banks`: a PP bank (a memory read combinationally, its only read's
+/// address, enable and instance clock-enabled registers) whose threaded read
+/// is registered from those registers' next values: the data a host cycle
+/// later is the combinational read of the registers, as long as no write to
+/// the row lands between (the row is the evaluated instance's, written only
+/// by its own state pass, at or after the read's stage).
+static constexpr StringLiteral kHostSyncRead = "foldsim.host_sync_read";
+/// pp-sync-banks: a deep read is registered only where at least this many
+/// estimated levels of logic follow it (a read whose data a register takes
+/// at once would only move its LUT RAM into a block RAM).
+static constexpr int kSyncAfterLevels = 16;
 
 /// The SLR group an op of the simulator is built in, until `extractGroups`
 /// moves it into the group's module.
@@ -12869,7 +12989,15 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
 
   // Comb-read memories to bank: their read ports' LUT RAM primitives past
   // the fanout (threaded: entries x depth rows, 64 a primitive).
-  DenseSet<Operation *> early;
+  DenseSet<Operation *> early, deepOnly, syncDeep;
+  const bool ppSyncBanks = ppSyncRows > 0;
+  const uint64_t syncBankRows = ppSyncRows;
+  // (FOLDSIM_SYNC_AFTER_LEVELS, a test hook: another bound on the logic
+  // after the read.)
+  static const int syncAfterLevels = [] {
+    const char *env = getenv("FOLDSIM_SYNC_AFTER_LEVELS");
+    return env ? atoi(env) : kSyncAfterLevels;
+  }();
   {
     DenseSet<Operation *> memories;
     for (auto *op : topo)
@@ -12881,8 +13009,40 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
     for (auto *op : memories) {
       auto memory = cast<seq::FirMemOp>(op);
       uint64_t deep = llvm::divideCeil(uint64_t(memory.getType().getDepth()) * entries, 64);
+      // pp-sync-banks: the estimated logic after the memory's reads (to the
+      // state or a register), for whether a registered read is worth it.
+      int after = 0;
+      if (ppSyncBanks) {
+        DenseMap<Value, int> memo;
+        auto edges = [](Value value, SmallVectorImpl<std::pair<Value, int>> &out) {
+          for (auto &use : value.getUses()) {
+            auto *user = use.getOwner();
+            if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp,
+                    seq::FirMemWriteOp, seq::FirMemReadOp, hw::InstanceOp, hw::OutputOp>(user))
+              continue;
+            for (auto result : user->getResults())
+              out.push_back({result, logicLevels(user)});
+          }
+        };
+        for (auto *u : memory->getUsers())
+          if (auto r = dyn_cast<seq::FirMemReadOp>(u))
+            after = std::max(after, longestPath(r.getData(), memo, edges));
+        if (deep * 64 > syncBankRows && after >= syncAfterLevels)
+          syncDeep.insert(memory);
+      }
       if (uint64_t(memory.getType().getWidth()) * deep > ppAddressFanout)
         early.insert(memory);
+      // pp-sync-banks: also a memory whose read is deep (past the row
+      // bound: a LUT RAM's multiplexers, Beacon 1 + log2(rows) - 6 levels)
+      // and feeds deep logic, banked and read registered.
+      else if (syncDeep.contains(memory)) {
+        early.insert(memory);
+        deepOnly.insert(memory);
+      }
+      if (ppSyncBanks && getenv("FOLDSIM_SYNC_DEBUG"))
+        llvm::errs() << "pp-sync-banks: " << cls.name << " " << memory.getName().value_or("?")
+                     << " rows " << deep * 64 << " width " << memory.getType().getWidth()
+                     << " after " << after << (syncDeep.contains(memory) ? " registered" : "") << "\n";
     }
   }
   auto isEarly = [&](Operation *op) {
@@ -13233,6 +13393,14 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
         hazards.insert(k);
         more = true;
       }
+    // (A read banked for its depth alone that a stage more puts past the
+    // state pass stays combinational.)
+    for (auto *op : topo)
+      if (isEarly(op) && deepOnly.contains(memoryOf(cast<seq::FirMemReadOp>(op))) &&
+          stageOfValue.lookup(op->getResult(0)) > int(last)) {
+        early.erase(memoryOf(cast<seq::FirMemReadOp>(op)));
+        more = true;
+      }
     if (!more)
       break;
   }
@@ -13461,7 +13629,7 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
   }
 
   // The logic: each op's operands at its stage.
-  unsigned bankedReads = 0, bankCount = 0;
+  unsigned bankedReads = 0, bankCount = 0, syncBanks = 0;
   for (auto *op : topo) {
     int stage = stageOfValue.lookup(op->getResult(0));
     if (stage < 0)
@@ -13522,12 +13690,46 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
         Value addr = reg(read.getAddress(), "pp_" + base + "_addr");
         Value en = read.getEnable() ? reg(read.getEnable(), "pp_" + base + "_en")
                                     : Value();
+        // The instance: the stage registers' (any evaluation's) at k - 1.
+        Value instReg = rinst ? keepReg(pipe(rinst, k - 1), liveNow(), "pp_" + base + "_inst")
+                              : Value();
+        // `pp-sync-banks`: the bank read registered (its address, enable and
+        // instance the registers' next values: the stage k - 1 value where
+        // the register loads, else the register's own), its data the read
+        // of the registers as a combinational read of them gives: the row is
+        // the evaluated instance's, which only its own state pass (at stage
+        // P >= k) writes. A deep LUT RAM's multiplexers then end in the
+        // RAM's register (or a block RAM) instead of the logic after it.
+        // (A constant is its own next value: an entry's fixed row.)
+        auto isCE = [](Value r) {
+          return !r || r.getDefiningOp<seq::CompRegClockEnabledOp>() ||
+                 r.getDefiningOp<hw::ConstantOp>();
+        };
+        // (pp-sync-banks: the threaded bank read registered, from these
+        // registers' next values: see kHostSyncRead.)
+        if (ppSyncBanks && getenv("FOLDSIM_SYNC_DEBUG") && syncDeep.contains(memory) &&
+            !(isCE(addr) && isCE(en) && isCE(instReg))) {
+          llvm::errs() << "pp-sync-banks: " << cls.name << " " << base << " not registered: addr "
+                       << isCE(addr) << " stage " << stageAt(read.getAddress()) << " en " << isCE(en)
+                       << " inst " << isCE(instReg) << " k " << k << "; addr ";
+          if (auto *d = read.getAddress().getDefiningOp())
+            d->print(llvm::errs());
+          else
+            llvm::errs() << "argument";
+          llvm::errs() << "\n";
+        }
+        // (Only a deep read, past the row bound: a shallow bank's read is
+        // a few levels, and registered it would only move its LUT RAM into
+        // a block RAM.)
+        bool deepRead = syncDeep.contains(memory);
+        if (ppSyncBanks && deepRead && isCE(addr) && isCE(en) && isCE(instReg)) {
+          bank.memory->setAttr(kHostSyncRead, UnitAttr::get(context));
+          ++syncBanks;
+        }
         auto bankRead = seq::FirMemReadOp::create(b, bank.memory, addr,
                                                   read.getClk(), en);
-        // The instance: the stage registers' (any evaluation's) at k - 1.
         if (rinst)
-          readInst[bankRead] =
-              keepReg(pipe(rinst, k - 1), liveNow(), "pp_" + base + "_inst");
+          readInst[bankRead] = instReg;
         datas.push_back(bankRead.getData());
         ++bankCount;
       }
@@ -13676,7 +13878,8 @@ LogicalResult StaticFolder::stagePP(Class &cls, Block *body,
        << " constant leading bits left out), " << holdBits
        << " hold bits (" << rawBits << " of them a row's register values), " << pipeBits << " stage register bits (ready cone, "
        << lateCone.size() << " ops); " << bankedReads << " banked reads, "
-       << bankCount << " bank address copies; captures by need:";
+       << bankCount << " bank address copies (" << syncBanks
+       << " registered reads, pp-sync-banks); captures by need:";
     for (auto &[w, n] : whyBits)
       os << " " << w << " " << n << ";";
     os << " by pass:";
@@ -17087,16 +17290,18 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       memory.erase();
       continue;
     }
+    bool hostSync = memory->hasAttr(kHostSyncRead) && memory.getReadLatency() == 0;
     auto threadedMemory = seq::FirMemOp::create(
-        b, threadedType, memory.getReadLatency(), memory.getWriteLatency(),
-        memory.getRuw(), memory.getWuw(), memory.getNameAttr(),
+        b, threadedType, hostSync ? 1 : memory.getReadLatency(), memory.getWriteLatency(),
+        hostSync ? seq::RUW::Old : memory.getRuw(), memory.getWuw(), memory.getNameAttr(),
         hw::InnerSymAttr{}, seq::FirMemInitAttr{}, memory.getPrefixAttr(),
         memory.getOutputFileAttr());
     threadedMemory->setDialectAttrs(memory->getDialectAttrs());
+    threadedMemory->removeAttr(kHostSyncRead);
     if (auto *rule = storageFor(cls, memory.getName().value_or(""),
                                 /*reg=*/false, memType.getWidth())) {
       if ((rule->kind == "block" || rule->kind == "ultra") &&
-          memory.getReadLatency() == 0)
+          memory.getReadLatency() == 0 && !hostSync)
         return memory.emitError("storage: '")
                << rule->kind << "' RAM for '" << rule->store
                << "', which reads combinationally";
@@ -17134,7 +17339,25 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       }
       auto read = cast<seq::FirMemReadOp>(user);
       Value data;
-      if (memory.getReadLatency() == 0) {
+      if (hostSync) {
+        // pp-sync-banks: a host cycle ahead, from the registers' next values
+        // (a constant address its own).
+        auto nextOf = [&](Value r) -> Value {
+          auto ce = r ? r.getDefiningOp<seq::CompRegClockEnabledOp>() : nullptr;
+          return ce ? Value(comb::MuxOp::create(b, ce.getClockEnable(), ce.getInput(), r)) : r;
+        };
+        Value inst = readInst.lookup(read);
+        Value addr = nextOf(read.getAddress());
+        Value full = addr;
+        if (idxWidth) {
+          Value i = nextOf(inst ? inst : region.inst);
+          full = !addrWidth ? i
+                            : b.createOrFold<comb::ConcatOp>(
+                                  b.createOrFold<comb::ExtractOp>(b.getIntegerType(addrWidth), addr, 0), i);
+        }
+        data = seq::FirMemReadOp::create(b, threadedMemory, full, hostClock,
+                                         nextOf(read.getEnable()));
+      } else if (memory.getReadLatency() == 0) {
         data = seq::FirMemReadOp::create(b, threadedMemory,
                                          addressOf(read.getAddress(), read),
                                          hostClock, read.getEnable());
@@ -18735,6 +18958,9 @@ static DenseMap<Value, TableSource> gTableSource;
 
 static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                        unsigned width, unsigned site, ArrayRef<uint8_t> care);
+static Value tableCare(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+                       ArrayRef<uint8_t> care, unsigned width,
+                       unsigned site = __builtin_LINE());
 
 static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                    unsigned width, unsigned site) {
@@ -18759,6 +18985,47 @@ static Value table(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows
     }
   }
   return v;
+}
+
+/// FOLDSIM_SLOT_CHECK: the simulation stops (`what`) at a host clock edge
+/// where `ne` is high.
+static void slotCheckFatal(ImplicitLocOpBuilder &b, Value clk, Value ne, const std::string &what) {
+  Value clock = seq::FromClockOp::create(b, clk);
+  sv::AlwaysOp::create(b, ArrayRef{sv::EventControl::AtPosEdge}, ArrayRef{clock}, [&] {
+    sv::IfOp::create(b, ne, [&] { sv::FatalProceduralOp::create(b, 1, b.getStringAttr(what)); });
+  });
+}
+
+/// The host clock of the module `v` is built in (null if none).
+static Value hostClockOf(Value v) {
+  auto mod = v.getParentBlock()->getParentOp();
+  if (auto hm = dyn_cast<hw::HWModuleOp>(mod))
+    for (auto [k, name] : llvm::enumerate(hm.getInputNames()))
+      if (cast<StringAttr>(name).getValue() == "hostClock")
+        return hm.getBodyBlock()->getArgument(k);
+  return {};
+}
+
+/// slot-ahead: `rows[index]` (index a position the counters know) from a
+/// register beside each position register, its next value's decoder read at
+/// the position a host cycle before (PosCounters::ahead).
+static Value tableAhead(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
+                        unsigned width, ArrayRef<uint8_t> care, bool raw = false) {
+  auto *pc = foldsim::currentPosCounters();
+  // (`raw`: the shifted rows a constant too, as the table was.)
+  auto decode = [&](Value pos, ArrayRef<uint64_t> rr, ArrayRef<uint8_t> rc) -> Value {
+    bool outer = gAheadBusy, outerRaw = gTableRaw;
+    gAheadBusy = true;
+    gTableRaw = outerRaw || raw;
+    Value v = tableCare(b, pos, rr, rc, width);
+    gAheadBusy = outer;
+    gTableRaw = outerRaw;
+    return v;
+  };
+  uint64_t key = llvm::hash_combine(llvm::hash_combine_range(rows.begin(), rows.end()),
+                                    llvm::hash_combine_range(care.begin(), care.end()), width,
+                                    raw, uint64_t(0xa4eadull));
+  return pc->ahead(b, index, rows, width, key, decode, care);
 }
 
 /// `reg1(table(index, rows))`, the table's decoder free to take that
@@ -18796,6 +19063,31 @@ static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> 
     bool counted = pc && pc->knows(index);
     uint64_t segsBefore = foldsim::slotSequencerStats().segments;
     if (Value decoded = tryDecodeTable(b, index, rows, width, care)) {
+      // slot-ahead: a decoder of K segments or more at a position read from
+      // a register loaded a host cycle ahead instead (this decoder dies).
+      uint64_t segs = foldsim::slotSequencerStats().segments - segsBefore;
+      if (gSlotAhead && !gAheadBusy && counted && segs >= gSlotAhead) {
+        if (getenv("FOLDSIM_TABLE_SITES"))
+          llvm::errs() << "table-ahead " << site << " " << rows.size() << " " << width << " "
+                       << segs << "\n";
+        Value r = tableAhead(b, index, rows, width, care);
+        if (getenv("FOLDSIM_SLOT_CHECK"))
+          if (Value clk = hostClockOf(index)) {
+            Value ne = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, r, decoded);
+            if (!care.empty()) {
+              SmallVector<uint64_t> careRows(care.begin(), care.end());
+              gTableRaw = true;
+              Value read = table(b, index, careRows, 1, site);
+              gTableRaw = false;
+              ne = comb::AndOp::create(b, ne, read);
+            }
+            slotCheckFatal(b, clk, ne,
+                           ("foldsim: slot-ahead: a register differs from its decoder (line " +
+                            Twine(site) + ", " + Twine(rows.size()) + " x " + Twine(width) + ")")
+                               .str());
+          }
+        return r;
+      }
       if (getenv("FOLDSIM_TABLE_SITES"))
         llvm::errs() << "table-dec " << site << " " << rows.size() << " " << width << " "
                      << foldsim::slotSequencerStats().segments - segsBefore << "\n";
@@ -18827,15 +19119,10 @@ static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> 
             gTableRaw = false;
             ne = comb::AndOp::create(b, ne, read);
           }
-          Value clock = seq::FromClockOp::create(b, clk);
-          std::string what = ("foldsim: slot-sequencer: decoder differs from its table (line " + Twine(site) + ", " +
-                              Twine(rows.size()) + " x " + Twine(width) + ")").str();
-          sv::AlwaysOp::create(b, ArrayRef{sv::EventControl::AtPosEdge},
-                               ArrayRef{clock}, [&] {
-            sv::IfOp::create(b, ne, [&] {
-              sv::FatalProceduralOp::create(b, 1, b.getStringAttr(what));
-            });
-          });
+          slotCheckFatal(b, clk, ne,
+                         ("foldsim: slot-sequencer: decoder differs from its table (line " +
+                          Twine(site) + ", " + Twine(rows.size()) + " x " + Twine(width) + ")")
+                             .str());
         }
       }
       return decoded;
@@ -18860,14 +19147,67 @@ static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> 
           inst[p] = unsigned(i);
         }
       }
-      Value hit = table(b, index, valid, 1);
-      Value at = table(b, index, inst, iw);
+      // slot-ahead: the sequence's pass and instance at the position from
+      // registers beside the position's (PosCounters::ahead), loaded a host
+      // cycle before: the instance's decoder (a segment per run of the
+      // sequence: tens at hundreds of instances) and the per-instance
+      // table no longer chain in one host cycle.
+      auto *posCtrs = foldsim::currentPosCounters();
+      bool ahead = gSlotAhead && !gAheadBusy && posCtrs && posCtrs->knows(index);
+      auto byAhead = [&](ArrayRef<uint64_t> r, unsigned w) -> Value {
+        return tableAhead(b, index, r, w, {});
+      };
+      Value hit = ahead ? byAhead(valid, 1) : table(b, index, valid, 1);
+      Value at = ahead ? byAhead(inst, iw) : table(b, index, inst, iw);
+      // (FOLDSIM_SLOT_CHECK: the tables built beside the registers; the
+      // simulation stops where they differ, the instance where it is read.)
+      if (ahead && getenv("FOLDSIM_SLOT_CHECK"))
+        if (Value clk = hostClockOf(index)) {
+          gTableRaw = true;
+          Value rawHit = table(b, index, valid, 1);
+          Value rawAt = table(b, index, inst, iw);
+          gTableRaw = false;
+          Value ne = comb::OrOp::create(
+              b, comb::ICmpOp::create(b, comb::ICmpPredicate::ne, hit, rawHit),
+              comb::AndOp::create(b, rawHit,
+                                  comb::ICmpOp::create(b, comb::ICmpPredicate::ne, at, rawAt)));
+          slotCheckFatal(b, clk, ne,
+                         ("foldsim: slot-ahead: a register differs from its table (line " +
+                          Twine(site) + ", " + Twine(rows.size()) + " rows)")
+                             .str());
+        }
       Value v = table(b, at, fac.perInstance, width);
       gFactoring = false;
       auto &st = foldsim::slotSequencerStats();
       ++st.factored;
       st.factoredBits += (uint64_t(1) << indexWidth) * width;
       return comb::MuxOp::create(b, hit, v, hw::ConstantOp::create(b, type, 0));
+    }
+    // slot-ahead: a position table kept as a constant (no decoder) read
+    // from a register loaded a host cycle ahead too: its next value reads
+    // the constant of the rows shifted by one at the position, which
+    // replaces this read (the same constant bits), so the constant's
+    // multiplexers no longer chain into the reader.
+    if (gSlotAhead && !gAheadBusy && counted && !gFactoring) {
+      if (getenv("FOLDSIM_TABLE_SITES"))
+        llvm::errs() << "table-ahead-kept " << site << " " << rows.size() << " " << width << "\n";
+      Value r = tableAhead(b, index, rows, width, care, /*raw=*/true);
+      if (getenv("FOLDSIM_SLOT_CHECK"))
+        if (Value clk = hostClockOf(index)) {
+          gTableRaw = true;
+          Value raw = table(b, index, rows, width, site);
+          Value ne = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, r, raw);
+          if (!care.empty()) {
+            SmallVector<uint64_t> careRows(care.begin(), care.end());
+            ne = comb::AndOp::create(b, ne, table(b, index, careRows, 1, site));
+          }
+          gTableRaw = false;
+          slotCheckFatal(b, clk, ne,
+                         ("foldsim: slot-ahead: a register differs from its kept table (line " +
+                          Twine(site) + ", " + Twine(rows.size()) + " x " + Twine(width) + ")")
+                             .str());
+        }
+      return r;
     }
     auto segs = foldsim::slotSegments(rows, width);
     foldsim::countFallback(indexWidth, width, segs.size());
@@ -19355,8 +19695,7 @@ static Value tryDecodeTable(ImplicitLocOpBuilder &b, Value index,
 /// table() of a value read only where `care` (a valid bit beside it): the
 /// other rows take whatever value decodes in the fewest segments.
 static Value tableCare(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
-                       ArrayRef<uint8_t> care, unsigned width,
-                       unsigned site = __builtin_LINE()) {
+                       ArrayRef<uint8_t> care, unsigned width, unsigned site) {
   if (!getenv("FOLDSIM_NO_CARE"))
     gCare = care;
   Value v = table(b, index, rows, width, site);
@@ -26055,6 +26394,8 @@ void FoldStaticPass::runOnOperation() {
   folder.stateInRamZeroLinks = stateInRamZeroLinks;
   folder.stateInRamPP = stateInRamPP;
   folder.ppAddressFanout = std::max(1u, unsigned(stateInRamPPFanout));
+  folder.ppSyncRows = ppSyncBanks;
+  folder.zeroChainLevels = zeroChainLevels;
   folder.ppPackStores = stateInRamPPPack;
   folder.ppReplicaDepth = stateInRamPPReplicas;
   folder.stateScratchBits = stateScratchBits;
@@ -26185,6 +26526,7 @@ void FoldStaticPass::runOnOperation() {
   gSlotSegments = slotSegments;
   gSlotColumnAffine = slotColumnAffine;
   gSlotTableCompose = slotTableCompose;
+  gSlotAhead = slotAhead;
   // (FOLDSIM_SLOT_COLUMN_AFFINE, a test hook: the whole suite with both.)
   if (getenv("FOLDSIM_SLOT_COLUMN_AFFINE"))
     gSlotColumnAffine = gSlotTableCompose = true;

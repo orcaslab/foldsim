@@ -642,6 +642,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "pass, forwarded from the register to a read in between: the "
            "producer's path ends at that one register, not at every reader's "
            "link">,
+    Option<"zeroChainLevels", "zero-chain-levels", "unsigned", "0",
+           "With zero-latency-chains: the most estimated logic levels a chain "
+           "of links taken in their producers' host cycle may reach into a "
+           "reader's state (each class's levels before its outputs and after "
+           "its inputs, each link's choice of source 3 more, instance by "
+           "instance); the first link of a chain past it is taken a host "
+           "cycle later from its register. 0: no bound (zero-chain-hops "
+           "alone)">,
     Option<"zeroChainHops", "zero-chain-hops", "unsigned", "0",
            "With zero-latency-chains: the most links taken in their "
            "producers' host cycle a combinational path may cross, instance "
@@ -970,6 +978,18 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "(an instance decoded from the position) that does not decode is "
            "read through the inner table's position instead (its rows "
            "composed), where the position's decoders and counters take it">,
+    Option<"slotAhead", "slot-ahead", "unsigned", "0",
+           "With slot-segments, K (0: off): a position table read through a "
+           "class's pass sequence (a table per instance at the instance "
+           "passing there) takes the sequence's pass and instance at the "
+           "position, and a position table decoded in K segments or more "
+           "takes its value, from registers beside the position registers, "
+           "loaded a host cycle before with the table at the position's next "
+           "(held, the rows shifted by one decoded at the position, or a "
+           "frame's end's constants), instead of through the decoder in the "
+           "reader's host cycle: the same values, no schedule or host cycle "
+           "moves (Beacon, 64/128 SMs: the rank counters, the PP slot sets "
+           "and the mailbox rows of a switch network's classes)">,
     Option<"slotSegments", "slot-segments", "unsigned", "0",
            "Slot tables (constants read by the frame's position or an "
            "instance) of at most this many affine segments of nonzero rows "
@@ -1106,6 +1126,16 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "ultra), read at the instance two host cycles ahead and written a "
            "host cycle after the state pass, as state-in-ram P = 1's rows; "
            "given a state gap of 4, else (or false) a store each">,
+    Option<"ppSyncBanks", "pp-sync-banks", "unsigned", "0",
+           "With state-in-ram-pp, R (0: off): a memory read combinationally "
+           "whose threaded rows (entries x instances) pass R is banked (each "
+           "bank's address, enable and instance registered at the stage "
+           "before the read) and threaded as a registered read of those "
+           "registers' next values: the same data (the row is the evaluated "
+           "instance's, written only by its own state pass), and the deep "
+           "LUT RAM's read (Beacon 1 + log2(rows) - 6 levels) ends in the "
+           "RAM's register, a block RAM, not in the logic after it; banks "
+           "past state-in-ram-pp-fanout of fewer rows stay combinational">,
     Option<"stateInRamPPFanout", "state-in-ram-pp-fanout", "unsigned", "96",
            "With state-in-ram-pp: the most RAM primitives a combinationally "
            "read memory's address register drives (the memory is banked by "

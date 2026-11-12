@@ -382,6 +382,10 @@ def frame_options(a):
         fold += ' slot-column-affine'
     if getattr(a, 'slot_table_compose', False):
         fold += ' slot-table-compose'
+    if getattr(a, 'pp_sync_banks', 0):
+        fold += f' pp-sync-banks={a.pp_sync_banks}'
+    if getattr(a, 'slot_ahead', 0):
+        fold += f' slot-ahead={a.slot_ahead}'
     if getattr(a, 'modulo_linear', None) is not None:
         fold += f' modulo-linear={a.modulo_linear}'
     if getattr(a, 'ready_choice', ''):
@@ -441,6 +445,8 @@ def frame_options(a):
         fold += ' share-link-writes=false'
     if getattr(a, 'zero_chain_hops', None):
         fold += f' zero-chain-hops={a.zero_chain_hops}'
+    if getattr(a, 'zero_chain_levels', None):
+        fold += f' zero-chain-levels={a.zero_chain_levels}'
     if getattr(a, 'page', '') and a.page != 'auto':
         fold += f' page={page_option(a.page)}'
     if getattr(a, 'no_page_masks', False):
@@ -702,7 +708,10 @@ def memory_registers(a, flat, out):
                       file=sys.stderr)
             continue
         if rx is None:
-            take, rows = foldsim_storage.memory_as_registers(m, instances[m['module']])
+            # (Static, no copies asked for: each module's instances in one
+            # copy, the only shape to price.)
+            take, rows = foldsim_storage.memory_as_registers(
+                m, instances[m['module']], one_copy=bool(a.static) and not a.copies)
             price = '; LUT sites as memory / registers: ' + ', '.join(
                 f'{t} instances {mem:.0f} / {reg:.0f}' for t, mem, reg in rows)
         else:
@@ -1604,6 +1613,15 @@ def build_parser():
                     help='with --slot-segments: a table read at a position table\'s value that does not decode is '
                          'read through the inner table\'s position (composed rows) (foldsim-fold-static '
                          'slot-table-compose)')
+    ap.add_argument('--pp-sync-banks', type=int, default=0, metavar='ROWS',
+                    help='with --state-in-ram-pp: a combinational read of a memory of more than ROWS threaded rows '
+                         'is banked and registered from its registers\' next values (same data; Beacon) '
+                         '(foldsim-fold-static pp-sync-banks)')
+    ap.add_argument('--slot-ahead', type=int, default=0, metavar='K',
+                    help='with --slot-segments: position tables read through a class\'s pass sequence, and '
+                         'position tables decoded in K segments or more, from registers beside the position '
+                         'registers loaded a host cycle ahead (same values; Beacon) (foldsim-fold-static '
+                         'slot-ahead)')
     ap.add_argument('--slot-column-affine', action='store_true',
                     help='with --slot-segments: instance tables the segments do not decode cut into column-affine '
                          'pieces (a period\'s rows plus a few slopes times the quotient, by a constant division) '
@@ -1755,6 +1773,10 @@ def build_parser():
                     help='with --static: a link read forwarded past the read register where the '
                          "reader's logic behind it stays below N levels (default 8; 0: into the "
                          'read register) (foldsim-fold-static)')
+    ap.add_argument('--zero-chain-levels', type=int, default=0, metavar='L',
+                    help='with --zero-latency-chains: the most estimated levels a chain of zero-latency links may '
+                         'reach into a reader\'s state; the first link past it is registered (foldsim-fold-static '
+                         'zero-chain-levels)')
     ap.add_argument('--zero-chain-hops', type=int, metavar='N',
                     help="with --zero-latency-chains: at most N links taken in their producers' host "
                          'cycle on a combinational path; a link past them is taken a host cycle later '

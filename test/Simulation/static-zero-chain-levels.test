@@ -1,0 +1,31 @@
+# REQUIRES: verilator
+# zero-chain-levels L (with zero-latency-chains): a chain of links taken in their producers' host cycle is
+# held to L estimated levels into a reader's state (each class's levels before its outputs and after its
+# inputs, 3 more a link for its choice of source), instance by instance; the first link of a chain past it
+# is taken a host cycle later from its register (zero-chain-hops bounds the hops alone). On
+# static-ready-search.mlir's model (10 zero-latency links, all taken without a bound): L 100 cuts none,
+# L 8 six (II 6 unchanged), L 4 all ten (II 7: the frame needs the host cycle). Exact against the target.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: mkdir -p %t/l100 && foldsim-opt %S/static-ready-search.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=S,A,B netlist},foldsim-fold-static{module=Top modulo zero-latency-links zero-latency-chains zero-chain-levels=100 report=%t/l100/schedule.txt})" -o %t/l100/sim.mlir 2> %t/l100/fold.log
+# RUN: FileCheck %s --check-prefix=L100 < %t/l100/fold.log
+# RUN: mkdir -p %t/l8 && foldsim-opt %S/static-ready-search.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=S,A,B netlist},foldsim-fold-static{module=Top modulo zero-latency-links zero-latency-chains zero-chain-levels=8 report=%t/l8/schedule.txt})" -o %t/l8/sim.mlir 2> %t/l8/fold.log
+# RUN: FileCheck %s --check-prefix=L8 < %t/l8/fold.log
+# RUN: firtool --format=mlir %t/l8/sim.mlir -o %t/l8/sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/l8/obj %S/Inputs/tb_staged.sv %t/l8/sim.sv > %t/l8/build.log 2>&1
+# RUN: %t/l8/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/l8/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 | FileCheck %s
+# RUN: mkdir -p %t/l4 && foldsim-opt %S/static-ready-search.mlir --pass-pipeline="builtin.module(foldsim-extract-models{module=Top models=S,A,B netlist},foldsim-fold-static{module=Top modulo zero-latency-links zero-latency-chains zero-chain-levels=4 copies=A:2,B:2 report=%t/l4/schedule.txt})" -o %t/l4/sim.mlir 2> %t/l4/fold.log
+# RUN: FileCheck %s --check-prefix=L4 < %t/l4/fold.log
+# RUN: firtool --format=mlir %t/l4/sim.mlir -o %t/l4/sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/l4/obj %S/Inputs/tb_staged.sv %t/l4/sim.sv > %t/l4/build.log 2>&1
+# RUN: %t/l4/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/l4/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 | FileCheck %s
+# L100: zero-chain-levels 100: 0 links cut
+# L100: zero-latency links: 10 of 10
+# L8: zero-chain-levels 8: 6 links cut
+# L8: II = 6
+# L8: zero-latency links: 4 of 10
+# L4: zero-chain-levels 4: {{[0-9]+}} links cut
+# L4: zero-latency links: 0 of
+# CHECK: z0: 00 00 01 07 0f 17 1e 28 23 2e 3a
+# CHECK: z1: 00 02 04 06 08 0a 0c 0e 10 11 13

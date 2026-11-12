@@ -909,12 +909,15 @@ def form_sites(c):
     return sites(c) + FF_SITES * c['ff']
 
 
-def memory_as_registers(m, instances):
+def memory_as_registers(m, instances, one_copy=False):
     """Whether memory `m` (memory_ports) is cheaper as registers for every
     copy of 1 to `instances` instances (the two ends), and the prices
-    [(instances, as a memory, as registers)] in LUT sites."""
+    [(instances, as a memory, as registers)] in LUT sites. `one_copy`: the
+    fold keeps every instance of a module in one copy (no copies asked for):
+    that copy's price alone (a one-instance copy never exists)."""
+    sizes = {max(1, instances)} if one_copy else {1, max(1, instances)}
     rows = [(t, form_sites(memory_form_cost(m, t)), form_sites(register_form_cost(m, t)))
-            for t in sorted({1, max(1, instances)})]
+            for t in sorted(sizes)]
     return all(r < mm for _, mm, r in rows), rows
 
 
