@@ -1,5 +1,6 @@
 # (Placement cases on hand-sized regions, sized before the 11-11 count corrections (the level's array reads,
-# masked LUTRAM, the level logic's synthesized share): counted as before, so the cases stay the ones they test.)
+# masked LUTRAM, the level logic's synthesized share) and the 11-12 ones (distributed RAM as Versal builds it, block
+# RAM aspect ratios, ROM tables, per-slice holds): counted as before, so the cases stay the ones they test.)
 # (11-08: the runs pin --no-drop-dead-inputs --no-staged-link-direct, the defaults before then, so that the
 # link counts and registers checked below stay those of the feature under test.)
 # Per-copy SLR caps. A class copy is placed whole in an SLR where it can; one
@@ -34,10 +35,10 @@
 # of 100 URAM it fits either. Without a placement model in the region the
 # SLLs are not projected.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/storage
-# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 foldsim --srcs top.f --top Top --out %t/x --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --storage 'Leaf:mem=ultra' Leaf 2> %t/x.log
-# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-small.json --foldsim-opt foldsim-opt --out %t/any | FileCheck %s --check-prefix=ANY
-# RUN: not env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-small.json --foldsim-opt foldsim-opt --copy-cap SLR1 --out %t/small | FileCheck %s --check-prefix=SMALL
-# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-big.json --foldsim-opt foldsim-opt --copy-cap smallest --out %t/big | FileCheck %s --check-prefix=BIG
+# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 FOLDSIM_COST_VERSAL_LUTRAM=0 FOLDSIM_COST_BRAM_ASPECT=0 FOLDSIM_COST_ROM_ARRAYS=0 FOLDSIM_COST_SLICED_HOLDS=0 foldsim --srcs top.f --top Top --out %t/x --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --storage 'Leaf:mem=ultra' Leaf 2> %t/x.log
+# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 FOLDSIM_COST_VERSAL_LUTRAM=0 FOLDSIM_COST_BRAM_ASPECT=0 FOLDSIM_COST_ROM_ARRAYS=0 FOLDSIM_COST_SLICED_HOLDS=0 python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-small.json --foldsim-opt foldsim-opt --out %t/any | FileCheck %s --check-prefix=ANY
+# RUN: not env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 FOLDSIM_COST_VERSAL_LUTRAM=0 FOLDSIM_COST_BRAM_ASPECT=0 FOLDSIM_COST_ROM_ARRAYS=0 FOLDSIM_COST_SLICED_HOLDS=0 python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-small.json --foldsim-opt foldsim-opt --copy-cap SLR1 --out %t/small | FileCheck %s --check-prefix=SMALL
+# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 FOLDSIM_COST_VERSAL_LUTRAM=0 FOLDSIM_COST_BRAM_ASPECT=0 FOLDSIM_COST_ROM_ARRAYS=0 FOLDSIM_COST_SLICED_HOLDS=0 python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-big.json --foldsim-opt foldsim-opt --copy-cap smallest --out %t/big | FileCheck %s --check-prefix=BIG
 # ANY: SLR1 capacity: lut 50,000, lutram 50,000, ff 100,000, uram 0.0, bram 100.0
 # ANY: copy cap: any (SLR1, SLR0)
 # ANY: Leaf: lut {{[0-9,]+}}, lutram {{[0-9,]+}}, ff {{[0-9,]+}}, uram 1.0, bram 0.0; of each SLR's capacity (binding resource): SLR1 inf %, SLR0 50 %
@@ -54,7 +55,7 @@
 # cut, filling its SLR's room and the rest in the other; its own cut by Rent's
 # rule, the links between the sides and the simulator level's constant are
 # the boundary's SLLs, a warning over the budget's 30.
-# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-place.json --foldsim-opt foldsim-opt --copy-cap none --out %t/place | FileCheck %s --check-prefix=PLACE
+# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 FOLDSIM_COST_VERSAL_LUTRAM=0 FOLDSIM_COST_BRAM_ASPECT=0 FOLDSIM_COST_ROM_ARRAYS=0 FOLDSIM_COST_SLICED_HOLDS=0 python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-place.json --foldsim-opt foldsim-opt --copy-cap none --out %t/place | FileCheck %s --check-prefix=PLACE
 # PLACE: (no whole assignment: Leaf left out, spread over the room the others leave)
 # PLACE: the design over the region: lut 69 %, lutram 24 %, ff 60 % (region fill lut 75 %, lutram 75 %, ff 75 %)
 # PLACE: SLR1 as placed: lut 112 (75 %)
@@ -67,9 +68,9 @@
 # buffers and the simulator level); --resources schedule is an estimate,
 # never a verdict.
 # RUN: mkdir -p %t/nonet && cp %t/x/schedule.txt %t/nonet/
-# RUN: not env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 python3 %foldsim_tools/foldsim_sll_check.py %t/nonet --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-place.json --foldsim-opt foldsim-opt --out %t/nn | FileCheck %s --check-prefix=NONET
+# RUN: not env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 FOLDSIM_COST_VERSAL_LUTRAM=0 FOLDSIM_COST_BRAM_ASPECT=0 FOLDSIM_COST_ROM_ARRAYS=0 FOLDSIM_COST_SLICED_HOLDS=0 python3 %foldsim_tools/foldsim_sll_check.py %t/nonet --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-place.json --foldsim-opt foldsim-opt --out %t/nn | FileCheck %s --check-prefix=NONET
 # NONET: nonet: REFUSE: no netlist ({{.*}}foldsim_sim.mlir missing)
-# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-place.json --resources schedule --foldsim-opt foldsim-opt --out %t/sched | FileCheck %s --check-prefix=SCHED
+# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 FOLDSIM_COST_VERSAL_LUTRAM=0 FOLDSIM_COST_BRAM_ASPECT=0 FOLDSIM_COST_ROM_ARRAYS=0 FOLDSIM_COST_SLICED_HOLDS=0 python3 %foldsim_tools/foldsim_sll_check.py %t/x --log %t/x.log --slr-region %S/Inputs/slr-copy-cap/region-place.json --resources schedule --foldsim-opt foldsim-opt --out %t/sched | FileCheck %s --check-prefix=SCHED
 # SCHED: resources from the schedule (AN ESTIMATE ONLY
 # SCHED: x: ESTIMATE (schedule resources, not a verdict)
 
@@ -79,11 +80,11 @@
 # projected, within the budget here) and fails the 11-08 rule under strict
 # (slr-rule.test), --sll-check or not. (Region region-place-drv.json: SLRs of 146
 # LUTs, the copy past each by its flops.)
-# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 foldsim --srcs top.f --top Top --out %t/d --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --storage 'Leaf:mem=ultra' --slr-region %S/Inputs/slr-copy-cap/region-place-drv.json --sll-check Leaf 2>&1 | FileCheck %s --check-prefix=DRV
+# RUN: env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 FOLDSIM_COST_VERSAL_LUTRAM=0 FOLDSIM_COST_BRAM_ASPECT=0 FOLDSIM_COST_ROM_ARRAYS=0 FOLDSIM_COST_SLICED_HOLDS=0 foldsim --srcs top.f --top Top --out %t/d --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --storage 'Leaf:mem=ultra' --slr-region %S/Inputs/slr-copy-cap/region-place-drv.json --sll-check Leaf 2>&1 | FileCheck %s --check-prefix=DRV
 # DRV: foldsim: SLL check: d: WARN: {{[0-9,]+}} SLLs projected over SLR1-SLR0 (budget 30); Leaf cut over SLRs
 # DRV: GUIDE: Leaf straddles
 # RUN: FileCheck %s --check-prefix=DRVR < %t/d/sll/sll.txt
 # DRVR: (past every SLR: Leaf left out, spread over the room the others leave)
-# RUN: not env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 foldsim --srcs top.f --top Top --out %t/ds --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --storage 'Leaf:mem=ultra' --slr-region %S/Inputs/slr-copy-cap/region-place-drv.json --sll-check --slr-policy strict Leaf 2>&1 | FileCheck %s --check-prefix=DRVS
+# RUN: not env FOLDSIM_COST_LEVEL_ARRAY_READS=0 FOLDSIM_COST_LEVEL_SCALE=1 FOLDSIM_COST_MASKED_LUTRAM=0 FOLDSIM_COST_VERSAL_LUTRAM=0 FOLDSIM_COST_BRAM_ASPECT=0 FOLDSIM_COST_ROM_ARRAYS=0 FOLDSIM_COST_SLICED_HOLDS=0 foldsim --srcs top.f --top Top --out %t/ds --static --no-drop-dead-inputs --no-staged-link-direct --copies Leaf:1 --storage 'Leaf:mem=ultra' --slr-region %S/Inputs/slr-copy-cap/region-place-drv.json --sll-check --slr-policy strict Leaf 2>&1 | FileCheck %s --check-prefix=DRVS
 # DRVS: foldsim: SLL check: ds: REFUSE: Leaf fits no SLR whole
 # DRVS: foldsim: error: SLR rule: no class copy may cross an SLR boundary

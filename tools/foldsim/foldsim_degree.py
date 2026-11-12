@@ -978,7 +978,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             if per:
                 units.append(unit(c, f'regs>={w}', per, lam, None if regs_free else 'distributed'))
         mems = {}
-        for (name, d, w, r, wr, rl, st, mask, named) in est[c]['mems']:
+        for (name, d, w, r, wr, rl, st, mask, named, *_) in est[c]["mems"]:
             mems.setdefault((name, named, d, w, r, wr, rl, st, mask), 0)
             mems[(name, named, d, w, r, wr, rl, st, mask)] += 1
         for (name, named, d, w, r, wr, rl, st, mask), cnt in mems.items():

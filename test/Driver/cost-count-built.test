@@ -1,0 +1,17 @@
+# The fit count prices a netlist as Vivado builds it on Versal (foldsim_cost.parse(..., count=True),
+# foldsim_fitdb.memory, foldsim_cost.mem_parts / uram_count; a32-UR 11-12, from V1's OOC synthesis of the A100-32
+# fold at 64 SMs); the compiler's own choices keep parse's default (`plain`).
+# - a read of a 128 x 8 constant table is a ROM: 8 varying bits x (2 LUT6 blocks + their select) = 24 LUTs, not a
+#   select of 128 entries (338.7); a rom_style "block" 64 x 16 table read into a register a block RAM (half a RAMB36,
+#   its 336 LUTs refunded);
+# - a product of two i26 values whose live bits are 13 (SIMD-packed 4-bit fields) one DSP58, not 4 by result width;
+# - a 4,096 x 1 distributed RAM read combinationally: 64 RAM64X1D (128 LUTRAM LUTs) and, as logic, the 64 blocks'
+#   read select (21) and a write enable a block (64): 85 (VX_fma_unit's slot RAMs synthesized 128 + 89);
+# - an 8K x 72 byte-masked ultra RAM: 2 URAM288 with its cascade_height, 3 without (Vivado's default build);
+# - a 1,024 x 36 block RAM one RAMB36 (1K x 36), not two 512 x 72 (mem_cost, the planner's price, says 2);
+# - xil_fdiv at its synthesized 1,476 LUTs, 1,389 FFs.
+# RUN: python3 -c "import sys; sys.path.insert(0, '%foldsim_tools'); import foldsim_cost as c, foldsim_fitdb as f; [print('count' if k else 'plain', 'array_get %%.1f' %% m.lut['array_get'], 'dsp', m.dsp, 'bram', m.bram, ' '.join('%%s %%s/%%s/%%s/%%s' %% (r[0], f.memory(r)['lutram'], f.memory(r)['mlogic'], f.memory(r)['uram'], f.memory(r)['bram']) for r in m.mems)) for k in (False, True) for m in [c.parse('%S/Inputs/cost-count-built/m.mlir', count=k)[0]['M']]]; print('bram 1024x36', c.mem_parts(1024, 36, 1, 1, 'block')[2], 'planner', c.mem_cost(1024, 36, 1, 1, 'block')[1]); print('fdiv', c.BLACKBOX['xil_fdiv'])" | FileCheck %s
+# CHECK: plain array_get 674.7 dsp 4 bram 0.0 tag 128/85/0.0/0 res 0.0/0.0/3/0.0 resc 0.0/0.0/2/0.0
+# CHECK: count array_get 24.0 dsp 1 bram 0.5 tag 128/85/0.0/0 res 0.0/0.0/3/0.0 resc 0.0/0.0/2/0.0
+# CHECK: bram 1024x36 1 planner 2
+# CHECK: fdiv (1476, 1389, 0)

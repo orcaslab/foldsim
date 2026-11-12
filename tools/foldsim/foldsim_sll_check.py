@@ -83,13 +83,13 @@ def split_top(pipeline):
 def mem_ram(rec):
     """(URAM288, RAMB36) of a foldsim_cost memory record as Vivado builds it: a
     ram_style ultra memory in 72-bit columns of 4,096 rows (Vivado puts a
-    small one in a whole URAM too), else foldsim_cost.mem_cost's block RAM."""
+    small one in a whole URAM too), else foldsim_cost.mem_parts's block RAM (its cheapest aspect ratio)."""
     _, d, w, r, wr, rl, st, mk, *_ = rec
     if st == 'ultra':
-        # A read port beyond the first is a copy (foldsim_storage.kind_cost).
-        copies = max(1, r if wr else math.ceil(r / 2))
-        return math.ceil(w / URAM_WIDTH) * math.ceil(d / URAM_DEPTH) * copies, 0.0
-    return 0.0, foldsim_cost.mem_cost(d, w, r, rl, st, mk)[1]
+        # A read port beyond the first is a copy (foldsim_storage.kind_cost); a deep one without its cascade_height
+        # at Vivado's default build (foldsim_cost.uram_count).
+        return foldsim_cost.uram_count(d, w, r, wr, mk, rec[9] if len(rec) > 9 else None), 0.0
+    return 0.0, foldsim_cost.mem_parts(d, w, r, rl, st, mk)[2]
 
 
 def add_memory(acc, rec):
@@ -97,10 +97,11 @@ def add_memory(acc, rec):
     `lutram`: a LUTRAM LUT takes a SLICEM's, of which an SLR has a share)."""
     u, b = mem_ram(rec)
     _, d, w, r, wr, rl, st, mk, *_ = rec
-    lr = foldsim_cost.mem_cost(d, w, r, rl, st, mk)[0] if st != 'ultra' else 0.0
+    # (Its read select and write enables are logic: LUTs, not LUTRAM sites.)
+    lr, lg, _ = foldsim_cost.mem_parts(d, w, r, rl, st, mk) if st != 'ultra' else (0.0, 0.0, 0.0)
     acc['uram'] += u
     acc['bram'] += b
-    acc['lut'] += lr
+    acc['lut'] += lr + lg
     acc['lutram'] += lr
     # The bits its ports carry (a feature of the copy's own wiring).
     acc['port_bits'] = acc.get('port_bits', 0) + w * (r + wr)
@@ -116,6 +117,7 @@ def subtree(mods, name, stop, acc):
     m = mods[name]
     acc['lut'] += sum(m.lut.values())
     acc['ff'] += m.ff
+    acc['bram'] += m.bram
     for rec in m.mems:
         add_memory(acc, rec)
     for child, _ in m.insts:
@@ -174,7 +176,7 @@ def netlist_resources(sim, copies, region, synthesis=None):
     synthesis of this netlist), each copy's own LUTs, LUTRAM and flops are
     the synthesized ones, and the copies it lacks take the measured ones'
     synthesized / counted ratio (a calibration per design)."""
-    mods, _ = foldsim_cost.parse(sim)
+    mods, _ = foldsim_cost.parse(sim, count=True)
     PARSED['mods'] = mods
     statics = {f'{c}_static' for c in copies if f'{c}_static' in mods}
     own, link = {}, {c: new_acc() for c in copies}
@@ -224,17 +226,29 @@ def netlist_resources(sim, copies, region, synthesis=None):
     ratio = {r: (sum(syn[c][r] for c in measured) / max(1e-9, sum(own[c][r] for c in measured))) if measured else None
              for r in ('lut', 'lutram', 'ff')}
 
-    def scale(v, sy=None):
+    # The residual synthesized-per-counted scales by part (`netlist_scales`: `copy` for a class copy's own module,
+    # `level` for the simulator level and its links; logic, LUTRAM and flops apart), where the region has them; else
+    # the flat netlist_*_scale.
+    parts = region.get('netlist_scales')
+
+    def scale(v, sy=None, part=None):
+        if parts and not sy and not syn:
+            p = parts[part]
+            logic = v['lut'] - v['lutram']
+            v['lut'] = (logic * p['logic'] + v['lutram'] * p['lutram']) * pl.get('lut', 1.0)
+            v['lutram'] = v['lutram'] * p['lutram'] * pl.get('lutram', 1.0)
+            v['ff'] = v['ff'] * p['ff'] * pl.get('ff', 1.0)
+            return
         for r, f in (('lut', ls), ('lutram', lr), ('ff', fs)):
             v[r] = (sy[r] if sy else v[r] * (ratio[r] if syn and ratio[r] else f)) * pl.get(r, 1.0)
     out = {}
     for c in copies:
-        scale(own[c], syn.get(c))
-        scale(link[c])
+        scale(own[c], syn.get(c), 'copy')
+        scale(link[c], part='level')
         out[c] = {r: own[c][r] + link[c][r] for r in RESOURCES}
         out[c]['io_bits'] = own[c].get('io_bits', 0)
         out[c]['port_bits'] = own[c].get('port_bits', 0) + link[c].get('port_bits', 0)
-    scale(rest)
+    scale(rest, part='level')
     # The kernel beside the simulator (its memory endpoints, virtual memory
     # controllers, host interface): not in the netlist, placed with it.
     kr = kernel_resources(os.path.dirname(os.path.abspath(sim)), region)
@@ -302,7 +316,7 @@ def split_copies(sim, gdir, res, names):
     is its subtree's share of the copy's netlist count (the copy's resources as counted: its links and scales kept);
     the crossing bits are the part instances' inputs from another part (each crossing a register to a register, one
     SLL a bit per boundary between their SLRs)."""
-    mods = PARSED.get('mods') or foldsim_cost.parse(sim)[0]
+    mods = PARSED.get("mods") or foldsim_cost.parse(sim, count=True)[0]
     fp = os.path.join(gdir, 'foldsim_floorplan.tcl')
     where = {}
     if os.path.exists(fp):
@@ -882,9 +896,12 @@ def main():
     res_est = dict(res, **{c: new_acc() for c in splits})
     room_whole = [{r: fill_of[r] * c[r] - t[r] for r in RESOURCES} for c, t in zip(full, top_spread)]
 
+    scales = (('by part: ' + ', '.join(f'{k} logic x{v["logic"]} LUTRAM x{v["lutram"]} FF x{v["ff"]}'
+                                      for k, v in region['netlist_scales'].items() if isinstance(v, dict)))
+              if region.get('netlist_scales') else
+              f'LUT x{region.get("netlist_lut_scale", 1.0)}, FF x{region.get("netlist_ff_scale", 1.0)}')
     lines = [f'{name}: SLRs {",".join(names)}, resources from the {mode}'
-             + (f' (LUT x{region.get("netlist_lut_scale", 1.0)}, FF x{region.get("netlist_ff_scale", 1.0)}, '
-                f'placed per synthesized {region.get("placed_per_synthesized", {})})'
+             + (f' ({scales}, placed per synthesized {region.get("placed_per_synthesized", {})})'
                 if mode == 'netlist' else ' (AN ESTIMATE ONLY: no stage registers, read buffers or simulator level)')
              + f'; margin {region.get("margin", 1.0)}; SLL budget {budget} a '
              f'boundary ({region.get("sll_per_boundary")} x {region.get("sll_margin")})']

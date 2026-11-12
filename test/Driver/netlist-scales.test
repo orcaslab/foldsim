@@ -1,0 +1,7 @@
+# The fit gate's residual synthesized-per-counted scales by part (foldsim_v80_slr.json `netlist_scales`, a32-UR
+# 11-12): a class copy's own logic, LUTRAM and flops by `copy`, the simulator level and its links by `level`; without
+# them the flat netlist_*_scale. Copy A of the fit-bound netlist: 51 logic LUTs (its 1,024 x 7 store's read select
+# and write enables) x 0.5 + 128 LUTRAM = 153.5, 8 flops x 0.5; copy B 16 flops x 0.5 and its link register's 8 x 2.
+# RUN: python3 -c "import sys; sys.path.insert(0, '%foldsim_tools'); import foldsim_sll_check as s; [print({c: [round(v[k], 1) for k in ('lut', 'lutram', 'ff')] for c, v in s.netlist_resources('%S/Inputs/fit-bound/foldsim_sim.mlir', ['A', 'B'], reg).items()}) for reg in ({'netlist_lut_scale': 1.0, 'netlist_ff_scale': 1.0}, {'netlist_scales': {'copy': {'logic': 0.5, 'lutram': 1.0, 'ff': 0.5}, 'level': {'logic': 2.0, 'lutram': 1.0, 'ff': 2.0}}})]" | FileCheck %s
+# CHECK: {'A': [179.0, 128.0, 8.0], 'B': [0.0, 0.0, 24.0], '__top__': [0.0, 0.0, 0.0]}
+# CHECK: {'A': [153.5, 128.0, 4.0], 'B': [0.0, 0.0, 24.0], '__top__': [0.0, 0.0, 0.0]}

@@ -23,9 +23,11 @@ FREE = {'comb.extract', 'comb.concat', 'hw.bitcast', 'hw.struct_extract', 'hw.st
         'hw.struct_inject', 'sv.verbatim', 'sv.attribute'}
 CONSTS = {'hw.constant', 'hw.aggregate_constant'}
 REGS = {'seq.firreg', 'seq.compreg', 'seq.compreg.ce'}
-# Xilinx floating-point cores (black boxes in the IR): LUTs, FFs, DSPs per instance,
-# measured in the I6UE synthesis (fill_blackbox_costs) or these V80 defaults.
-BLACKBOX = {'xil_fma': (850, 1400, 2), 'xil_fdiv': (800, 1400, 0), 'xil_fsqrt': (500, 900, 0),
+# Xilinx floating-point cores (black boxes in the IR): LUTs, FFs, DSPs per instance. xil_fma / xil_fdiv / xil_fsqrt
+# synthesized (Vivado 2025.2, xcv80, OOC, the cores as hw/scripts/xilinx_ip_gen.tcl configures them: fma latency 16
+# Medium_Usage, fdiv / fsqrt latency 28; a32-V1 11-11, uh_VX_{fma,fdiv,fsqrt}_unit_static.rpt: 966 / 1,476 / 897 LUTs,
+# 1,084 / 1,389 / 841 FFs, 2 / 0 / 0 DSPs; were 850 / 800 / 500 defaults); xil_fmul / xil_fadd V80 defaults.
+BLACKBOX = {'xil_fma': (966, 1084, 2), 'xil_fdiv': (1476, 1389, 0), 'xil_fsqrt': (897, 841, 0),
             'xil_fmul': (90, 260, 2), 'xil_fadd': (260, 500, 0)}
 
 
@@ -104,6 +106,12 @@ class Mod:
         self.regw = defaultdict(int)    # register width -> registers
         self.insts = []                 # (child module, instance name)
         self.consts = set()
+        self.roms = {}                  # constant array (hw.aggregate_constant, through hw.wire) -> varying bits
+        self.block_roms = set()         # those of them a rom_style "block" wire states
+        self.rom_reads = {}             # a block ROM's read -> (its LUTs as priced, entries, width)
+        self.bram = 0.0                 # block RAM ROMs (the fit count)
+        self.count = False              # parse(..., count=True)
+        self.cur_res = None             # the op being priced's result (lut_cost)
         self.Z, self.O, self.W = {}, {}, {}   # known-zero / known-one bits, widths of int values
         self.P = {}                           # bit provenance of wide values: [(length, src, src_lo)]
         self.regs, self.muxes = {}, {}        # register -> next value; mux -> (cost, a, b)
@@ -121,7 +129,8 @@ PROV_MIN = 16      # provenance is tracked for values at least this wide
 # FOLDSIM_COST_SLICED_HOLDS=1 (an option, not the default yet): a register whose next value is
 # a concat of slices each holding the register's own bits at their place (mux(c, x, r[lo +: w]),
 # as replicate-controls cuts a fetch buffer's load per replicated land strobe) is clock-enabled
-# per slice: Vivado maps such a mux to the flops' CE, no LUTs (refund_enables).
+# per slice: Vivado maps such a mux to the flops' CE, no LUTs (refund_enables). The fit count
+# (parse(..., count=True)) has it on unless FOLDSIM_COST_SLICED_HOLDS=0 (COUNT_SLICED_HOLDS).
 SLICED_HOLDS = os.environ.get('FOLDSIM_COST_SLICED_HOLDS', '') == '1'
 
 
@@ -318,6 +327,45 @@ def track_prov(mod, op, rhs, operands, w, ws):
     return None
 
 
+def mux_tree(n):
+    """LUT6s a bit of an n:1 select built as a tree of 4:1 LUT6 muxes (Versal's CLB has no MUXF7 / MUXF8: a 2:1
+    select of two LUT outputs is a LUT of its own): n = 2..4 one, 8 three, 64 twenty-one ((n - 1) / 3 at powers of
+    4, more between them: a32-UR 11-12, l2fs_4's 128-deep distributed RAMs: one LUT3 a bit for the two 64-row
+    blocks' select, priced a third)."""
+    t = 0
+    while n > 1:
+        n = math.ceil(n / 4)
+        t += n
+    return t
+
+
+# The fit count (parse(..., roms=True): foldsim_fitdb.count, foldsim_sll_check) prices a constant array's read as a
+# ROM; FOLDSIM_COST_ROM_ARRAYS=0 there, as a select of its entries (before 11-12). The compiler's own choices keep
+# the select (parse's default).
+ROM_ARRAYS = os.environ.get('FOLDSIM_COST_ROM_ARRAYS', '1') != '0'
+# The fit count's per-slice holds (SLICED_HOLDS): on unless FOLDSIM_COST_SLICED_HOLDS=0 (kit/e1terms counted with
+# them, the fit gate without: 21.6k LUTs apart on y64g34, a32-D1 11-11).
+COUNT_SLICED_HOLDS = os.environ.get('FOLDSIM_COST_SLICED_HOLDS', '1') != '0'
+
+
+def const_array_varying(rhs):
+    """The bits not the same in every entry of a hw.aggregate_constant array of integers (`rhs` its op's text),
+    or None if it is not one."""
+    mm = re.search(r'!hw\.array<(\d+)xi(\d+)>\s*$', rhs)
+    if not mm:
+        return None
+    w = int(mm.group(2))
+    vals = re.findall(r'(-?\d+|true|false) : i\d+', rhs.split('] :')[0])
+    if len(vals) != int(mm.group(1)):
+        return w
+    a, o = (1 << w) - 1, 0
+    for v in vals:
+        x = (1 if v == 'true' else 0 if v == 'false' else int(v)) & ((1 << w) - 1)
+        a &= x
+        o |= x
+    return popcount(o & ~a)
+
+
 def popcount(x):
     return bin(x).count('1')
 
@@ -357,6 +405,15 @@ def reachable(mod, idx, n, rhs):
                 a |= 1 << b
         cnt += a < n
     return max(1, cnt)
+
+
+def live_width(mod, v, w):
+    """The bits of a w-bit value below its highest bit not known zero (mod.Z)."""
+    z = mod.Z.get(v, 0)
+    for i in range(w - 1, -1, -1):
+        if not (z >> i) & 1:
+            return i + 1
+    return 0
 
 
 def lut_cost(op, rhs, mod, operands):
@@ -411,6 +468,16 @@ def lut_cost(op, rhs, mod, operands):
         w = width(t)
         if len(nonconst) < 2:
             return w
+        if mod.count and len(operands) == 2:
+            # The fit count: a product of its operands' live widths (their high bits known zero dropped: a
+            # zero-extended or SIMD-packed operand), DSP58s of 27 x 24 signed (26 x 23 unsigned) each, at the
+            # cheaper orientation (a32-UR 11-12, VX_tcu_fedp_tfr: 56 i17 / i22 / i26 products of 13 x 13, 11 x 11 and
+            # 9 x 8 live bits, each one DSP58 in Vivado (40 for the 56: some merged), counted 176 by result width).
+            a, b = live_width(mod, operands[0], w), live_width(mod, operands[1], w)
+            if max(a, b) <= 8:
+                return a * b / 2
+            mod.dsp += min(math.ceil(a / 26) * math.ceil(b / 23), math.ceil(b / 26) * math.ceil(a / 23))
+            return 0
         if w <= 8:
             return w * w / 2
         mod.dsp += math.ceil(w / 18) ** 2 if w > 18 else 1
@@ -438,6 +505,14 @@ def lut_cost(op, rhs, mod, operands):
             return 0
         n, w = int(m.group(1)), width(m.group(2))
         n = reachable(mod, idx[0] if idx else None, n, rhs)
+        if operands and operands[0] in mod.roms:
+            # A read of a constant array is a ROM (array_read_cost's 'const'), not a select of its entries
+            # (a32-UR 11-12: VX_mufu_pe's 512 x 72 table counted 12.3k LUTs, synthesized under 1k); a registered
+            # read of a rom_style "block" one a block RAM (block_roms).
+            c = array_read_cost(n, w, 'const', varying=min(w, mod.roms[operands[0]]))
+            if operands[0] in mod.block_roms and mod.cur_res:
+                mod.rom_reads[mod.cur_res] = (c, n, w)
+            return c
         return w * (n - 1) / 3
     if op == 'hw.array_inject':
         m = re.search(r'!hw\.array<(\d+)x(.*)>\s*,', rhs)
@@ -449,7 +524,20 @@ def lut_cost(op, rhs, mod, operands):
     return None
 
 
-def parse(path):
+def parse(path, count=False):
+    """{module: Mod}, {unknown op: n} of an MLIR file. `count`: as the fit count prices a netlist (foldsim_fitdb.count,
+    foldsim_sll_check): a constant array's read a ROM (ROM_ARRAYS), per-slice holds refunded (COUNT_SLICED_HOLDS)."""
+    global SLICED_HOLDS
+    saved = SLICED_HOLDS
+    if count:
+        SLICED_HOLDS = COUNT_SLICED_HOLDS
+    try:
+        return _parse(path, count and ROM_ARRAYS)
+    finally:
+        SLICED_HOLDS = saved
+
+
+def _parse(path, roms):
     mods = {}
     cur = None
     hdr = re.compile(r'^\s*hw\.module(?:\.extern)?(?:\s+private)?\s+@([\w$.]+)(?:<[^>]*>)?\((.*)\)\s*(?:->\s*\((.*)\))?\s*(?:attributes.*)?\{?\s*$')
@@ -461,6 +549,7 @@ def parse(path):
             m = hdr.match(line)
             if m:
                 cur = Mod(m.group(1), m.group(2) + (',' + m.group(3) if m.group(3) else ''))
+                cur.count = roms
                 mods[cur.name] = cur
                 mems = {}
                 if 'hw.module.extern' in s:
@@ -471,6 +560,7 @@ def parse(path):
         if s.startswith('hw.output'):
             for v in re.findall(SSA, s):
                 cur.uses[v] += 1
+            block_roms(cur)
             refund_enables(cur)
             pack_and_or(cur)
             trim_shifts(cur)
@@ -496,7 +586,15 @@ def parse(path):
             cur.consts.update(res)
             if op == 'hw.constant':
                 track(cur, op, rhs, res, operands)
+            elif res and roms:
+                v = const_array_varying(rhs)
+                if v is not None:
+                    cur.roms[res[0]] = v
             continue
+        if op == "hw.wire" and len(res) == 1 and operands and operands[0] in cur.roms:
+            cur.roms[res[0]] = cur.roms[operands[0]]
+            if re.search(r'rom_style" = "\\22block\\22', rhs):
+                cur.block_roms.add(res[0])
         if op in FREE:
             if op == 'comb.extract' and operands:
                 lo = re.search(r'from (\d+)', rhs)
@@ -522,8 +620,9 @@ def parse(path):
             nm = re.search(r'name "([^"]*)"', rhs)
             st = re.search(r'ram_style" = "\\22(\w+)', rhs)
             mk = re.search(r'mask\s+(\d+)\s*>', rhs)
+            ch = re.search(r'cascade_height" = "(\d+)"', rhs)
             rec = [nm.group(1) if nm else res[0][1:], int(mm.group(3)), int(mm.group(4)), 0, 0, int(mm.group(1)),
-                   st.group(1) if st else None, int(mk.group(1)) if mk else 1, bool(nm)]
+                   st.group(1) if st else None, int(mk.group(1)) if mk else 1, bool(nm), int(ch.group(1)) if ch else None]
             mems[res[0]] = rec
             cur.mems.append(rec)
             continue
@@ -537,6 +636,7 @@ def parse(path):
             if mm:
                 cur.insts.append((mm.group(2), mm.group(1)))
             continue
+        cur.cur_res = res[0] if len(res) == 1 else None
         c = lut_cost(op, rhs, cur, operands)
         track(cur, op, rhs, res, operands)
         if c is None:
@@ -589,6 +689,18 @@ def trim_shifts(mod):
         if len(bits) < w:
             mod.lut[cls] -= c * (1 - len(bits) / w)
     mod.shifts, mod.extracts, mod.uses = {}, defaultdict(list), defaultdict(int)
+
+
+def block_roms(mod):
+    """A rom_style "block" ROM read straight into a register is a block RAM (Vivado absorbs the register as the
+    RAM's output register: VX_mufu_pe's 512 x 72 table, one RAMB36, no LUTs): its LUTs refunded, its RAMB36 in
+    mod.bram (bram_blocks)."""
+    for r, nxt in mod.regs.items():
+        if nxt in mod.rom_reads:
+            c, n, w = mod.rom_reads.pop(nxt)
+            mod.lut['array_get'] -= c
+            mod.bram += bram_blocks(n, w)
+    mod.rom_reads = {}
 
 
 def refund_enables(mod):
@@ -657,7 +769,7 @@ def array_read_cost(n, w, src, live=None, varying=None):
     if src == 'const':
         v = w if varying is None else varying
         blocks = math.ceil(n / 64)
-        return ARRAY_READ_SYNTH['const'] * v * (blocks + (blocks - 1) / 3)
+        return ARRAY_READ_SYNTH['const'] * v * (blocks + mux_tree(blocks))
     k = n if live is None else live
     return ARRAY_READ_SYNTH.get(src, 1.0) * w * max(k - 1, 0) / 3
 
@@ -738,10 +850,88 @@ MASKED_LUTRAM_PER_BIT = 2.0
 MASKED_LUTRAM = os.environ.get('FOLDSIM_COST_MASKED_LUTRAM', '1') != '0'
 
 
+# FOLDSIM_COST_VERSAL_LUTRAM=0: the fit count prices a distributed RAM as mem_cost does (before 11-12).
+VERSAL_LUTRAM = os.environ.get('FOLDSIM_COST_VERSAL_LUTRAM', '1') != '0'
+
+
+def lutram_cost(depth, w, rports, mask=1):
+    """(RAM LUTs, logic LUTs) of a distributed RAM of `depth` x `w` with `rports` read ports, as Vivado builds it on
+    Versal: per read port and 64-row block (32 rows: RAM32M16) the cheaper of RAM64M8 (8 LUTs for 7 bits; RAM32M16 8
+    for 14) and RAM64X1D (2 LUTs a bit; RAM32X1D), a byte-masked one of single-bit dual-port primitives
+    (MASKED_LUTRAM_PER_BIT); deeper than 64 rows, the blocks' read select (mux_tree, a LUT a bit for two blocks) and a
+    write enable a block (a32-UR 11-12, V1's OOC of y64g34: VX_fma_unit's 4,096 x 1 slot RAMs 128 RAM + 89 logic LUTs
+    each, l2fs_4's 128 x 24 landing buffers a LUT3 a bit for the select)."""
+    rports = max(rports, 1)
+    if depth <= 32:
+        prim = min(8 * math.ceil(w / 14), 2 * w)
+        blocks = 1
+    else:
+        blocks = math.ceil(depth / 64)
+        prim = min(8 * math.ceil(w / 7), 2 * w)
+    if mask > 1 and MASKED_LUTRAM:
+        prim = w * MASKED_LUTRAM_PER_BIT
+    ram = prim * blocks * rports
+    logic = (w * mux_tree(blocks) * rports + blocks) if blocks > 1 else 0
+    return ram, logic
+
+
+# RAMB36 aspect ratios (width, depth) on Versal (RAMB36E5: 512 x 72 simple dual port, 1K x 36 ... 32K x 1; a RAMB18E5
+# half of it, 512 x 36 ... 16K x 1). FOLDSIM_COST_BRAM_ASPECT=0: priced in 512 x 72 blocks only (RAMB18 at <= 512 x 36),
+# as before 11-12.
+BRAM36 = ((72, 512), (36, 1024), (18, 2048), (9, 4096), (4, 8192), (2, 16384), (1, 32768))
+BRAM18 = ((36, 512), (18, 1024), (9, 2048), (4, 4096), (2, 8192), (1, 16384))
+BRAM_ASPECT = os.environ.get('FOLDSIM_COST_BRAM_ASPECT', '1') != '0'
+
+
+def bram_blocks(depth, w):
+    """RAMB36 (a RAMB18 half) of one depth x w block RAM at its cheapest aspect ratio: Vivado builds a 1,024 x 36
+    memory in one RAMB36, not two 512 x 72 (a32-UR 11-12: V1's OOC of y64g34, block RAM 1,261 synthesized against
+    1,358 counted, the counted VX_mufu_pe's 1,024 x 36 state in two)."""
+    if not BRAM_ASPECT:
+        return 0.5 if w <= 36 and depth <= 512 else math.ceil(w / 72) * math.ceil(depth / 512)
+    c36 = min(math.ceil(w / cw) * math.ceil(depth / cd) for cw, cd in BRAM36)
+    c18 = min(math.ceil(w / cw) * math.ceil(depth / cd) for cw, cd in BRAM18) * 0.5
+    return min(c36, c18)
+
+
+# URAM288 Vivado 2025.2 builds a ram_style ultra memory of 72 bits and h x 4,096 rows of without a cascade_height
+# (its default "cascade height of 1"), by h (a32-UR 11-12, OOC on the V80, 1R1W, byte-masked / unmasked): 8K 3 / 2,
+# 12K 5, 16K 5, 24K 9 / 8; past these h + ceil(h / 2) / h + h // 3 (the measured points' trend).
+URAM_NO_CASCADE = {True: {1: 1, 2: 3, 3: 5, 4: 5, 6: 9}, False: {1: 1, 2: 2, 6: 8}}
+
+
+def uram_count(depth, w, rports, wports, mask=1, cascade=None):
+    """URAM288 of one ram_style ultra memory as Vivado builds it: 72-bit columns of 4,096 rows cascaded (the memory
+    states its cascade_height, foldsim-fold-static since 11-12), else Vivado's default build of a deep one
+    (URAM_NO_CASCADE); a read port beyond the first of a memory without a read-write port a copy."""
+    copies = max(1, rports if wports else math.ceil(rports / 2))
+    h = math.ceil(depth / 4096)
+    if h > 1 and not cascade:
+        masked = mask > 1
+        h = URAM_NO_CASCADE[masked].get(h, h + (math.ceil(h / 2) if masked else h // 3))
+    return math.ceil(w / 72) * h * copies
+
+
+def mem_parts(depth, w, rports, rlat, style=None, mask=1):
+    """(distributed RAM LUTs, logic LUTs, RAMB36) of one memory as Vivado builds it on Versal (the fit count,
+    foldsim_fitdb.count and foldsim_sll_check: lutram_cost, bram_blocks; its LUTRAM's read select and write enables
+    as logic, as Vivado reports them). Block RAM by mem_cost's rule."""
+    rports = max(rports, 1)
+    bram = style == 'block' or (style != 'distributed' and rlat >= 1 and depth >= 32 and depth * w >= 2048)
+    if bram:
+        return 0.0, 0.0, bram_blocks(depth, w) * max(1, math.ceil(rports / 2))
+    if not VERSAL_LUTRAM:
+        return mem_cost(depth, w, rports, rlat, style, mask)[0], 0.0, 0
+    ram, logic = lutram_cost(depth, w, rports, mask)
+    return ram, logic, 0
+
+
 def mem_cost(depth, w, rports, rlat, style=None, mask=1):
     """(LUTRAM LUTs, BRAM36) of one memory. Synchronous reads from 32 entries up go to
     block RAM, as Vivado infers them, unless the memory asks otherwise. `mask`: the
-    write mask's lanes (a masked distributed RAM: MASKED_LUTRAM_PER_BIT)."""
+    write mask's lanes (a masked distributed RAM: MASKED_LUTRAM_PER_BIT). The price the
+    compiler's choices are made on (foldsim_degree, foldsim_storage); the fit count prices
+    a netlist's memories as built (mem_parts)."""
     rports = max(rports, 1)
     bram = style == 'block' or (style != 'distributed' and rlat >= 1 and depth >= 32 and depth * w >= 2048)
     if bram:
