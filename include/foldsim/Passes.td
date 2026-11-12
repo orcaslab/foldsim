@@ -433,6 +433,20 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "positions on that port after every earlier copy (rd_after); no "
            "image controller, answer queue, table of reads in flight or "
            "prefetch queue. A ring's prefetch positions taken on its port">,
+    Option<"vmemFoldEngines", "vmem-fold-on-engines", "bool", "false",
+           "With vmem-on-engines: a folded store streamed to HBM "
+           "(fold-store-stream) on a page engine too, at its requests' "
+           "positions (each instance's issue: the landing ring's state pass, "
+           "else its own), like any class virtual memory, instead of a "
+           "controller of its own">,
+    Option<"vportWriteBeats", "vport-write-beats", "bool", "false",
+           "With vport-engines, vmem-on-engines, vmem-stagger and vport-hz: a "
+           "target RAM's row wider than a beat written as its 512-bit beats at "
+           "successive positions after its pass (beat k k positions after the "
+           "first, its address the row's beat offset + k; a write-first "
+           "member's read at its last beat), so its port's write rows are one "
+           "beat; the row held in the simulator until its last beat (before "
+           "the class's next pass). Reads stay whole rows. Not for copy rings">,
     Option<"vportHz", "vport-hz", "unsigned", "0",
            "With vport-engines: read after write by each port's table of "
            "write numbers by a hash of the row (2^N entries; the fences "

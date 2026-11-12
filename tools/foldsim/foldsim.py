@@ -493,6 +493,10 @@ def frame_options(a):
             fold += f' vport-hz={a.vport_hz}'
         if a.vport_copy:
             fold += ' vport-copy'
+        if a.vport_write_beats:
+            fold += ' vport-write-beats'
+        if a.vmem_fold_on_engines:
+            fold += ' vmem-fold-on-engines'
     if getattr(a, 'port_plan_out', None):
         fold += f' port-plan-out={os.path.abspath(a.port_plan_out)}'
     if getattr(a, 'pp_beat_bits', 0):
@@ -1812,6 +1816,14 @@ def build_parser():
     ap.add_argument('--vport-copy', action='store_true',
                     help='with --vport-engines and --vmem-rings: ring answers copied into their images by the port '
                          '(foldsim-fold-static vport-copy)')
+    ap.add_argument('--vmem-fold-on-engines', action='store_true',
+                    help='with --vmem-on-engines and --fold-store-stream: streamed folded stores on page engines '
+                         '(their issues\' positions) instead of controllers of their own (foldsim-fold-static '
+                         'vmem-fold-on-engines)')
+    ap.add_argument('--vport-write-beats', action='store_true',
+                    help='with --vport-engines, --vmem-on-engines, --vmem-stagger and --vport-hz: target RAM rows '
+                         'wider than a 512-bit beat written beat by beat at successive positions (one-beat port '
+                         'write rows; foldsim-fold-static vport-write-beats)')
     ap.add_argument('--vport-hz', type=int, default=0, metavar='N',
                     help='with --vport-engines: read after write by a 2^N-entry table of write numbers a port '
                          '(by a hash of the row) instead of fence classes (0)')

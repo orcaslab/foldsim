@@ -1,0 +1,43 @@
+# REQUIRES: verilator
+# Wide target-RAM rows written beat by beat (--vport-write-beats): a row of B
+# > 1 beats leaves as B one-beat writes at successive positions after its pass
+# (vmem-stagger; the row held in registers until its last beat), its address
+# the row's beat offset + the beat, so its port's write rows are one beat
+# (FOLDSIM_VPORT<p>_DW 512); reads stay whole rows (LMAX); read after write by
+# the port's table (--vport-hz), every beat of a row in one entry (KS). A
+# write-first member reads at its last beat (it sees the whole row, rd_new).
+# Each run against the target from zero state (tb_vmem_multi.sv) on real
+# foldsim_vport (SYNC) ports and an AXI memory applying writes at their B,
+# latencies 1 to 600 host cycles, ready stalls, bubbles.
+# Write-first: three 400-bit lanes merged into a 1,200-bit row (3 beats, byte
+# enables crossing beats).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vport_wb
+# RUN: foldsim --srcs top.f --top Top --out %t/wf --static --bubbles --copies Leaf:1 --stage-levels 2 --virtual-memories 'Leaf:.*' --page-engines 16 --vmem-on-engines --vmem-merge-lanes --vmem-stagger 8 --vport-engines --vport-hz 8 --vport-write-beats Leaf 2>&1 | FileCheck %s --check-prefix=WF
+# RUN: FileCheck %s --check-prefix=WFH < %t/wf/foldsim_sim.vh
+# RUN: FileCheck %s --check-prefix=SV < %t/wf/foldsim_sim.sv
+# RUN: python3 %S/Inputs/vmem_bind.py %t/wf/foldsim_sim.json %t/wf
+# RUN: cd %S/../Driver/Inputs/vport_wb && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/wf -Mdir %t/wf/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/wf/foldsim_sim.sv > %t/wf/build.log 2>&1
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=30 +bubble=30 +stall=10 | FileCheck %s
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=20 +hi=600 +full=80 +bubble=90 +stall=20 | FileCheck %s
+# Read-first rows of two beats (600 bits), read buffers as rings (vmem-rings).
+# RUN: cd %S/../Driver/Inputs/vport_rf && foldsim --srcs top.f --top Top --out %t/rf --static --bubbles --copies Leaf:1 --stage-levels 1 --virtual-memories 'Leaf:.*' --vmem-rings 16 --page-engines 16 --vmem-on-engines --vmem-stagger 8 --vport-engines --vport-hz 8 --vport-write-beats Leaf 2>&1 | FileCheck %s --check-prefix=RF
+# RUN: FileCheck %s --check-prefix=RFH < %t/rf/foldsim_sim.vh
+# RUN: python3 %S/Inputs/vmem_bind.py %t/rf/foldsim_sim.json %t/rf
+# RUN: cd %S/../Driver/Inputs/vport_rf && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/rf -Mdir %t/rf/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/rf/foldsim_sim.sv > %t/rf/build.log 2>&1
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=600 +bubble=90 +burst=8 +stall=20 | FileCheck %s
+# WF: vport-write-beats: 1 written beat by beat
+# WFH: `define FOLDSIM_VPORT0_DW 512
+# WFH: `define FOLDSIM_VPORT0_LMAX 3
+# WFH: `define FOLDSIM_VPORT0_KS 2
+# SV: _stag_beat
+# (The write-first row's read at its last beat: its read chain as long as its writes'.)
+# SV: Memory_x3_stag_rv2
+# RF: vport-write-beats: 1 written beat by beat
+# RFH: `define FOLDSIM_VPORT1_DW 512
+# RFH: `define FOLDSIM_VPORT1_LMAX 2
+# CHECK: MATCH

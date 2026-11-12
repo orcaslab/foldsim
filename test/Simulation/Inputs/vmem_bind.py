@@ -58,10 +58,11 @@ for g, ks in enumerate(groups):
 # reset (the region clean: no fill).
 for p, q in enumerate(info.get('vports', [])):
     lrw = max(1, (q['LMAX'] - 1).bit_length())
+    lw = max(1, ((q['DW'] + 511) // 512 - 1).bit_length())
     ow, tw, dw, mw = q['OW'], q['TW'], q['DW'], q['MW']
     decl.append(f'wire vp{p}_rd_valid, vp{p}_rd_new, vp{p}_rd_copy, vp{p}_rd_after, vp{p}_wr_valid, vp{p}_wr_pair; '
                 f'wire [{ow-1}:0] vp{p}_rd_addr, vp{p}_rd_copy_addr, vp{p}_wr_addr; wire [{lrw-1}:0] vp{p}_rd_len, '
-                f'vp{p}_wr_len, vp{p}_rsp_beat; wire [{tw-1}:0] vp{p}_rd_tag, vp{p}_rsp_tag; wire [3:0] vp{p}_rd_fence; '
+                f'vp{p}_rsp_beat; wire [{lw-1}:0] vp{p}_wr_len; wire [{tw-1}:0] vp{p}_rd_tag, vp{p}_rsp_tag; wire [3:0] vp{p}_rd_fence; '
                 f'wire [15:0] vp{p}_rd_need, vp{p}_w_count; wire [{dw-1}:0] vp{p}_wr_data; wire [{mw-1}:0] vp{p}_wr_mask; '
                 f'wire vp{p}_rsp_valid, vp{p}_rsp_last, vp{p}_rsp_copied; wire [511:0] vp{p}_rsp_data; '
                 f'wire [5:0] vp{p}_rd_room, vp{p}_wr_room;')
