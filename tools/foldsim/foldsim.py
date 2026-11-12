@@ -422,6 +422,8 @@ def frame_options(a):
         fold += f' vmem-auto-bits={a.vmem_auto_bits}'
     if getattr(a, 'vmem_auto_instance_bits', 0):
         fold += f' vmem-auto-instance-bits={a.vmem_auto_instance_bits}'
+    if getattr(a, 'vmem_cost', False):
+        fold += ' vmem-cost'
     if getattr(a, 'vmem_rings', 0):
         fold += f' vmem-rings={a.vmem_rings} vmem-ring-entries={a.vmem_ring_entries}'
     if getattr(a, 'fold_store_rings', 0):
@@ -485,6 +487,24 @@ def frame_options(a):
         fold += f' link-hbm-lead={a.link_hbm_lead}'
     if getattr(a, 'page_engines_pp', False):
         fold += ' page-engines-pp'
+    if getattr(a, 'vmem_on_engines', False):
+        fold += ' vmem-on-engines'
+    if getattr(a, 'vmem_stagger', 0):
+        fold += f' vmem-stagger={a.vmem_stagger}'
+    if getattr(a, 'vport_engines', False):
+        fold += ' vport-engines'
+        if a.vport_fence_shift != 4:
+            fold += f' vport-fence-shift={a.vport_fence_shift}'
+        if a.vport_hz:
+            fold += f' vport-hz={a.vport_hz}'
+        if a.vport_copy:
+            fold += ' vport-copy'
+        if a.vport_write_beats:
+            fold += ' vport-write-beats'
+        if a.vmem_fold_on_engines:
+            fold += ' vmem-fold-on-engines'
+    if getattr(a, 'port_plan_out', None):
+        fold += f' port-plan-out={os.path.abspath(a.port_plan_out)}'
     if getattr(a, 'pp_beat_bits', 0):
         fold += f' pp-beat-bits={a.pp_beat_bits}'
     if getattr(a, 'link_hbm_beat_bits', 0):
@@ -1686,6 +1706,10 @@ def build_parser():
     ap.add_argument('--vmem-auto-instance-bits', type=int, default=0, metavar='N',
                     help='as --vmem-auto-bits, by one instance\'s image (rows x width) at least N bits: the same '
                          'memories are virtual at every instance count (foldsim-fold-static vmem-auto-instance-bits)')
+    ap.add_argument('--vmem-cost', action='store_true',
+                    help='a memory the virtual-memory rules pick (pattern or size) stays on chip where its '
+                         'threaded image there costs fewer LUTs than as a virtual memory (foldsim-fold-static '
+                         'vmem-cost; each choice reported)')
     ap.add_argument('--vmem-auto-bits', type=int, default=0, metavar='N',
                     help='with --static: every registered-read target memory (one read port, at most one write '
                          'port) whose threaded image is at least N bits is a virtual memory too, whatever storage '
@@ -1760,6 +1784,12 @@ def build_parser():
     ap.add_argument('--vmem-known-zero-bits', type=int, default=1 << 16, metavar='N',
                     help="with --virtual-memories: each controller's known-zero bits at most (a bit per "
                          "block of rows, the smallest block within N; default %(default)s); 0: none")
+    ap.add_argument('--vmem-controller', choices=('vmem', 'vport'), default='vmem',
+                    help="the kernel's controller of each virtual memory (group, page engine): foldsim_vmem "
+                         "(default), or vport: a static port in its place (shell foldsim_vport_ctl: one AXI id, "
+                         "in-order, counter fences instead of hazard tables and write buffers, a zero fill of "
+                         "the image after a reset instead of known-zero bits; FOLDSIM_VMEM_VPORT and each "
+                         "image's bytes in foldsim_sim.vh)")
     ap.add_argument('--vmem-forward', type=int, choices=(0, 1), default=1,
                     help="with virtual memories (or page engines, link streams): whether a read is "
                          "answered from its controller's write buffer (1, default) or waits for the "
@@ -1798,6 +1828,38 @@ def build_parser():
     ap.add_argument('--pp-beat-bits', type=int, default=0, metavar='N',
                     help='with --page-engines-pp: streamed PP rows as beats of at most N bits, '
                          'drained from a row buffer (foldsim-fold-static pp-beat-bits)')
+    ap.add_argument('--vmem-stagger', type=int, default=0, metavar='D',
+                    help='with --vmem-on-engines: a target RAM\'s requests may leave up to D positions after its '
+                         'pass (held in registers) so a copy\'s memories share engines at successive positions '
+                         '(foldsim-fold-static vmem-stagger; 0: at the pass)')
+    ap.add_argument('--vport-engines', action='store_true',
+                    help='with --page-engines: each page engine a static port (foldsim_vport, vp<p>_* simulator '
+                         'ports, FOLDSIM_VPORT<p>_* in foldsim_sim.vh; foldsim-fold-static vport-engines)')
+    ap.add_argument('--vport-copy', action='store_true',
+                    help='with --vport-engines and --vmem-rings: ring answers copied into their images by the port '
+                         '(foldsim-fold-static vport-copy)')
+    ap.add_argument('--vmem-fold-on-engines', action='store_true',
+                    help='with --vmem-on-engines and --fold-store-stream: streamed folded stores on page engines '
+                         '(their issues\' positions) instead of controllers of their own (foldsim-fold-static '
+                         'vmem-fold-on-engines)')
+    ap.add_argument('--vport-write-beats', action='store_true',
+                    help='with --vport-engines, --vmem-on-engines, --vmem-stagger and --vport-hz: target RAM rows '
+                         'wider than a 512-bit beat written beat by beat at successive positions (one-beat port '
+                         'write rows; foldsim-fold-static vport-write-beats)')
+    ap.add_argument('--vport-hz', type=int, default=0, metavar='N',
+                    help='with --vport-engines: read after write by a 2^N-entry table of write numbers a port '
+                         '(by a hash of the row) instead of fence classes (0)')
+    ap.add_argument('--vport-fence-shift', type=int, default=4, metavar='FS',
+                    help='with --vport-engines: the ports\' fence sample interval\'s log2 (0: every read waits for '
+                         'every earlier write)')
+    ap.add_argument('--port-plan-out', metavar='JSON',
+                    help='report only: every HBM member\'s request positions (page engine members as placed, class '
+                         'virtual memories\' state passes and issues) in this JSON file, a static-port placement '
+                         'model\'s input (foldsim-fold-static port-plan-out)')
+    ap.add_argument('--vmem-on-engines', action='store_true',
+                    help='with --page-engines and --virtual-memories: the target RAMs ride the engines (static '
+                         'ports) at their own positions, no controller or member queue per memory '
+                         '(foldsim-fold-static vmem-on-engines)')
     ap.add_argument('--page-engines-pp', action='store_true',
                     help='with --page-engines and --state-in-ram-pp streamed rows: PP row chunks ride the engines '
                          '(foldsim-fold-static page-engines-pp)')
@@ -2512,6 +2574,9 @@ def main():
     m = a.vmem_row_bytes_min
     if m < 1 or m & (m - 1):
         sys.exit('--vmem-row-bytes-min: a power of two')
+    if a.vmem_controller == 'vport' and a.vmem_row_bytes_min < 64:
+        # A static port moves whole 64-byte beats: rows of at least a beat.
+        a.vmem_row_bytes_min = 64
     if a.vmem_known_zero_bits != 0 and a.vmem_known_zero_bits < 16:
         sys.exit('--vmem-known-zero-bits: 0 (none) or at least 16')
     if a.storage and not a.static:
@@ -2629,6 +2694,13 @@ def main():
     }
     for name, n in info['threads'].items():
         info['threads'][name] = int(n)
+    # Static ports (fold-static vport-engines), in the simulator's vp<p>_ order:
+    # each its FOLDSIM_VPORT<p>_* parameters (VBa/STATUS 5 item 9).
+    vps = re.search(r'foldsim\.vports = \[(.*?)\]', sim_text)
+    info['vports'] = []
+    for entry in re.findall(r'"([^"]*)"', vps.group(1)) if vps else []:
+        info['vports'].append(dict(zip(('DW', 'MW', 'TW', 'OW', 'LMAX', 'COPY', 'NEED_IN', 'HZ', 'BYTES', 'ZERO', 'FS', 'KS'),
+                                       (int(x) for x in entry.split(':')))))
     # Virtual memories, in the simulator's vm<k>_ port order.
     vmems = re.search(r'foldsim\.vmems = \[(.*?)\]', sim_text)
     info['vmem'] = []
@@ -2740,6 +2812,11 @@ def main():
                 for x in pf[kind]:
                     f.write(f'`define FOLDSIM_PORTS_{kind.upper()}_{x["name"].upper()}_LO {x["lo"]}\n')
                     f.write(f'`define FOLDSIM_PORTS_{kind.upper()}_{x["name"].upper()}_W {x["width"]}\n')
+        if info.get('vports'):
+            f.write(f'`define FOLDSIM_VPORTS {len(info["vports"])}\n')
+            for p, q in enumerate(info['vports']):
+                for k, v in q.items():
+                    f.write(f'`define FOLDSIM_VPORT{p}_{k} {v}\n')
         if info['vmem']:
             f.write(f'`define FOLDSIM_VMEM_COUNT {len(info["vmem"])}\n')
             if not a.vmem_forward:
@@ -2782,6 +2859,12 @@ def main():
                     f.write(f'`define FOLDSIM_VMEM_G{g}_KZ_SHIFT {v["kz_shift"]}\n')
                     if 'cache_rows' in v:
                         f.write(f'`define FOLDSIM_VMEM_G{g}_CACHE_ROWS {v["cache_rows"]}\n')
+            if getattr(a, 'vmem_controller', 'vmem') == 'vport':
+                f.write('`define FOLDSIM_VMEM_VPORT\n')
+                for k, v in enumerate(info['vmem']):
+                    f.write(f'`define FOLDSIM_VMEM_{k}_BYTES 64\'h{v["bytes"]:x}\n')
+                for g, v in enumerate(info.get('vmem_groups', [])):
+                    f.write(f'`define FOLDSIM_VMEM_G{g}_BYTES 64\'h{v["bytes"]:x}\n')
             f.write(f'`define FOLDSIM_VMEM_BYTES 64\'h{info["vmem_bytes"]:x}\n')
     print(f'foldsim: {", ".join(f"{k} x{v}" for k, v in info["threads"].items())}', file=sys.stderr)
     if region:

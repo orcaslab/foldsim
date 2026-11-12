@@ -113,10 +113,14 @@ ipx::associate_bus_interfaces -busif s_axi_control -clock ap_clk $core
 # AMD recommends advertising that the memory-mapped masters use neither
 # wrap/fixed bursts nor narrow bursts. These are bus-interface parameters,
 # not properties of the interface object.
+# The static ports bound straight to the shell's HBM ports (m_axi_hbm_*) run
+# their AXI side in hbm_clk (the linker drives it from the static region clock).
+set hbm_clk [expr {[llength [ipx::get_bus_interfaces hbm_clk -of_objects $core]] ? "hbm_clk" : "ap_clk"}]
 foreach bif [ipx::get_bus_interfaces -of_objects $core] {
     set bifname [get_property NAME $bif]
     if {[string match "m_axi_*" $bifname]} {
-        ipx::associate_bus_interfaces -busif $bifname -clock ap_clk $core
+        ipx::associate_bus_interfaces -busif $bifname \
+            -clock [expr {[string match "m_axi_hbm_*" $bifname] ? $hbm_clk : "ap_clk"}] $core
         foreach param {HAS_BURST SUPPORTS_NARROW_BURST} {
             if {[llength [ipx::get_bus_parameters $param -of_objects $bif]] == 0} {
                 ipx::add_bus_parameter $param $bif

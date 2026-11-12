@@ -1,0 +1,32 @@
+# REQUIRES: verilator
+# Staggered requests on page engines (--vmem-stagger, foldsim-fold-static
+# vmem-stagger, with vmem-on-engines): a staged copy of four leaves
+# (Driver/Inputs/vmem_multi, --stage-levels 1: passes four positions apart)
+# lets a member leave up to three positions after its pass, so the copy's
+# eight memories share two engines at successive positions instead of taking
+# eight. Its fields are held from the pass, its valids stepped by the
+# positions run (none in a bubble), so each request leaves at its placed
+# position under any bubbles. Against the controllers' models
+# (Inputs/tb_vmem_multi.sv, FIFOs of 16 for the larger room, rows of the
+# engines' {member, instance, row}), the simulator matches the target at
+# response latencies of 1 to 600 host cycles, stalled channels, a controller
+# out of room and bubbles in bursts.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_multi
+# RUN: foldsim --srcs top.f --top Top --out %t/no --static --virtual-memories 'Leaf:.*' --copies Leaf:1 --stage-levels 1 --page-engines 16 --vmem-on-engines Leaf 2>&1 | FileCheck %s --check-prefix=NO
+# NO: vmem-on-engines: 8 virtual memories on page engines (8 new, 8 engines)
+# RUN: foldsim --srcs top.f --top Top --out %t/st --static --virtual-memories 'Leaf:.*' --copies Leaf:1 --stage-levels 1 --page-engines 16 --vmem-on-engines Leaf --vmem-stagger 4 --bubbles 2>&1 | FileCheck %s --check-prefix=ST
+# ST: vmem-on-engines: 8 virtual memories on page engines (2 new, 2 engines); vmem-stagger: 6 leave after their pass
+# RUN: FileCheck %s --check-prefix=SV < %t/st/foldsim_sim.sv
+# SV: Leaf_g_lane_2_lane2FMemory_stag_rv2
+# SV: Leaf_g_lane_2_lane2FMemory_stag_o6
+# RUN: python3 %S/Inputs/vmem_bind.py %t/st/foldsim_sim.json %t/st
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/st --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -Mdir %t/st/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/st/foldsim_sim.sv > %t/st/build.log 2>&1
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=FAST
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=30 +bubble=30 +stall=10 | FileCheck %s
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=1 +hi=600 +bubble=90 +burst=8 +stall=20 | FileCheck %s
+# RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=20 +hi=600 +full=80 +stall=20 | FileCheck %s
+# FAST: {{^}}MATCH 196 cycles in 4400 host cycles, H 22.00
+# CHECK-NOT: %Error
+# CHECK: {{^}}MATCH

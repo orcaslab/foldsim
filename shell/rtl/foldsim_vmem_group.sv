@@ -95,6 +95,11 @@ module foldsim_vmem_group #(
     parameter FIFO           = 8,
     // The controller's telemetry counters (foldsim_vmem TELEMETRY).
     parameter TELEMETRY      = 1,
+    // The controller: foldsim_vmem (0), or a static port in its place
+    // (foldsim_vport_ctl, foldsim --vmem-controller vport) whose zero fill
+    // covers the image's BYTES bytes.
+    parameter VPORT          = 0,
+    parameter longint BYTES  = 0,
     localparam GF            = $clog2(2 * FIFO + 1)
 ) (
     input  wire                        clk,
@@ -411,6 +416,70 @@ module foldsim_vmem_group #(
     end
     assign rsp_inst = c_rsp_inst[IW-1:0];
 
+    if (VPORT != 0) begin : g_vport
+    foldsim_vport_ctl #(
+        .IW             (IW),
+        .AW             (AW),
+        .DW             (DW),
+        .MW             (MW),
+        .RDW_READ_FIRST (RDW_READ_FIRST),
+        .QUEUE          (QUEUE),
+        .AXI_ID_W       (AXI_ID_W),
+        .OUTSTANDING    (OUTSTANDING),
+        .INSTANCES      (INSTANCES),
+        .KNOWN_ZERO     (KNOWN_ZERO),
+        .KZ_SHIFT       (KZ_SHIFT),
+        .ROW_BYTES      (ROW_BYTES),
+        .TAGW           (TW),
+        .WRITES_OUT     (WRITES_OUT),
+        .TELEMETRY      (TELEMETRY),
+        .BYTES          (BYTES)
+    ) vport (
+        .clk       (clk),
+        .reset     (c_reset),
+        .rd_valid  (c_rd),
+        .rd_inst   (c_inst),
+        .rd_row    (c_rrow),
+        .wr_valid  (c_wr),
+        .wr_inst   (c_inst),
+        .wr_row    (c_wrow),
+        .wr_data   (c_wdata),
+        .wr_mask   (c_wmask),
+        .rsp_valid (c_rsp_valid),
+        .rsp_inst  (c_rsp_inst),
+        .rsp_data  (rsp_data),
+        .free      (c_free),
+        .base      (c_base),
+        .zero      (zero),
+        .move      (c_move),
+        .moving    (c_moving),
+        .m_awvalid (m_awvalid),
+        .m_awready (m_awready),
+        .m_awaddr  (m_awaddr),
+        .m_awid    (m_awid),
+        .m_awlen   (m_awlen),
+        .m_wvalid  (m_wvalid),
+        .m_wready  (m_wready),
+        .m_wdata   (m_wdata),
+        .m_wstrb   (m_wstrb),
+        .m_wlast   (m_wlast),
+        .m_bvalid  (m_bvalid),
+        .m_bready  (m_bready),
+        .m_bid     (m_bid),
+        .m_arvalid (m_arvalid),
+        .m_arready (m_arready),
+        .m_araddr  (m_araddr),
+        .m_arid    (m_arid),
+        .m_arlen   (m_arlen),
+        .m_rvalid  (m_rvalid),
+        .m_rready  (m_rready),
+        .m_rdata   (m_rdata),
+        .m_rid     (m_rid),
+        .m_rlast   (m_rlast),
+        .tel       (tel)
+    );
+
+    end else begin : g_vmem
     foldsim_vmem #(
         .IW             (IW),
         .AW             (AW),
@@ -475,5 +544,7 @@ module foldsim_vmem_group #(
         .m_rlast   (m_rlast),
         .tel       (tel)
     );
+
+    end
 
 endmodule

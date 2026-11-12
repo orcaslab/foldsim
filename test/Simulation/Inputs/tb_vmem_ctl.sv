@@ -13,7 +13,7 @@
 `timescale 1ns/1ps
 module tb;
     parameter IW = 3, AW = 4, DW = 1040, MW = 1, RDW_READ_FIRST = 1, QUEUE = 16, OUTSTANDING = 16,
-              CACHE_ROWS = 0, KNOWN_ZERO = 0, FORWARD = 0, WRITES_OUT = 8, ROW_BYTES = 0, CYCLES = 30000;
+              CACHE_ROWS = 0, KNOWN_ZERO = 0, FORWARD = 0, WRITES_OUT = 8, ROW_BYTES = 0, CYCLES = 30000, KZ_SHIFT = 0;
     localparam INST = 1 << IW, ROWS = 1 << AW, DB = (DW + 7) / 8 * 8, BYTES = DB / 8;
     localparam RB = ROW_BYTES ? ROW_BYTES : ((BYTES > 64) ? (1 << $clog2(BYTES)) : 64);
     localparam FW = $clog2(QUEUE + 1), GROUP = BYTES / MW;
@@ -40,9 +40,15 @@ module tb;
     reg [511:0] m_rdata;
     wire [7*48-1:0] tel;
 
-    foldsim_vmem #(.IW(IW), .AW(AW), .DW(DW), .MW(MW), .RDW_READ_FIRST(RDW_READ_FIRST), .QUEUE(QUEUE), .AXI_ID_W(1),
+    // (-DVPORT_CTL: the static port in the controller's place, foldsim_vport_ctl,
+    // its zero fill over the image.)
+`ifdef VPORT_CTL
+    foldsim_vport_ctl #(.BYTES(longint'(INST) * ROWS * RB), .IW(IW),
+`else
+    foldsim_vmem #(.IW(IW),
+`endif .AW(AW), .DW(DW), .MW(MW), .RDW_READ_FIRST(RDW_READ_FIRST), .QUEUE(QUEUE), .AXI_ID_W(1),
         .OUTSTANDING(OUTSTANDING), .INSTANCES(INST), .CACHE_ROWS(CACHE_ROWS), .KNOWN_ZERO(KNOWN_ZERO), .ROW_BYTES(RB),
-        .WRITES_OUT(WRITES_OUT), .FORWARD(FORWARD)) dut (
+        .WRITES_OUT(WRITES_OUT), .FORWARD(FORWARD), .KZ_SHIFT(KZ_SHIFT)) dut (
         .clk(clk), .reset(reset), .rd_valid(rd_valid), .rd_inst(rd_inst), .rd_row(rd_row), .wr_valid(wr_valid),
         .wr_inst(wr_inst), .wr_row(wr_row), .wr_data(wr_data), .wr_mask(wr_mask), .rsp_valid(rsp_valid),
         .rsp_inst(rsp_inst), .rsp_data(rsp_data), .free(free), .base(64'h1000_0000), .zero(1'b1), .move(1'b0),
@@ -53,7 +59,7 @@ module tb;
         .m_rready(m_rready), .m_rdata(m_rdata), .m_rid(m_rid), .m_rlast(m_rlast), .tel(tel));
 
     reg stop = 0;
-    integer hi = 40, stall = 0, errors = 0, reads = 0, answered = 0, writes = 0, pairs = 0, hazards = 0;
+    integer hi = 40, stall = 0, errors = 0, reads = 0, answered = 0, writes = 0, pairs = 0, hazards = 0, resets = 0;
     // The reference RAM, and each instance's pending read's expected row.
     reg [DB-1:0] ram [INST][ROWS];
     reg [DB-1:0] expect_row [INST];
@@ -158,7 +164,9 @@ module tb;
             if (m[j / GROUP]) merge[j*8 +: 8] = d[j*8 +: 8];
     endfunction
     always @(posedge clk) begin
-        if (rsp_valid) begin
+        // (An answer in a cycle the simulator spends in reset is not taken: a
+        // read whose last beat came just before the reset may show there.)
+        if (rsp_valid && !reset) begin
             answered <= answered + 1;
             if (!pending[rsp_inst]) begin
                 $display("FAIL: an answer for instance %0d with no read", rsp_inst);
@@ -207,6 +215,7 @@ module tb;
     initial begin
         void'($value$plusargs("hi=%d", hi));
         void'($value$plusargs("stall=%d", stall));
+        void'($value$plusargs("resets=%d", resets));
         for (int i = 0; i < INST; ++i) begin
             pending[i] = 0;
             for (int r = 0; r < ROWS; ++r) ram[i][r] = '0;
@@ -215,7 +224,28 @@ module tb;
         reset <= 0;
         // The reset's drain: free comes back at QUEUE.
         wait (free == FW'(QUEUE));
-        repeat (CYCLES) @(posedge clk);
+        // +resets=N: N resets with requests in flight, CYCLES apart. No read
+        // taken before one is answered after it; with known-zero rows (and
+        // `zero`), every row reads zero after it (the controller's zero fill,
+        // or the image still clean), else memory keeps the rows.
+        for (int n = 0; n < resets; ++n) begin
+            repeat (CYCLES / (resets + 1)) @(posedge clk);
+            // (The driver quiet for a cycle: no request in the reset's own.)
+            stop = 1;
+            repeat (2) @(posedge clk);
+            reset <= 1;
+            @(posedge clk);
+            for (int i = 0; i < INST; ++i) pending[i] = 0;
+            if (KNOWN_ZERO != 0)
+                for (int i = 0; i < INST; ++i)
+                    for (int r = 0; r < ROWS; ++r) ram[i][r] = '0;
+            repeat (2) @(posedge clk);
+            reset <= 0;
+            @(posedge clk);
+            wait (free == FW'(QUEUE));
+            stop = 0;
+        end
+        repeat (CYCLES / (resets + 1)) @(posedge clk);
         stop = 1;
         repeat (20 * hi + 2000) @(posedge clk);
         for (int i = 0; i < INST; ++i)

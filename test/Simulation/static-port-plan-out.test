@@ -1,0 +1,18 @@
+# The static-port placement model's input (--port-plan-out, foldsim-fold-static
+# port-plan-out; report only): every page engine member's read and write
+# positions as placed, each class virtual memory's instances' state passes,
+# widths and kinds. Driver/Inputs/vmem_multi, two copies, on page engines
+# (vmem-on-engines): 16 memories, 8 engines; each member's positions are its
+# copy's state passes (instance i at slot[kState][i]), no two members of an
+# engine share a position, and the netlist is the same with and without it.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_multi
+# RUN: foldsim --srcs top.f --top Top --out %t/a --static --virtual-memories 'Leaf:.*' --copies Leaf:2 --page-engines 16 --vmem-on-engines Leaf --port-plan-out %t/plan.json > /dev/null 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/b --static --virtual-memories 'Leaf:.*' --copies Leaf:2 --page-engines 16 --vmem-on-engines Leaf > /dev/null 2>&1
+# RUN: sed -e 's#//.*##' %t/a/foldsim_sim.sv > %t/a.sv
+# RUN: sed -e 's#//.*##' %t/b/foldsim_sim.sv > %t/b.sv
+# RUN: diff %t/a.sv %t/b.sv
+# RUN: python3 %S/Inputs/port_plan_check.py %t/plan.json | FileCheck %s
+# CHECK: engines 8 members 16
+# CHECK: classes 2 memories 16 on engines 16
+# CHECK: members at their state passes: 16
+# CHECK: shared positions: 0

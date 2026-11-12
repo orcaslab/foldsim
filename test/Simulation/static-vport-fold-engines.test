@@ -1,0 +1,33 @@
+# REQUIRES: verilator
+# Streamed folded stores on page engines (--vmem-fold-on-engines): each folded
+# store of fold-store-stream (its requests at each instance's issue: the
+# landing ring's state pass) placed on a static port like any class virtual
+# memory (vmem-on-engines, vmem-stagger), instead of a controller of its own;
+# with --vport-write-beats its 600-bit rows written as two beats. Each run
+# against the target from zero state (tb_vmem_multi.sv) on real foldsim_vport
+# (SYNC) ports and an AXI memory applying writes at their B, latencies 1 to 600
+# host cycles, ready stalls, bubbles. Driver/Inputs/fold_stream (sixteen
+# leaves, stores of 48, 512, 384 and 38,400 bits; vmem rings of the answers).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/fold_stream
+# RUN: foldsim --srcs top.f --top Top --out %t/fe --static --bubbles --state-in-ram Leaf::4 --fold-store-stream --vmem-rings 4 --page-engines 16 --vmem-on-engines --vmem-stagger 8 --vport-engines --vport-hz 8 --vmem-fold-on-engines --vport-write-beats --port-plan-out %t/fe.json Leaf 2>&1 | FileCheck %s --check-prefix=FE
+# RUN: python3 %S/Inputs/port_plan_folds.py %t/fe.json | FileCheck %s --check-prefix=AT
+# RUN: FileCheck %s --check-prefix=FEH < %t/fe/foldsim_sim.vh
+# RUN: python3 %S/Inputs/vmem_bind.py %t/fe/foldsim_sim.json %t/fe
+# RUN: cd %S/../Driver/Inputs/fold_stream && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/fe -Mdir %t/fe/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/fe/foldsim_sim.sv > %t/fe/build.log 2>&1
+# RUN: %t/fe/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/fe/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RUN: %t/fe/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=600 +bubble=90 +burst=8 +stall=20 | FileCheck %s
+# Two copies, modulo, the stores at their passes (no stagger room).
+# RUN: cd %S/../Driver/Inputs/fold_stream && foldsim --srcs top.f --top Top --out %t/cb --static --bubbles --modulo --min-ii 64 --fold-store-stream --vmem-rings 4 --copies Leaf:2 --page-engines 16 --vmem-on-engines --vmem-stagger 8 --vport-engines --vport-hz 8 --vmem-fold-on-engines Leaf 2>&1 | FileCheck %s --check-prefix=CB
+# RUN: python3 %S/Inputs/vmem_bind.py %t/cb/foldsim_sim.json %t/cb
+# RUN: cd %S/../Driver/Inputs/fold_stream && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/cb -Mdir %t/cb/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/cb/foldsim_sim.sv > %t/cb/build.log 2>&1
+# RUN: %t/cb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: %t/cb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +bubble=30 +stall=10 | FileCheck %s
+# FE: vmem-on-engines: 4 virtual memories on page engines
+# FE-SAME: vport-write-beats: 1 written beat by beat
+# FEH: `define FOLDSIM_VPORT1_DW 512
+# CB: vmem-on-engines: 8 virtual memories on page engines
+# AT-NOT: NOT at issues
+# AT: fold at issues: Leaf:fold{{[0-9]}}_store d
+# AT-NOT: NOT at issues
+# CHECK: MATCH 196 cycles

@@ -24,17 +24,26 @@ module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1}
                           parameter int DW = 1024, parameter int MB = (DW + 7) / 8) (
     input logic clk, rst,
     input int cyc, lo, hi, full,
-    input logic rd_valid [N], input logic [7:0] rd_inst [N], input logic [7:0] rd_row [N],
-    input logic wr_valid [N], input logic [7:0] wr_inst [N], input logic [7:0] wr_row [N],
+    input logic rd_valid [N], input logic [7:0] rd_inst [N], input logic [15:0] rd_row [N],
+    input logic wr_valid [N], input logic [7:0] wr_inst [N], input logic [15:0] wr_row [N],
     input logic [DW-1:0] wr_data [N], input logic [MB-1:0] wr_mask [N],
     output logic rsp_valid [N], output logic [7:0] rsp_inst, output logic [DW-1:0] rsp_data,
     output logic [15:0] free [N],
     output bit ok);
+`ifdef VMEM_DEPTH
+  localparam DEPTH = `VMEM_DEPTH;  // (vmem-stagger: a larger room)
+`else
   localparam DEPTH = 8;
-  typedef struct packed { logic rd, wr; logic [7:0] inst, winst; logic [7:0] rrow, wrow; logic [DW-1:0] data; logic [MB-1:0] mask; } ent_t;
-  // Rows of up to DW bits (vmem_bind.py: the group's widest member, at least
-  // 1024); instances (the address's) below 256, rows below 64.
-  logic [DW-1:0] mem [N][256][64];
+`endif
+  typedef struct packed { logic rd, wr; logic [7:0] inst, winst; logic [15:0] rrow, wrow; logic [DW-1:0] data; logic [MB-1:0] mask; } ent_t;
+  // Rows of up to DW bits (vmem_bind.py: the group's widest member, at least 1024); instances (the address's) below 256, rows below ROWS (a page engine's rows {member,
+  // instance, row}; VMEM_ROWS for wider ones, vmem-stagger's engines of more members).
+`ifdef VMEM_ROWS
+  localparam ROWS = `VMEM_ROWS;
+`else
+  localparam ROWS = 256;
+`endif
+  logic [DW-1:0] mem [N][256][ROWS];
   ent_t fifo [N][DEPTH];
   int head [N], cnt [N];
   bit outstanding [N][256], answered [N][256];
@@ -47,7 +56,7 @@ module vmem_group_model #(parameter N = 1, parameter int MMW [N] = '{default: 1}
       head[m] = 0; cnt[m] = 0;
       for (int i = 0; i < 256; i++) begin
         outstanding[m][i] = 0; answered[m][i] = 0;
-        for (int r = 0; r < 64; r++) mem[m][i][r] = 0;
+        for (int r = 0; r < ROWS; r++) mem[m][i][r] = 0;
       end
     end
   end
@@ -129,19 +138,29 @@ module tb;
   bit ref_done = 0;
 `ifdef TOP8
   Top8 target(.clk(rclk), .x(rx), .y(ry));
+`elsif RST
+  // (A target with a reset input: high its first two cycles, a token stream
+  // of the simulator's too.)
+  logic rrst;
+  Top target(.clk(rclk), .rst(rrst), .x(rx), .y(ry));
 `else
   Top target(.clk(rclk), .x(rx), .y(ry));
 `endif
   initial begin
     for (int t = 0; t < T; t++) begin
       rx = stim_x(t);
+`ifdef RST
+      rrst = t < 2;
+`endif
       #1; ref_y[t] = ry; rclk = 1; #1; rclk = 0;
     end
     ref_done = 1;
   end
   logic clk = 0, rst = 1;
   always #5 clk = ~clk;
-  int ix = 0, iy = 0, cyc = 0;
+  int ix = 0, iy = 0, ir = 0, cyc = 0;
+  logic vr;
+  wire rr;
   logic [7:0] sim_y [T];
   logic vx, yr, adv;
   wire xr, yv;
@@ -155,6 +174,9 @@ module tb;
 `include "vm_decl.svh"
   foldsim_sim dut(.hostClock(clk), .hostReset(rst),
     .x_valid(vx), .x_bits(stim_x(ix)), .x_ready(xr),
+`ifdef RST
+    .rst_valid(vr), .rst_bits(ir < 2), .rst_ready(rr),
+`endif
     .y_ready(yr), .y_valid(yv), .y_bits(yb),
 `ifdef BUBBLES
     .advance(adv),
@@ -163,6 +185,7 @@ module tb;
     .profile_finish());
   always @(negedge clk) begin
     vx = ix < T && ($urandom % 100 >= stall);
+    vr = ir < T && ($urandom % 100 >= stall);
     yr = $urandom % 100 >= stall;
     adv = $urandom % 100 >= bubble;
   end
@@ -170,12 +193,15 @@ module tb;
     cyc <= cyc + 1; rst <= 0;
     if (!rst) begin
       if (vx && xr) ix <= ix + 1;
+`ifdef RST
+      if (vr && rr) ir <= ir + 1;
+`endif
       if (yv && yr && iy < T) begin sim_y[iy] <= yb; iy <= iy + 1; end
     end
   end
   initial begin
     automatic bit ok = 1;
-    do @(posedge clk); while (iy < T && cyc < 400000);
+    do @(posedge clk); while (iy < T && cyc < 4000000);
     wait (ref_done);
     if (iy < T) begin $display("TIMEOUT at %0d tokens", iy); $finish; end
     for (int t = W; t < T; t++)

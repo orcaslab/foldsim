@@ -1,0 +1,71 @@
+# REQUIRES: verilator
+# The direct-HBM binding of static ports through the kernel flow, end to end
+# short of Vivado: a simulator with 32 static ports (Inputs/flow/vport_stub.py:
+# the simulator's side of foldsim_vport, vp<p>_*, and FOLDSIM_VPORT<p>_* in its
+# header) and a manifest binding them to HBM channels 0, 2, .., 62 ([platform]
+# hbm_direct). kernel-vh: the ports' channels, apertures and repeat macros;
+# afu: hbm_clk and m_axi_hbm_<p> (256 bits) on the kernel's top; kernel-srcs:
+# foldsim_vport; cfg: each m_axi_hbm_<p> on its channel with :DIRECT and hbm_clk
+# on the static region clock. The kernel elaborates in Verilator (lint -Wall:
+# nothing about the static ports) and in CIRCT: 32 foldsim_vport instances,
+# their AXI side on hbm_clk. Without hbm_direct (a simulator without static
+# ports) nothing changes; a mismatched binding fails.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: python3 %S/Inputs/flow/vport_stub.py 32 %t/gen
+# RUN: python3 %foldsim_tools/foldsim_flow.py kernel-vh --manifest %S/Inputs/flow/vport32.toml --gen %t/gen -o %t/gen/foldsim_kernel.vh
+# RUN: FileCheck %s --check-prefix=VH < %t/gen/foldsim_kernel.vh
+# RUN: python3 %foldsim_tools/foldsim_flow.py afu --manifest %S/Inputs/flow/vport32.toml --gen %t/gen --rtl-dir %S/../../shell/rtl -o %t/gen/foldsim_afu.sv
+# RUN: python3 %foldsim_tools/foldsim_flow.py kernel-srcs --gen %t/gen --rtl-dir %S/../../shell/rtl -o %t/srcs.f
+# RUN: FileCheck %s --check-prefix=SRCS < %t/srcs.f
+# RUN: python3 %foldsim_tools/foldsim_flow.py cfg --manifest %S/Inputs/flow/vport32.toml --gen %t/gen -o %t/link.cfg
+# RUN: FileCheck %s --check-prefix=CFG < %t/link.cfg
+# RUN: grep -c ':DIRECT$' %t/link.cfg | FileCheck %s --check-prefix=N32
+# RUN: %verilator -E -P -DSIMULATION -I%S/../../shell/rtl -I%t/gen %t/gen/foldsim_afu.sv | FileCheck %s --check-prefix=TOP
+# RUN: %verilator --lint-only -Wall -Wno-fatal -DSIMULATION --top-module foldsim_afu -f %t/srcs.f > %t/lint.log 2>&1
+# RUN: grep -E '^%%(Warning|Error)' %t/lint.log | sed -E 's#^(%%[A-Za-z-]+): [^ ]+:[0-9]+:[0-9]+: #\1: #' | FileCheck %s --check-prefix=LINT
+# RUN: circt-verilog --ir-hw --allow-use-before-declare -DSYNTHESIS -I %S/../../shell/rtl -I %t/gen --top foldsim_afu %t/gen/foldsim_sim.sv %S/../../shell/rtl/foldsim_token.sv %S/../../shell/rtl/foldsim_mem_bmap.sv %S/../../shell/rtl/foldsim_mem_bank.sv %S/../../shell/rtl/foldsim_mem.sv %S/../../shell/rtl/foldsim_vmem.sv %S/../../shell/rtl/foldsim_vmem_share.sv %S/../../shell/rtl/foldsim_vmem_group.sv %S/../../shell/rtl/foldsim_vport.sv %S/../../shell/rtl/foldsim_ctrl.sv %t/gen/foldsim_afu.sv -o %t/afu.mlir
+# RUN: grep -o 'hw.instance "vport[0-9]*" @foldsim_vport' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=N32
+# RUN: grep -o 'm_clk: %%hbm_clk' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=N32
+# RUN: grep -o 'out m_axi_hbm_[0-9]*_wdata : i256' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=N32
+# No static ports, no hbm_direct: nothing of them.
+# RUN: python3 %S/Inputs/flow/vport_stub.py 0 %t/g0
+# RUN: grep -v hbm_direct %S/Inputs/flow/vport32.toml > %t/plain.toml
+# RUN: python3 %foldsim_tools/foldsim_flow.py kernel-vh --manifest %t/plain.toml --gen %t/g0 -o %t/g0/foldsim_kernel.vh
+# RUN: python3 %foldsim_tools/foldsim_flow.py afu --manifest %t/plain.toml --gen %t/g0 --rtl-dir %S/../../shell/rtl -o %t/g0/foldsim_afu.sv
+# RUN: python3 %foldsim_tools/foldsim_flow.py cfg --manifest %t/plain.toml --gen %t/g0 | FileCheck %s --check-prefix=PLAIN
+# RUN: %verilator -E -P -DSIMULATION -I%S/../../shell/rtl -I%t/g0 %t/g0/foldsim_afu.sv | FileCheck %s --check-prefix=PLAIN
+# RUN: FileCheck %s --check-prefix=PLAIN < %t/g0/foldsim_kernel.vh
+# A binding that does not match the simulator's ports fails.
+# RUN: not python3 %foldsim_tools/foldsim_flow.py kernel-vh --manifest %t/plain.toml --gen %t/gen 2>&1 | FileCheck %s --check-prefix=UNBOUND
+# RUN: not python3 %foldsim_tools/foldsim_flow.py kernel-vh --manifest %S/Inputs/flow/vport32.toml --gen %t/g0 2>&1 | FileCheck %s --check-prefix=NOPORTS
+# RUN: not python3 %foldsim_tools/foldsim_flow.py cfg --manifest %S/Inputs/flow/vport32.toml --set 'platform.hbm_direct=[0,2,2]' --gen %t/gen 2>&1 | FileCheck %s --check-prefix=UNBOUND
+# VH: `define FOLDSIM_VPORT_DIRECT
+# VH: `define FOLDSIM_VPORT0_HBM 0
+# VH-NEXT: `define FOLDSIM_VPORT0_ADDR 64'h4000000000
+# VH-NEXT: `define FOLDSIM_VPORT1_HBM 2
+# VH-NEXT: `define FOLDSIM_VPORT1_ADDR 64'h4040000000
+# VH: `define FOLDSIM_VPORT31_HBM 62
+# VH-NEXT: `define FOLDSIM_VPORT31_ADDR 64'h47c0000000
+# VH-NEXT: `define FOLDSIM_VPORT_REPEAT0(f,s) `f(0) `s `f(1) `s `f(2) `s `f(3) `s `f(4) `s `f(5) `s `f(6) `s `f(7)
+# VH: `define FOLDSIM_VPORT_REPEAT3(f,s) `s `f(24) `s `f(25) `s `f(26) `s `f(27) `s `f(28) `s `f(29) `s `f(30) `s `f(31)
+# VH-NEXT: `define FOLDSIM_VPORT_REPEAT4(f,s) {{$}}
+# SRCS: shell/rtl/foldsim_vport.sv
+# SRCS-NEXT: shell/rtl/foldsim_ctrl.sv
+# CFG: sp=foldsim_afu_0.m_axi_mem_0:MEM
+# CFG-NEXT: sp=foldsim_afu_0.m_axi_hbm_0:HBM0:DIRECT
+# CFG-NEXT: sp=foldsim_afu_0.m_axi_hbm_1:HBM2:DIRECT
+# CFG: sp=foldsim_afu_0.m_axi_hbm_31:HBM62:DIRECT
+# CFG-NEXT: clk=foldsim_afu_0.hbm_clk:STATIC
+# N32: {{^}}32{{$}}
+# TOP: input wire hbm_clk,
+# TOP: output wire m_axi_hbm_0_awvalid,
+# TOP: output wire [255:0] m_axi_hbm_31_wdata,
+# TOP: .ASYNC (1),
+# TOP: .m_clk (hbm_clk),
+# (Only the kernel's own two warnings, none of the static ports'.)
+# LINT: %Warning-DECLFILENAME: Filename 'foldsim_token'
+# LINT-NEXT: %Warning-UNUSEDSIGNAL: Signal is not used: 'advance'
+# LINT-NOT: %
+# PLAIN-NOT: {{hbm_clk|m_axi_hbm|vport|VPORT|DIRECT}}
+# UNBOUND: [platform] hbm_direct
+# NOPORTS: the simulator has no static ports

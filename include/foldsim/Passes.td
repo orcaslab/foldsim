@@ -405,6 +405,81 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "its state pass and keeps each instance's read data from the "
            "responses; a slot whose instance's read has not been answered "
            "waits in a bubble, so the target's cycles never change">,
+    Option<"vmemStagger", "vmem-stagger", "unsigned", "0",
+           "With vmem-on-engines: the most positions a class virtual memory's "
+           "requests may leave after its pass (held in registers, the valids "
+           "stepped by the positions run), so that a copy's memories at one "
+           "pass share engines at successive positions; bounded by the "
+           "class's least gap between passes, the room (a controller's 32 "
+           "entries) and the frame's end. Classes whose folded stores stream "
+           "take part too (their folded stores keep their controllers). 0: "
+           "every request at its pass">,
+    Option<"vportEngines", "vport-engines", "bool", "false",
+           "With page-engines: each page engine is a static port (the kernel's "
+           "foldsim_vport, contract VB/STATUS 5.1): the simulator's vp<p>_* "
+           "ports instead of an engine's vm<k>_* row interface and its "
+           "controller. A request's address is its row's beat offset in the "
+           "port's region ({member, instance, row} x the row's beats), its "
+           "tag the engine's; a row of several 512-bit beats is answered beat "
+           "by beat into a register of the row. Read after write by a fence "
+           "class a member (vport-fence-shift), from the schedule's least "
+           "distance from any write of the member to a later read; read-first "
+           "members' writes wait for the reads before them (wr_pair)">,
+    Option<"vportCopy", "vport-copy", "bool", "false",
+           "With vport-engines and vmem-rings: a ring memory's image in its "
+           "port's region (rows {image member, instance}), its reads copied "
+           "into the image row by the port (rd_copy: answered with rsp_copied, "
+           "no data), the ring's prefetches reads of the image at their "
+           "positions on that port after every earlier copy (rd_after); no "
+           "image controller, answer queue, table of reads in flight or "
+           "prefetch queue. A ring's prefetch positions taken on its port">,
+    Option<"vmemFoldEngines", "vmem-fold-on-engines", "bool", "false",
+           "With vmem-on-engines: a folded store streamed to HBM "
+           "(fold-store-stream) on a page engine too, at its requests' "
+           "positions (each instance's issue: the landing ring's state pass, "
+           "else its own), like any class virtual memory, instead of a "
+           "controller of its own">,
+    Option<"vportWriteBeats", "vport-write-beats", "bool", "false",
+           "With vport-engines, vmem-on-engines, vmem-stagger and vport-hz: a "
+           "target RAM's row wider than a beat written as its 512-bit beats at "
+           "successive positions after its pass (beat k k positions after the "
+           "first, its address the row's beat offset + k; a write-first "
+           "member's read at its last beat), so its port's write rows are one "
+           "beat; the row held in the simulator until its last beat (before "
+           "the class's next pass). Reads stay whole rows. Not for copy rings">,
+    Option<"vportHz", "vport-hz", "unsigned", "0",
+           "With vport-engines: read after write by each port's table of "
+           "write numbers by a hash of the row (2^N entries; the fences "
+           "unused) instead of fence classes; 0: fence classes">,
+    Option<"vportFenceShift", "vport-fence-shift", "unsigned", "4",
+           "With vport-engines: the ports' fence sample interval's log2 (FS): "
+           "a member whose writes precede its reads by at least (c + 1) x 2^FS "
+           "positions reads in fence class c (at most 15); 0 waits for every "
+           "earlier write's B">,
+    Option<"portPlanOut", "port-plan-out", "std::string", "\"\"",
+           "Report only: write every HBM member's request positions (each page "
+           "engine member's reads and writes as placed; each class virtual "
+           "memory's instances' state passes and folded-store issues, widths "
+           "and kinds) to this JSON file, the input of a static-port placement "
+           "model; empty: none">,
+    Option<"vmemEngines", "vmem-on-engines", "bool", "false",
+           "With page-engines: the class virtual memories (the target's RAMs; "
+           "not page columns, rings or a class with folded-store streams) ride "
+           "the page engines as members at their requests' own positions (each "
+           "instance's state pass, a host cycle later for a held read), first "
+           "fit on an engine of the same read-during-write order and row bytes "
+           "whose positions are free, else a new one: a static port per engine, "
+           "no controller and no member queue per memory. A copy's memories "
+           "requesting at one position take distinct engines">,
+    Option<"vmemCost", "vmem-cost", "bool", "false",
+           "A memory the virtual-memory rules pick (pattern or size) stays a "
+           "virtual memory only where that costs fewer LUTs than keeping its "
+           "threaded image on chip in the copy: a member's select leaves (a "
+           "third of a LUT a bit of its row, at the fit's level scale), its "
+           "read ring (a row of LUTRAM per 32 entries) and its control, "
+           "against the image in LUTRAM (instances x rows <= 64 entries a "
+           "LUT6 column, 8 LUTs per 32 x 14 bits) or block RAM; the choices "
+           "in the report">,
     Option<"vmemMergeLanes", "vmem-merge-lanes", "bool", "false",
            "With virtual-memories, the arrays a front end split from one "
            "target RAM (byte lanes, ways: the same depth, read-during-write "
@@ -727,6 +802,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "after its last row's pass; the class's reads and drains move by "
            "a constant each to share an engine. One member a class (no "
            "chunks of 56 columns). 0: whole rows">,
+    Option<"ppChunkColumns", "pp-chunk-columns", "unsigned", "56",
+           "A streamed PP class's row chunks (a virtual memory each): at most "
+           "this many 72-bit columns a chunk (56: 4,032 bits, a row of 8 "
+           "beats; 7: 504 bits, a beat, so that every chunk is one page-engine "
+           "lane and a row's chunks stripe over engines at the same positions)">,
     Option<"linkHbmBeatBits", "link-hbm-beat-bits", "unsigned", "0",
            "HBM link streams on their own controllers: a row wider than this "
            "many bits moves as beats (at most 8) of a controller this wide, "

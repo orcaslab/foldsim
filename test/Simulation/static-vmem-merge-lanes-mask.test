@@ -1,0 +1,19 @@
+# REQUIRES: verilator
+# --vmem-merge-lanes merges into one row only the arrays whose mask lanes are
+# whole bytes (the row's byte enables). Driver/Inputs/vmem_lanes_mask is
+# vmem_multi plus, at the lanes' address, a 16 x 10 RAM written by two enables
+# of 5 bits each: it stays a memory of its own (padded lanes) and the static
+# simulator matches the target. (Merged, its 5-bit lanes took whole bytes of
+# the row: wrong rows, and on the 64-SM netlists an hw.output width mismatch.)
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem_lanes_mask
+# RUN: foldsim --srcs top.f --top Top --out %t/m --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=JSON < %t/m/foldsim_sim.json
+# JSON: "memory": "g_lane_0.lane/Memory_x5"
+# JSON: "memory": "pairm/Memory"
+# RUN: python3 %S/Inputs/vmem_bind.py %t/m/foldsim_sim.json %t/m
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/m --top-module tb -Mdir %t/m/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/m/foldsim_sim.sv > %t/m/build.log 2>&1
+# RUN: %t/m/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/m/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: %t/m/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# CHECK-NOT: MISMATCH
+# CHECK: {{^}}MATCH

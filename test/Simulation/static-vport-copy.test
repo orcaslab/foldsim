@@ -1,0 +1,58 @@
+# REQUIRES: verilator
+# Ring copies in the static port (--vport-copy): a ring memory on a static port
+# keeps its image in that port's region (rows {image member, instance}); its
+# reads carry rd_copy and the image row (the port writes the answer there and
+# answers rsp_copied, no data); the ring's prefetches are reads of the image at
+# their own positions on that port with rd_after (after every earlier copy's
+# B): no image controller, answer queue, table of reads in flight or prefetch
+# queue in the simulator. Against the target from zero state (tb_vmem_multi.sv,
+# each port a real foldsim_vport with COPY on vport_axi_model.sv: writes
+# applied at their B, reads sampled at AR), 1 to 600 host cycles, stalls,
+# bubbles; with class control and stagger, the port's table (HZ 8) and fence
+# classes; a ring whose prefetches fall at its own positions keeps an image of
+# its own (COPY 0).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmemring
+# RUN: foldsim --srcs top.f --top Top --out %t/c --static --modulo --bubbles --min-ii 160 --virtual-memories 'Leaf:.*' --vmem-rings 16 --page-engines 16 --vmem-on-engines --vport-engines --vport-hz 8 --vport-copy Leaf > %t/c.log 2>&1
+# RUN: FileCheck %s --check-prefix=VH < %t/c/foldsim_sim.vh
+# RUN: FileCheck %s --check-prefix=SV < %t/c/foldsim_sim.sv
+# RUN: python3 %S/Inputs/vmem_bind.py %t/c/foldsim_sim.json %t/c
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/c -Mdir %t/c/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/c/foldsim_sim.sv > %t/c/build.log 2>&1
+# RUN: %t/c/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/c/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: %t/c/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# RUN: %t/c/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=600 +bubble=90 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/g --static --modulo --min-ii 160 --virtual-memories 'Leaf:.*' --vmem-rings 16 --vmem-ring-class-control --page-engines 16 --vmem-on-engines --vmem-stagger 7 --vport-engines --vport-fence-shift 2 --vport-copy Leaf > %t/g.log 2>&1
+# RUN: FileCheck %s --check-prefix=VH < %t/g/foldsim_sim.vh
+# RUN: python3 %S/Inputs/vmem_bind.py %t/g/foldsim_sim.json %t/g
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/g -Mdir %t/g/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/g/foldsim_sim.sv > %t/g/build.log 2>&1
+# RUN: %t/g/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/own --static --modulo --min-ii 160 --virtual-memories 'Leaf:.*' --vmem-rings 4 --page-engines 16 --vmem-on-engines --vport-engines --vport-hz 8 --vport-copy Leaf > %t/own.log 2>&1
+# RUN: FileCheck %s --check-prefix=OWN < %t/own/foldsim_sim.vh
+# RUN: python3 %S/Inputs/vmem_bind.py %t/own/foldsim_sim.json %t/own
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/own -Mdir %t/own/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/own/foldsim_sim.sv > %t/own/build.log 2>&1
+# RUN: %t/own/obj/Vtb +verilator+rand+reset+0 +verilator+seed+6 +lo=1 +hi=600 +stall=30 | FileCheck %s
+# Read-first rings of one class, one of two-beat rows (vport_rf); write-first rings (vmem_multi) keep their own
+# images (their reads wait for their own cycle's write, queued in the port after the copy's slot).
+# RUN: cd %S/../Driver/Inputs/vport_rf && foldsim --srcs top.f --top Top --out %t/rf --static --modulo --bubbles --min-ii 160 --virtual-memories 'Leaf:.*' --vmem-rings 16 --page-engines 16 --vmem-on-engines --vport-engines --vport-hz 8 --vport-copy Leaf > %t/rf.log 2>&1
+# RUN: FileCheck %s --check-prefix=RF < %t/rf/foldsim_sim.vh
+# RUN: python3 %S/Inputs/vmem_bind.py %t/rf/foldsim_sim.json %t/rf
+# RUN: cd %S/../Driver/Inputs/vport_rf && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/rf -Mdir %t/rf/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/rf/foldsim_sim.sv > %t/rf/build.log 2>&1
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=600 +bubble=90 +stall=20 | FileCheck %s
+# RUN: %t/rf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=5 +hi=60 +full=30 +stall=20 | FileCheck %s
+# RUN: cd %S/../Driver/Inputs/vmem_multi && foldsim --srcs top.f --top Top --out %t/wf --static --modulo --min-ii 160 --virtual-memories 'Leaf:.*' --vmem-rings 16 --page-engines 16 --vmem-on-engines --vport-engines --vport-hz 8 --vport-copy Leaf > %t/wf.log 2>&1
+# RUN: FileCheck %s --check-prefix=WF < %t/wf/foldsim_sim.vh
+# RUN: python3 %S/Inputs/vmem_bind.py %t/wf/foldsim_sim.json %t/wf
+# RUN: cd %S/../Driver/Inputs/vmem_multi && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -I%t/wf -Mdir %t/wf/obj %S/Inputs/tb_vmem_multi.sv %S/Inputs/vport_axi_model.sv %S/../../shell/rtl/foldsim_vport.sv top.sv %t/wf/foldsim_sim.sv > %t/wf/build.log 2>&1
+# RUN: %t/wf/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=600 +stall=30 | FileCheck %s
+
+# RF: `define FOLDSIM_VPORT0_COPY 1
+# RF: `define FOLDSIM_VPORT1_LMAX 2
+# RF: `define FOLDSIM_VPORT1_COPY 1
+# WF-NOT: _COPY 1
+# VH: `define FOLDSIM_VPORTS 1
+# VH: `define FOLDSIM_VPORT0_COPY 1
+# SV-NOT: ring_flight
+# SV-NOT: _qhead
+# SV: assign vp0_rd_after = {{.*}}ring_pref0
+# OWN: `define FOLDSIM_VPORT0_COPY 0
+# CHECK: MATCH 196 cycles

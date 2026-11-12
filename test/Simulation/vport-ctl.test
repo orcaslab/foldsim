@@ -1,0 +1,31 @@
+# REQUIRES: verilator
+# The static port in a controller's place (shell/rtl/foldsim_vport_ctl.sv over
+# foldsim_vport.sv) against the controller's own contract test
+# (Inputs/tb_vmem_ctl.sv, -DVPORT_CTL): a memory that applies a write at its B
+# and reads rows at AR, answers checked against a reference RAM; read-first and
+# write-first same-row pairs, byte and whole-row enables, rows of three beats,
+# of a beat and of 32 bits in a 64-byte row; known-zero rows by the zero fill
+# after the reset; HBM latency 1 to 600 host cycles, channels stalled at random.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION -DVPORT_CTL --top-module tb -Mdir %t/wide %S/Inputs/tb_vmem_ctl.sv %S/../../shell/rtl/foldsim_vport_ctl.sv %S/../../shell/rtl/foldsim_vport.sv > %t/wide.log 2>&1
+# RUN: %t/wide/Vtb +verilator+seed+1 +hi=1 | FileCheck %s
+# RUN: %t/wide/Vtb +verilator+seed+2 +hi=600 +stall=30 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION -DVPORT_CTL --top-module tb -GKNOWN_ZERO=1 -GMW=130 -Mdir %t/kz %S/Inputs/tb_vmem_ctl.sv %S/../../shell/rtl/foldsim_vport_ctl.sv %S/../../shell/rtl/foldsim_vport.sv > %t/kz.log 2>&1
+# RUN: %t/kz/Vtb +verilator+seed+3 +hi=60 +stall=20 | FileCheck %s
+# Known-zero blocks of four rows (KZ_SHIFT 2): untouched blocks answered zero on chip;
+# a queue of 32 (the kernel's): the room returns to QUEUE when idle.
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION -DVPORT_CTL --top-module tb -GKNOWN_ZERO=1 -GKZ_SHIFT=2 -GDW=600 -GMW=75 -GQUEUE=32 -GOUTSTANDING=32 -Mdir %t/kzb %S/Inputs/tb_vmem_ctl.sv %S/../../shell/rtl/foldsim_vport_ctl.sv %S/../../shell/rtl/foldsim_vport.sv > %t/kzb.log 2>&1
+# RUN: %t/kzb/Vtb +verilator+seed+4 +hi=300 +stall=20 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION -DVPORT_CTL --top-module tb -GDW=32 -GMW=4 -Mdir %t/narrow %S/Inputs/tb_vmem_ctl.sv %S/../../shell/rtl/foldsim_vport_ctl.sv %S/../../shell/rtl/foldsim_vport.sv > %t/narrow.log 2>&1
+# RUN: %t/narrow/Vtb +verilator+seed+5 +hi=300 +stall=40 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION -DVPORT_CTL --top-module tb -GRDW_READ_FIRST=0 -GDW=600 -GMW=75 -Mdir %t/wf %S/Inputs/tb_vmem_ctl.sv %S/../../shell/rtl/foldsim_vport_ctl.sv %S/../../shell/rtl/foldsim_vport.sv > %t/wf.log 2>&1
+# RUN: %t/wf/Vtb +verilator+seed+7 +hi=200 +stall=20 | FileCheck %s
+# Resets with requests in flight: known-zero rows read zero after each (the
+# first reset finds the image clean: no fill; later ones fill), without
+# known-zero rows memory keeps them; pre-reset reads are never answered.
+# RUN: %t/kzb/Vtb +verilator+seed+8 +hi=300 +stall=20 +resets=3 | FileCheck %s
+# RUN: %t/wide/Vtb +verilator+seed+9 +hi=100 +stall=10 +resets=2 | FileCheck %s
+# CHECK-NOT: FAIL
+# CHECK-NOT: %Error
+# CHECK: {{[0-9]+}} reads ({{[0-9]+}} answered), {{[0-9]+}} writes
+# CHECK: PASS
