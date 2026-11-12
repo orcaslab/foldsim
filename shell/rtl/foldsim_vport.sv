@@ -268,7 +268,10 @@ module foldsim_vport #(
     reg  [OW-1:0]  fill_at;
     reg  [OW:0]    fill_left;
     wire           fill_more = (ZERO_FILL != 0) && fill_left != '0;
-    wire [BLW-1:0] fill_n    = (|fill_left[OW:6]) ? BLW'(63) : BLW'(fill_left[5:0] - 6'd1);
+    // (Zero-extended to 6 bits above the burst's: the selects below stay in
+    // range for regions of fewer than 64 beats, OW < 6.)
+    wire [OW+6:0]  fill_x    = (OW+7)'(fill_left);
+    wire [BLW-1:0] fill_n    = (|fill_x[OW+6:6]) ? BLW'(63) : BLW'(fill_x[5:0] - 6'd1);
 
     // ---- read queue: {addr, len, tag, need, copy, after, copies before,
     // contiguous with the read before it in one page}
@@ -396,8 +399,13 @@ module foldsim_vport #(
     // one's within its 4 KiB page (requests never cross a page).
     reg  [OW-1:0]  r_end, w_end;               // the last request's next beat
     reg            w_end_ok;
-    wire           rd_cont = (MB != 0) && rd_addr == r_end && rd_addr[5:0] != 6'd0;
-    wire           wr_cont = (MB != 0) && w_end_ok && !take_cp && wr_addr == w_end && wr_addr[5:0] != 6'd0;
+    // A beat offset's beat within its 4 KiB page (64 beats; zero-extended for
+    // regions of fewer than 64 beats, OW < 6).
+    function automatic [5:0] page_beat(input [OW-1:0] a);
+        page_beat = 6'(64'(a));
+    endfunction
+    wire           rd_cont = (MB != 0) && rd_addr == r_end && page_beat(rd_addr) != 6'd0;
+    wire           wr_cont = (MB != 0) && w_end_ok && !take_cp && wr_addr == w_end && page_beat(wr_addr) != 6'd0;
     always @(posedge clk) begin
         if (take_rd) begin
             rq_mem[rq_tail[QW-1:0]] <= rq_pack({rd_addr, rd_len, rd_tag, in_need, take_cp,
@@ -1133,11 +1141,11 @@ module foldsim_vport #(
     initial if (MB == 0 && RDB > OFD) $error("foldsim_vport: %0d reads on AXI, %0d in-flight entries", RDB, OFD);
     // The contract's preconditions.
     always @(posedge clk) begin
-        if (take_rd && 32'(rd_addr[5:0]) + 32'(rd_len) > 63)
+        if (take_rd && 32'(page_beat(rd_addr)) + 32'(rd_len) > 63)
             $error("foldsim_vport: a read crosses a 4 KiB page (offset %0h, %0d beats)", rd_addr, rd_len + 1);
-        if (take_wr && 32'(wr_addr[5:0]) + 32'(wr_len) > 63)
+        if (take_wr && 32'(page_beat(wr_addr)) + 32'(wr_len) > 63)
             $error("foldsim_vport: a write crosses a 4 KiB page (offset %0h, %0d beats)", wr_addr, wr_len + 1);
-        if (take_cp && (32'(rd_len) >= BEATS || 32'(rd_copy_addr[5:0]) + 32'(rd_len) > 63))
+        if (take_cp && (32'(rd_len) >= BEATS || 32'(page_beat(rd_copy_addr)) + 32'(rd_len) > 63))
             $error("foldsim_vport: a copied read longer than a write row or crossing a page");
         if (take_rd && 32'((QW+1)'(rq_tail - rq_head)) + 32'(p_valid) + 32'(h_valid) >= QUEUE)
             $error("foldsim_vport: a read taken with no room");

@@ -1,0 +1,20 @@
+# REQUIRES: verilator
+# A static port whose region is smaller than a 4 KiB page (OW < 6: fewer than 64 beats; the 64-SM A100
+# netlist y64c1 has 20 such ports, 528-bit rows, OW 5). Its beat-in-page selects (the zero fill's burst
+# length, the bursts' continuation, the page checks) take the offset zero-extended to a page's 6 bits:
+# the selects stay legal SystemVerilog (no reversed or out-of-range part-select; circt-verilog/slang
+# stopped on fill_left[OW:6] with OW 5), and the port behaves as before. The zero fill writes the whole
+# region in one burst of its 32 beats (as a 4 KiB one), checked by the tb.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: circt-verilog --ir-hw --top=foldsim_vport -G DW=528 -G OW=5 -G TW=3 -G LMAX=2 -G HZ=8 -G KS=1 -G FS=4 -G MAX_BURST=1 -G AXI_RD_OUT=0 -G AXI_WR_OUT=0 %S/../../shell/rtl/foldsim_vport.sv -o %t/ow5.mlir
+# RUN: circt-verilog --ir-hw --top=foldsim_vport -G DW=512 -G OW=3 -G TW=3 -G MAX_BURST=8 -G AXI_RD_OUT=4 -G AXI_WR_OUT=4 -G COPY=1 -G ASYNC=1 -G BASE_ALIGNED=1 %S/../../shell/rtl/foldsim_vport.sv -o %t/ow3.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GIW=1 -GAW=2 -GDW=528 -GOW=5 -GCYCLES=12000 -Mdir %t/s %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/s.log 2>&1
+# RUN: %t/s/Vtb +verilator+seed+1 +hi=600 +stall=30 +cycles=30000 | FileCheck %s
+# RUN: %t/s/Vtb +verilator+seed+2 +hi=60 +stall=20 +resets=3 | FileCheck %s
+# RUN: %t/s/Vtb +verilator+seed+3 +hi=200 +stall=10 +resets=2 +clean=1 | FileCheck %s
+# RUN: %t/s/Vtb +verilator+seed+4 +hi=40 +sparse=60 +trim=1 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GIW=1 -GAW=2 -GDW=512 -GOW=4 -GHZ=3 -GCYCLES=12000 -Mdir %t/h %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/h.log 2>&1
+# RUN: %t/h/Vtb +verilator+seed+5 +hi=600 +resets=4 +cycles=30000 | FileCheck %s
+# RUN: %t/h/Vtb +verilator+seed+6 +hi=100 +far=1 | FileCheck %s
+# CHECK-NOT: FAIL
+# CHECK: PASS

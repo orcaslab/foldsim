@@ -45,7 +45,9 @@ module tb;
     localparam BEATS = (DW + 511) / 512, LW = (BEATS > 1) ? $clog2(BEATS) : 1;
     // A row's slot in memory: a power of two beats (rows never cross a 4 KiB page).
     localparam STRIDE = 1 << $clog2(BEATS);
-    localparam FW = $clog2(QUEUE + 1), OW = 20, TW = IW, FCW = 4;
+    // A beat offset's bits (OW 5: a region of 32 beats, fewer than a 4 KiB page's 64).
+    parameter OW = 20;
+    localparam FW = $clog2(QUEUE + 1), TW = IW, FCW = 4;
     localparam AXW = ASYNC ? 256 : 512, AXB = AXW / 8;
     localparam longint BASE = BASE_ALIGNED ? 64'h0000_0040_0000_0000 : 64'h1234_5000;
     // The rows, then the image rows the copies write.
@@ -158,8 +160,10 @@ module tb;
             page_check("AW", longint'(m_awaddr), int'(m_awlen) + 1);
             aws = aws + 1; aw_out = aw_out + 1;
             if (!stop && int'(m_awlen) + 1 > aw_beats) aw_beats = int'(m_awlen) + 1;
-            // (A burst of 64 512-bit beats is the zero fill's.)
-            if (int'(m_awlen) + 1 > ((MAX_BURST > BEATS) ? MAX_BURST : BEATS) * (512 / AXW) && int'(m_awlen) + 1 != 64 * (512 / AXW)) begin
+            // (A burst of 64 512-bit beats is the zero fill's, and so is one of the region's last beats
+            // past a multiple of 64: a region of fewer than 64 beats, OW < 6, fills in one burst.)
+            if (int'(m_awlen) + 1 > ((MAX_BURST > BEATS) ? MAX_BURST : BEATS) * (512 / AXW) && int'(m_awlen) + 1 != 64 * (512 / AXW)
+                && int'(m_awlen) + 1 != int'((BYTES / 64) % 64) * (512 / AXW)) begin
                 if (errors < 5) $display("FAIL: an AW of %0d beats (bursts of at most %0d 512-bit beats)", int'(m_awlen) + 1, MAX_BURST);
                 errors = errors + 1;
             end
