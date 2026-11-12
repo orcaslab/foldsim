@@ -217,7 +217,7 @@ module foldsim_vport #(
         rq_head = '0; rq_tail = '0; wq_head = '0; wq_tail = '0;
         w_taken = '0; w_aw = '0; w_done = '0; r_in = '0; r_taken = '0; r_done = '0; r_out = '0; stale = '0;
         epoch = '0; tick = '0; ring_at = '0; draining = 1'b1; filling = 1'b0; base_q = '0; fill_at = '0; fill_left = '0;
-        h_valid = 1'b0; g_valid = 1'b0; bq_head = '0; bq_tail = '0; n_out = '0; h_bucket = '0;
+        h_valid = 1'b0; p_valid = 1'b0; g_valid = 1'b0; bq_head = '0; bq_tail = '0; n_out = '0; h_bucket = '0;
         for (int i = 0; i < (1 << ((HZ > 0) ? HZ : 1)); i++) begin bk_taken[i] = '0; bk_done[i] = '0; end
         r_fence_ok = 1'b0; r_room = 1'b0; of_head = '0; of_tail = '0; r_beat = '0;
         w_busy = 1'b0; w_beat = '0; fill_beat = '0; fill_last = '0; fill_w = 1'b0;
@@ -269,30 +269,51 @@ module foldsim_vport #(
     wire [TW-1:0]  rh_tag   = rh[RQW-OW-LW-1 -: TW];
     wire [CW-1:0]  rh_need  = rh[CW+HB-1:HB];
     wire [HB-1:0]  rh_bucket = rh[HB-1:0];
-    // The head's fence, registered (a cycle late: B's only add, so it is
-    // conservative); a head loading this cycle is checked against its own.
+    // Two reads at the head, out of the queue's memory into registers: the
+    // next (p) behind the head (h), so the head's fence is always computed
+    // from registers (never through the queue's read), a cycle late (B's
+    // only add: conservative). A next read moves up as the head leaves.
     reg            r_fence_ok;
-    wire [CW-1:0]  next_need = h_load ? rh_need : h_need;
     reg  [HB-1:0]  h_bucket;
-    wire [HB-1:0]  next_bucket = h_load ? rh_bucket : h_bucket;
+    reg            p_valid;
+    reg  [OW-1:0]  p_addr;
+    reg  [LW-1:0]  p_len;
+    reg  [TW-1:0]  p_tag;
+    reg  [CW-1:0]  p_need;
+    reg  [HB-1:0]  p_bucket;
+    // (A difference's sign bit, not a compare after it.)
+    function automatic fence_ok(input [HB-1:0] bkt, input [CW-1:0] need);
+        /* verilator lint_off UNUSEDSIGNAL */
+        reg [7:0]    db;
+        reg [CW-1:0] dw;
+        /* verilator lint_on UNUSEDSIGNAL */
+        db = bk_done[bkt] - 8'(need);
+        dw = w_done - need;
+        fence_ok = (HZ > 0) ? !db[7] : !dw[CW-1];
+    endfunction
     // Room for another read on AXI, registered (one AR a cycle: a margin of one).
     reg            r_room;
     wire           ar_go    = h_valid && r_fence_ok && r_room && (!m_arvalid || m_arready) && !reset;
     wire           rq_any   = rq_head != rq_tail;
-    wire           h_load   = rq_any && (!h_valid || ar_go);
+    wire           promote  = p_valid && (!h_valid || ar_go);
+    wire           h_load   = rq_any && (!p_valid || promote);     // into p
 
     always @(posedge clk) begin
-        if (HZ > 0)
-            r_fence_ok <= $signed(bk_done[next_bucket] - 8'(next_need)) >= 0;
-        else
-            r_fence_ok <= $signed(w_done - next_need) >= 0;
+        r_fence_ok <= promote ? fence_ok(p_bucket, p_need) : fence_ok(h_bucket, h_need);
         r_room     <= r_out < CW'(OUTSTANDING - 1);
         if (h_load) begin
-            h_addr <= rh_addr;
-            h_len  <= rh_len;
-            h_tag  <= rh_tag;
-            h_need <= rh_need;
-            h_bucket <= rh_bucket;
+            p_addr   <= rh_addr;
+            p_len    <= rh_len;
+            p_tag    <= rh_tag;
+            p_need   <= rh_need;
+            p_bucket <= rh_bucket;
+        end
+        if (promote) begin
+            h_addr   <= p_addr;
+            h_len    <= p_len;
+            h_tag    <= p_tag;
+            h_need   <= p_need;
+            h_bucket <= p_bucket;
         end
         if (ar_go) begin
             m_araddr <= base_q + 64'({h_addr, 6'b0});
@@ -370,9 +391,11 @@ module foldsim_vport #(
         end
         if (take_rd) begin rq_tail <= rq_tail + 1'b1; r_in <= r_in + 1'b1; end
         if (take_wr) begin wq_tail <= wq_tail + 1'b1; w_taken <= w_taken + 1'b1; end
-        // the read head
+        // the read head and the one behind it
         if (h_load) rq_head <= rq_head + 1'b1;
-        if (h_load) h_valid <= 1'b1;
+        if (h_load) p_valid <= 1'b1;
+        else if (promote) p_valid <= 1'b0;
+        if (promote) h_valid <= 1'b1;
         else if (ar_go) h_valid <= 1'b0;
         // AR
         if (m_arvalid && m_arready) m_arvalid <= 1'b0;
@@ -452,7 +475,7 @@ module foldsim_vport #(
         end
         // Drain (reset / move): done once every queue is empty and every
         // transaction answered; then (reset) the fill; then free.
-        if (draining && !rq_any && !h_valid && !wq_any && !g_valid && !w_busy && !fill_w
+        if (draining && !rq_any && !h_valid && !p_valid && !wq_any && !g_valid && !w_busy && !fill_w
                 && r_out == 0 && w_aw == w_done && !m_arvalid && !m_awvalid && !m_wvalid
                 && !(filling && fill_more)) begin
             filling  <= 1'b0;
@@ -461,7 +484,7 @@ module foldsim_vport #(
         end
         // Room, from registers (a cycle conservative): the queue's entries,
         // its head register, this cycle's intake.
-        rd_free <= draining ? '0 : FW'(QUEUE - 32'(rq_tail - rq_head) - 32'(h_valid) - 32'(take_rd));
+        rd_free <= draining ? '0 : FW'(QUEUE - 32'(rq_tail - rq_head) - 32'(h_valid) - 32'(p_valid) - 32'(take_rd));
         wr_free <= draining ? '0 : FW'(QUEUE - 32'(wq_tail - wq_head) - 32'(g_valid) - 32'(take_wr));
         // Reset: drop the reads not yet on AR (and the answers to those on
         // AXI), keep the writes (they reach memory before the fill); a move
@@ -469,6 +492,7 @@ module foldsim_vport #(
         if (reset) begin
             rq_head   <= rq_tail;
             h_valid   <= 1'b0;
+            p_valid   <= 1'b0;
             stale     <= r_out - CW'(r_last_beat);
             r_in      <= r_taken;
             epoch     <= epoch + 1'b1;

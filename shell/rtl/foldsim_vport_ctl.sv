@@ -312,7 +312,11 @@ module foldsim_vport_ctl #(
 
     // Room: the port's, less the requests in the input register.
     wire [6:0]    zq_used  = zq_tail - zq_head;
-    wire [FW-1:0] zq_room  = (KZ != 0) ? FW'(((ZQ - 32'(zq_used) - 3) < QUEUE) ? (ZQ - 32'(zq_used) - 3) : QUEUE) : FW'(QUEUE);
+    // (Registered: a cycle late, one more entry of margin; 7-bit arithmetic.)
+    wire [6:0]    zq_free  = 7'(ZQ - 4) - zq_used;
+    reg  [FW-1:0] zq_room;
+    always @(posedge clk)
+        zq_room <= (KZ == 0 || zq_free >= 7'(QUEUE)) ? FW'(QUEUE) : FW'(zq_free);
     wire [FW-1:0] rd_room0 = rd_free - FW'(q_rd) - FW'(q2_rd);
     wire [FW-1:0] rd_room  = (rd_room0 < zq_room) ? rd_room0 : zq_room;
     wire [FW-1:0] wr_room  = wr_free - FW'(q_wr) - FW'(q2_wr);
@@ -349,6 +353,7 @@ module foldsim_vport_ctl #(
         kz_rd = 1'b1;
         kz_same = 1'b0;
         zq_head = '0;
+        zq_room = '0;
         zq_tail = '0;
         mid_row = 1'b0;
         for (int i = 0; i < NBLK; i++) kz_bits[i] = 1'b0;
