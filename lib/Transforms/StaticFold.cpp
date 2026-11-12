@@ -6020,7 +6020,20 @@ LogicalResult StaticFolder::assignPageEngines() {
         // (Its prefetches may leave up to `maxShift` positions after their
         // plan's: still before their uses' decisions, useGap = lead + 2
         // after. `shift` the least that fits, per engine tried.)
-        unsigned maxShift = copyRing ? unsigned(decisionLead()) : 0, shift = 0;
+        // (Each prefetch's first use is useGap = lead + 2 positions or more
+        // after it in the plan; the shift keeps every prefetch at least that
+        // far before its uses: their decisions need not wait for it.)
+        unsigned maxShift = 0, shift = 0;
+        if (copyRing) {
+          auto &plan = *cls.ring;
+          int slack = int(ii);
+          for (unsigned q = 0; q < ii; ++q)
+            if (plan.useValid[q]) {
+              int dist = (int(q) - int(plan.useOwner[q]) + int(ii)) % int(ii);
+              slack = std::min(slack, dist - int(decisionLead()) - 2);
+            }
+          maxShift = unsigned(std::clamp(slack, 0, 64));
+        }
         auto prefFree = [&](PageEngine &eng, unsigned d, unsigned t) {
           return llvm::none_of(prefAt, [&](unsigned p) {
             unsigned x = (p + t) % ii;
