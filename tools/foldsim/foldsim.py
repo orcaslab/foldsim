@@ -1742,6 +1742,12 @@ def build_parser():
     ap.add_argument('--vmem-known-zero-bits', type=int, default=1 << 16, metavar='N',
                     help="with --virtual-memories: each controller's known-zero bits at most (a bit per "
                          "block of rows, the smallest block within N; default %(default)s); 0: none")
+    ap.add_argument('--vmem-controller', choices=('vmem', 'vport'), default='vmem',
+                    help="the kernel's controller of each virtual memory (group, page engine): foldsim_vmem "
+                         "(default), or vport: a static port in its place (shell foldsim_vport_ctl: one AXI id, "
+                         "in-order, counter fences instead of hazard tables and write buffers, a zero fill of "
+                         "the image after a reset instead of known-zero bits; FOLDSIM_VMEM_VPORT and each "
+                         "image's bytes in foldsim_sim.vh)")
     ap.add_argument('--vmem-forward', type=int, choices=(0, 1), default=1,
                     help="with virtual memories (or page engines, link streams): whether a read is "
                          "answered from its controller's write buffer (1, default) or waits for the "
@@ -2490,6 +2496,9 @@ def main():
     m = a.vmem_row_bytes_min
     if m < 1 or m & (m - 1):
         sys.exit('--vmem-row-bytes-min: a power of two')
+    if a.vmem_controller == 'vport' and a.vmem_row_bytes_min < 64:
+        # A static port moves whole 64-byte beats: rows of at least a beat.
+        a.vmem_row_bytes_min = 64
     if a.vmem_known_zero_bits != 0 and a.vmem_known_zero_bits < 16:
         sys.exit('--vmem-known-zero-bits: 0 (none) or at least 16')
     if a.storage and not a.static:
@@ -2760,6 +2769,12 @@ def main():
                     f.write(f'`define FOLDSIM_VMEM_G{g}_KZ_SHIFT {v["kz_shift"]}\n')
                     if 'cache_rows' in v:
                         f.write(f'`define FOLDSIM_VMEM_G{g}_CACHE_ROWS {v["cache_rows"]}\n')
+            if getattr(a, 'vmem_controller', 'vmem') == 'vport':
+                f.write('`define FOLDSIM_VMEM_VPORT\n')
+                for k, v in enumerate(info['vmem']):
+                    f.write(f'`define FOLDSIM_VMEM_{k}_BYTES 64\'h{v["bytes"]:x}\n')
+                for g, v in enumerate(info.get('vmem_groups', [])):
+                    f.write(f'`define FOLDSIM_VMEM_G{g}_BYTES 64\'h{v["bytes"]:x}\n')
             f.write(f'`define FOLDSIM_VMEM_BYTES 64\'h{info["vmem_bytes"]:x}\n')
     print(f'foldsim: {", ".join(f"{k} x{v}" for k, v in info["threads"].items())}', file=sys.stderr)
     if region:

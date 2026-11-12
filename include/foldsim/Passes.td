@@ -719,6 +719,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "after its last row's pass; the class's reads and drains move by "
            "a constant each to share an engine. One member a class (no "
            "chunks of 56 columns). 0: whole rows">,
+    Option<"ppChunkColumns", "pp-chunk-columns", "unsigned", "56",
+           "A streamed PP class's row chunks (a virtual memory each): at most "
+           "this many 72-bit columns a chunk (56: 4,032 bits, a row of 8 "
+           "beats; 7: 504 bits, a beat, so that every chunk is one page-engine "
+           "lane and a row's chunks stripe over engines at the same positions)">,
     Option<"linkHbmBeatBits", "link-hbm-beat-bits", "unsigned", "0",
            "HBM link streams on their own controllers: a row wider than this "
            "many bits moves as beats (at most 8) of a controller this wide, "

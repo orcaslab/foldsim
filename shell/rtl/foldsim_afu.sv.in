@@ -284,6 +284,14 @@ module foldsim_afu #(
     // runtime has placed their region (FOLDSIM_REG_VMEM_BASE), it sees no room.
     localparam [63:0] VMEM_BYTES = `FOLDSIM_VMEM_BYTES;
     localparam VMEM_QUEUE       = 32;
+    // The controllers: foldsim_vmem, or static ports in their place
+    // (FOLDSIM_VMEM_VPORT, foldsim --vmem-controller vport), each zero-filling
+    // its image (FOLDSIM_VMEM_G<g>_BYTES) after a reset that finds `zero` high.
+`ifdef FOLDSIM_VMEM_VPORT
+    localparam VMEM_VPORT       = 1;
+`else
+    localparam VMEM_VPORT       = 0;
+`endif
     // Reads in flight per controller, on as many ids as the master has (up
     // to that many), in order per id.
     localparam VMEM_OUTSTANDING = 128;
@@ -401,6 +409,11 @@ module foldsim_afu #(
 `define FOLDSIM_VMEM_AXI(p, k, s) m_axi_mem_``p``_``s
 `endif
 
+`ifdef FOLDSIM_VMEM_VPORT
+`define FOLDSIM_VMEM_KBYTES(k) (`FOLDSIM_VMEM_``k``_BYTES)
+`else
+`define FOLDSIM_VMEM_KBYTES(k) 0
+`endif
     // Memory k on master p. Its region's base is registered: base + the
     // region's offset is static while requests flow. Its host cache has
     // FOLDSIM_VMEM_ROWS(k) lines, at most a line per row of its image.
@@ -417,68 +430,130 @@ module foldsim_afu #(
     reg  [63:0]                         vm``k``_base; \
     always @(posedge ap_clk) \
         vm``k``_base <= vmem_base + `FOLDSIM_VMEM_``k``_BASE; \
+    if (VMEM_VPORT != 0) begin : g_vp``k \
+    foldsim_vport_ctl #( \
+            .BYTES          (`FOLDSIM_VMEM_KBYTES(k)), \
+            .IW             (`FOLDSIM_VMEM_``k``_IW - `FOLDSIM_VMEM_TW(k)), \
+            .TAGW           (`FOLDSIM_VMEM_TW(k)), \
+            .AW             (`FOLDSIM_VMEM_``k``_AW), \
+            .DW             (`FOLDSIM_VMEM_``k``_DW), \
+            .MW             (`FOLDSIM_VMEM_``k``_MW), \
+            .RDW_READ_FIRST (`FOLDSIM_VMEM_``k``_RDWRF), \
+            .QUEUE          (VMEM_QUEUE), \
+            .AXI_ID_W       (C_M_AXI_MEM_ID_WIDTH), \
+            .OUTSTANDING    (VMEM_OUTSTANDING), \
+            .WRITES_OUT     (VMEM_WRITES_OUT), \
+            .INSTANCES      (`FOLDSIM_VMEM_``k``_INSTANCES), \
+            .KNOWN_ZERO     (VMEM_KNOWN_ZERO & `FOLDSIM_VMEM_KZ(k)), \
+            .ROW_BYTES      (`FOLDSIM_VMEM_RB(k)) \
+        ) vport_``k ( \
+            .clk       (ap_clk), \
+            .reset     (reset), \
+            .rd_valid  (vm``k``_rd_valid), \
+            .rd_inst   (vm``k``_rd_inst), \
+            .rd_row    (vm``k``_rd_row), \
+            .wr_valid  (vm``k``_wr_valid), \
+            .wr_inst   (vm``k``_wr_inst), \
+            .wr_row    (vm``k``_wr_row), \
+            .wr_data   (vm``k``_wr_data), \
+            .wr_mask   (vm``k``_wr_mask), \
+            .rsp_valid (vm``k``_rsp_valid), \
+            .rsp_inst  (vm``k``_rsp_inst), \
+            .rsp_data  (vm``k``_rsp_data), \
+            .free      (vm``k``_room), \
+            .base      (vm``k``_base), \
+            .zero      (vmem_zero), \
+            .move      (vmem_move), \
+            .moving    (vm``k``_moving), \
+            .m_awvalid (`FOLDSIM_VMEM_AXI(p, k, awvalid)), \
+            .m_awready (`FOLDSIM_VMEM_AXI(p, k, awready)), \
+            .m_awaddr  (`FOLDSIM_VMEM_AXI(p, k, awaddr)), \
+            .m_awid    (`FOLDSIM_VMEM_AXI(p, k, awid)), \
+            .m_awlen   (`FOLDSIM_VMEM_AXI(p, k, awlen)), \
+            .m_wvalid  (`FOLDSIM_VMEM_AXI(p, k, wvalid)), \
+            .m_wready  (`FOLDSIM_VMEM_AXI(p, k, wready)), \
+            .m_wdata   (`FOLDSIM_VMEM_AXI(p, k, wdata)), \
+            .m_wstrb   (`FOLDSIM_VMEM_AXI(p, k, wstrb)), \
+            .m_wlast   (`FOLDSIM_VMEM_AXI(p, k, wlast)), \
+            .m_bvalid  (`FOLDSIM_VMEM_AXI(p, k, bvalid)), \
+            .m_bready  (`FOLDSIM_VMEM_AXI(p, k, bready)), \
+            .m_bid     (`FOLDSIM_VMEM_AXI(p, k, bid)), \
+            .m_arvalid (`FOLDSIM_VMEM_AXI(p, k, arvalid)), \
+            .m_arready (`FOLDSIM_VMEM_AXI(p, k, arready)), \
+            .m_araddr  (`FOLDSIM_VMEM_AXI(p, k, araddr)), \
+            .m_arid    (`FOLDSIM_VMEM_AXI(p, k, arid)), \
+            .m_arlen   (`FOLDSIM_VMEM_AXI(p, k, arlen)), \
+            .m_rvalid  (`FOLDSIM_VMEM_AXI(p, k, rvalid)), \
+            .m_rready  (`FOLDSIM_VMEM_AXI(p, k, rready)), \
+            .m_rdata   (`FOLDSIM_VMEM_AXI(p, k, rdata)), \
+            .m_rid     (`FOLDSIM_VMEM_AXI(p, k, rid)), \
+            .m_rlast   (`FOLDSIM_VMEM_AXI(p, k, rlast)), \
+            .tel       (vmem_tel[k]) \
+        ); \
+    end else begin : g_vm``k \
     foldsim_vmem #( \
-        .IW             (`FOLDSIM_VMEM_``k``_IW - `FOLDSIM_VMEM_TW(k)), \
-        .TAGW           (`FOLDSIM_VMEM_TW(k)), \
-        .AW             (`FOLDSIM_VMEM_``k``_AW), \
-        .DW             (`FOLDSIM_VMEM_``k``_DW), \
-        .MW             (`FOLDSIM_VMEM_``k``_MW), \
-        .RDW_READ_FIRST (`FOLDSIM_VMEM_``k``_RDWRF), \
-        .QUEUE          (VMEM_QUEUE), \
-        .AXI_ID_W       (C_M_AXI_MEM_ID_WIDTH), \
-        .OUTSTANDING    (VMEM_OUTSTANDING), \
-        .WRITES_OUT     (VMEM_WRITES_OUT), \
-        .FORWARD        (VMEM_FORWARD), \
-        .INSTANCES      (`FOLDSIM_VMEM_``k``_INSTANCES), \
-        .CACHE_ROWS     ((`FOLDSIM_VMEM_ROWS(k) < (1 << (`FOLDSIM_VMEM_``k``_AW + $clog2(`FOLDSIM_VMEM_``k``_INSTANCES)))) \
-                         ? `FOLDSIM_VMEM_ROWS(k) : (1 << (`FOLDSIM_VMEM_``k``_AW + $clog2(`FOLDSIM_VMEM_``k``_INSTANCES)))), \
-        .KNOWN_ZERO     (VMEM_KNOWN_ZERO & `FOLDSIM_VMEM_KZ(k)), \
-        .KZ_SHIFT       (`FOLDSIM_VMEM_KZS(k)), \
-        .ROW_BYTES      (`FOLDSIM_VMEM_RB(k)) \
-    ) vmem_``k ( \
-        .clk       (ap_clk), \
-        .reset     (reset), \
-        .rd_valid  (vm``k``_rd_valid), \
-        .rd_inst   (vm``k``_rd_inst), \
-        .rd_row    (vm``k``_rd_row), \
-        .wr_valid  (vm``k``_wr_valid), \
-        .wr_inst   (vm``k``_wr_inst), \
-        .wr_row    (vm``k``_wr_row), \
-        .wr_data   (vm``k``_wr_data), \
-        .wr_mask   (vm``k``_wr_mask), \
-        .rsp_valid (vm``k``_rsp_valid), \
-        .rsp_inst  (vm``k``_rsp_inst), \
-        .rsp_data  (vm``k``_rsp_data), \
-        .free      (vm``k``_room), \
-        .base      (vm``k``_base), \
-        .zero      (vmem_zero), \
-        .move      (vmem_move), \
-        .moving    (vm``k``_moving), \
-        .m_awvalid (`FOLDSIM_VMEM_AXI(p, k, awvalid)), \
-        .m_awready (`FOLDSIM_VMEM_AXI(p, k, awready)), \
-        .m_awaddr  (`FOLDSIM_VMEM_AXI(p, k, awaddr)), \
-        .m_awid    (`FOLDSIM_VMEM_AXI(p, k, awid)), \
-        .m_awlen   (`FOLDSIM_VMEM_AXI(p, k, awlen)), \
-        .m_wvalid  (`FOLDSIM_VMEM_AXI(p, k, wvalid)), \
-        .m_wready  (`FOLDSIM_VMEM_AXI(p, k, wready)), \
-        .m_wdata   (`FOLDSIM_VMEM_AXI(p, k, wdata)), \
-        .m_wstrb   (`FOLDSIM_VMEM_AXI(p, k, wstrb)), \
-        .m_wlast   (`FOLDSIM_VMEM_AXI(p, k, wlast)), \
-        .m_bvalid  (`FOLDSIM_VMEM_AXI(p, k, bvalid)), \
-        .m_bready  (`FOLDSIM_VMEM_AXI(p, k, bready)), \
-        .m_bid     (`FOLDSIM_VMEM_AXI(p, k, bid)), \
-        .m_arvalid (`FOLDSIM_VMEM_AXI(p, k, arvalid)), \
-        .m_arready (`FOLDSIM_VMEM_AXI(p, k, arready)), \
-        .m_araddr  (`FOLDSIM_VMEM_AXI(p, k, araddr)), \
-        .m_arid    (`FOLDSIM_VMEM_AXI(p, k, arid)), \
-        .m_arlen   (`FOLDSIM_VMEM_AXI(p, k, arlen)), \
-        .m_rvalid  (`FOLDSIM_VMEM_AXI(p, k, rvalid)), \
-        .m_rready  (`FOLDSIM_VMEM_AXI(p, k, rready)), \
-        .m_rdata   (`FOLDSIM_VMEM_AXI(p, k, rdata)), \
-        .m_rid     (`FOLDSIM_VMEM_AXI(p, k, rid)), \
-        .m_rlast   (`FOLDSIM_VMEM_AXI(p, k, rlast)), \
-        .tel       (vmem_tel[k]) \
-    )
+            .IW             (`FOLDSIM_VMEM_``k``_IW - `FOLDSIM_VMEM_TW(k)), \
+            .TAGW           (`FOLDSIM_VMEM_TW(k)), \
+            .AW             (`FOLDSIM_VMEM_``k``_AW), \
+            .DW             (`FOLDSIM_VMEM_``k``_DW), \
+            .MW             (`FOLDSIM_VMEM_``k``_MW), \
+            .RDW_READ_FIRST (`FOLDSIM_VMEM_``k``_RDWRF), \
+            .QUEUE          (VMEM_QUEUE), \
+            .AXI_ID_W       (C_M_AXI_MEM_ID_WIDTH), \
+            .OUTSTANDING    (VMEM_OUTSTANDING), \
+            .WRITES_OUT     (VMEM_WRITES_OUT), \
+            .FORWARD        (VMEM_FORWARD), \
+            .INSTANCES      (`FOLDSIM_VMEM_``k``_INSTANCES), \
+            .CACHE_ROWS     ((`FOLDSIM_VMEM_ROWS(k) < (1 << (`FOLDSIM_VMEM_``k``_AW + $clog2(`FOLDSIM_VMEM_``k``_INSTANCES)))) \
+                             ? `FOLDSIM_VMEM_ROWS(k) : (1 << (`FOLDSIM_VMEM_``k``_AW + $clog2(`FOLDSIM_VMEM_``k``_INSTANCES)))), \
+            .KNOWN_ZERO     (VMEM_KNOWN_ZERO & `FOLDSIM_VMEM_KZ(k)), \
+            .KZ_SHIFT       (`FOLDSIM_VMEM_KZS(k)), \
+            .ROW_BYTES      (`FOLDSIM_VMEM_RB(k)) \
+        ) vmem_``k ( \
+            .clk       (ap_clk), \
+            .reset     (reset), \
+            .rd_valid  (vm``k``_rd_valid), \
+            .rd_inst   (vm``k``_rd_inst), \
+            .rd_row    (vm``k``_rd_row), \
+            .wr_valid  (vm``k``_wr_valid), \
+            .wr_inst   (vm``k``_wr_inst), \
+            .wr_row    (vm``k``_wr_row), \
+            .wr_data   (vm``k``_wr_data), \
+            .wr_mask   (vm``k``_wr_mask), \
+            .rsp_valid (vm``k``_rsp_valid), \
+            .rsp_inst  (vm``k``_rsp_inst), \
+            .rsp_data  (vm``k``_rsp_data), \
+            .free      (vm``k``_room), \
+            .base      (vm``k``_base), \
+            .zero      (vmem_zero), \
+            .move      (vmem_move), \
+            .moving    (vm``k``_moving), \
+            .m_awvalid (`FOLDSIM_VMEM_AXI(p, k, awvalid)), \
+            .m_awready (`FOLDSIM_VMEM_AXI(p, k, awready)), \
+            .m_awaddr  (`FOLDSIM_VMEM_AXI(p, k, awaddr)), \
+            .m_awid    (`FOLDSIM_VMEM_AXI(p, k, awid)), \
+            .m_awlen   (`FOLDSIM_VMEM_AXI(p, k, awlen)), \
+            .m_wvalid  (`FOLDSIM_VMEM_AXI(p, k, wvalid)), \
+            .m_wready  (`FOLDSIM_VMEM_AXI(p, k, wready)), \
+            .m_wdata   (`FOLDSIM_VMEM_AXI(p, k, wdata)), \
+            .m_wstrb   (`FOLDSIM_VMEM_AXI(p, k, wstrb)), \
+            .m_wlast   (`FOLDSIM_VMEM_AXI(p, k, wlast)), \
+            .m_bvalid  (`FOLDSIM_VMEM_AXI(p, k, bvalid)), \
+            .m_bready  (`FOLDSIM_VMEM_AXI(p, k, bready)), \
+            .m_bid     (`FOLDSIM_VMEM_AXI(p, k, bid)), \
+            .m_arvalid (`FOLDSIM_VMEM_AXI(p, k, arvalid)), \
+            .m_arready (`FOLDSIM_VMEM_AXI(p, k, arready)), \
+            .m_araddr  (`FOLDSIM_VMEM_AXI(p, k, araddr)), \
+            .m_arid    (`FOLDSIM_VMEM_AXI(p, k, arid)), \
+            .m_arlen   (`FOLDSIM_VMEM_AXI(p, k, arlen)), \
+            .m_rvalid  (`FOLDSIM_VMEM_AXI(p, k, rvalid)), \
+            .m_rready  (`FOLDSIM_VMEM_AXI(p, k, rready)), \
+            .m_rdata   (`FOLDSIM_VMEM_AXI(p, k, rdata)), \
+            .m_rid     (`FOLDSIM_VMEM_AXI(p, k, rid)), \
+            .m_rlast   (`FOLDSIM_VMEM_AXI(p, k, rlast)), \
+            .tel       (vmem_tel[k]) \
+        ); \
+    end
 
 `ifdef FOLDSIM_VMEM_GROUPS
 `undef FOLDSIM_VMEM
@@ -500,6 +575,11 @@ module foldsim_afu #(
 `define FOLDSIM_VMEM_RB(g)  ((((`FOLDSIM_VMEM_G``g``_DW + 7) / 8) > 64) ? (1 << $clog2((`FOLDSIM_VMEM_G``g``_DW + 7) / 8)) : 64)
 `define FOLDSIM_VMEM_KZ(g)  1
 `define FOLDSIM_VMEM_KZS(g) 0
+`endif
+`ifdef FOLDSIM_VMEM_VPORT
+`define FOLDSIM_VMEM_GBYTES(g) (`FOLDSIM_VMEM_G``g``_BYTES)
+`else
+`define FOLDSIM_VMEM_GBYTES(g) 0
 `endif
 `ifdef FOLDSIM_VMEM_PER_MEMORY_ROWS
 `define FOLDSIM_VMEM_ROWS(g) (`FOLDSIM_VMEM_G``g``_CACHE_ROWS)
@@ -563,6 +643,45 @@ module foldsim_afu #(
     if (VG``g``_N == 1) begin : g_vg``g \
         wire [$clog2(VMEM_QUEUE+1)-1:0] room; \
         assign vg``g``_free[0] = 16'(room); \
+        if (VMEM_VPORT != 0) begin : g_vp \
+        foldsim_vport_ctl #( \
+            .BYTES          (`FOLDSIM_VMEM_GBYTES(g)), \
+            .IW             (`FOLDSIM_VMEM_G``g``_IW - `FOLDSIM_VMEM_TW(g)), \
+            .TAGW           (`FOLDSIM_VMEM_TW(g)), \
+            .AW             (VG``g``_AW), \
+            .DW             (`FOLDSIM_VMEM_G``g``_DW), \
+            .MW             (`FOLDSIM_VMEM_G``g``_MW), \
+            .RDW_READ_FIRST (`FOLDSIM_VMEM_G``g``_RDWRF), \
+            .QUEUE          (VMEM_QUEUE), \
+            .AXI_ID_W       (C_M_AXI_MEM_ID_WIDTH), \
+            .OUTSTANDING    (VMEM_OUTSTANDING), \
+            .WRITES_OUT     (VMEM_WRITES_OUT), \
+            .INSTANCES      (VG``g``_IN), \
+            .KNOWN_ZERO     (VMEM_KNOWN_ZERO & `FOLDSIM_VMEM_KZ(g)), \
+            .ROW_BYTES      (`FOLDSIM_VMEM_RB(g)) \
+        ) vport ( \
+            .clk       (ap_clk), \
+            .reset     (reset), \
+            .rd_valid  (vg``g``_rd_valid[0]), \
+            .rd_inst   (vg``g``_rd_inst[0]), \
+            .rd_row    (vg``g``_rd_row[0]), \
+            .wr_valid  (vg``g``_wr_valid[0]), \
+            .wr_inst   (vg``g``_wr_inst[0]), \
+            .wr_row    (vg``g``_wr_row[0]), \
+            .wr_data   (vg``g``_wr_data[0]), \
+            .wr_mask   (vg``g``_wr_mask[0]), \
+            .rsp_valid (vg``g``_rsp_valid[0]), \
+            .rsp_inst  (vg``g``_rsp_inst), \
+            .rsp_data  (vg``g``_rsp_data), \
+            .free      (room), \
+            .base      (vg``g``_base), \
+            .zero      (vmem_zero), \
+            .move      (vmem_move), \
+            .moving    (vmem_moving[g]), \
+            `FOLDSIM_VMEM_AXI_PORTS(p, g), \
+            .tel       (vmem_tel[g]) \
+        ); \
+        end else begin : g_vm \
         foldsim_vmem #( \
             .IW             (`FOLDSIM_VMEM_G``g``_IW - `FOLDSIM_VMEM_TW(g)), \
             .TAGW           (`FOLDSIM_VMEM_TW(g)), \
@@ -602,6 +721,7 @@ module foldsim_afu #(
             `FOLDSIM_VMEM_AXI_PORTS(p, g), \
             .tel       (vmem_tel[g]) \
         ); \
+        end \
     end else begin : g_vg``g \
         if (`FOLDSIM_VMEM_TW(g) != 0) begin : g_tagged \
             $error("foldsim_afu: a group of memories with tagged requests"); \
@@ -631,7 +751,9 @@ module foldsim_afu #(
             .KNOWN_ZERO     (VMEM_KNOWN_ZERO & `FOLDSIM_VMEM_KZ(g)), \
             .KZ_SHIFT       (`FOLDSIM_VMEM_KZS(g)), \
             .ROW_BYTES      (`FOLDSIM_VMEM_RB(g)), \
-            .FIFO           (VMEM_GROUP_FIFO) \
+            .FIFO           (VMEM_GROUP_FIFO), \
+            .VPORT          (VMEM_VPORT), \
+            .BYTES          (`FOLDSIM_VMEM_GBYTES(g)) \
         ) group ( \
             .clk       (ap_clk), \
             .reset     (reset), \

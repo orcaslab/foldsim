@@ -158,3 +158,14 @@
 # RUN: FileCheck %s --check-prefix=CTL < %t/auto/sll/sll.txt
 # CTL: kernel controllers: 6, {{[0-9,]+}} data bits, {{[0-9,]+}} LUT [ctl_cost]
 # CTL: kernel (in the region sums): base 4,200, 0 memory port endpoints 0, 6 controllers {{[0-9,]+}}
+# --vmem-controller vport: static ports in the controllers' place (the kernel's
+# FOLDSIM_VMEM_VPORT), each image's bytes for its zero fill; rows of at least a
+# 64-byte beat.
+# RUN: foldsim --srcs top.f --top Top --out %t/vport --static --virtual-memories 'Leaf:.*' --vmem-merge-lanes --vmem-group copy --vmem-controller vport --copies Leaf:2 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=VPORT < %t/vport/foldsim_sim.vh
+# VPORT: `define FOLDSIM_VMEM_0_ROW_BYTES 64
+# VPORT: `define FOLDSIM_VMEM_VPORT
+# VPORT-NEXT: `define FOLDSIM_VMEM_0_BYTES 64'h{{[0-9a-f]+}}
+# VPORT: `define FOLDSIM_VMEM_G0_BYTES 64'h{{[0-9a-f]+}}
+# VPORT-NEXT: `define FOLDSIM_VMEM_G1_BYTES 64'h{{[0-9a-f]+}}
+# VPORT-NEXT: `define FOLDSIM_VMEM_BYTES

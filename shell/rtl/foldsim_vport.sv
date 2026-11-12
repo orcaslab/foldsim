@@ -102,7 +102,9 @@ module foldsim_vport #(
     output reg  [FW-1:0]        wr_free,
 
     input  wire [63:0]          base,
-    input  wire [63:0]          bytes,
+    /* verilator lint_off UNUSEDSIGNAL */
+    input  wire [63:0]          bytes,       // sampled at reset
+    /* verilator lint_on UNUSEDSIGNAL */
     input  wire                 move,
     output wire                 busy,
 
@@ -161,7 +163,9 @@ module foldsim_vport #(
 
     reg  [63:0]    base_q;
     reg            draining, filling;
-    reg  [63:0]    fill_at;
+    // The zero fill: the next burst's offset and the bytes left (40 bits: a
+    // region below 1 TiB), counted down so no compare reaches across them.
+    reg  [39:0]    fill_at, fill_left;
 
     // The head read, out of the queue's memory into registers.
     reg            h_valid;
@@ -187,7 +191,11 @@ module foldsim_vport #(
     reg  [LW-1:0]  w_beat;
     reg  [QW-1:0]  w_slot;
     reg  [LW-1:0]  w_len;
-    reg  [5:0]     fill_beat;
+    reg  [5:0]     fill_beat, fill_last;
+    // A fill burst's beats: up to 64 (4 KiB), fewer for the region's last
+    // bytes (whole beats: a region is whole beats).
+    wire           fill_more = fill_left != 40'd0;
+    wire [5:0]     fill_n    = (|fill_left[39:12]) ? 6'd63 : 6'(fill_left[11:6] - 6'd1);
     reg            fill_w;                  // a fill burst's beats are leaving
 
 `ifdef SIMULATION
@@ -195,9 +203,9 @@ module foldsim_vport #(
     initial begin
         rq_head = '0; rq_tail = '0; wq_head = '0; wq_tail = '0;
         w_taken = '0; w_aw = '0; w_done = '0; r_in = '0; r_taken = '0; r_done = '0; r_out = '0; stale = '0;
-        epoch = '0; tick = '0; ring_at = '0; draining = 1'b1; filling = 1'b0; base_q = '0; fill_at = '0;
+        epoch = '0; tick = '0; ring_at = '0; draining = 1'b1; filling = 1'b0; base_q = '0; fill_at = '0; fill_left = '0;
         h_valid = 1'b0; g_valid = 1'b0; r_fence_ok = 1'b0; r_room = 1'b0; of_head = '0; of_tail = '0; r_beat = '0;
-        w_busy = 1'b0; w_beat = '0; fill_beat = '0; fill_w = 1'b0;
+        w_busy = 1'b0; w_beat = '0; fill_beat = '0; fill_last = '0; fill_w = 1'b0;
         m_arvalid = 1'b0; m_awvalid = 1'b0; m_wvalid = 1'b0; rsp_valid = 1'b0; rd_free = '0; wr_free = '0;
         for (int i = 0; i < FCLASSES; i++) w_ring[i] = '0;
     end
@@ -299,7 +307,7 @@ module foldsim_vport #(
 
     // ---- zero fill (after a reset's drain): 4 KiB bursts of zeros.
     wire           fill_aw = filling && draining && !g_valid && !wq_any && !w_busy && !fill_w && w_room
-                          && (!m_awvalid || m_awready) && (fill_at < bytes);
+                          && (!m_awvalid || m_awready) && fill_more;
 
     assign m_bready = 1'b1;
     assign busy     = draining;
@@ -362,11 +370,13 @@ module foldsim_vport #(
             w_aw      <= w_aw + 1'b1;
         end else if (fill_aw) begin
             m_awvalid <= 1'b1;
-            m_awaddr  <= base_q + fill_at;
-            m_awlen   <= 8'd63;
+            m_awaddr  <= base_q + 64'(fill_at);
+            m_awlen   <= 8'(fill_n);
             fill_w    <= 1'b1;
             fill_beat <= '0;
-            fill_at   <= fill_at + 64'd4096;
+            fill_last <= fill_n;
+            fill_at   <= fill_at + 40'({7'(fill_n) + 7'd1, 6'b0});
+            fill_left <= fill_left - 40'({7'(fill_n) + 7'd1, 6'b0});
             w_taken   <= w_taken + 1'b1;
             w_aw      <= w_aw + 1'b1;
         end
@@ -382,16 +392,16 @@ module foldsim_vport #(
             m_wvalid  <= 1'b1;
             m_wdata   <= '0;
             m_wstrb   <= '1;
-            m_wlast   <= &fill_beat;
+            m_wlast   <= fill_beat == fill_last;
             fill_beat <= fill_beat + 1'b1;
-            if (&fill_beat) fill_w <= 1'b0;
+            if (fill_beat == fill_last) fill_w <= 1'b0;
         end
         if (m_bvalid) w_done <= w_done + 1'b1;
         // Drain (reset / move): done once every queue is empty and every
         // transaction answered; then (reset) the fill; then free.
         if (draining && !rq_any && !h_valid && !wq_any && !g_valid && !w_busy && !fill_w
                 && r_out == 0 && w_aw == w_done && !m_arvalid && !m_awvalid && !m_wvalid
-                && !(filling && fill_at < bytes)) begin
+                && !(filling && fill_more)) begin
             filling  <= 1'b0;
             draining <= 1'b0;
             base_q   <= base;
@@ -412,6 +422,7 @@ module foldsim_vport #(
             draining  <= 1'b1;
             filling   <= (ZERO_FILL != 0);
             fill_at   <= '0;
+            fill_left <= (ZERO_FILL != 0) ? 40'(bytes) : 40'd0;
             base_q    <= base;
             rd_free   <= '0;
             wr_free   <= '0;

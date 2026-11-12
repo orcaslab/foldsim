@@ -40,7 +40,13 @@ module tb;
     reg [511:0] m_rdata;
     wire [7*48-1:0] tel;
 
-    foldsim_vmem #(.IW(IW), .AW(AW), .DW(DW), .MW(MW), .RDW_READ_FIRST(RDW_READ_FIRST), .QUEUE(QUEUE), .AXI_ID_W(1),
+    // (-DVPORT_CTL: the static port in the controller's place, foldsim_vport_ctl,
+    // its zero fill over the image.)
+`ifdef VPORT_CTL
+    foldsim_vport_ctl #(.BYTES(longint'(INST) * ROWS * RB), .IW(IW),
+`else
+    foldsim_vmem #(.IW(IW),
+`endif .AW(AW), .DW(DW), .MW(MW), .RDW_READ_FIRST(RDW_READ_FIRST), .QUEUE(QUEUE), .AXI_ID_W(1),
         .OUTSTANDING(OUTSTANDING), .INSTANCES(INST), .CACHE_ROWS(CACHE_ROWS), .KNOWN_ZERO(KNOWN_ZERO), .ROW_BYTES(RB),
         .WRITES_OUT(WRITES_OUT), .FORWARD(FORWARD)) dut (
         .clk(clk), .reset(reset), .rd_valid(rd_valid), .rd_inst(rd_inst), .rd_row(rd_row), .wr_valid(wr_valid),

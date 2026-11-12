@@ -13736,10 +13736,12 @@ static constexpr unsigned kStreamMasters = 8;
 /// over the masters. A controller costs its data width and itself (Y's
 /// calibrated ctl_cost), so chunks are as few as the bandwidth allows. Chunk k
 /// takes columns [lo, hi).
+/// `pp-chunk-columns`: the most columns a chunk (56 by default).
+static unsigned gPpChunkColumns = 56;
 static unsigned ppChunks(unsigned columns, bool spread, bool beats = false) {
   // (Beats: a row moves beat by beat, so the columns of a controller are
   // not bounded: one chunk, unless spread.)
-  unsigned least = beats ? 1u : unsigned(llvm::divideCeil(columns, 56));
+  unsigned least = beats ? 1u : unsigned(llvm::divideCeil(columns, std::max(1u, gPpChunkColumns)));
   unsigned masters = spread ? std::min(kStreamMasters, unsigned(llvm::divideCeil(columns, 7))) : 1u;
   return std::max({1u, least, masters});
 }
@@ -26196,6 +26198,7 @@ void FoldStaticPass::runOnOperation() {
   folder.slotSegmentsK = slotSegments;
   gMaxTableBits = std::max<uint64_t>(1, maxTableBits);
   gSlotSegments = slotSegments;
+  gPpChunkColumns = ppChunkColumns;
   gSlotColumnAffine = slotColumnAffine;
   gSlotTableCompose = slotTableCompose;
   // (FOLDSIM_SLOT_COLUMN_AFFINE, a test hook: the whole suite with both.)
