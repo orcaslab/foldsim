@@ -20,6 +20,11 @@
 # RUN: %t/narrow/Vtb +verilator+seed+5 +hi=300 +stall=40 | FileCheck %s
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION -DVPORT_CTL --top-module tb -GRDW_READ_FIRST=0 -GDW=600 -GMW=75 -Mdir %t/wf %S/Inputs/tb_vmem_ctl.sv %S/../../shell/rtl/foldsim_vport_ctl.sv %S/../../shell/rtl/foldsim_vport.sv > %t/wf.log 2>&1
 # RUN: %t/wf/Vtb +verilator+seed+7 +hi=200 +stall=20 | FileCheck %s
+# Resets with requests in flight: known-zero rows read zero after each (the
+# first reset finds the image clean: no fill; later ones fill), without
+# known-zero rows memory keeps them; pre-reset reads are never answered.
+# RUN: %t/kzb/Vtb +verilator+seed+8 +hi=300 +stall=20 +resets=3 | FileCheck %s
+# RUN: %t/wide/Vtb +verilator+seed+9 +hi=100 +stall=10 +resets=2 | FileCheck %s
 # CHECK-NOT: FAIL
 # CHECK-NOT: %Error
 # CHECK: {{[0-9]+}} reads ({{[0-9]+}} answered), {{[0-9]+}} writes

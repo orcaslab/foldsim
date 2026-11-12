@@ -59,7 +59,7 @@ module tb;
         .m_rready(m_rready), .m_rdata(m_rdata), .m_rid(m_rid), .m_rlast(m_rlast), .tel(tel));
 
     reg stop = 0;
-    integer hi = 40, stall = 0, errors = 0, reads = 0, answered = 0, writes = 0, pairs = 0, hazards = 0;
+    integer hi = 40, stall = 0, errors = 0, reads = 0, answered = 0, writes = 0, pairs = 0, hazards = 0, resets = 0;
     // The reference RAM, and each instance's pending read's expected row.
     reg [DB-1:0] ram [INST][ROWS];
     reg [DB-1:0] expect_row [INST];
@@ -213,6 +213,7 @@ module tb;
     initial begin
         void'($value$plusargs("hi=%d", hi));
         void'($value$plusargs("stall=%d", stall));
+        void'($value$plusargs("resets=%d", resets));
         for (int i = 0; i < INST; ++i) begin
             pending[i] = 0;
             for (int r = 0; r < ROWS; ++r) ram[i][r] = '0;
@@ -221,7 +222,28 @@ module tb;
         reset <= 0;
         // The reset's drain: free comes back at QUEUE.
         wait (free == FW'(QUEUE));
-        repeat (CYCLES) @(posedge clk);
+        // +resets=N: N resets with requests in flight, CYCLES apart. No read
+        // taken before one is answered after it; with known-zero rows (and
+        // `zero`), every row reads zero after it (the controller's zero fill,
+        // or the image still clean), else memory keeps the rows.
+        for (int n = 0; n < resets; ++n) begin
+            repeat (CYCLES / (resets + 1)) @(posedge clk);
+            // (The driver quiet for a cycle: no request in the reset's own.)
+            stop = 1;
+            repeat (2) @(posedge clk);
+            reset <= 1;
+            @(posedge clk);
+            for (int i = 0; i < INST; ++i) pending[i] = 0;
+            if (KNOWN_ZERO != 0)
+                for (int i = 0; i < INST; ++i)
+                    for (int r = 0; r < ROWS; ++r) ram[i][r] = '0;
+            repeat (2) @(posedge clk);
+            reset <= 0;
+            @(posedge clk);
+            wait (free == FW'(QUEUE));
+            stop = 0;
+        end
+        repeat (CYCLES / (resets + 1)) @(posedge clk);
         stop = 1;
         repeat (20 * hi + 2000) @(posedge clk);
         for (int i = 0; i < INST; ++i)

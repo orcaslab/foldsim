@@ -29,7 +29,10 @@
 // Known-zero rows: where KNOWN_ZERO is set and `zero` is high when a reset
 // starts, the port writes zeros over the image's `BYTES` bytes after the
 // reset's drain (no bit per row on chip); free returns after it. Without
-// `zero` it behaves as foldsim_vmem without the bits.
+// `zero` it behaves as foldsim_vmem without the bits. The fill is skipped
+// while the image is clean: `zero` rose (the host cleared the region and
+// said so) and no write was taken since, as on the reset a runtime gives
+// right after its clear.
 //
 // `moving` is high from `move` until the drain ends; the new base takes
 // effect then. Telemetry: [0] reads taken, [1] writes taken, [2] reads
@@ -244,6 +247,15 @@ module foldsim_vport_ctl #(
         end
     end
     wire           z_ans  = (KZ != 0) && q2_rd && kz_hit && zero;
+    // The image clean: `zero` rose since the last write taken.
+    reg            z_q, clean;
+    always @(posedge clk) begin
+        z_q <= zero;
+        if (q_wr)
+            clean <= 1'b0;
+        else if (zero && !z_q)
+            clean <= 1'b1;
+    end
     wire           p_rd   = q2_rd && !z_ans;
 
     // Zero answers waiting for a cycle without the port's answer.
@@ -265,7 +277,7 @@ module foldsim_vport_ctl #(
         .wr_data(DB'(q2_wdata)), .wr_mask(q2_wmask),
         .rsp_valid(p_rsp_valid), .rsp_tag(p_rsp_tag), .rsp_beat(p_rsp_beat), .rsp_last(p_rsp_last), .rsp_data(p_rsp_data),
         .rd_free(rd_free), .wr_free(wr_free),
-        .base(base), .bytes(zero ? 64'(BYTES) : 64'd0), .move(move), .busy(busy), .stat(p_stat),
+        .base(base), .bytes((zero && !clean) ? 64'(BYTES) : 64'd0), .move(move), .busy(busy), .stat(p_stat),
         .m_awvalid(m_awvalid), .m_awready(m_awready), .m_awaddr(m_awaddr), .m_awlen(m_awlen),
         .m_wvalid(m_wvalid), .m_wready(m_wready), .m_wdata(m_wdata), .m_wstrb(m_wstrb), .m_wlast(m_wlast),
         .m_bvalid(m_bvalid), .m_bready(m_bready), .m_arvalid(m_arvalid), .m_arready(m_arready),
@@ -361,6 +373,8 @@ module foldsim_vport_ctl #(
         q2_rd = 1'b0;
         q2_wr = 1'b0;
         kz_sweep = '0;
+        z_q = 1'b0;
+        clean = 1'b0;
         kz_rd = 1'b1;
         kz_same = 1'b0;
         zq_head = '0;
