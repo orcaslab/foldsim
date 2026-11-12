@@ -17,7 +17,8 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/st --static --virtual-memories 'Leaf:.*' --copies Leaf:1 --stage-levels 1 --page-engines 16 --vmem-on-engines Leaf --vmem-stagger 4 --bubbles 2>&1 | FileCheck %s --check-prefix=ST
 # ST: vmem-on-engines: 8 virtual memories on page engines (2 new, 2 engines); vmem-stagger: 6 leave after their pass
 # RUN: FileCheck %s --check-prefix=SV < %t/st/foldsim_sim.sv
-# SV: Leaf_g_lane_3_lane2FMemory_stag_rv2
+# SV: Leaf_g_lane_2_lane2FMemory_stag_rv2
+# SV: Leaf_g_lane_2_lane2FMemory_stag_o6
 # RUN: python3 %S/Inputs/vmem_bind.py %t/st/foldsim_sim.json %t/st
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -I%t/st --top-module tb -DBUBBLES -DVMEM_DEPTH=16 -DVMEM_ROWS=1024 -Mdir %t/st/obj %S/Inputs/tb_vmem_multi.sv top.sv %t/st/foldsim_sim.sv > %t/st/build.log 2>&1
 # RUN: %t/st/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=FAST
