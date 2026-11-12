@@ -25651,8 +25651,14 @@ LogicalResult StaticFolder::buildSim() {
     struct AheadParts {
       Value step;
       uint64_t first, idle;
+      /// The table the step reads (at the position's next's next), kept
+      /// for `ready-ahead`, which reads it from a lookahead register too.
+      SmallVector<uint64_t> row;
+      unsigned width;
     };
     DenseMap<Value, AheadParts> aheadOf;
+    /// `ready-ahead`: each instance register's step register, one a class.
+    DenseMap<Value, Value> stepAheadOf;
     auto atNext = [&](ArrayRef<uint64_t> row, unsigned width) -> Value {
       if (!lookaheadTables)
         return table(b, next, row, width);
@@ -25675,7 +25681,8 @@ LogicalResult StaticFolder::buildSim() {
       Value r = resetReg(nextValue, "vready_ahead" + Twine(aheadCount++),
                          row[nx(ii)]);
       self.setValue(r);
-      aheadOf[r] = {stepRead, row[nx(0)], row[nx(ii)]};
+      aheadOf[r] = {stepRead, row[nx(0)], row[nx(ii)],
+                    SmallVector<uint64_t>(row.begin(), row.end()), width};
       return r;
     };
     SmallVector<Value> terms;
@@ -26342,6 +26349,20 @@ LogicalResult StaticFolder::buildSim() {
           auto ahead = aheadOf.find(inst);
           if (readyAhead && !vm.pages && advance && ahead != aheadOf.end()) {
             auto parts = ahead->second;
+            // The step's index from a lookahead register of its own (the
+            // table one position on, at the position's next: within the
+            // frame, the step's table at the position), not a table read
+            // in front of the select: the select starts at registers.
+            {
+              Value &stepReg = stepAheadOf[inst];
+              if (!stepReg) {
+                SmallVector<uint64_t> row2(ii + 1, 0);
+                for (unsigned p = 0; p <= ii; ++p)
+                  row2[p] = parts.row[nx(p)];
+                stepReg = atNext(row2, parts.width);
+              }
+              parts.step = stepReg;
+            }
             Value issued = copies[c].getResult(vm.firstOutput);
             Value issuedInst = copies[c].getResult(vm.firstOutput + 1);
             Value answered = copies[c].getOperand(vm.firstInput);
