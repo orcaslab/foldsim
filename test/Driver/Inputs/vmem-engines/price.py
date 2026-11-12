@@ -33,3 +33,12 @@ tot, rows = sc.vmem_slls(c, shares, top, names, v80, 'placer')
 print('engine placed:', rows[0]['slr'], ' '.join(f'{x:.0f}' for x in tot))
 print('port links from wires:', sc.port_links('  II = 4\n', {('wide', 'narrow'): 96}))
 print('port links from A -> B:', sc.port_links('    wide -> narrow: 2 links, 64 bits\n', {('wide', 'narrow'): 96}))
+# --vmem-engines slr: each controller in its members' main SLR (page engines of one SLR group, foldsim
+# --vmem-slr-groups), the masters shared per SLR (the binding's HBM ports, 8 on the V80, split by the controllers'
+# port bits, at least one an SLR with controllers): only the masters and the off-SLR share of a member cross.
+tot, rows = sc.vmem_slls(ctrls, shares, top, names, v80, 'slr')
+print('v80 slr: ' + ' '.join(f'{x:.0f}' for x in tot) + ' | ' + ' '.join(f'{r["name"]}:{r["slr"]}' for r in rows
+      if r['cls']) + ' | masters ' + ' '.join(f'{k}:{v}' for r in rows if not r['cls'] for k, v in r['masters'].items()))
+tot, rows = sc.vmem_slls(ctrls, shares, top, names, v80, 'slr', 3)
+print('v80 slr 3 masters: ' + ' '.join(f'{x:.0f}' for x in tot))
+print('slr_masters:', sc.slr_masters([1, 1, 0], 8), sc.slr_masters([100, 1, 1], 2), sc.slr_masters([0, 0, 0], 8))

@@ -638,10 +638,35 @@ def vmem_controllers(gdir, stext=''):
 # SLLs (the placer moves it there: y8r1di, 11-07, put each controller beside its class copy, VX_opc_unit's in
 # SLR1 with its master crossing to the NMUs); nmu: at its HBM NMU's SLR; local: in its copies' main SLR; flat: the
 # 11-07 fitted constant (sll_per_vmem_bit x every port bit at every boundary).
-VMEM_ENGINES = ('placer', 'auto', 'nmu', 'local', 'flat')
+# slr: each controller in its members' SLR (page engines of one SLR group: foldsim --vmem-slr-groups), the
+# controllers of an SLR sharing that SLR's masters (foldsim_vmem_share placed with them), so only the masters cross:
+# the binding's HBM ports (noc ports reaching HBM, or --vmem-masters) split over the SLRs by the controllers' port
+# bits, at least one an SLR with controllers.
+VMEM_ENGINES = ('placer', 'auto', 'nmu', 'local', 'flat', 'slr')
 
 
-def vmem_slls(ctrls, shares, top_spread, names, noc, mode):
+def slr_masters(weights, total):
+    """Masters per SLR: `total` split by `weights` (largest remainder), at least one where a weight is positive."""
+    live = [i for i, w in enumerate(weights) if w > 0]
+    if not live:
+        return [0] * len(weights)
+    total = max(total, len(live))
+    tw = sum(weights[i] for i in live)
+    out = [0] * len(weights)
+    for i in live:
+        out[i] = max(1, int(total * weights[i] / tw))
+    while sum(out) > total:
+        i = max((i for i in live if out[i] > 1), key=lambda i: out[i] - total * weights[i] / tw, default=None)
+        if i is None:
+            break
+        out[i] -= 1
+    while sum(out) < total:
+        i = max(live, key=lambda i: total * weights[i] / tw - out[i])
+        out[i] += 1
+    return out
+
+
+def vmem_slls(ctrls, shares, top_spread, names, noc, mode, masters=0):
     """Each boundary's SLLs of the virtual-memory wiring with the controllers
     placed by `mode` (--vmem-engines), and each controller's placement.
 
@@ -686,6 +711,15 @@ def vmem_slls(ctrls, shares, top_spread, names, noc, mode):
             for b in range(min(g, h), max(g, h)):
                 x[b] += km * mbits
             return x
+        if mode == 'slr':
+            g = max(range(n), key=lambda i: (dist[i], -i))
+            x = [0.0] * (n - 1)
+            for i, f in enumerate(dist):
+                for b in range(min(i, g), max(i, g)):
+                    x[b] += kp * c['port_bits'] * f
+            out = [u + v for u, v in zip(out, x)]
+            rows.append(dict(name=c['name'], cls=c['cls'], slr=names[g], slls=x, port_bits=c['port_bits']))
+            continue
         if mode == 'nmu':
             g = min(hbm, key=lambda h: (sum(slls_at(h)), h))
         elif mode == 'local':
@@ -695,6 +729,15 @@ def vmem_slls(ctrls, shares, top_spread, names, noc, mode):
         x = slls_at(g)
         out = [u + v for u, v in zip(out, x)]
         rows.append(dict(name=c['name'], cls=c['cls'], slr=names[g], slls=x))
+    if mode == 'slr':
+        weights = [sum(r['port_bits'] for r in rows if r['slr'] == nm) for nm in names]
+        total = masters or sum(1 for p in noc.get('ports', []) if 'HBM' in p.get('targets', ()))
+        ms = slr_masters(weights, total)
+        for i, m in enumerate(ms):
+            h = near(i)
+            for b in range(min(i, h), max(i, h)):
+                out[b] += km * mbits * m
+        rows.append(dict(name='masters', cls='', slr='', slls=[], masters=dict(zip(names, ms))))
     return out, rows
 
 
@@ -765,13 +808,17 @@ def main():
                          'suggested assignment, never a refusal; the design past the placement fill, the memories '
                          'past the region\'s and the SLLs past a boundary still refuse. strict: a copy past every SLR '
                          'refuses (the 11-08 hard SLR rule)')
+    ap.add_argument('--vmem-masters', type=int, default=0,
+                    help='with --vmem-engines slr: the controllers\' masters in all (default: the region\'s NoC '
+                         'ports that reach HBM), split over the SLRs by their controllers\' port bits')
     ap.add_argument('--vmem-engines', choices=VMEM_ENGINES, default='placer',
                     help='the virtual-memory controllers\' SLLs, placed against the region\'s memory NMUs (its '
                          '`noc` section, flow/v80/noc_ports.py), only the wire bits that cross a boundary charged '
                          'to it: placer (default) and auto, each controller where it crosses the fewest (the '
                          'placer\'s choice on y8r1di); nmu, at its HBM NMU (its ports cross); local, with its '
                          'copies (its master crosses); flat, the 11-07 fitted term (sll_per_vmem_bit x every port '
-                         'bit at every boundary)')
+                         'bit at every boundary); slr, each in its members\' SLR (page engines of one SLR group, '
+                         'foldsim --vmem-slr-groups) on its SLR\'s shared masters, only the masters crossing')
     a = ap.parse_args()
     gen = os.path.abspath(a.gen.rstrip('/'))
     gdir = os.path.join(gen, 'gen') if os.path.isdir(os.path.join(gen, 'gen')) else gen
@@ -1105,7 +1152,12 @@ def main():
                 vm = None
                 if a.vmem_engines != 'flat' and 'noc' in region:
                     vm, vmem_rows = vmem_slls(vmem_controllers(gdir, stext), shares, top_spread, names,
-                                              region['noc'], a.vmem_engines)
+                                              region['noc'], a.vmem_engines, a.vmem_masters)
+                    mrow = [r for r in vmem_rows if r['name'] == 'masters' and not r['cls']]
+                    vmem_rows = [r for r in vmem_rows if r not in mrow]
+                    if mrow:
+                        lines.append('  virtual-memory masters per SLR (--vmem-engines slr, shared in their SLR): '
+                                     + ', '.join(f'{k} {v}' for k, v in mrow[0]['masters'].items()))
                     # Where the controllers sit (their LUTs and RAMB36 by the kernel fit, if any): per die.
                     kk = region.get('kernel', {})
                     if 'ctl_lut_scale' in kk:

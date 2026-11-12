@@ -503,6 +503,8 @@ def frame_options(a):
             fold += ' vport-write-beats'
         if a.vmem_fold_on_engines:
             fold += ' vmem-fold-on-engines'
+    if getattr(a, 'vmem_slr_groups', ''):
+        fold += ' vmem-slr-groups=' + ','.join(f'{c}:{g}' for c, g in vmem_slr_map(a.vmem_slr_groups))
     if getattr(a, 'port_plan_out', None):
         fold += f' port-plan-out={os.path.abspath(a.port_plan_out)}'
     if getattr(a, 'pp_beat_bits', 0):
@@ -1425,6 +1427,22 @@ def vmem_known_zero(rows, budget):
     return 1, shift
 
 
+def vmem_slr_map(spec):
+    """[(class, group)] of --vmem-slr-groups: a JSON file whose `assignment`
+    lists the classes of each SLR group in order (foldsim_sll_check.py
+    --json), or `<class>:<group>,...`."""
+    if os.path.isfile(spec):
+        groups = json.load(open(spec)).get('assignment') or []
+        return [(c, g) for g, names in enumerate(groups) for c in names]
+    out = []
+    for x in spec.split(','):
+        c, _, g = x.rpartition(':')
+        if not c or not g.isdigit():
+            sys.exit(f'--vmem-slr-groups: {x!r} is not <class>:<group>')
+        out.append((c, int(g)))
+    return out
+
+
 def vmem_groups(vmems, choice, weights=None, kz_bits=0):
     """The kernel's controllers for --vmem-group (VMEM_INTERFACE.md, v6, v7): a
     class copy's virtual memories with the same instances, row size (bytes in
@@ -1842,6 +1860,11 @@ def build_parser():
                     help='with --vmem-on-engines and --fold-store-stream: streamed folded stores on page engines '
                          '(their issues\' positions) instead of controllers of their own (foldsim-fold-static '
                          'vmem-fold-on-engines)')
+    ap.add_argument('--vmem-slr-groups', default='', metavar='JSON|SPEC',
+                    help='with --page-engines: the SLR group of each class, so that a page engine carries one '
+                         'group\'s members only (foldsim-fold-static vmem-slr-groups): a JSON whose `assignment` '
+                         'lists the classes of each SLR in the region\'s order (foldsim_sll_check.py --json), or '
+                         '<class>:<group>,...')
     ap.add_argument('--vport-write-beats', action='store_true',
                     help='with --vport-engines, --vmem-on-engines, --vmem-stagger and --vport-hz: target RAM rows '
                          'wider than a 512-bit beat written beat by beat at successive positions (one-beat port '

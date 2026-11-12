@@ -28,6 +28,9 @@
 # y8r1di). placer (the default): each where it crosses the fewest (the wide
 # one beside its copy, its master crossing; the narrow ones at the NMUs);
 # nmu: every port crosses to SLR2; local: every controller with its copies.
+# slr (foldsim --vmem-slr-groups): every controller in its members' main SLR,
+# the masters shared per SLR (8 split by port bits, one at least an SLR with
+# controllers): the masters cross, and a spread engine's far half.
 # Only the bits crossing a boundary are charged to it. With an HBM port in
 # every SLR only the spread page engine's far half crosses.
 # A page engine's copies come from the schedule's `page engine` line; the link
@@ -44,6 +47,9 @@
 # PRICE-NEXT: engine placed: SLR2 240 60
 # PRICE-NEXT: port links from wires: {('wide', 'narrow'): 96}
 # PRICE-NEXT: port links from A -> B: {('wide', 'narrow'): 64}
+# PRICE-NEXT: v80 slr: 9151 1411 | G0:SLR1 G1:SLR0 G2:SLR2 | masters SLR2:1 SLR1:6 SLR0:1
+# PRICE-NEXT: v80 slr 3 masters: 2701 1411
+# PRICE-NEXT: slr_masters: [4, 4, 0] [1, 1, 1] [0, 0, 0]
 #
 # The driver: --vmem-engines local with --slr-groups puts each controller
 # (foldsim_afu's g_vg<g>.vmem / .group) in its copy's SLR group in the

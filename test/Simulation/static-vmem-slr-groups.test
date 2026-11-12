@@ -1,0 +1,32 @@
+# --vmem-slr-groups (foldsim-fold-static vmem-slr-groups): a page engine
+# carries the members of one SLR group only (a link stream counts as its
+# reader's), so that its port, member selects and device-memory master can sit
+# in the SLR of the copies it serves. Inputs/linkhbm with both models' pages in
+# HBM and both links streamed: without groups the first engine carries Unit's
+# and Reader's pages and the Reader -> Unit stream (groups 0 and 1 on one
+# engine); with Unit in group 0 and Reader in group 1 each engine carries one
+# group's members, at the same II. Exact with stalls, long latencies and full
+# queues.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/linkhbm
+# RUN: foldsim --srcs top.f --top Top --out %t/mix --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --min-ii 160 --page 1 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/mix.log 2>&1
+# RUN: python3 ../linkshare/engines_groups.py %t/mix/schedule.txt Unit:0,Reader:1 | FileCheck %s --check-prefix=MIX
+# RUN: foldsim --srcs top.f --top Top --out %t/grp --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --min-ii 160 --page 1 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm --vmem-slr-groups Unit:0,Reader:1 Unit Reader > %t/grp.log 2>&1
+# RUN: python3 ../linkshare/engines_groups.py %t/grp/schedule.txt Unit:0,Reader:1 | FileCheck %s --check-prefix=GRP
+# RUN: FileCheck %s --check-prefix=II < %t/grp.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/grp -DVM1 -Mdir %t/grp/obj %S/Inputs/tb_linkhbm.sv top.sv %t/grp/foldsim_sim.sv > %t/grp/build.log 2>&1
+# RUN: %t/grp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/grp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 | FileCheck %s
+# RUN: %t/grp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 | FileCheck %s
+# The same groups from a JSON assignment (foldsim_sll_check.py --json: the
+# classes of each SLR in order).
+# RUN: echo '{"assignment": [["Unit"], ["Reader"]]}' > %t/assign.json
+# RUN: foldsim --srcs top.f --top Top --out %t/js --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --min-ii 160 --page 1 --storage Unit:pages=hbm,Reader:pages=hbm --page-engines auto --link-kinds Unit:Reader:hbm,Reader:Unit:hbm --vmem-slr-groups %t/assign.json Unit Reader > %t/js.log 2>&1
+# RUN: python3 ../linkshare/engines_groups.py %t/js/schedule.txt Unit:0,Reader:1 | FileCheck %s --check-prefix=GRP
+# MIX: engines 2, mixed 1
+# MIX: engine 0: groups 0,1
+# GRP: engines 2, mixed 0
+# GRP-NEXT: engine 0: groups 0
+# GRP-NEXT: engine 1: groups 1
+# II: II = 160
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL

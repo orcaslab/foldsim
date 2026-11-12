@@ -439,6 +439,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "positions (each instance's issue: the landing ring's state pass, "
            "else its own), like any class virtual memory, instead of a "
            "controller of its own">,
+    ListOption<"vmemSlrGroups", "vmem-slr-groups", "std::string",
+           "With page-engines: <class>:<group> entries (the SLR each class's copy "
+           "is placed in); a page engine carries the members of one group only "
+           "(a link stream counts as its reader's), so that the engine's port, "
+           "its member selects and its device-memory master sit in one SLR with "
+           "the copies it serves and no member's row crosses an SLR boundary to "
+           "reach it. Classes not named form a group of their own">,
     Option<"vportWriteBeats", "vport-write-beats", "bool", "false",
            "With vport-engines, vmem-on-engines, vmem-stagger and vport-hz: a "
            "target RAM's row wider than a beat written as its 512-bit beats at "

@@ -907,6 +907,10 @@ public:
   bool vportWriteBeats = false;
   /// `vmem-fold-on-engines`: streamed folded stores on page engines too.
   bool vmemFoldEngines = false;
+  /// `vmem-slr-groups`: <class>:<group> entries; a page engine carries the
+  /// members of one group only (a link stream: its reader's), so that its
+  /// port, selects and master sit in one SLR with the copies it serves.
+  SmallVector<std::string> vmemSlrGroupSpecs;
   /// `port-plan-out`: a JSON file of every HBM member's request positions
   /// (each page engine member as placed, each class virtual memory's
   /// instances' state passes and issues): a static-port placement model's
@@ -1751,6 +1755,9 @@ private:
   /// at the same position (a read and a write a position at most, checked):
   /// the frame's static order multiplexes them, without FIFOs or arbiters.
   struct PageEngine {
+    /// `vmem-slr-groups`: the group of every member it carries (-1: none
+    /// named).
+    int group = -1;
     /// (class, virtual memory) of each column it carries, then the HBM link
     /// streams it carries (their members after the columns).
     SmallVector<std::pair<unsigned, unsigned>> members;
@@ -5524,8 +5531,24 @@ LogicalResult StaticFolder::assignPageEngines() {
   // engines.
   int frame = int(ii);
   auto wrap = [&](int pos) { return unsigned(((pos % frame) + frame) % frame); };
+  // `vmem-slr-groups`: each class's group (-1 unnamed); a member joins only
+  // an engine of its own group (`curGroup` while it is placed), a new engine
+  // takes it.
+  SmallVector<int> slrGroupOf(classes.size(), -1);
+  for (auto &spec : vmemSlrGroupSpecs) {
+    auto [name, g] = StringRef(spec).rsplit(':');
+    int group = -1;
+    if (g.getAsInteger(10, group) || group < 0)
+      return netlist.emitError("vmem-slr-groups: '") << spec << "' is not <class>:<group>";
+    for (auto [c, cls] : llvm::enumerate(classes))
+      if (cls.name == name)
+        slrGroupOf[c] = group;
+  }
+  int curGroup = -1;
+  auto own = [&](unsigned e) { return pageEngines[e].group == curGroup; };
   auto newEngine = [&]() -> PageEngine & {
     pageEngines.emplace_back();
+    pageEngines.back().group = curGroup;
     pageEngines.back().reads.assign(ii + 1, 0);
     pageEngines.back().writes.assign(ii + 1, 0);
     return pageEngines.back();
@@ -5556,6 +5579,7 @@ LogicalResult StaticFolder::assignPageEngines() {
     llvm::stable_sort(order, [&](unsigned x, unsigned y) { return taken(x) > taken(y); });
     for (unsigned c : order) {
       auto &cls = classes[c];
+      curGroup = slrGroupOf[c];
       unsigned k = cls.ppBeats, run = cls.pp * k;
       SmallVector<int> readAt, drainAt;
       int maxR = 0, maxW = 0;
@@ -5577,6 +5601,8 @@ LogicalResult StaticFolder::assignPageEngines() {
       int sr = 0, sw = 0;
       bool found = false;
       for (unsigned e = 0; e < pageEngines.size() && !found; ++e) {
+        if (!own(e))
+          continue;
         int r = 0, w = 0;
         while (r <= maxR && !fits(pageEngines[e].reads, readAt, r))
           ++r;
@@ -5594,7 +5620,8 @@ LogicalResult StaticFolder::assignPageEngines() {
         auto &vm = cls.virtualMemories[x];
         unsigned e = 0;
         for (; e < pageEngines.size(); ++e)
-          if (fits(pageEngines[e].reads, readAt, sr) && fits(pageEngines[e].writes, drainAt, sw))
+          if (own(e) && fits(pageEngines[e].reads, readAt, sr) &&
+              fits(pageEngines[e].writes, drainAt, sw))
             break;
         if (e == pageEngines.size()) {
           if (e >= pageEngineCap)
@@ -5631,6 +5658,7 @@ LogicalResult StaticFolder::assignPageEngines() {
     for (auto [c, cls] : llvm::enumerate(classes)) {
       if (!cls.pp || !cls.ppHbm || (ppBeatBits && cls.ppBeats > 1))
         continue;
+      curGroup = slrGroupOf[c];
       SmallVector<uint64_t> readRow, instRow, rowRow;
       ppStreamRows(cls, readRow, instRow, rowRow);
       SmallVector<unsigned> rq, wr;
@@ -5648,7 +5676,7 @@ LogicalResult StaticFolder::assignPageEngines() {
           continue;
         unsigned e = 0;
         for (; e < pageEngines.size(); ++e)
-          if (llvm::none_of(rq, [&](unsigned q) { return pageEngines[e].reads[q]; }) &&
+          if (own(e) && llvm::none_of(rq, [&](unsigned q) { return pageEngines[e].reads[q]; }) &&
               llvm::none_of(wr, [&](unsigned q) { return pageEngines[e].writes[q]; }))
             break;
         if (getenv("FOLDSIM_PPE_LOG")) {
@@ -5701,6 +5729,7 @@ LogicalResult StaticFolder::assignPageEngines() {
     auto &st = linkStreams[k];
     if (!st.kept)
       continue;
+    curGroup = slrGroupOf[st.rcls];
     // `link-hbm-beat-bits`: a stream of beats at its own positions (each
     // landing's beats before its request position, each page's after its
     // write position), on the first engine where they are all free, else a
@@ -5745,6 +5774,8 @@ LogicalResult StaticFolder::assignPageEngines() {
       int sr = 0, sw = 0;
       bool found = false;
       for (; e < pageEngines.size() && maxR >= 0 && maxW >= 0 && !found; ++e) {
+        if (!own(e))
+          continue;
         int r = 0, w = 0;
         while (r <= maxR && !requestsFit(e, r))
           ++r;
@@ -5817,20 +5848,20 @@ LogicalResult StaticFolder::assignPageEngines() {
     for (auto &l : st.landings)
       requests.push_back(l.q - int(st.lead));
     bool fit = linkHbmFitSlots || st.twoSets;
-    unsigned own = fit ? fitSlots(st, requests) : st.leadSlots();
-    unsigned slots = own;
+    unsigned ownSlots = fit ? fitSlots(st, requests) : st.leadSlots();
+    unsigned slots = ownSlots;
     unsigned e = 0;
     for (; e < pageEngines.size(); ++e)
-      if (placeStream(st, pageEngines[e].reads, pageEngines[e].writes, linkHbmShift,
-                      own, requests, writes))
+      if (own(e) && placeStream(st, pageEngines[e].reads, pageEngines[e].writes, linkHbmShift,
+                                ownSlots, requests, writes))
         break;
-    if (e == pageEngines.size() && own != st.leadSlots())
+    if (e == pageEngines.size() && ownSlots != st.leadSlots())
       for (e = 0, slots = st.leadSlots(); e < pageEngines.size(); ++e)
-        if (placeStream(st, pageEngines[e].reads, pageEngines[e].writes, linkHbmShift,
-                        slots, requests, writes))
+        if (own(e) && placeStream(st, pageEngines[e].reads, pageEngines[e].writes, linkHbmShift,
+                                  slots, requests, writes))
           break;
     if (e == pageEngines.size()) {
-      slots = own;
+      slots = ownSlots;
       if (e >= pageEngineCap)
         return netlist.emitError("page engines: ")
                << pageEngineCap << " engines cannot carry the link stream "
@@ -5884,11 +5915,18 @@ LogicalResult StaticFolder::assignPageEngines() {
       offChipRows(cls, fixed.read, fixed.inst, fixed.page, fixed.write, fixed.wpage);
     PageRows rows;
     unsigned first = 0;
+    curGroup = slrGroupOf[c];
     for (;; ++first) {
       if (first + columns > pageEngineCap)
         return netlist.emitError("page engines: ")
                << pageEngineCap << " engines cannot carry the page columns of "
                << cls.name << " (" << columns << " columns)";
+      // (`vmem-slr-groups`: a run of its group's engines, or past the last.)
+      bool foreign = false;
+      for (unsigned e = first; e < first + columns && e < pageEngines.size(); ++e)
+        foreign |= !own(e);
+      if (foreign)
+        continue;
       // The run's positions taken (engines past the last: none).
       SmallVector<uint64_t> reads(ii, 0), writes(ii, 0);
       for (unsigned e = first; e < first + columns && e < pageEngines.size(); ++e)
@@ -6002,6 +6040,7 @@ LogicalResult StaticFolder::assignPageEngines() {
       // passes, with vmem-stagger; the folded stores keep their own.)
       if (!cls.foldIssue.empty() && !vmemStagger)
         continue;
+      curGroup = slrGroupOf[c];
       for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
         if (vm.pages || (vm.fold && !vmemFoldEngines) ||
             pageEngineOf.count({unsigned(c), unsigned(k)}))
@@ -6113,6 +6152,8 @@ LogicalResult StaticFolder::assignPageEngines() {
           };
           unsigned e = 0, d = 1;
           for (; e < pageEngines.size(); ++e) {
+            if (!own(e))
+              continue;
             for (d = 1; d + wb - 1 <= most && !beatsFree(pageEngines[e], d); ++d)
               ;
             if (d + wb - 1 <= most)
@@ -6154,6 +6195,8 @@ LogicalResult StaticFolder::assignPageEngines() {
         unsigned e = 0, d = 0;
         for (; e < pageEngines.size(); ++e) {
           auto &eng = pageEngines[e];
+          if (!own(e))
+            continue;
           // (Static ports, `vport-engines`: any order (a member's own wr_pair
           // and rd_new) and any member of no more beats than the port's rows.)
           if (vportEngines ? (vm.dataWidth + 511) / 512 > (std::max(1u, eng.writeWidth) + 511) / 512
@@ -6179,7 +6222,7 @@ LogicalResult StaticFolder::assignPageEngines() {
           unsigned e2 = 0, d2 = 0;
           for (; e2 < pageEngines.size(); ++e2) {
             auto &eng = pageEngines[e2];
-            if ((vm.dataWidth + 511) / 512 > (std::max(1u, eng.writeWidth) + 511) / 512)
+            if (!own(e2) || (vm.dataWidth + 511) / 512 > (std::max(1u, eng.writeWidth) + 511) / 512)
               continue;
             bool found = false;
             for (unsigned t = 0; t <= most && !found; ++t) {
@@ -27560,6 +27603,7 @@ void FoldStaticPass::runOnOperation() {
   folder.vportCopy = vportCopy;
   folder.vportWriteBeats = vportWriteBeats;
   folder.vmemFoldEngines = vmemFoldEngines;
+  folder.vmemSlrGroupSpecs.assign(vmemSlrGroups.begin(), vmemSlrGroups.end());
   folder.vmemRingLead = vmemRings;
   folder.foldRingLead = foldStoreRings;
   folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));
