@@ -114,7 +114,7 @@
 // outputs, so every target cycle is a loop through the whole hierarchy;
 // against the unthreaded target, reset at the start and in mid-run
 // (tb_nest.sv).
-// CHECK: MATCH
+// CHECK: {{^}}MATCH
 module {
   hw.module @L3(in %clk : !seq.clock, in %reset : i1, in %x : i8, out y : i8) {
     %c49_i16 = hw.constant 49 : i16

@@ -18,4 +18,4 @@
 # SCAN: lane-scan: cell Top_lane_Leaf
 # SCAN: lane-scan: Top lanes Leaf x32: {{.*}}; scans ac {{[0-9]+}} prio 1 ({{.*}}; residual 0 ops
 
-# CHECK: MATCH
+# CHECK: {{^}}MATCH
