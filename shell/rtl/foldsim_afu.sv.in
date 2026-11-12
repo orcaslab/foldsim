@@ -208,10 +208,19 @@ module foldsim_afu #(
     localparam NW = (MEM_SPEC == 2) ? 4 : 1;
 `endif
 
-    // A registered reset, so it reaches the whole kernel in one cycle's time.
-    reg reset;
+    // A registered reset tree: a root register of ap_rst_n, then the reset
+    // every block takes, a register Vivado replicates by its fanout
+    // (MAX_FANOUT) and places by its loads. One register and one long net
+    // reached the whole kernel (a folded simulator's every copy and memory
+    // controller) in a cycle; on a three-SLR kernel (FSD 1,024 nodes, 11-12)
+    // those paths had ~5 ns of route. Every block sees reset in the same host
+    // cycle, a cycle later than before.
+    reg reset_root;
     always @(posedge ap_clk)
-        reset <= ~ap_rst_n;
+        reset_root <= ~ap_rst_n;
+    (* max_fanout = 256 *) reg reset;
+    always @(posedge ap_clk)
+        reset <= reset_root;
 
     // ---- The simulator's channels, named after the target's ports ----
 `define FOLDSIM_CH(name, w) \
