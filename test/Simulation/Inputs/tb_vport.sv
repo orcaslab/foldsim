@@ -27,11 +27,13 @@
 // an image row instead of answering, +copy/2 percent read image rows with
 // rd_after_copies: they must see every earlier copy). Every AXI burst is
 // checked to stay in its 4 KiB page; every answer's beats arrive once, in
-// order. Prints PASS or the first mismatches.
+// order. NEED_IN: the driver keeps each row's newest write number (from the
+// port's w_count) and hands it with the read (rd_need). Prints PASS or the
+// first mismatches.
 `timescale 1ps/1ps
 module tb;
     parameter IW = 3, AW = 4, DW = 1040, QUEUE = 16, OUTSTANDING = 16, WRITES_OUT = 8, CYCLES = 30000, FS = 4, HZ = 0;
-    parameter ASYNC = 0, COPY = 0, MAX_BURST = 1, AXI_RD_OUT = 0, AXI_WR_OUT = 0, BASE_ALIGNED = 0;
+    parameter ASYNC = 0, COPY = 0, MAX_BURST = 1, AXI_RD_OUT = 0, AXI_WR_OUT = 0, BASE_ALIGNED = 0, NEED_IN = 0;
     localparam INST = 1 << IW, ROWS = 1 << AW, MW = DW / 8;
     localparam BEATS = (DW + 511) / 512, LW = (BEATS > 1) ? $clog2(BEATS) : 1;
     // A row's slot in memory: a power of two beats (rows never cross a 4 KiB page).
@@ -58,6 +60,8 @@ module tb;
     reg [FCW-1:0] rd_fence = 0;
     reg [DW-1:0] wr_data = 0;
     reg [MW-1:0] wr_mask = 0;
+    reg [15:0] rd_need = 0;
+    wire [15:0] w_count;
     wire rsp_valid, rsp_last, rsp_copied, busy;
     wire [TW-1:0] rsp_tag;
     wire [LW-1:0] rsp_beat;
@@ -74,14 +78,14 @@ module tb;
 
     foldsim_vport #(.DW(DW), .MW(MW), .TW(TW), .OW(OW), .QUEUE(QUEUE), .OUTSTANDING(OUTSTANDING),
         .WRITES_OUT(WRITES_OUT), .AXI_RD_OUT(AXI_RD_OUT), .AXI_WR_OUT(AXI_WR_OUT), .MAX_BURST(MAX_BURST),
-        .FCLASSES(16), .FS(FS), .HZ(HZ), .COPY(COPY), .ASYNC(ASYNC), .BASE_ALIGNED(BASE_ALIGNED)) dut (
+        .FCLASSES(16), .FS(FS), .HZ(HZ), .COPY(COPY), .ASYNC(ASYNC), .BASE_ALIGNED(BASE_ALIGNED), .NEED_IN(NEED_IN)) dut (
         .clk(clk), .reset(reset),
         .rd_valid(rd_valid), .rd_addr(rd_addr), .rd_len(rd_len), .rd_tag(rd_tag), .rd_fence(rd_fence), .rd_new(1'b0),
         .rd_copy(rd_copy), .rd_copy_addr(rd_copy_addr), .rd_after_copies(rd_after),
         .wr_valid(wr_valid), .wr_addr(wr_addr), .wr_len(wr_len), .wr_pair(wr_pair), .wr_data(wr_data), .wr_mask(wr_mask),
         .rsp_valid(rsp_valid), .rsp_tag(rsp_tag), .rsp_beat(rsp_beat), .rsp_last(rsp_last), .rsp_copied(rsp_copied),
         .rsp_data(rsp_data), .rd_free(rd_free), .wr_free(wr_free), .base(BASE), .bytes(BYTES), .zero(zero),
-        .move(1'b0), .busy(busy), .stat(stat), .m_clk(m_clk),
+        .move(1'b0), .busy(busy), .stat(stat), .rd_need(rd_need), .w_count(w_count), .m_clk(m_clk),
         .m_awvalid(m_awvalid), .m_awready(m_awready), .m_awaddr(m_awaddr), .m_awlen(m_awlen),
         .m_wvalid(m_wvalid), .m_wready(m_wready), .m_wdata(m_wdata), .m_wstrb(m_wstrb), .m_wlast(m_wlast),
         .m_bvalid(m_bvalid), .m_bready(m_bready), .m_arvalid(m_arvalid), .m_arready(m_arready),
@@ -100,6 +104,8 @@ module tb;
     reg          is_copy [INST];
     integer      beat_at [INST];
     integer      last_k [INST];
+    // (NEED_IN) each row's newest write number, rows then image rows.
+    reg [15:0]   num [INST][2*ROWS];
     // When each row was last written (host cycle), for +far's reads.
     longint      wrote_at [INST][ROWS];
     reg [AXW-1:0] mem [longint];
@@ -309,6 +315,7 @@ module tb;
                 m = ($urandom % 2) ? '1 : MW'({$urandom, $urandom, $urandom, $urandom, $urandom});
                 for (int q = 0; q < DW; q += 32) d[q +: 32] = $urandom;
                 if (dr) begin
+                    rd_need <= num[i][ir ? ROWS + k : r];
                     rd_valid <= 1; rd_len <= LW'(BEATS - 1); rd_tag <= TW'(i);
                     rd_addr <= ir ? img_of(i, k) : addr_of(i, r);
                     rd_fence <= far ? 4'd2 : 4'd0;
@@ -319,6 +326,8 @@ module tb;
                     if (ir) img_reads <= img_reads + 1;
                 end
                 if (dw) begin
+                    // Its number: the writes taken so far (one more if last cycle's is taken now) + 1.
+                    num[i][iw ? ROWS + k : w] = w_count + 16'(wr_valid) + 16'd1;
                     wr_valid <= 1; wr_len <= LW'(BEATS - 1); wr_data <= d; wr_mask <= m;
                     if (iw) begin
                         // A write of an image row (after any copy into it taken before).
@@ -342,6 +351,7 @@ module tb;
         for (int i = 0; i < INST; ++i) begin
             pending[i] = 0;
             for (int r = 0; r < ROWS; ++r) begin ram[i][r] = '0; img[i][r] = '0; wrote_at[i][r] = -1000000; end
+            for (int r = 0; r < 2 * ROWS; ++r) num[i][r] = '0;
         end
     endtask
 

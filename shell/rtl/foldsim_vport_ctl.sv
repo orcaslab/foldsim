@@ -262,6 +262,37 @@ module foldsim_vport_ctl #(
         end
     end
     wire           z_ans  = (KZ != 0) && q2_rd && kz_hit && zero;
+
+    // ---- The write-number table (HZ > 0): 2^HZE entries by a hash of the
+    // row (its beat offset above its alignment bits, as foldsim_vport's),
+    // each the number of the newest write taken of a row hashing there, in
+    // a block RAM: written as a write is taken (q2), read a host cycle ahead
+    // at the input register (q) for the read the port takes at q2. A write
+    // taken in the lookup's own cycle is the newest of its entry (a bypass);
+    // a write-first pair's read takes its own write's number. The port
+    // checks the number against the writes in flight (foldsim_vport NEED_IN).
+    localparam HZE = (HZ < AW + KB) ? HZ : AW + KB;
+    localparam HB  = (HZE > 0) ? HZE : 1;
+    localparam KSH = RB - 6;
+    function automatic [HB-1:0] bucket_of(input [OW-1:0] a);
+        bucket_of = '0;
+        for (int i = KSH; i < OW; i++)
+            bucket_of[(i - KSH) % HB] = bucket_of[(i - KSH) % HB] ^ a[i];
+    endfunction
+    wire [15:0]    w_count;
+    (* ram_style = "block" *) reg [15:0] hz_ram [1 << HB];
+    reg  [15:0]    hz_q, hz_byp_n;
+    reg            hz_byp;
+    wire [HB-1:0]  hz_ra = bucket_of(q_raddr);
+    wire [HB-1:0]  hz_wa = bucket_of(q2_waddr);
+    always @(posedge clk) begin
+        if (HZE > 0 && q2_wr)
+            hz_ram[hz_wa] <= w_count + 16'd1;
+        hz_q     <= hz_ram[hz_ra];
+        hz_byp   <= q2_wr && hz_wa == hz_ra;
+        hz_byp_n <= w_count + 16'd1;
+    end
+    wire [15:0]    p_need = q2_new ? w_count + 16'd1 : hz_byp ? hz_byp_n : hz_q;
     wire           p_rd   = q2_rd && !z_ans;
 
     // Zero answers waiting for a cycle without the port's answer.
@@ -275,7 +306,7 @@ module foldsim_vport_ctl #(
     foldsim_vport #(
         .DW(DB), .MW(MW), .TW(IT), .OW(OW), .QUEUE(QUEUE), .OUTSTANDING(OUTSTANDING), .WRITES_OUT(WRITES_OUT),
         .AXI_RD_OUT(0), .AXI_WR_OUT(0), .MAX_BURST(1),
-        .ZERO_FILL(KNOWN_ZERO), .HZ((HZ < AW + KB) ? HZ : AW + KB), .KS(RB - 6)
+        .ZERO_FILL(KNOWN_ZERO), .HZ(HZE), .KS(RB - 6), .NEED_IN(1)
     ) port (
         .clk(clk), .reset(reset),
         .rd_valid(p_rd), .rd_addr(q2_raddr), .rd_len(LW'(BEATS - 1)), .rd_tag(q2_rtag), .rd_fence(4'd0),
@@ -286,6 +317,7 @@ module foldsim_vport_ctl #(
         .rsp_data(p_rsp_data),
         .rd_free(rd_free), .wr_free(wr_free),
         .base(base), .bytes(64'(BYTES)), .zero(zero), .move(move), .busy(busy), .stat(p_stat), .m_clk(clk),
+        .rd_need(p_need), .w_count(w_count),
         .m_awvalid(m_awvalid), .m_awready(m_awready), .m_awaddr(m_awaddr), .m_awlen(m_awlen),
         .m_wvalid(m_wvalid), .m_wready(m_wready), .m_wdata(m_wdata), .m_wstrb(m_wstrb), .m_wlast(m_wlast),
         .m_bvalid(m_bvalid), .m_bready(m_bready), .m_arvalid(m_arvalid), .m_arready(m_arready),
@@ -383,6 +415,8 @@ module foldsim_vport_ctl #(
         kz_sweep = '0;
         z_q = 1'b0;
         clean = 1'b0;
+        hz_byp = 1'b0;
+        for (int i = 0; i < (1 << HB); i++) hz_ram[i] = '0;
         kz_rd = 1'b1;
         kz_same = 1'b0;
         zq_head = '0;

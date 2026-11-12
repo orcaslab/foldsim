@@ -164,7 +164,9 @@ module tb;
             if (m[j / GROUP]) merge[j*8 +: 8] = d[j*8 +: 8];
     endfunction
     always @(posedge clk) begin
-        if (rsp_valid) begin
+        // (An answer in a cycle the simulator spends in reset is not taken: a
+        // read whose last beat came just before the reset may show there.)
+        if (rsp_valid && !reset) begin
             answered <= answered + 1;
             if (!pending[rsp_inst]) begin
                 $display("FAIL: an answer for instance %0d with no read", rsp_inst);

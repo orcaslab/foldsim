@@ -104,6 +104,12 @@ module foldsim_vport #(
     // taken of a row hashing there.
     parameter HZ           = 0,
     parameter KS           = 0,
+    // The write number a read waits for comes in with it (rd_need, 1) from a
+    // table its sender keeps (a block RAM looked up a host cycle ahead,
+    // foldsim_vport_ctl), instead of the port's own (0). Numbers are this
+    // port's: a write taken in a host cycle is number w_count + 1 of that
+    // cycle (fill bursts count too; copies do not).
+    parameter NEED_IN      = 0,
     // Ring copies (rd_copy, rd_after_copies).
     parameter COPY         = 0,
     // AXI side in m_clk at 256 bits.
@@ -162,6 +168,10 @@ module foldsim_vport #(
     // Telemetry: this cycle the head read waits (fence, credit, channel);
     // the head write waits; a read is on AXI.
     output wire [2:0]           stat,
+    /* verilator lint_off UNUSEDSIGNAL */
+    input  wire [15:0]          rd_need,     // (NEED_IN)
+    /* verilator lint_on UNUSEDSIGNAL */
+    output wire [15:0]          w_count,
 
     /* verilator lint_off UNUSEDSIGNAL */
     input  wire                 m_clk,       // (ASYNC)
@@ -210,6 +220,9 @@ module foldsim_vport #(
     localparam GROUP = DB / MW;
     localparam H     = 512 / AXW;               // AXI beats a 512-bit beat
     localparam HB_   = (HZ > 0) ? HZ : 1;
+    // Read-after-write by write numbers (the port's table or the sender's).
+    localparam TAB   = (HZ > 0 || NEED_IN != 0) ? 1 : 0;
+    localparam NB    = (HZ > 0 && NEED_IN == 0) ? (1 << HB_) : 1;
     localparam LOGA  = 3;                       // request FIFOs (ASYNC)
     localparam LOGR  = 4;                       // read beats (ASYNC)
 
@@ -273,15 +286,22 @@ module foldsim_vport #(
         for (int i = KS; i < OW; i++)
             bucket_of[(i - KS) % HB_] = bucket_of[(i - KS) % HB_] ^ a[i];
     endfunction
-    localparam NB = 1 << HB_;
-    reg  [CW-1:0]  hz_tab [NB];
-    wire [HB_-1:0] in_bucket = bucket_of(rd_addr);
-    wire [HB_-1:0] wr_bucket = bucket_of(wr_addr);
-    wire [CW-1:0]  in_need_b = (rd_new && take_wr) ? w_taken + 1'b1 : hz_tab[in_bucket];
-    always @(posedge clk)
-        if (HZ > 0 && take_wr)
-            hz_tab[wr_bucket] <= w_taken + 1'b1;
-    wire [CW-1:0]  in_need   = (HZ > 0) ? in_need_b : in_need_c;
+    wire [CW-1:0]  in_tab;                     // the port's own table's number for the read
+    if (NB > 1) begin : g_tab
+        reg  [CW-1:0]  hz_tab [NB];
+        always @(posedge clk)
+            if (take_wr)
+                hz_tab[bucket_of(wr_addr)] <= w_taken + 1'b1;
+        assign in_tab = hz_tab[bucket_of(rd_addr)];
+`ifdef SIMULATION
+        initial for (int i = 0; i < NB; i++) hz_tab[i] = '0;
+`endif
+    end else begin : g_no_tab
+        assign in_tab = '0;
+    end
+    wire [CW-1:0]  in_need_b = (NEED_IN != 0) ? rd_need : (rd_new && take_wr) ? w_taken + 1'b1 : in_tab;
+    assign w_count = 16'(w_taken);
+    wire [CW-1:0]  in_need   = (TAB != 0) ? in_need_b : in_need_c;
     // (A difference's sign bit, not a compare after it.) Table numbers: the
     // write is in flight while its number is in (w_done, w_done + w_inflight].
     function automatic fence_ok(input [CW-1:0] need);
@@ -289,7 +309,7 @@ module foldsim_vport #(
         reg [CW-1:0] dw;
         /* verilator lint_on UNUSEDSIGNAL */
         dw = w_done - need;
-        fence_ok = (HZ > 0) ? ((need - w_done - 1'b1) >= w_inflight) : !dw[CW-1];
+        fence_ok = (TAB != 0) ? ((need - w_done - 1'b1) >= w_inflight) : !dw[CW-1];
     endfunction
     function automatic after_ok(input af, input [CCW-1:0] cn);
         /* verilator lint_off UNUSEDSIGNAL */
@@ -888,7 +908,6 @@ module foldsim_vport #(
         p_valid = 1'b0; h_valid = 1'b0; p_ok = 1'b0; h_ok = 1'b0; r_room = 1'b0; of_room = 1'b0;
         pw_valid = 1'b0; g_valid = 1'b0; pw_ok = 1'b0; g_ok = 1'b0; w_room = 1'b0;
         of_head = '0; of_tail = '0; of_iss = '0; r_beat = '0; ar_cnt = '0; bq_cnt = '0;
-        for (int i = 0; i < NB; i++) hz_tab[i] = '0;
         for (int i = 0; i < FCLASSES; i++) w_ring[i] = '0;
         m_arvalid = 1'b0; m_awvalid = 1'b0; m_wvalid = 1'b0; rsp_valid = 1'b0; rsp_copied = 1'b0;
         rd_free = '0; wr_free = '0;

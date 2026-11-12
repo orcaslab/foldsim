@@ -57,6 +57,14 @@
 # RUN: %t/acopy/Vtb +verilator+seed+30 +sp=2500 +mp=1250 +hi=80 +copy=40 +stall=20 +resets=3 +far=1 | FileCheck %s
 # RUN: %t/acopy/Vtb +verilator+seed+31 +sp=2511 +mp=1777 +hi=60 +copy=30 +seq=60 +stall=10 +far=1 | FileCheck %s
 # RUN: %t/acopy/Vtb +verilator+seed+32 +sp=1000 +mp=3000 +hi=600 +copy=30 +stall=30 +cycles=30000 | FileCheck %s
+# The write number a read waits for handed in by its sender (NEED_IN: the
+# driver keeps each row's newest number from w_count), with bursts and copies.
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=1040 -GNEED_IN=1 -GCYCLES=12000 -Mdir %t/need %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/need.log 2>&1
+# RUN: %t/need/Vtb +verilator+seed+40 +hi=600 +stall=30 +cycles=30000 | FileCheck %s
+# RUN: %t/need/Vtb +verilator+seed+41 +hi=60 +stall=20 +resets=3 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GIW=5 -GDW=512 -GASYNC=1 -GCOPY=1 -GMAX_BURST=8 -GAXI_RD_OUT=4 -GAXI_WR_OUT=4 -GNEED_IN=1 -GCYCLES=12000 -Mdir %t/needm %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/needm.log 2>&1
+# RUN: %t/needm/Vtb +verilator+seed+42 +sp=2500 +mp=1250 +hi=60 +seq=70 +stall=10 +copy=30 | FileCheck %s
+# RUN: %t/needm/Vtb +verilator+seed+43 +sp=2511 +mp=1777 +hi=200 +seq=90 +wr=60 +resets=2 | FileCheck %s
 # CHECK-NOT: FAIL
 # CHECK-NOT: %Error
 # CHECK: {{[0-9]+}} reads ({{[0-9]+}} answered), {{[0-9]+}} writes
