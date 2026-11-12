@@ -58,7 +58,7 @@
 // children's outputs of the same cycle, so a child's cycle depends on its
 // siblings'; the first child's input has constant high bits; against the
 // unthreaded target (tb_nest.sv).
-// CHECK: MATCH
+// CHECK: {{^}}MATCH
 module {
   hw.module @L3(in %clk : !seq.clock, in %reset : i1, in %x : i8, out y : i8, in %g : i4) {
     %c49_i16 = hw.constant 49 : i16
