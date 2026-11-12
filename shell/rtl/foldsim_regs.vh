@@ -68,6 +68,9 @@
 `define FOLDSIM_REG_MEM_WMARK   12'h0F0
 `define FOLDSIM_REG_MEM_REFI    12'h0F4
 `define FOLDSIM_REG_MEM_RFC     12'h0F8
+// VMEM_BYTES' high word (read only): the virtual memories' space past 4 GiB
+// (static ports of 64 SMs: 5.9 GiB); 0 below, and in kernels without it.
+`define FOLDSIM_REG_VMEM_BYTES_HI 12'h0FC
 // Per class c: the host cycles a thread of it finished its target cycle, up
 // to 96 classes.
 `define FOLDSIM_REG_FINISH_BASE 12'h100

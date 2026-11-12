@@ -89,6 +89,9 @@ enum {
 #define FOLDSIM_REG_MEM_WMARK   0x0F0u  // write bursts: [7:0] to writes at, [15:8] back below
 #define FOLDSIM_REG_MEM_REFI    0x0F4u  // refresh: DRAM clocks from one to the next
 #define FOLDSIM_REG_MEM_RFC     0x0F8u  // refresh: DRAM clocks a refreshed bank may not activate
+// VMEM_BYTES' high word (read only): the virtual memories' space past 4 GiB;
+// 0 below it, and in kernels without the register (reads of unknown offsets are 0).
+#define FOLDSIM_REG_VMEM_BYTES_HI 0x0FCu
 #define FOLDSIM_REG_MEM_TIMING(i) (0x400u + 4u * (i))  // FOLDSIM_MEM_T_*, 12 bits each
 #define FOLDSIM_REG_MEM_STATS(p, i) (0x800u + 0x40u * (p) + 8u * (i))  // port p's FOLDSIM_MEM_STAT_*, lo/hi (p < 32)
 #define FOLDSIM_REG_MEM_AXI(p, i) (0x480u + 0x20u * (p) + 4u * (i))  // port p's FOLDSIM_MEM_AXI_*, 32 bits (p < 24)

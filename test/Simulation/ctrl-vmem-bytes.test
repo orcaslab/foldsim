@@ -1,0 +1,15 @@
+# REQUIRES: verilator
+# The kernel's virtual-memory space past 4 GiB (the 64-SM A100 netlist y64c1's 95 static ports: 5.9 GiB): VMEM_BYTES
+# gives its low word, VMEM_BYTES_HI (0x0FC) its high word; below 4 GiB the high word is 0. Elaborates without the old
+# 4 GiB $error. (A kernel without the register answers 0 at 0x0FC, as any unknown offset: old kernels read as < 4 GiB.)
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -Mdir %t/big %S/Inputs/tb_ctrl_vmem.sv %S/../../shell/rtl/foldsim_token.sv %S/../../shell/rtl/foldsim_ctrl.sv > %t/big.log 2>&1
+# RUN: %t/big/Vtb | FileCheck %s --check-prefix=BIG
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb "-GVMEM_BYTES=64'h12b56000" -I%S/../../shell/rtl -Mdir %t/small %S/Inputs/tb_ctrl_vmem.sv %S/../../shell/rtl/foldsim_token.sv %S/../../shell/rtl/foldsim_ctrl.sv > %t/small.log 2>&1
+# RUN: %t/small/Vtb | FileCheck %s --check-prefix=SMALL
+# BIG: VMEM_BYTES 00000001_76288000
+# BIG-NOT: FAIL
+# BIG: PASS
+# SMALL: VMEM_BYTES 00000000_12b56000
+# SMALL-NOT: FAIL
+# SMALL: PASS

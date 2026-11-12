@@ -17,6 +17,14 @@
 # RUN: grep -o 'hw.instance "vport[0-9]*" @foldsim_vport' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=N70
 # RUN: grep -o 'hw.instance "vport69" @foldsim_vport' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=ONE
 # RUN: grep -o 'hw.instance "g_vmem_master_[0-9]*.share" @foldsim_vmem_share' %t/afu.mlir | wc -l | FileCheck %s --check-prefix=N8
+# The same ports of 128 MiB: a vmem space of 8.75 GiB (past 4 GiB: VMEM_BYTES_HI) lints as clean.
+# RUN: python3 %S/Inputs/flow/vport_stub.py 70 %t/g8 1 134217728
+# RUN: python3 %foldsim_tools/foldsim_flow.py kernel-vh --manifest %t/plain.toml --gen %t/g8 --vmem-masters 8 -o %t/g8/foldsim_kernel.vh
+# RUN: python3 %foldsim_tools/foldsim_flow.py afu --manifest %t/plain.toml --gen %t/g8 --rtl-dir %S/../../shell/rtl -o %t/g8/foldsim_afu.sv
+# RUN: python3 %foldsim_tools/foldsim_flow.py kernel-srcs --gen %t/g8 --rtl-dir %S/../../shell/rtl -o %t/srcs8.f
+# RUN: %verilator --lint-only -Wall -Wno-fatal -DSIMULATION --top-module foldsim_afu -f %t/srcs8.f > %t/lint8.log 2>&1
+# RUN: grep -E '^%%(Warning|Error)' %t/lint8.log | sed -E 's#^(%%[A-Za-z-]+): [^ ]+:[0-9]+:[0-9]+: #\1: #' | FileCheck %s --check-prefix=LINT
+# RUN: grep -q "FOLDSIM_VPORT_REGION_BYTES 64'h230000000" %t/g8/foldsim_sim.vh
 # Past the kernel's 256 (32 parts): refused.
 # RUN: python3 %S/Inputs/flow/vport_stub.py 257 %t/g257
 # RUN: not python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %t/g257/foldsim_sim.vh --mem-ports 1 --vmem-masters 8 2>&1 | FileCheck %s --check-prefix=MAX

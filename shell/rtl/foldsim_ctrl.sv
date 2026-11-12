@@ -127,9 +127,6 @@ module foldsim_ctrl #(
     if (NUM_CLASSES > 96 || MEM_PORTS > 32) begin : g_map
         $error("foldsim_ctrl: the register map holds up to 96 classes and 32 memory ports");
     end
-    if (VMEM_BYTES >= 64'h1_0000_0000) begin : g_vmem_map
-        $error("foldsim_ctrl: FOLDSIM_REG_VMEM_BYTES holds up to 4 GiB");
-    end
 
     localparam QW = $clog2(QUEUE);
     localparam QC = $clog2(QUEUE + 1);
@@ -459,6 +456,7 @@ module foldsim_ctrl #(
                     r_in_vm <= 1'b1;
                     case ({ar_addr[11:2], 2'b00})
                     `FOLDSIM_REG_VMEM_BYTES:   r_vm <= VMEM_BYTES[31:0];
+                    `FOLDSIM_REG_VMEM_BYTES_HI: r_vm <= VMEM_BYTES[63:32];
                     `FOLDSIM_REG_VMEM_BASE_LO: r_vm <= vmem_base[31:0];
                     `FOLDSIM_REG_VMEM_BASE_HI: r_vm <= vmem_base[63:32];
                     default:                   r_in_vm <= 1'b0;
