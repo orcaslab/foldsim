@@ -491,6 +491,8 @@ def frame_options(a):
             fold += f' vport-fence-shift={a.vport_fence_shift}'
         if a.vport_hz:
             fold += f' vport-hz={a.vport_hz}'
+        if a.vport_copy:
+            fold += ' vport-copy'
     if getattr(a, 'port_plan_out', None):
         fold += f' port-plan-out={os.path.abspath(a.port_plan_out)}'
     if getattr(a, 'pp_beat_bits', 0):
@@ -1807,6 +1809,9 @@ def build_parser():
     ap.add_argument('--vport-engines', action='store_true',
                     help='with --page-engines: each page engine a static port (foldsim_vport, vp<p>_* simulator '
                          'ports, FOLDSIM_VPORT<p>_* in foldsim_sim.vh; foldsim-fold-static vport-engines)')
+    ap.add_argument('--vport-copy', action='store_true',
+                    help='with --vport-engines and --vmem-rings: ring answers copied into their images by the port '
+                         '(foldsim-fold-static vport-copy)')
     ap.add_argument('--vport-hz', type=int, default=0, metavar='N',
                     help='with --vport-engines: read after write by a 2^N-entry table of write numbers a port '
                          '(by a hash of the row) instead of fence classes (0)')

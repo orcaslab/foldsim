@@ -891,7 +891,7 @@ public:
   unsigned vmemStagger = 0;
   /// `vport-engines`: each page engine a static port (vp<p>_* ports);
   /// `vport-fence-shift`: its fence sample interval's log2.
-  bool vportEngines = false;
+  bool vportEngines = false, vportCopy = false;
   unsigned vportFS = 4, vportHz = 0;
   /// `port-plan-out`: a JSON file of every HBM member's request positions
   /// (each page engine member as placed, each class virtual memory's
@@ -1741,6 +1741,9 @@ private:
     /// streams it carries (their members after the columns).
     SmallVector<std::pair<unsigned, unsigned>> members;
     SmallVector<unsigned> streams;
+    /// `vport-copy`: the ring memories (among `members`) whose images it
+    /// keeps, members after the streams (rows {member, instance}).
+    SmallVector<std::pair<unsigned, unsigned>> images;
     /// Positions with a request: a read, a write (ii + 1 each).
     SmallVector<uint64_t> reads, writes;
     /// A member's tag bits (a column's instance-and-page, a stream's
@@ -1792,7 +1795,7 @@ private:
         n += x != 0;
       return n;
     }
-    unsigned count() const { return members.size() + streams.size(); }
+    unsigned count() const { return members.size() + streams.size() + images.size(); }
     /// `vport-engines`: a member's (index `m`, streams after the members)
     /// least positions from any of its writes to a later read (a read of a
     /// write-first member at a write's own position: 0; of a read-first
@@ -6000,8 +6003,20 @@ LogicalResult StaticFolder::assignPageEngines() {
         unsigned most = vm.delayed ? 0
                                    : std::min<unsigned>(cls.staggerMax,
                                                         unsigned(std::max(int(ii) - 1 - last, 0)));
+        // (`vport-copy`: a ring's prefetches, at its plan's positions, read
+        // its image on its port: free there too, and not at its own.)
+        SmallVector<unsigned> prefAt;
+        bool copyRing = vportEngines && vportCopy && vm.ring && cls.ring;
+        if (copyRing)
+          for (unsigned p = 0; p < ii; ++p)
+            if (cls.ring->prefValid[p])
+              prefAt.push_back(p);
         auto freeAt = [&](PageEngine &eng, unsigned d) {
-          return llvm::none_of(at, [&](unsigned q) { return eng.reads[q + d] || eng.writes[q + d]; });
+          if (llvm::any_of(at, [&](unsigned q) { return eng.reads[q + d] || eng.writes[q + d]; }))
+            return false;
+          return llvm::none_of(prefAt, [&](unsigned p) {
+            return eng.reads[p] || llvm::is_contained(at, unsigned((p + ii - d) % ii));
+          });
         };
         unsigned iw = vm.instWidth ? vm.instWidth
                                    : std::max(cls.threads() > 1
@@ -6029,6 +6044,13 @@ LogicalResult StaticFolder::assignPageEngines() {
         }
         if (e == pageEngines.size())
           d = most ? 1 : 0;
+        // (A ring whose prefetches fall at its own requests' positions cannot
+        // keep its image on its port: it keeps an image of its own.)
+        if (copyRing && e == pageEngines.size() &&
+            llvm::any_of(prefAt, [&](unsigned p) {
+              return llvm::is_contained(at, unsigned((p + ii - d) % ii));
+            }))
+          copyRing = false;
         if (e == pageEngines.size()) {
           if (e >= pageEngineCap)
             return netlist.emitError("page engines: ")
@@ -6043,6 +6065,21 @@ LogicalResult StaticFolder::assignPageEngines() {
         eng.mark();
         for (unsigned q : at)
           eng.reads[q + d] = eng.writes[q + d] = 1;
+        if (copyRing) {
+          if (getenv("FOLDSIM_COPY_LOG")) {
+            llvm::errs() << "copy: " << cls.name << ":" << vm.name << " engine " << e << " d " << d << " at";
+            for (unsigned q : at)
+              llvm::errs() << " " << q;
+            llvm::errs() << " pref";
+            for (unsigned p : prefAt)
+              llvm::errs() << " " << p;
+            llvm::errs() << "\n";
+          }
+          for (unsigned p : prefAt)
+            eng.reads[p] = 1;
+          eng.images.push_back({unsigned(c), unsigned(k)});
+          eng.instWidth = std::max(eng.instWidth, unsigned(llvm::Log2_32_Ceil(cls.ring->entries)));
+        }
         vm.delay = d;
         eng.delay = std::max(eng.delay, d);
         staggered += d > 0;
@@ -20280,6 +20317,11 @@ LogicalResult StaticFolder::buildSim() {
     return failure();
   if (failed(assignPageEngines()))
     return failure();
+  // `vport-copy`: each copy ring's (engine, image member index).
+  std::map<std::pair<unsigned, unsigned>, std::pair<unsigned, unsigned>> imageSlot;
+  for (auto [e, eng] : llvm::enumerate(pageEngines))
+    for (auto [j, ck] : llvm::enumerate(eng.images))
+      imageSlot[ck] = {unsigned(e), unsigned(eng.members.size() + eng.streams.size() + j)};
   // Each class virtual memory's, unless an engine carries it.
   std::map<std::pair<unsigned, unsigned>, unsigned> simOf;
   for (auto [c, cls] : llvm::enumerate(classes))
@@ -20372,7 +20414,8 @@ LogicalResult StaticFolder::buildSim() {
     uint64_t perLead = std::max<uint64_t>(1, ringLead() / 2);
     for (auto [c, cls] : llvm::enumerate(classes))
       for (auto [k, vm] : llvm::enumerate(cls.virtualMemories)) {
-        if (!vm.ring || !(simOf.count({unsigned(c), unsigned(k)}) ||
+        if (!vm.ring || imageSlot.count({unsigned(c), unsigned(k)}) ||
+            !(simOf.count({unsigned(c), unsigned(k)}) ||
                           pageEngineOf.count({unsigned(c), unsigned(k)})))
           continue;
         uint64_t load = std::max<uint64_t>({1, cls.ring->prefetches, cls.threads()});
@@ -21503,7 +21546,8 @@ LogicalResult StaticFolder::buildSim() {
     auto &plan = *cls.ring;
     auto &rb = ringBuilt[{c, k}];
     auto answer = vmAnswer(c, k);
-    auto &image = simVirtuals[imageOf.at({c, k})];
+    auto copySlot = imageSlot.find({c, k});
+    bool copy = copySlot != imageSlot.end();
     std::string prefix = vm.name + "_ring";
     unsigned idxWidth = llvm::Log2_32_Ceil(cls.threads());
     unsigned iw = std::max(idxWidth, 1u);
@@ -21560,9 +21604,24 @@ LogicalResult StaticFolder::buildSim() {
     rb.pinst0 = ctl.pinst0;
     rb.pentry0 = ctl.pentry0;
     Value uentry2 = ctl.uentry2, skip2 = ctl.skip2, last0 = ctl.last0, uentry0 = ctl.uentry0;
-    Value irspValid = body->getArgument(image.firstInput);
+    Value irspValid, irspEntry, irspData;
+    if (copy) {
+      // (`vport-copy`: its port's answers to its image member: {member,
+      // entry} tags.)
+      auto [e, m] = copySlot->second;
+      auto &eng = pageEngines[e];
+      auto &v = simVirtuals[engineSim[e]];
+      Value tag = b.createOrFold<comb::ExtractOp>(b.getIntegerType(eng.tagBits()), vin(v, 1), 1);
+      irspValid = comb::AndOp::create(
+          b, vin(v, 0),
+          eq(b.createOrFold<comb::ExtractOp>(b.getIntegerType(eng.memberBits()), tag, eng.instWidth), m));
+      irspEntry = b.createOrFold<comb::ExtractOp>(b.getIntegerType(eb), tag, 0);
+      irspData = b.createOrFold<comb::ExtractOp>(b.getIntegerType(vm.dataWidth), vin(v, 2), 0);
+    } else {
+    auto &image = simVirtuals[imageOf.at({c, k})];
+    irspValid = body->getArgument(image.firstInput);
     Value irspTag = body->getArgument(image.firstInput + 1);
-    Value irspEntry = b.createOrFold<comb::ExtractOp>(b.getIntegerType(eb), irspTag, 1);
+    irspEntry = b.createOrFold<comb::ExtractOp>(b.getIntegerType(eb), irspTag, 1);
     // (A shared image: the answers of this ring's reads, by the tag's ring.)
     unsigned img = imageOf.at({c, k});
     if (unsigned kb = memberBits(img))
@@ -21572,8 +21631,9 @@ LogicalResult StaticFolder::buildSim() {
                                b.createOrFold<comb::ExtractOp>(b.getIntegerType(kb), irspTag,
                                                                1 + imageEntryBits.at(img)),
                                constant(kb, ringIndex.at({c, k}))));
-    Value irspData = b.createOrFold<comb::ExtractOp>(
+    irspData = b.createOrFold<comb::ExtractOp>(
         b.getIntegerType(vm.dataWidth), body->getArgument(image.firstInput + 2), 0);
+    }
     // (Read combinationally and registered here: the register's synchronous
     // reset is the skip, so a use whose prefetch would have come before the
     // first frame reads zero with no select on the data (the flop's reset
@@ -24933,7 +24993,7 @@ LogicalResult StaticFolder::buildSim() {
       std::map<std::pair<void *, unsigned>, SmallVector<unsigned>> byKey;
       SmallVector<std::pair<void *, unsigned>> keyOrder;
       for (auto [k, vm] : llvm::enumerate(cls.virtualMemories))
-        if (vm.ring && ringBuilt.count({c, unsigned(k)})) {
+        if (vm.ring && ringBuilt.count({c, unsigned(k)}) && !imageSlot.count({c, unsigned(k)})) {
           auto [root, depth] = issueKey(out.getOperand(vm.firstOutput + 1));
           std::pair<void *, unsigned> key{root.getAsOpaquePointer(), depth};
           if (!byKey.count(key))
@@ -25151,6 +25211,23 @@ LogicalResult StaticFolder::buildSim() {
           // image row written), a use for its entry (VmemRings.h).
           auto &plan = *cls.ring;
           auto &rb = ringBuilt.at({unsigned(c), unsigned(&vm - cls.virtualMemories.data())});
+          if (imageSlot.count({unsigned(c), unsigned(&vm - cls.virtualMemories.data())})) {
+            // `vport-copy`: the port orders a prefetch after the copies
+            // before it (no table of reads in flight, no queue): a use waits
+            // for its entry alone.
+            unsigned eb = llvm::Log2_32_Ceil(plan.entries);
+            Value uv = atNext(plan.useValid, 1);
+            Value entry = atNext(plan.useEntry, eb);
+            Value seen = comb::OrOp::create(b, rb.seen, eq(posD, ii - 1));
+            Value skip = comb::AndOp::create(b, atNext(plan.useCross, 1), notOf(seen));
+            Value landed = b.createOrFold<comb::ExtractOp>(
+                i1,
+                comb::ShrUOp::create(b, rb.landed,
+                                     b.createOrFold<comb::ConcatOp>(constant(plan.entries - eb, 0), entry)),
+                0);
+            terms.push_back(comb::OrOp::create(b, ValueRange{notOf(uv), skip, landed}, false));
+            continue;
+          }
           // The reads in flight: a table of kRingReads entries, each a read's
           // instance, set at its issue (the first free entry) and cleared as
           // its answer's image write leaves (below). Its room: the decisions
@@ -25594,9 +25671,9 @@ LogicalResult StaticFolder::buildSim() {
       // (`vport-engines`: the port's read and write room, each.)
       if (v.vport) {
         for (unsigned j : {6u, 7u})
-          terms.push_back(comb::ICmpOp::create(b, comb::ICmpPredicate::uge,
-                                               body->getArgument(v.firstInput + j),
-                                               constant(16, room)));
+          terms.push_back(comb::ICmpOp::create(
+              b, comb::ICmpPredicate::uge, body->getArgument(v.firstInput + j),
+              constant(16, j == 7 && !pageEngines[v.k].images.empty() ? 2 * room : room)));
         continue;
       }
       terms.push_back(comb::ICmpOp::create(
@@ -25735,6 +25812,9 @@ LogicalResult StaticFolder::buildSim() {
                          : b.createOrFold<comb::ConcatOp>(constant(w - have, 0), x);
       };
       SmallVector<Value> rdValid, rdInst, rdRow, wrValid, wrInst, wrRow, wrData, wrMask;
+      // `vport-copy`: the copy rings' reads (copied into their image rows,
+      // {image member, instance}) and their images' prefetches.
+      SmallVector<Value> copyV, copyRow, prefV;
       for (auto [m, member] : llvm::enumerate(eng.members)) {
         auto [c, k] = member;
         auto &vm = classes[c].virtualMemories[k];
@@ -25814,6 +25894,12 @@ LogicalResult StaticFolder::buildSim() {
         rdInst.push_back(when(rv, b.createOrFold<comb::ConcatOp>(
                                       tagOf(out(1)), constant(1, 0))));
         rdRow.push_back(when(rv, rowOf(out(1), out(2))));
+        if (auto slot = imageSlot.find({c, k}); slot != imageSlot.end()) {
+          copyV.push_back(rv);
+          copyRow.push_back(when(rv, b.createOrFold<comb::ConcatOp>(
+                                         constant(eng.memberBits(), slot->second.second),
+                                         zext(out(1), eng.addrWidth))));
+        }
         wrInst.push_back(when(wv, b.createOrFold<comb::ConcatOp>(
                                       tagOf(out(4)), constant(1, 0))));
         wrRow.push_back(when(wv, rowOf(out(4), out(5))));
@@ -25878,6 +25964,24 @@ LogicalResult StaticFolder::buildSim() {
                      : zeroed    ? outs[7]
                                  : when(wv, outs[7]);
         wrMask.push_back(zext(mask, dw / 8));
+      }
+      // Its images' prefetches: a read of the instance's image row, tagged
+      // {image member, entry}.
+      unsigned membersAndStreams = rdValid.size();
+      for (auto [j, ck] : llvm::enumerate(eng.images)) {
+        auto &rb = ringBuilt.at(ck);
+        unsigned mi = eng.members.size() + eng.streams.size() + unsigned(j);
+        auto when = [&](Value valid, Value x) -> Value {
+          return comb::MuxOp::create(b, valid, x, constant(hw::getBitWidth(x.getType()), 0));
+        };
+        Value pv = rb.pref0;
+        prefV.push_back(pv);
+        rdValid.push_back(pv);
+        rdInst.push_back(when(pv, b.createOrFold<comb::ConcatOp>(ValueRange{
+                                      constant(eng.memberBits(), mi), zext(rb.pentry0, eng.instWidth),
+                                      constant(1, 0)})));
+        rdRow.push_back(when(pv, b.createOrFold<comb::ConcatOp>(constant(eng.memberBits(), mi),
+                                                                 zext(rb.pinst0, eng.addrWidth))));
       }
       auto any = [&](SmallVector<Value> &xs) -> Value {
         return xs.size() == 1 ? xs[0] : Value(comb::OrOp::create(b, xs, false));
@@ -25945,7 +26049,11 @@ LogicalResult StaticFolder::buildSim() {
           auto &mvm = classes[eng.members[m].first].virtualMemories[eng.members[m].second];
           return mvm.pages ? true : mvm.readFirst;
         };
-        for (unsigned m = 0; m < rdValid.size(); ++m) {
+        // (An image's prefetch: rows the simulator never writes, ordered
+        // after the copies by rd_after: the last class.)
+        for (unsigned m = membersAndStreams; m < rdValid.size(); ++m)
+          fence.push_back(comb::MuxOp::create(b, rdValid[m], constant(4, 15), constant(4, 0)));
+        for (unsigned m = 0; m < membersAndStreams; ++m) {
           bool rf = readFirstOf(m);
           unsigned least = eng.leastWriteToRead(m, ii, rf);
           unsigned cls = 0;
@@ -25977,8 +26085,9 @@ LogicalResult StaticFolder::buildSim() {
             wlen.push_back(comb::MuxOp::create(b, wrValid[m], constant(lrw, mb - 1), constant(lrw, 0)));
         }
         results.append({any(rdValid), addrOf(any(rdRow)), constant(lrw, beats - 1), any(rdInst),
-                        orOr(fence, 4), orOr(fresh, 1), constant(1, 0), constant(ow, 0),
-                        constant(1, 0), constant(16, 0), any(wrValid), addrOf(any(wrRow)),
+                        orOr(fence, 4), orOr(fresh, 1), orOr(copyV, 1),
+                        copyRow.empty() ? constant(ow, 0) : addrOf(any(copyRow)),
+                        orOr(prefV, 1), constant(16, 0), any(wrValid), addrOf(any(wrRow)),
                         orOr(wlen, lrw), orOr(pair, 1), zext(any(wrData), vportDW(eng)),
                         zext(any(wrMask), vportDW(eng) / 8)});
         continue;
@@ -26059,7 +26168,8 @@ LogicalResult StaticFolder::buildSim() {
         unsigned beats = vportBeats(eng), ow = vportOW(eng);
         vports.push_back(b.getStringAttr(
             Twine(vportDW(eng)) + ":" + Twine(vportDW(eng) / 8) + ":" + Twine(eng.tagBits() + 1) + ":" +
-            Twine(ow) + ":" + Twine(beats) + ":0:0:" + Twine(vportHz) + ":" +
+            Twine(ow) + ":" + Twine(beats) + ":" + Twine(eng.images.empty() ? 0 : 1) + ":0:" +
+            Twine(vportHz) + ":" +
             Twine(uint64_t(64) << ow) + ":1:" + Twine(vportFS ? vportFS : 8) + ":" +
             Twine(llvm::Log2_32(vportStride(eng)))));
         continue;
@@ -26778,6 +26888,7 @@ void FoldStaticPass::runOnOperation() {
   folder.vportEngines = vportEngines;
   folder.vportFS = vportFenceShift;
   folder.vportHz = vportHz;
+  folder.vportCopy = vportCopy;
   folder.vmemRingLead = vmemRings;
   folder.foldRingLead = foldStoreRings;
   folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));

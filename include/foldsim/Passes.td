@@ -425,6 +425,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "class a member (vport-fence-shift), from the schedule's least "
            "distance from any write of the member to a later read; read-first "
            "members' writes wait for the reads before them (wr_pair)">,
+    Option<"vportCopy", "vport-copy", "bool", "false",
+           "With vport-engines and vmem-rings: a ring memory's image in its "
+           "port's region (rows {image member, instance}), its reads copied "
+           "into the image row by the port (rd_copy: answered with rsp_copied, "
+           "no data), the ring's prefetches reads of the image at their "
+           "positions on that port after every earlier copy (rd_after); no "
+           "image controller, answer queue, table of reads in flight or "
+           "prefetch queue. A ring's prefetch positions taken on its port">,
     Option<"vportHz", "vport-hz", "unsigned", "0",
            "With vport-engines: read after write by each port's table of "
            "write numbers by a hash of the row (2^N entries; the fences "
