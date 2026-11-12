@@ -319,7 +319,10 @@ module foldsim_vport #(
     wire           w_pair_ok = !g_pair || (g_ep != epoch) || ($signed(r_done - g_rcnt) >= 0);
     wire           w_room  = (w_aw - w_done) < CW'(WRITES_OUT);
     wire           wq_any  = wq_head != wq_tail;
-    wire           aw_go   = g_valid && !w_busy && !fill_w && w_pair_ok && w_room && (!m_awvalid || m_awready);
+    // (The next row's AW goes out in the cycle the current row's last beat
+    // leaves: rows back to back, a beat a cycle.)
+    wire           w_last_now = w_busy && (!m_wvalid || m_wready) && (w_beat == w_len);
+    wire           aw_go   = g_valid && (!w_busy || w_last_now) && !fill_w && w_pair_ok && w_room && (!m_awvalid || m_awready);
     wire           g_load  = wq_any && (!g_valid || aw_go);
     wire           w_step  = w_busy && (!m_wvalid || m_wready);
     wire           w_end   = w_step && (w_beat == w_len);
@@ -421,8 +424,8 @@ module foldsim_vport #(
             m_wdata  <= beat_d;
             m_wstrb  <= beat_s;
             m_wlast  <= (w_beat == w_len);
-            w_beat   <= w_beat + 1'b1;
-            if (w_end) w_busy <= 1'b0;
+            w_beat   <= w_end ? '0 : w_beat + 1'b1;
+            if (w_end && !aw_go) w_busy <= 1'b0;
         end else if (fill_w && (!m_wvalid || m_wready)) begin
             m_wvalid  <= 1'b1;
             m_wdata   <= '0;
