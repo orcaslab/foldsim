@@ -1,0 +1,26 @@
+# REQUIRES: verilator
+# The kernel's static port (shell/rtl/foldsim_vport.sv) alone, against
+# Inputs/tb_vport.sv: a memory that applies a write at its B and reads rows at
+# AR (one id, in order), so a read that reached AR before the B of an earlier
+# write of its row would answer the old row; answers checked against a
+# reference RAM. Reads carry fence class 0 (every earlier write) or (+far)
+# class 2 for rows not written within that distance; read-first pairs (the
+# write waits for the reads taken up to its cycle). HBM latency 1 to 600 host
+# cycles, channels stalled at random, resets with requests in flight (no
+# pre-reset answer delivered, memory zero-filled before room returns); rows of
+# three beats, one beat and 64 bits.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=1040 -GCYCLES=12000 -Mdir %t/wide %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/wide.log 2>&1
+# RUN: %t/wide/Vtb +verilator+seed+1 +hi=1 | FileCheck %s
+# RUN: %t/wide/Vtb +verilator+seed+2 +hi=600 +stall=30 | FileCheck %s
+# RUN: %t/wide/Vtb +verilator+seed+3 +hi=60 +stall=20 +resets=3 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=512 -GCYCLES=12000 -Mdir %t/beat %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/beat.log 2>&1
+# RUN: %t/beat/Vtb +verilator+seed+4 +hi=100 +far=1 | FileCheck %s
+# RUN: %t/beat/Vtb +verilator+seed+5 +hi=600 +resets=4 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique -DSIMULATION --top-module tb -GDW=64 -GCYCLES=12000 -Mdir %t/narrow %S/Inputs/tb_vport.sv %S/../../shell/rtl/foldsim_vport.sv > %t/narrow.log 2>&1
+# RUN: %t/narrow/Vtb +verilator+seed+6 +hi=20 +far=1 +stall=30 | FileCheck %s
+# RUN: %t/narrow/Vtb +verilator+seed+7 +hi=600 +stall=10 +resets=2 | FileCheck %s
+# CHECK-NOT: FAIL
+# CHECK-NOT: %Error
+# CHECK: {{[0-9]+}} reads ({{[0-9]+}} answered), {{[0-9]+}} writes
+# CHECK: PASS
