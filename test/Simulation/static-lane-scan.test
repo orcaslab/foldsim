@@ -39,4 +39,4 @@
 
 # SCHED: Top_lane_Leaf x8
 
-# CHECK: MATCH
+# CHECK: {{^}}MATCH

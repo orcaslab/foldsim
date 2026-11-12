@@ -30,4 +30,4 @@
 # TOP-COUNT-8: hw.instance "lane_Leaf_{{[0-7]}}" @Top_lane_Leaf(
 # TOP: hw.output
 
-# CHECK: MATCH
+# CHECK: {{^}}MATCH

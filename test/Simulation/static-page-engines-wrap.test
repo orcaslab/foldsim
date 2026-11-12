@@ -33,6 +33,6 @@
 # SLOTS: Mid x4 state gap {{[0-9]+}} page 1 off chip
 # SLOTS-NEXT: state: 0 13 26 39
 # CHECK-NOT: PROTOCOL
-# CHECK: MATCH
+# CHECK: {{^}}MATCH
 # MUT: MISMATCH
 # CAP: page engines: 2 engines cannot carry the page columns of Mid
