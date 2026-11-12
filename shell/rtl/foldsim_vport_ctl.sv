@@ -197,7 +197,7 @@ module foldsim_vport_ctl #(
     localparam KZ    = (KNOWN_ZERO != 0) ? 1 : 0;
     localparam NBLK  = 1 << KZB;
     reg            kz_bits [NBLK];
-    reg            kz_hit;                   // the q read's block untouched
+    reg            kz_hit;                   // the q2 read's block untouched
     reg            q2_rd, q2_new, q2_wr, q2_pair;
     reg  [OW-1:0]  q2_waddr;
     reg  [DW-1:0]  q2_wdata;
@@ -206,14 +206,22 @@ module foldsim_vport_ctl #(
     reg  [IT-1:0]  q2_rtag;
     reg  [KZB:0]   kz_sweep;                 // blocks left to clear (+1: busy)
     wire           sweeping = (KZ != 0) && kz_sweep != 0;
+    // (The bit memory in the plain form of a RAM -- one write port, one
+    // registered read -- so tools take it as one: an array of registers
+    // with a read mux of 2^KZB inputs is not.)
+    wire           kz_we = (KZ != 0) && (sweeping || q_wr);
+    wire [KZB-1:0] kz_wa = sweeping ? KZB'(kz_sweep - 1'b1) : q_wblk;
+    reg            kz_rd;
     always @(posedge clk) begin
-        if (KZ != 0) begin
-            kz_hit <= !kz_bits[q_rblk] && !(q_wr && q_wblk == q_rblk && RDW_READ_FIRST == 0);
-            if (sweeping)
-                kz_bits[KZB'(kz_sweep - 1'b1)] <= 1'b0;
-            else if (q_wr)
-                kz_bits[q_wblk] <= 1'b1;
-        end
+        if (kz_we)
+            kz_bits[kz_wa] <= !sweeping;
+        kz_rd <= kz_bits[q_rblk];
+    end
+    reg            kz_same;                  // a write-first pair's write of the block
+    always @(posedge clk)
+        kz_same <= q_wr && q_wblk == q_rblk && RDW_READ_FIRST == 0;
+    always @* kz_hit = (KZ != 0) && !kz_rd && !kz_same;
+    always @(posedge clk) begin
         q2_rd    <= q_rd;
         q2_new   <= q_pair && (RDW_READ_FIRST == 0);
         q2_wr    <= q_wr;
@@ -338,7 +346,8 @@ module foldsim_vport_ctl #(
         q2_rd = 1'b0;
         q2_wr = 1'b0;
         kz_sweep = '0;
-        kz_hit = 1'b0;
+        kz_rd = 1'b1;
+        kz_same = 1'b0;
         zq_head = '0;
         zq_tail = '0;
         mid_row = 1'b0;
