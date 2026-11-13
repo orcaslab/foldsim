@@ -653,6 +653,34 @@ def floorplan_copies(path):
     return {c: w for c, w in re.findall(r'-hierarchical (\w+)_copy\]\s*\n[^\n]*USER_SLR_ASSIGNMENT (SLR\d+) \$c', sec)}
 
 
+VMEM_FLOORPLAN_MARK = '(vmem_ports.py --floorplan)'
+
+
+def floorplan_vmem(path):
+    """The virtual-memory controllers and their masters' shares the floorplan pins by SLR group (flow/v80/
+    vmem_ports.py --floorplan: its section's marker line, then one USER_SLR_ASSIGNMENT a cell): {'ctrls': {controller
+    name as vmem_controllers names it (G<g> a group's, <k> a memory's, P<p> a static port's): SLR}, 'masters': [the
+    SLR of each pinned master's share]}, the SLRs as named (fs_slr<g>: the placer's choice), or None without it."""
+    if not path or not os.path.exists(path):
+        return None
+    text = open(path).read()
+    at = text.find(VMEM_FLOORPLAN_MARK)
+    if at < 0:
+        return None
+    ctrls, masters = {}, []
+    for pat, where in re.findall(r'-regexp \{([^}]*)\}\]\s*\n[^\n]*USER_SLR_ASSIGNMENT (\S+) \$c', text[at:]):
+        for rx, name in ((r'\.\*/g_vg(\d+)\[\./\]', 'G{}'), (r'\.\*/\(vmem\|vport\)_(\d+)\$', '{}'),
+                         (r'\.\*/vport(\d+)\$', 'P{}')):
+            mm = re.match(rx, pat)
+            if mm:
+                ctrls[name.format(mm.group(1))] = where
+                break
+        else:
+            if re.match(r'\.\*/g_vmem_master\\\[\d+\\\]', pat):
+                masters.append(where)
+    return dict(ctrls=ctrls, masters=masters)
+
+
 def floorplan_groups(path, stext):
     """The compiler's own SLR groups as the implementation gets them (foldsim --slr-groups): each foldsim_slr<g> the
     floorplan (foldsim_floorplan.tcl, the file pre_opt_hook.tcl applies) pins whole, by SLR name (--slr-region) or
@@ -678,8 +706,9 @@ def floorplan_groups(path, stext):
 # slr: each controller in its members' SLR (page engines of one SLR group: foldsim --vmem-slr-groups), the
 # controllers of an SLR sharing that SLR's masters (foldsim_vmem_share placed with them), so only the masters cross:
 # the binding's HBM ports (noc ports reaching HBM, or --vmem-masters) split over the SLRs by the controllers' port
-# bits, at least one an SLR with controllers.
-VMEM_ENGINES = ('placer', 'auto', 'nmu', 'local', 'flat', 'slr')
+# bits, at least one an SLR with controllers. A floorplan with vmem_ports.py --floorplan's section (the image's, the
+# controllers and the masters' shares pinned in their SLR groups) is slr mode by default, with its pins as given.
+VMEM_ENGINES =('placer', 'auto', 'nmu', 'local', 'flat', 'slr')
 
 
 def slr_masters(weights, total):
@@ -703,7 +732,7 @@ def slr_masters(weights, total):
     return out
 
 
-def vmem_slls(ctrls, shares, top_spread, names, noc, mode, masters=0):
+def vmem_slls(ctrls, shares, top_spread, names, noc, mode, masters=0, pinned=None):
     """Each boundary's SLLs of the virtual-memory wiring with the controllers
     placed by `mode` (--vmem-engines), and each controller's placement.
 
@@ -717,7 +746,10 @@ def vmem_slls(ctrls, shares, top_spread, names, noc, mode, masters=0):
     crossing a boundary takes `sll_per_port_bit` SLLs, a master's
     `sll_per_master_bit` (fit on y8r1di's placed controllers, 11-11: see the
     region's noc `about`). Only the bits that cross a boundary are charged to
-    it. Returns ([SLLs per boundary], [{name, cls, slr, slls}])."""
+    it. With `pinned` (slr mode: floorplan_vmem, the floorplan's own pins),
+    each pinned controller in its SLR and (without `masters`) the masters as
+    pinned, their count per SLR, as given; the others as slr mode places them. Returns ([SLLs
+    per boundary], [{name, cls, slr, slls}])."""
     n = len(names)
     at = {nm: i for i, nm in enumerate(names)}
     hbm = sorted({at[p['slr']] for p in noc.get('ports', []) if 'HBM' in p.get('targets', ()) and p.get('slr') in at})
@@ -750,6 +782,8 @@ def vmem_slls(ctrls, shares, top_spread, names, noc, mode, masters=0):
             return x
         if mode == 'slr':
             g = max(range(n), key=lambda i: (dist[i], -i))
+            if pinned and pinned['ctrls'].get(c['name']) in at:
+                g = at[pinned['ctrls'][c['name']]]
             x = [0.0] * (n - 1)
             for i, f in enumerate(dist):
                 for b in range(min(i, g), max(i, g)):
@@ -770,6 +804,8 @@ def vmem_slls(ctrls, shares, top_spread, names, noc, mode, masters=0):
         weights = [sum(r['port_bits'] for r in rows if r['slr'] == nm) for nm in names]
         total = masters or sum(1 for p in noc.get('ports', []) if 'HBM' in p.get('targets', ()))
         ms = slr_masters(weights, total)
+        if not masters and pinned and pinned['masters'] and all(w in at for w in pinned['masters']):
+            ms = [sum(1 for w in pinned['masters'] if w == nm) for nm in names]
         for i, m in enumerate(ms):
             h = near(i)
             for b in range(min(i, h), max(i, h)):
@@ -852,14 +888,16 @@ def main():
     ap.add_argument('--vmem-masters', type=int, default=0,
                     help='with --vmem-engines slr: the controllers\' masters in all (default: the region\'s NoC '
                          'ports that reach HBM), split over the SLRs by their controllers\' port bits')
-    ap.add_argument('--vmem-engines', choices=VMEM_ENGINES, default='placer',
+    ap.add_argument('--vmem-engines', choices=VMEM_ENGINES, default=None,
                     help='the virtual-memory controllers\' SLLs, placed against the region\'s memory NMUs (its '
                          '`noc` section, flow/v80/noc_ports.py), only the wire bits that cross a boundary charged '
                          'to it: placer (default) and auto, each controller where it crosses the fewest (the '
                          'placer\'s choice on y8r1di); nmu, at its HBM NMU (its ports cross); local, with its '
                          'copies (its master crosses); flat, the 11-07 fitted term (sll_per_vmem_bit x every port '
                          'bit at every boundary); slr, each in its members\' SLR (page engines of one SLR group, '
-                         'foldsim --vmem-slr-groups) on its SLR\'s shared masters, only the masters crossing')
+                         'foldsim --vmem-slr-groups) on its SLR\'s shared masters, only the masters crossing. '
+                         'Default: slr when the floorplan pins the controllers and their masters\' shares by SLR group '
+                         '(flow/v80/vmem_ports.py --floorplan\'s section: those pins as given), else placer')
     a = ap.parse_args()
     gen = os.path.abspath(a.gen.rstrip('/'))
     gdir = os.path.join(gen, 'gen') if os.path.isdir(os.path.join(gen, 'gen')) else gen
@@ -958,6 +996,12 @@ def main():
     # (y64c2, 11-12: the check's full-region assignment moved VX_opc_unit to SLR2, URAM 125 %, where the sim-only one,
     # pinned, keeps it in SLR1).
     pins = floorplan_copies(fpath) if fpg is None else None
+    # The virtual-memory controllers and their masters' shares the floorplan pins by SLR group (vmem_ports.py
+    # --floorplan, as an image appends it): slr mode by default, those pins as given (y64c2, 11-12: the fit gate placed
+    # every static port in SLR2 by the placer default, 29,540 SLLs, where the image pins them in their groups: 16,004).
+    vpins = floorplan_vmem(fpath)
+    if a.vmem_engines is None:
+        a.vmem_engines = 'slr' if vpins is not None else 'placer'
     ii, classes, _ = foldsim_degree.parse_schedule(stext)
     info = foldsim_degree.parse_classes(stext)
 
@@ -1255,9 +1299,15 @@ def main():
                 vm = None
                 if a.vmem_engines != 'flat' and 'noc' in region:
                     vm, vmem_rows = vmem_slls(vmem_controllers(gdir, stext), shares, top_spread, names,
-                                              region['noc'], a.vmem_engines, a.vmem_masters)
+                                              region['noc'], a.vmem_engines, a.vmem_masters,
+                                              vpins if a.vmem_engines == 'slr' else None)
                     mrow = [r for r in vmem_rows if r['name'] == 'masters' and not r['cls']]
                     vmem_rows = [r for r in vmem_rows if r not in mrow]
+                    if vpins is not None:
+                        lines.append(f'  virtual memories pinned by the floorplan {fpath} (vmem_ports.py --floorplan): '
+                                     f'{len(vpins["ctrls"])} controllers, {len(vpins["masters"])} master shares'
+                                     + ('' if a.vmem_engines == 'slr' else
+                                        f'; NOT as given: --vmem-engines {a.vmem_engines}'))
                     if mrow:
                         lines.append('  virtual-memory masters per SLR (--vmem-engines slr, shared in their SLR): '
                                      + ', '.join(f'{k} {v}' for k, v in mrow[0]['masters'].items()))

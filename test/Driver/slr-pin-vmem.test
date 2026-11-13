@@ -1,0 +1,43 @@
+# The SLL check takes the virtual-memory controllers and their masters' shares as the floorplan pins them: a floorplan
+# with flow/v80/vmem_ports.py --floorplan's section (an image appends it: each controller and each master's
+# foldsim_vmem_share in its SLR group's SLR) is --vmem-engines slr by default, with those pins as given (each pinned
+# controller in its SLR, the masters as pinned per SLR); without it, the default stays placer. An explicit
+# --vmem-engines wins, and the report says it is not the floorplan's. (y64c2, 11-12: the fit gate ran the check in
+# placer mode, every static port in SLR2, 29,540 SLLs, on an image floorplan that pins them in their groups.)
+# Two leaves' copies in SLR groups 0 and 1 (six controllers, three a group), two masters (one a group).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/vmem_multi
+# RUN: foldsim --srcs top.f --top Top --out %t/g --static --virtual-memories 'Leaf:.*' --vmem-group copy --copies Leaf:2 --vmem-slr-groups Leaf:0,Leaf_copy1:1 Leaf 2> %t/g.log
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %t/g/foldsim_sim.vh --mem-ports 1 --vmem-masters 2 --floorplan > %t/vm.tcl
+# RUN: python3 %foldsim_tools/foldsim_pin_copies.py %t/g --assignment Leaf:SLR2,Leaf_copy1:SLR1,Top_model:SLR1 -o %t/pins.tcl
+# RUN: cat %t/vm.tcl %t/pins.tcl > %t/fp.tcl
+# Copies pinned, the controllers not: placer (the default unchanged).
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --foldsim-opt foldsim-opt --floorplan %t/pins.tcl --out %t/c0 | FileCheck %s --check-prefix=PINS
+# PINS: as pinned: 3 of 3 copies by the floorplan
+# PINS-NOT: pinned by the floorplan
+# PINS-NOT: masters per SLR
+# PINS: virtual memories (--vmem-engines placer): 6 controllers, SLR2 6
+# The image's floorplan (controllers and copies pinned): slr by itself, the pins as given.
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --foldsim-opt foldsim-opt --floorplan %t/fp.tcl --out %t/c1 | FileCheck %s --check-prefix=FP
+# FP: as pinned: 3 of 3 copies by the floorplan
+# FP: virtual memories pinned by the floorplan {{.*}}fp.tcl (vmem_ports.py --floorplan): 6 controllers, 2 master shares{{$}}
+# FP-NEXT: virtual-memory masters per SLR (--vmem-engines slr, shared in their SLR): SLR2 1, SLR1 1, SLR0 0
+# FP: virtual memories (--vmem-engines slr): 6 controllers, SLR1 3, SLR2 3
+# FP: boundary SLR2-SLR1: 1,793 SLLs projected
+# FP: boundary SLR1-SLR0: 500 SLLs projected
+# FP: g: OK
+# As given, not the check's own choice: the second group's controllers and its master pinned to SLR0 (where none of
+# their copies are) are priced there.
+# RUN: sed -e '/g_vg[345]\[/{n;s/SLR1/SLR0/}' -e '/g_vmem_master\\\[1\\\]/{n;s/SLR1/SLR0/}' %t/fp.tcl > %t/far.tcl
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --foldsim-opt foldsim-opt --floorplan %t/far.tcl --out %t/c2 | FileCheck %s --check-prefix=FAR
+# FAR: virtual-memory masters per SLR (--vmem-engines slr, shared in their SLR): SLR2 1, SLR1 0, SLR0 1
+# FAR: virtual memories (--vmem-engines slr): 6 controllers, SLR0 3, SLR2 3
+# The masters as pinned, not the check's split by port bits: the second group's master alone moved to SLR0.
+# RUN: sed -e '/g_vmem_master\\\[1\\\]/{n;s/SLR1/SLR0/}' %t/fp.tcl > %t/mst.tcl
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --foldsim-opt foldsim-opt --floorplan %t/mst.tcl --out %t/c4 | FileCheck %s --check-prefix=MST
+# MST: virtual-memory masters per SLR (--vmem-engines slr, shared in their SLR): SLR2 1, SLR1 0, SLR0 1
+# MST: virtual memories (--vmem-engines slr): 6 controllers, SLR1 3, SLR2 3
+# An explicit --vmem-engines wins and says so.
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --foldsim-opt foldsim-opt --floorplan %t/fp.tcl --vmem-engines placer --out %t/c3 | FileCheck %s --check-prefix=EXP
+# EXP: 6 controllers, 2 master shares; NOT as given: --vmem-engines placer
+# EXP-NOT: masters per SLR
+# EXP: virtual memories (--vmem-engines placer): 6 controllers, SLR2 6
