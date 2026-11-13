@@ -1,0 +1,34 @@
+# The SLL check judges class copies pinned one by one (foldsim_pin_copies.py's '# foldsim pinned copies' section of
+# the floorplan) as given, instead of assigning them itself: each SLR within its room at the placement fill, the links
+# and the virtual memories as placed by the pins. (y64c2, 11-12: the check's own full-region assignment moved
+# VX_opc_unit into SLR2, URAM 125 %, while the image would be held to the sim-only one.) Three leaves on two SLRs of
+# 100 LUTs (fill 75 %): the check's own assignment fits; all four copies pinned to SLR1 is past its room (REFUSE);
+# a balanced pin fits with its own links over the boundary; a partial pin leaves the rest to the check.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/three
+# RUN: foldsim --srcs top.f --top Top --out %t/g --static --copies Leaf:3 Leaf 2> %t/g.log
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --slr-region %S/Inputs/slr-copy-cap/region-pin.json --foldsim-opt foldsim-opt --copy-cap none --out %t/c0 | FileCheck %s --check-prefix=OWN
+# OWN-NOT: as pinned
+# OWN: g: OK
+# RUN: python3 %foldsim_tools/foldsim_pin_copies.py %t/g --assignment Leaf:SLR1,Leaf_copy1:SLR1,Leaf_copy2:SLR1,Top_model:SLR1 -o %t/all1.tcl
+# RUN: not python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --floorplan %t/all1.tcl --slr-region %S/Inputs/slr-copy-cap/region-pin.json --foldsim-opt foldsim-opt --copy-cap none --out %t/c1 | FileCheck %s --check-prefix=ALL1
+# ALL1: as pinned: 4 of 4 copies by the floorplan {{.*}}all1.tcl
+# ALL1-NEXT: SLR1: lut 48, uram 0, bram 0: Leaf Leaf_copy1 Leaf_copy2 Top_model
+# ALL1-NEXT: SLR0: lut 0, uram 0, bram 0:
+# ALL1: SLR1 as placed: lut 81 (81 %)
+# ALL1: g: REFUSE: the pinned copies past their SLRs' room: SLR1 lut
+# RUN: python3 %foldsim_tools/foldsim_pin_copies.py %t/g --assignment Leaf:SLR1,Top_model:SLR1,Leaf_copy1:SLR0,Leaf_copy2:SLR0 -o %t/bal.tcl
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --floorplan %t/bal.tcl --slr-region %S/Inputs/slr-copy-cap/region-pin.json --foldsim-opt foldsim-opt --copy-cap none --out %t/c2 --json %t/c2.json | FileCheck %s --check-prefix=BAL
+# BAL: SLR1: lut 16, uram 0, bram 0: Leaf Top_model
+# BAL-NEXT: SLR0: lut 32, uram 0, bram 0: Leaf_copy1 Leaf_copy2
+# BAL: boundary SLR1-SLR0: 9 SLLs projected (links 8,
+# BAL: g: OK
+# RUN: python3 -c "import json; print(';'.join(','.join(g) for g in json.load(open('%t/c2.json'))['assignment']))" | FileCheck %s --check-prefix=BJ
+# BJ: {{^}}Leaf,Top_model;Leaf_copy1,Leaf_copy2{{$}}
+# RUN: python3 %foldsim_tools/foldsim_pin_copies.py %t/g --assignment Leaf:SLR1 --partial -o %t/part.tcl
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --floorplan %t/part.tcl --slr-region %S/Inputs/slr-copy-cap/region-pin.json --foldsim-opt foldsim-opt --copy-cap none --out %t/c3 | FileCheck %s --check-prefix=PART
+# PART: as pinned: 1 of 4 copies by the floorplan {{.*}}part.tcl, the other 3 as the check assigns them
+# PART: g: OK
+# A pin to an SLR the region does not name:
+# RUN: sed 's/SLR0/SLR7/' %t/bal.tcl > %t/bad.tcl
+# RUN: not python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --floorplan %t/bad.tcl --slr-region %S/Inputs/slr-copy-cap/region-pin.json --foldsim-opt foldsim-opt --copy-cap none --out %t/c4 | FileCheck %s --check-prefix=BAD
+# BAD: REFUSE: the floorplan {{.*}}bad.tcl pins copies to SLRs the region does not name: SLR7

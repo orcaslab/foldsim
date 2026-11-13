@@ -641,6 +641,18 @@ def vmem_controllers(gdir, stext=''):
             for k, v in enumerate(vm)] + ports
 
 
+def floorplan_copies(path):
+    """The class copies the floorplan pins one by one (foldsim_pin_copies.py: the `# foldsim pinned copies` section,
+    a USER_SLR_ASSIGNMENT of each `<class>_copy` to an SLR by name): {class: SLR name}, or None without it."""
+    if not path or not os.path.exists(path):
+        return None
+    text = open(path).read()
+    if '# foldsim pinned copies' not in text:
+        return None
+    sec = text[text.index('# foldsim pinned copies'):]
+    return {c: w for c, w in re.findall(r'-hierarchical (\w+)_copy\]\s*\n[^\n]*USER_SLR_ASSIGNMENT (SLR\d+) \$c', sec)}
+
+
 def floorplan_groups(path, stext):
     """The compiler's own SLR groups as the implementation gets them (foldsim --slr-groups): each foldsim_slr<g> the
     floorplan (foldsim_floorplan.tcl, the file pre_opt_hook.tcl applies) pins whole, by SLR name (--slr-region) or
@@ -828,7 +840,8 @@ def main():
     ap.add_argument('--json', help='write the copies\' resources, wires and assignment here (calibration)')
     ap.add_argument('--floorplan', metavar='TCL',
                     help='the floorplan the implementation applies (default <gen>/foldsim_floorplan.tcl): SLR groups '
-                         'it pins whole (foldsim_slr<g>) are checked as pinned, each within its SLR\'s room')
+                         'it pins whole (foldsim_slr<g>) are checked as pinned, each within its SLR\'s room; class '
+                         'copies it pins one by one (foldsim_pin_copies.py) are the assignment, as given')
     ap.add_argument('--register-state-entries', type=int, default=None)
     ap.add_argument('--slr-policy', choices=('guide', 'strict'), default='guide',
                     help='guide (default, 11-08): a copy past every SLR (with --copy-cap any) is cut by the placer like '
@@ -941,6 +954,10 @@ def main():
     fpath = a.floorplan or os.path.join(gdir, 'foldsim_floorplan.tcl')
     fpg = floorplan_groups(fpath, stext)
     grouped = grouped or fpg is not None
+    # Class copies pinned one by one (foldsim_pin_copies.py): the assignment as given, not one of the check's own
+    # (y64c2, 11-12: the check's full-region assignment moved VX_opc_unit to SLR2, URAM 125 %, where the sim-only one,
+    # pinned, keeps it in SLR1).
+    pins = floorplan_copies(fpath) if fpg is None else None
     ii, classes, _ = foldsim_degree.parse_schedule(stext)
     info = foldsim_degree.parse_classes(stext)
 
@@ -1126,6 +1143,24 @@ def main():
             + f'lut {need(groups[i]):,.0f} ({100 * need(groups[i]) / full[i]["lut"]:.0f} % of the SLR): '
             + ' '.join(groups[i]) for i in sorted(at)] + [
             f'    {names[i]}: no group pinned' for i in range(len(names)) if i not in at]
+    elif pins is not None:
+        text, sec, wires, est = estimate(res_est, room0)
+        unknown = sorted(c for c in pins if c not in res)
+        if unknown or any(w not in names for w in pins.values()):
+            finish(lines, 'REFUSE: the floorplan ' + fpath + ' pins ' + (
+                f'copies this netlist does not have: {" ".join(unknown)}' if unknown else
+                f'copies to SLRs the region does not name: {" ".join(sorted(set(pins.values()) - set(names)))}'))
+        left = [c for c in res if c not in pins]
+        if left and est is None:
+            finish(lines, f'REFUSE: the floorplan {fpath} pins {len(pins)} of {len(res)} copies and the others have no '
+                          f'assignment of the check\'s ({" ".join(sorted(left))})')
+        eg = {c: i for i, cs in enumerate(est or []) for c in cs}
+        groups = [[c for c in res if (names.index(pins[c]) if c in pins else eg.get(c)) == i] for i in range(len(names))]
+        sec = [f'  as pinned: {len(pins)} of {len(res)} copies by the floorplan {fpath}'
+               + (f', the other {len(left)} as the check assigns them' if left else '')] + [
+            f'    {names[i]}: lut {sum(res[c]["lut"] for c in groups[i]):,.0f}, uram '
+            f'{sum(res[c]["uram"] for c in groups[i]):,.0f}, bram {sum(res[c]["bram"] for c in groups[i]):,.0f}: '
+            + ' '.join(sorted(groups[i])) for i in range(len(names))]
     elif grouped:
         text, sec, groups, bwires = as_built()
         wires = {}
@@ -1146,7 +1181,7 @@ def main():
     # Guide (--slr-policy guide, any SLR): a copy past every SLR is cut by the placer, as a copy left out of the
     # assignment is (its own cut by Rent's rule, its links over the boundary): left out from the start.
     guide = a.slr_policy == 'guide' and a.copy_cap == 'any'
-    forced = [c for c, _, _ in over] if guide and mode == 'netlist' and not grouped else []
+    forced = [c for c, _, _ in over] if guide and mode == 'netlist' and not grouped and pins is None else []
     # The other copies within the SLRs' balanced share (the placer balances the SLRs' fill: each SLR at most the
     # region's fill of the whole design plus model['balance_slack']), the cut copies filling the room left.
     tot_full = {r: sum(c[r] for c in full) for r in RESOURCES}
@@ -1199,7 +1234,7 @@ def main():
         failed = None
         # As built (slr-groups): every group within its SLR's room (the fold placed them by its own estimate).
         group_over = [(names[g], r) for g in range(len(groups)) for r in RESOURCES if room[g][r] < -1e-9] \
-            if grouped else []
+            if grouped or pins is not None else []
         for c in cuts:
             home = next(g for g, cs in enumerate(groups) if c in cs)
             use = [{r: roomr[g][r] - room[g][r] + top_spread[g][r] for r in RESOURCES} for g in range(len(groups))]
@@ -1291,6 +1326,8 @@ def main():
     elif grouped and group_over:
         verdict = 'REFUSE: the generation\'s SLR groups past their SLRs\' room: ' + ', '.join(
             f'{n} {r}' for n, r in group_over)
+    elif pins is not None and group_over:
+        verdict = 'REFUSE: the pinned copies past their SLRs\' room: ' + ', '.join(f'{n} {r}' for n, r in group_over)
     elif fill_over:
         verdict = 'REFUSE: the design\'s ' + ', '.join(f'{r} {100 * region_fill[r]:.0f} %' for r in fill_over) + \
             ' of the region, past the placement fill (' + ', '.join(f'{100 * region_cap[r]:.0f} %' for r in fill_over) + \
