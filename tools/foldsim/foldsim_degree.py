@@ -395,7 +395,7 @@ def state_factors(c):
     return STATE_CAL.get('copy_logic', 1.0), STATE_CAL.get('copy_lutram', 1.0)
 
 
-def copy_budget(region, frac, slr='smallest'):
+def copy_budget(region, frac, slr='smallest', region_frac=None):
     """COPY_CAP of the state-home policy: each copy's LUTs (its logic plus its
     stores' LUTs and LUTRAM, synthesized: STATE_CAL) at most `frac` of the
     smallest SLR it may sit in (`slr`: smallest / largest or a name), placed
@@ -411,9 +411,14 @@ def copy_budget(region, frac, slr='smallest'):
             raise ValueError(f'no SLR {slr} in the region (' + ', '.join(x['name'] for x in slrs) + ')')
     m = region.get('margin', 1.0)
     pl = region.get('placed_per_synthesized', {}).get('lut', 1.0)
-    return dict(name=pick['name'], frac=frac, uram=m * pick['uram'], bram=m * pick['ramb36'],
-                lut=frac * pick['luts'] / pl,
-                lutram=frac * pick.get('lutram_luts', pick['luts']) / pl)
+    out = dict(name=pick['name'], frac=frac, uram=m * pick['uram'], bram=m * pick['ramb36'],
+               lut=frac * pick['luts'] / pl,
+               lutram=frac * pick.get('lutram_luts', pick['luts']) / pl)
+    if region_frac:
+        # The region's LUTs at `region_frac` (below the per-SLR share: the SLRs
+        # are unequal and take whole copies, so the design needs headroom).
+        out.update(region_frac=region_frac, region_lut=region_frac * sum(x['luts'] for x in slrs) / pl)
+    return out
 
 
 def given_rules(text):
@@ -471,7 +476,7 @@ def state_units(units, lev=1.0):
             u['per'] = {k: [(j, scale(c, k)) for j, c in v] for k, v in u['per'].items()}
 
 
-def copy_cap_pools(units, caps, base, copy_logic=None):
+def copy_cap_pools(units, caps, base, copy_logic=None, region_luts=0.0):
     """COPY_CAP as pools of storage.assign: for each copy j of a class c, its
     stores' URAM (`uram@c#j`) and RAMB36 (`bram@c#j`) at each kind, from the
     units' per-copy costs, each pool capped. With the cap's `lut` (and
@@ -512,6 +517,17 @@ def copy_cap_pools(units, caps, base, copy_logic=None):
                         u['costs'][kind][key] = u['costs'][kind].get(key, 0.0) + x
                         caps[key] = COPY_CAP[res]
                         base.setdefault(key, 0.0)
+    if COPY_CAP.get('region_lut'):
+        # The whole region's LUTs (the copies', the level's and the kernel's,
+        # LUTRAM a LUT each, synthesized): `lut@region`, so that the state
+        # leaves distributed RAM for block and ultra RAM until the design
+        # leaves the SLRs room to take whole copies at their share.
+        caps['lut@region'] = COPY_CAP['region_lut']
+        base['lut@region'] = region_luts
+        for u in units:
+            for kind, c in u['costs'].items():
+                if c is not None and (kind not in storage.RELIEF_KINDS or u.get('link')):
+                    c['lut@region'] = c.get('lut', 0.0) + c.get('lutram', 0.0)
 
 
 def read_built(path):
@@ -1265,7 +1281,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         lk = dict(lk, lutram=lk['lutram'] * KERNEL['calibration']['link_lutram'])
         base = dict(base, sites=logic + storage.LUTRAM_SITES * (lk['lutram'] + base_lutram),
                     luts=storage.fold_load(logic + lk['lutram'] + base_lutram, cache + lk['bram'], lk['uram']))
-    copy_cap_pools(units, caps, base, copy_logic)
+    copy_cap_pools(units, caps, base, copy_logic, logic + lk['lutram'] + base_lutram)
     choice, used = storage.assign(units, base, caps,
                                   dict(luts=storage.route_luts(slrs)) if route else None,
                                   price_extra=tiers is not None)
@@ -3196,7 +3212,7 @@ def state_fit_main(a):
     return 0
 
 
-def state_policy(cal_path, budget=None, region_path='v80'):
+def state_policy(cal_path, budget=None, region_path='v80', region_frac=None):
     """Set the state-home policy (foldsim --state auto): STATE_CAL from
     `cal_path` (or none), the per-copy budget `budget` (FRAC[:SLR]: COPY_CAP)
     over the region's SLRs, the on-chip-first repair. Returns COPY_CAP."""
@@ -3208,7 +3224,7 @@ def state_policy(cal_path, budget=None, region_path='v80'):
         frac, _, slr = str(budget).partition(':')
         if region_path in ('', 'v80'):
             region_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
-        COPY_CAP = copy_budget(json.load(open(region_path)), float(frac), slr or 'smallest')
+        COPY_CAP = copy_budget(json.load(open(region_path)), float(frac), slr or 'smallest', region_frac)
         storage.READ_BUFFERS = True
         storage.ONCHIP_FIRST = True
     return COPY_CAP

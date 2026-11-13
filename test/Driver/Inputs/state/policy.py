@@ -83,6 +83,13 @@ more = dict(queues, Slice=dict(queues['Slice'], mems=[(f'q{k}/ram', 2, 2048, 1, 
                                                       for k in range(16)]))
 run('queues longer', more)
 d.COPY_CAP = cap
+# One large SLR (a copy budget of 450k that does not bind) and the region's
+# LUTs at 6 % of its 600k (36k, below the queues' free 54k with the rest):
+# the stores leave distributed RAM until the whole design is within it.
+d.COPY_CAP = d.copy_budget(dict(REGION, slrs=REGION['slrs'][:1]), 0.75, region_frac=0.06)
+out = run('queues region', queues)
+print(f"region cap {d.COPY_CAP['region_lut']:.0f} used {out['res']['luts']} within {out['res']['luts'] <= d.COPY_CAP['region_lut']}")
+d.COPY_CAP = cap
 # A given rule (--storage) fixes its store: priced at its kind, no rule
 # emitted for it, the others still chosen within the budget.
 d.GIVEN = d.given_rules('Slice:q0/ram=distributed,Top:regs>=1=registers')

@@ -16,6 +16,9 @@
 # CHECK: queues spent: copy 32814 lutram 12814 H 256 page - off [] moved ['q0/ram', 'q1/ram', 'q2/ram', 'q3/ram']
 # More bytes off chip than the schedule's frame carries: a longer frame.
 # CHECK: queues longer: copy {{[0-9]+}} lutram {{[0-9]+}} H 384 page - off [] moved ['q0/ram', 'q1/ram', 'q10/ram',
+# The region's LUTs (--state-region-budget) where the copy's budget does not bind.
+# CHECK: queues region: copy {{[0-9]+}} lutram {{[0-9]+}} H 256 page - off [] moved [] rules ['Slice:q0/ram=ultra',
+# CHECK-NEXT: region cap 36000 used {{[0-9]+}} within True
 # CHECK: queues given: {{.*}} rules ['Slice:q7/ram=ultra', 'Slice:regs>=2000=ultra']
 # CHECK: factors (2.0, 1.0) (1.5, 1.25)
 # CHECK: queues measured: copy {{[0-9]+}}
@@ -37,13 +40,13 @@
 # DRV: foldsim: state auto: frame [[F:[0-9]+]] (II [[F]]), H at most [[F]];
 # DRV: foldsim: state budget: largest copy Leaf {{[0-9]+}} LUTs ({{[0-9]+}} % of the budget, counted x 0.791); see
 # DRV-NOT: past it
-# TABLE: policy: calibration state-v80-y8b-20261113.json, copy budget 256 LUTs (x0.001 of SLR0)
+# TABLE: policy: calibration state-v80-y8b-20261113.json, copy budget 256 LUTs (x0.001 of SLR0), region 1041835 LUTs (x0.65)
 # TABLE: storage: Leaf:regs>=8=block
 # TABLE: copies (synthesized LUTs, the budget 256):
 # TABLE-NEXT: Leaf#0
 # BUDGET: copy budget 256 LUTs, 128 LUTRAM (x0.001 of SLR0); counted x 0.791
 # BUDGET-NOT: OVER
-# REFUSE: --state auto: nothing fits the V80 region {{.*}} copy budget 128 LUTs (x0.0005 of SLR0)); past their copy budget: Leaf#0 ({{[0-9]+}} LUTs at the schedule's frame)
+# REFUSE: --state auto: nothing fits the V80 region {{.*}} copy budget 128 LUTs (x0.0005 of SLR0){{.*}}); past their copy budget: Leaf#0 ({{[0-9]+}} LUTs at the schedule's frame)
 # GIVEN: foldsim-fold-static{{.*}} storage=Leaf:ram=block,Leaf:regs>=8=distributed{{[ }]}}
 # GIVEN-NOT: Leaf:ram=distributed
 # GIVEN-NOT: storage: no memory

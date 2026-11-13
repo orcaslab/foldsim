@@ -890,7 +890,8 @@ def state_policy(a, out):
     calp = '' if a.state_calibration == 'none' else (a.state_calibration or STATE_CALIBRATION)
     budget = None if a.state_copy_budget in ('', '0', 'off', 'none') else a.state_copy_budget
     region = a.slr_region if a.slr_region not in ('',) else 'v80'
-    cap = foldsim_degree.state_policy(calp, budget, region)
+    rf = None if a.state_region_budget in ('', '0', 'off', 'none') else float(a.state_region_budget)
+    cap = foldsim_degree.state_policy(calp, budget, region, rf)
     if a.state_measured:
         if not foldsim_degree.STATE_CAL:
             sys.exit('--state-measured needs a --state-calibration')
@@ -899,6 +900,7 @@ def state_policy(a, out):
         foldsim_degree.GIVEN = foldsim_degree.given_rules(a.storage)
     return ('calibration ' + (os.path.basename(calp) if calp else 'none')
             + (f", copy budget {cap['lut']:.0f} LUTs (x{cap['frac']:g} of {cap['name']})" if cap else '')
+            + (f", region {cap['region_lut']:.0f} LUTs (x{cap['region_frac']:g})" if cap and cap.get('region_lut') else '')
             + (f", measured {a.state_measured}" if a.state_measured else ''))
 
 
@@ -966,12 +968,14 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
                                       row_bytes_min=a.vmem_row_bytes_min)
     if res is None:
         last = foldsim_degree.LAST_REFUSAL
-        over = sorted({p.partition('@')[2] for p in last.get('over', [])})
+        over = sorted({p.partition('@')[2] for p in last.get('over', []) if '#' in p})
+        if 'lut@region' in last.get('over', []):
+            over.append('the region')
         if over:
             # The copies whose own logic leaves no room in their budget, with
             # every store moved.
             over = [f"{c} ({last['copies'].get(c, {}).get('total', 0):.0f} LUTs at the schedule's frame)"
-                    for c in over]
+                    if c in last['copies'] else c for c in over]
         sys.exit(f'--state auto: nothing fits the V80 region (II {ii})'
                  + (f" with the links' {links['lutram']:.0f} LUTRAM LUTs, {links['bram']} RAMB36, "
                     f"{links['uram']} URAM288" if links else '') + f' ({policy})'
@@ -2337,6 +2341,11 @@ def build_parser():
                          'by default), its block and ultra RAM within the region\'s margin of it; a copy over '
                          'moves stores to block or ultra RAM first (registered reads), then to HBM; default '
                          '0.75, 0: none')
+    ap.add_argument('--state-region-budget', default='0.65', metavar='FRAC',
+                    help="with --state auto and a copy budget: the whole region's LUTs (copies, level, kernel; "
+                         'LUTRAM a LUT each, synthesized) at most FRAC of the region\'s, the state moved into block '
+                         'and ultra RAM (then HBM) until it is: headroom under the per-SLR share for whole copies on '
+                         'unequal SLRs (8 SMs split at 76 % left a copy without an SLR); default 0.65, 0: none')
     ap.add_argument('--state-calibration', default='', metavar='JSON|none',
                     help="with --state auto: the area model's calibration to synthesized LUTs (copies' logic "
                          'and LUTRAM, the level, the kernel beside the simulator: foldsim_degree.py state-fit; '
