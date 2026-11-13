@@ -577,6 +577,8 @@ def frame_options(a):
         fold += ' slr-group-control'
     if getattr(a, 'slr_group_reset', False):
         fold += ' slr-group-reset'
+    if getattr(a, 'slr_group_local', 0):
+        fold += f' slr-group-local={a.slr_group_local}'
     if getattr(a, 'registered_links', ''):
         fold += f' registered-links={a.registered_links}'
     if getattr(a, 'split_latency', ''):
@@ -2214,6 +2216,10 @@ def build_parser():
                     help='with --slr-groups: each class\'s sequencer, bubble register, slot tables and their register '
                          'chains built in its class\'s group (foldsim-fold-static slr-group-control); the same netlist '
                          'but for the hierarchy: only the frame decision and a parent\'s sequencer cross into a group')
+    ap.add_argument('--slr-group-local', type=int, default=0, metavar='OPS',
+                    help='with --slr-groups: each group computes the level\'s combinational values it reads (the frame '
+                         'decision, a frame input\'s select) from their registers, cloning cones of up to OPS ops '
+                         '(foldsim-fold-static slr-group-local): no logic before a crossing into a group; same values')
     ap.add_argument('--slr-group-reset', action='store_true',
                     help='with --slr-groups: the simulator\'s reset registered in each group and in the level '
                          '(foldsim-fold-static slr-group-reset); one host cycle more after reset, no value moves')

@@ -63,3 +63,20 @@
 # RUN: python3 -c "import re,sys; h=lambda f: int(re.search(r'in (\d+) host', open(f).read()).group(1)); a, b = h(sys.argv[1]), h(sys.argv[2]); print('HOST', b - a)" %t/base/r2.txt %t/rst/r2.txt | FileCheck %s --check-prefix=PLUS1
 # PLUS1: HOST 1
 # CHECK: {{^}}MATCH
+# --slr-group-local: each group computes the level's logic it reads (the
+# frame decision's go and advance, a frame input's select) from their
+# registers, so every value entering a group leaves a register
+# (foldsim_xcheck.py: 0 edges with logic; without the option the decision's
+# go / advance cross as logic). The same MATCH and host cycles.
+# RUN: not python3 %foldsim_tools/foldsim_xcheck.py %t/ctl/foldsim_sim.mlir | FileCheck %s --check-prefix=XBASE
+# XBASE: cross-group edges: {{.*}}LOGIC {{[1-9]}}
+# RUN: foldsim --srcs top.f --top Top --out %t/loc --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-count 3 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-local 1000 Leaf > %t/loc.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOCLOG < %t/loc.log
+# LOCLOG: slr-group-local: {{[1-9][0-9]*}} level ops cloned into groups, 0 cones left in the level
+# RUN: python3 %foldsim_tools/foldsim_xcheck.py %t/loc/foldsim_sim.mlir | FileCheck %s --check-prefix=XLOC
+# XLOC: cross-group edges: {{.*}} LOGIC 0 (0 bits); group outputs read by the level: {{[0-9]+}}, LOGIC 0
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/loc/obj %S/Inputs/tb_late.sv top.sv %t/loc/foldsim_sim.sv > %t/loc/build.log 2>&1
+# RUN: %t/loc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 +bubble=30 +burst=4 | grep MATCH > %t/loc/r1.txt
+# RUN: %t/loc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=0 +bubble=0 | grep MATCH > %t/loc/r2.txt
+# RUN: diff %t/base/r1.txt %t/loc/r1.txt
+# RUN: diff %t/base/r2.txt %t/loc/r2.txt

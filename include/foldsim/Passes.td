@@ -802,6 +802,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "(go, advance) and the parent's sequencer cross into a group. The "
            "same netlist apart from the hierarchy: no value or host cycle "
            "moves">,
+    Option<"slrGroupLocal", "slr-group-local", "unsigned", "0",
+           "With SLR groups: each group computes the simulator level's "
+           "combinational values it reads (the frame decision's go and "
+           "advance, a frame input's select) itself, from their registers: "
+           "the level's logic cone of such a value, up to this many ops, is "
+           "cloned into the group, so that every value entering a group "
+           "leaves a register (no logic before an SLR crossing). The same "
+           "values in the same host cycles. 0: off">,
     Option<"slrGroupReset", "slr-group-reset", "bool", "false",
            "With SLR groups: the simulator's reset registered once in each "
            "group (inside the group's module) and once for the level, so that "

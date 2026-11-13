@@ -893,6 +893,9 @@ public:
   bool slrGroupControl = false;
   /// `slr-group-reset`: the reset registered in each group and the level.
   bool slrGroupReset = false;
+  /// `slr-group-local`: the level's logic a group reads cloned into it (ops
+  /// per cone at most; 0 off).
+  unsigned slrGroupLocal = 0;
   struct LinkCandidate {
     std::tuple<unsigned, unsigned, uint64_t> key;
     /// Its rows and columns in block or ultra RAM (paged as built), and its
@@ -27162,6 +27165,88 @@ LogicalResult StaticFolder::extractGroups() {
       opsOf[attr.getInt()].push_back(&op);
       op.removeAttr(kSlrAttr);
     }
+  // `slr-group-local`: a group's operand that the level computes with logic
+  // (not a register, memory, instance, constant or port) is computed in the
+  // group instead: the level's cone of it, back to those, cloned into the
+  // group (one clone a group, shared by its readers), so every value that
+  // enters a group leaves a register. A cone of more than slrGroupLocal ops
+  // is left in the level (reported).
+  if (slrGroupLocal) {
+    DenseSet<Operation *> inGroups;
+    for (auto &ops : opsOf)
+      inGroups.insert(ops.begin(), ops.end());
+    auto isLevelLogic = [&](Operation *op) {
+      return op && op->getBlock() == body && !inGroups.contains(op) &&
+             op->getNumRegions() == 0 && !isa<hw::ConstantOp>(op) &&
+             !isa<hw::InstanceOp, hw::OutputOp>(op) &&
+             op->getDialect()->getNamespace() != "seq" &&
+             op->getDialect()->getNamespace() != "sv" &&
+             mlir::isMemoryEffectFree(op);
+    };
+    unsigned cloned = 0, kept = 0;
+    for (unsigned g = 0; g < slrGroups; ++g) {
+      DenseMap<Value, Value> local;
+      OpBuilder cb(body->getTerminator());
+      // The cone of `root` (level logic), in operand-before-user order, or
+      // empty past the limit.
+      auto cone = [&](Operation *root) {
+        SmallVector<Operation *> order;
+        DenseSet<Operation *> seen;
+        SmallVector<std::pair<Operation *, unsigned>> stack{{root, 0}};
+        seen.insert(root);
+        while (!stack.empty()) {
+          auto &[op, next] = stack.back();
+          if (next < op->getNumOperands()) {
+            Value operand = op->getOperand(next++);
+            auto *def = operand.getDefiningOp();
+            if (!local.count(operand) && isLevelLogic(def) &&
+                seen.insert(def).second) {
+              if (seen.size() > slrGroupLocal)
+                return SmallVector<Operation *>();
+              stack.push_back({def, 0});
+            }
+            continue;
+          }
+          order.push_back(op);
+          stack.pop_back();
+        }
+        return order;
+      };
+      for (unsigned i = 0; i < opsOf[g].size(); ++i) {
+        Operation *user = opsOf[g][i];
+        for (auto &operand : user->getOpOperands()) {
+          Value value = operand.get();
+          if (!isLevelLogic(value.getDefiningOp()))
+            continue;
+          if (!local.count(value)) {
+            auto order = cone(value.getDefiningOp());
+            if (order.empty()) {
+              ++kept;
+              continue;
+            }
+            for (auto *op : order) {
+              if (local.count(op->getResult(0)))
+                continue;
+              auto *clone = cb.clone(*op);
+              for (auto &o : clone->getOpOperands())
+                if (auto it = local.find(o.get()); it != local.end())
+                  o.set(it->second);
+              for (auto [r, c] : llvm::zip(op->getResults(), clone->getResults()))
+                local[r] = c;
+              opsOf[g].push_back(clone);
+              inGroups.insert(clone);
+              ++cloned;
+            }
+          }
+          operand.set(local.lookup(value));
+        }
+      }
+    }
+    llvm::errs() << "foldsim-fold-static: slr-group-local: " << cloned
+                 << " level ops cloned into groups, " << kept
+                 << " cones left in the level (past " << slrGroupLocal
+                 << " ops)\n";
+  }
   // `slr-group-reset`: the level's ops take the reset through a register of
   // their own (a group's, through one in the group's module, below): every
   // part of the simulator sees hostReset a host cycle later, so no value
@@ -27749,6 +27834,7 @@ void FoldStaticPass::runOnOperation() {
   folder.slrLinkRams = slrLinkRams;
   folder.slrGroupControl = slrGroupControl;
   folder.slrGroupReset = slrGroupReset;
+  folder.slrGroupLocal = slrGroupLocal;
   folder.slrKept = std::max(1u, unsigned(slrKept));
   for (auto [spec, out, name] :
        {std::tuple{std::string(linkKindGroups), &folder.linkKindGroupCap, "link-kind-groups"},
