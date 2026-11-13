@@ -952,6 +952,12 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
         sys.exit(r.stderr)
     text = open(base).read()
     ii, classes, _ = foldsim_degree.parse_schedule(text)
+    if foldsim_degree.STATE_CAL is not None:
+        # The kernel's memory endpoints: one a m_axi_mem port, or one folded
+        # (--fold-ports) priced as the calibration's folded share.
+        foldsim_degree.STATE_CAL['ports'] = (foldsim_degree.STATE_CAL.get('kernel_port_folded', 1.0)
+                                             if getattr(a, 'fold_ports', '') else
+                                             foldsim_degree.kernel_mem_ports(text))
     path = a.degree_calibration or DEGREE_CALIBRATION
     cal = json.load(open(path)) if path != 'none' and os.path.exists(path) else None
     names = sorted({re.sub(r'_copy\d+$', '', c) for c in classes})

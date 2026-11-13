@@ -395,6 +395,16 @@ def state_factors(c):
     return STATE_CAL.get('copy_logic', 1.0), STATE_CAL.get('copy_lutram', 1.0)
 
 
+def state_kernel_ports():
+    """STATE_CAL's kernel term past its fit point's: the memory port endpoints
+    the fold has (`ports`, set by the driver: its m_axi_mem ports, or
+    `port_lut_folded` worth of one folded endpoint) against the fit's
+    (`kernel_ports`), each `kernel_port_logic` LUTs."""
+    if not STATE_CAL or STATE_CAL.get('ports') is None or not STATE_CAL.get('kernel_port_logic'):
+        return 0.0
+    return STATE_CAL['kernel_port_logic'] * (STATE_CAL['ports'] - STATE_CAL.get('kernel_ports', 0))
+
+
 def copy_budget(region, frac, slr='smallest', region_frac=None):
     """COPY_CAP of the state-home policy: each copy's LUTs (its logic plus its
     stores' LUTs and LUTRAM, synthesized: STATE_CAL) at most `frac` of the
@@ -985,7 +995,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     lev = STATE_CAL.get('level', 1.0) if STATE_CAL else 1.0
     logic *= lev
     if STATE_CAL:
-        logic += STATE_CAL.get('kernel_logic', 0.0)
+        logic += STATE_CAL.get('kernel_logic', 0.0) + state_kernel_ports()
         base_lutram += STATE_CAL.get('kernel_lutram', 0.0)
     kernel_uram = kernel_bram = 0.0
     if KERNEL['on']:
