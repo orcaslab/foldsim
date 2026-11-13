@@ -889,6 +889,10 @@ public:
   bool slrLinkRams = false;
   /// `slr-kept`: the SLR group assignments chooseGroups schedules.
   unsigned slrKept = 8;
+  /// `slr-group-control`: each class's controls built in its class's group.
+  bool slrGroupControl = false;
+  /// `slr-group-reset`: the reset registered in each group and the level.
+  bool slrGroupReset = false;
   struct LinkCandidate {
     std::tuple<unsigned, unsigned, uint64_t> key;
     /// Its rows and columns in block or ultra RAM (paged as built), and its
@@ -21217,6 +21221,23 @@ LogicalResult StaticFolder::buildSim() {
         b, comb::ICmpPredicate::eq, v,
         hw::ConstantOp::create(b, v.getType(), k));
   };
+  // `slr-group-control`: class c's controls go to its SLR group (-1: the
+  // level). The ops built since a mark (the body's last op before them) are
+  // tagged into it, but constants, which each group that reads one copies.
+  auto controlGroup = [&](unsigned c) -> int {
+    return slrGroupControl && c < slrOf.size() ? slrOf[c] : -1;
+  };
+  auto lastOp = [&]() -> Operation * {
+    return body->empty() ? nullptr : &body->back();
+  };
+  auto tagSince = [&](Operation *mark, int group) {
+    if (group < 0)
+      return;
+    for (Operation *op = mark ? mark->getNextNode() : &body->front(); op;
+         op = op->getNextNode())
+      if (!isa<hw::ConstantOp>(op))
+        tagGroup(op, group);
+  };
 
   // The frame's position three host cycles ahead: a slot, or `ii` between
   // frames; the frame's parity with it. A frame starts when every input has
@@ -21360,8 +21381,14 @@ LogicalResult StaticFolder::buildSim() {
     SmallVector<Value> nextOf(classes.size());
     for (auto c : order) {
       auto &cls = classes[c];
+      Operation *mark = lastOp();
       Value load = rootNext;
-      if (cls.parent >= 0) {
+      if (controlGroup(c) >= 0) {
+        // In its group, the class's own next position of its parent's
+        // sequencer (the root's: posD), the same function as the shared
+        // one: only registers and the decision cross into the group.
+        load = nextPosition(cls.parent >= 0 ? sequencer[cls.parent] : posD);
+      } else if (cls.parent >= 0) {
         auto &parentNext = nextOf[cls.parent];
         if (!parentNext)
           parentNext = nextPosition(sequencer[cls.parent]);
@@ -21375,6 +21402,7 @@ LogicalResult StaticFolder::buildSim() {
           hw::ConstantOp::create(b, type, ii), hw::InnerSymAttr{},
           /*isAsync=*/false, b.getIntegerAttr(type, ii)));
       posCounters.addReg(sequencer[c], load);
+      tagSince(mark, controlGroup(c));
     }
   }
   // Overlapped frames: a slot past the frame runs in the next frame's, for
@@ -21397,6 +21425,10 @@ LogicalResult StaticFolder::buildSim() {
         b, primed, comb::AndOp::create(b, starting, started)));
   }
   for (auto [c, cls] : llvm::enumerate(classes)) {
+    // (`slr-group-control`: everything this iteration builds -- the bubble,
+    // the tables read at the class's position and their register chains --
+    // in the class's group: tagged at the iteration's end.)
+    Operation *controlMark = lastOp();
     unsigned threads = cls.threads();
     unsigned idxWidth = threads > 1 ? llvm::Log2_32_Ceil(threads) : 0;
     SmallVector<uint64_t> instRow(ii + 1, 0), stateRow(ii + 1, 0),
@@ -21799,6 +21831,7 @@ LogicalResult StaticFolder::buildSim() {
         ctl.ppPrefSlot3 = byRank(pfSet, pfRank, pfSlotRow, pfValid, cls.ppSlotBits());
       }
     }
+    tagSince(controlMark, controlGroup(c));
   }
 
   // The netlist's inputs: each token taken into a holding queue as it comes,
@@ -27129,6 +27162,45 @@ LogicalResult StaticFolder::extractGroups() {
       opsOf[attr.getInt()].push_back(&op);
       op.removeAttr(kSlrAttr);
     }
+  // `slr-group-reset`: the level's ops take the reset through a register of
+  // their own (a group's, through one in the group's module, below): every
+  // part of the simulator sees hostReset a host cycle later, so no value
+  // moves, and no reset net spans the device. Kept: the registers are equal,
+  // and merged they would be one net again.
+  Value hostClock = body->getArgument(0), hostReset = body->getArgument(1);
+  if (slrGroupReset) {
+    DenseSet<Operation *> grouped;
+    for (auto &ops : opsOf)
+      grouped.insert(ops.begin(), ops.end());
+    OpBuilder rb = OpBuilder::atBlockBegin(body);
+    auto levelReset = keep(seq::FirRegOp::create(
+        rb, simModule.getLoc(), hostReset, hostClock,
+        rb.getStringAttr("reset_level")));
+    hostReset.replaceUsesWithIf(levelReset, [&](OpOperand &use) {
+      return use.getOwner() != levelReset &&
+             !grouped.contains(use.getOwner());
+    });
+    // The host cycle after hostReset falls the simulator is still in reset:
+    // its handshakes (every channel's `_ready` and `_valid` out) are held
+    // low then, so that the environment, out of reset, neither hands it a
+    // token nor takes one it would lose.
+    auto *output = body->getTerminator();
+    OpBuilder ob(output);
+    Value running;
+    for (unsigned i = 0, e = output->getNumOperands(); i < e; ++i) {
+      Value operand = output->getOperand(i);
+      StringRef name = simModule.getOutputName(i);
+      if (!operand.getType().isInteger(1) ||
+          !(name.ends_with("_ready") || name.ends_with("_valid")))
+        continue;
+      if (!running)
+        running = comb::XorOp::create(
+            ob, simModule.getLoc(), levelReset,
+            hw::ConstantOp::create(ob, simModule.getLoc(), ob.getI1Type(), 1));
+      output->setOperand(i, comb::AndOp::create(ob, simModule.getLoc(),
+                                                operand, running));
+    }
+  }
   // A name for the port of a value: its op's name, if any.
   auto nameOf = [&](Value value) -> std::string {
     if (auto arg = dyn_cast<BlockArgument>(value))
@@ -27165,6 +27237,11 @@ LogicalResult StaticFolder::extractGroups() {
         if (isInput.insert(operand).second)
           inputs.push_back(operand);
       }
+    // (`slr-group-reset`: a group that takes the reset registers it, so it
+    // takes the clock too.)
+    bool groupReset = slrGroupReset && isInput.contains(hostReset);
+    if (groupReset && isInput.insert(hostClock).second)
+      inputs.push_back(hostClock);
     for (auto *op : ops)
       for (auto result : op->getResults())
         if (llvm::any_of(result.getUsers(), [&](Operation *user) {
@@ -27215,6 +27292,13 @@ LogicalResult StaticFolder::extractGroups() {
       for (auto &operand : clone->getOpOperands())
         if (auto mapped = map.lookupOrNull(operand.get()))
           operand.set(mapped);
+    if (groupReset) {
+      Value groupResetIn = map.lookup(hostReset);
+      auto groupResetReg = keep(seq::FirRegOp::create(
+          gb, simModule.getLoc(), groupResetIn, map.lookup(hostClock),
+          gb.getStringAttr("reset_slr" + Twine(g))));
+      groupResetIn.replaceAllUsesExcept(groupResetReg, groupResetReg);
+    }
     SmallVector<Value> results;
     for (auto value : outputs)
       results.push_back(map.lookup(value));
@@ -27663,6 +27747,8 @@ void FoldStaticPass::runOnOperation() {
   folder.readBufferBits = readBufferBits;
   folder.linkKindCost = linkKindCost;
   folder.slrLinkRams = slrLinkRams;
+  folder.slrGroupControl = slrGroupControl;
+  folder.slrGroupReset = slrGroupReset;
   folder.slrKept = std::max(1u, unsigned(slrKept));
   for (auto [spec, out, name] :
        {std::tuple{std::string(linkKindGroups), &folder.linkKindGroupCap, "link-kind-groups"},

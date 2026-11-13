@@ -1,0 +1,65 @@
+# REQUIRES: verilator
+# Fixes for an FSD 1,024-node fold whose controls, token channels and resets
+# crossed the device (a32-F4, 11-12).
+# --slr-group-control: each class's controls (its sequencer, from its own next
+# position of its parent's; its bubble register; its slot tables and their
+# register chains) built in its class's SLR group, not in the simulator level.
+# The same netlist but for the hierarchy: it matches the target in exactly the
+# host cycles of the fold without the option (nested sequencers, bubbles,
+# stalls). --slr-group-reset: the reset registered once in each group and once
+# for the level; the simulator leaves reset a host cycle later (one host cycle
+# more), its handshakes held low in that host cycle (the testbench offers a
+# token the host cycle after its reset falls: without the hold the first token
+# is lost and the run times out).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/late
+# RUN: foldsim --srcs top.f --top Top --out %t/base --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-count 3 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/base/obj %S/Inputs/tb_late.sv top.sv %t/base/foldsim_sim.sv > %t/base/build.log 2>&1
+# RUN: %t/base/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 +bubble=30 +burst=4 | grep MATCH > %t/base/r1.txt
+# RUN: %t/base/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=0 +bubble=0 | grep MATCH > %t/base/r2.txt
+# RUN: FileCheck %s < %t/base/r1.txt
+# RUN: foldsim --srcs top.f --top Top --out %t/ctl --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-count 3 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-level 2 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=CTL < %t/ctl/foldsim_sim.sv
+# --slr-level 2: the floorplan puts the level's cells (the simulator's but its
+# groups) and the environment beside it with group 2.
+# RUN: FileCheck %s --check-prefix=LEVEL < %t/ctl/foldsim_floorplan.tcl
+# LEVEL: set c [get_cells -quiet -hierarchical foldsim_slr0]
+# LEVEL: # The simulator level and its environment with group 2 (--slr-level).
+# LEVEL-NEXT: set g [get_cells -quiet -hierarchical foldsim_slr2]
+# LEVEL: set c [get_cells -quiet -filter {NAME !~ "*/foldsim_slr*"} $sim/*]
+# LEVEL-NEXT: if {[llength $c] > 0} { set_property USER_SLR_ASSIGNMENT fs_slr2 $c }
+# LEVEL: /env]
+# LEVEL-NEXT: if {[llength $e] == 1} { set_property USER_SLR_ASSIGNMENT fs_slr2 $e }
+# Without --slr-level: no level lines.
+# RUN: not grep -q 'slr-level' %t/base/foldsim_floorplan.tcl
+# CTL-LABEL: module foldsim_sim_slr0(
+# CTL: Leaf_seq
+# CTL: Leaf_bubble
+# CTL: Leaf_state2
+# CTL-LABEL: module foldsim_sim_slr1(
+# CTL: Leaf_copy1_seq
+# CTL: Leaf_copy1_bubble
+# CTL: Leaf_copy2_seq
+# CTL: Leaf_copy2_bubble
+# CTL-LABEL: module foldsim_sim(
+# CTL-NOT: Leaf{{(_copy[12])?}}_seq <=
+# CTL-NOT: Leaf{{(_copy[12])?}}_bubble <=
+# CTL: endmodule
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/ctl/obj %S/Inputs/tb_late.sv top.sv %t/ctl/foldsim_sim.sv > %t/ctl/build.log 2>&1
+# RUN: %t/ctl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 +bubble=30 +burst=4 | grep MATCH > %t/ctl/r1.txt
+# RUN: %t/ctl/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=0 +bubble=0 | grep MATCH > %t/ctl/r2.txt
+# RUN: diff %t/base/r1.txt %t/ctl/r1.txt
+# RUN: diff %t/base/r2.txt %t/ctl/r2.txt
+# RUN: foldsim --srcs top.f --top Top --out %t/rst --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-count 3 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=RST < %t/rst/foldsim_sim.sv
+# RST-LABEL: module foldsim_sim_slr0(
+# RST: reset_slr0 <= hostReset;
+# RST-LABEL: module foldsim_sim_slr1(
+# RST: reset_slr1 <= hostReset;
+# RST-LABEL: module foldsim_sim(
+# RST: reset_level <= hostReset;
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/rst/obj %S/Inputs/tb_late.sv top.sv %t/rst/foldsim_sim.sv > %t/rst/build.log 2>&1
+# RUN: %t/rst/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 +bubble=30 +burst=4 | FileCheck %s
+# RUN: %t/rst/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=0 +bubble=0 | grep MATCH > %t/rst/r2.txt
+# RUN: python3 -c "import re,sys; h=lambda f: int(re.search(r'in (\d+) host', open(f).read()).group(1)); a, b = h(sys.argv[1]), h(sys.argv[2]); print('HOST', b - a)" %t/base/r2.txt %t/rst/r2.txt | FileCheck %s --check-prefix=PLUS1
+# PLUS1: HOST 1
+# CHECK: {{^}}MATCH

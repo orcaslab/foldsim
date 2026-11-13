@@ -29,6 +29,7 @@ port (`<port>_valid`, `_ready`, `_bits`) and a `profile_finish` bit per class;
 order of those bits; and <out>/foldsim_sim.vh, their number for the kernel.
 """
 import argparse
+import collections
 import fnmatch
 import json
 import os
@@ -572,6 +573,10 @@ def frame_options(a):
         fold += f' slr-kept={a.slr_kept}'
     if getattr(a, 'slr_link_rams', False):
         fold += ' slr-link-rams'
+    if getattr(a, 'slr_group_control', False):
+        fold += ' slr-group-control'
+    if getattr(a, 'slr_group_reset', False):
+        fold += ' slr-group-reset'
     if getattr(a, 'registered_links', ''):
         fold += f' registered-links={a.registered_links}'
     if getattr(a, 'split_latency', ''):
@@ -1406,6 +1411,53 @@ def write_slr_split(plan, path):
                     f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT {slr} $c }}\n')
 
 
+def slr_level_group(spec, region, groups):
+    """--slr-level: the SLR group (index) the simulator level goes with. auto: the
+    group of the region's SLR with the most HBM NoC ports (its noc section: the
+    virtual-memory controllers' masters and the kernel meet the memory there), else
+    group 0; or a group index; none: the level left to the placer."""
+    if spec in (None, '', 'none'):
+        return None
+    if spec != 'auto':
+        g = int(spec)
+        if not 0 <= g < groups:
+            sys.exit(f'--slr-level: group {g} of {groups}')
+        return g
+    if region:
+        path = region if region != 'v80' else os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
+        r = json.load(open(path))
+        order = [slr['name'] for slr in r['slrs']]
+        hbm = collections.Counter(p['slr'] for p in r.get('noc', {}).get('ports', [])
+                                  if 'HBM' in p.get('targets', []))
+        if hbm:
+            best = max(order, key=lambda n: (hbm.get(n, 0), -order.index(n)))
+            if order.index(best) < groups:
+                return order.index(best)
+    return 0
+
+
+def write_slr_level(path, group, names=None):
+    """--slr-level: appends to the floorplan the simulator level -- the simulator's
+    cells outside its SLR groups: the frame decision, the token channels'
+    queues, the readiness registers -- and the environment beside it (the
+    simulator's sibling `env`, the shell's token engine its channels meet) in
+    group `group`'s SLR. Left to the placer, the level lands where room is
+    (FSD 1,024 nodes, 11-12: SLR0, its groups in SLR2/SLR1, the env split over
+    both): every control and token path then crosses the device."""
+    where = names[group] if names else f'fs_slr{group}'
+    with open(path, 'a') as f:
+        f.write(f'# The simulator level and its environment with group {group} (--slr-level).\n'
+                f'set g [get_cells -quiet -hierarchical foldsim_slr{group}]\n'
+                f'if {{[llength $g] == 1}} {{\n'
+                f'  set sim [get_property PARENT $g]\n'
+                f'  set c [get_cells -quiet -filter {{NAME !~ "*/foldsim_slr*"}} $sim/*]\n'
+                f'  if {{[llength $c] > 0}} {{ set_property USER_SLR_ASSIGNMENT {where} $c }}\n'
+                f'  set e [get_cells -quiet [get_property PARENT [get_cells $sim]]/env]\n'
+                f'  if {{[llength $e] == 1}} {{ set_property USER_SLR_ASSIGNMENT {where} $e }}\n'
+                f'}}\n')
+
+
 def write_slr_groups(sv, path, names=None):
     # A group split over an SLR boundary pays a crossing on paths wholly inside
     # it, and Vivado otherwise places by area alone. A group name, not an SLR,
@@ -2154,6 +2206,17 @@ def build_parser():
                     help='with --slr-groups: links may be block or ultra RAM too, in their reader\'s group '
                          '(foldsim-fold-static slr-link-rams); else every link of a grouped fold is distributed '
                          'RAM or registers')
+    ap.add_argument('--slr-level', default=None, metavar='auto|G|none',
+                    help='with --slr-groups: the floorplan puts the simulator level (its cells outside the groups) '
+                         'and the shell environment beside it with group G (auto: the group of the region\'s SLR '
+                         'with the most HBM NoC ports, else 0; default none: left to the placer)')
+    ap.add_argument('--slr-group-control', action='store_true',
+                    help='with --slr-groups: each class\'s sequencer, bubble register, slot tables and their register '
+                         'chains built in its class\'s group (foldsim-fold-static slr-group-control); the same netlist '
+                         'but for the hierarchy: only the frame decision and a parent\'s sequencer cross into a group')
+    ap.add_argument('--slr-group-reset', action='store_true',
+                    help='with --slr-groups: the simulator\'s reset registered in each group and in the level '
+                         '(foldsim-fold-static slr-group-reset); one host cycle more after reset, no value moves')
     ap.add_argument('--link-kinds', default='', metavar='P:R:KIND,...',
                     help='with --static: the RAM (distributed, block or ultra) of the links from model P '
                          'to model R that --link-block-depth\'s rules let block or ultra RAM hold, '
@@ -2910,6 +2973,13 @@ def main():
             sys.exit('--slr-groups needs --static')
         names = [n for n, _ in slr_region_capacities(a.slr_region)] if a.slr_region else None
         write_slr_groups(open(out('foldsim_sim.sv')).read(), out('foldsim_floorplan.tcl'), names)
+        sv_text = open(out('foldsim_sim.sv')).read()
+        ngroups = len(set(re.findall(r'^\s+\w+ (foldsim_slr\d+) \(', sv_text, re.M)))
+        level = slr_level_group(getattr(a, 'slr_level', None), a.slr_region, ngroups)
+        if level is not None and ngroups:
+            write_slr_level(out('foldsim_floorplan.tcl'), level, names)
+            print(f'foldsim: the simulator level and its environment with SLR group {level}'
+                  + (f' ({names[level]})' if names else ''), file=sys.stderr)
     if split_plan:
         write_slr_split(split_plan, out('foldsim_floorplan.tcl'))
 

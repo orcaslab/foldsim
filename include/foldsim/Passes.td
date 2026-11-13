@@ -794,6 +794,21 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "ahead between groups, whose write lands a host cycle later, only "
            "where no write lands in the three host cycles before its read "
            "(false: every link with groups distributed RAM or registers)">,
+    Option<"slrGroupControl", "slr-group-control", "bool", "false",
+           "With SLR groups: each class's controls built in its class's "
+           "group, not in the simulator level: its sequencer (and, nested, "
+           "the next position it loads from its parent's), bubble register, "
+           "slot tables and their register chains. Only the frame decision "
+           "(go, advance) and the parent's sequencer cross into a group. The "
+           "same netlist apart from the hierarchy: no value or host cycle "
+           "moves">,
+    Option<"slrGroupReset", "slr-group-reset", "bool", "false",
+           "With SLR groups: the simulator's reset registered once in each "
+           "group (inside the group's module) and once for the level, so that "
+           "no reset wire spans the device: the whole simulator leaves reset "
+           "one host cycle after hostReset falls, uniformly (no value moves; "
+           "one host cycle more after reset). The simulator's ready and valid "
+           "outputs are held low in that host cycle">,
     Option<"linkKindOthers", "link-kind-others", "std::string", "\"0,0,0\"",
            "With link-kind-cost: what the rest of the simulator takes of each "
            "(\"<uram>,<ramb36>,<luts>\": URAM288, RAMB36, logic and other "
