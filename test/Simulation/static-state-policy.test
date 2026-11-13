@@ -1,0 +1,29 @@
+# REQUIRES: verilator
+# The state-home policy of --state auto (Driver/state-policy.test): under a
+# per-copy budget the leaves' register stores leave distributed RAM for block
+# RAM, read a host cycle early (their registered read in the RAM, the read
+# register after it). The leaves (Driver/Inputs/paged: four in a chain, a
+# 160-bit shift-xor, a 13-bit sum, a byte, a register a ready pass reads, a
+# 16 x 8 RAM read through a register) against the target (tb_late.sv), from
+# zero state, with bubbles and stalled channels: the budget's choice
+# (register stores from 8 bits in block RAM), a tighter one with the RAM
+# given in block RAM (--storage kept alone for its store), and nested
+# sequencers with a short lead.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/paged
+# RUN: foldsim --srcs top.f --top Top --out %t/b --static --bubbles --state auto --state-copy-budget 0.001 Leaf > %t/b.log 2>&1
+# RUN: FileCheck %s --check-prefix=B < %t/b/state.txt
+# RUN: FileCheck %s --check-prefix=SV < %t/b/foldsim_sim.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/b/obj %S/Inputs/tb_late.sv top.sv %t/b/foldsim_sim.sv > %t/b/build.log 2>&1
+# RUN: %t/b/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +bubble=30 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/g --static --bubbles --storage "Leaf:ram=block" --state auto --state-copy-budget 0.0009 Leaf > %t/g.log 2>&1
+# RUN: FileCheck %s --check-prefix=G < %t/g.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/g/obj %S/Inputs/tb_late.sv top.sv %t/g/foldsim_sim.sv > %t/g/build.log 2>&1
+# RUN: %t/g/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +bubble=40 +stall=20 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/n --static --bubbles --nest --short-lead --state auto --state-copy-budget 0.001 Leaf > %t/n.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/n/obj %S/Inputs/tb_late.sv top.sv %t/n/foldsim_sim.sv > %t/n/build.log 2>&1
+# RUN: %t/n/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +bubble=30 +stall=20 | FileCheck %s
+# B: storage: Leaf:regs>=8=block
+# SV: (* ram_style = "block"
+# G: storage=Leaf:ram=block,Leaf:regs>={{[0-9]+}}=block{{[ }]}}
+# CHECK: {{^}}MATCH
+# CHECK-NOT: MISMATCH

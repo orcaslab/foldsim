@@ -1,0 +1,11 @@
+{
+ "name": "state-v80-y8b-20261113",
+ "source": "/home/blaise/dev/fame5_work/static/a32_1109/HX2/loc/y8b_built_rb.json against /home/blaise/dev/fame5_work/static/a32_1109/H8/img/img_y8b_200/postsynth/hier_utilization.rpt",
+ "copy_logic": 1.292,
+ "copy_lutram": 1.086,
+ "level": 1.262,
+ "kernel_logic": 289160,
+ "kernel_lutram": 50615,
+ "placed_per_priced": 1.02,
+ "count_to_synth": 0.791
+}

@@ -410,6 +410,12 @@ HBM_ROUND_TRIP = 64
 VMEM_ROW_BITS = 4096
 HBM_BEAT_BYTES = 64
 RELIEF_KINDS = ('hbm',)
+# The state-home policy (foldsim --state auto with a per-copy budget): a pool
+# over its cap is relieved by a move into RAM on chip first (block or ultra
+# RAM, a page's rows, a link's own kind) whatever the prices; where none
+# relieves it (the RAM spent), off chip (HBM); only then into flops or
+# distributed RAM.
+ONCHIP_FIRST = False
 # The kernel's controllers (foldsim_vmem: request queue, tags, write buffer,
 # AXI master; a host cache and the known-zero bits in block RAM where it has
 # them), as foldsim_afu instantiates them for a virtual memory or a group of
@@ -1052,13 +1058,22 @@ def assign(units, base, caps, extra=None, paging=False, price_extra=False):
 
         def relieve(p, active):
             """The move that frees pool p at the least price elsewhere per unit
-            of p freed: (key, unit, from, to, stores), or None."""
+            of p freed: (key, unit, from, to, stores), or None. With
+            ONCHIP_FIRST a move off chip only where none on chip relieves p."""
+            if ONCHIP_FIRST:
+                flat = ('registers', 'distributed')
+                return (relieve_to(p, active, [k for k in order if k not in RELIEF_KINDS + flat]) or
+                        relieve_to(p, active, [k for k in order if k not in flat]) or
+                        relieve_to(p, active, order))
+            return relieve_to(p, active, order)
+
+        def relieve_to(p, active, kinds):
             best = None
             for i, u in enumerate(units):
                 if u.get('fixed') in u['costs']:
                     continue
                 for a, n in choice[i].items():
-                    for b in order:
+                    for b in kinds:
                         if b == a or not admissible(u, b):
                             continue
                         relief = usage_of(i, a, p) - usage_of(i, b, p)

@@ -24,6 +24,13 @@ foreach(f ${FOLDSIM_FLOW_FILES})
   configure_file(${f} ${CMAKE_BINARY_DIR}/bin/${f} COPYONLY)
 endforeach()
 install(DIRECTORY flow DESTINATION bin USE_SOURCE_PERMISSIONS)
+# The area models' calibrations (calibrations/*.json: --state auto's default, state-v80-*.json, among them).
+file(GLOB FOLDSIM_CALIBRATIONS RELATIVE ${CMAKE_CURRENT_SOURCE_DIR} CONFIGURE_DEPENDS
+     ${CMAKE_CURRENT_SOURCE_DIR}/calibrations/*.json)
+foreach(f ${FOLDSIM_CALIBRATIONS})
+  configure_file(${f} ${CMAKE_BINARY_DIR}/bin/${f} COPYONLY)
+endforeach()
+install(DIRECTORY calibrations DESTINATION bin FILES_MATCHING PATTERN "*.json")
 file(GLOB FOLDSIM_KERNEL_RTL RELATIVE ${PROJECT_SOURCE_DIR} CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/rtl/kernel/*)
 foreach(f ${FOLDSIM_KERNEL_RTL})
   configure_file(${PROJECT_SOURCE_DIR}/${f} ${CMAKE_BINARY_DIR}/bin/${f} COPYONLY)

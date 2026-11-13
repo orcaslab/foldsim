@@ -368,6 +368,109 @@ def slr_copy_cap(region, slr='smallest', luts=False):
     return cap
 
 
+# The state-home policy's area in synthesized LUTs (foldsim --state auto with
+# --state-calibration): factors on the cost model's copy logic (`copy_logic`:
+# a copy's own logic and its stores' selects) and its stores' distributed RAM
+# (`copy_lutram`), a class's own where a generation measured it (`classes`:
+# {model: {logic, lutram}}, foldsim --state-measured), the simulator level's
+# (`level`: the links and the rest outside the copies), the kernel and the
+# shell glue beside the simulator (`kernel_logic`, `kernel_lutram`, fixed),
+# and the placed LUTs per synthesized one (`placed_per_priced`, the region
+# pool's margin, storage.PLACED_PER_PRICED). None: the cost model as it is.
+STATE_CAL = None
+# A store's kind the flow fixes (foldsim --storage rules given with --state
+# auto): {'mem': {(model, store): kind}, 'regs': {model: [(width, kind)]}}.
+# Such a store is priced in its kind and never moved; the choice emits no
+# rule for it (the given one stays the only one).
+GIVEN = None
+
+
+def state_factors(c):
+    """STATE_CAL's (logic, LUTRAM) factors of a class (its copies' model)."""
+    if not STATE_CAL:
+        return 1.0, 1.0
+    m = (STATE_CAL.get('classes') or {}).get(re.sub(r'_copy\d+$', '', c))
+    if m:
+        return m['logic'], m['lutram']
+    return STATE_CAL.get('copy_logic', 1.0), STATE_CAL.get('copy_lutram', 1.0)
+
+
+def copy_budget(region, frac, slr='smallest'):
+    """COPY_CAP of the state-home policy: each copy's LUTs (its logic plus its
+    stores' LUTs and LUTRAM, synthesized: STATE_CAL) at most `frac` of the
+    smallest SLR it may sit in (`slr`: smallest / largest or a name), placed
+    over synthesized (the region's placed_per_synthesized), its LUTRAM within
+    the share of the SLR's SLICEM LUTs, and its block and ultra RAM within the
+    region's margin of the SLR's."""
+    slrs = region['slrs']
+    if slr in ('smallest', 'largest'):
+        pick = (min if slr == 'smallest' else max)(slrs, key=lambda x: x['luts'])
+    else:
+        pick = next((x for x in slrs if x['name'] == slr), None)
+        if pick is None:
+            raise ValueError(f'no SLR {slr} in the region (' + ', '.join(x['name'] for x in slrs) + ')')
+    m = region.get('margin', 1.0)
+    pl = region.get('placed_per_synthesized', {}).get('lut', 1.0)
+    return dict(name=pick['name'], frac=frac, uram=m * pick['uram'], bram=m * pick['ramb36'],
+                lut=frac * pick['luts'] / pl,
+                lutram=frac * pick.get('lutram_luts', pick['luts']) / pl)
+
+
+def given_rules(text):
+    """GIVEN of a --storage rule list (<model>:<store>=<kind>,...)."""
+    out = dict(mem={}, regs={})
+    for rule in filter(None, (text or '').split(',')):
+        key, _, kind = rule.rpartition('=')
+        model, _, store = key.partition(':')
+        if store.startswith('regs>='):
+            out['regs'].setdefault(model, []).append((int(store[6:]), kind))
+        elif store == 'regs':
+            out['regs'].setdefault(model, []).append((0, kind))
+        elif store:
+            out['mem'][(model, store)] = kind
+    return out
+
+
+def fix_given(units):
+    """The units GIVEN names: fixed at the given kind (a register store by
+    width: the largest bound at most its width, as the compiler takes it)."""
+    if not GIVEN:
+        return
+    for u in units:
+        if u.get('link') or u.get('fixed') or u['store'] == 'pages':
+            continue
+        model = re.sub(r'_copy\d+$', '', u['class'])
+        if u['store'].startswith('regs>='):
+            w, kind = int(u['store'][6:]), None
+            for bound, k in sorted(GIVEN['regs'].get(model, [])):
+                if bound <= w:
+                    kind = k
+        else:
+            kind = GIVEN['mem'].get((model, u['store']))
+        if kind is not None:
+            u['fixed'] = kind
+            u['given'] = True
+
+
+def state_units(units, lev=1.0):
+    """The units' costs with STATE_CAL's factors: a store's LUTs by its
+    class's logic factor, its LUTRAM by its LUTRAM factor; a link's by the
+    level's (copies of the cost dicts)."""
+    if not STATE_CAL:
+        return
+    for u in units:
+        fl, fr = (lev, lev) if u.get('link') else state_factors(u['class'])
+
+        def scale(c, k):
+            if c is None or k == 'hbm' and not u.get('link'):
+                # Off chip: the controller's own price (ctl_cost, routed).
+                return c
+            return dict(c, lut=c.get('lut', 0.0) * fl, lutram=c.get('lutram', 0.0) * fr)
+        u['costs'] = {k: scale(c, k) for k, c in u['costs'].items()}
+        if 'per' in u:
+            u['per'] = {k: [(j, scale(c, k)) for j, c in v] for k, v in u['per'].items()}
+
+
 def copy_cap_pools(units, caps, base, copy_logic=None):
     """COPY_CAP as pools of storage.assign: for each copy j of a class c, its
     stores' URAM (`uram@c#j`) and RAMB36 (`bram@c#j`) at each kind, from the
@@ -383,7 +486,9 @@ def copy_cap_pools(units, caps, base, copy_logic=None):
         if u.get('link'):
             continue
         for kind, parts in u.get('per', {}).items():
-            if kind not in u['costs']:
+            if kind not in u['costs'] or kind in storage.RELIEF_KINDS:
+                # Off chip: the store's controller is the kernel's, beside
+                # the simulator, not the copy's.
                 continue
             for j, pc in parts:
                 amounts = {res: pc.get(res, 0.0) for res in ('uram', 'bram')}
@@ -859,6 +964,13 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     # thread controls and the estimate of the rest are inside them (`rest`).
     logic = rest * (KERNEL['calibration'].get('rest', 1.0) if KERNEL['on'] and KERNEL['calibration'] else 1.0)
     units, copy_logic, base_lutram = [], {}, 0.0
+    # The state-home policy's calibration (STATE_CAL): the level's factor on
+    # the rest and the links, the kernel and glue beside the simulator.
+    lev = STATE_CAL.get('level', 1.0) if STATE_CAL else 1.0
+    logic *= lev
+    if STATE_CAL:
+        logic += STATE_CAL.get('kernel_logic', 0.0)
+        base_lutram += STATE_CAL.get('kernel_lutram', 0.0)
     kernel_uram = kernel_bram = 0.0
     if KERNEL['on']:
         if KERNEL['fold_ports'] and KERNEL['folded_measured']:
@@ -908,6 +1020,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             elif KERNEL['on']:
                 cl *= cal_factors(c)[0]
                 base_lutram += cal_lutram_add(c)
+            cl *= state_factors(c)[0]
             logic += cl
             copy_logic[(c, j)] = cl
             forms.append((j, t, form, info['gap'] if info else None))
@@ -1092,7 +1205,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     lk = link_cost(cal, (sched or {}).get('__links__'))
     # HBM link streams built (a schedule made with them): their logic, and
     # their traffic in the HBM pool and H.
-    logic += lk['lut']
+    logic += lk['lut'] * lev
     built_hbm = lk['hbm']
     # With the report's link uses, a pair of models' links that block or
     # ultra RAM may hold is a unit of its own (the link tier); the rest stays
@@ -1104,7 +1217,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
         units.extend(lu[0])
         lk = dict(lu[1], lutram=lu[1]['lutram'] + lk['lutram'] -
                   link_cost(cal, dict((sched or {}).get('__links__'), streams=[]))['lutram'])
-    lk = dict(lk, uram=lk['uram'] + kernel_uram, bram=lk['bram'] + kernel_bram)
+    lk = dict(lk, uram=lk['uram'] + kernel_uram, bram=lk['bram'] + kernel_bram,
+              lutram=lk['lutram'] * lev)
     base = dict(sites=logic + storage.LUTRAM_SITES * (lk['lutram'] + base_lutram),
                 luts=storage.fold_load(logic + lk['lutram'] + base_lutram, cache + lk['bram'],
                                        lk['uram']),
@@ -1144,6 +1258,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             if kind in u['costs']:
                 u['fixed'] = kind
     calibrate_units(units)
+    state_units(units, lev)
+    fix_given(units)
     if KERNEL['calibration']:
         # The links' LUTRAM in the base (those no tier chooses) too.
         lk = dict(lk, lutram=lk['lutram'] * KERNEL['calibration']['link_lutram'])
@@ -1192,7 +1308,9 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             logic += c['lut']
             if u['store'] != 'pages':
                 floor = max(floor, c['ii_floor'])
-            per_copy[(u['class'], j)] += c['lut'] + c['lutram']
+            if kind != 'hbm':
+                # (Off chip, the controller is the kernel's: not the copy's.)
+                per_copy[(u['class'], j)] += c['lut'] + c['lutram']
             if kind == 'hbm':
                 for x in ('lut', 'lutram', 'bram'):
                     vmem_ctl[x] += c[x]
@@ -2384,6 +2502,10 @@ PAGE_FEW = 8
 FRAME_STEPS = (1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8)
 
 
+# choose_state's unpaged point at the schedule's frame (what it leaves over).
+LAST_REFUSAL = {}
+
+
 def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True, vmem=None,
                  pattern='', weights=None, pages_hbm=True, row_bytes_min=1, max_ii=1 << 16,
                  page=True, link_pages=True, link_hbm=False, frame_growth=None,
@@ -2532,9 +2654,20 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
         tiers = dict(frame=f, base_hbm=base_hbm, base_bubbles=base_bubbles, weights=weights,
                      pages_hbm=pages_hbm, row_bytes_min=row_bytes_min, link_pages=link_pages,
                      link_hbm=link_hbm, vmem_group=vmem_group, page_engines=page_engines)
-        if f == ii:
+        if f == ii or (f in steps and not only_frames):
+            # Unpaged: at the schedule's frame, and at the frame's steps too,
+            # where a longer frame carries the HBM bytes of more stores off
+            # chip (the state-home policy's last tier, once a copy's block and
+            # ultra RAM are spent).
             res = area(cal, est, classes, {}, rest, sched, f, entries, 'auto', route, uram,
                        vmem=vmem, tiers=tiers)
+            if f == ii:
+                # What the schedule's frame leaves over (the copies past their
+                # caps), for the refusal's message.
+                LAST_REFUSAL.clear()
+                LAST_REFUSAL.update(over=(res.get('copy_cap') or {}).get('over', []),
+                                    copies=res.get('copies', {}), fits=res['fits'],
+                                    routes=res.get('routes', True))
             if ok(res) and take(outcome(res, {}, f)):
                 return best
         pages = page_pick(est, classes, f, sched=sched) if page else None
@@ -2889,6 +3022,26 @@ def main():
     st.add_argument('--links-from', default='', metavar='SCHEDULE',
                     help='another schedule report of the same fold to read the link storage from '
                          '(one made by a compiler that reports it)')
+    st.add_argument('--state-calibration', default='', metavar='JSON',
+                    help="the state-home policy's calibration to synthesized LUTs (STATE_CAL; "
+                         'calibrations/state-*.json, state-fit)')
+    st.add_argument('--copy-budget', default='', metavar='FRAC[:SLR]',
+                    help="the state-home policy's per-copy budget (copy_budget): each copy's LUTs at most "
+                         'FRAC of the SLR (smallest by default) of the V80 region; with --state-calibration')
+    sf = sub.add_parser('state-fit', help="fit the state-home policy's calibration (STATE_CAL) on a "
+                                          'synthesized build: its as-built state outcome against Vivado')
+    sf.add_argument('--state', required=True, metavar='JSON',
+                    help="`state --built-json ... --out` of the build's generation, without a calibration")
+    sf.add_argument('--hier', required=True, metavar='RPT',
+                    help="the build's report_utilization -hierarchical (post-synthesis)")
+    sf.add_argument('--sim', default='sim', help="the simulator's instance in the report")
+    sf.add_argument('--afu', default='foldsim_afu_0', help="the kernel's (the simulator's parent)")
+    sf.add_argument('--top', default='top_wrapper', help="the region's top (the kernel's parent)")
+    sf.add_argument('--netlist', default='', metavar='MLIR',
+                    help="the build's foldsim_sim.mlir: the synthesized LUTs per counted (foldsim_cost) of its "
+                         'copies (count_to_synth, the per-class measure of foldsim --state-measured)')
+    sf.add_argument('--name', default='')
+    sf.add_argument('--out', required=True)
     f = sub.add_parser('fit', help='the period fit of a calibration and its leave-one-out error')
     f.add_argument('--calibration', required=True)
     for p in (g, c, e):
@@ -2917,6 +3070,8 @@ def main():
         return calibrate(a)
     if a.cmd == 'state':
         return state_main(a)
+    if a.cmd == 'state-fit':
+        return state_fit_main(a)
     cal = json.load(open(a.calibration)) if a.calibration else None
     fold = f'module={a.module} sim=foldsim_sim'
     if a.fold_options:
@@ -2942,8 +3097,127 @@ def main():
               default=str)
 
 
+def hier_rows(path):
+    """{instance: {lut, lutram (with SRLs), ff}} of a Vivado hierarchical
+    utilization report (the first row of each name)."""
+    hdr, out = None, {}
+    for line in open(path):
+        if not line.startswith('|'):
+            continue
+        c = [x.strip() for x in line.split('|')[1:-1]]
+        if hdr is None and c and c[0] == 'Instance':
+            hdr = c
+            continue
+        if hdr and len(c) == len(hdr) and c[0] not in out:
+            d = dict(zip(hdr, c))
+
+            def num(k):
+                m = re.match(r'[\d.]+', d.get(k, '') or '')
+                return float(m.group(0)) if m else 0.0
+            out[c[0]] = dict(lut=num('Total LUTs'), lutram=num('LUTRAMs') + num('SRLs'), ff=num('FFs'))
+    return out
+
+
+def state_fit(state, hier, sim='sim', afu='foldsim_afu_0', top='top_wrapper'):
+    """STATE_CAL fitted on one synthesized build: `state` the as-built
+    outcome of its generation (state --built-json, uncalibrated), `hier` its
+    hierarchical utilization (hier_rows). The copies' logic and LUTRAM
+    factors (least squares through zero over every copy the report has, as
+    `<copy>_copy`); the level's (the simulator less its copies, against the
+    outcome's LUTs outside the copies); the kernel and glue (the region's top
+    less the simulator), fixed. Returns (STATE_CAL, per-copy rows)."""
+    copies = state['res']['copies']
+    rows = []
+    for key, v in copies.items():
+        c, _, j = key.rpartition('#')
+        meas = hier.get(f'{c}_copy') if j == '0' else None
+        if meas:
+            rows.append(dict(copy=c, logic=v['logic'] + v['store_lut'], lutram=v['store_lutram'],
+                             m_logic=meas['lut'] - meas['lutram'], m_lutram=meas['lutram'],
+                             m_lut=meas['lut'], model=v['total']))
+    fl = sum(r['logic'] * r['m_logic'] for r in rows) / max(1e-9, sum(r['logic'] ** 2 for r in rows))
+    fr = sum(r['lutram'] * r['m_lutram'] for r in rows) / max(1e-9, sum(r['lutram'] ** 2 for r in rows))
+    model_copies = sum(v['total'] for v in copies.values())
+    m_copies = sum(r['m_lut'] for r in rows)
+    out_level = state['res']['luts'] - model_copies
+    m_level = hier[sim]['lut'] - m_copies
+    k_lut = hier[top]['lut'] - hier[sim]['lut']
+    k_lutram = hier[top]['lutram'] - hier[sim]['lutram']
+    cal = dict(copy_logic=round(fl, 3), copy_lutram=round(fr, 3),
+               level=round(m_level / max(out_level, 1), 3),
+               kernel_logic=round(k_lut - k_lutram), kernel_lutram=round(k_lutram),
+               placed_per_priced=1.02)
+    for r in rows:
+        r['fitted'] = fl * r['logic'] + fr * r['lutram']
+    return cal, rows
+
+
+def count_copies(sim):
+    """{copy: {lut, lutram, ff}} of a generated simulator (foldsim_sim.mlir):
+    each class copy's own module subtree (`<copy>_static`, the other copies
+    left out, no links), counted by foldsim_cost."""
+    import foldsim_cost
+    import foldsim_sll_check as sll
+    mods, _ = foldsim_cost.parse(sim, count=True)
+    statics = {m for m in mods if m.endswith('_static')}
+    out = {}
+    for st in statics:
+        acc = sll.new_acc()
+        sll.subtree(mods, st, statics - {st}, acc)
+        out[st[:-len('_static')]] = dict(lut=acc['lut'], lutram=acc['lutram'], ff=acc['ff'])
+    return out
+
+
+def state_fit_main(a):
+    state = json.load(open(a.state))
+    hier = hier_rows(a.hier)
+    cal, rows = state_fit(state, hier, a.sim, a.afu, a.top)
+    if a.netlist:
+        counted = count_copies(a.netlist)
+        # The LUT-weighted median of the copies' synthesized / counted (robust
+        # to the few small copies whose link rows the count charges them).
+        both = sorted((hier[f'{c}_copy']['lut'] / counted[c]['lut'], hier[f'{c}_copy']['lut'])
+                      for c in counted if f'{c}_copy' in hier and counted[c]['lut'])
+        half, acc = sum(w for _, w in both) / 2, 0.0
+        for r, w in both:
+            acc += w
+            if acc >= half:
+                cal['count_to_synth'] = round(r, 3)
+                break
+    cal = dict(name=a.name or os.path.basename(a.out).rsplit('.', 1)[0],
+               source=f'{os.path.abspath(a.state)} against {os.path.abspath(a.hier)}', **cal)
+    json.dump(cal, open(a.out, 'w'), indent=1)
+    print(f"copies: logic x{cal['copy_logic']}, LUTRAM x{cal['copy_lutram']}; level x{cal['level']}; "
+          f"kernel {cal['kernel_logic']} + {cal['kernel_lutram']} LUTRAM")
+    print(f"{'copy':40s} {'model':>9s} {'measured':>9s} {'fitted':>9s} {'error':>6s}")
+    for r in sorted(rows, key=lambda r: -r['m_lut']):
+        print(f"{r['copy'][:40]:40s} {r['model']:9.0f} {r['m_lut']:9.0f} {r['fitted']:9.0f} "
+              f"{100 * (r['fitted'] / max(r['m_lut'], 1) - 1):+5.0f}%")
+    return 0
+
+
+def state_policy(cal_path, budget=None, region_path='v80'):
+    """Set the state-home policy (foldsim --state auto): STATE_CAL from
+    `cal_path` (or none), the per-copy budget `budget` (FRAC[:SLR]: COPY_CAP)
+    over the region's SLRs, the on-chip-first repair. Returns COPY_CAP."""
+    global STATE_CAL, COPY_CAP
+    STATE_CAL = json.load(open(cal_path)) if cal_path else None
+    if STATE_CAL and STATE_CAL.get('placed_per_priced'):
+        storage.PLACED_PER_PRICED = STATE_CAL['placed_per_priced']
+    if budget:
+        frac, _, slr = str(budget).partition(':')
+        if region_path in ('', 'v80'):
+            region_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
+        COPY_CAP = copy_budget(json.load(open(region_path)), float(frac), slr or 'smallest')
+        storage.READ_BUFFERS = True
+        storage.ONCHIP_FIRST = True
+    return COPY_CAP
+
+
 def state_main(a):
     global BUILT
+    if getattr(a, 'state_calibration', '') or getattr(a, 'copy_budget', ''):
+        state_policy(a.state_calibration, a.copy_budget)
     ENGINES.update(rule=getattr(a, 'engine_rule', 'max'), shift=getattr(a, 'link_hbm_shift', 0))
     PLATFORM.update(by_traffic=getattr(a, 'masters_by_traffic', False))
     storage.PAGE_WRITE_GATE = getattr(a, 'page_write_gate', False)

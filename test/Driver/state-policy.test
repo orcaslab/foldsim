@@ -1,0 +1,50 @@
+# The state-home policy of --state auto (foldsim_degree.state_policy): each
+# class copy's LUTs (its logic, its stores' LUTs and LUTRAM, calibrated to
+# synthesized LUTs) at most a share of the smallest SLR it may sit in
+# (--state-copy-budget, 0.75 by default); a copy past it moves stores into
+# RAM on chip first (block or ultra RAM, a page RAM), off chip (HBM) only once
+# the copy's RAM is spent; --storage rules given stay the only ones for their
+# stores; the calibration's fit (state-fit) and a class's own factors.
+# RUN: rm -rf %t && python3 %S/Inputs/state/policy.py foldsim %t/py | FileCheck %s
+# CHECK: budget small lut 90000 lutram 15000 bram 255 uram 85; named 450000
+# Register state past the budget's LUTRAM: paged on chip, H the frame.
+# CHECK: regs free: copy 44551 lutram 24551 H 256 page -
+# CHECK: regs policy: copy {{[0-9]+}} lutram 0 H 256 page Slice:4 off [] moved []
+# Queues: to block and ultra RAM; with the copy's RAM spent, to HBM.
+# CHECK: queues free: copy 49157 lutram 29157 H 256 page - off [] moved []
+# CHECK: queues policy: copy {{[0-9]+}} lutram {{[0-9]+}} H 256 page - off [] moved [] rules ['Slice:q7/ram=ultra', 'Slice:regs>=2000=ultra']
+# CHECK: queues spent: copy 32814 lutram 12814 H 256 page - off [] moved ['q0/ram', 'q1/ram', 'q2/ram', 'q3/ram']
+# More bytes off chip than the schedule's frame carries: a longer frame.
+# CHECK: queues longer: copy {{[0-9]+}} lutram {{[0-9]+}} H 384 page - off [] moved ['q0/ram', 'q1/ram', 'q10/ram',
+# CHECK: queues given: {{.*}} rules ['Slice:q7/ram=ultra', 'Slice:regs>=2000=ultra']
+# CHECK: factors (2.0, 1.0) (1.5, 1.25)
+# CHECK: queues measured: copy {{[0-9]+}}
+# CHECK: onchip-first True: ['block']
+# CHECK: onchip-first False: ['hbm']
+# CHECK: fit {'copy_logic': 1.323, 'copy_lutram': 1.5, 'level': 1.225, 'kernel_logic': 450, 'kernel_lutram': 50}
+# Through the driver (Inputs/paged, four leaves): within 0.1 % of SLR0 (256
+# LUTs) the leaves' register stores from 8 bits go to block RAM; the copy as
+# counted in the netlist within the budget (state_budget.txt); a budget below
+# the copy's own logic refused, the copy named; a --storage rule given kept
+# alone for its store.
+# RUN: cd %S/Inputs/paged
+# RUN: foldsim --srcs top.f --top Top --out %t/b --static --bubbles --state auto --state-copy-budget 0.001 Leaf 2>&1 | FileCheck %s --check-prefix=DRV
+# RUN: FileCheck %s --check-prefix=TABLE < %t/b/state.txt
+# RUN: FileCheck %s --check-prefix=BUDGET < %t/b/state_budget.txt
+# RUN: not foldsim --srcs top.f --top Top --out %t/x --static --bubbles --state auto --state-copy-budget 0.0005 Leaf 2>&1 | FileCheck %s --check-prefix=REFUSE
+# RUN: foldsim --srcs top.f --top Top --out %t/g --static --bubbles --storage "Leaf:ram=block,Leaf:regs>=8=distributed" --state auto --state-copy-budget 0.002 Leaf 2>&1 | FileCheck %s --check-prefix=GIVEN
+# RUN: foldsim --srcs top.f --top Top --out %t/m --static --bubbles --state auto --state-copy-budget 0.001 --state-measured %t/b Leaf 2>&1 | FileCheck %s --check-prefix=MEASURED
+# DRV: foldsim: state auto: frame [[F:[0-9]+]] (II [[F]]), H at most [[F]];
+# DRV: foldsim: state budget: largest copy Leaf {{[0-9]+}} LUTs ({{[0-9]+}} % of the budget, counted x 0.791); see
+# DRV-NOT: past it
+# TABLE: policy: calibration state-v80-y8b-20261113.json, copy budget 256 LUTs (x0.001 of SLR0)
+# TABLE: storage: Leaf:regs>=8=block
+# TABLE: copies (synthesized LUTs, the budget 256):
+# TABLE-NEXT: Leaf#0
+# BUDGET: copy budget 256 LUTs, 128 LUTRAM (x0.001 of SLR0); counted x 0.791
+# BUDGET-NOT: OVER
+# REFUSE: --state auto: nothing fits the V80 region {{.*}} copy budget 128 LUTs (x0.0005 of SLR0)); past their copy budget: Leaf#0 ({{[0-9]+}} LUTs at the schedule's frame)
+# GIVEN: foldsim-fold-static{{.*}} storage=Leaf:ram=block,Leaf:regs>=8=distributed{{[ }]}}
+# GIVEN-NOT: Leaf:ram=distributed
+# GIVEN-NOT: storage: no memory
+# MEASURED: foldsim: state auto: frame

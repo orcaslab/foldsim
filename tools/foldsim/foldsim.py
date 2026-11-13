@@ -844,6 +844,90 @@ def choose_pages(a, foldsim_opt, flat, passes, out, fold):
     return spec, [f'{m}:pages=hbm' for m in off]
 
 
+# The state-home policy's calibration to synthesized LUTs by default
+# (foldsim_degree.STATE_CAL: fitted on the 8-SM y8b image's post-synthesis
+# hierarchy, foldsim_degree.py state-fit).
+STATE_CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'calibrations',
+                                 'state-v80-y8b-20261113.json')
+
+
+def state_measured(path, cal):
+    """Per class (model) logic and LUTRAM factors of a generation of the same
+    recipe (--state-measured <its out dir>): its copies as counted in its
+    foldsim_sim.mlir (foldsim_degree.count_copies, times the calibration's
+    count_to_synth) against what its --state auto priced them at (its
+    state.json, with the factors it used)."""
+    import foldsim_degree
+    prev = json.load(open(os.path.join(path, 'state.json')))
+    counted = foldsim_degree.count_copies(os.path.join(path, 'foldsim_sim.mlir'))
+    k = (cal or {}).get('count_to_synth', 1.0)
+    sums = {}
+    for key, v in prev['copies'].items():
+        c = key.rpartition('#')[0]
+        if c not in counted:
+            continue
+        model = re.sub(r'_copy\d+$', '', c)
+        x = sums.setdefault(model, [0.0, 0.0, 0.0, 0.0])
+        x[0] += (counted[c]['lut'] - counted[c]['lutram']) * k
+        x[1] += counted[c]['lutram'] * k
+        x[2] += v['logic'] + v['store_lut']
+        x[3] += v['store_lutram']
+    out = {}
+    for model, (ml, mr, pl, pr) in sums.items():
+        fl, fr = prev['factors'].get(model, (1.0, 1.0))
+        out[model] = dict(logic=round(fl * ml / pl, 3) if pl > 0 else fl,
+                          lutram=round(fr * mr / pr, 3) if pr > 0 and mr > 0 else fr)
+    return out
+
+
+def state_policy(a, out):
+    """The state-home policy of --state auto (foldsim_degree.state_policy):
+    the calibration to synthesized LUTs, each copy's budget within the
+    smallest SLR it may sit in, on chip before HBM; the --storage rules given
+    kept as they are (GIVEN); a generation's measure (--state-measured).
+    Returns a line for the log."""
+    import foldsim_degree
+    calp = '' if a.state_calibration == 'none' else (a.state_calibration or STATE_CALIBRATION)
+    budget = None if a.state_copy_budget in ('', '0', 'off', 'none') else a.state_copy_budget
+    region = a.slr_region if a.slr_region not in ('',) else 'v80'
+    cap = foldsim_degree.state_policy(calp, budget, region)
+    if a.state_measured:
+        if not foldsim_degree.STATE_CAL:
+            sys.exit('--state-measured needs a --state-calibration')
+        foldsim_degree.STATE_CAL['classes'] = state_measured(a.state_measured, foldsim_degree.STATE_CAL)
+    if a.storage and a.storage != 'auto':
+        foldsim_degree.GIVEN = foldsim_degree.given_rules(a.storage)
+    return ('calibration ' + (os.path.basename(calp) if calp else 'none')
+            + (f", copy budget {cap['lut']:.0f} LUTs (x{cap['frac']:g} of {cap['name']})" if cap else '')
+            + (f", measured {a.state_measured}" if a.state_measured else ''))
+
+
+def state_budget_check(a, sim, out):
+    """After the fold, each copy as counted in the netlist (synthesized:
+    count_to_synth) against the policy's budget: the copies past it, and the
+    measure to choose again with (--state-measured)."""
+    import foldsim_degree
+    cap, cal = foldsim_degree.COPY_CAP, foldsim_degree.STATE_CAL or {}
+    if not cap:
+        return
+    k = cal.get('count_to_synth', 1.0)
+    counted = foldsim_degree.count_copies(sim)
+    rows = sorted(((c, v['lut'] * k, v['lutram'] * k) for c, v in counted.items()), key=lambda r: -r[1])
+    over = [r for r in rows if r[1] > cap['lut'] or r[2] > cap['lutram']]
+    with open(out('state_budget.txt'), 'w') as f:
+        f.write(f"copy budget {cap['lut']:.0f} LUTs, {cap['lutram']:.0f} LUTRAM (x{cap['frac']:g} of "
+                f"{cap['name']}); counted x {k}\n")
+        for c, lut, lr in rows:
+            f.write(f"{c:48s} {lut:10.0f} {lr:10.0f} {100 * lut / cap['lut']:6.1f} %"
+                    + ('  OVER' if (c, lut, lr) in over else '') + '\n')
+    largest = rows[0] if rows else ('none', 0, 0)
+    print(f"foldsim: state budget: largest copy {largest[0]} {largest[1]:.0f} LUTs "
+          f"({100 * largest[1] / cap['lut']:.0f} % of the budget, counted x {k})"
+          + (f"; {len(over)} past it ({', '.join(r[0] for r in over)}): choose again with "
+             f"--state-measured {os.path.dirname(sim)}" if over else '')
+          + f"; see {out('state_budget.txt')}", file=sys.stderr)
+
+
 def choose_state(a, foldsim_opt, flat, passes, out, fold):
     """--state auto: where each class's state lives (foldsim_degree.choose_state:
     on chip, paged on chip, or in HBM, priced against the V80 region, its
@@ -852,6 +936,7 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
     and the storage rules (pages=hbm among them); the choice is written to
     <out>/state.txt."""
     import foldsim_degree
+    policy = state_policy(a, out)
     models = out('models.mlir')
     if not os.path.exists(models):
         run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
@@ -880,11 +965,36 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
                                       pattern=pattern, weights=weights,
                                       row_bytes_min=a.vmem_row_bytes_min)
     if res is None:
+        last = foldsim_degree.LAST_REFUSAL
+        over = sorted({p.partition('@')[2] for p in last.get('over', [])})
+        if over:
+            # The copies whose own logic leaves no room in their budget, with
+            # every store moved.
+            over = [f"{c} ({last['copies'].get(c, {}).get('total', 0):.0f} LUTs at the schedule's frame)"
+                    for c in over]
         sys.exit(f'--state auto: nothing fits the V80 region (II {ii})'
                  + (f" with the links' {links['lutram']:.0f} LUTRAM LUTs, {links['bram']} RAMB36, "
-                    f"{links['uram']} URAM288" if links else '') + f'; see {base}')
+                    f"{links['uram']} URAM288" if links else '') + f' ({policy})'
+                 + (f"; past their copy budget: {', '.join(over)}" if over else '') + f'; see {base}')
+    cap = foldsim_degree.COPY_CAP
+    over = (res['res'].get('copy_cap') or {}).get('over', [])
     with open(out('state.txt'), 'w') as f:
-        f.write(f'II {ii} (schedule)\n' + foldsim_degree.state_table(res, classes, est) + '\n')
+        f.write(f'II {ii} (schedule); policy: {policy}\n' + foldsim_degree.state_table(res, classes, est) + '\n')
+        if cap:
+            f.write(f"copies (synthesized LUTs, the budget {cap['lut']:.0f}):\n")
+            for key, v in sorted(res['res']['copies'].items(), key=lambda kv: -kv[1]['total']):
+                f.write(f"  {key:48s} {v['total']:9.0f} ({v['logic']:.0f} logic, {v['store_lut']:.0f} store LUTs, "
+                        f"{v['store_lutram']:.0f} LUTRAM, {v['bram']} RAMB36, {v['uram']} URAM) "
+                        f"{100 * v['total'] / cap['lut']:5.1f} %\n")
+            if over:
+                f.write('past their caps: ' + ', '.join(over) + '\n')
+    # The outcome per copy and the factors it was priced with (for --state-measured).
+    json.dump(dict(copies=res['res']['copies'], copy_cap=cap,
+                   factors={re.sub(r'_copy\d+$', '', c): foldsim_degree.state_factors(c) for c in classes}),
+              open(out('state.json'), 'w'), indent=1)
+    if over:
+        sys.exit(f'--state auto: copies past the per-copy budget ({policy}): {", ".join(over)}; '
+                 f'see {out("state.txt")}')
     h = res['h']
     print(f"foldsim: state auto: frame {res['frame']} (II {ii}), H at most {h['h']}; page "
           f"{len(res['page'].split(',')) if res['page'] else 0} models, {len(res['rows_new'])} "
@@ -909,8 +1019,15 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
                 fold += ' vmem-skip-held-reads'
     if res['storage']:
         m = re.search(r' storage=(\S+)', fold)
-        fold = (fold.replace(m.group(0), f" storage={m.group(1)},{res['storage']}") if m
-                else fold + f" storage={res['storage']}")
+        rules = res['storage']
+        if m:
+            # The given rules stay the only ones for their stores (the
+            # compiler takes one rule a store).
+            given = {r.rpartition('=')[0] for r in m.group(1).split(',')}
+            rules = ','.join(r for r in rules.split(',') if r.rpartition('=')[0] not in given)
+        if rules:
+            fold = (fold.replace(m.group(0), f" storage={m.group(1)},{rules}") if m
+                    else fold + f" storage={rules}")
     return fold
 
 
@@ -2213,6 +2330,20 @@ def build_parser():
                          'or in HBM (virtual memories, pages off chip), the least state off chip '
                          'that lets the fold place and route on the V80 region at the shortest '
                          'frame, H projected; the choice in <out>/state.txt')
+    ap.add_argument('--state-copy-budget', default='0.75', metavar='FRAC[:SLR]',
+                    help="with --state auto: the state-home policy's budget per class copy: its LUTs "
+                         '(its logic, its stores\' LUTs and LUTRAM, synthesized: --state-calibration) at most '
+                         'FRAC of the smallest SLR it may sit in (or the SLR named) of --slr-region (the V80\'s '
+                         'by default), its block and ultra RAM within the region\'s margin of it; a copy over '
+                         'moves stores to block or ultra RAM first (registered reads), then to HBM; default '
+                         '0.75, 0: none')
+    ap.add_argument('--state-calibration', default='', metavar='JSON|none',
+                    help="with --state auto: the area model's calibration to synthesized LUTs (copies' logic "
+                         'and LUTRAM, the level, the kernel beside the simulator: foldsim_degree.py state-fit; '
+                         'default calibrations/state-v80-y8b-20261113.json)')
+    ap.add_argument('--state-measured', default='', metavar='DIR',
+                    help='with --state auto: per class factors from a generation of the same recipe (its out '
+                         'dir: state.json and foldsim_sim.mlir), its copies as counted against as priced')
     ap.add_argument('--page-rows', metavar='REGEX',
                     help='with --page: the memories (<model>:<name>) that page as rows whatever '
                          'their size, as --state auto chooses them (foldsim-fold-static page-rows)')
@@ -2750,6 +2881,8 @@ def main():
             sys.exit('--slr-split needs --static')
         split_plan = slr_split(a, foldsim_opt, sim, out)
     sim_text = open(sim).read()
+    if a.static and a.state == 'auto':
+        state_budget_check(a, sim, out)
     # A RAM with a registered read states its read-under-write behavior to
     # Vivado, which otherwise leaves a read colliding with a write undefined.
     run([tool('firtool'), '--format=mlir', sim,
