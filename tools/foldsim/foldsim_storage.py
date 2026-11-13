@@ -1144,7 +1144,11 @@ def assign(units, base, caps, extra=None, paging=False, price_extra=False):
         choice, used = solve(weight)
         if peak(used) < best[0]:
             best = (peak(used), choice, used)
-    if best[0][0]:
+    if best[0][0] and not ONCHIP_FIRST:
+        # (The state-home policy's repair is ordered, RAM on chip before HBM;
+        # the price search below ignores the order, and over its per-copy
+        # pools it takes hours: where the ordered repair places nothing, the
+        # point does not place.)
         # Nothing placed: several pools over pull the repair's single moves
         # apart. Search the pools' prices instead (multiplicative weights:
         # each store its cheapest kind at the prices, a pool's price raised
