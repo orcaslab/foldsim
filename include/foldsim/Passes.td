@@ -1728,6 +1728,31 @@ def CompressAddTrees : Pass<"foldsim-compress-add-trees",
   let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
 }
 
+def LocalizeReadAddresses : Pass<"foldsim-localize-read-addresses", "::mlir::ModuleOp"> {
+  let summary = "Copy a memory read's address registers out of a kept instance";
+  let description = [{
+    For each asynchronous-read memory that seq-retime-firmem-reads would make
+    synchronous (it asks for block RAM, or `mode=auto` and at least
+    `min-bits` bits): where its read address is computed from registers and
+    from outputs of kept instances (class modules, not inlined) that are
+    themselves computed from registers on the memory's write clock, the
+    instance's module gets an output `<output>_foldsim_next`, the next value
+    of that output (its registers' next values, synchronous resets applied),
+    and the memory's module a register of it; the address is computed from
+    that register, equal to the output on every cycle after the first edge.
+    The read can then be retimed with the module boundary kept.
+  }];
+  let options = [
+    Option<"mode", "mode", "std::string", "\"off\"",
+           "Memories without a hint: off (leave alone) or auto">,
+    Option<"minBits", "min-bits", "uint64_t", "0",
+           "In auto mode, leave unhinted memories of fewer bits alone">,
+    Option<"verbose", "verbose", "bool", "false",
+           "Print how many reads were localized">,
+  ];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::seq::SeqDialect"];
+}
+
 def KeepModules : Pass<"foldsim-keep-modules", "::mlir::ModuleOp"> {
   let summary = "Keep the instances of named modules through inlining";
   let description = [{

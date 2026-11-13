@@ -1,0 +1,23 @@
+# REQUIRES: verilator
+# foldsim-localize-read-addresses: a memory that asks for block RAM, read
+# asynchronously at an address whose registers sit in a class kept as an
+# instance (Driver/Inputs/localize: the queue's head in class Ptr, the RAM in
+# class Leaf). seq-retime-firmem-reads, which inlines only private modules,
+# refused it ("address depends on hw.instance"; a32-HX 11-12: the compute
+# slice split into execute_slice / issue_slice classes, its ipdom stack's RAM
+# read at an address from execute_slice). The class gets an output with the
+# next value of the head, the RAM's module a register of it, the read is
+# retimed with the boundary kept; virtual (a registered read), it matches the
+# target at any latency, with stalls.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/localize
+# RUN: foldsim --srcs top.f --top Top --out %t/lz --static --nest --virtual-memories ram Leaf Ptr > %t/lz.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/lz.log
+# RUN: FileCheck %s --check-prefix=RPT < %t/lz/memories.rpt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DWRITE_FIRST -Mdir %t/lz/obj %S/Inputs/tb_vmem.sv top.sv %t/lz/foldsim_sim.sv > %t/lz/build.log 2>&1
+# RUN: %t/lz/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/lz/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | FileCheck %s
+# RUN: %t/lz/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | FileCheck %s
+# LOG: foldsim-localize-read-addresses: 1 reads' address registers copied beside their memory
+# RPT: Leaf.ram 16x8 ram_style=block converted
+# CHECK: {{^}}MATCH
+# CHECK-NOT: MISMATCH

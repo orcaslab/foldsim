@@ -4,6 +4,7 @@ add_mlir_library(FoldsimTransforms
   Compose.cpp
   EstimateArea.cpp
   EstimateTiming.cpp
+  LocalizeReadAddresses.cpp
   ExtractModels.cpp
   FAME5.cpp
   FindPipelines.cpp

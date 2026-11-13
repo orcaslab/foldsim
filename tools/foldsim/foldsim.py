@@ -1808,6 +1808,10 @@ def build_parser():
                     help='negations of at least MIN_BITS bits (x & -x, the lowest set bit of a '
                          'priority select) as a logarithmic prefix OR instead of a carry chain, before '
                          'folding (foldsim-lower-wide-negation). Exact; 0: none')
+    ap.add_argument('--localize-read-addresses', choices=('hinted', 'auto'), default='hinted',
+                    help='copy a memory read\'s address registers out of a kept class instance (foldsim-localize-'
+                         'read-addresses) for memories that ask for block RAM (hinted, the default), or also for '
+                         'the unhinted ones --retime-memory-reads converts (auto)')
     ap.add_argument('--retime-memory-reads', metavar='MIN_BITS', type=int,
                     help="memories of at least MIN_BITS bits without a ram_style hint, read "
                          'asynchronously at an address that is a function of registers alone (a '
@@ -2480,11 +2484,24 @@ def main():
         f.write(publish(open(design).read(), [a.top] + modules))
     # A RAM that asks for block RAM reads synchronously once its wrapper is
     # flattened into the module that registers its address.
+    # A memory whose address registers sit in a class kept as an instance (a
+    # deeper fold) gets a copy of them beside it first (foldsim-localize-read-
+    # addresses): the class boundary stays. Memories that ask for block RAM
+    # always (else the retime fails); unhinted ones (mode auto) only with
+    # --localize-read-addresses auto, which may convert more of them.
     run([tool('circt-opt'), flat + '.in', '--symbol-dce', '--hw-flatten-modules', '--symbol-dce',
-         '--canonicalize', '--cse', f'--seq-retime-firmem-reads=report={out("memories.rpt")}'
+         '--canonicalize', '--cse', '-o', flat + '.pre'])
+    os.remove(flat + '.in')
+    loc_mode = ' mode=auto' if a.localize_read_addresses == 'auto' and a.retime_memory_reads is not None else ''
+    loc_bits = f' min-bits={a.retime_memory_reads}' if a.retime_memory_reads is not None else ''
+    run([foldsim_opt, flat + '.pre',
+         f'--pass-pipeline=builtin.module(foldsim-localize-read-addresses{{{loc_mode}{loc_bits} verbose}})',
+         '-o', flat + '.loc'])
+    os.remove(flat + '.pre')
+    run([tool('circt-opt'), flat + '.loc', f'--seq-retime-firmem-reads=report={out("memories.rpt")}'
          + (f' mode=auto min-bits={a.retime_memory_reads}' if a.retime_memory_reads is not None else ''),
          '--canonicalize', '--cse', '-o', flat])
-    os.remove(flat + '.in')
+    os.remove(flat + '.loc')
     # The top's per-child glue folded: lanes, a lane cell class, scans.
     if a.lane_scan:
         lanes = f' lanes={a.lane_scan_modules}' if a.lane_scan_modules else ''
