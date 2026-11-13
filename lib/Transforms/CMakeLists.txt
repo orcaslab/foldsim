@@ -24,6 +24,7 @@ add_mlir_library(FoldsimTransforms
   Pipelines.cpp
   OutlineScopes.cpp
   RemoveDeadState.cpp
+  SplitArrayRegisters.cpp
   ReplicateControls.cpp
   TableRoms.cpp
   SlrSplit.cpp

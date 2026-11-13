@@ -2429,6 +2429,10 @@ def build_parser():
                     help='a generate loop of a flat module (its registers named PREFIX<i>.): each iteration, with the '
                          'logic that feeds it alone, an instance of a new module NAME, folded as a class '
                          '(foldsim-outline-scopes; the iterations must be the same logic)')
+    ap.add_argument('--split-array-registers', default='', metavar='MODULE,...',
+                    help='in these modules, an array register read only at constant indices becomes a register '
+                         'per element (foldsim-split-array-registers), so that --absorb-registers can move one '
+                         'element\'s state with the logic that reads it alone (a switch\'s per-output snapshot)')
     ap.add_argument('--absorb-registers', action='store_true',
                     help="with --absorb-exclusive: the logic a model input alone reads may pass "
                          "through registers (a per-port pipeline register and the select in front "
@@ -3514,6 +3518,11 @@ def main():
     # State no output observes goes before the models are cut (their ports then
     # carry only what is read) and again in each model (OPTIMIZE).
     passes = ['hw.module(foldsim-remove-dead-state)']
+    # Array registers read only by constant index in these modules: a register per element (absorb-registers can
+    # then move one element's state into the model of the logic that reads it alone).
+    if getattr(a, 'split_array_registers', ''):
+        passes.append(f'hw.module(foldsim-split-array-registers{{modules={a.split_array_registers}}})')
+        passes += ['canonicalize', 'cse']
     registers = memory_registers(a, flat, out)
     if registers:
         passes.append(registers)

@@ -2251,6 +2251,31 @@ def OutlineScopes : Pass<"foldsim-outline-scopes", "::mlir::ModuleOp"> {
   let dependentDialects = ["circt::hw::HWDialect", "circt::seq::SeqDialect"];
 }
 
+def SplitArrayRegisters : Pass<"foldsim-split-array-registers", "::circt::hw::HWModuleOp"> {
+  let summary = "A register per element of an array register read only by constant index";
+  let description = [{
+    A register of array type (no symbol, no preset) whose every reader is a
+    `hw.array_get` at a constant index becomes a register per element, each
+    taking that element of the next value and of the reset value; nested
+    arrays split level by level. The same bits in every cycle. An RTL array
+    written in one process (`s_hit[o][i] <= ...` over loops) is then
+    per-element state: logic that reads one element alone, with its register,
+    can move into a model (foldsim-extract-models absorb-exclusive with
+    absorb-registers), e.g. a switch's per-output snapshot into the class of
+    that output's arbiter.
+  }];
+  let options = [
+    Option<"maxElements", "max-elements", "unsigned", "0",
+           "Split arrays of at most this many elements (0: any)">,
+    ListOption<"modules", "modules", "std::string",
+               "Only in these modules (all if empty)">,
+  ];
+  let statistics = [
+    Statistic<"numSplit", "split", "Array registers split">,
+  ];
+  let dependentDialects = ["circt::hw::HWDialect", "circt::seq::SeqDialect"];
+}
+
 def RemoveDeadState : Pass<"foldsim-remove-dead-state", "::circt::hw::HWModuleOp"> {
   let summary = "Remove registers and memories that no output observes";
   let description = [{
