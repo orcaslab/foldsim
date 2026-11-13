@@ -43,6 +43,9 @@ install(PROGRAMS ready_choice.py DESTINATION bin)
 # The SLLs an existing netlist needs against the region's budget (from its logged fold pipeline).
 configure_file(foldsim_sll_check.py ${CMAKE_BINARY_DIR}/bin/foldsim_sll_check.py COPYONLY)
 install(PROGRAMS foldsim_sll_check.py DESTINATION bin)
+# A floorplan that pins each class copy to its SLR from a given assignment (judged by foldsim_sll_check --floorplan).
+configure_file(foldsim_pin_copies.py ${CMAKE_BINARY_DIR}/bin/foldsim_pin_copies.py COPYONLY)
+install(PROGRAMS foldsim_pin_copies.py DESTINATION bin)
 # The fit calibration database (every synthesis of a netlist against its count) and the bound check of a fold
 # against its region (floor, median, upper bound; per copy against the SLRs; the image's post-synthesis gate).
 configure_file(foldsim_fitdb.py ${CMAKE_BINARY_DIR}/bin/foldsim_fitdb.py COPYONLY)

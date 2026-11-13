@@ -1,0 +1,28 @@
+# foldsim_pin_copies.py: a floorplan pinning each class copy (the simulator top's <class>_copy) to an SLR from a given
+# assignment: CLASS:SLR pairs, or the `assignment` of an SLL check's --json (one list a SLR, named by its `caps`).
+# Classes with no copy in the netlist are refused; copies the assignment leaves out too, unless --partial.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/three
+# RUN: foldsim --srcs top.f --top Top --out %t/g --static --copies Leaf:3 Leaf 2> %t/g.log
+# RUN: python3 %foldsim_tools/foldsim_pin_copies.py %t/g --assignment Leaf:SLR1,Top_model:SLR1,Leaf_copy1:SLR0,Leaf_copy2:SLR0 -o %t/bal.tcl
+# RUN: FileCheck %s --check-prefix=BAL < %t/bal.tcl
+# BAL: # foldsim pinned copies: 4 of 4 copies
+# BAL-NEXT: set c [get_cells -quiet -hierarchical Leaf_copy1_copy]
+# BAL-NEXT: if {[llength $c] == 1} { set_property USER_SLR_ASSIGNMENT SLR0 $c }
+# BAL-NEXT: set c [get_cells -quiet -hierarchical Leaf_copy2_copy]
+# BAL-NEXT: USER_SLR_ASSIGNMENT SLR0
+# BAL-NEXT: set c [get_cells -quiet -hierarchical Leaf_copy]
+# BAL-NEXT: USER_SLR_ASSIGNMENT SLR1
+# BAL-NEXT: set c [get_cells -quiet -hierarchical Top_model_copy]
+# BAL-NEXT: USER_SLR_ASSIGNMENT SLR1
+# From an SLL check's --json: its own assignment, every copy.
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --slr-region %S/Inputs/slr-copy-cap/region-pin.json --foldsim-opt foldsim-opt --copy-cap none --out %t/own --json %t/own.json > %t/own.txt
+# RUN: python3 %foldsim_tools/foldsim_pin_copies.py %t/g --assignment %t/own.json | FileCheck %s --check-prefix=JSON
+# JSON: # foldsim pinned copies: 4 of 4 copies
+# RUN: not python3 %foldsim_tools/foldsim_pin_copies.py %t/g --assignment Leaf:SLR1,Nope:SLR0 2>&1 | FileCheck %s --check-prefix=UNKNOWN
+# UNKNOWN: names classes with no copy in this netlist: Nope
+# RUN: not python3 %foldsim_tools/foldsim_pin_copies.py %t/g --assignment Leaf:SLR1 2>&1 | FileCheck %s --check-prefix=LEFT
+# LEFT: leaves out copies of this netlist (--partial to leave them to the placer): Leaf_copy1 Leaf_copy2 Top_model
+# RUN: not python3 %foldsim_tools/foldsim_pin_copies.py %t/g --assignment Leaf:north 2>&1 | FileCheck %s --check-prefix=NAME
+# NAME: not an SLR name: north
+# RUN: python3 %foldsim_tools/foldsim_pin_copies.py %t/g --assignment Leaf:SLR1 --partial | FileCheck %s --check-prefix=PART
+# PART: # foldsim pinned copies: 1 of 4 copies
