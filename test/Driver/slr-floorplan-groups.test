@@ -1,0 +1,28 @@
+# The SLL check judges the floorplan the implementation gets. A generation folded into SLR groups
+# (--slr-groups) pins each group whole (foldsim_floorplan.tcl, applied before opt_design): that floorplan is the
+# assignment, each group within its SLR's room at the placement fill, whatever the options the check is given. (y8b,
+# 11-12: the fit gate's check never saw the groups and passed its own 3-SLR assignment; the floorplan pinned 2 groups
+# whole, SLR2 placed at 94.5 % of its LUTs, and the route failed.) Three leaves pinned in one group on two SLRs of 100
+# LUTs (fill 75 %): the group (with the simulator level's share) is past SLR1's room, while an assignment of its own
+# (the copies over both SLRs) fits. A group named fs_slr<g> (the placer's choice) is checked in the SLR it fits best.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/three
+# RUN: foldsim --srcs top.f --top Top --out %t/g --static --copies Leaf:3 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:0,Leaf_copy2:0 Leaf 2> %t/g.log
+# RUN: FileCheck %s --check-prefix=FP < %t/g/foldsim_floorplan.tcl
+# FP: set c [get_cells -quiet -hierarchical foldsim_slr0]
+# FP-NEXT: USER_SLR_ASSIGNMENT fs_slr0
+# With the generation's log:
+# RUN: not python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/g.log --slr-region %S/Inputs/slr-copy-cap/region-pin.json --foldsim-opt foldsim-opt --copy-cap none --out %t/c1 | FileCheck %s
+# With fold options that do not name the groups (as the stale check saw y8b): the floorplan's groups all the same.
+# RUN: sed -E 's/ slr-[a-z-]+=[^ }]*//g' %t/g.log > %t/nogroups.log
+# RUN: not python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/nogroups.log --slr-region %S/Inputs/slr-copy-cap/region-pin.json --foldsim-opt foldsim-opt --copy-cap none --out %t/c2 | FileCheck %s
+# CHECK: as built (slr-groups: the generation's groups and serialized link wires), pinned whole by the floorplan {{.*}}foldsim_floorplan.tcl
+# CHECK-NEXT: slr0 ({{[0-9]+}} sites): Leaf Top_model Leaf_copy1 Leaf_copy2
+# CHECK-NEXT: slr0 -> SLR1 (the placer: its best fit): lut 48 (48 % of the SLR): Leaf Top_model Leaf_copy1 Leaf_copy2
+# CHECK-NEXT: SLR0: no group pinned
+# CHECK: SLR1 as placed: lut 81 (81 %)
+# CHECK: g: REFUSE: the generation's SLR groups past their SLRs' room: SLR1 lut
+# Without the pins (another floorplan given, here none of the groups): the check's own assignment fits.
+# RUN: echo '# no SLR groups' > %t/none.tcl
+# RUN: python3 %foldsim_tools/foldsim_sll_check.py %t/g --log %t/nogroups.log --floorplan %t/none.tcl --slr-region %S/Inputs/slr-copy-cap/region-pin.json --foldsim-opt foldsim-opt --copy-cap none --out %t/c3 | FileCheck %s --check-prefix=OWN
+# OWN-NOT: as built
+# OWN: g: OK

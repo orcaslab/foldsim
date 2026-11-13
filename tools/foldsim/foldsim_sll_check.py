@@ -47,7 +47,7 @@ refuses; the driver's --slr-policy strict and fit_gate.sh FIT_SLR_POLICY=strict 
 """
 import argparse, json, math, os, re, shlex, subprocess, sys
 from collections import defaultdict
-from itertools import takewhile
+from itertools import permutations, takewhile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -641,6 +641,24 @@ def vmem_controllers(gdir, stext=''):
             for k, v in enumerate(vm)] + ports
 
 
+def floorplan_groups(path, stext):
+    """The compiler's own SLR groups as the implementation gets them (foldsim --slr-groups): each foldsim_slr<g> the
+    floorplan (foldsim_floorplan.tcl, the file pre_opt_hook.tcl applies) pins whole, by SLR name (--slr-region) or
+    as fs_slr<g> (the placer's choice), with the generation's own schedule's `slr groups:` section (its
+    `slr<g> (<sites> sites): <classes>` lines). [(g, classes, SLR name or None)], or None without such pins."""
+    if not path or not os.path.exists(path):
+        return None
+    pins = re.findall(r'-hierarchical foldsim_slr(\d+)\]\s*\n[^\n]*USER_SLR_ASSIGNMENT (\S+) \$c', open(path).read())
+    if not pins:
+        return None
+    sec = stext[stext.index('  slr groups:'):] if '  slr groups:' in stext else ''
+    out = []
+    for g, where in sorted((int(g), w) for g, w in pins):
+        mm = re.search(rf'^    slr{g} \(\d+ sites\):(.*)$', sec, re.M)
+        out.append((g, mm.group(1).split() if mm else [], where if re.fullmatch(r'SLR\d+', where) else None))
+    return out
+
+
 # --vmem-engines: where each controller (its engine) sits. placer (default) and auto: where it crosses the fewest
 # SLLs (the placer moves it there: y8r1di, 11-07, put each controller beside its class copy, VX_opc_unit's in
 # SLR1 with its master crossing to the NMUs); nmu: at its HBM NMU's SLR; local: in its copies' main SLR; flat: the
@@ -808,6 +826,9 @@ def main():
                     help='the global SLR plan: every whole copy and split part assigned to an SLR within its caps, '
                          'the worst boundary\'s SLLs least; its floorplan (parts in pblocks, copies soft) written here')
     ap.add_argument('--json', help='write the copies\' resources, wires and assignment here (calibration)')
+    ap.add_argument('--floorplan', metavar='TCL',
+                    help='the floorplan the implementation applies (default <gen>/foldsim_floorplan.tcl): SLR groups '
+                         'it pins whole (foldsim_slr<g>) are checked as pinned, each within its SLR\'s room')
     ap.add_argument('--register-state-entries', type=int, default=None)
     ap.add_argument('--slr-policy', choices=('guide', 'strict'), default='guide',
                     help='guide (default, 11-08): a copy past every SLR (with --copy-cap any) is cut by the placer like '
@@ -914,6 +935,12 @@ def main():
         o))
     # The class copies and their instances: the generation's own schedule (same fold options).
     stext = open(os.path.join(gdir, 'schedule.txt')).read()
+    # The floorplan the implementation gets: SLR groups pinned whole are the assignment, whatever the options in
+    # the log (y8b, 11-12: the check judged its own 3-SLR assignment while the floorplan pinned 2 groups whole at
+    # 94.5 % / 90 % of SLR2 / SLR1's LUTs; the route failed).
+    fpath = a.floorplan or os.path.join(gdir, 'foldsim_floorplan.tcl')
+    fpg = floorplan_groups(fpath, stext)
+    grouped = grouped or fpg is not None
     ii, classes, _ = foldsim_degree.parse_schedule(stext)
     info = foldsim_degree.parse_classes(stext)
 
@@ -1065,7 +1092,41 @@ def main():
         return text, sec, groups, bwires
 
     bwires = None
-    if grouped:
+    if fpg is not None:
+        # The floorplan's groups: a named SLR as named; the others (fs_slr<g>) where they fit best (the least
+        # largest LUT fill over the SLRs left), the placer's best case. Links: the generation's own schedule.
+        text = stext
+        need = lambda cs: sum(res[c]['lut'] for c in cs if c in res)
+        taken = {names.index(w): g for g, _, w in fpg if w in names}
+        free = [g for g, _, w in fpg if w not in names]
+        slots = [i for i in range(len(names)) if i not in taken]
+        if len(free) > len(slots):
+            finish(lines, f'REFUSE: the floorplan {fpath} pins {len(fpg)} SLR groups on {len(names)} SLRs')
+        best = min(permutations(slots, len(free)),
+                   key=lambda pm: max([need(dict((g, cs) for g, cs, _ in fpg)[g]) / full[i]['lut']
+                                       for g, i in zip(free, pm)] or [0]))
+        at = {**taken, **{i: g for g, i in zip(free, best)}}
+        cls_of = {g: cs for g, cs, _ in fpg}
+        groups = [list(cls_of[at[i]]) if i in at else [] for i in range(len(names))]
+        gof = {c: i for i, cs in enumerate(groups) for c in cs}
+        bwires = [0] * (len(names) - 1)
+        for m in re.finditer(r'^\s+(\S+) -> (\S+): \d+ links, (\d+) bits(?:, \d+ host cycles on (\d+) wires)?', text,
+                             re.M):
+            x, y = gof.get(m.group(1)), gof.get(m.group(2))
+            if x is None or y is None or x == y:
+                continue
+            for b in range(min(x, y), max(x, y)):
+                bwires[b] += int(m.group(4) or m.group(3))
+        wires = {}
+        gsec = stext[stext.index('  slr groups:'):].split('\n') if '  slr groups:' in stext else ['']
+        sec = [f'  as built (slr-groups: the generation\'s groups and serialized link wires), pinned whole by the '
+               f'floorplan {fpath}'] + [l for l in takewhile(lambda l: l.startswith('    '), gsec[1:])
+                                         if re.match(r'    slr\d+ \(', l)] + [
+            f'    slr{at[i]} -> {names[i]} ({"named" if at[i] in taken.values() else "the placer: its best fit"}): '
+            + f'lut {need(groups[i]):,.0f} ({100 * need(groups[i]) / full[i]["lut"]:.0f} % of the SLR): '
+            + ' '.join(groups[i]) for i in sorted(at)] + [
+            f'    {names[i]}: no group pinned' for i in range(len(names)) if i not in at]
+    elif grouped:
         text, sec, groups, bwires = as_built()
         wires = {}
         sec = ['  as built (slr-groups: the generation\'s groups and serialized link wires)'] + sec
@@ -1227,6 +1288,9 @@ def main():
         verdict = 'REFUSE: ' + '; '.join(f'{c} fits no SLR whole (the nearest, {s}: over its {"/".join(r)})'
                                          for c, s, r in over) + \
             ' (a copy past its SLR is cut by the placer, its SLLs unknown: r16c failed so)'
+    elif grouped and group_over:
+        verdict = 'REFUSE: the generation\'s SLR groups past their SLRs\' room: ' + ', '.join(
+            f'{n} {r}' for n, r in group_over)
     elif fill_over:
         verdict = 'REFUSE: the design\'s ' + ', '.join(f'{r} {100 * region_fill[r]:.0f} %' for r in fill_over) + \
             ' of the region, past the placement fill (' + ', '.join(f'{100 * region_cap[r]:.0f} %' for r in fill_over) + \
@@ -1235,9 +1299,6 @@ def main():
         verdict = f'REFUSE: the copies\' {"/".join(mem_over)} past the region\'s at the placement fill'
     elif groups is None:
         verdict = 'REFUSE: no assignment of the copies within the SLRs\' fill, even with the largest cut'
-    elif grouped and group_over:
-        verdict = 'REFUSE: the generation\'s SLR groups past their SLRs\' room: ' + ', '.join(
-            f'{n} {r}' for n, r in group_over)
     elif failed is not None:
         verdict = f'REFUSE: {failed} does not fit the room the other copies leave in the SLRs'
     elif slls is None:
