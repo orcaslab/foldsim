@@ -21,6 +21,7 @@ add_mlir_library(FoldsimTransforms
   AffineSlots.cpp
   CsfMailboxes.cpp
   Pipelines.cpp
+  OutlineScopes.cpp
   RemoveDeadState.cpp
   ReplicateControls.cpp
   SlrSplit.cpp

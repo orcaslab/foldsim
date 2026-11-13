@@ -1932,6 +1932,10 @@ def build_parser():
                     help='an output of a module that only wires out its classes\' outputs, its inputs and constants (a '
                          'port bundle of a child passed straight out of the top) is wired so in the netlist, not passed '
                          'through the module\'s own model (foldsim-extract-models direct-outputs)')
+    ap.add_argument('--outline-scopes', default='', metavar='MODULE:PREFIX=NAME,...',
+                    help='a generate loop of a flat module (its registers named PREFIX<i>.): each iteration, with the '
+                         'logic that feeds it alone, an instance of a new module NAME, folded as a class '
+                         '(foldsim-outline-scopes; the iterations must be the same logic)')
     ap.add_argument('--absorb-registers', action='store_true',
                     help="with --absorb-exclusive: the logic a model input alone reads may pass "
                          "through registers (a per-port pipeline register and the select in front "
@@ -2894,6 +2898,19 @@ def main():
         with open(out('lane_scan.txt'), 'w') as f:
             f.write(r.stderr)
         for cell in re.findall(r'^lane-scan: cell (\S+)$', r.stderr, re.M):
+            modules.append(cell)
+            a.classes.append(cell)
+    # A flat module's generate loops outlined: each iteration's registers and the logic that feeds them alone an
+    # instance of one module, a class of its own (foldsim-outline-scopes).
+    if getattr(a, 'outline_scopes', ''):
+        specs = [x for x in a.outline_scopes.split(',') if x]
+        r = run([foldsim_opt, flat, '--pass-pipeline=builtin.module(foldsim-outline-scopes{scopes='
+                 + ','.join(specs) + '},canonicalize,cse)', '-o', flat + '.os'], check=False, capture_output=True)
+        sys.stderr.write(r.stderr)
+        if r.returncode:
+            sys.exit('foldsim: outline-scopes failed')
+        os.replace(flat + '.os', flat)
+        for cell in re.findall(r'^outline-scopes: cell (\S+) ', r.stderr, re.M):
             modules.append(cell)
             a.classes.append(cell)
     text = open(flat).read()

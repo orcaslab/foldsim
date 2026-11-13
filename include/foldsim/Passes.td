@@ -2083,6 +2083,30 @@ def SlrSplit : Pass<"foldsim-slr-split", "::mlir::ModuleOp"> {
                            "circt::sv::SVDialect"];
 }
 
+def OutlineScopes : Pass<"foldsim-outline-scopes", "::mlir::ModuleOp"> {
+  let summary = "Outline the iterations of a generate loop of a flat module";
+  let description = [{
+    A generate loop (`for (genvar i ...) begin : g_in`) of a module leaves,
+    once the module is flat, registers named `g_in_<i>.<...>` and no module
+    of its own. For each `MODULE:PREFIX=NAME` of `scopes`, the registers of
+    MODULE named PREFIX<i>.<...> are grouped by i; each group, with the
+    logic whose users are all in it (back from the registers' next and reset
+    values), becomes an instance `PREFIX<i>.NAME` of one generated module NAME,
+    when the iterations are the same logic: an op whose attributes differ
+    between iterations (an extract of each iteration's own bit) stays in the
+    parent, its result an input; constants that differ are inputs. The same
+    ops on the same values. Prints `outline-scopes: cell NAME (...)`; the
+    module can then be folded as a class (a loop's iterations its
+    instances).
+  }];
+  let options = [
+    ListOption<"scopes", "scopes", "std::string",
+               "MODULE:PREFIX=NAME: the generate loop of MODULE whose "
+               "registers are named PREFIX<i>. and the module to make of it">,
+  ];
+  let dependentDialects = ["circt::hw::HWDialect", "circt::seq::SeqDialect"];
+}
+
 def RemoveDeadState : Pass<"foldsim-remove-dead-state", "::circt::hw::HWModuleOp"> {
   let summary = "Remove registers and memories that no output observes";
   let description = [{
