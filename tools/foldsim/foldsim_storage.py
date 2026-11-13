@@ -1036,6 +1036,20 @@ def assign(units, base, caps, extra=None, paging=False, price_extra=False):
     def usage_of(i, k, p):
         return usage(units[i]['costs'][k], p)
 
+    # The pools a kind's cost can touch: the derived ones (sites, luts) and the
+    # cost's own keys that are pools (per-copy pools among them).
+    derived = {'sites', 'luts'} & set(pools)
+    pool_set = set(pools)
+    touch_cache = {}
+
+    def touched(i, a, b):
+        key = (i, a, b)
+        if key not in touch_cache:
+            ca, cb = units[i]['costs'][a], units[i]['costs'][b]
+            touch_cache[key] = sorted(derived | ((set(ca) | set(cb)) & pool_set))
+        return touch_cache[key]
+    active_set = set()
+
     def admissible(u, k):
         c = u['costs'].get(k)
         return c is not None and (paging or not c['ii_floor'])
@@ -1068,6 +1082,8 @@ def assign(units, base, caps, extra=None, paging=False, price_extra=False):
             return relieve_to(p, active, order)
 
         def relieve_to(p, active, kinds):
+            nonlocal active_set
+            active_set = set(active)
             best = None
             for i, u in enumerate(units):
                 if u.get('fixed') in u['costs']:
@@ -1080,15 +1096,18 @@ def assign(units, base, caps, extra=None, paging=False, price_extra=False):
                         if relief <= 0:
                             continue
                         m = min(n, math.ceil((used[p] - limit[p]) / relief))
-                        for q in active:
+                        # Only the pools either kind touches can change (a
+                        # unit's per-copy pools are its copy's alone).
+                        qs = [q for q in touched(i, a, b) if q in active_set and q != p]
+                        for q in qs:
                             dq = usage_of(i, b, q) - usage_of(i, a, q)
-                            if q != p and dq > 0:
+                            if dq > 0:
                                 room = limit[q] - used[q]
                                 m = min(m, int(room // dq) if room > 0 else 0)
                         if m <= 0:
                             continue
                         more = sum((usage_of(i, b, q) - usage_of(i, a, q)) / limit[q]
-                                   for q in active if q != p and limit[q])
+                                   for q in qs if limit[q])
                         key = (more / (relief / limit[p]), i, order.index(b))
                         if best is None or key < best[0]:
                             best = (key, i, a, b, m)

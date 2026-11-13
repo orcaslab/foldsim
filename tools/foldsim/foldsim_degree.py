@@ -2654,6 +2654,12 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
     steps = {round(ii * x) for x in FRAME_STEPS if ii * x <= top}
     frames = sorted({f for n in deep for f in range(n * ((ii + n - 1) // n), top + 1, n)} |
                     {ii} | steps)
+    if storage.ONCHIP_FIRST and not only_frames:
+        # The state-home policy: the schedule's frame and its steps only (its
+        # budgets do not move with the frame by an instance; the frame by
+        # each copy's instances made a refused 8-SM point search for over
+        # 15 minutes).
+        frames = sorted({ii} | steps)
     if only_frames:
         # Given frames only, each paging every number of models (the
         # least load that fits and routes): a large fold's frame is set by
