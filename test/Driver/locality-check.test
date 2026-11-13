@@ -1,0 +1,31 @@
+# foldsim_locality.py: a design that fits but is not local (a path between regions registered at neither end, a copy
+# larger than every region, a level signal fanning out over regions with no per-region register stage) is refused.
+# (y8b, 11-12: passed the fit check and failed routing; the user: "a symptom of passing fit but failing routing is that
+# the design is not fully hierarchical to absorb wire delay via spatial locality".) Three leaves whose outputs are late,
+# with zero-latency links: each link is logic from one copy into the next.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/locality
+# RUN: foldsim --srcs top.f --top Top --out %t/z --static --copies Leaf:3 --zero-latency-links --zero-latency-chains Leaf 2> %t/z.log
+# Split over two SLRs: the zero-latency link Leaf -> Leaf_copy1 crosses unregistered; the copies form one cluster.
+# RUN: not python3 %foldsim_tools/foldsim_locality.py %t/z --assign Leaf:SLR1,Top_model:SLR1,Leaf_copy1:SLR0,Leaf_copy2:SLR0 --slr-region %S/Inputs/slr-copy-cap/region-pin.json --out %t/l0 | FileCheck %s --check-prefix=SPLIT
+# SPLIT: REFUSE {{.*}} over SLR0/SLR1 {{.*}}: Leaf, Leaf_copy1, Leaf_copy2, Top_model
+# SPLIT: REFUSE unregistered{{ +}}Leaf -> Leaf_copy1: 8 bits, 1 sinks
+# SPLIT: REFUSE control{{ +}}%pos3 {{.*}}over K/SLR0/SLR1: {{.*}}through logic
+# SPLIT: z: locality REFUSE
+# One SLR for all: no crossing, no fanout over SLRs (the kernel's side alone is a warning).
+# RUN: python3 %foldsim_tools/foldsim_locality.py %t/z --assign Leaf:SLR1,Top_model:SLR1,Leaf_copy1:SLR1,Leaf_copy2:SLR1 --slr-region %S/Inputs/slr-copy-cap/region-pin.json --out %t/l1 | FileCheck %s --check-prefix=ONE
+# ONE-NOT: REFUSE
+# ONE: z: locality WARN
+# SLR groups: the compiler registers the links between groups (at the producer's group, read into the reader's): no
+# copy-to-copy crossing is unregistered; the frame position still reaches both groups' copies through the slot tables.
+# RUN: foldsim --srcs top.f --top Top --out %t/g --static --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-count 2 --slr-region %S/Inputs/slr-copy-cap/region-pin.json --slr-assign Leaf:0,Top_model:0,Leaf_copy1:1,Leaf_copy2:1 Leaf 2> %t/g.log
+# RUN: not python3 %foldsim_tools/foldsim_locality.py %t/g --slr-region %S/Inputs/slr-copy-cap/region-pin.json --json %t/g.json --out %t/l2 | FileCheck %s --check-prefix=GRP
+# GRP-NOT: REFUSE unregistered
+# GRP: WARN   source-registered
+# GRP: REFUSE control{{ +}}%pos3
+# RUN: python3 -c "import json; j = json.load(open('%t/g.json')); print(sorted((v['cls'], v['slr'], v['how']) for v in j['copies'].values()))" | FileCheck %s --check-prefix=GJ
+# GJ: ('Leaf', 'SLR1', 'group'), ('Leaf_copy1', 'SLR0', 'group'), ('Leaf_copy2', 'SLR0', 'group'), ('Top_model', 'SLR1', 'group')
+# A copy larger than every SLR (the fit check's sizes): a straddle, refused.
+# RUN: python3 -c "import json; json.dump({'copies': {'Leaf': {'lut': 500}, 'Leaf_copy1': {'lut': 10}}, 'over': [], 'cuts': []}, open('%t/big.json', 'w'))"
+# RUN: not python3 %foldsim_tools/foldsim_locality.py %t/z --assign Leaf:SLR1,Top_model:SLR1,Leaf_copy1:SLR1,Leaf_copy2:SLR1 --sll-json %t/big.json --slr-region %S/Inputs/slr-copy-cap/region-pin.json | FileCheck %s --check-prefix=BIG
+# BIG: REFUSE Leaf: lut 500, fits no SLR
+# BIG: z: locality REFUSE
