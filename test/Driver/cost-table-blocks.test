@@ -1,0 +1,17 @@
+# A constant table read (the folded simulator's slot and instance tables, read at a frame position of up to II
+# entries) priced on its contents (foldsim_cost.const_table_cost, 11-13): each distinct output bit of 64-entry
+# blocks, one LUT6 a distinct non-constant block (constant blocks none), a decoder a run of equal blocks and a select
+# of the distinct ones. FSD 1,024 nodes (E3/E4, II 5,118) holds 2,953 such reads in its level and SLR group modules:
+# counted 397k LUTs before; placed, the level that held them is 640 LUTs (a32-F4, Vivado report on the Q2 placement).
+# An i1 array prints bare elements (`[false, true, ...]`): read as typed only, each 1-bit table was taken as varying
+# and priced as a full ROM (here the all-zero 8,192-entry one: 171 LUTs); it is constant, 0.
+# RUN: rm -rf %t && mkdir -p %t && python3 %S/Inputs/table-cost/gen.py > %t/t.mlir
+# RUN: python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import foldsim_cost as fc; r = {}; t = fc.array_reads(sys.argv[2], ['foldsim_sim'], r); print(round(t['foldsim_sim'][0], 2), sorted(round(c, 2) for _, c in r.values()))" %foldsim_tools %t/t.mlir | FileCheck %s
+# CHECK: 6.0 [0.0, 6.0]
+# FOLDSIM_COST_TABLE_BLOCKS=0: one LUT6 a varying bit a 64 entries and their select (16 blocks: 21), as before.
+# RUN: env FOLDSIM_COST_TABLE_BLOCKS=0 python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import foldsim_cost as fc; r = {}; t = fc.array_reads(sys.argv[2], ['foldsim_sim'], r); print(round(t['foldsim_sim'][0], 2), sorted(round(c, 2) for _, c in r.values()))" %foldsim_tools %t/t.mlir | FileCheck %s --check-prefix=OLD
+# OLD: 21.0 [0.0, 21.0]
+# foldsim_sll_check.floorplan_level: a floorplan that pins the simulator level (foldsim --slr-level) names its SLR;
+# the check then charges the level's part of the level-and-kernel term to it, not spread over the region.
+# RUN: python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import foldsim_sll_check as s; print(s.floorplan_level(sys.argv[2]), s.floorplan_groups(sys.argv[2], ''))" %foldsim_tools %S/Inputs/table-cost/floorplan.tcl | FileCheck %s --check-prefix=LEVEL
+# LEVEL: SLR2 [(0, [], 'SLR2'), (1, [], 'SLR1')]

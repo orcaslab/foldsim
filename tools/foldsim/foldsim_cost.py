@@ -749,6 +749,34 @@ def refund_enables(mod):
 # word whose pages are mostly constant registers costs ~1 LUT a bit, a select of live words its full mux), the
 # other arrays 2,625 against 2,688; tables (88) none measurable.
 ARRAY_READ_SYNTH = {'const': 1.0, 'create': 0.33, 'other': 1.0}
+# A constant table read (a ROM; the folded simulator's slot tables, read at a frame position of up to II entries):
+# priced on its contents (FOLDSIM_COST_TABLE_BLOCKS=0: one LUT6 per 64 entries of every varying bit, as before 11-13).
+# Each distinct output bit (bit columns of the same contents are one function) is built of 64-entry blocks, one LUT6
+# each, of which identical blocks are one and constant blocks none; the blocks are chosen by the index's upper bits:
+# a decoder per run of equal blocks and a select of the distinct ones. Measured 11-13 (a32-F4): FSD 1,024 nodes (E3,
+# II 5,118), 2,953 table reads in the simulator level and its SLR group modules, counted 397k LUTs as before; placed
+# (Vivado 2025.2, F4/pnr/Q2util/hier_afu.rpt) the level they were in holds 640 LUTs (and 54 RAMB36 ROMs).
+TABLE_BLOCKS = os.environ.get('FOLDSIM_COST_TABLE_BLOCKS', '1') != '0'
+
+
+def const_table_cost(n, w, ints):
+    """LUT6s of a read of the constant table `ints` (n entries of w bits) at a non-constant index (TABLE_BLOCKS)."""
+    blocks = math.ceil(n / 64)
+    columns = set()
+    for b in range(w):
+        columns.add(tuple((x >> b) & 1 for x in ints))
+    total = 0.0
+    for col in columns:
+        pats = [col[k * 64:(k + 1) * 64] for k in range(blocks)]
+        const = {p for p in pats if all(v == p[0] for v in p)}
+        classes = len(set(pats))
+        if classes == 1 and pats[0] in const:
+            continue                                   # a constant bit
+        live = len(set(pats) - const)                  # one LUT6 a distinct non-constant block
+        runs = 1 + sum(1 for k in range(1, blocks) if pats[k] != pats[k - 1])
+        total += live + (runs - 1 + mux_tree(classes) if classes > 1 else 0)
+    return ARRAY_READ_SYNTH['const'] * total
+
 # The simulator level's other logic (its own ops as `parse` prices them, array reads and memories apart),
 # synthesized per counted: 80,549 / 110,618 = 0.73 in the same OOC, 89.3k / 126.6k = 0.71 in P/s11 p1_300 (routed,
 # flattened, the same profile's shell-sized fold of 11-09): foldsim_fitdb.count scales the level's logic by it.
@@ -804,7 +832,11 @@ def array_reads(path, modules, per_read=None):
         elif op == 'hw.aggregate_constant' and res:
             mm = re.search(r'!hw\.array<(\d+)xi(\d+)>\s*$', rhs)
             if mm:
-                vals = re.findall(r'(-?\d+|true|false) : i\d+', rhs.split('] :')[0])
+                # (An i1 array prints its elements bare, `[false, true, ...]`: no ` : i1` after each. Read as typed only,
+                # every 1-bit table was taken as varying in every bit and priced as a full ROM: a32-F4 11-13, FSD 1,024's
+                # 2,049 one-run 1-bit tables of 1,024-8,192 entries, ~171 LUTs counted each.)
+                vals = re.findall(r'(-?\d+|true|false)(?:\s*:\s*i\d+)?', rhs.split('[', 1)[1].rsplit('] :', 1)[0]) \
+                    if '[' in rhs else []
                 w = int(mm.group(2))
                 if len(vals) == int(mm.group(1)):
                     ints = [(1 if v == 'true' else 0 if v == 'false' else int(v)) & ((1 << w) - 1) for v in vals]
@@ -814,8 +846,8 @@ def array_reads(path, modules, per_read=None):
                         o |= x
                     varying = popcount(o & ~a)
                 else:
-                    varying = w
-                arrays[res[0]] = ('const', varying)
+                    varying, ints = w, None
+                arrays[res[0]] = ('const', varying, ints, {})
             consts.update(res)
         elif op == 'hw.array_create' and res:
             ops = re.findall(SSA, rhs.split(' : ')[0])
@@ -829,7 +861,13 @@ def array_reads(path, modules, per_read=None):
             n, w = int(mm.group(1)), width(mm.group(2))
             src = arrays.get(ops[0])
             if src and src[0] == 'const':
-                kind, c = 'const', array_read_cost(n, w, 'const', varying=src[1])
+                kind = 'const'
+                if TABLE_BLOCKS and src[2] is not None and len(src[2]) == n:
+                    if (n, w) not in src[3]:               # (a table read several times is priced once)
+                        src[3][(n, w)] = const_table_cost(n, w, src[2])
+                    c = src[3][(n, w)]
+                else:
+                    c = array_read_cost(n, w, 'const', varying=src[1])
             elif src and src[0] == 'create':
                 kind, c = 'create', array_read_cost(n, w, 'create', live=src[1])
             else:
