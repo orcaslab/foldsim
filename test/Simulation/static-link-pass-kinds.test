@@ -1,0 +1,25 @@
+# REQUIRES: verilator
+# An HBM link stream's pages hold the producer's link port only after the pass
+# that writes them: a class with a ready pass and a state pass that writes its
+# stream at one of them spaces that kind of pass by the pages, the other by the
+# landings it reads (a32-HX 11-12: splitting VX_tcu_core out of the compute
+# slice put a 32-page stream to its fedp children on a class with a ready pass,
+# and every pass, both kinds, was spaced 32: the 4-SM fixed shell's II went
+# 640 -> 1,024; with the pages on the writing pass only, 640 again). Here four
+# parents (a ready pass and a state pass each) write 10 rows a state pass to
+# their two children: the parents hold the port 4 x (10 + 1) = 44 slots, not
+# 10 x 8 = 80, and the children's landings (8 x 7 = 56) set the frame.
+# Exact against the target with stalls and long latencies.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/linkpass
+# RUN: env FOLDSIM_SEARCH_LOG=1 foldsim --srcs top.f --top Top --out %t/k --static --nest --modulo --ready-choice Parent_model,Top_model --link-hbm-row-bits 32 --link-kinds Parent_model:Child:hbm Parent Child > %t/k.log 2>&1
+# RUN: FileCheck %s --check-prefix=II < %t/k.log
+# II: modulo lower bound 56 set by Child link port held 56 slots by 8 evaluations (most 7)
+# II: II = 56
+# RUN: FileCheck %s --check-prefix=REP < %t/k/schedule.txt
+# REP: Parent_model x4 (ready pass)
+# REP: link stream Parent_model Child 2 0 320 32 10
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/k -Mdir %t/k/obj %S/Inputs/tb_linkhbm.sv top.sv %t/k/foldsim_sim.sv > %t/k/build.log 2>&1
+# RUN: %t/k/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/k/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=40 | FileCheck %s
+# CHECK: MATCH
+# CHECK-NOT: MISMATCH

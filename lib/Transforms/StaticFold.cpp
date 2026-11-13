@@ -379,6 +379,14 @@ struct Class {
   /// copy then holds its link port that many slots, so its passes are at
   /// least that far apart (0: none).
   unsigned linkPage = 0;
+  /// With laid-out link streams: the link port's spacing a pass of each kind
+  /// needs for the streams it writes (index 0 the state pass, 1 + l a ready
+  /// pass of level l), and the spacing every pass keeps (link-kinds pages,
+  /// the landings the class reads). A pass that writes no stream page holds
+  /// the port only for the latter (linkPage is the most of all).
+  SmallVector<unsigned> linkPageAt;
+  unsigned linkPageBase = 0;
+  bool linkPageByKind = false;
   /// Off chip with a window (`page-hbm-window`): its slots (0: none), and
   /// each instance's slot.
   unsigned pageWindow = 0;
@@ -828,6 +836,18 @@ public:
   unsigned linkSpacing(unsigned c) const {
     unsigned m = c < mailboxSpacing.size() ? mailboxSpacing[c] : 1;
     return std::max(classes[c].linkPage, m);
+  }
+  /// The link port's spacing of one evaluation: its own kind of pass's
+  /// stream pages, the class's landings and mailbox (linkSpacing: the most
+  /// over its passes).
+  unsigned linkSpacingOf(const Node &node) const {
+    auto &cls = classes[node.cls];
+    if (!cls.linkPageByKind)
+      return linkSpacing(node.cls);
+    unsigned m = node.cls < mailboxSpacing.size() ? mailboxSpacing[node.cls] : 1;
+    unsigned k = node.pass == kState ? 0 : 1 + node.level;
+    unsigned at = k < cls.linkPageAt.size() ? cls.linkPageAt[k] : 0;
+    return std::max({cls.linkPageBase, at, m});
   }
   /// The state-in-ram classes' RAM primitives by SLR group, once scheduled.
   void reportStateInRam() const;
@@ -4424,15 +4444,27 @@ void StaticFolder::streamPages() {
   // Ports: the producer's passes a write's pages apart, the reader's its
   // landings and two more apart (the last lands two host cycles before
   // the slot; the next pass's first after it).
-  for (unsigned c = 0; c < classes.size(); ++c)
+  for (unsigned c = 0; c < classes.size(); ++c) {
     classes[c].linkPage = linkPageKinds[c];
+    classes[c].linkPageBase = linkPageKinds[c];
+    classes[c].linkPageAt.clear();
+    classes[c].linkPageByKind = true;
+  }
   for (auto &s : laidOutStreams) {
     if (s.excluded)
       continue;
     classes[s.pcls].linkPage = std::max(classes[s.pcls].linkPage, s.pages);
+    // The producer's pages hold the port after the pass that writes them
+    // (its kind of pass): its other passes write none of this stream.
+    auto &at = classes[s.pcls].linkPageAt;
+    unsigned k = s.atReady ? 1 + s.level : 0;
+    if (at.size() <= k)
+      at.resize(k + 1, 0);
+    at[k] = std::max(at[k], s.pages);
     // (A mailbox of one row a pass lands in two sets in turn: no spacing.)
-    classes[s.rcls].linkPage = std::max(
-        classes[s.rcls].linkPage, s.twoSets && s.maxNeed == 1 ? 1u : s.maxNeed + 2);
+    unsigned need = s.twoSets && s.maxNeed == 1 ? 1u : s.maxNeed + 2;
+    classes[s.rcls].linkPage = std::max(classes[s.rcls].linkPage, need);
+    classes[s.rcls].linkPageBase = std::max(classes[s.rcls].linkPageBase, need);
   }
 }
 
@@ -7814,25 +7846,54 @@ unsigned StaticFolder::placeModulo(
   for (auto &node : nodes)
     ++taking[resourceOf(node)];
   unsigned lower = 2;
-  for (auto count : taking)
-    lower = std::max(lower, count);
+  // FOLDSIM_SEARCH_LOG: which term sets the lower bound.
+  std::string lowerWhy = "minimum";
+  auto raise = [&](unsigned v, auto &&why) {
+    if (v > lower) {
+      lower = v;
+      lowerWhy = why();
+    }
+  };
+  for (auto [r, count] : llvm::enumerate(taking))
+    raise(count, [&, r = r] {
+      return "evaluations of resource " + std::to_string(r) +
+             (r < classes.size() ? " (" + classes[r].name + ")" : "");
+    });
   // Nor than a paged copy's state passes, each its page apart, nor its
   // page recurrence.
   for (auto [c, cls] : llvm::enumerate(classes))
-    if (passSpacing(c) && cls.threads())
-      lower = std::max({lower, passSpacing(c) * cls.threads(),
-                        paged(c) ? cls.pageLead() + 4 : 0u});
+    if (passSpacing(c) && cls.threads()) {
+      raise(passSpacing(c) * cls.threads(), [&] {
+        return cls.name + " pass spacing " + std::to_string(passSpacing(c)) +
+               " x " + std::to_string(cls.threads()) + " instances";
+      });
+      raise(paged(c) ? cls.pageLead() + 4 : 0u,
+            [&] { return cls.name + " page recurrence"; });
+    }
   // Nor than a copy with paged links' passes, each its link page apart.
+  // (Each evaluation by its own kind of pass's spacing: windows of one port.)
+  SmallVector<uint64_t> linkHeld(classes.size(), 0);
+  for (auto &node : nodes)
+    if (linkSpacing(node.cls) > 1)
+      linkHeld[node.cls] += linkSpacingOf(node);
   for (auto [c, cls] : llvm::enumerate(classes))
-    if (linkSpacing(c) > 1)
-      lower = std::max(lower, linkSpacing(c) * evaluations[c]);
+    if (linkHeld[c])
+      raise(unsigned(linkHeld[c]), [&] {
+        return cls.name + " link port held " + std::to_string(linkHeld[c]) +
+               " slots by " + std::to_string(evaluations[c]) + " evaluations (most " +
+               std::to_string(linkSpacing(c)) + ")";
+      });
   // Nor than a serialized copy's passes of a kind, each its k apart.
   auto serial = serialSpacing();
   for (auto [c, cls] : llvm::enumerate(classes))
     if (serial[c] > 1)
-      lower = std::max(lower, serial[c] * cls.threads());
+      raise(serial[c] * cls.threads(),
+            [&] { return cls.name + " serialized links"; });
   // Nor than `min-ii`.
-  lower = std::max(lower, minII);
+  raise(minII, [] { return std::string("min-ii"); });
+  if (getenv("FOLDSIM_SEARCH_LOG"))
+    llvm::errs() << "foldsim-fold-static: modulo lower bound " << lower
+                 << " set by " << lowerWhy << "\n";
   auto cmp = [&](unsigned a, unsigned b) {
     if (height[a] != height[b])
       return height[a] < height[b];
@@ -7952,27 +8013,27 @@ unsigned StaticFolder::placeModulo(
     auto window = [&](unsigned c, int t, auto &&each) {
       windowOf(passSpacing(c), t, each);
     };
-    auto linkFree = [&](unsigned c, int t) {
-      auto &port = linkPort[c];
+    auto linkFree = [&](unsigned n, int t) {
+      auto &port = linkPort[nodes[n].cls];
       if (port.empty())
         return true;
       bool free = true;
-      windowOf(linkSpacing(c), t,
+      windowOf(linkSpacingOf(nodes[n]), t,
                [&](int lo, int hi) { free &= port.find_first_in(lo, hi) < 0; });
       return free;
     };
-    auto linkTake = [&](unsigned c, int t, bool take) {
-      auto &port = linkPort[c];
+    auto linkTake = [&](unsigned n, int t, bool take) {
+      auto &port = linkPort[nodes[n].cls];
       if (port.empty())
         port.resize(period);
-      windowOf(linkSpacing(c), t, [&](int lo, int hi) {
+      windowOf(linkSpacingOf(nodes[n]), t, [&](int lo, int hi) {
         if (take)
           port.set(lo, hi);
         else
           port.reset(lo, hi);
       });
     };
-    auto spaced = [&](unsigned n) { return linkSpacing(nodes[n].cls) > 1; };
+    auto spaced = [&](unsigned n) { return linkSpacingOf(nodes[n]) > 1; };
     // slr-serialize: each kind of pass of a copy whose link crosses groups
     // holds the k slots up to it, (t - k, t], modulo the frame.
     std::map<std::pair<unsigned, unsigned>, llvm::BitVector> serialPort;
@@ -8053,7 +8114,7 @@ unsigned StaticFolder::placeModulo(
         auto &g = groups[it->second];
         unsigned c = node.cls;
         g.minStride = std::max({g.minStride, pages(n) ? passSpacing(c) : 1u,
-                                spaced(n) ? linkSpacing(c) : 1u,
+                                spaced(n) ? linkSpacingOf(node) : 1u,
                                 serialed(n) ? serial[c] : 1u});
         ++g.count;
         members[it->second].push_back(unsigned(n));
@@ -8102,7 +8163,7 @@ unsigned StaticFolder::placeModulo(
       auto fitsAt = [&](unsigned n, int t) {
         unsigned c = nodes[n].cls;
         return t >= 0 && !busy[resourceOf(nodes[n])].test(unsigned(t) % period) &&
-               (!pages(n) || pageFree(c, t)) && (!spaced(n) || linkFree(c, t)) &&
+               (!pages(n) || pageFree(c, t)) && (!spaced(n) || linkFree(n, t)) &&
                (!serialed(n) || serialFree(n, t));
       };
       auto takeAt = [&](unsigned n, int t, bool on) {
@@ -8115,7 +8176,7 @@ unsigned StaticFolder::placeModulo(
         if (pages(n))
           pageTake(c, t, on);
         if (spaced(n))
-          linkTake(c, t, on);
+          linkTake(n, t, on);
         if (serialed(n))
           serialTake(n, t, on);
       };
@@ -8145,7 +8206,7 @@ unsigned StaticFolder::placeModulo(
       earliest = firstFree(taken, earliest, period);
       while (earliest < int(2 * period) &&
              ((pages(n) && !pageFree(c, earliest)) ||
-              (spaced(n) && !linkFree(c, earliest)) ||
+              (spaced(n) && !linkFree(n, earliest)) ||
               (serialed(n) && !serialFree(n, earliest))))
         earliest = firstFree(taken, earliest + 1, period);
       if (earliest >= int(2 * period)) {
@@ -8158,7 +8219,7 @@ unsigned StaticFolder::placeModulo(
       if (pages(n))
         pageTake(c, earliest, true);
       if (spaced(n))
-        linkTake(c, earliest, true);
+        linkTake(n, earliest, true);
       if (serialed(n))
         serialTake(n, earliest, true);
       slotOf[n] = earliest;
@@ -8214,7 +8275,7 @@ unsigned StaticFolder::placeModulo(
       if (pages(n))
         pageTake(node.cls, slotOf[n], false);
       if (spaced(n))
-        linkTake(node.cls, slotOf[n], false);
+        linkTake(n, slotOf[n], false);
       if (serialed(n))
         serialTake(n, slotOf[n], false);
       int at = slotOf[n];
@@ -8232,7 +8293,7 @@ unsigned StaticFolder::placeModulo(
       } else {
         for (int t = latest; t > slotOf[n]; --t)
           if (!taken.test(t % period) && (!pages(n) || pageFree(node.cls, t)) &&
-              (!spaced(n) || linkFree(node.cls, t)) &&
+              (!spaced(n) || linkFree(n, t)) &&
               (!serialed(n) || serialFree(n, t))) {
             at = t;
             break;
@@ -8242,7 +8303,7 @@ unsigned StaticFolder::placeModulo(
       if (pages(n))
         pageTake(node.cls, at, true);
       if (spaced(n))
-        linkTake(node.cls, at, true);
+        linkTake(n, at, true);
       if (serialed(n))
         serialTake(n, at, true);
       slotOf[n] = at;
