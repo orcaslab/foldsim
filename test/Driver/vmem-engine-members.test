@@ -1,0 +1,8 @@
+# The SLL check's page-engine members (foldsim_sll_check.vmem_controllers): a link stream `link:<producer>><reader>` is
+# half each, and a reader carrying the stream's mode in the schedule, `<reader>(zero idle)`, is its class (y64c2,
+# 11-12: `VX_compute_slice__lift_model(zero` named no class, its half priced as spread over the simulator level, so a
+# port beside its two copies was charged crossings it does not have).
+# RUN: python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import foldsim_sll_check as k; [print(c['name'], c['port_bits'], sorted(c['members'].items())) for c in k.vmem_controllers(sys.argv[2], open(sys.argv[2] + '/schedule.txt').read())]" %foldsim_tools %S/Inputs/vmem-members | FileCheck %s
+# CHECK: P0 810 [('Opc', 0.5), ('Slice', 0.5)]
+# CHECK-NEXT: P1 610 [('Opc', 0.5), ('Slice', 0.5)]
+# CHECK-NEXT: P2 410 [('Core', 2.5), ('Slice', 0.5)]

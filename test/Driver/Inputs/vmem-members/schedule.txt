@@ -1,0 +1,3 @@
+    page engine 0 480 bits, tag 8, row 13: link:Opc>Slice(zero idle)
+    page engine 1 440 bits, tag 8, row 14: link:Slice>Opc
+    page engine 2 344 bits, tag 8, row 11: Core:pps0_rows Core:pps1_rows link:Core>Slice(zero idle)

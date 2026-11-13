@@ -621,7 +621,9 @@ def vmem_controllers(gdir, stext=''):
         w = defaultdict(float)
         for x in mm.group(2).split():
             if x.startswith('link:') and '>' in x:
+                # (A link stream's reader may carry the stream's mode, `<reader>(zero idle)`: the class is before it.)
                 pc, rc = x[5:].split('>', 1)
+                rc = rc.split('(', 1)[0]
                 w[pc] += 0.5
                 w[rc] += 0.5
             elif ':' in x:
