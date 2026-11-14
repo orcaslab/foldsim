@@ -579,6 +579,8 @@ def frame_options(a):
         fold += ' slr-group-reset'
     if getattr(a, 'slr_group_local', 0):
         fold += f' slr-group-local={a.slr_group_local}'
+    if getattr(a, 'slr_group_own', 0):
+        fold += f' slr-group-own={a.slr_group_own}'
     if getattr(a, 'registered_links', ''):
         fold += f' registered-links={a.registered_links}'
     if getattr(a, 'split_latency', ''):
@@ -2220,6 +2222,11 @@ def build_parser():
                     help='with --slr-groups: each group computes the level\'s combinational values it reads (the frame '
                          'decision, a frame input\'s select) from their registers, cloning cones of up to OPS ops '
                          '(foldsim-fold-static slr-group-local): no logic before a crossing into a group; same values')
+    ap.add_argument('--slr-group-own', type=int, default=0, metavar='OPS',
+                    help='with --slr-groups: each group owns the level\'s control it reads -- a level register a group '
+                         'reads, directly or through logic, replicated into the group with its next-value cone, back '
+                         'through the registers it reads, up to OPS ops a closure (foldsim-fold-static slr-group-own): '
+                         'no level register fans out over the groups; the same values in the same host cycles')
     ap.add_argument('--slr-group-reset', action='store_true',
                     help='with --slr-groups: the simulator\'s reset registered in each group and in the level '
                          '(foldsim-fold-static slr-group-reset); one host cycle more after reset, no value moves')

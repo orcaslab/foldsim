@@ -80,3 +80,30 @@
 # RUN: %t/loc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=0 +bubble=0 | grep MATCH > %t/loc/r2.txt
 # RUN: diff %t/base/r1.txt %t/loc/r1.txt
 # RUN: diff %t/base/r2.txt %t/loc/r2.txt
+# --slr-group-own: each group owns the level's control it reads (S26 concept
+# A, a32-S26X 11-14): the level registers a group reads (the sequencer's
+# positions, the token counters, a link's held bit) replicated into the group
+# with their next-value cones. foldsim_locality.py: without it the level's
+# pos0 / token counters fan out over the SLRs through logic (L3 REFUSE); with
+# it no level register spans the groups (the kernel beside group 2). The same
+# MATCH and host cycles.
+# RUN: foldsim --srcs top.f --top Top --out %t/own --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 Leaf > %t/own.log 2>&1
+# RUN: FileCheck %s --check-prefix=OWNLOG < %t/own.log
+# OWNLOG: slr-group-own: {{[1-9][0-9]*}} level registers and {{[0-9]+}} level ops replicated into groups, 0 closures left
+# RUN: foldsim --srcs top.f --top Top --out %t/own0 --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 Leaf > /dev/null 2>&1
+# RUN: not python3 %foldsim_tools/foldsim_locality.py %t/own0 --out %t/own0/l --kernel-slr SLR0 > /dev/null
+# RUN: FileCheck %s --check-prefix=OWN0 < %t/own0/l/locality.txt
+# OWN0: REFUSE control   %pos0
+# RUN: python3 %foldsim_tools/foldsim_locality.py %t/own --out %t/own/l --kernel-slr SLR0 > /dev/null
+# RUN: FileCheck %s --check-prefix=OWN < %t/own/l/locality.txt
+# OWN: L3 global fanout
+# OWN-NOT: REFUSE
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/own/obj %S/Inputs/tb_late.sv top.sv %t/own/foldsim_sim.sv > %t/own/build.log 2>&1
+# RUN: %t/own/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 +bubble=30 +burst=4 | grep MATCH > %t/own/r1.txt
+# RUN: %t/own/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=0 +bubble=0 | grep MATCH > %t/own/r2.txt
+# RUN: FileCheck %s < %t/own/r1.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/own0/obj %S/Inputs/tb_late.sv top.sv %t/own0/foldsim_sim.sv > %t/own0/build.log 2>&1
+# RUN: %t/own0/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 +bubble=30 +burst=4 | grep MATCH > %t/own0/r1.txt
+# RUN: %t/own0/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=0 +bubble=0 | grep MATCH > %t/own0/r2.txt
+# RUN: diff %t/own0/r1.txt %t/own/r1.txt
+# RUN: diff %t/own0/r2.txt %t/own/r2.txt

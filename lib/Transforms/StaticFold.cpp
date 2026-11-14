@@ -896,6 +896,10 @@ public:
   /// `slr-group-local`: the level's logic a group reads cloned into it (ops
   /// per cone at most; 0 off).
   unsigned slrGroupLocal = 0;
+  /// `slr-group-own`: the level's registers a group reads (through logic or
+  /// not), with their next-value cones, replicated into the group (ops per
+  /// closure at most; 0 off).
+  unsigned slrGroupOwn = 0;
   struct LinkCandidate {
     std::tuple<unsigned, unsigned, uint64_t> key;
     /// Its rows and columns in block or ultra RAM (paged as built), and its
@@ -27165,6 +27169,116 @@ LogicalResult StaticFolder::extractGroups() {
       opsOf[attr.getInt()].push_back(&op);
       op.removeAttr(kSlrAttr);
     }
+  // `slr-group-own`: each group owns the level's control it reads. A level
+  // register a group reads -- directly or through the level's logic -- is
+  // replicated into the group with its next-value cone, and so on back
+  // through the registers that cone reads (the frame decision's sequencer,
+  // parity, readiness and token counters), until the closure meets ports,
+  // memories, instances, constants and other groups' values. A replica has
+  // its original's next value, clock, reset and reset value, so it holds
+  // the same value in every host cycle: no value or host cycle moves. The
+  // group's control then fans out from its own registers inside its SLR;
+  // what still enters it is the simulator's ports and the other groups'
+  // outputs (registers), never a level register's fanout over the device.
+  // A closure of more than slrGroupOwn ops is left in the level (reported;
+  // slr-group-local may still clone its logic). Replicas are kept apart
+  // from their originals (`keep`), as synthesis would merge equal registers.
+  if (slrGroupOwn) {
+    DenseSet<Operation *> inGroups;
+    for (auto &ops : opsOf)
+      inGroups.insert(ops.begin(), ops.end());
+    auto isLevel = [&](Operation *op) {
+      return op && op->getBlock() == body && !inGroups.contains(op);
+    };
+    auto isLevelReg = [&](Operation *op) {
+      return isLevel(op) && isa<seq::FirRegOp, seq::CompRegOp>(op);
+    };
+    auto isLevelLogic = [&](Operation *op) {
+      return isLevel(op) && op->getNumRegions() == 0 &&
+             !isa<hw::ConstantOp>(op) && !isa<hw::InstanceOp, hw::OutputOp>(op) &&
+             op->getDialect()->getNamespace() != "seq" &&
+             op->getDialect()->getNamespace() != "sv" &&
+             mlir::isMemoryEffectFree(op);
+    };
+    auto ownable = [&](Operation *op) {
+      return isLevelReg(op) || isLevelLogic(op);
+    };
+    unsigned replicatedRegs = 0, replicatedOps = 0, left = 0;
+    for (unsigned g = 0; g < slrGroups; ++g) {
+      DenseMap<Value, Value> local;
+      OpBuilder cb(body->getTerminator());
+      // The closure of `root`: the level's logic and registers it reads,
+      // back to what a group may read as it is; empty past the limit.
+      auto closure = [&](Operation *root) {
+        SmallVector<Operation *> order;
+        DenseSet<Operation *> seen{root};
+        SmallVector<Operation *> work{root};
+        while (!work.empty()) {
+          Operation *op = work.pop_back_val();
+          order.push_back(op);
+          for (Value operand : op->getOperands()) {
+            auto *def = operand.getDefiningOp();
+            if (local.count(operand) || !ownable(def) ||
+                !seen.insert(def).second)
+              continue;
+            if (seen.size() > slrGroupOwn)
+              return SmallVector<Operation *>();
+            work.push_back(def);
+          }
+        }
+        return order;
+      };
+      for (unsigned i = 0; i < opsOf[g].size(); ++i) {
+        Operation *user = opsOf[g][i];
+        for (auto &operand : user->getOpOperands()) {
+          Value value = operand.get();
+          auto *def = value.getDefiningOp();
+          if (!ownable(def))
+            continue;
+          if (!local.count(value)) {
+            auto order = closure(def);
+            if (order.empty()) {
+              ++left;
+              continue;
+            }
+            // Clone first (a register's cone may read the register), then
+            // rewire every clone's operands to the group's values.
+            SmallVector<Operation *> clones;
+            for (auto *op : order) {
+              if (local.count(op->getResult(0)))
+                continue;
+              auto *clone = cb.clone(*op);
+              clone->removeAttr("inner_sym");
+              if (auto reg = dyn_cast<seq::FirRegOp>(clone)) {
+                reg.setNameAttr(cb.getStringAttr(reg.getName() + "_g" + Twine(g)));
+                keep(reg);
+              }
+              if (isa<seq::FirRegOp, seq::CompRegOp>(clone))
+                ++replicatedRegs;
+              else
+                ++replicatedOps;
+              for (auto [r, c] : llvm::zip(op->getResults(), clone->getResults()))
+                local[r] = c;
+              clones.push_back(clone);
+            }
+            for (auto *clone : clones) {
+              for (auto &o : clone->getOpOperands())
+                if (auto it = local.find(o.get()); it != local.end())
+                  o.set(it->second);
+              opsOf[g].push_back(clone);
+              inGroups.insert(clone);
+            }
+          }
+          operand.set(local.lookup(value));
+        }
+      }
+    }
+    llvm::errs() << "foldsim-fold-static: slr-group-own: " << replicatedRegs
+                 << " level registers and " << replicatedOps
+                 << " level ops replicated into groups, " << left
+                 << " closures left in the level (past " << slrGroupOwn
+                 << " ops)\n";
+  }
   // `slr-group-local`: a group's operand that the level computes with logic
   // (not a register, memory, instance, constant or port) is computed in the
   // group instead: the level's cone of it, back to those, cloned into the
@@ -27835,6 +27949,7 @@ void FoldStaticPass::runOnOperation() {
   folder.slrGroupControl = slrGroupControl;
   folder.slrGroupReset = slrGroupReset;
   folder.slrGroupLocal = slrGroupLocal;
+  folder.slrGroupOwn = slrGroupOwn;
   folder.slrKept = std::max(1u, unsigned(slrKept));
   for (auto [spec, out, name] :
        {std::tuple{std::string(linkKindGroups), &folder.linkKindGroupCap, "link-kind-groups"},
