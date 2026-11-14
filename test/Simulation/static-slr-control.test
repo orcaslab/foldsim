@@ -96,6 +96,13 @@
 # OWN0: REFUSE control   %pos0
 # RUN: python3 %foldsim_tools/foldsim_locality.py %t/own --out %t/own/l --kernel-slr SLR0 > /dev/null
 # RUN: FileCheck %s --check-prefix=OWN < %t/own/l/locality.txt
+# A class whose parent sits in another group loads posD's next position
+# (every sequencer holds posD's value), its group's own: no other group's
+# sequencer enters a group.
+# RUN: FileCheck %s --check-prefix=OWNSEQ < %t/own/foldsim_sim.sv
+# OWNSEQ-LABEL: module foldsim_sim_slr0(
+# OWNSEQ-NOT: _seq,
+# OWNSEQ: );
 # OWN: L3 global fanout
 # OWN-NOT: REFUSE
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/own/obj %S/Inputs/tb_late.sv top.sv %t/own/foldsim_sim.sv > %t/own/build.log 2>&1

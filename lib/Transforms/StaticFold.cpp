@@ -21413,7 +21413,14 @@ LogicalResult StaticFolder::buildSim() {
         // In its group, the class's own next position of its parent's
         // sequencer (the root's: posD), the same function as the shared
         // one: only registers and the decision cross into the group.
-        load = nextPosition(cls.parent >= 0 ? sequencer[cls.parent] : posD);
+        // Every sequencer holds posD's value (each loads the next position
+        // of one that does, from the same reset), so a class whose parent
+        // sits in another group takes posD's next position as a root does
+        // (`slr-group-own`: then from the group's own posD): no other
+        // group's sequencer enters it.
+        bool parentHere = cls.parent >= 0 &&
+                          (!slrGroupOwn || controlGroup(cls.parent) == controlGroup(c));
+        load = nextPosition(parentHere ? sequencer[cls.parent] : posD);
       } else if (cls.parent >= 0) {
         auto &parentNext = nextOf[cls.parent];
         if (!parentNext)
