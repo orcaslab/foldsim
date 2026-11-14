@@ -1091,12 +1091,19 @@ def slr_options(a, foldsim_opt, models, fold, out):
         # beside the level's group (--slr-level).
         level_sites = 0
         rams = {}
+        kernel = {}
         if isinstance(measured.get('copies'), dict):
             top = measured.get('top', {})
-            level_sites = round(top.get('lut', 0) * spl)
+            # The SLL check's own placement of them: the level beside its
+            # group (the floorplan pins it), the kernel beside the simulator
+            # (`top_kernel`, not pinned) spread over the SLRs by their
+            # capacity, as foldsim_sll_check.spread charges them.
+            kernel = measured.get('top_kernel') or {}
+            level_sites = round(max(0.0, top.get('lut', 0) - kernel.get('lut', 0)) * spl)
             # Its block and ultra RAM too (tenths of a URAM288 / RAMB36):
             # each group within its SLR's RAM at the region's margin.
-            level_rams = (round(10 * top.get('uram', 0)), round(10 * top.get('bram', 0)))
+            level_rams = (round(10 * max(0.0, top.get('uram', 0) - kernel.get('uram', 0))),
+                          round(10 * max(0.0, top.get('bram', 0) - kernel.get('bram', 0))))
             measured = measured['copies']
             rams = {c: (round(10 * m.get('uram', 0)), round(10 * m.get('bram', 0))) for c, m in measured.items()}
         for c in sites:
@@ -1115,8 +1122,16 @@ def slr_options(a, foldsim_opt, models, fold, out):
         if a.slr_sites and level is not None and level_sites:
             n, c = caps[level]
             caps[level] = (n, max(0, c - level_sites))
-            print(f'foldsim: SLR group {level} ({n}) keeps {level_sites} LUT sites for the simulator level and the '
-                  f'kernel (measured, {a.slr_sites})', file=sys.stderr)
+            print(f'foldsim: SLR group {level} ({n}) keeps {level_sites} LUT sites for the simulator level'
+                  + ('' if kernel else ' and the kernel') + f' (measured, {a.slr_sites})', file=sys.stderr)
+        if a.slr_sites and kernel:
+            r3 = json.load(open(a.slr_region if a.slr_region != 'v80' else rj))
+            tot = sum(x['luts'] for x in r3['slrs'])
+            for g, slr in enumerate(r3['slrs'][:len(caps)]):
+                n, c = caps[g]
+                caps[g] = (n, max(0, c - round(kernel.get('lut', 0) * spl * slr['luts'] / tot)))
+            print(f"foldsim: the kernel beside the simulator ({kernel.get('lut', 0):.0f} LUTs, measured) spread over "
+                  'the SLRs by their LUTs', file=sys.stderr)
         caps_more = None
         if a.slr_sites and rams:
             rj2 = a.slr_region if a.slr_region != 'v80' else rj
@@ -1126,6 +1141,11 @@ def slr_options(a, foldsim_opt, models, fold, out):
                          for slr in r2['slrs']]
             if level is not None:
                 caps_more[level] = [max(0, x - y) for x, y in zip(caps_more[level], level_rams)]
+            if kernel:
+                for g, slr in enumerate(r2['slrs'][:len(caps_more)]):
+                    for j, (key, tkey) in enumerate((('uram', 'uram'), ('bram', 'ramb36'))):
+                        tot = sum(x[tkey] for x in r2['slrs']) or 1
+                        caps_more[g][j] = max(0, caps_more[g][j] - round(10 * kernel.get(key, 0) * slr[tkey] / tot))
             print('foldsim: SLR groups\' URAM288 / RAMB36 (tenths) at most '
                   + ', '.join(f'{n} {u}/{b}' for (n, _), (u, b) in zip(caps, caps_more)), file=sys.stderr)
         print(f'foldsim: {len(caps)} SLR groups of at most '

@@ -252,9 +252,12 @@ def netlist_resources(sim, copies, region, synthesis=None):
     # The kernel beside the simulator (its memory endpoints, virtual memory
     # controllers, host interface): not in the netlist, placed with it.
     kr = kernel_resources(os.path.dirname(os.path.abspath(sim)), region)
+    placed = {r: 0.0 for r in RESOURCES}
     for r in ('lut', 'lutram', 'ff', 'bram'):
-        rest[r] += kr[r] * (pl.get(r, 1.0) if r in ('lut', 'lutram', 'ff') else 1.0)
+        placed[r] = kr[r] * (pl.get(r, 1.0) if r in ('lut', 'lutram', 'ff') else 1.0)
+        rest[r] += placed[r]
     KERNEL['last'] = kr
+    KERNEL['placed'] = placed
     out['__top__'] = rest
     return out
 
@@ -399,11 +402,29 @@ def full_capacities(region):
                  uram=s.get('uram', 0), bram=s.get('ramb36', 0)) for s in region['slrs']]
 
 
-def spread(top, full):
+def spread(top, full, level_slr=None, kernel=None):
     """The simulator level's share of each SLR (spread over the region in
-    proportion to each resource's capacity)."""
+    proportion to each resource's capacity). With `level_slr` (the floorplan
+    pins the level beside an SLR group: foldsim --slr-level), the level is
+    that SLR's whole and only the kernel beside it (`kernel`, its placed part
+    of `top`: not pinned) spreads."""
     tot = {r: sum(c[r] for c in full) for r in RESOURCES}
-    return [{r: (top or {}).get(r, 0.0) * c[r] / tot[r] if tot[r] else 0.0 for r in RESOURCES} for c in full]
+    if level_slr is None or level_slr not in [c['name'] for c in full]:
+        return [{r: (top or {}).get(r, 0.0) * c[r] / tot[r] if tot[r] else 0.0 for r in RESOURCES} for c in full]
+    k = kernel or {}
+    lev = {r: max(0.0, (top or {}).get(r, 0.0) - k.get(r, 0.0)) for r in RESOURCES}
+    return [{r: k.get(r, 0.0) * c[r] / tot[r] + (lev[r] if c['name'] == level_slr else 0.0) if tot[r] else 0.0
+             for r in RESOURCES} for c in full]
+
+
+def floorplan_level(path):
+    """The SLR the floorplan pins the simulator level to (foldsim --slr-level: the sim's cells outside the
+    foldsim_slr<g> groups, after `set sim [get_property PARENT $g]`), or None."""
+    if not path or not os.path.exists(path):
+        return None
+    m = re.search(r'set sim \[get_property PARENT \$g\]\s*\n[^\n]*foldsim_slr[^\n]*\n[^\n]*USER_SLR_ASSIGNMENT (SLR\d+) \$c',
+                  open(path).read())
+    return m.group(1) if m else None
 
 
 def distribute(res_l, room, home, use, full):
@@ -1026,7 +1047,8 @@ def main():
     fills = model.get('fill', {})
     # The simulator level's own logic and unowned memories spread over the region (each SLR keeps its share free);
     # the placer fills an SLR up to its `fill` of each resource (the region's placement model).
-    top_spread = spread(top_share, full)
+    level_slr = floorplan_level(fpath)
+    top_spread = spread(top_share, full, level_slr, KERNEL.get('placed') if mode == 'netlist' else None)
     fill_of = {r: fills.get(r, region.get('margin', 1.0) if r in LOGIC else 1.0) for r in RESOURCES}
     room0 = [{r: fill_of[r] * c[r] - t[r] for r in RESOURCES} for c, t in zip(full, top_spread)]
     # Copies split over SLRs (foldsim-slr-split): each part placed in its SLR (the floorplan's), not assigned; the
@@ -1052,7 +1074,8 @@ def main():
     for c in caps:
         lines.append(f'  {c["name"]} capacity: ' + ', '.join(f'{r} {fmt(r, c[r])}' for r in RESOURCES))
     if top_share:
-        lines.append('  simulator level (spread): ' + ', '.join(f'{r} {fmt(r, top_share[r])}' for r in RESOURCES))
+        lines.append(('  simulator level (in ' + level_slr + ', the kernel spread): ' if level_slr else
+                      '  simulator level (spread): ') + ', '.join(f'{r} {fmt(r, top_share[r])}' for r in RESOURCES))
     # 1. Each copy whole within an SLR: any of them, or the one named.
     if a.copy_cap == 'none':
         allowed = [dict(c, **{r: math.inf for r in RESOURCES}) for c in caps]
@@ -1363,7 +1386,7 @@ def main():
                             f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT {names[h]} $c'
                             + (f'; fs_slr_pblock $c {names[h]}' if k is not None else '') + ' }\n')
     if a.json:
-        json.dump(dict(name=name, ii=ii, mode=mode, copies=res, top=top_share, wires=[[x, y, w] for (x, y), w in
+        json.dump(dict(name=name, ii=ii, mode=mode, copies=res, top=top_share, top_kernel=KERNEL.get('placed'), level_slr=level_slr, wires=[[x, y, w] for (x, y), w in
                                                                                      wires.items()],
                        assignment=groups, cuts=cuts, shares=shares,
                        slls=slls, over=[c for c, _, _ in over], caps=caps, margin=region.get('margin', 1.0)),

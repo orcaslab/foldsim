@@ -132,6 +132,17 @@
 # RUN: FileCheck %s --check-prefix=FILL < %t/fill.log
 # FILL: SLR group 1 (SLR1) keeps {{[1-9][0-9]+}} LUT sites for the simulator level and the kernel
 # FILL: 3 SLR groups of at most SLR2 {{[0-9]+}}, SLR1 {{[0-9]+}}, SLR0 {{[0-9]+}} LUT sites; copies: Leaf {{[0-9]+}}
+# With the kernel's part of `top` (`top_kernel`, the SLL check's): the level
+# alone kept from the level's group, the kernel spread over the SLRs by their
+# LUTs, as the check charges them; the check itself puts the level in the SLR
+# the floorplan pins it to (--slr-level), not spread.
+# RUN: echo '{"copies": {"Leaf": {"lut": 10}, "Top_model": {"lut": 5}}, "top": {"lut": 100000}, "top_kernel": {"lut": 40000}}' > %t/lvl.json
+# RUN: foldsim --srcs top.f --top Top --out %t/lvl --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-sites %t/lvl.json --slr-level 1 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 Leaf > %t/lvl.log 2>&1
+# RUN: FileCheck %s --check-prefix=LVL < %t/lvl.log
+# LVL: SLR group 1 (SLR1) keeps 87300 LUT sites for the simulator level (measured
+# LVL: the kernel beside the simulator (40000 LUTs, measured) spread over the SLRs by their LUTs
+# RUN: FileCheck %s --check-prefix=LVLCHK < %t/lvl/sll/sll.txt
+# LVLCHK: simulator level (in SLR1, the kernel spread):
 # With the sll.json's URAM288 / RAMB36 (tenths) the chooser keeps each
 # group within its SLR's RAM at the region's margin too: a copy past every
 # SLR's URAM finds no assignment.
