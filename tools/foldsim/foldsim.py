@@ -1119,7 +1119,8 @@ def slr_options(a, foldsim_opt, models, fold, out):
         if a.slr_sites and rams:
             rj2 = a.slr_region if a.slr_region != 'v80' else rj
             r2 = json.load(open(rj2))
-            caps_more = [[round(10 * r2['margin'] * slr['uram']), round(10 * r2['margin'] * slr['ramb36'])]
+            rf = a.slr_ram_fill or r2['margin']
+            caps_more = [[round(10 * rf * slr['uram']), round(10 * rf * slr['ramb36'])]
                          for slr in r2['slrs']]
             if level is not None:
                 caps_more[level] = [max(0, x - y) for x, y in zip(caps_more[level], level_rams)]
@@ -2625,6 +2626,9 @@ def build_parser():
     ap.add_argument('--slr-fill', type=float, default=0, metavar='FRAC',
                     help="with --slr-groups and --slr-region: the fraction of each SLR's LUTs a group may fill "
                          "(default the region's margin), e.g. a fit rule's per-SLR LUT limit")
+    ap.add_argument('--slr-ram-fill', type=float, default=0, metavar='FRAC',
+                    help="with --slr-groups and an sll.json as --slr-sites: the fraction of each SLR's URAM288 and "
+                         "RAMB36 a group may fill (default the region's margin)")
     ap.add_argument('--slr-capacity', type=int, default=0,
                     help="with --slr-groups: a group's most LUT sites (foldsim_degree.py's "
                          "estimate; default: the V80 dynamic region's, with margin, over "
