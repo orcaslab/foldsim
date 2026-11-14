@@ -9576,6 +9576,20 @@ LogicalResult StaticFolder::chooseGroups() {
   std::vector<std::pair<uint64_t, SmallVector<int>>> kept;
   SmallVector<int> group(n, -1);
   SmallVector<uint64_t> used(slrGroups, 0);
+  // The further resources (slr-sites <sites>/<r>..., slr-capacities): a
+  // group within each of its SLR's too (e.g. its URAM and block RAM).
+  size_t moreKinds = slrCapsMore.empty() ? 0 : slrCapsMore[0].size();
+  SmallVector<SmallVector<uint64_t>> usedMore(
+      slrGroups, SmallVector<uint64_t>(moreKinds, 0));
+  auto moreOf = [&](unsigned c, size_t r) -> uint64_t {
+    return r < slrMore[c].size() ? slrMore[c][r] : 0;
+  };
+  auto pastMore = [&](unsigned c, unsigned g) {
+    for (size_t r = 0; r < moreKinds; ++r)
+      if (usedMore[g][r] + moreOf(c, r) > slrCapsMore[g][r])
+        return true;
+    return false;
+  };
   // With slr-capacities the groups are the region's SLRs in order: a link
   // between groups i and j crosses every boundary between them, and with
   // slr-sll-budget no boundary may carry more link bits than the budget.
@@ -9619,7 +9633,8 @@ LogicalResult StaticFolder::chooseGroups() {
         for (unsigned g = 0; g < limit; ++g) {
           if (pinned[c] >= 0 && int(g) != pinned[c])
             continue;
-          if (slrCaps[g] && used[g] + slrSites[c] > slrCaps[g]) {
+          if ((slrCaps[g] && used[g] + slrSites[c] > slrCaps[g]) ||
+              pastMore(c, g)) {
             ++prunedCapacity;
             continue;
           }
@@ -9673,8 +9688,12 @@ LogicalResult StaticFolder::chooseGroups() {
           }
           group[c] = g;
           used[g] += slrSites[c];
+          for (size_t r = 0; r < moreKinds; ++r)
+            usedMore[g][r] += moreOf(c, r);
           visit(k + 1, std::max(opened, g + 1), cut + more, bound2);
           used[g] -= slrSites[c];
+          for (size_t r = 0; r < moreKinds; ++r)
+            usedMore[g][r] -= moreOf(c, r);
           group[c] = -1;
           for (unsigned b = 0; b < boundary.size(); ++b)
             boundary[b] -= added[b];

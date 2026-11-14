@@ -1088,9 +1088,15 @@ def slr_options(a, foldsim_opt, models, fold, out):
         # simulator level with the kernel (`top`), which the floorplan puts
         # beside the level's group (--slr-level).
         level_sites = 0
+        rams = {}
         if isinstance(measured.get('copies'), dict):
-            level_sites = round(measured.get('top', {}).get('lut', 0) * spl)
+            top = measured.get('top', {})
+            level_sites = round(top.get('lut', 0) * spl)
+            # Its block and ultra RAM too (tenths of a URAM288 / RAMB36):
+            # each group within its SLR's RAM at the region's margin.
+            level_rams = (round(10 * top.get('uram', 0)), round(10 * top.get('bram', 0)))
             measured = measured['copies']
+            rams = {c: (round(10 * m.get('uram', 0)), round(10 * m.get('bram', 0))) for c, m in measured.items()}
         for c in sites:
             if c in measured:
                 sites[c] = round(measured[c]['lut'] * spl)
@@ -1109,11 +1115,27 @@ def slr_options(a, foldsim_opt, models, fold, out):
             caps[level] = (n, max(0, c - level_sites))
             print(f'foldsim: SLR group {level} ({n}) keeps {level_sites} LUT sites for the simulator level and the '
                   f'kernel (measured, {a.slr_sites})', file=sys.stderr)
+        caps_more = None
+        if a.slr_sites and rams:
+            rj2 = a.slr_region if a.slr_region != 'v80' else rj
+            r2 = json.load(open(rj2))
+            caps_more = [[round(10 * r2['margin'] * slr['uram']), round(10 * r2['margin'] * slr['ramb36'])]
+                         for slr in r2['slrs']]
+            if level is not None:
+                caps_more[level] = [max(0, x - y) for x, y in zip(caps_more[level], level_rams)]
+            print('foldsim: SLR groups\' URAM288 / RAMB36 (tenths) at most '
+                  + ', '.join(f'{n} {u}/{b}' for (n, _), (u, b) in zip(caps, caps_more)), file=sys.stderr)
         print(f'foldsim: {len(caps)} SLR groups of at most '
               + ', '.join(f'{n} {c}' for n, c in caps) + ' LUT sites; copies: '
               + ', '.join(f'{c} {s}' for c, s in sites.items()), file=sys.stderr)
-        opts = (f' slr-groups={len(caps)} slr-capacities={",".join(str(c) for _, c in caps)} slr-sites='
-                + ','.join(f'{c}:{s}' for c, s in sites.items())
+        if caps_more:
+            opts = (f' slr-groups={len(caps)} slr-capacities='
+                    + ','.join(f'{c}/{u}/{b}' for (_, c), (u, b) in zip(caps, caps_more)) + ' slr-sites='
+                    + ','.join(f'{c}:{s}/{rams.get(c, (0, 0))[0]}/{rams.get(c, (0, 0))[1]}' for c, s in sites.items()))
+        else:
+            opts = (f' slr-groups={len(caps)} slr-capacities={",".join(str(c) for _, c in caps)} slr-sites='
+                    + ','.join(f'{c}:{s}' for c, s in sites.items()))
+        opts += (''
                 + f' slr-sll-budget={slr_region_sll_budget(a.slr_region)}')
     else:
         capacity = a.slr_capacity or round(foldsim_degree.PLACE_MARGIN *

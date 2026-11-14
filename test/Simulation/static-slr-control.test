@@ -125,3 +125,15 @@
 # RUN: FileCheck %s --check-prefix=FILL < %t/fill.log
 # FILL: SLR group 1 (SLR1) keeps {{[1-9][0-9]+}} LUT sites for the simulator level and the kernel
 # FILL: 3 SLR groups of at most SLR2 {{[0-9]+}}, SLR1 {{[0-9]+}}, SLR0 {{[0-9]+}} LUT sites; copies: Leaf {{[0-9]+}}
+# With the sll.json's URAM288 / RAMB36 (tenths) the chooser keeps each
+# group within its SLR's RAM at the region's margin too: a copy past every
+# SLR's URAM finds no assignment.
+# RUN: echo '{"copies": {"Leaf": {"lut": 10, "uram": 1, "bram": 2}, "Top_model": {"lut": 5, "uram": 0, "bram": 1}}, "top": {"lut": 1000, "uram": 0, "bram": 3}}' > %t/rams.json
+# RUN: foldsim --srcs top.f --top Top --out %t/rams --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-sites %t/rams.json --slr-level 0 Leaf > %t/rams.log 2>&1
+# RUN: FileCheck %s --check-prefix=RAMS < %t/rams.log
+# RAMS: SLR groups' URAM288 / RAMB36 (tenths) at most SLR2 4216/8258, SLR1 4344/8874, SLR0 1734/3366
+# RAMS: slr-capacities={{[0-9]+}}/4216/8258,{{[0-9]+}}/4344/8874,{{[0-9]+}}/1734/3366 slr-sites=Leaf:{{[0-9]+}}/10/20
+# RUN: echo '{"copies": {"Leaf": {"lut": 10, "uram": 600, "bram": 2}}, "top": {"lut": 1000}}' > %t/rams2.json
+# RUN: not foldsim --srcs top.f --top Top --out %t/rams2 --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-sites %t/rams2.json --slr-level 0 Leaf > %t/rams2.log 2>&1
+# RUN: FileCheck %s --check-prefix=RAMS2 < %t/rams2.log
+# RAMS2: slr-groups: no assignment
