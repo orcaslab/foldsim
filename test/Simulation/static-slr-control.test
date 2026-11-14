@@ -117,3 +117,11 @@
 # SP-NEXT: group 2 SLR0 MEM_SLR0_0 MEM_SLR0_1 MEM_SLR0_2 MEM_SLR0_3
 # SP-NEXT: level SLR0 MEM_SLR0_0 MEM_SLR0_1 MEM_SLR0_2 MEM_SLR0_3
 # RUN: not test -e %t/own/foldsim_sp.txt
+# --slr-sites from an SLL check's sll.json: the copies' measured LUTs, and its
+# simulator level with the kernel (`top`) kept from the --slr-level group's
+# room; --slr-fill: the fraction of each SLR a group may fill.
+# RUN: echo '{"copies": {"Leaf": {"lut": 10}, "Top_model": {"lut": 5}}, "top": {"lut": 100000}}' > %t/sites.json
+# RUN: foldsim --srcs top.f --top Top --out %t/fill --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-fill 0.5 --slr-sites %t/sites.json --slr-level 1 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 Leaf > %t/fill.log 2>&1
+# RUN: FileCheck %s --check-prefix=FILL < %t/fill.log
+# FILL: SLR group 1 (SLR1) keeps {{[1-9][0-9]+}} LUT sites for the simulator level and the kernel
+# FILL: 3 SLR groups of at most SLR2 {{[0-9]+}}, SLR1 {{[0-9]+}}, SLR0 {{[0-9]+}} LUT sites; copies: Leaf {{[0-9]+}}

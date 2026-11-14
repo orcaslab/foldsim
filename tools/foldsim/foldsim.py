@@ -1081,6 +1081,13 @@ def slr_options(a, foldsim_opt, models, fold, out):
             os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
         spl = json.load(open(rj))['sites_per_lut']
         measured = json.load(open(a.slr_sites))
+        # An SLL check's sll.json of the same recipe: its copies, and its
+        # simulator level with the kernel (`top`), which the floorplan puts
+        # beside the level's group (--slr-level).
+        level_sites = 0
+        if isinstance(measured.get('copies'), dict):
+            level_sites = round(measured.get('top', {}).get('lut', 0) * spl)
+            measured = measured['copies']
         for c in sites:
             if c in measured:
                 sites[c] = round(measured[c]['lut'] * spl)
@@ -1090,7 +1097,15 @@ def slr_options(a, foldsim_opt, models, fold, out):
         # Unequal SLRs: group g is the region's g-th SLR, each with its own
         # capacity (its LUTs, with margin, in LUT sites); the floorplan names it.
         # No boundary may carry more link bits than its SLLs, with margin.
-        caps = slr_region_capacities(a.slr_region)
+        caps = slr_region_capacities(a.slr_region, a.slr_fill)
+        # The level and the kernel beside group G (--slr-level) take their
+        # room from G's SLR: measured (an sll.json as --slr-sites), else none.
+        level = slr_level_group(getattr(a, 'slr_level', None), a.slr_region, len(caps))
+        if a.slr_sites and level is not None and level_sites:
+            n, c = caps[level]
+            caps[level] = (n, max(0, c - level_sites))
+            print(f'foldsim: SLR group {level} ({n}) keeps {level_sites} LUT sites for the simulator level and the '
+                  f'kernel (measured, {a.slr_sites})', file=sys.stderr)
         print(f'foldsim: {len(caps)} SLR groups of at most '
               + ', '.join(f'{n} {c}' for n, c in caps) + ' LUT sites; copies: '
               + ', '.join(f'{c} {s}' for c, s in sites.items()), file=sys.stderr)
@@ -1111,7 +1126,7 @@ def slr_options(a, foldsim_opt, models, fold, out):
     return opts
 
 
-def slr_region_capacities(path):
+def slr_region_capacities(path, fill=None):
     """[(SLR name, LUT sites)] of a dynamic region's SLRs (--slr-region): each
     SLR's LUTs times the margin a group may fill (the SLR's own `margin` if it
     has one, e.g. an SLR whose copies route only at a lower fill, else the
@@ -1120,7 +1135,8 @@ def slr_region_capacities(path):
     if path == 'v80':
         path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
     region = json.load(open(path))
-    return [(slr['name'], round(slr.get('margin', region['margin']) * slr['luts'] * region['sites_per_lut']))
+    return [(slr['name'], round((fill if fill else slr.get('margin', region['margin'])) * slr['luts']
+                                * region['sites_per_lut']))
             for slr in region['slrs']]
 
 
@@ -2577,6 +2593,9 @@ def build_parser():
                          'implementation flow to source after synthesis')
     ap.add_argument('--slr-count', type=int, default=3,
                     help='with --slr-groups: the most SLR groups (the V80: 3 SLRs)')
+    ap.add_argument('--slr-fill', type=float, default=0, metavar='FRAC',
+                    help="with --slr-groups and --slr-region: the fraction of each SLR's LUTs a group may fill "
+                         "(default the region's margin), e.g. a fit rule's per-SLR LUT limit")
     ap.add_argument('--slr-capacity', type=int, default=0,
                     help="with --slr-groups: a group's most LUT sites (foldsim_degree.py's "
                          "estimate; default: the V80 dynamic region's, with margin, over "
