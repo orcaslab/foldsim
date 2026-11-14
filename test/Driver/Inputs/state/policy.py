@@ -74,7 +74,8 @@ queues = dict(Slice=dict(lut=20000.0, ff=2000, regw={2000: 1},
 d.COPY_CAP = None
 run('queues free', queues)
 d.COPY_CAP = cap
-run('queues policy', queues)
+qp = run('queues policy', queues)
+print(f"queues policy RAM {qp['res']['bram']:g} {qp['res']['uram']:g}")
 d.COPY_CAP = d.copy_budget(dict(REGION, slrs=[dict(REGION['slrs'][1], ramb36=60, uram=10)]), 0.75)
 run('queues spent', queues)
 # Sixteen such queues: more HBM bytes than the schedule's frame carries; the
@@ -89,6 +90,15 @@ d.COPY_CAP = cap
 d.COPY_CAP = d.copy_budget(dict(REGION, slrs=REGION['slrs'][:1]), 0.75, region_frac=0.06)
 out = run('queues region', queues)
 print(f"region cap {d.COPY_CAP['region_lut']:.0f} used {out['res']['luts']} within {out['res']['luts'] <= d.COPY_CAP['region_lut']}")
+d.COPY_CAP = cap
+# The region's RAM (--state-ram-budget) at 6 % of the V80 region's (144.9
+# RAMB36, 72.7 URAM288; the copy budget alone took 199.5 RAMB36): stores
+# leave block RAM until the design is within.
+d.COPY_CAP = dict(cap, region_ram=0.06)
+out = run('queues ram', queues)
+print(f"ram cap {0.06 * s.REGION['bram']:.1f} {0.06 * s.REGION['uram']:.1f} used "
+      f"{out['res']['bram']:g} {out['res']['uram']:g} within "
+      f"{out['res']['bram'] <= 0.06 * s.REGION['bram'] and out['res']['uram'] <= 0.06 * s.REGION['uram']}")
 d.COPY_CAP = cap
 # A given rule (--storage) fixes its store: priced at its kind, no rule
 # emitted for it, the others still chosen within the budget.

@@ -1226,6 +1226,11 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                 u['costs'].pop('ultra', None)
                 u['per'].pop('ultra', None)
     caps = storage.capacities()
+    if COPY_CAP and COPY_CAP.get('region_ram'):
+        # The region's RAM at the policy's own fill (below the placement
+        # margin): whole copies on unequal SLRs need RAM headroom as LUTs do.
+        for p in ('bram', 'uram'):
+            caps[p] = min(caps[p], COPY_CAP['region_ram'] * storage.REGION[p])
     # The links' storage, as the compiler emits it (the schedule report's
     # link kinds), in the base usage the stores' kinds are chosen against.
     lk = link_cost(cal, (sched or {}).get('__links__'))
@@ -3228,10 +3233,12 @@ def state_fit_main(a):
     return 0
 
 
-def state_policy(cal_path, budget=None, region_path='v80', region_frac=None):
+def state_policy(cal_path, budget=None, region_path='v80', region_frac=None, ram_frac=None):
     """Set the state-home policy (foldsim --state auto): STATE_CAL from
     `cal_path` (or none), the per-copy budget `budget` (FRAC[:SLR]: COPY_CAP)
-    over the region's SLRs, the on-chip-first repair. Returns COPY_CAP."""
+    over the region's SLRs, the on-chip-first repair; `ram_frac`: the whole
+    region's block and ultra RAM at most that fraction of its (else the
+    region's margin). Returns COPY_CAP."""
     global STATE_CAL, COPY_CAP
     STATE_CAL = json.load(open(cal_path)) if cal_path else None
     if STATE_CAL and STATE_CAL.get('placed_per_priced'):
@@ -3243,6 +3250,8 @@ def state_policy(cal_path, budget=None, region_path='v80', region_frac=None):
         COPY_CAP = copy_budget(json.load(open(region_path)), float(frac), slr or 'smallest', region_frac)
         storage.READ_BUFFERS = True
         storage.ONCHIP_FIRST = True
+    if ram_frac and COPY_CAP is not None:
+        COPY_CAP['region_ram'] = ram_frac
     return COPY_CAP
 
 

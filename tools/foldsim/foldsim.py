@@ -900,7 +900,8 @@ def state_policy(a, out):
     budget = None if a.state_copy_budget in ('', '0', 'off', 'none') else a.state_copy_budget
     region = a.slr_region if a.slr_region not in ('',) else 'v80'
     rf = None if a.state_region_budget in ('', '0', 'off', 'none') else float(a.state_region_budget)
-    cap = foldsim_degree.state_policy(calp, budget, region, rf)
+    ram = None if a.state_ram_budget in ('', '0', 'off', 'none') else float(a.state_ram_budget)
+    cap = foldsim_degree.state_policy(calp, budget, region, rf, ram)
     if a.state_home == 'onchip':
         foldsim_degree.storage.ONCHIP_ONLY = True
     if a.state_measured:
@@ -912,6 +913,7 @@ def state_policy(a, out):
     return ('calibration ' + (os.path.basename(calp) if calp else 'none')
             + (f", copy budget {cap['lut']:.0f} LUTs (x{cap['frac']:g} of {cap['name']})" if cap else '')
             + (f", region {cap['region_lut']:.0f} LUTs (x{cap['region_frac']:g})" if cap and cap.get('region_lut') else '')
+            + (f", region RAM x{cap['region_ram']:g}" if cap and cap.get('region_ram') else '')
             + (f", measured {a.state_measured}" if a.state_measured else '')
             + (', state on chip only' if a.state_home == 'onchip' else ''))
 
@@ -2502,6 +2504,11 @@ def build_parser():
                          'LUTRAM a LUT each, synthesized) at most FRAC of the region\'s, the state moved into block '
                          'and ultra RAM (then HBM) until it is: headroom under the per-SLR share for whole copies on '
                          'unequal SLRs (8 SMs split at 76 % left a copy without an SLR); default 0.65, 0: none')
+    ap.add_argument('--state-ram-budget', default='', metavar='FRAC',
+                    help="with --state auto and a copy budget: the whole region's block and ultra RAM (stores, "
+                         'links, kernel) at most FRAC of the region\'s (default: the region\'s margin), the '
+                         'stores and links that use RAM least well moved to LUTRAM (or HBM) until it is: RAM '
+                         'headroom for whole copies on unequal SLRs, as --state-region-budget is for LUTs')
     ap.add_argument('--state-calibration', default='', metavar='JSON|none',
                     help="with --state auto: the area model's calibration to synthesized LUTs (copies' logic "
                          'and LUTRAM, the level, the kernel beside the simulator: foldsim_degree.py state-fit; '

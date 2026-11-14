@@ -13,12 +13,16 @@
 # Queues: to block and ultra RAM; with the copy's RAM spent, to HBM.
 # CHECK: queues free: copy 49157 lutram 29157 H 256 page - off [] moved []
 # CHECK: queues policy: copy {{[0-9]+}} lutram {{[0-9]+}} H 256 page - off [] moved [] rules ['Slice:q7/ram=ultra', 'Slice:regs>=2000=ultra']
+# CHECK-NEXT: queues policy RAM 199.5 57
 # CHECK: queues spent: copy 32814 lutram 12814 H 256 page - off [] moved ['q0/ram', 'q1/ram', 'q2/ram', 'q3/ram']
 # More bytes off chip than the schedule's frame carries: a longer frame.
 # CHECK: queues longer: copy {{[0-9]+}} lutram {{[0-9]+}} H 384 page - off [] moved ['q0/ram', 'q1/ram', 'q10/ram',
 # The region's LUTs (--state-region-budget) where the copy's budget does not bind.
 # CHECK: queues region: copy {{[0-9]+}} lutram {{[0-9]+}} H 256 page - off [] moved [] rules ['Slice:q0/ram=ultra',
 # CHECK-NEXT: region cap 36000 used {{[0-9]+}} within True
+# The region's RAM (--state-ram-budget) below what the copy budget alone takes.
+# CHECK: queues ram: {{.*}} rules ['Slice:q5/ram=ultra', 'Slice:q6/ram=ultra', 'Slice:q7/ram=distributed']
+# CHECK-NEXT: ram cap 144.9 72.7 used {{[0-9.]+}} {{[0-9.]+}} within True
 # CHECK: queues given: {{.*}} rules ['Slice:q7/ram=ultra', 'Slice:regs>=2000=ultra']
 # CHECK: factors (2.0, 1.0) (1.5, 1.25)
 # CHECK: queues measured: copy {{[0-9]+}}
