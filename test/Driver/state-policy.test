@@ -24,6 +24,8 @@
 # CHECK: queues measured: copy {{[0-9]+}}
 # CHECK: onchip-first True: ['block']
 # CHECK: onchip-first False: ['hbm']
+# CHECK: onchip-only first True: ['distributed']
+# CHECK: onchip-only first False: ['distributed']
 # CHECK: fit {'copy_logic': 1.323, 'copy_lutram': 1.5, 'level': 1.225, 'kernel_logic': 450, 'kernel_lutram': 50}
 # Through the driver (Inputs/paged, four leaves): within 0.1 % of SLR0 (256
 # LUTs) the leaves' register stores from 8 bits go to block RAM; the copy as

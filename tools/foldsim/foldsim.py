@@ -901,6 +901,8 @@ def state_policy(a, out):
     region = a.slr_region if a.slr_region not in ('',) else 'v80'
     rf = None if a.state_region_budget in ('', '0', 'off', 'none') else float(a.state_region_budget)
     cap = foldsim_degree.state_policy(calp, budget, region, rf)
+    if a.state_home == 'onchip':
+        foldsim_degree.storage.ONCHIP_ONLY = True
     if a.state_measured:
         if not foldsim_degree.STATE_CAL:
             sys.exit('--state-measured needs a --state-calibration')
@@ -910,7 +912,8 @@ def state_policy(a, out):
     return ('calibration ' + (os.path.basename(calp) if calp else 'none')
             + (f", copy budget {cap['lut']:.0f} LUTs (x{cap['frac']:g} of {cap['name']})" if cap else '')
             + (f", region {cap['region_lut']:.0f} LUTs (x{cap['region_frac']:g})" if cap and cap.get('region_lut') else '')
-            + (f", measured {a.state_measured}" if a.state_measured else ''))
+            + (f", measured {a.state_measured}" if a.state_measured else '')
+            + (', state on chip only' if a.state_home == 'onchip' else ''))
 
 
 def state_budget_check(a, sim, out):
@@ -2467,6 +2470,10 @@ def build_parser():
                          'by default), its block and ultra RAM within the region\'s margin of it; a copy over '
                          'moves stores to block or ultra RAM first (registered reads), then to HBM; default '
                          '0.75, 0: none')
+    ap.add_argument('--state-home', choices=('any', 'onchip'), default='any',
+                    help="with --state auto: onchip: the policy never moves state off chip (no virtual memories or "
+                         "pages in HBM chosen; the HBM tier's relief is not admissible), e.g. the rule that up to 16 "
+                         "SMs the state lives in block / ultra RAM; any (default): on chip first, then HBM")
     ap.add_argument('--state-region-budget', default='0.65', metavar='FRAC',
                     help="with --state auto and a copy budget: the whole region's LUTs (copies, level, kernel; "
                          'LUTRAM a LUT each, synthesized) at most FRAC of the region\'s, the state moved into block '

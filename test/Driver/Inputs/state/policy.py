@@ -114,6 +114,14 @@ for first in (True, False):
     ch, _ = s.assign([dict(u) for u in units], dict(sites=800.0), dict(sites=1000.0, bram=20.0, hbm=1000.0))
     print(f'onchip-first {first}: {list(ch[0])}')
 s.ONCHIP_FIRST = False
+# --state-home onchip: block RAM spent (cap 10), HBM never admissible: the
+# store stays in distributed RAM (the pool stays over), never off chip.
+s.ONCHIP_ONLY = True
+for first in (True, False):
+    s.ONCHIP_FIRST = first
+    ch, _ = s.assign([dict(u) for u in units], dict(sites=800.0), dict(sites=1000.0, bram=10.0, hbm=1000.0))
+    print(f'onchip-only first {first}: {list(ch[0])}')
+s.ONCHIP_ONLY = s.ONCHIP_FIRST = False
 
 # state_fit: two copies against a report; the level and the kernel by
 # difference.

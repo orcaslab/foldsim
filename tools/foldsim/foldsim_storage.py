@@ -416,6 +416,11 @@ RELIEF_KINDS = ('hbm',)
 # relieves it (the RAM spent), off chip (HBM); only then into flops or
 # distributed RAM.
 ONCHIP_FIRST = False
+# --state-home onchip: no state off chip at all (the user's 11-12 rule: state
+# in block / ultra RAM up to 16 SMs, HBM from 32): the relief kinds are never
+# admissible; a pool the RAM on chip cannot relieve stays over (the policy
+# then says nothing fits).
+ONCHIP_ONLY = False
 # The kernel's controllers (foldsim_vmem: request queue, tags, write buffer,
 # AXI master; a host cache and the known-zero bits in block RAM where it has
 # them), as foldsim_afu instantiates them for a virtual memory or a group of
@@ -1052,7 +1057,7 @@ def assign(units, base, caps, extra=None, paging=False, price_extra=False):
 
     def admissible(u, k):
         c = u['costs'].get(k)
-        return c is not None and (paging or not c['ii_floor'])
+        return c is not None and (paging or not c['ii_floor']) and not (ONCHIP_ONLY and k in RELIEF_KINDS)
 
     def solve(weight):
         def price(c):
