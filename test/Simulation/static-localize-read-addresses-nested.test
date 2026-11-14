@@ -1,0 +1,24 @@
+# REQUIRES: verilator
+# foldsim-localize-read-addresses across more than one class boundary, both
+# ways (Driver/Inputs/localize2; a32-S26X 11-14: execute_slice split into
+# alu/lsu/fpu/sfu block classes, the frontend's ipdom RAM read at an address
+# from execute_slice's output, itself an output of the nested sfu_block):
+# - Leaf.ram's address comes from Mid's output, Inner's register through Mid:
+#   Inner and Mid both get a next-value output;
+# - Ram.ram's address comes from its input (Leaf's register plus Mid's output):
+#   Ram gets a next-value input that every Leaf feeds.
+# Both reads are retimed with every boundary kept, and the simulator matches
+# the target with and without stalls. A mutant feeding the input's current
+# value instead of its next value mismatches.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/localize2
+# RUN: foldsim --srcs top.f --top Top --out %t/n --static --nest Leaf Mid Inner Ram > %t/n.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/n.log
+# RUN: FileCheck %s --check-prefix=RPT < %t/n/memories.rpt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/n/obj %S/Inputs/tb_nest.sv top.sv %t/n/foldsim_sim.sv > %t/n/build.log 2>&1
+# RUN: %t/n/obj/Vtb +stall=0 | FileCheck %s
+# RUN: %t/n/obj/Vtb +stall=30 | FileCheck %s
+# LOG: foldsim-localize-read-addresses: 2 reads' address registers copied beside their memory (2 next-value outputs, 1 next-value inputs)
+# RPT-DAG: Ram.ram 16x8 ram_style=block converted
+# RPT-DAG: Leaf.ram 16x8 ram_style=block converted
+# CHECK: {{^}}MATCH
+# CHECK-NOT: MISMATCH

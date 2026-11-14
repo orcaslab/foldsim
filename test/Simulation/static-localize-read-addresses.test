@@ -17,7 +17,7 @@
 # RUN: %t/lz/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
 # RUN: %t/lz/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | FileCheck %s
 # RUN: %t/lz/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | FileCheck %s
-# LOG: foldsim-localize-read-addresses: 1 reads' address registers copied beside their memory
+# LOG: foldsim-localize-read-addresses: 1 reads' address registers copied beside their memory (1 next-value outputs, 0 next-value inputs)
 # RPT: Leaf.ram 16x8 ram_style=block converted
 # CHECK: {{^}}MATCH
 # CHECK-NOT: MISMATCH

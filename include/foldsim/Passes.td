@@ -1761,18 +1761,24 @@ def CompressAddTrees : Pass<"foldsim-compress-add-trees",
 }
 
 def LocalizeReadAddresses : Pass<"foldsim-localize-read-addresses", "::mlir::ModuleOp"> {
-  let summary = "Copy a memory read's address registers out of a kept instance";
+  let summary = "Copy a memory read's address registers across kept class boundaries";
   let description = [{
     For each asynchronous-read memory that seq-retime-firmem-reads would make
     synchronous (it asks for block RAM, or `mode=auto` and at least
-    `min-bits` bits): where its read address is computed from registers and
-    from outputs of kept instances (class modules, not inlined) that are
-    themselves computed from registers on the memory's write clock, the
-    instance's module gets an output `<output>_foldsim_next`, the next value
-    of that output (its registers' next values, synchronous resets applied),
-    and the memory's module a register of it; the address is computed from
-    that register, equal to the output on every cycle after the first edge.
-    The read can then be retimed with the module boundary kept.
+    `min-bits` bits): where its read address is computed from registers,
+    from outputs of kept instances (class modules, not inlined) and from the
+    memory module's own inputs, and the next value of each such boundary
+    signal can be computed (its cone, followed down through nested kept
+    instances and up through module inputs to every instance's parent, ends
+    at constants and synchronous registers clocked by the memory's write
+    clock): a module whose output is crossed gets an output
+    `<output>_foldsim_next` with that output's next value (its registers'
+    next values, synchronous resets applied), a module whose input is crossed
+    an input `<input>_foldsim_next` that every instance feeds with the next
+    value of its operand, and the memory's module a register of each next
+    value at its boundary; the address is computed from those registers,
+    equal to the boundary signals on every cycle after the first edge. The
+    read can then be retimed with every module boundary kept.
   }];
   let options = [
     Option<"mode", "mode", "std::string", "\"off\"",
