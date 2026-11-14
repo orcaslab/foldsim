@@ -107,3 +107,13 @@
 # RUN: %t/own0/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=0 +bubble=0 | grep MATCH > %t/own0/r2.txt
 # RUN: diff %t/own0/r1.txt %t/own/r1.txt
 # RUN: diff %t/own0/r2.txt %t/own/r2.txt
+# The groups' HBM ports by linker tag (foldsim_sp.txt) from a region that
+# names them (the asl9 any-SLR shell): a group's memory masters bind to its
+# own SLR's ports; the level (group 2 here, SLR0) with its SLR's.
+# RUN: foldsim --srcs top.f --top Top --out %t/sp --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region %foldsim_tools/foldsim_v80_asl9_slr.json --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-level 2 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=SP < %t/sp/foldsim_sp.txt
+# SP: group 0 SLR2 MEM
+# SP-NEXT: group 1 SLR1 MEM_SLR1_0 MEM_SLR1_1 MEM_SLR1_2 MEM_SLR1_3
+# SP-NEXT: group 2 SLR0 MEM_SLR0_0 MEM_SLR0_1 MEM_SLR0_2 MEM_SLR0_3
+# SP-NEXT: level SLR0 MEM_SLR0_0 MEM_SLR0_1 MEM_SLR0_2 MEM_SLR0_3
+# RUN: not test -e %t/own/foldsim_sp.txt

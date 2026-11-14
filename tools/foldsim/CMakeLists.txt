@@ -86,6 +86,8 @@ install(FILES foldsim_v80_route.csv DESTINATION bin)
 # The V80 compute shell's dynamic region per SLR (foldsim --slr-region v80).
 configure_file(foldsim_v80_slr.json ${CMAKE_BINARY_DIR}/bin/foldsim_v80_slr.json COPYONLY)
 install(FILES foldsim_v80_slr.json DESTINATION bin)
+configure_file(foldsim_v80_asl9_slr.json ${CMAKE_BINARY_DIR}/bin/foldsim_v80_asl9_slr.json COPYONLY)
+install(FILES foldsim_v80_asl9_slr.json DESTINATION bin)
 # Interface boundary lifting: plain-port wrappers that let interface-port units
 # be classes, on a rewritten copy of the sources (needs pyslang).
 configure_file(foldsim_lift.py ${CMAKE_BINARY_DIR}/bin/foldsim-lift COPYONLY)

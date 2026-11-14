@@ -1,0 +1,503 @@
+{
+ "about": "The V80 compute shell's dynamic region (pblock_slash, SLASH linker/slashkit/resources/base/compute/constraints/impl.xdc) per SLR, its sites counted by Vivado 2025.2 on b4e's opt checkpoint (11-07). Unequal: the static region owns most of SLR0. sites_per_lut converts placed LUTs to foldsim_degree's LUT sites: b4e's largest SLR group, 978,886 estimated sites placed as 672,695 LUTs (post-synth hierarchical utilization), the group that spilled over SLR2/SLR1 at 95 % of SLR2's LUTs. margin: the share of an SLR's LUTs a group may fill and still route at 200 MHz. sll_per_boundary: the V80's super long lines between adjacent SLRs (report_utilization -slr, both boundaries 18,870; Vivado refuses a partition past it: r16c, 11-07, 23,987 needed between SLR1 and SLR2). sll_margin: the share of them the fold's link bits may take (the rest for the shell's crossings and the placer). netlist_lut_scale / netlist_lutram_scale / netlist_ff_scale (foldsim_sll_check.py --resources netlist): synthesized LUTs, LUTRAM and flip-flops per foldsim_cost LUT, memory LUT and flop of a class copy's module, fit 11-07 (est) over 172 copies of 7 synthesized designs (hierarchical utilization: r16c, y8r1di, b4e opt, b4ct150, c2d, pv80, FSD vD) with foldsim_cost packing AND-OR selects and trimming extract-only shifts: one LUT scale 0.782, the designs' copy totals r16c +12.5 %, y8r1di 0, b4e -9.9 %, b4ct150 -7.6 %, c2d -3.8 %, vD +6.6 % (before the packing vD was 0.52 against Vortex's 0.68-0.85); LUTRAM 0.896, flops 0.851. Per copy the residual is larger (b4e core -27 %, vD node model +47 %): foldsim_sll_check.py --synthesis takes a design's own synthesis instead. URAM by ram_style as built: the slice copy 522 counted, 517 synthesized. placed_per_synthesized: placed per synthesized LUT / LUTRAM / flop (b4e's slice copy: 523,144 synthesized and opt, about 524k placed: 1.0; set to make the three placed builds' totals within -4..+4 %). kernel: the kernel beside the simulator (memory endpoints, virtual memory controllers, host interface), not in the netlist: AFU minus simulator level, synthesized, r16c 184k, y8r1di 146k, b4e 140k, c2d 162k, vD 189k LUTs (155k placed); flops b4e 65k. placement: foldsim_sll_check.py's placement model (its own about). 11-11 (a32-G0): netlist_lut_scale 0.782 -> 1.0 with the corrected count (foldsim_fitdb.count / foldsim_cost: the level's array reads, masked LUTRAM, the level logic's synthesized share): the old count was 0.79 of Vivado on the shell-sized profile at 64 SMs (312,396 / 397,700, the 0.782 this scale carried), the corrected one 0.99 (392,397). foldsim_v80_asl9_slr.json: the same region in the asl9 any-SLR HBM shell (a32-SH 11-14, flashed 11-14 12:52): the 8 shared hbm_vnoc ports in SLR2 are the linker tag MEM; 4 more NoC master units in SLR0 (MEM_SLR0_0..3) and 4 in SLR1 (MEM_SLR1_0..3) reach HBM, 1,500 MB/s booked each (report_noc_qos on asl9 top_wrapper_routed.dcp: SLR0 read latency est. avg 221 / max 246 ns, SLR1 154 / 178, SLR2 72 / 106).",
+ "sites_per_lut": 1.455,
+ "margin": 0.85,
+ "slrs": [
+  {
+   "name": "SLR2",
+   "luts": 707808,
+   "lutram_luts": 353904,
+   "ramb36": 975,
+   "uram": 496
+  },
+  {
+   "name": "SLR1",
+   "luts": 665952,
+   "lutram_luts": 332976,
+   "ramb36": 1044,
+   "uram": 511
+  },
+  {
+   "name": "SLR0",
+   "luts": 261120,
+   "lutram_luts": 130560,
+   "ramb36": 396,
+   "uram": 204
+  }
+ ],
+ "sll_per_boundary": 18870,
+ "sll_margin": 0.85,
+ "netlist_lut_scale": 1.0,
+ "netlist_ff_scale": 0.851,
+ "placed_per_synthesized": {
+  "lut": 1.02,
+  "lutram": 0.98,
+  "ff": 0.99
+ },
+ "placement": {
+  "about": "foldsim_sll_check.py's placement model, fit 11-07 on three placed V80 builds (b4e routed, y8r1di post-place phys_opt, b4ct150 post-place; per-copy SLR placement and SLR-crossing nets read from the checkpoints, est_1107/inv). The placer balances the SLRs: whole copies fill each SLR up to `fill` of a resource (0.70), the region as a whole to `region_fill` (0.80: placed builds 66-74 % of its LUTs, r16c failed at 85 %), a cut copy up to the region fill (logic: LUT, LUTRAM, flops; memories whole counts, their primitives placed apart), the copies other than the cut ones up to the region's fill of the whole design plus balance_slack; where no whole assignment exists the largest copies by logic (at most cut_copies) fill their SLR's room and level the next SLRs' fill. Measured: y8r1di's slice copy 11/62/26 % over SLR2/1/0 (model 14/58/28), SLR fills 60/75/59 % (model 60/75/60); b4e's 8/60/32 % (model 8/66/26). A cut copy's own SLLs follow Rent's rule over its smaller side, rent_t x placed LUTs^rent_p (per-copy fit of the crossing nets: t 0.93-1.52 at p 0.75); links: SLLs per link wire bit between the two sides (measured 0.002-0.065: link memories are read a word at a time); other_slls the simulator level and shell; sll_per_vmem_bit the virtual memory ports' wiring to the kernel's controllers (only y8r1di has many: 23,570 bits). Least squares over the 6 boundaries with links 0.01 and other 500 fixed: worst boundary b4e 9,326 vs 10,114 placed (-8 %), y8r1di 15,015 vs 15,631 (-4 %), b4ct150 9,746 vs 8,981 (+9 %); leave one build out: -10 / -29 / +14 % (the vmem term rests on y8r1di alone). Refit 11-07 19:00 with the synthesis-fit scales and links charged to their readers: worst boundary b4e 9,403 vs 10,134 (-7 %), y8r1di 13,953 vs 15,631 (-11 %), b4ct150 9,436 vs 8,981 (+5 %); modelled slice cuts y8r1di 11 / 62 / 26 % (measured 11 / 62 / 26), b4e 24 / 48 / 28 (8 / 60 / 32), b4ct150 24 / 48 / 28 (13 / 70 / 17); b4ct150's own slice crossing nets 4,150 / 6,447 against Rent 4.7k / 5.7k (not in the fit). sll_per_port_bit (11-08 slrsplit): the links counted by their port widths (each link's bits once, the schedule's \"A -> B: n links, m bits\"), SLLs per bit where the two ends sit in different SLRs; fit on the split b4e image C-1 (p0 SLR2, p1 SLR1 pblocks; Vivado Place 30-5425 demanded 20,059 SLLs SLR1-SLR2: 11,822 split crossings + 1,002 + 0.45 x 16,057 port bits). At 1 a bit (full width) b4e straddled projects 36k against 4,700 measured; at 0.01 a link bit C-1 projects 13,385 against 20,059. Refit 11-11 (a32-G0): links counted by port width now from the sll estimate's `wires` lines when the schedule has no `A -> B` lines (no --slr-groups: the term had read 0); sll_per_port_bit 0.45 -> 0.39, least squares (other_slls 500 fixed) over the 6 boundaries of y8r1di, b4e, b4ct150 against their measured crossing nets that are neither a copy's own nor a virtual-memory controller's (est_1107/inv/<b>/crossing.tsv: y8r1di 7,209 / 9,943, b4e 2,387 / 2,913, b4ct150 3,585 / 3,792; model 7,325 / 8,163, 4,037 / 4,076, 4,085 / 4,085: -18 to +69 %, the worst b4e SLR2-SLR1 where the model's slice shares 24/48/28 % miss the placed 8/60/32 %). sll_per_vmem_bit is the flat term of --vmem-engines flat only: by default the virtual-memory wiring is placed (the noc section).",
+  "fill": {
+   "lut": 0.7,
+   "lutram": 0.7,
+   "ff": 0.7,
+   "uram": 0.95,
+   "bram": 0.95
+  },
+  "balance_slack": 0.05,
+  "cut_copies": 2,
+  "rent_t": 1.13,
+  "rent_p": 0.75,
+  "sll_per_link_bit": 0.01,
+  "other_slls": 500,
+  "sll_per_vmem_bit": 0.242,
+  "region_fill": {
+   "lut": 0.8,
+   "lutram": 0.8,
+   "ff": 0.8
+  },
+  "sll_per_port_bit": 0.39
+ },
+ "netlist_lutram_scale": 0.896,
+ "kernel": {
+  "lut": 155000,
+  "ff": 65000,
+  "base_lut": 4200,
+  "mem_fold_lut": 94600,
+  "mem_port_lut": 30600,
+  "ctl_lut_scale": {
+   "vmem": 1.6,
+   "vmem_group": 2.44,
+   "engine": 0.77
+  },
+  "ctl_bram_scale": 1.08,
+  "about": "The kernel beside the simulator (11-11, a32-G0, G0/cal/kernel_fit.py): the 5 calibration builds' AFU minus simulator (synthesized, fit_1108/db) split by their hierarchical utilization into the virtual-memory controllers (g_vg<g>, vmem_<k>, g_vmem_master shares) and the rest. Rest = host control (ctrl, env, inst: 3.6-4.9k; base_lut 4,200) + memory endpoints: one folded endpoint (mem_fold, the netlist's memory port bundles folded) 88.5k c2d, 94.2k y8r1di, 101.2k r16c (mem_fold_lut 94,600, -6 .. +7 %), else 30.3-31.5k a m_axi_mem port (b4e: 4 ports 122.6k; mem_port_lut 30,600), none (vD). Controllers, measured per controller against foldsim_storage.ctl_cost (logic + LUTRAM): a vmem of one memory 1.21 (29: b4e, c2d, vD; -29 .. +41 % a controller, 10-90 %), a vmem group of several 2.05 (16: r16c, y8r1di, vD; -28 .. +119 %), a page engine 1.44 (18: c2d, r16c, y8r1di; -22 .. +7 %): ctl_lut_scale by kind; RAMB36 measured / model 1.03-1.11 (ctl_bram_scale 1.08). Kernel = base + endpoints + the netlist's own controllers x scales; against the measured kernel: c2d 164.9k vs 162.5k (+2 %), b4e 137.3k vs 136.9k (0 %), y8r1di 139.6k vs 146.5k (-5 %), r16c 156.9k vs 184.5k (-15 %), vD 184.4k vs 188.6k (-2 %). lut / ff: the 11-07 flat term (its lut held the builds' own controllers), used for a region without the fit; ff stays flat (no controller FF model). The SLL check prints the controllers per die where its placement puts them. Rescaled 11-11 (a32-D1, D1/cal/rescale.py) for the controller RTL of C1 (bb4da1c, 420c3e7: no write-buffer match without forwarding, cache-less rows into the buffer at intake, one AXI id for wide answers): the fit above priced the pre-C1 RTL. The yosys proxy (C1's ys_census, synth_xilinx xcup) of every controller of the 5 calibration builds, pre-C1 (d15893a) vs current: vmem single x1.02, group x0.91, engine x0.48; measured / proxy (pre-C1) 1.15 / 1.02 / 1.03. Carried to the A100-32 netlists (y64g34, y128g33 with host caches off: forward 0, wide engines), whose configurations the calibration builds do not span: scale = their proxy (current RTL) x measured/proxy, over ctl_cost, by kind (sums kept): vmem 1.60, vmem group 2.44, engine 0.77 (was 1.21 / 2.05 / 1.44). y64g34's 114 controllers: 407.8k -> 349.6k (proxy x measured/proxy 349.0k); y128g33: 352.8k (353.6k). Fit on the calibration builds' own configurations alone the scales would be 1.31 / 1.88 / 0.65 (285k on y64g34): ctl_cost's shape (its no-forward factors) does not follow the current RTL across configurations, so the A100-anchored scales are the ones for these netlists."
+ },
+ "noc": {
+  "about": "The compute shell's memory NoC ports, from its NoC solution (flow/v80/noc_ports.py on the b4e image's impl_1/top_wrapper.ncr, 11-09: the pinned shell of 09-01, slash_base.tcl PHYSICAL_LOC NOC_NMU512_X*Y13..17). The RP's NoC master units (NMUs) keep the shell's sites: an RM placing one elsewhere fails opt_design (DRC HDPR-122), and a new NMU to HBM would need a route through the static region's NoC switches. All 8 HBM ports (hbm_vnoc_00..07) enter the NoC in SLR2; SLR1 has 6 DDR4 ports (ddr_noc_4..7, 9, 11: one DDR4-3200 x72 controller, 0x600_0000_0000 32 GB), SLR0 none. read_latency: the NoC compiler's achieved read latency over each NMU's paths (min / mean / max); the 07-31 unpinned shell's hbm_vnoc NMUs in SLR1 read HBM at 69-87 against 25-53 from SLR2. master_bits: an AXI4 master of 512-bit data, 64-bit address and 8-bit IDs (AW and AR 87 each, W 579, R 525, B 12). Placed pricing (foldsim_sll_check.py --vmem-engines, default placer): each controller sits where its wiring crosses the fewest SLLs, between the copies its ports are wired to (their SLR shares) and the nearest HBM NMU over its master; a boundary is charged only the wire bits that cross it: sll_per_port_bit per port bit, sll_per_master_bit per master wire. Fit 11-11 (a32-G0) on y8r1di (s8_1105/img_y8r1di physopt, the one placed build with wide controllers: 8 groups, 23,570 port bits): the placer put every controller beside its copies (slrxing_1108/y8r1di/inst_slr.tsv: g_vg2, VX_opc_unit's, in SLR1, the others with their copies in SLR2), as the model places them; the nets of the controller cells crossing (est_1107/inv/y8r1di/crossing.tsv) are 1,521 over SLR2-SLR1 (VX_opc_unit's master: sll_per_master_bit 1.0) and 290 over SLR1-SLR0 (VX_opc_unit's ports to its copy's 15 % in SLR0: 0.23 a port bit), against the 11-07 flat term's 6,204 at both. b4e and b4ct150 (2 controllers, 2,074 port bits, l2req beside its copy) measure 0 and 1; the model gives 0 and 272 (b4ct150's l2req copy straddles; its port registers sit with the controller).",
+  "rows": {
+   "SLR0": [
+    0,
+    6
+   ],
+   "SLR1": [
+    7,
+    12
+   ],
+   "SLR2": [
+    13,
+    18
+   ]
+  },
+  "master_bits": 1290,
+  "ports": [
+   {
+    "name": "ddr_noc_0",
+    "site": "NOC_NMU512_X1Y15",
+    "slr": "SLR2",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     106,
+     109.0,
+     112
+    ]
+   },
+   {
+    "name": "ddr_noc_1",
+    "site": "NOC_NMU512_X0Y14",
+    "slr": "SLR2",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     102,
+     103.0,
+     104
+    ]
+   },
+   {
+    "name": "ddr_noc_10",
+    "site": "NOC_NMU512_X0Y15",
+    "slr": "SLR2",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     104,
+     105.0,
+     106
+    ]
+   },
+   {
+    "name": "ddr_noc_11",
+    "site": "NOC_NMU512_X1Y12",
+    "slr": "SLR1",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     72,
+     75.0,
+     78
+    ]
+   },
+   {
+    "name": "ddr_noc_2",
+    "site": "NOC_NMU512_X1Y16",
+    "slr": "SLR2",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     108,
+     111.0,
+     114
+    ]
+   },
+   {
+    "name": "ddr_noc_3",
+    "site": "NOC_NMU512_X1Y17",
+    "slr": "SLR2",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     110,
+     113.0,
+     116
+    ]
+   },
+   {
+    "name": "ddr_noc_4",
+    "site": "NOC_NMU512_X1Y10",
+    "slr": "SLR1",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     68,
+     71.0,
+     74
+    ]
+   },
+   {
+    "name": "ddr_noc_5",
+    "site": "NOC_NMU512_X1Y9",
+    "slr": "SLR1",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     66,
+     69.0,
+     72
+    ]
+   },
+   {
+    "name": "ddr_noc_6",
+    "site": "NOC_NMU512_X2Y11",
+    "slr": "SLR1",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     74,
+     77.0,
+     80
+    ]
+   },
+   {
+    "name": "ddr_noc_7",
+    "site": "NOC_NMU512_X2Y12",
+    "slr": "SLR1",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     76,
+     79.0,
+     82
+    ]
+   },
+   {
+    "name": "ddr_noc_8",
+    "site": "NOC_NMU512_X3Y13",
+    "slr": "SLR2",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     112,
+     115.0,
+     118
+    ]
+   },
+   {
+    "name": "ddr_noc_9",
+    "site": "NOC_NMU512_X2Y10",
+    "slr": "SLR1",
+    "targets": [
+     "DDR"
+    ],
+    "read_latency": [
+     72,
+     75.0,
+     78
+    ]
+   },
+   {
+    "name": "hbm_vnoc_00",
+    "site": "NOC_NMU512_X0Y13",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     33,
+     40.9,
+     53
+    ],
+    "tag": "MEM"
+   },
+   {
+    "name": "hbm_vnoc_01",
+    "site": "NOC_NMU512_X2Y15",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     29,
+     33.9,
+     43
+    ],
+    "tag": "MEM"
+   },
+   {
+    "name": "hbm_vnoc_02",
+    "site": "NOC_NMU512_X1Y14",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     31,
+     36.2,
+     45
+    ],
+    "tag": "MEM"
+   },
+   {
+    "name": "hbm_vnoc_03",
+    "site": "NOC_NMU512_X3Y16",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     27,
+     35.0,
+     47
+    ],
+    "tag": "MEM"
+   },
+   {
+    "name": "hbm_vnoc_04",
+    "site": "NOC_NMU512_X0Y17",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     25,
+     32.6,
+     45
+    ],
+    "tag": "MEM"
+   },
+   {
+    "name": "hbm_vnoc_05",
+    "site": "NOC_NMU512_X1Y13",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     33,
+     37.8,
+     47
+    ],
+    "tag": "MEM"
+   },
+   {
+    "name": "hbm_vnoc_06",
+    "site": "NOC_NMU512_X2Y14",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     31,
+     36.2,
+     45
+    ],
+    "tag": "MEM"
+   },
+   {
+    "name": "hbm_vnoc_07",
+    "site": "NOC_NMU512_X3Y15",
+    "slr": "SLR2",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     29,
+     37.3,
+     49
+    ],
+    "tag": "MEM"
+   },
+   {
+    "name": "qdma_slave_bridge_noc",
+    "site": "NOC_NMU512_X2Y13",
+    "slr": "SLR2",
+    "targets": [
+     "other"
+    ],
+    "read_latency": [
+     114,
+     114.0,
+     114
+    ]
+   },
+   {
+    "name": "mem_slr0_0",
+    "site": "NOC_NMU512_X0Y5",
+    "slr": "SLR0",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     221,
+     221.0,
+     246
+    ],
+    "tag": "MEM_SLR0_0"
+   },
+   {
+    "name": "mem_slr0_1",
+    "site": "NOC_NMU512_X0Y6",
+    "slr": "SLR0",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     221,
+     221.0,
+     246
+    ],
+    "tag": "MEM_SLR0_1"
+   },
+   {
+    "name": "mem_slr0_2",
+    "site": "NOC_NMU512_X1Y5",
+    "slr": "SLR0",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     221,
+     221.0,
+     246
+    ],
+    "tag": "MEM_SLR0_2"
+   },
+   {
+    "name": "mem_slr0_3",
+    "site": "NOC_NMU512_X1Y6",
+    "slr": "SLR0",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     221,
+     221.0,
+     246
+    ],
+    "tag": "MEM_SLR0_3"
+   },
+   {
+    "name": "mem_slr1_0",
+    "site": "NOC_NMU512_X0Y8",
+    "slr": "SLR1",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     154,
+     154.0,
+     178
+    ],
+    "tag": "MEM_SLR1_0"
+   },
+   {
+    "name": "mem_slr1_1",
+    "site": "NOC_NMU512_X0Y10",
+    "slr": "SLR1",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     154,
+     154.0,
+     178
+    ],
+    "tag": "MEM_SLR1_1"
+   },
+   {
+    "name": "mem_slr1_2",
+    "site": "NOC_NMU512_X1Y7",
+    "slr": "SLR1",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     154,
+     154.0,
+     178
+    ],
+    "tag": "MEM_SLR1_2"
+   },
+   {
+    "name": "mem_slr1_3",
+    "site": "NOC_NMU512_X1Y8",
+    "slr": "SLR1",
+    "targets": [
+     "HBM"
+    ],
+    "read_latency": [
+     154,
+     154.0,
+     178
+    ],
+    "tag": "MEM_SLR1_3"
+   }
+  ],
+  "sll_per_port_bit": 0.23,
+  "sll_per_master_bit": 1.0
+ },
+ "netlist_scales": {
+  "about": "foldsim_sll_check.py --resources netlist, by part (a32-UR 11-12): synthesized per counted of the count as it stands after the 11-12 corrections (foldsim_cost.parse(count=True): distributed RAM as Versal builds it, ROM tables, DSP58 products of live widths, synthesized FP cores, block RAM aspect ratios, per-slice holds), what it does not model. Source: a32-V1's OOC synthesis of the A100-32 fold at 64 SMs (G3/gen/y64g34, Vivado 2025.2 xcv80, -flatten_hierarchy none, each class copy its own top + the simulator with the copies black-boxed; a32_1109/V1/out/v1cmp_y64g34.json). copy: the 60 class copies' own modules, logic 519,992 synthesized / 629,693 counted = 0.826 (per class 0.25 fcvt .. 1.68 l2fs_0: Vivado removes dead and constant state the count keeps, e.g. 9 of the slice copy's 30 256 x 504 state RAMs; small stream arbiters' isolated 2:1 selects cost a LUT a bit), LUTRAM + SRL 50,918 / 52,384 = 0.972, flops 606,085 / 968,067 = 0.626 (dead, constant and merged registers, flop chains as SRLs). level: the simulator less its copies (its own logic, array reads, link memories and registers), logic 380,614 / 345,411 = 1.102 (the level's other logic synthesizes at 0.82 of parse's price on this design, 0.73 on the shell-sized profile LEVEL_LOGIC_SYNTH was fit on), LUTRAM + SRL 124,806 / 129,566 = 0.963, flops 829,658 / 955,645 = 0.868. Whole simulator: 1,076,330 synthesized LUTs, 1,157,054 counted, 1,076,459 with these scales (copies 571,044, level 505,415). One design (one point): refit with every new synthesis (foldsim_fitdb.py).",
+  "copy": {
+   "logic": 0.826,
+   "lutram": 0.972,
+   "ff": 0.626
+  },
+  "level": {
+   "logic": 1.102,
+   "lutram": 0.963,
+   "ff": 0.868
+  }
+ }
+}
