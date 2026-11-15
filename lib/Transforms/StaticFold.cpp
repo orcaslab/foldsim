@@ -6909,8 +6909,47 @@ void StaticFolder::linkUses(std::vector<LinkUse> &uses) const {
   // starts or ends, each run of bits read from each class producer (and the
   // low bit there) its own link, at the producer instances the reader's
   // instances take.
+  // An element input (its ghosts are not read): as the element input builds
+  // its class outputs' reads, a link per producer port of the span of its
+  // bits there, at every producer instance any element names; a
+  // single-instance producer's once for all of the class's element inputs.
+  std::set<std::tuple<unsigned, unsigned, unsigned, unsigned>> indexedSeen;
   for (auto &consumer : consumers) {
-    if (consumer.cls < 0)
+    if (consumer.cls < 0 || consumer.ghostOf >= 0 || consumer.indexOutput < 0)
+      continue;
+    struct Span {
+      unsigned lo = ~0u, hi = 0;
+      std::set<uint64_t> rows;
+    };
+    std::map<unsigned, Span> spans;
+    for (auto &elements : consumer.instElements)
+      for (auto &pieces : elements)
+        for (auto &piece : pieces)
+          if (piece.producer >= 0 && producers[piece.producer].cls >= 0) {
+            auto &sp = spans[piece.producer];
+            sp.lo = std::min(sp.lo, piece.low);
+            sp.hi = std::max(sp.hi, piece.low + piece.width);
+            sp.rows.insert(piece.inst);
+          }
+    for (auto &[p, sp] : spans) {
+      bool single = classes[producers[p].cls].threads() <= 1;
+      if (single && !indexedSeen.insert({p, sp.lo, sp.hi - sp.lo, unsigned(consumer.cls)}).second)
+        continue;
+      LinkUse use{p, sp.lo, sp.hi - sp.lo, unsigned(consumer.cls),
+                  classes[consumer.cls].inputNames[consumer.port],
+                  SmallVector<uint64_t>(sp.rows.begin(), sp.rows.end()), {}, {}};
+      for (unsigned i = 0; i < consumer.instElements.size(); ++i) {
+        use.readers.push_back(i);
+        use.readerRows.push_back(*sp.rows.begin());
+      }
+      use.port = consumer.port;
+      use.sources = 2;
+      use.at = 0;
+      uses.push_back(std::move(use));
+    }
+  }
+  for (auto &consumer : consumers) {
+    if (consumer.cls < 0 || consumer.ghostOf >= 0 || consumer.indexOutput >= 0)
       continue;
     unsigned threads = classes[consumer.cls].threads();
     std::set<unsigned> cuts{consumer.width};
