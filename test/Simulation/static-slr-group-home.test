@@ -1,0 +1,35 @@
+# REQUIRES: verilator
+# --slr-group-home (with --slr-group-own): a level register whose next value
+# reads, through the level's logic, more outputs of one group's instances than
+# of all the others' together is moved into that group, not replicated into
+# every group that reads it. The FSD 1,024-node fold (a32-S26X-F26, 11-14):
+# each virtual memory's pending bit read ahead (--ready-ahead) reads its copy's
+# issue, row and pending outputs; replicated into every group (the decision
+# reads them all) each replica read another SLR's copy outputs through logic
+# (foldsim_locality.py L2 REFUSE). Homed, the register sits beside its copy
+# and the other groups read the register. The same values: the same MATCH in
+# the same host cycles as without the option.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem
+# RUN: foldsim --srcs top.f --top Top --out %t/own --static --virtual-memories ram --ready-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 Leaf > %t/own.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/home --static --virtual-memories ram --ready-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-home Leaf > %t/home.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/home.log
+# LOG: slr-group-home: {{[1-9][0-9]*}} level registers moved into the group whose outputs they read
+# Each copy's pending bit in its own group, once (no replica in the other).
+# RUN: FileCheck %s --check-prefix=SV < %t/home/foldsim_sim.sv
+# SV-LABEL: module foldsim_sim_slr0(
+# SV: ram_pending_ahead_g0{{(_[0-9]+)?}} <=
+# SV-NOT: ram_pending_ahead_g1
+# SV-LABEL: module foldsim_sim_slr1(
+# SV: ram_pending_ahead_g1{{(_[0-9]+)?}} <=
+# SV-NOT: ram_pending_ahead_g0
+# SV-LABEL: module foldsim_sim(
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DCOPIES2 -DIW=1 -Mdir %t/own/obj %S/Inputs/tb_vmem.sv top.sv %t/own/foldsim_sim.sv > %t/own/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DCOPIES2 -DIW=1 -Mdir %t/home/obj %S/Inputs/tb_vmem.sv top.sv %t/home/foldsim_sim.sv > %t/home/build.log 2>&1
+# RUN: %t/own/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | grep MATCH > %t/own/r1.txt
+# RUN: %t/home/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | grep MATCH > %t/home/r1.txt
+# RUN: %t/own/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/own/r2.txt
+# RUN: %t/home/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/home/r2.txt
+# RUN: FileCheck %s < %t/home/r1.txt
+# RUN: diff %t/own/r1.txt %t/home/r1.txt
+# RUN: diff %t/own/r2.txt %t/home/r2.txt
+# CHECK: {{^}}MATCH 196 cycles

@@ -900,6 +900,10 @@ public:
   /// not), with their next-value cones, replicated into the group (ops per
   /// closure at most; 0 off).
   unsigned slrGroupOwn = 0;
+  /// `slr-group-home`: with slr-group-own, a level register whose next value
+  /// reads one group's instance outputs through logic is moved into that
+  /// group (its home); the others read it there.
+  bool slrGroupHome = false;
   /// `slr-group-env`: the environment's channels and reset enter the
   /// simulator through one register stage in the level, then one per group.
   bool slrGroupEnv = false;
@@ -27486,6 +27490,91 @@ LogicalResult StaticFolder::extractGroups() {
       return isLevelReg(op) || isLevelLogic(op);
     };
     unsigned replicatedRegs = 0, replicatedOps = 0, left = 0;
+    // `slr-group-home`: a level register whose next-value logic (the
+    // level's logic back to registers, ports and instances) reads, through
+    // at least one op, more outputs of one group's instances than of all
+    // the other groups' together (a virtual memory's pending bit read ahead:
+    // its copy's issue, its row and its pending bits, against the decision's
+    // few) is moved into that group: its replica there takes every use (the level's
+    // and the other groups'), so the group's outputs meet logic only inside
+    // their own SLR and what leaves the group is the register. The group's
+    // replication below then gives it its next-value cone; the others stop
+    // at it (another group's value). Registers read straight from an
+    // instance output (no op between: a link's capture) stay as they are.
+    unsigned homed = 0;
+    if (slrGroupHome) {
+      DenseMap<Operation *, unsigned> groupOf;
+      for (unsigned g = 0; g < slrGroups; ++g)
+        for (auto *op : opsOf[g])
+          if (isa<hw::InstanceOp>(op))
+            groupOf[op] = g;
+      SmallVector<std::pair<Operation *, unsigned>> moves;
+      for (auto &op : body->without_terminator()) {
+        if (!isLevelReg(&op))
+          continue;
+        // The instance outputs the next value reads, by group (each output
+        // once). The frame decision every register's next value may read
+        // (it ANDs the copies' pending bits of every group) brings a few of
+        // other groups' outputs; the home is the group whose outputs are
+        // more than all the others' together.
+        DenseMap<unsigned, DenseSet<Value>> outsOf;
+        bool throughLogic = false;
+        DenseSet<Operation *> seen;
+        SmallVector<std::pair<Value, bool>> work;
+        for (Value v : op.getOperands())
+          work.push_back({v, false});
+        while (!work.empty() && seen.size() <= slrGroupOwn) {
+          auto [v, viaLogic] = work.pop_back_val();
+          auto *def = v.getDefiningOp();
+          if (!def)
+            continue;
+          if (auto it = groupOf.find(def); it != groupOf.end()) {
+            outsOf[it->second].insert(v);
+            throughLogic |= viaLogic;
+            continue;
+          }
+          if (!isLevelLogic(def) || !seen.insert(def).second)
+            continue;
+          for (Value o : def->getOperands())
+            work.push_back({o, true});
+        }
+        if (outsOf.empty() || !throughLogic || seen.size() > slrGroupOwn)
+          continue;
+        unsigned best = 0, bestN = 0, total = 0;
+        for (auto &[g, outs] : outsOf) {
+          total += outs.size();
+          if (outs.size() > bestN || (outs.size() == bestN && g < best))
+            best = g, bestN = outs.size();
+        }
+        if (2 * bestN > total)
+          moves.push_back({&op, best});
+        else if (getenv("FOLDSIM_HOME_LOG")) {
+          auto reg = dyn_cast<seq::FirRegOp>(&op);
+          llvm::errs() << "slr-group-home: kept " << (reg ? reg.getName() : StringRef("?"))
+                       << ":";
+          for (auto &[g, outs] : outsOf)
+            llvm::errs() << " group " << g << " " << outs.size();
+          llvm::errs() << "\n";
+        }
+      }
+      OpBuilder hb(body->getTerminator());
+      for (auto [op, g] : moves) {
+        auto *clone = hb.clone(*op);
+        clone->removeAttr("inner_sym");
+        if (auto reg = dyn_cast<seq::FirRegOp>(clone)) {
+          reg.setNameAttr(hb.getStringAttr(reg.getName() + "_g" + Twine(g)));
+          keep(reg);
+        }
+        op->getResult(0).replaceAllUsesWith(clone->getResult(0));
+        op->erase();
+        opsOf[g].push_back(clone);
+        inGroups.insert(clone);
+        ++homed;
+      }
+      llvm::errs() << "foldsim-fold-static: slr-group-home: " << homed
+                   << " level registers moved into the group whose outputs "
+                      "they read\n";
+    }
     for (unsigned g = 0; g < slrGroups; ++g) {
       DenseMap<Value, Value> local;
       OpBuilder cb(body->getTerminator());
@@ -28249,6 +28338,7 @@ void FoldStaticPass::runOnOperation() {
   folder.slrGroupReset = slrGroupReset;
   folder.slrGroupLocal = slrGroupLocal;
   folder.slrGroupOwn = slrGroupOwn;
+  folder.slrGroupHome = slrGroupHome;
   folder.slrGroupEnv = slrGroupEnv;
   folder.slrKept = std::max(1u, unsigned(slrKept));
   for (auto [spec, out, name] :

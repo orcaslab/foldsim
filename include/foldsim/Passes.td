@@ -819,6 +819,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "values end it). Replicas hold their originals' values in every "
            "host cycle: nothing moves. No level register then fans out over "
            "the groups. 0: off">,
+    Option<"slrGroupHome", "slr-group-home", "bool", "false",
+           "With slr-group-own: a level register whose next value reads, "
+           "through the level's logic, more outputs of one group's instances "
+           "than of all the others together (a virtual memory's pending bit "
+           "read ahead: its copy's issue and pending outputs) is homed in that group -- moved there "
+           "with its next-value cone, not replicated -- and every other "
+           "group and the level read the home's register. Its cone's "
+           "instance outputs then stay in their SLR; what crosses is a "
+           "register. The same values in every host cycle: nothing moves">,
     Option<"slrGroupEnv", "slr-group-env", "bool", "false",
            "With SLR groups: each environment channel (P_valid / P_<data> / "
            "P_ready) enters through one register stage in the level and one "

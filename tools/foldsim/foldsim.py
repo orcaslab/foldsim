@@ -585,6 +585,8 @@ def frame_options(a):
         fold += f' slr-group-local={a.slr_group_local}'
     if getattr(a, 'slr_group_own', 0):
         fold += f' slr-group-own={a.slr_group_own}'
+    if getattr(a, 'slr_group_home', False):
+        fold += ' slr-group-home'
     if getattr(a, 'slr_group_env', False):
         fold += ' slr-group-env'
     if getattr(a, 'registered_links', ''):
@@ -2345,6 +2347,11 @@ def build_parser():
                          'reads, directly or through logic, replicated into the group with its next-value cone, back '
                          'through the registers it reads, up to OPS ops a closure (foldsim-fold-static slr-group-own): '
                          'no level register fans out over the groups; the same values in the same host cycles')
+    ap.add_argument('--slr-group-home', action='store_true',
+                    help='with --slr-group-own: a level register whose next value reads one group\'s instance outputs '
+                         '(through logic) alone is moved into that group, not replicated; the level and the other '
+                         'groups read it there (foldsim-fold-static slr-group-home): a virtual memory\'s pending bit '
+                         'read ahead sits beside its copy, the same values in every host cycle')
     ap.add_argument('--slr-group-env', action='store_true',
                     help='with --slr-groups and --slr-group-own: each environment channel enters through one '
                          'register stage in the level and one per group behind a one-token elastic buffer, the '
