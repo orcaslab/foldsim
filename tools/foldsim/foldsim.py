@@ -980,6 +980,9 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
         foldsim_degree.STATE_CAL['ports'] = (foldsim_degree.STATE_CAL.get('kernel_port_folded', 1.0)
                                              if getattr(a, 'fold_ports', '') else
                                              foldsim_degree.kernel_mem_ports(text))
+        # A folded endpoint's ways (the memory ports it folds): the calibration's per-way kernel term.
+        foldsim_degree.STATE_CAL['fold_ways'] = (foldsim_degree.kernel_mem_ports(text)
+                                                 if getattr(a, 'fold_ports', '') else None)
     path = a.degree_calibration or DEGREE_CALIBRATION
     cal = json.load(open(path)) if path != 'none' and os.path.exists(path) else None
     names = sorted({re.sub(r'_copy\d+$', '', c) for c in classes})

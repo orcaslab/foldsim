@@ -1,0 +1,23 @@
+{
+ "name": "state-v80-s26-20261114",
+ "source": "a32-S26X-F26 B8: the y8b fit (state-v80-y8b-20261113.json) refit on three post-synthesis builds of 11-14 (fitdb/fit.jsonl a32s26x_e4b / _e8h / _g16i1p1, report_utilization -hierarchical of the asl9 images, S26X/G/img/img_<t>_200_A/.../impl_1/hier_utilization.rpt) against the policy priced on their own generations (S26X/f26/b8/pol_<t>.json = foldsim_degree area at the schedule frame)",
+ "copy_logic": 1.5,
+ "copy_lutram": 0.907,
+ "level": 1.465,
+ "kernel_logic": 289160,
+ "kernel_lutram": 50615,
+ "placed_per_priced": 1.02,
+ "count_to_synth": 0.791,
+ "kernel_ports": 8,
+ "kernel_port_logic": 30600,
+ "kernel_port_folded": 3.0915032679738563,
+ "kernel_note": "kernel_logic is y8b's (8 m_axi_mem endpoints); another fold's kernel adds kernel_port_logic a port past 8 (foldsim_v80_slr.json kernel.mem_port_lut), a folded endpoint (--fold-ports) counting as kernel_port_folded ports (mem_fold_lut / mem_port_lut)",
+ "logic_ref_frame": 256,
+ "logic_per_doubling": 0.117,
+ "kernel_fold_logic": 69150,
+ "kernel_fold_logic_per_way": 810,
+ "kernel_fold_lutram": 23100,
+ "kernel_fold_bram": 72.2,
+ "kernel_fold_bram_per_way": 0.83,
+ "fit_note": "Measured simulator logic per priced (copies + level, the y8b factors applied): 1.041 / 1.161 / 1.313 at frames 128 / 256 / 512 (e4b / e8h / g16i1p1): the class estimate does not grow with the instances a copy serves (state read selects, slot tables, link word selects do); fit 1.161 x (1 + 0.117 log2(frame / 256)) -> copy_logic, level x1.161 at 256. LUTRAM per priced 0.807 / 0.824 / 0.866 (pooled 0.835). Kernel (AFU less sim, synthesized): logic 72,377 / 76,023 / 82,112, LUTRAM 22.8-23.5k, RAMB36 75.5 / 81.5 / 85.5 at 4 / 8 / 16 folded ways -> 69,150 + 810 a way (G B6: 88.5k + 830 a way, LUTs with LUTRAM), 23,100 LUTRAM, 72.2 + 0.83 RAMB36 a way; the old term (y8b 289k + 30.6k a port past 8 at 3.09 ports a folded endpoint) priced 139k against 95-106k measured."
+}

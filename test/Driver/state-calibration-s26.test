@@ -1,0 +1,15 @@
+# The state-home policy's 11-14 calibration (calibrations/state-v80-s26-20261114.json, a32-S26X-F26 B8): fit on three
+# post-synthesis builds (e4b / e8h / g16i1p1: frames 128 / 256 / 512, folded endpoints of 4 / 8 / 16 ways).
+# (1) The logic factors grow with the schedule's II: 1 + 0.117 log2(II / 256) (0.883 / 1 / 1.117 at 128 / 256 / 512);
+#     measured simulator logic per priced 1.041 / 1.161 / 1.313 against the y8b fit.
+# (2) The kernel beside a folded endpoint: 69,150 + 810 a way logic, 23,100 LUTRAM, 72.2 + 0.83 a way RAMB36 (measured
+#     72,377 / 76,023 / 82,112 logic, 75.5 / 81.5 / 85.5 RAMB36); the old term priced 139k for any fold.
+# RUN: python3 -c "import sys, json; sys.path.insert(0, sys.argv[1]); import foldsim_degree as d; d.STATE_CAL = json.load(open(sys.argv[1] + '/calibrations/state-v80-s26-20261114.json')); out = []; [out.append(round((setattr(d, 'STATE_FRAME', f) or d.frame_factor()), 3)) for f in (128, 256, 512)]; print('frame', out); d.STATE_CAL['fold_ways'] = 16; print('kernel16', [round(x, 2) for x in d.state_kernel()]); d.STATE_CAL['fold_ways'] = None; d.STATE_CAL['ports'] = 8; print('kernel-ports', [round(x) for x in d.state_kernel()])" %foldsim_tools | FileCheck %s
+# CHECK: frame [0.883, 1.0, 1.117]
+# CHECK: kernel16 [82110, 23100, 85.48]
+# The y8b fit's own kernel where no fold ways are given (its 8 m_axi_mem ports: 289,160 + 0).
+# CHECK: kernel-ports [289160, 50615, 0]
+# (3) The SLL check's folded endpoint by its ways (foldsim_v80_slr.json kernel.mem_fold_lut_per_way): 4,200 + 88,500 + 830 a way.
+# RUN: rm -rf %t && mkdir -p %t && echo '{"port_bundles": {"count": 16, "chan_width": 4, "req": [], "rsp": []}}' > %t/foldsim_sim.json
+# RUN: python3 -c "import sys, json; sys.path.insert(0, sys.argv[1]); import foldsim_sll_check as s; r = json.load(open(sys.argv[1] + '/foldsim_v80_asl9_slr.json')); k = s.kernel_resources(sys.argv[2], r); print('sll kernel', round(k['lut']), round(k['bram'], 2))" %foldsim_tools %t | FileCheck %s --check-prefix=SLL
+# SLL: sll kernel 105980 85.48

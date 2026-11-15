@@ -63,6 +63,11 @@
   "ff": 65000,
   "base_lut": 4200,
   "mem_fold_lut": 94600,
+  "mem_fold_lut_base": 88500,
+  "mem_fold_lut_per_way": 830,
+  "mem_fold_bram": 72.2,
+  "mem_fold_bram_per_way": 0.83,
+  "about_fold_per_way": "11-14 (a32-S26X-F26 B8, G B6): the folded endpoint by its ways (foldsim_sim.json port_bundles.count), fit on the asl9 images e4b / e8h / g16i1p1 (AFU less sim, synthesized: 95,214 / 98,998 / 105,579 LUT at 4 / 8 / 16 ways; RAMB36 75.5 / 81.5 / 85.5): base_lut 4,200 + 88,500 + 830 a way (+0.8 / +0.3 / +0.4 %), RAMB36 72.2 + 0.83 a way; mem_fold_lut (94,600 flat: -3.6 .. +3.8 %) stays for a fold without a ways count.",
   "mem_port_lut": 30600,
   "ctl_lut_scale": {
    "vmem": 1.6,
@@ -368,16 +373,17 @@
   "sll_per_master_bit": 1.0
  },
  "netlist_scales": {
+  "about_1114": "Refit 11-14 (a32-S26X-F26 B8, S26X/f26/b8/refit.py) pooled over 4 post-synthesis builds of fitdb/fit.jsonl (a32h8_y8b, a32s26x_e4b, a32s26x_e8h, a32s26x_g16i1p1; was V1's y64g34 alone: copy 0.826 / 0.972 / 0.626, level 1.102 / 0.963 / 0.868): copy logic 0.877 / 0.731 / 0.766 / 0.724, LUTRAM 0.89-0.95, FF 0.68-0.94; level logic 1.65-2.29. Simulator LUT model vs measured: y8b -3.5 %, e8h +1.1 %, e4b +2.0 %, g16i1p1 +1.0 % (V1 scales: -3.6 / +0.5 / +3.4 / -2.4 %). The level (logic 1.9 per counted) holds more of the fold's control since the SLR groups own / env / home.",
   "about": "foldsim_sll_check.py --resources netlist, by part (a32-UR 11-12): synthesized per counted of the count as it stands after the 11-12 corrections (foldsim_cost.parse(count=True): distributed RAM as Versal builds it, ROM tables, DSP58 products of live widths, synthesized FP cores, block RAM aspect ratios, per-slice holds), what it does not model. Source: a32-V1's OOC synthesis of the A100-32 fold at 64 SMs (G3/gen/y64g34, Vivado 2025.2 xcv80, -flatten_hierarchy none, each class copy its own top + the simulator with the copies black-boxed; a32_1109/V1/out/v1cmp_y64g34.json). copy: the 60 class copies' own modules, logic 519,992 synthesized / 629,693 counted = 0.826 (per class 0.25 fcvt .. 1.68 l2fs_0: Vivado removes dead and constant state the count keeps, e.g. 9 of the slice copy's 30 256 x 504 state RAMs; small stream arbiters' isolated 2:1 selects cost a LUT a bit), LUTRAM + SRL 50,918 / 52,384 = 0.972, flops 606,085 / 968,067 = 0.626 (dead, constant and merged registers, flop chains as SRLs). level: the simulator less its copies (its own logic, array reads, link memories and registers), logic 380,614 / 345,411 = 1.102 (the level's other logic synthesizes at 0.82 of parse's price on this design, 0.73 on the shell-sized profile LEVEL_LOGIC_SYNTH was fit on), LUTRAM + SRL 124,806 / 129,566 = 0.963, flops 829,658 / 955,645 = 0.868. Whole simulator: 1,076,330 synthesized LUTs, 1,157,054 counted, 1,076,459 with these scales (copies 571,044, level 505,415). One design (one point): refit with every new synthesis (foldsim_fitdb.py).",
   "copy": {
-   "logic": 0.826,
-   "lutram": 0.972,
-   "ff": 0.626
+   "logic": 0.775,
+   "lutram": 0.919,
+   "ff": 0.767
   },
   "level": {
-   "logic": 1.102,
-   "lutram": 0.963,
-   "ff": 0.868
+   "logic": 1.888,
+   "lutram": 1.046,
+   "ff": 0.818
   }
  }
 }
