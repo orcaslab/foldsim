@@ -196,6 +196,14 @@ proc fs_dom_stripes {slr cols cells xs parent {pcell ""}} {
     if {$encl ne ""} { set_property PARENT [get_property NAME $encl] $pb }
     set_property IS_SOFT TRUE $pb
     add_cells_to_pblock $pb [get_cells $r]
+    # (the virtual-memory controllers of the domain's class, fs_domain_adapters: the kernel's cells, with their logic)
+    global fs_domain_adapters
+    if {[info exists fs_domain_adapters] && [regexp {fs_dom_(.*)$} $r -> cls] && [dict exists $fs_domain_adapters $cls]} {
+      foreach re [dict get $fs_domain_adapters $cls] {
+        set ac [get_cells -quiet -hierarchical -regexp $re]
+        if {[llength $ac]} { add_cells_to_pblock $pb $ac; puts "INFO: foldsim domain pblock $pb: [llength $ac] adapter cells of $cls ($re)" }
+      }
+    }
     puts "INFO: foldsim domain pblock $pb: $r tile columns $x0..$x1 ($slr), demand $d"
     set kids [get_cells -quiet $r/fs_dom_*]
     if {[llength $kids] >= 1 && [llength $rxs] >= 2} { fs_dom_stripes $slr $cols $kids [lsort -integer $rxs] $d $r }
