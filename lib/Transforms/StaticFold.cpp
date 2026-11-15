@@ -28944,6 +28944,8 @@ LogicalResult StaticFolder::extractDomains(hw::HWModuleOp mod, StringRef suffix)
       if (inst.getInstanceName() == classes[c].name + "_copy")
         present[c] = true;
   }
+  // Each op's domain class here (-1: this module's own logic).
+  DenseMap<Operation *, int> domOf;
   for (auto &op : body->without_terminator()) {
     auto attr = op.getAttrOfType<IntegerAttr>(kDomAttr);
     if (!attr)
@@ -28951,8 +28953,53 @@ LogicalResult StaticFolder::extractDomains(hw::HWModuleOp mod, StringRef suffix)
     op.removeAttr(kDomAttr);
     int c = attr.getInt();
     if (c >= 0 && unsigned(c) < n && present[c])
-      opsOf[c].push_back(&op);
+      domOf[&op] = c;
   }
+  // A memory and its ports stay in one module (its handle is no value a port
+  // can carry): where they were built in different domains, all of them go to
+  // the domains' nearest common enclosing domain (or this module's logic).
+  auto ancestors = [&](int c) {
+    SmallVector<int> chain;
+    for (int a = c; a >= 0; a = classes[a].parent)
+      if (present[a])
+        chain.push_back(a);
+    return chain;
+  };
+  unsigned memsMoved = 0;
+  for (auto &op : body->without_terminator()) {
+    auto mem = dyn_cast<seq::FirMemOp>(op);
+    if (!mem)
+      continue;
+    SmallVector<Operation *> group{&op};
+    for (auto *user : mem->getUsers())
+      if (user->getBlock() == body)
+        group.push_back(user);
+    auto domain = [&](Operation *o) {
+      auto it = domOf.find(o);
+      return it == domOf.end() ? -1 : it->second;
+    };
+    int first = domain(group[0]);
+    if (llvm::all_of(group, [&](Operation *o) { return domain(o) == first; }))
+      continue;
+    // The common chain: the first's ancestors present in every other's.
+    SmallVector<int> common = first >= 0 ? ancestors(first) : SmallVector<int>{};
+    for (auto *o : group) {
+      int d = domain(o);
+      SmallVector<int> mine = d >= 0 ? ancestors(d) : SmallVector<int>{};
+      llvm::erase_if(common, [&](int a) { return !llvm::is_contained(mine, a); });
+    }
+    int lca = common.empty() ? -1 : common.front();
+    for (auto *o : group) {
+      if (lca < 0)
+        domOf.erase(o);
+      else
+        domOf[o] = lca;
+    }
+    ++memsMoved;
+  }
+  for (auto &op : body->without_terminator())
+    if (auto it = domOf.find(&op); it != domOf.end())
+      opsOf[it->second].push_back(&op);
   // Each present class's domain parent: its nearest ancestor class present
   // here (-1: a domain root of this module).
   auto domParent = [&](unsigned c) -> int {
@@ -29134,6 +29181,9 @@ LogicalResult StaticFolder::extractDomains(hw::HWModuleOp mod, StringRef suffix)
        << " not from a register), out " << outBits << " bits (" << outUnreg
        << " not from a register)\n";
   }
+  if (memsMoved)
+    rs << "  physical domains of " << mod.getModuleName() << ": " << memsMoved
+       << " memories with ports built in different domains kept whole in their common domain\n";
   rs << "  physical domains of " << mod.getModuleName() << ": " << built
      << " domains, boundary in " << allIn << " bits (" << unregIn
      << " not from a register), out " << allOut << " bits (" << unregOut
