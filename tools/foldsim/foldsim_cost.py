@@ -621,8 +621,11 @@ def _parse(path, roms):
             st = re.search(r'ram_style" = "\\22(\w+)', rhs)
             mk = re.search(r'mask\s+(\d+)\s*>', rhs)
             ch = re.search(r'cascade_height" = "(\d+)"', rhs)
+            # (named: an explicit `name` attribute, or a result printed under its name -- the assembly elides the
+            # attribute when the name is a legal SSA identifier, e.g. a class whose memory sits at its top: `%ram = ...`)
+            named = bool(nm) or not re.fullmatch(r'%\d+(#\d+)?', res[0])
             rec = [nm.group(1) if nm else res[0][1:], int(mm.group(3)), int(mm.group(4)), 0, 0, int(mm.group(1)),
-                   st.group(1) if st else None, int(mk.group(1)) if mk else 1, bool(nm), int(ch.group(1)) if ch else None]
+                   st.group(1) if st else None, int(mk.group(1)) if mk else 1, named, int(ch.group(1)) if ch else None]
             mems[res[0]] = rec
             cur.mems.append(rec)
             continue

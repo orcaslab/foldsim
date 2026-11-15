@@ -1039,8 +1039,14 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
         if over:
             # The copies whose own logic leaves no room in their budget, with
             # every store moved.
-            over = [f"{c} ({last['copies'].get(c, {}).get('total', 0):.0f} LUTs at the schedule's frame)"
-                    if c in last['copies'] else c for c in over]
+            # (each with the resources past its cap: lut, uram, bram...)
+            res_of = {}
+            for p in last.get('over', []):
+                if '#' in p:
+                    res_of.setdefault(p.partition('@')[2], []).append(p.partition('@')[0])
+            over = [f"{c} ({'/'.join(res_of.get(c, []))} past its cap; {last['copies'].get(c, {}).get('total', 0):.0f} LUTs, "
+                    f"{last['copies'].get(c, {}).get('uram', 0)} URAM, {last['copies'].get(c, {}).get('bram', 0)} RAMB36 "
+                    f"at the schedule's frame)" if c in last['copies'] else c for c in over]
         sys.exit(f'--state auto: nothing fits the V80 region (II {ii})'
                  + (f" with the links' {links['lutram']:.0f} LUTRAM LUTs, {links['bram']} RAMB36, "
                     f"{links['uram']} URAM288" if links else '') + f' ({policy})'

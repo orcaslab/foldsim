@@ -1,0 +1,5 @@
+# The cost model's memory records: a memory printed under its own SSA name (`%ram = seq.firmem ...`: the attribute
+# elided) is named as one with an explicit `name` is (the state planner then lets a --storage rule fix its kind: the
+# L2 data store as a class of its own, a32-S26X-PH); a memory with a numbered result is not.
+# RUN: python3 -c "import sys; sys.path.insert(0, '%S/../../tools/foldsim'); import foldsim_cost as c; m, _ = c.parse('%S/Inputs/cost/named_mem.mlir'); print(sorted((r[0], r[8]) for r in m['Mems'].mems))" | FileCheck %s
+# CHECK: [('3', False), ('inner/x.ram', True), ('ram', True)]

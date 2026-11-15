@@ -56,7 +56,7 @@
 # TABLE-NEXT: Leaf#0
 # BUDGET: copy budget 256 LUTs, 128 LUTRAM (x0.001 of SLR0); counted x 0.791
 # BUDGET-NOT: OVER
-# REFUSE: --state auto: nothing fits the V80 region {{.*}} copy budget 128 LUTs (x0.0005 of SLR0){{.*}}); past their copy budget: Leaf#0 ({{[0-9]+}} LUTs at the schedule's frame)
+# REFUSE: --state auto: nothing fits the V80 region {{.*}} copy budget 128 LUTs (x0.0005 of SLR0){{.*}}); past their copy budget: Leaf#0 ({{[a-z/]+}} past its cap; {{[0-9]+}} LUTs, {{.*}} at the schedule's frame)
 # GIVEN: foldsim-fold-static{{.*}} storage=Leaf:ram=block,Leaf:regs>=8=distributed{{[ }]}}
 # GIVEN-NOT: Leaf:ram=distributed
 # GIVEN-NOT: storage: no memory

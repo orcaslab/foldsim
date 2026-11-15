@@ -485,6 +485,13 @@ def given_rules(text):
     return out
 
 
+def given_kind(u):
+    """The kind GIVEN names for a memory unit (None: no rule, a link, pages or registers)."""
+    if not GIVEN or u.get('link') or u['store'] == 'pages' or u['store'].startswith('regs'):
+        return None
+    return GIVEN['mem'].get((re.sub(r'_copy\d+$', '', u['class']), u['store']))
+
+
 def fix_given(units):
     """The units GIVEN names: fixed at the given kind (a register store by
     width: the largest bound at most its width, as the compiler takes it)."""
@@ -1328,10 +1335,12 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             u['costs'].pop('ultra', None)
     if KERNEL['on'] and not KERNEL['uram_memories']:
         # Memories (not pages, not links) in ultra RAM: Vivado inferred block
-        # RAM for most of them; priced as it builds them.
+        # RAM for most of them; priced as it builds them. A memory a --storage
+        # rule puts in ultra RAM (GIVEN, fixed below by fix_given) keeps the
+        # kind: the compiler states ram_style ultra and Vivado builds it so.
         for u in units:
             if (not u.get('link') and u['store'] != 'pages' and len(u['costs']) > 1 and
-                    u.get('fixed') != 'ultra'):
+                    u.get('fixed') != 'ultra' and given_kind(u) != 'ultra'):
                 u['costs'].pop('ultra', None)
                 u['per'].pop('ultra', None)
     caps = storage.capacities()
