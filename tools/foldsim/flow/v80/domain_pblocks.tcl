@@ -49,9 +49,9 @@ proc fs_dom_stripes {slr cols cells xs parent} {
   set big {}
   foreach r $cells {
     set d [fs_dom_demand $r]
-    # (a domain below the least stripe, FOLDSIM_DOMAIN_MIN_LUT LUTs, stays in its parent's area: a stripe a column
+    # (a domain below the least stripe, FOLDSIM_DOMAIN_MIN_LUT LUTs, stays in its parent's area, a root in its SLR: a stripe a column
     # wide and the SLR high is the wrong shape for it)
-    if {[dict get $d lut] < $fs_dom_min_lut && $parent ne ""} continue
+    if {[dict get $d lut] < $fs_dom_min_lut} continue
     lappend big $r
     dict set dem $r $d
     foreach k {lut bram uram dsp} { dict incr tot $k [dict get $d $k] }
