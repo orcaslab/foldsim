@@ -437,6 +437,14 @@ struct Consumer {
   /// the analyses that read an input's sources.
   int indexOutput = -1;
   SmallVector<Pieces> elements;
+  /// Each instance's elements (`elements` is instance 0's), and whether
+  /// every instance reads the same array.
+  SmallVector<SmallVector<Pieces>> instElements;
+  bool sameElements = true;
+  /// A ghost of element input `ghostOf` (another element's bits, each
+  /// instance's in `pieces`): read by the analyses (the schedule's waits, the
+  /// links' storage), never built -- the element input builds its reads.
+  int ghostOf = -1;
 };
 
 /// Host cycles from a link's write to the first slot that reads it: the write
@@ -1024,7 +1032,10 @@ public:
   /// Element inputs read at an index (foldsim-index-class-inputs), and
   /// their pieces: read from the rows, of constants, chosen of the frame's.
   unsigned indexedInputs = 0, indexedRows = 0, indexedTables = 0,
-           indexedChoices = 0;
+           indexedChoices = 0, indexedLinks = 0;
+  /// The element inputs' (class, input): never zero-latency (the reader's
+  /// evaluation chooses the source).
+  std::set<std::pair<unsigned, unsigned>> indexedPorts;
   uint64_t deadInputBits = 0;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
   /// landing) a member is streamed with (0: the decision lead + 6). A
@@ -2379,6 +2390,8 @@ static bool isStateless(hw::HWModuleOp model) {
 
 LogicalResult StaticFolder::collect() {
   auto *body = netlist.getBodyBlock();
+  // Element inputs' other elements (consumer, element), for their ghosts.
+  SmallVector<std::pair<unsigned, unsigned>> ghosts;
   for (auto aggregate :
        llvm::make_early_inc_range(body->getOps<hw::AggregateConstantOp>())) {
     OpBuilder builder(aggregate);
@@ -2501,49 +2514,56 @@ LogicalResult StaticFolder::collect() {
       if (auto get = cls.instances[0].getOperand(i).getDefiningOp<hw::ArrayGetOp>()) {
         unsigned o = cast<OpResult>(get.getIndex()).getResultNumber();
         consumer.indexOutput = o;
-        auto type = cast<hw::ArrayType>(get.getInput().getType());
-        unsigned n = type.getNumElements();
-        for (auto [inst, instance] : llvm::enumerate(cls.instances)) {
+        unsigned n = cast<hw::ArrayType>(get.getInput().getType()).getNumElements();
+        auto same = [](const Pieces &x, const Pieces &y) {
+          return x.size() == y.size() &&
+                 llvm::all_of(llvm::zip(x, y), [](auto pair) {
+                   auto &[a, b] = pair;
+                   return a.producer == b.producer && a.inst == b.inst &&
+                          a.low == b.low && a.width == b.width &&
+                          (a.producer >= 0 || a.constant == b.constant);
+                 });
+        };
+        for (auto instance : cls.instances) {
           auto g = instance.getOperand(i).getDefiningOp<hw::ArrayGetOp>();
           if (!g || g.getIndex() != instance.getResult(o) ||
               g.getInput().getType() != get.getInput().getType())
             return instance.emitError("an element input read at another index "
                                       "in another instance");
-          SmallVector<Pieces> elements(n);
+          auto &elements = consumer.instElements.emplace_back(n);
           for (unsigned e = 0; e < n; ++e)
             if (failed(decompose(g.getInput(), e * consumer.width, consumer.width,
                                  elements[e])))
               return failure();
-          auto same = [](const Pieces &x, const Pieces &y) {
-            return x.size() == y.size() &&
-                   llvm::all_of(llvm::zip(x, y), [](auto pair) {
-                     auto &[a, b] = pair;
-                     return a.producer == b.producer && a.inst == b.inst &&
-                            a.low == b.low && a.width == b.width &&
-                            (a.producer >= 0 || a.constant == b.constant);
-                   });
-          };
-          if (inst == 0)
-            consumer.elements = std::move(elements);
-          else if (!llvm::all_of(llvm::seq<unsigned>(0, n), [&](unsigned e) {
-                     return same(elements[e], consumer.elements[e]);
-                   }))
-            return instance.emitError("an element input of another array in "
-                                      "another instance (not supported)");
+          if (consumer.instElements.size() > 1)
+            consumer.sameElements &= llvm::all_of(
+                llvm::seq<unsigned>(0, n), [&](unsigned e) {
+                  return same(elements[e], consumer.instElements[0][e]);
+                });
         }
-        for (auto &element : consumer.elements)
-          for (auto &piece : element)
-            if (piece.producer >= 0 && producers[piece.producer].cls >= 0)
-              return cls.instances[0].emitError(
-                  "an element input of an array of model outputs (not "
-                  "supported: an array of the netlist's inputs and constants)");
-        auto *shown = llvm::find_if(consumer.elements, [](const Pieces &pieces) {
+        consumer.elements = consumer.instElements[0];
+        // The analyses see one element's bits as the input's (one with a
+        // producer in every instance) and the others' as ghosts.
+        auto produced = [](const Pieces &pieces) {
           return llvm::any_of(pieces, [](auto &piece) { return piece.producer >= 0; });
-        });
-        if (shown == consumer.elements.end())
-          return cls.instances[0].emitError("an element input of an array of "
-                                            "constants");
-        consumer.pieces.assign(cls.instances.size(), *shown);
+        };
+        int shown = -1;
+        for (unsigned e = 0; e < n && shown < 0; ++e)
+          if (llvm::all_of(consumer.instElements,
+                           [&](auto &elements) { return produced(elements[e]); }))
+            shown = e;
+        if (shown < 0)
+          return cls.instances[0].emitError(
+              "an element input none of whose elements has a producer in every "
+              "instance (not supported)");
+        for (auto &elements : consumer.instElements)
+          consumer.pieces.push_back(elements[shown]);
+        for (unsigned e = 0; e < n; ++e)
+          if (int(e) != shown &&
+              llvm::any_of(consumer.instElements,
+                           [&](auto &elements) { return produced(elements[e]); }))
+            ghosts.push_back({unsigned(consumers.size() - 1), e});
+        indexedPorts.insert({unsigned(c), unsigned(i)});
         ++indexedInputs;
         continue;
       }
@@ -2599,6 +2619,25 @@ LogicalResult StaticFolder::collect() {
       }
     }
   }
+  // The element inputs' other elements, as ghost consumers.
+  for (auto [k, e] : ghosts) {
+    Consumer ghost;
+    auto &of = consumers[k];
+    ghost.name = of.name + "_element" + std::to_string(e);
+    ghost.cls = of.cls;
+    ghost.port = of.port;
+    ghost.width = of.width;
+    ghost.ghostOf = k;
+    for (auto &elements : of.instElements) {
+      Pieces pieces = elements[e];
+      // (Constant bits of an instance's element: as the analyses take an
+      // input that is constant there.)
+      if (pieces.empty())
+        pieces.push_back(Piece{-1, 0, 0, of.width, APInt::getZero(of.width)});
+      ghost.pieces.push_back(std::move(pieces));
+    }
+    consumers.push_back(std::move(ghost));
+  }
   auto *output = body->getTerminator();
   for (auto [index, operand] : llvm::enumerate(output->getOperands())) {
     auto &consumer = consumers.emplace_back();
@@ -2637,6 +2676,11 @@ LogicalResult StaticFolder::collect() {
         for (auto &piece : pieces)
           if (piece.producer >= 0)
             piece.producer = canonical[piece.producer];
+      for (auto &elements : consumer.instElements)
+        for (auto &pieces : elements)
+          for (auto &piece : pieces)
+            if (piece.producer >= 0)
+              piece.producer = canonical[piece.producer];
     }
   }
   for (auto &consumer : consumers) {
@@ -2644,10 +2688,11 @@ LogicalResult StaticFolder::collect() {
       for (auto &piece : pieces)
         if (piece.producer >= 0)
           producers[piece.producer].read = true;
-    for (auto &pieces : consumer.elements)
-      for (auto &piece : pieces)
-        if (piece.producer >= 0)
-          producers[piece.producer].read = true;
+    for (auto &elements : consumer.instElements)
+      for (auto &pieces : elements)
+        for (auto &piece : pieces)
+          if (piece.producer >= 0)
+            producers[piece.producer].read = true;
   }
   return success();
 }
@@ -6646,6 +6691,9 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
     return false;
   // Between SLR groups a link is registered on both sides of the crossing.
   if (crosses(producer.cls, c))
+    return false;
+  // An element input's source is chosen by its reader's evaluation.
+  if (indexedPorts.count({c, input}))
     return false;
   // A staged reader reads its inputs from their read registers, its stages
   // before its state pass.
@@ -23995,13 +24043,21 @@ LogicalResult StaticFolder::buildSim() {
         if (!isa<hw::ConstantOp>(op))
           tagGroup(op, to);
     });
+    // A ghost of an element input: built by the element input.
+    if (consumer.ghostOf >= 0)
+      continue;
     // An element input (foldsim-index-class-inputs): the element at the
     // index the instance's evaluation computes, read in the host cycle of the
     // evaluation (the copy's index output, through no register, back into
     // its input), as the read register would hold it then. Each piece of
     // the elements: one field of the folded bundles' rows, read at the
     // index's bundle (fold-ports-rows); a table of constants; or else a
-    // choice of the frame's inputs.
+    // choice, by the instance and the index, of constants, the frame's
+    // inputs and class outputs' links -- each link read in this host cycle
+    // at the producer instance the instance and the index name (one read
+    // per producer port and bits), at the bank and entry the read register
+    // would have read a host cycle ahead, registered: a write landing in
+    // between is one the read register's forward takes too.
     if (consumer.indexOutput >= 0) {
       if (cls.stages || cls.pp || cls.page || cls.folding)
         return cls.instances[0].emitError(
@@ -24017,26 +24073,44 @@ LogicalResult StaticFolder::buildSim() {
                    b, SmallVector<Value>(values.rbegin(), values.rend())),
             index);
       };
+      auto &all = consumer.instElements;
       auto &elements = consumer.elements;
       unsigned n = elements.size();
       std::set<unsigned> ends{consumer.width};
-      for (auto &pieces : elements) {
-        unsigned end = 0;
-        for (auto &piece : pieces)
-          ends.insert(end += piece.width);
-      }
-      auto elementAt = [&](unsigned e, unsigned at) {
+      for (auto &elems : all)
+        for (auto &pieces : elems) {
+          unsigned end = 0;
+          for (auto &piece : pieces)
+            ends.insert(end += piece.width);
+        }
+      auto elementAt = [&](unsigned i, unsigned e, unsigned at) {
         unsigned base = 0;
-        for (auto &piece : elements[e]) {
+        for (auto &piece : all[i][e]) {
           if (at < base + piece.width)
             return std::make_pair(&piece, at - base);
           base += piece.width;
         }
         llvm_unreachable("a bit not covered by a piece");
       };
+      // A table of the instance now and the index: rows[i][e], `w` bits.
+      auto table2 = [&](ArrayRef<SmallVector<uint64_t>> rows, unsigned w) -> Value {
+        bool uniform = llvm::all_of(rows, [&](auto &r) { return r == rows[0]; });
+        SmallVector<Value> cols;
+        for (unsigned e = 0; e < n; ++e) {
+          if (uniform) {
+            cols.push_back(constant(w, rows[0][e]));
+            continue;
+          }
+          SmallVector<uint64_t> column;
+          for (auto &r : rows)
+            column.push_back(r[e]);
+          cols.push_back(table(b, ctl.inst, column, w));
+        }
+        return choose(cols);
+      };
       // The evaluation's host cycle: the frame's row, its tail bit and
       // each spec group's index, a register of the read-ahead's.
-      Value rowNow, tailNow;
+      Value rowNow, tailNow, bankNow;
       std::map<unsigned, Value> specNow;
       auto tail = [&]() -> Value {
         if (!tailNow)
@@ -24052,6 +24126,19 @@ LogicalResult StaticFolder::buildSim() {
         Value prev = prevFrameInput[{p, slrOf.empty() ? -1 : slrOf[c]}];
         return comb::MuxOp::create(b, tail(), prev, frameInput[p]);
       };
+      // A link's bank now: the read register's (parity and tail a host
+      // cycle ahead), registered.
+      auto bank = [&]() -> Value {
+        if (!bankNow) {
+          std::string name = consumer.name + "_index_parity";
+          bankNow = copyReg(copyReg(par2, name + "1"), name + "0");
+          if (ctl.tail2)
+            bankNow = comb::XorOp::create(
+                b, bankNow,
+                copyReg(copyReg(ctl.tail2, name + "_tail1"), name + "_tail0"));
+        }
+        return bankNow;
+      };
       SmallVector<Value> segments;
       unsigned at = 0;
       for (unsigned end : ends) {
@@ -24061,24 +24148,17 @@ LogicalResult StaticFolder::buildSim() {
         SmallVector<const Piece *> piece(n);
         SmallVector<unsigned> offset(n);
         for (unsigned e = 0; e < n; ++e)
-          std::tie(piece[e], offset[e]) = elementAt(e, at);
-        bool constants = llvm::all_of(piece, [](auto *x) { return x->producer < 0; });
+          std::tie(piece[e], offset[e]) = elementAt(0, e, at);
         bool rows =
-            portRows && llvm::all_of(llvm::seq<unsigned>(0, n), [&](unsigned e) {
+            consumer.sameElements && portRows &&
+            llvm::all_of(llvm::seq<unsigned>(0, n), [&](unsigned e) {
               int p = piece[e]->producer, p0 = piece[0]->producer;
-              return p >= 0 && folded(p) &&
+              return p >= 0 && producers[p].cls < 0 && folded(p) &&
                      pf.producerField[p] == pf.producerField[p0] &&
                      piece[e]->low + offset[e] == piece[0]->low + offset[0] &&
                      (specOf[p] < 0) == (specOf[p0] < 0);
             });
-        if (constants) {
-          SmallVector<Value> values;
-          for (unsigned e = 0; e < n; ++e)
-            values.push_back(hw::ConstantOp::create(
-                b, piece[e]->constant.extractBits(width, offset[e])));
-          segments.push_back(choose(values));
-          ++indexedTables;
-        } else if (rows) {
+        if (rows) {
           if (!rowNow)
             rowNow = reg(rowsRowFor(c), cls.name + "_rows_row0");
           unsigned p0 = piece[0]->producer;
@@ -24105,19 +24185,77 @@ LogicalResult StaticFolder::buildSim() {
           segments.push_back(b.createOrFold<comb::ExtractOp>(
               b.getIntegerType(width), value, piece[0]->low + offset[0]));
           ++indexedRows;
-        } else {
-          SmallVector<Value> values;
-          for (unsigned e = 0; e < n; ++e)
-            values.push_back(
-                piece[e]->producer < 0
-                    ? Value(hw::ConstantOp::create(
-                          b, piece[e]->constant.extractBits(width, offset[e])))
-                    : b.createOrFold<comb::ExtractOp>(
-                          b.getIntegerType(width), frameNow(piece[e]->producer),
-                          piece[e]->low + offset[e]));
-          segments.push_back(choose(values));
-          ++indexedChoices;
+          at = end;
+          continue;
         }
+        // Each instance's source at each index: a constant (by value), a
+        // frame input's bits, or a class output's link (by producer port
+        // and bits, with the producer instance read).
+        SmallVector<Value> values;
+        std::map<std::string, unsigned> constIndex;
+        std::map<std::pair<unsigned, unsigned>, unsigned> frameIndex, linkIndex;
+        std::map<std::pair<unsigned, unsigned>, SmallVector<SmallVector<uint64_t>>> linkRows;
+        SmallVector<SmallVector<uint64_t>> sel(all.size(), SmallVector<uint64_t>(n, 0));
+        bool anyFrame = false, anyLink = false;
+        for (unsigned i = 0; i < all.size(); ++i)
+          for (unsigned e = 0; e < n; ++e) {
+            auto [x, off] = elementAt(i, e, at);
+            if (x->producer < 0) {
+              APInt v = x->constant.extractBits(width, off);
+              std::string key = llvm::toString(v, 16, false);
+              auto [it, fresh] = constIndex.try_emplace(key, values.size());
+              if (fresh)
+                values.push_back(hw::ConstantOp::create(b, v));
+              sel[i][e] = it->second;
+              continue;
+            }
+            unsigned p = x->producer, low = x->low + off;
+            if (producers[p].cls < 0) {
+              auto [it, fresh] = frameIndex.try_emplace({p, low}, values.size());
+              if (fresh)
+                values.push_back(b.createOrFold<comb::ExtractOp>(
+                    b.getIntegerType(width), frameNow(p), low));
+              sel[i][e] = it->second;
+              anyFrame = true;
+              continue;
+            }
+            auto [it, fresh] = linkIndex.try_emplace({p, low}, values.size());
+            if (fresh) {
+              values.push_back(Value());
+              linkRows[{p, low}].assign(all.size(), SmallVector<uint64_t>(n, 0));
+            }
+            linkRows[{p, low}][i][e] = x->inst;
+            sel[i][e] = it->second;
+            anyLink = true;
+          }
+        for (auto &[key, idx] : linkIndex) {
+          auto [p, low] = key;
+          auto &producer = producers[p];
+          unsigned pThreads = classes[producer.cls].threads();
+          Value address;
+          if (pThreads > 1)
+            address = table2(linkRows[key], llvm::Log2_32_Ceil(pThreads));
+          values[idx] = linkRead(
+              p, low, width, [&]() { return address; }, bank,
+              producer.name + "_to_" + consumer.name + "_ix" + Twine(at), to);
+          ++indexedLinks;
+        }
+        if (values.size() == 1) {
+          segments.push_back(values[0]);
+        } else {
+          unsigned sw = llvm::Log2_32_Ceil(values.size());
+          while (values.size() < (1u << sw))
+            values.push_back(values[0]);
+          Value which = table2(sel, sw);
+          segments.push_back(hw::ArrayGetOp::create(
+              b, hw::ArrayCreateOp::create(
+                     b, SmallVector<Value>(values.rbegin(), values.rend())),
+              which));
+        }
+        if (anyFrame)
+          ++indexedChoices;
+        else if (!anyLink)
+          ++indexedTables;
         at = end;
       }
       Value value = segments.size() == 1
@@ -25389,7 +25527,7 @@ LogicalResult StaticFolder::buildSim() {
     if (indexedInputs)
       os << "; indexed inputs " << indexedInputs << " (" << indexedRows
          << " rows, " << indexedTables << " tables, " << indexedChoices
-         << " choices)";
+         << " choices, " << indexedLinks << " link reads)";
     if (dropDeadInputs)
       os << "; dead inputs " << deadInputs << " + " << partlyDeadInputs
          << " in part (" << deadInputBits << " bits, no link)";

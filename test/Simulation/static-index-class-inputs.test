@@ -22,7 +22,7 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/r --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --fold-ports-rows --index-class-inputs Unit Arb > %t/r.log 2>&1
 # RUN: FileCheck %s --check-prefix=RLOG < %t/r.log
 # RLOG: foldsim-index-class-inputs: Arb.data_in: 4 x 17 b read at 2 index(es), 2 instance(s)
-# RLOG: indexed inputs 2 (4 rows, 0 tables, 0 choices)
+# RLOG: indexed inputs 2 (4 rows, 0 tables, 0 choices, 0 link reads)
 # RUN: FileCheck %s --check-prefix=RSV < %t/r/foldsim_sim.sv
 # RSV: module ports_rows_rdata_16x{{[0-9]+}}(
 # RSV: R2_addr,
@@ -34,7 +34,7 @@
 # RUN: %t/r/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=S3
 # RUN: foldsim --srcs top.f --top Top --out %t/p --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --index-class-inputs Unit Arb > %t/p.log 2>&1
 # RUN: FileCheck %s --check-prefix=PLOG < %t/p.log
-# PLOG: indexed inputs 2 (0 rows, 0 tables, 4 choices)
+# PLOG: indexed inputs 2 (0 rows, 0 tables, 4 choices, 0 link reads)
 # RUN: not grep -E 'reg .*mp_[0-9]_rdata_frame_Arb' %t/p/foldsim_sim.sv
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/p -Mdir %t/p/obj %S/Inputs/tb_ports.sv top.sv %t/p/foldsim_sim.sv > %t/p/build.log 2>&1
 # RUN: %t/p/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s --check-prefix=S1

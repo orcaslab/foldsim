@@ -2329,6 +2329,10 @@ def build_parser():
                          'arbiter\'s data_in[grant]) becomes an index output and an element input per read; the '
                          'simulator reads that element in the evaluation\'s host cycle (with --fold-ports-rows: one '
                          'rows read per index), not the whole array per instance (foldsim-index-class-inputs)')
+    ap.add_argument('--index-class-links', action='store_true',
+                    help='with --index-class-inputs: also arrays of other classes\' outputs (a crossbar arbiter fed by '
+                         'models): each element read from its producer\'s link in the evaluation\'s host cycle at the '
+                         'producer instance the index names (foldsim-index-class-inputs inputs-only=false)')
     ap.add_argument('--index-min-elements', type=int, default=4, metavar='N',
                     help='with --index-class-inputs: arrays of at least N elements')
     ap.add_argument('--fold-ports-reset', default='reset', metavar='INPUT',
@@ -2974,7 +2978,8 @@ def main():
     if a.compress_adds:
         passes.append(f'hw.module(foldsim-compress-add-trees{{min-operands={a.compress_adds}}})')
     if getattr(a, 'index_class_inputs', False):
-        passes.append(f'foldsim-index-class-inputs{{module={a.top} min-elements={a.index_min_elements} verbose}}')
+        links = ' inputs-only=false' if getattr(a, 'index_class_links', False) else ''
+        passes.append(f'foldsim-index-class-inputs{{module={a.top} min-elements={a.index_min_elements}{links} verbose}}')
     compose = f'module={a.top} sim=foldsim_sim'
     # With registered state the next thread is picked a host cycle earlier, from
     # inputs a cycle older: on classes of 16 threads that costs 37.5 % more host

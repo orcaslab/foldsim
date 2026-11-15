@@ -1,0 +1,48 @@
+# REQUIRES: verilator
+# --index-class-inputs --index-class-links: element arrays of OTHER CLASSES'
+# outputs (Driver/Inputs/ports_xbar/top_links.sv: six arbiters of one class --
+# a0/a1 the bundles' responses, a2 the units' {data, ack} (an early and a
+# late output of four producer instances), a3 the same rotated (each
+# instance its own array), a4 four bit ranges of registers of the top's model
+# (one producer instance), a5 a mix of a response, units' outputs and a
+# constant). Each element of a class output is read from its producer's link
+# in the host cycle of the reader's evaluation, at the producer instance the
+# instance and the index name, the bank and entry registered from the read
+# register's (its forward's writes included); the other elements are ghost
+# consumers for the schedule's waits, and an element input is never a
+# zero-latency link. Every run MATCHes in the host cycles of the build
+# without the options (bubbles: MATCH, schedule may differ). A mutant reading
+# the producer instance next to the right one MISMATCHes at cycle 4 (by hand,
+# 11-15).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/ports_xbar
+# RUN: foldsim --srcs top_links.f --top Top --out %t/k --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --index-class-inputs --index-class-links Unit Arb > %t/k.log 2>&1
+# RUN: FileCheck %s --check-prefix=KLOG < %t/k.log
+# KLOG: foldsim-index-class-inputs: Arb.data_in: 4 x 17 b read at 2 index(es), 6 instance(s)
+# KLOG: indexed inputs 2 (0 rows, 0 tables, 4 choices, 22 link reads)
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/k -Mdir %t/k/obj %S/Inputs/tb_ports.sv top_links.sv %t/k/foldsim_sim.sv > %t/k/build.log 2>&1
+# RUN: %t/k/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s --check-prefix=S1
+# RUN: %t/k/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s --check-prefix=S2
+# RUN: %t/k/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=S3
+# Without --index-class-links the arrays fed by models are left alone (the input is not rewritten at all).
+# RUN: foldsim --srcs top_links.f --top Top --out %t/i --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --index-class-inputs Unit Arb > %t/i.log 2>&1
+# RUN: FileCheck %s --check-prefix=ILOG < %t/i.log
+# ILOG: foldsim-index-class-inputs: 0 input(s), 0 read(s)
+# Spec groups + rows.
+# RUN: foldsim --srcs top_links.f --top Top --out %t/sp --static --nest --modulo --spec-groups mp_0_ack=mp_0_rvalid:mp_0_rdata,mp_1_ack=mp_1_rvalid:mp_1_rdata,mp_2_ack=mp_2_rvalid:mp_2_rdata,mp_3_ack=mp_3_rvalid:mp_3_rdata --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --fold-ports-rows --index-class-inputs --index-class-links Unit Arb > %t/sp.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/sp -DSPEC -Mdir %t/sp/obj %S/Inputs/tb_ports.sv top_links.sv %t/sp/foldsim_sim.sv > %t/sp/build.log 2>&1
+# RUN: %t/sp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=200 +stall=50 | FileCheck %s --check-prefix=S4
+# SLR groups (links crossing groups: written late from the producer's group).
+# RUN: foldsim --srcs top_links.f --top Top --out %t/g --static --nest --modulo --spec-groups mp_0_ack=mp_0_rvalid:mp_0_rdata,mp_1_ack=mp_1_rvalid:mp_1_rdata,mp_2_ack=mp_2_rvalid:mp_2_rdata,mp_3_ack=mp_3_rvalid:mp_3_rdata --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --fold-ports-rows --index-class-inputs --index-class-links --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2,Arb:1 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env Unit Arb > %t/g.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/g -DSPEC -Mdir %t/g/obj %S/Inputs/tb_ports.sv top_links.sv %t/g/foldsim_sim.sv > %t/g/build.log 2>&1
+# RUN: %t/g/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s --check-prefix=G1
+# RUN: %t/g/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=G3
+# RUN: foldsim --srcs top_links.f --top Top --out %t/bu --static --nest --modulo --bubbles --direct-outputs --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --index-class-inputs --index-class-links Unit Arb > %t/bu.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/bu -DBUBBLES -Mdir %t/bu/obj %S/Inputs/tb_ports.sv top_links.sv %t/bu/foldsim_sim.sv > %t/bu/build.log 2>&1
+# RUN: %t/bu/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 +bubble=30 | FileCheck %s
+# CHECK: {{^}}MATCH 196 cycles
+# S1: {{^}}MATCH 196 cycles in 2802 host cycles
+# S2: {{^}}MATCH 196 cycles in 11948 host cycles
+# S3: {{^}}MATCH 196 cycles in 69996 host cycles
+# S4: {{^}}MATCH 196 cycles in 34686 host cycles
+# G1: {{^}}MATCH 196 cycles in 5007 host cycles
+# G3: {{^}}MATCH 196 cycles in 71406 host cycles
