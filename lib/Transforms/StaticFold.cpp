@@ -430,6 +430,13 @@ struct Consumer {
   unsigned port = 0, width = 0;
   /// Each instance's bits, low ones first.
   SmallVector<Pieces> pieces;
+  /// An element input of `foldsim-index-class-inputs`: the netlist drives it
+  /// with an element of an array at an index output of the same instance
+  /// (`indexOutput`, -1 otherwise); each element's bits (every instance
+  /// reads the same array). `pieces` holds a non-constant element's, for
+  /// the analyses that read an input's sources.
+  int indexOutput = -1;
+  SmallVector<Pieces> elements;
 };
 
 /// Host cycles from a link's write to the first slot that reads it: the write
@@ -1014,6 +1021,10 @@ public:
   /// `room-ahead`: the controllers' room terms registered (two entries more).
   bool roomAhead = false;
   unsigned deadInputs = 0, partlyDeadInputs = 0;
+  /// Element inputs read at an index (foldsim-index-class-inputs), and
+  /// their pieces: read from the rows, of constants, chosen of the frame's.
+  unsigned indexedInputs = 0, indexedRows = 0, indexedTables = 0,
+           indexedChoices = 0;
   uint64_t deadInputBits = 0;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
   /// landing) a member is streamed with (0: the decision lead + 6). A
@@ -2382,6 +2393,19 @@ LogicalResult StaticFolder::collect() {
   for (auto &op : body->without_terminator()) {
     auto instance = dyn_cast<hw::InstanceOp>(op);
     if (!instance) {
+      // An element read at an index output of the instance that takes it
+      // (foldsim-index-class-inputs).
+      if (auto get = dyn_cast<hw::ArrayGetOp>(op)) {
+        auto index = dyn_cast<OpResult>(get.getIndex());
+        auto owner = index ? dyn_cast<hw::InstanceOp>(index.getOwner())
+                           : hw::InstanceOp();
+        if (owner && llvm::all_of(get->getUses(), [&](OpOperand &use) {
+              return use.getOwner() == owner.getOperation();
+            }))
+          continue;
+        return op.emitError("an array read in a netlist must be an element "
+                            "input of the instance whose output is its index");
+      }
       if (!isa<hw::ConstantOp, comb::ExtractOp, comb::ConcatOp,
                comb::ReplicateOp, hw::BitcastOp>(op))
         return op.emitError("not wiring or a model in a netlist");
@@ -2472,6 +2496,57 @@ LogicalResult StaticFolder::collect() {
         deadInputBits += consumer.width;
         continue;
       }
+      // An element input (foldsim-index-class-inputs): the array's elements,
+      // the same in every instance, read at the instance's index output.
+      if (auto get = cls.instances[0].getOperand(i).getDefiningOp<hw::ArrayGetOp>()) {
+        unsigned o = cast<OpResult>(get.getIndex()).getResultNumber();
+        consumer.indexOutput = o;
+        auto type = cast<hw::ArrayType>(get.getInput().getType());
+        unsigned n = type.getNumElements();
+        for (auto [inst, instance] : llvm::enumerate(cls.instances)) {
+          auto g = instance.getOperand(i).getDefiningOp<hw::ArrayGetOp>();
+          if (!g || g.getIndex() != instance.getResult(o) ||
+              g.getInput().getType() != get.getInput().getType())
+            return instance.emitError("an element input read at another index "
+                                      "in another instance");
+          SmallVector<Pieces> elements(n);
+          for (unsigned e = 0; e < n; ++e)
+            if (failed(decompose(g.getInput(), e * consumer.width, consumer.width,
+                                 elements[e])))
+              return failure();
+          auto same = [](const Pieces &x, const Pieces &y) {
+            return x.size() == y.size() &&
+                   llvm::all_of(llvm::zip(x, y), [](auto pair) {
+                     auto &[a, b] = pair;
+                     return a.producer == b.producer && a.inst == b.inst &&
+                            a.low == b.low && a.width == b.width &&
+                            (a.producer >= 0 || a.constant == b.constant);
+                   });
+          };
+          if (inst == 0)
+            consumer.elements = std::move(elements);
+          else if (!llvm::all_of(llvm::seq<unsigned>(0, n), [&](unsigned e) {
+                     return same(elements[e], consumer.elements[e]);
+                   }))
+            return instance.emitError("an element input of another array in "
+                                      "another instance (not supported)");
+        }
+        for (auto &element : consumer.elements)
+          for (auto &piece : element)
+            if (piece.producer >= 0 && producers[piece.producer].cls >= 0)
+              return cls.instances[0].emitError(
+                  "an element input of an array of model outputs (not "
+                  "supported: an array of the netlist's inputs and constants)");
+        auto *shown = llvm::find_if(consumer.elements, [](const Pieces &pieces) {
+          return llvm::any_of(pieces, [](auto &piece) { return piece.producer >= 0; });
+        });
+        if (shown == consumer.elements.end())
+          return cls.instances[0].emitError("an element input of an array of "
+                                            "constants");
+        consumer.pieces.assign(cls.instances.size(), *shown);
+        ++indexedInputs;
+        continue;
+      }
       for (auto instance : cls.instances)
         if (failed(decompose(instance.getOperand(i), 0, consumer.width,
                              consumer.pieces.emplace_back())))
@@ -2553,17 +2628,27 @@ LogicalResult StaticFolder::collect() {
         }
       }
     }
-    for (auto &consumer : consumers)
+    for (auto &consumer : consumers) {
       for (auto &pieces : consumer.pieces)
         for (auto &piece : pieces)
           if (piece.producer >= 0)
             piece.producer = canonical[piece.producer];
+      for (auto &pieces : consumer.elements)
+        for (auto &piece : pieces)
+          if (piece.producer >= 0)
+            piece.producer = canonical[piece.producer];
+    }
   }
-  for (auto &consumer : consumers)
+  for (auto &consumer : consumers) {
     for (auto &pieces : consumer.pieces)
       for (auto &piece : pieces)
         if (piece.producer >= 0)
           producers[piece.producer].read = true;
+    for (auto &pieces : consumer.elements)
+      for (auto &piece : pieces)
+        if (piece.producer >= 0)
+          producers[piece.producer].read = true;
+  }
   return success();
 }
 
@@ -22184,7 +22269,7 @@ LogicalResult StaticFolder::buildSim() {
   }
   // The frame's input as a class's evaluation a host cycle ahead reads it:
   // in a slot past the frame, the frame before's.
-  std::map<std::pair<unsigned, int>, Value> prevFrameInputNext;
+  std::map<std::pair<unsigned, int>, Value> prevFrameInputNext, prevFrameInput;
   DenseMap<unsigned, Value> classTail1;
   // fold-ports-rows: input `p`'s field in the row of bundle `port` (a
   // value) and frame `row` (mod 4).
@@ -22268,12 +22353,14 @@ LogicalResult StaticFolder::buildSim() {
     if (!readCtl(c).tail2)
       return frameInputNext[p];
     // One per SLR group, in the group.
-    Value &prevNext = prevFrameInputNext[{p, slrOf.empty() ? -1 : slrOf[c]}];
+    std::pair<unsigned, int> key{p, slrOf.empty() ? -1 : slrOf[c]};
+    Value &prevNext = prevFrameInputNext[key];
     if (!prevNext) {
       auto next = backedges.get(frameInput[p].getType());
       Value prev = reg(next, producers[p].name + "_prev");
       prevNext = comb::MuxOp::create(b, load, frameInput[p], prev);
       next.setValue(prevNext);
+      prevFrameInput[key] = prev;
     }
     Value &tail1 = classTail1[c];
     if (!tail1)
@@ -23908,6 +23995,143 @@ LogicalResult StaticFolder::buildSim() {
         if (!isa<hw::ConstantOp>(op))
           tagGroup(op, to);
     });
+    // An element input (foldsim-index-class-inputs): the element at the
+    // index the instance's evaluation computes, read in the host cycle of the
+    // evaluation (the copy's index output, through no register, back into
+    // its input), as the read register would hold it then. Each piece of
+    // the elements: one field of the folded bundles' rows, read at the
+    // index's bundle (fold-ports-rows); a table of constants; or else a
+    // choice of the frame's inputs.
+    if (consumer.indexOutput >= 0) {
+      if (cls.stages || cls.pp || cls.page || cls.folding)
+        return cls.instances[0].emitError(
+            "an element input read at an index (foldsim-index-class-inputs) "
+            "of a staged, paged, pass-partitioned or pipeline-folded class "
+            "(not supported: its index comes out after its input is read)");
+      Value index = asBits(b, copies[c].getResult(consumer.indexOutput));
+      auto choose = [&](ArrayRef<Value> values) -> Value {
+        if (llvm::all_of(values, [&](Value v) { return v == values[0]; }))
+          return values[0];
+        return hw::ArrayGetOp::create(
+            b, hw::ArrayCreateOp::create(
+                   b, SmallVector<Value>(values.rbegin(), values.rend())),
+            index);
+      };
+      auto &elements = consumer.elements;
+      unsigned n = elements.size();
+      std::set<unsigned> ends{consumer.width};
+      for (auto &pieces : elements) {
+        unsigned end = 0;
+        for (auto &piece : pieces)
+          ends.insert(end += piece.width);
+      }
+      auto elementAt = [&](unsigned e, unsigned at) {
+        unsigned base = 0;
+        for (auto &piece : elements[e]) {
+          if (at < base + piece.width)
+            return std::make_pair(&piece, at - base);
+          base += piece.width;
+        }
+        llvm_unreachable("a bit not covered by a piece");
+      };
+      // The evaluation's host cycle: the frame's row, its tail bit and
+      // each spec group's index, a register of the read-ahead's.
+      Value rowNow, tailNow;
+      std::map<unsigned, Value> specNow;
+      auto tail = [&]() -> Value {
+        if (!tailNow)
+          tailNow = reg(rowsTail1(c), cls.name + "_tail0");
+        return tailNow;
+      };
+      auto frameNow = [&](unsigned p) -> Value {
+        if (portRows && folded(p))
+          return classFrameInput(p, c);
+        if (!readCtl(c).tail2)
+          return frameInput[p];
+        frameInputFor(p, c);
+        Value prev = prevFrameInput[{p, slrOf.empty() ? -1 : slrOf[c]}];
+        return comb::MuxOp::create(b, tail(), prev, frameInput[p]);
+      };
+      SmallVector<Value> segments;
+      unsigned at = 0;
+      for (unsigned end : ends) {
+        if (end == at)
+          continue;
+        unsigned width = end - at;
+        SmallVector<const Piece *> piece(n);
+        SmallVector<unsigned> offset(n);
+        for (unsigned e = 0; e < n; ++e)
+          std::tie(piece[e], offset[e]) = elementAt(e, at);
+        bool constants = llvm::all_of(piece, [](auto *x) { return x->producer < 0; });
+        bool rows =
+            portRows && llvm::all_of(llvm::seq<unsigned>(0, n), [&](unsigned e) {
+              int p = piece[e]->producer, p0 = piece[0]->producer;
+              return p >= 0 && folded(p) &&
+                     pf.producerField[p] == pf.producerField[p0] &&
+                     piece[e]->low + offset[e] == piece[0]->low + offset[0] &&
+                     (specOf[p] < 0) == (specOf[p0] < 0);
+            });
+        if (constants) {
+          SmallVector<Value> values;
+          for (unsigned e = 0; e < n; ++e)
+            values.push_back(hw::ConstantOp::create(
+                b, piece[e]->constant.extractBits(width, offset[e])));
+          segments.push_back(choose(values));
+          ++indexedTables;
+        } else if (rows) {
+          if (!rowNow)
+            rowNow = reg(rowsRowFor(c), cls.name + "_rows_row0");
+          unsigned p0 = piece[0]->producer;
+          SmallVector<Value> ports, specs;
+          for (unsigned e = 0; e < n; ++e) {
+            unsigned p = piece[e]->producer;
+            ports.push_back(constant(pf.chanWidth, pf.producerPort[p]));
+            if (specOf[p] < 0)
+              continue;
+            unsigned g = specOf[p];
+            Value &now = specNow[g];
+            if (!now) {
+              auto [indexFrame, indexPrev] = rowsIndexFor(g);
+              Value ahead = readCtl(c).tail2
+                                ? Value(comb::MuxOp::create(b, rowsTail1(c),
+                                                            indexPrev, indexFrame))
+                                : indexFrame;
+              now = reg(ahead, cls.name + "_rows_index0_" + Twine(g));
+            }
+            specs.push_back(now);
+          }
+          Value all = rowsRead(p0, choose(ports), rowNow);
+          Value value = specOf[p0] < 0 ? all : specPick(p0, all, choose(specs));
+          segments.push_back(b.createOrFold<comb::ExtractOp>(
+              b.getIntegerType(width), value, piece[0]->low + offset[0]));
+          ++indexedRows;
+        } else {
+          SmallVector<Value> values;
+          for (unsigned e = 0; e < n; ++e)
+            values.push_back(
+                piece[e]->producer < 0
+                    ? Value(hw::ConstantOp::create(
+                          b, piece[e]->constant.extractBits(width, offset[e])))
+                    : b.createOrFold<comb::ExtractOp>(
+                          b.getIntegerType(width), frameNow(piece[e]->producer),
+                          piece[e]->low + offset[e]));
+          segments.push_back(choose(values));
+          ++indexedChoices;
+        }
+        at = end;
+      }
+      Value value = segments.size() == 1
+                        ? segments[0]
+                        : b.createOrFold<comb::ConcatOp>(
+                              SmallVector<Value>(segments.rbegin(), segments.rend()));
+      unsigned argIndex = 0;
+      for (unsigned i = 0; i < consumer.port; ++i)
+        if (int(i) != cls.clockInput)
+          ++argIndex;
+      copyInputs[c][argIndex].setValue(
+          b.createOrFold<hw::BitcastOp>(cls.inputTypes[consumer.port], value));
+      continue;
+    }
     std::set<unsigned> cuts{consumer.width};
     for (auto &pieces : consumer.pieces) {
       unsigned at = 0;
@@ -25162,6 +25386,10 @@ LogicalResult StaticFolder::buildSim() {
       os << "; staged " << stagedReads;
     if (stagedLinkDirect)
       os << " (read in place " << stagedDirectReads << ")";
+    if (indexedInputs)
+      os << "; indexed inputs " << indexedInputs << " (" << indexedRows
+         << " rows, " << indexedTables << " tables, " << indexedChoices
+         << " choices)";
     if (dropDeadInputs)
       os << "; dead inputs " << deadInputs << " + " << partlyDeadInputs
          << " in part (" << deadInputBits << " bits, no link)";
