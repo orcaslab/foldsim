@@ -929,6 +929,10 @@ public:
   /// `physical-domains`: the simulator as a tree of modules mirroring the
   /// class tree (extractDomains).
   bool physicalDomains = false;
+  /// `slr-adjacent`: no link between SLR groups more than one SLR apart.
+  bool slrAdjacent = false;
+  /// `slr-level-group`: the group the simulator level sits with (-1 unknown).
+  int slrLevelGroup = -1;
   /// physical-domains: the domain report (schedule report and stderr).
   std::string domainReport;
   struct LinkCandidate {
@@ -9721,6 +9725,22 @@ LogicalResult StaticFolder::chooseGroups() {
   SmallVector<SmallVector<uint64_t>> bits;
   SmallVector<SmallVector<unsigned>> links;
   linkBits(bits, links);
+  // `slr-level-group`: each class's bits to and from the netlist's ports,
+  // a link to the level's group.
+  SmallVector<uint64_t> envBits(n, 0);
+  if (slrLevelGroup >= 0) {
+    for (auto &consumer : consumers)
+      for (auto &pieces : consumer.pieces)
+        for (auto &piece : pieces) {
+          if (piece.producer < 0)
+            continue;
+          int from = producers[piece.producer].cls;
+          if (consumer.cls >= 0 && from < 0)
+            envBits[consumer.cls] += piece.width;
+          else if (consumer.cls < 0 && from >= 0)
+            envBits[from] += piece.width;
+        }
+  }
 
   // The ungrouped schedule's modulo lower bound: no assignment's frame is
   // shorter (groups only add the crossings' latencies and spacing; the
@@ -9796,7 +9816,7 @@ LogicalResult StaticFolder::chooseGroups() {
   // Why candidates were pruned, for the message when none is left: by a
   // group's capacity, by an SLR boundary's link budget (and the least
   // overflow of a boundary seen, and which).
-  uint64_t prunedCapacity = 0, prunedBudget = 0;
+  uint64_t prunedCapacity = 0, prunedBudget = 0, prunedFar = 0;
   uint64_t leastOver = std::numeric_limits<uint64_t>::max();
   unsigned leastOverAt = 0;
   // Ranked by (the frame's bound from serialized crossings, at least the
@@ -9840,7 +9860,8 @@ LogicalResult StaticFolder::chooseGroups() {
           auto wires = [&](unsigned x, unsigned y) {
             return serialWires(x, bits[x][y]) + serialWires(y, bits[y][x]);
           };
-          uint64_t more = 0, bound2 = bound;
+          uint64_t more = slrLevelGroup >= 0 && int(g) != slrLevelGroup ? envBits[c] : 0;
+          uint64_t bound2 = bound;
           for (unsigned j = 0; j < k; ++j) {
             unsigned d = order[j];
             if (group[d] != int(g)) {
@@ -9849,6 +9870,23 @@ LogicalResult StaticFolder::chooseGroups() {
                 bound2 = std::max(bound2, serialBound(c));
               if (bits[d][c])
                 bound2 = std::max(bound2, serialBound(d));
+            }
+          }
+          // `slr-adjacent`: a link to a class placed more than one SLR away
+          // would cross an SLR it does not use (the level's group counts as a
+          // class's, slr-level-group).
+          if (slrAdjacent && !slrCapacitySpecs.empty()) {
+            bool far = slrLevelGroup >= 0 && envBits[c] &&
+                       (g > unsigned(slrLevelGroup) ? g - unsigned(slrLevelGroup)
+                                                    : unsigned(slrLevelGroup) - g) > 1;
+            for (unsigned j = 0; j < k && !far; ++j) {
+              unsigned d = order[j];
+              unsigned h = group[d];
+              far = (g > h ? g - h : h - g) > 1 && (bits[c][d] || bits[d][c]);
+            }
+            if (far) {
+              ++prunedFar;
+              continue;
             }
           }
           SmallVector<uint64_t> added(boundary.size(), 0);
@@ -9923,6 +9961,9 @@ LogicalResult StaticFolder::chooseGroups() {
                                                   std::to_string(leastOverAt + 1) + ")"
                                             : std::string())
                         : std::string())
+           << (slrAdjacent ? ", " + std::to_string(prunedFar) +
+                                 " with a link more than one SLR apart (slr-adjacent)"
+                           : std::string())
            << (visited > 20'000'000 ? "; the search stopped at 20,000,000 nodes" : "");
   }
 
@@ -29555,6 +29596,8 @@ void FoldStaticPass::runOnOperation() {
   gUramCascadeMax = uramCascadeMax;
   folder.slrGroupEnv = slrGroupEnv;
   folder.physicalDomains = physicalDomains;
+  folder.slrAdjacent = slrAdjacent;
+  folder.slrLevelGroup = slrLevelGroup;
   folder.slrKept = std::max(1u, unsigned(slrKept));
   for (auto [spec, out, name] :
        {std::tuple{std::string(linkKindGroups), &folder.linkKindGroupCap, "link-kind-groups"},

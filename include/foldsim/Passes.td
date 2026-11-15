@@ -616,6 +616,19 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"slrSllBudget", "slr-sll-budget", "uint64_t", "0",
            "With slr-groups and slr-capacities, the most link bits an "
            "assignment may put over any one SLR boundary (its SLLs; 0: any)">,
+    Option<"slrAdjacent", "slr-adjacent", "bool", "false",
+           "With slr-groups and slr-capacities (group g on the region's g-th "
+           "SLR): no link between groups more than one SLR apart. Such a link "
+           "crosses an SLR it does not use on that SLR's own routing and SLLs "
+           "(g16i1p1e: the 1,334 bits between SLR0 and SLR2 were 9-18 % of the "
+           "wirelength over SLR1's congested windows); the assignment search "
+           "prunes it">,
+    Option<"slrLevelGroup", "slr-level-group", "int", "-1",
+           "With slr-groups: the group the simulator level and the "
+           "environment sit with (the driver's --slr-level): a class's bits to "
+           "and from the netlist's ports (its memory and token channels) are a "
+           "link to that group in the assignment's cut, and with slr-adjacent a "
+           "class with any is kept within one SLR of it. -1: unknown (ignored)">,
     ListOption<"slrSerialize", "slr-serialize", "std::string",
                "With slr-groups, the links between groups of the given classes "
                "(globs; a copy goes by its class's name) carried over k host "

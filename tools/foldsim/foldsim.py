@@ -594,6 +594,8 @@ def frame_options(a):
         fold += ' slr-group-env'
     if getattr(a, 'physical_domains', False):
         fold += ' physical-domains'
+    if getattr(a, 'slr_adjacent', False):
+        fold += ' slr-adjacent'
     if getattr(a, 'registered_links', ''):
         fold += f' registered-links={a.registered_links}'
     if getattr(a, 'split_latency', ''):
@@ -1211,6 +1213,9 @@ def slr_options(a, foldsim_opt, models, fold, out):
                     + ','.join(f'{c}:{s}' for c, s in sites.items()))
         opts += (''
                 + f' slr-sll-budget={slr_region_sll_budget(a.slr_region)}')
+        # (--slr-adjacent: the level's group is a fixed end of the classes' port bits)
+        if getattr(a, 'slr_adjacent', False) and level is not None:
+            opts += f' slr-level-group={level}'
     else:
         capacity = a.slr_capacity or round(foldsim_degree.PLACE_MARGIN *
                                            foldsim_degree.PLACE_SITES / a.slr_count)
@@ -2477,6 +2482,9 @@ def build_parser():
                     help='with --physical-domains: <out>/foldsim_domain_pblocks.tcl, each SLR group\'s root domains in '
                          'side-by-side full-height column stripes of its SLR sized by their measured demand (soft '
                          'pblocks, flow/v80/domain_pblocks.tcl with FOLDSIM_DOMAIN_PBLOCKS)')
+    ap.add_argument('--slr-adjacent', action='store_true',
+                    help='with --slr-groups and an SLR region: no link between groups more than one SLR apart '
+                         '(foldsim-fold-static slr-adjacent)')
     ap.add_argument('--physical-domains', action='store_true',
                     help='emit the simulator as a tree of modules mirroring the class tree (foldsim-fold-static '
                          'physical-domains): a class\'s domain fs_dom_<class> holds its copies, its controls, the links '
