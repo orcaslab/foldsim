@@ -592,6 +592,8 @@ def frame_options(a):
         fold += ' slr-group-cut'
     if getattr(a, 'slr_group_env', False):
         fold += ' slr-group-env'
+    if getattr(a, 'physical_domains', False):
+        fold += ' physical-domains'
     if getattr(a, 'registered_links', ''):
         fold += f' registered-links={a.registered_links}'
     if getattr(a, 'split_latency', ''):
@@ -2425,6 +2427,10 @@ def build_parser():
                          'applied twice), registered, and registered again in each reading group (foldsim-fold-static '
                          'slr-group-cut): one cone, every crossing registered at both ends, the same values in every '
                          'host cycle')
+    ap.add_argument('--physical-domains', action='store_true',
+                    help='emit the simulator as a tree of modules mirroring the class tree (foldsim-fold-static '
+                         'physical-domains): a class\'s domain fs_dom_<class> holds its copies, its controls, the links '
+                         'read into it and its child classes\' domains; each domain is a placement unit')
     ap.add_argument('--slr-group-env', action='store_true',
                     help='with --slr-groups and --slr-group-own: each environment channel enters through one '
                          'register stage in the level and one per group behind a one-token elastic buffer, the '

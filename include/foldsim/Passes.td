@@ -852,6 +852,17 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "elastic buffer (credit in, present-and-confirm out), and the "
            "reset through one level register: no input port loads more than "
            "one SLR. The same tokens in the same order; host cycles move">,
+    Option<"physicalDomains", "physical-domains", "bool", "false",
+           "Physical domains: the simulator emitted as a tree of modules "
+           "that mirrors the class tree. Class c's domain `<sim>_dom_<c>` "
+           "(instance `fs_dom_<c>`) holds its copies, its controls (its "
+           "sequencer, slot tables, register chains), the links read into it "
+           "and the domains of its child classes; a class whose parent is in "
+           "another module (another SLR group, with slr-groups) is a domain "
+           "root there. What crosses a domain boundary is reported (bits, and "
+           "those not from a register or memory read). Every domain is a "
+           "placement unit (a pblock, an SLR assignment). The same netlist "
+           "apart from the hierarchy: no value or host cycle moves">,
     Option<"slrGroupReset", "slr-group-reset", "bool", "false",
            "With SLR groups: the simulator's reset registered once in each "
            "group (inside the group's module) and once for the level, so that "

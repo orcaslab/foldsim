@@ -926,6 +926,11 @@ public:
   /// `slr-group-env`: the environment's channels and reset enter the
   /// simulator through one register stage in the level, then one per group.
   bool slrGroupEnv = false;
+  /// `physical-domains`: the simulator as a tree of modules mirroring the
+  /// class tree (extractDomains).
+  bool physicalDomains = false;
+  /// physical-domains: the domain report (schedule report and stderr).
+  std::string domainReport;
   struct LinkCandidate {
     std::tuple<unsigned, unsigned, uint64_t> key;
     /// Its rows and columns in block or ultra RAM (paged as built), and its
@@ -1222,6 +1227,10 @@ private:
   /// Moves each SLR group's logic of the simulator into a module of its
   /// own, instantiated as `slr<g>`.
   LogicalResult extractGroups();
+  /// physical-domains: moves each class's tagged ops of `mod` (the
+  /// simulator or an SLR group's module) into a module of its own, nested as
+  /// the class tree.
+  LogicalResult extractDomains(hw::HWModuleOp mod, StringRef suffix);
   /// Whether a link from class `p` to class `c` crosses SLR groups: it is
   /// then registered on both sides and taken a host cycle later.
   bool crosses(int p, int c) const {
@@ -12751,6 +12760,17 @@ static void tagGroup(Operation *op, int group) {
                               IntegerType::get(op->getContext(), 32), group));
 }
 
+/// physical-domains: the class whose domain an op of the simulator is built
+/// in (its copy, controls, the links read into it), until `extractDomains`
+/// moves it there. The first tag wins.
+static constexpr StringLiteral kDomAttr = "foldsim.dom";
+
+static void tagDomain(Operation *op, int cls) {
+  if (cls >= 0 && !op->hasAttr(kDomAttr))
+    op->setAttr(kDomAttr, IntegerAttr::get(
+                              IntegerType::get(op->getContext(), 32), cls));
+}
+
 static Value asBits(ImplicitLocOpBuilder &b, Value value) {
   auto width = hw::getBitWidth(value.getType());
   return b.createOrFold<hw::BitcastOp>(b.getIntegerType(width), value);
@@ -21480,13 +21500,16 @@ LogicalResult StaticFolder::buildSim() {
   auto lastOp = [&]() -> Operation * {
     return body->empty() ? nullptr : &body->back();
   };
-  auto tagSince = [&](Operation *mark, int group) {
-    if (group < 0)
+  auto tagSince = [&](Operation *mark, int group, int cls = -1) {
+    int dom = physicalDomains ? cls : -1;
+    if (group < 0 && dom < 0)
       return;
     for (Operation *op = mark ? mark->getNextNode() : &body->front(); op;
          op = op->getNextNode())
-      if (!isa<hw::ConstantOp>(op))
+      if (!isa<hw::ConstantOp>(op)) {
         tagGroup(op, group);
+        tagDomain(op, dom);
+      }
   };
 
   // The frame's position three host cycles ahead: a slot, or `ii` between
@@ -21666,7 +21689,7 @@ LogicalResult StaticFolder::buildSim() {
           hw::ConstantOp::create(b, type, ii), hw::InnerSymAttr{},
           /*isAsync=*/false, b.getIntegerAttr(type, ii)));
       posCounters.addReg(sequencer[c], load);
-      tagSince(mark, controlGroup(c));
+      tagSince(mark, controlGroup(c), int(c));
     }
   }
   // Overlapped frames: a slot past the frame runs in the next frame's, for
@@ -22095,7 +22118,7 @@ LogicalResult StaticFolder::buildSim() {
         ctl.ppPrefSlot3 = byRank(pfSet, pfRank, pfSlotRow, pfValid, cls.ppSlotBits());
       }
     }
-    tagSince(controlMark, controlGroup(c));
+    tagSince(controlMark, controlGroup(c), int(c));
   }
 
   // The netlist's inputs: each token taken into a holding queue as it comes,
@@ -22758,6 +22781,8 @@ LogicalResult StaticFolder::buildSim() {
                                        operands);
     if (!slrOf.empty())
       tagGroup(copies[c], slrOf[c]);
+    if (physicalDomains)
+      tagDomain(copies[c], int(c));
   }
 
   // Groups of links, each with its own copy of its producer's controls and of
@@ -22977,11 +23002,15 @@ LogicalResult StaticFolder::buildSim() {
         if (!registered) {
           if (auto *op = data.getDefiningOp())
             tagGroup(op, slrOf[c]);
+          if (auto *op = data.getDefiningOp(); op && physicalDomains)
+            tagDomain(op, int(c));
           std::string crossName = producer.name + "_slr" + std::to_string(to) +
                                   "_" + std::to_string(low + at);
           if (serial <= 1) {
             registered = copyReg(data, crossName);
             tagGroup(registered.getDefiningOp(), slrOf[c]);
+            if (physicalDomains)
+              tagDomain(registered.getDefiningOp(), int(c));
           } else {
             // slr-serialize: the producer's group holds the bits of its
             // pass (host cycle T) and sends chunk j of them in a register
@@ -23027,8 +23056,11 @@ LogicalResult StaticFolder::buildSim() {
               next = comb::MuxOp::create(b, step[j + 1], chunk(hold, j), next);
             Value sent = copyReg(next, crossName);
             for (auto *op = mark->getNextNode(); op; op = op->getNextNode())
-              if (!isa<hw::ConstantOp>(op))
+              if (!isa<hw::ConstantOp>(op)) {
                 tagGroup(op, slrOf[c]);
+                if (physicalDomains)
+                  tagDomain(op, int(c));
+              }
             // The reader's side (tagged with the reader's group by the
             // input): chunk j shifted k - 1 - j times.
             SmallVector<Value> parts{sent};
@@ -24079,15 +24111,19 @@ LogicalResult StaticFolder::buildSim() {
     unsigned threads = cls.threads();
     int to = slrOf.empty() ? -1 : slrOf[c];
     // What this input builds is in its class's SLR group, but for the
-    // producers' registers of links from other groups.
+    // producers' registers of links from other groups (tagged before);
+    // physical-domains: in its class's domain likewise.
     Operation *mark = body->empty() ? nullptr : &body->back();
     llvm::scope_exit tagBuilt([&] {
-      if (to < 0)
+      if (to < 0 && !physicalDomains)
         return;
       for (auto *op = mark ? mark->getNextNode() : &body->front(); op;
            op = op->getNextNode())
-        if (!isa<hw::ConstantOp>(op))
+        if (!isa<hw::ConstantOp>(op)) {
           tagGroup(op, to);
+          if (physicalDomains)
+            tagDomain(op, int(c));
+        }
     });
     // A ghost of an element input: built by the element input.
     if (consumer.ghostOf >= 0)
@@ -25557,11 +25593,19 @@ LogicalResult StaticFolder::buildSim() {
       }
       lanes += box.lanes.size();
       banked += bank;
-      if (box.to >= 0)
+      // (physical-domains: a mailbox is its producer's output store, in its
+      // producer's domain: every lane has the same producer class.)
+      int boxDom = physicalDomains ? int(producers[box.lanes[0].producer].cls) : -1;
+      for (auto &lane : box.lanes)
+        if (int(producers[lane.producer].cls) != boxDom)
+          boxDom = -1;
+      if (box.to >= 0 || boxDom >= 0)
         for (auto *op = mark ? mark->getNextNode() : &body->front(); op;
              op = op->getNextNode())
-          if (!isa<hw::ConstantOp>(op))
+          if (!isa<hw::ConstantOp>(op)) {
             tagGroup(op, box.to);
+            tagDomain(op, boxDom);
+          }
     }
     llvm::raw_string_ostream os(mailboxReport);
     os << "  csf mailboxes: " << mailboxes.size() << " (" << banked
@@ -28839,6 +28883,223 @@ LogicalResult StaticFolder::extractGroups() {
   return success();
 }
 
+LogicalResult StaticFolder::extractDomains(hw::HWModuleOp mod, StringRef suffix) {
+  auto *context = top.getContext();
+  auto *body = mod.getBodyBlock();
+  // The classes whose copy is here: a copy instance (`<class>_copy`) tagged
+  // with its class. Ops tagged with a class whose copy is elsewhere (another
+  // SLR group's) stay in this module's own logic.
+  unsigned n = classes.size();
+  SmallVector<bool> present(n, false);
+  SmallVector<SmallVector<Operation *>> opsOf(n);
+  for (auto &op : body->without_terminator()) {
+    auto attr = op.getAttrOfType<IntegerAttr>(kDomAttr);
+    if (!attr)
+      continue;
+    int c = attr.getInt();
+    if (c < 0 || unsigned(c) >= n)
+      continue;
+    if (auto inst = dyn_cast<hw::InstanceOp>(op))
+      if (inst.getInstanceName() == classes[c].name + "_copy")
+        present[c] = true;
+  }
+  for (auto &op : body->without_terminator()) {
+    auto attr = op.getAttrOfType<IntegerAttr>(kDomAttr);
+    if (!attr)
+      continue;
+    op.removeAttr(kDomAttr);
+    int c = attr.getInt();
+    if (c >= 0 && unsigned(c) < n && present[c])
+      opsOf[c].push_back(&op);
+  }
+  // Each present class's domain parent: its nearest ancestor class present
+  // here (-1: a domain root of this module).
+  auto domParent = [&](unsigned c) -> int {
+    for (int a = classes[c].parent; a >= 0; a = classes[a].parent)
+      if (present[a])
+        return a;
+    return -1;
+  };
+  SmallVector<unsigned> order;
+  for (unsigned c = 0; c < n; ++c)
+    if (present[c])
+      order.push_back(c);
+  // Deepest first: a domain's children are modules before it is built.
+  llvm::stable_sort(order, [&](unsigned x, unsigned y) {
+    return classes[x].depth > classes[y].depth;
+  });
+  auto nameOf = [&](Value value) -> std::string {
+    if (auto *def = value.getDefiningOp()) {
+      if (auto name = def->getAttrOfType<StringAttr>("name"))
+        return name.getValue().str();
+      if (auto inst = dyn_cast<hw::InstanceOp>(def))
+        return (inst.getInstanceName() + "_" +
+                inst.getOutputName(cast<OpResult>(value).getResultNumber()).getValue())
+            .str();
+    } else if (auto arg = dyn_cast<BlockArgument>(value)) {
+      return mod.getInputName(arg.getArgNumber()).str();
+    }
+    return "";
+  };
+  // A boundary bit is registered when its source is a register, a memory's
+  // read, a constant or a port of the enclosing module: what crosses then
+  // leaves a flop (or a RAM's output) and meets no logic before the boundary.
+  auto registered = [&](Value v) -> bool {
+    auto *def = v.getDefiningOp();
+    if (!def)
+      return true;
+    return isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp,
+               seq::FirMemReadOp, hw::ConstantOp>(def);
+  };
+  llvm::raw_string_ostream rs(domainReport);
+  SmallVector<SmallVector<Operation *>> childInstances(n);
+  unsigned built = 0;
+  uint64_t allIn = 0, allOut = 0, unregIn = 0, unregOut = 0;
+  for (unsigned c : order) {
+    auto ops = opsOf[c];
+    ops.append(childInstances[c].begin(), childInstances[c].end());
+    DenseSet<Operation *> inSet(ops.begin(), ops.end());
+    SmallVector<Value> inputs, outputs;
+    DenseSet<Value> isInput;
+    SetVector<Operation *> constants;
+    for (auto *op : ops)
+      op->walk([&](Operation *inner) {
+        for (auto operand : inner->getOperands()) {
+          auto *def = operand.getDefiningOp();
+          // (Values defined inside an op of the domain, e.g. an always
+          // block's region, stay inside.)
+          if (def && (inSet.contains(def) ||
+                      llvm::any_of(ops, [&](Operation *o) {
+                        return o != def && o->isProperAncestor(def);
+                      })))
+            continue;
+          if (!def && operand.getParentBlock() != body)
+            continue;
+          if (def && isa<hw::ConstantOp>(def)) {
+            constants.insert(def);
+            continue;
+          }
+          if (isInput.insert(operand).second)
+            inputs.push_back(operand);
+        }
+      });
+    for (auto *op : ops)
+      for (auto result : op->getResults())
+        if (llvm::any_of(result.getUsers(), [&](Operation *user) {
+              Operation *u = user;
+              while (u && u->getBlock() != body)
+                u = u->getParentOp();
+              return !u || !inSet.contains(u);
+            }))
+          outputs.push_back(result);
+    uint64_t inBits = 0, outBits = 0, inUnreg = 0, outUnreg = 0;
+    for (auto v : inputs) {
+      uint64_t w = std::max<int64_t>(0, hw::getBitWidth(v.getType()));
+      inBits += w;
+      if (!registered(v))
+        inUnreg += w;
+    }
+    for (auto v : outputs) {
+      uint64_t w = std::max<int64_t>(0, hw::getBitWidth(v.getType()));
+      outBits += w;
+      if (!registered(v))
+        outUnreg += w;
+    }
+    SmallVector<hw::PortInfo> ports;
+    llvm::StringSet<> names;
+    auto addPort = [&](Value value, bool isIn, size_t argNum) {
+      std::string base = nameOf(value);
+      if (base.empty())
+        base = isIn ? "in" : "out";
+      std::string name = base;
+      for (unsigned k = 1; !names.insert(name).second; ++k)
+        name = base + "_" + std::to_string(k);
+      hw::PortInfo port;
+      port.name = StringAttr::get(context, name);
+      port.type = value.getType();
+      port.dir = isIn ? hw::ModulePort::Direction::Input
+                      : hw::ModulePort::Direction::Output;
+      port.argNum = argNum;
+      ports.push_back(port);
+    };
+    for (auto [i, value] : llvm::enumerate(inputs))
+      addPort(value, true, i);
+    for (auto [i, value] : llvm::enumerate(outputs))
+      addPort(value, false, i);
+    OpBuilder mb(mod);
+    auto module = hw::HWModuleOp::create(
+        mb, mod.getLoc(),
+        StringAttr::get(context, simName + "_dom_" + classes[c].name + suffix),
+        hw::ModulePortInfo(ports));
+    module.setPrivate();
+    auto *domBody = module.getBodyBlock();
+    domBody->getTerminator()->erase();
+    IRMapping map;
+    for (auto [value, arg] : llvm::zip(inputs, domBody->getArguments()))
+      map.map(value, arg);
+    OpBuilder gb = OpBuilder::atBlockEnd(domBody);
+    for (auto *constant : constants)
+      gb.clone(*constant, map);
+    SmallVector<Operation *> clones;
+    for (auto *op : ops)
+      clones.push_back(gb.clone(*op, map));
+    // A graph region: an operand may be defined further down.
+    for (auto *clone : clones)
+      clone->walk([&](Operation *inner) {
+        for (auto &operand : inner->getOpOperands())
+          if (auto mapped = map.lookupOrNull(operand.get()))
+            operand.set(mapped);
+      });
+    SmallVector<Value> results;
+    for (auto value : outputs)
+      results.push_back(map.lookup(value));
+    hw::OutputOp::create(gb, mod.getLoc(), results);
+    OpBuilder ib(body->getTerminator());
+    // (FOLDSIM_DOM_MUTANT=1, a test's mutant: the first domain built takes
+    // zeros for its first input wider than a bit -- a wrong boundary.)
+    SmallVector<Value> operands(inputs.begin(), inputs.end());
+    if (!built && getenv("FOLDSIM_DOM_MUTANT"))
+      for (auto &v : operands)
+        if (hw::getBitWidth(v.getType()) > 1 && isa<IntegerType>(v.getType())) {
+          v = hw::ConstantOp::create(ib, mod.getLoc(), v.getType(), 0);
+          break;
+        }
+    auto instance = hw::InstanceOp::create(
+        ib, mod.getLoc(), module,
+        StringAttr::get(context, "fs_dom_" + classes[c].name), operands);
+    for (auto [value, result] : llvm::zip(outputs, instance.getResults()))
+      value.replaceUsesWithIf(result, [&](OpOperand &use) {
+        Operation *u = use.getOwner();
+        while (u && u->getBlock() != body)
+          u = u->getParentOp();
+        return !u || !inSet.contains(u);
+      });
+    for (auto *op : ops)
+      op->dropAllUses();
+    for (auto *op : ops)
+      op->erase();
+    int dp = domParent(c);
+    if (dp >= 0)
+      childInstances[dp].push_back(instance);
+    ++built;
+    allIn += inBits;
+    allOut += outBits;
+    unregIn += inUnreg;
+    unregOut += outUnreg;
+    rs << "    domain " << classes[c].name << suffix << " (in "
+       << (dp >= 0 ? classes[dp].name : std::string(mod.getModuleName()))
+       << "): " << opsOf[c].size() << " ops, " << childInstances[c].size()
+       << " child domains; boundary in " << inBits << " bits (" << inUnreg
+       << " not from a register), out " << outBits << " bits (" << outUnreg
+       << " not from a register)\n";
+  }
+  rs << "  physical domains of " << mod.getModuleName() << ": " << built
+     << " domains, boundary in " << allIn << " bits (" << unregIn
+     << " not from a register), out " << allOut << " bits (" << unregOut
+     << " not from a register)\n";
+  return success();
+}
+
 LogicalResult StaticFolder::resolveEnvironment() {
   specOf.assign(producers.size(), -1);
   specSelect.assign(consumers.size(), -1);
@@ -29170,6 +29431,25 @@ LogicalResult StaticFolder::run() {
                  << " links' kinds of the plan, " << linkKindAsked[0] << " outside it (thresholds)\n";
   if (!slrOf.empty() && failed(extractGroups()))
     return failure();
+  if (physicalDomains) {
+    // Each SLR group's module (their own trees), then the simulator's.
+    SmallVector<hw::HWModuleOp> mods;
+    if (!slrOf.empty())
+      for (unsigned g = 0; g < slrGroups; ++g)
+        if (auto m = top.lookupSymbol<hw::HWModuleOp>((simName + "_slr" + Twine(g)).str()))
+          mods.push_back(m);
+    mods.push_back(simModule);
+    for (auto m : mods)
+      if (failed(extractDomains(m, "")))
+        return failure();
+    llvm::errs() << "foldsim-fold-static: physical-domains:\n" << domainReport;
+    if (!reportPath.empty()) {
+      std::error_code ec;
+      llvm::raw_fd_ostream file(reportPath, ec, llvm::sys::fs::OF_Append);
+      if (!ec)
+        file << "physical domains:\n" << domainReport;
+    }
+  }
   netlist.erase();
   for (auto *callee : inlined)
     callee->erase();
@@ -29274,6 +29554,7 @@ void FoldStaticPass::runOnOperation() {
   folder.slrGroupCut = slrGroupCut;
   gUramCascadeMax = uramCascadeMax;
   folder.slrGroupEnv = slrGroupEnv;
+  folder.physicalDomains = physicalDomains;
   folder.slrKept = std::max(1u, unsigned(slrKept));
   for (auto [spec, out, name] :
        {std::tuple{std::string(linkKindGroups), &folder.linkKindGroupCap, "link-kind-groups"},
