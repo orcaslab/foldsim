@@ -11,11 +11,6 @@
 #
 # fs_domain_roots: {SLR {root cell name suffix ...}} pairs, e.g. {SLR1 {foldsim_slr1/fs_dom_X foldsim_slr1/fs_dom_Y}}.
 
-proc fs_dom_tile_coord {site axis} {
-  set tl [lindex [get_tiles -quiet -of_objects $site] 0]
-  if {[regexp {_X(\d+)Y(\d+)$} $tl -> x y]} { return [expr {$axis eq "y" ? $y : $x}] }
-  return -1
-}
 
 # Each kind's sites in the SLR by tile column: dict kind -> dict x -> count; and per kind its sites by x for ranges.
 proc fs_dom_enclosing {cell} {
@@ -31,17 +26,29 @@ proc fs_dom_enclosing {cell} {
   return ""
 }
 
-# The SLR's sites of each kind (inside `parent`'s, when the domains sit in a pblock) by tile coordinate on `axis`.
+# The SLR's sites of each kind (inside `parent`'s, when the domains sit in a pblock) by coordinate on `axis` (the
+# sites' RPM grid, read in bulk: one coordinate system for every site kind).
 proc fs_dom_columns {slr axis parent} {
-  set inpb [dict create]
-  if {$parent ne ""} { foreach s [get_sites -quiet -of_objects $parent] { dict set inpb $s 1 } }
+  set prop [expr {$axis eq "y" ? "RPM_Y" : "RPM_X"}]
   set cols [dict create]
   foreach {kind pat} {lut SLICE* bram RAMB36* uram URAM288* dsp DSP*} {
     set by [dict create]
-    foreach s [get_sites -quiet -of_objects [get_slrs $slr] -filter "SITE_TYPE =~ $pat"] {
-      if {$parent ne "" && ![dict exists $inpb $s]} continue
-      set x [fs_dom_tile_coord $s $axis]
-      dict lappend by $x $s
+    set ss [get_sites -quiet -of_objects [get_slrs $slr] -filter "SITE_TYPE =~ $pat"]
+    if {[llength $ss]} {
+      # (inside a pblock: its sites of the kind within the SLR's rows -- an SLR is a band of rows)
+      set sites $ss
+      if {$parent ne ""} {
+        set ys [lsort -integer [get_property RPM_Y $ss]]
+        set lo [lindex $ys 0]; set hi [lindex $ys end]
+        set sites {}
+        set ps [get_sites -quiet -of_objects $parent -filter "SITE_TYPE =~ $pat"]
+        if {[llength $ps]} {
+          foreach s $ps y [get_property RPM_Y $ps] { if {$y >= $lo && $y <= $hi} { lappend sites $s } }
+        }
+      }
+      if {[llength $sites]} {
+        foreach s $sites x [get_property $prop $sites] { dict lappend by $x $s }
+      }
     }
     dict set cols $kind $by
   }
@@ -69,11 +76,21 @@ proc fs_dom_ranges {sites} {
 }
 
 proc fs_dom_demand {cell} {
-  set d [dict create]
-  dict set d lut [llength [get_cells -quiet -hierarchical -filter "NAME =~ $cell/* && PRIMITIVE_SUBGROUP == LUT"]]
-  dict set d bram [llength [get_cells -quiet -hierarchical -filter "NAME =~ $cell/* && PRIMITIVE_GROUP == BLOCKRAM && REF_NAME =~ RAMB36*"]]
-  dict set d uram [llength [get_cells -quiet -hierarchical -filter "NAME =~ $cell/* && REF_NAME =~ URAM288*"]]
-  dict set d dsp [llength [get_cells -quiet -hierarchical -filter "NAME =~ $cell/* && PRIMITIVE_GROUP == ARITHMETIC"]]
+  # One utilization report of the cell (a few seconds even on a full device); its LUT, RAMB36-equivalent, URAM and DSP
+  # rows. A row the report lacks counts the leaf cells instead.
+  set d [dict create lut 0 bram 0 uram 0 dsp 0]
+  set rpt [report_utilization -quiet -cells [get_cells $cell] -return_string]
+  set got 0
+  foreach {k re} {lut {\|\s*CLB LUTs\*?\s*\|\s*(\d+)} bram {\|\s*Block RAM Tile\s*\|\s*([\d.]+)}
+                  uram {\|\s*URAM\s*\|\s*(\d+)} dsp {\|\s*DSP[\w ]*\|\s*(\d+)}} {
+    if {[regexp $re $rpt -> v]} { dict set d $k [expr {int(ceil($v))}]; incr got }
+  }
+  if {$got == 0} {
+    dict set d lut [llength [get_cells -quiet -hierarchical -filter "NAME =~ $cell/* && PRIMITIVE_SUBGROUP == LUT"]]
+    dict set d bram [llength [get_cells -quiet -hierarchical -filter "NAME =~ $cell/* && REF_NAME =~ RAMB36*"]]
+    dict set d uram [llength [get_cells -quiet -hierarchical -filter "NAME =~ $cell/* && REF_NAME =~ URAM288*"]]
+    dict set d dsp [llength [get_cells -quiet -hierarchical -filter "NAME =~ $cell/* && PRIMITIVE_GROUP == ARITHMETIC"]]
+  }
   return $d
 }
 
@@ -124,27 +141,42 @@ proc fs_dom_stripes {slr cols cells xs parent {pcell ""}} {
   set cap [dict create lut 0 bram 0 uram 0 dsp 0]
   foreach x $xs { foreach k {lut bram uram dsp} {
     if {[dict exists [dict get $cols $k] $x]} { dict incr cap $k [llength [dict get [dict get $cols $k] $x]] } } }
+  # Each domain's need: its largest share of the base over the kinds it uses (a URAM-heavy domain needs as many rows
+  # as its URAM share, whatever its LUTs); the parent's own logic needs its own largest share. When the needs add up
+  # past the band (sites of one kind cluster in columns: a row band holds every kind in proportion), all shrink alike
+  # (soft pblocks: the placer may spill).
+  set need [dict create]; set sum 0.0
+  foreach r $cells {
+    set n 0.0
+    foreach k {lut bram uram dsp} {
+      set t [dict get $base $k]
+      if {$t > 0 && [dict get $cap $k] > 0} { set n [expr {max($n, double([dict get [dict get $dem $r] $k]) / $t)}] }
+    }
+    dict set need $r $n; set sum [expr {$sum + $n}]
+  }
+  if {$parent ne ""} {
+    set n 0.0
+    foreach k {lut bram uram dsp} {
+      set t [dict get $base $k]; set own $t
+      foreach r $cells { set own [expr {$own - [dict get [dict get $dem $r] $k]}] }
+      if {$t > 0 && [dict get $cap $k] > 0} { set n [expr {max($n, double(max(0, $own)) / $t)}] }
+    }
+    set sum [expr {$sum + $n}]
+  }
+  set scale [expr {$sum > 1.0 ? 1.0 / $sum : 1.0}]
   set i 0; set at 0; set nx [llength $xs]; set out {}
   foreach r $cells {
     incr i
-    if {$at >= $nx} { puts "CRITICAL WARNING: foldsim domain pblocks: no column left for $r"; break }
-    set have [dict create lut 0 bram 0 uram 0 dsp 0]
+    if {$at >= $nx} { puts "CRITICAL WARNING: foldsim domain pblocks: no row/column left for $r"; break }
+    set have 0
     set from $at
+    set want [expr {[dict get $need $r] * $scale * [dict get $cap lut]}]
     if {$i == [llength $cells] && $parent eq ""} { set at $nx } else {
       while {$at < $nx} {
         set x [lindex $xs $at]
-        foreach k {lut bram uram dsp} {
-          if {[dict exists [dict get $cols $k] $x]} { dict incr have $k [llength [dict get [dict get $cols $k] $x]] }
-        }
+        if {[dict exists [dict get $cols lut] $x]} { incr have [llength [dict get [dict get $cols lut] $x]] }
         incr at
-        set ok 1
-        foreach k {lut bram uram dsp} {
-          set t [dict get $base $k]
-          if {$t == 0} continue
-          set want [expr {double([dict get [dict get $dem $r] $k]) / $t * [dict get $cap $k]}]
-          if {[dict get $have $k] < $want} { set ok 0 }
-        }
-        if {$ok} break
+        if {$have >= $want} break
       }
     }
     lappend out [list $r [lrange $xs $from [expr {$at - 1}]] [dict get $dem $r]]
@@ -181,11 +213,13 @@ if {[info exists fs_domain_roots]} {
       if {[llength $c] != 1} { set c [get_cells -quiet -hierarchical -filter "NAME =~ */$r"] }
       if {[llength $c] == 1} { lappend cells $c } else { puts "CRITICAL WARNING: foldsim domain $r: [llength $c] cells" }
     }
+    puts "INFO: foldsim domain pblocks: $slr: [llength $cells] root domains, sites by [expr {[info exists fs_domain_axis] ? $fs_domain_axis : "x"}] ([clock format [clock seconds] -format %T])"
     set cols [fs_dom_columns $slr [expr {[info exists fs_domain_axis] ? $fs_domain_axis : "x"}] \
                   [expr {[llength $cells] ? [fs_dom_enclosing [lindex $cells 0]] : ""}]]
     set xs {}
     foreach kind {lut bram uram dsp} { foreach x [dict keys [dict get $cols $kind]] { if {$x >= 0} { lappend xs $x } } }
     set xs [lsort -integer -unique $xs]
+    puts "INFO: foldsim domain pblocks: $slr: sites read ([clock format [clock seconds] -format %T])"
     # a single root: striped inside (its children), else the roots side by side
     if {[llength $cells] == 1} {
       set kids [get_cells -quiet [lindex $cells 0]/fs_dom_*]
