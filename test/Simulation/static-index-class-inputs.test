@@ -49,6 +49,11 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/spg -DSPEC -Mdir %t/spg/obj %S/Inputs/tb_ports.sv top.sv %t/spg/foldsim_sim.sv > %t/spg/build.log 2>&1
 # RUN: %t/spg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s --check-prefix=G1
 # RUN: %t/spg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=G3
+# Without rows in SLR groups: the frame's registers (the level's) chosen in the reading group; every group input registered.
+# RUN: foldsim --srcs top.f --top Top --out %t/pg --static --nest --modulo --spec-groups mp_0_ack=mp_0_rvalid:mp_0_rdata,mp_1_ack=mp_1_rvalid:mp_1_rdata,mp_2_ack=mp_2_rvalid:mp_2_rdata,mp_3_ack=mp_3_rvalid:mp_3_rdata --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --index-class-inputs --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2,Arb:1 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env Unit Arb > %t/pg.log 2>&1
+# RUN: FileCheck %s --check-prefix=PLOG < %t/pg.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/pg -DSPEC -Mdir %t/pg/obj %S/Inputs/tb_ports.sv top.sv %t/pg/foldsim_sim.sv > %t/pg/build.log 2>&1
+# RUN: %t/pg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=G3
 # RUN: foldsim --srcs top.f --top Top --out %t/bu --static --nest --modulo --bubbles --direct-outputs --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --fold-ports-rows --index-class-inputs Unit Arb > %t/bu.log 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/bu -DBUBBLES -Mdir %t/bu/obj %S/Inputs/tb_ports.sv top.sv %t/bu/foldsim_sim.sv > %t/bu/build.log 2>&1
 # RUN: %t/bu/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 +bubble=30 | FileCheck %s
