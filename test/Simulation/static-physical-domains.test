@@ -59,6 +59,14 @@
 # RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gflat --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env > %t/gflat.log 2>&1
 # RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gdom --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --physical-domains > %t/gdom.log 2>&1
 # RUN: FileCheck %s --check-prefix=GLOG < %t/gdom.log
+# --domain-pblocks: each SLR group's root domains for flow/v80/domain_pblocks.tcl (the
+# region's SLR names: group g on the region's g-th SLR).
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gpb --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --physical-domains --domain-pblocks > %t/gpb.log 2>&1
+# RUN: FileCheck %s --check-prefix=PB < %t/gpb/foldsim_domain_pblocks.tcl
+# PB: set fs_domain_roots {
+# PB-DAG: SLR2 {foldsim_slr0/fs_dom_Core_model}
+# PB-DAG: SLR1 {foldsim_slr1/fs_dom_Sm_model}
+# PB-DAG: SLR0 {foldsim_slr2/fs_dom_Top_model}
 # RUN: FileCheck %s --check-prefix=GJSON < %t/gdom/foldsim_domains.json
 # GJSON-DAG: "path": "foldsim_slr0/fs_dom_Core_model/fs_dom_Alu"
 # GJSON-DAG: "path": "foldsim_slr1/fs_dom_Sm_model/fs_dom_L1"
