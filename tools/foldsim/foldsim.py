@@ -1027,6 +1027,14 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
     if over:
         sys.exit(f'--state auto: copies past the per-copy budget ({policy}): {", ".join(over)}; '
                  f'see {out("state.txt")}')
+    # The virtual memories' host caches at the budget the choice was priced
+    # with (it halves the caches where they would make the choice miss).
+    used = res['res'].get('vmem_cache_budget')
+    if used is not None and vmem and used != a.vmem_cache_budget:
+        print(f'foldsim: state auto: the virtual memories\' host caches within {used} RAMB36 '
+              f'(of --vmem-cache-budget {a.vmem_cache_budget}): more would miss the region or the router',
+              file=sys.stderr)
+        a.vmem_cache_budget = used
     h = res['h']
     print(f"foldsim: state auto: frame {res['frame']} (II {ii}), H at most {h['h']}; page "
           f"{len(res['page'].split(',')) if res['page'] else 0} models, {len(res['rows_new'])} "

@@ -733,15 +733,29 @@ def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fi
                            slrs, cache, tiers)
         if tiers is not None and res.get('vmem_new') and vmem:
             # The host caches of the memories it moved off chip: priced again
-            # with them in the base (their lines are block RAM).
-            more = vmem_bram(split_virtual(est, tiers_pattern(res['vmem_new'])), classes,
-                             degree, vmem, vg, rbm)
-            if more > cache:
-                cache = more
+            # with them in the base (their lines are block RAM). The caches are
+            # a speed-up, not state: where they make the choice miss the region
+            # or the router (32 SMs, a32-S26X 11-14: 120 RAMB36 of caches turned
+            # the one choice that routes into one that does not, so every frame
+            # was refused), their budget halves, down to none -- the choice
+            # without caches, which the first pricing already found.
+            first, budget = res, vmem[1]
+            vms = split_virtual(est, tiers_pattern(res['vmem_new']))
+            while True:
+                more = vmem_bram(vms, classes, degree, (vmem[0], budget), vg, rbm)
+                if more <= cache:
+                    res = first
+                    break
                 res = storage_area(cal, est, classes, degree, rest, sched, ii, entries, route,
-                                   uram, slrs, cache, dict(tiers, force=res['vmem_new'],
-                                                           force_pages=res['pages_offchip'],
-                                                           force_rows=res['rows_new']))
+                                   uram, slrs, more, dict(tiers, force=first['vmem_new'],
+                                                          force_pages=first['pages_offchip'],
+                                                          force_rows=first['rows_new']))
+                if res.get('fits') and (not route or storage.fold_congestion(
+                        res['luts'], res['bram'], res.get('uram', 0), slrs) <= storage.ROUTE_LIMIT):
+                    cache = more
+                    break
+                budget = budget // 2 if budget > 1 else 0
+            res['vmem_cache_budget'] = budget
     else:
         res = fixed_area(cal, est, classes, degree, rest, sched, ii, entries, cache)
     if cache:

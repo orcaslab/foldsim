@@ -30,6 +30,10 @@
 # CHECK: onchip-first False: ['hbm']
 # CHECK: onchip-only first True: ['distributed']
 # CHECK: onchip-only first False: ['distributed']
+# The host caches shrink (budget halved) until the choice fits, down to none.
+# CHECK: caches within 20: budget 30 fits True bram 15.0
+# CHECK: caches within 100: budget 120 fits True bram 60.0
+# CHECK: caches within 0: budget 0 fits True bram 0.0
 # CHECK: fit {'copy_logic': 1.323, 'copy_lutram': 1.5, 'level': 1.225, 'kernel_logic': 450, 'kernel_lutram': 50}
 # Through the driver (Inputs/paged, four leaves): within 0.1 % of SLR0 (256
 # LUTs) the leaves' register stores from 8 bits go to block RAM; the copy as

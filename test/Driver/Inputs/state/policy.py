@@ -141,3 +141,20 @@ hier = dict(A_copy=dict(lut=550, lutram=150, ff=0), B_copy=dict(lut=260, lutram=
             sim=dict(lut=1300, lutram=300, ff=0), top_wrapper=dict(lut=1800, lutram=350, ff=0))
 cal, rows = d.state_fit(state, hier)
 print('fit', {k: cal[k] for k in ('copy_logic', 'copy_lutram', 'level', 'kernel_logic', 'kernel_lutram')})
+
+# The virtual memories' host caches (--vmem-cache-rows auto) are a speed-up, not state: where a choice with them misses
+# the region, their budget halves down to none (32 SMs, 11-14: 120 RAMB36 of caches made the one routable choice
+# unroutable and every frame was refused). Stubs: the caches take half their budget in RAMB36; a choice fits with at
+# most `room` RAMB36 of caches.
+saved = (d.storage_area, d.vmem_bram, d.split_virtual, d.tiers_pattern)
+first_est = {}
+def stub_cache(vms, classes, degree, vmem, vg=None, rbm=1):
+    return 0.0 if vms is first_est or not vmem else vmem[1] / 2
+d.vmem_bram, d.split_virtual, d.tiers_pattern = stub_cache, (lambda est, pat: ['vm']), (lambda new: 'p')
+for room in (20, 100, 0):
+    def stub_area(cal, est, classes, degree, rest, sched, ii, entries, route, uram, slrs, cache, tiers, room=room):
+        return dict(fits=cache <= room, vmem_new=['m'], pages_offchip=[], rows_new=[], luts=1, bram=cache, uram=0)
+    d.storage_area = stub_area
+    r = d.area({}, first_est, {}, {}, 0, None, 1, 2, 'auto', False, True, False, ('auto', 120), {})
+    print(f"caches within {room}: budget {r['vmem_cache_budget']} fits {r['fits']} bram {r['bram']}")
+d.storage_area, d.vmem_bram, d.split_virtual, d.tiers_pattern = saved
