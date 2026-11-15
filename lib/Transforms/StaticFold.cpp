@@ -21988,11 +21988,9 @@ LogicalResult StaticFolder::buildSim() {
       return netlist.emitError("fold-ports-rows: needs a frame of at least 4 "
                                "host cycles (II ")
              << ii << ")";
-    for (unsigned port = 0; port < pf.ports; ++port)
-      for (unsigned p : pf.rspOf[port])
-        if (specOf[p] >= 0)
-          return netlist.emitError("fold-ports-rows: input '")
-                 << producers[p].name << "' is in a spec group";
+    // (A field in a spec group -- its environment offers a token for each
+    // value of the group's select -- keeps every offered value in its row;
+    // the frame's read picks the one its group's select chose, below.)
     unsigned cw = pf.chanWidth;
     rowsAddrWidth = cw + 2;
     Value chan = body->getArgument(rspPort + 1);
@@ -22210,10 +22208,63 @@ LogicalResult StaticFolder::buildSim() {
         b, rowsTail1(c),
         comb::SubOp::create(b, rowsFrameNext, constant(2, 1)), rowsFrameNext);
   };
+  // fold-ports-rows with spec groups: each group's select index as the
+  // frame loaded then has it (a host cycle ahead, as rowsFrameNext), and the
+  // frame's before (a slot past the frame reads that one's row).
+  // (Also the index of the frame loaded now, for reads at rowsFrame.)
+  struct RowsIndex {
+    Value frameNext, prevNext, frame;
+  };
+  DenseMap<unsigned, RowsIndex> rowsIndexOf;
+  auto rowsIndex = [&](unsigned g) -> RowsIndex & {
+    auto &e = rowsIndexOf[g];
+    if (!e.frameNext) {
+      Type t = groupIndex[g].getType();
+      auto frameNext = backedges.get(t), prevNext = backedges.get(t);
+      Value frame = reg(frameNext, "ports_rows_index" + Twine(g));
+      Value prev = reg(prevNext, "ports_rows_index_prev" + Twine(g));
+      Value fn = comb::MuxOp::create(b, load, groupIndex[g], frame);
+      Value pn = comb::MuxOp::create(b, load, frame, prev);
+      frameNext.setValue(fn);
+      prevNext.setValue(pn);
+      e = {fn, pn, frame};
+    }
+    return e;
+  };
+  auto rowsIndexFor = [&](unsigned g) -> std::pair<Value, Value> {
+    auto &e = rowsIndex(g);
+    return {e.frameNext, e.prevNext};
+  };
+  // The offered value a spec group's select chose, of a row of every value.
+  auto specPick = [&](unsigned p, Value all, Value index) -> Value {
+    unsigned w = producers[p].width;
+    SmallVector<Value> values;
+    for (unsigned v = specValues(); v-- > 0;)
+      values.push_back(comb::ExtractOp::create(b, b.getIntegerType(w), all, v * w));
+    if (specDepth == 1)
+      return comb::MuxOp::create(b, index, values[0], values[1]);
+    return hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, values), index);
+  };
+  // fold-ports-rows: a folded input's value in the frame loaded now (what
+  // frameInput holds otherwise): its row at rowsFrame, the offered value its
+  // spec group chose.
+  auto rowsFrameValue = [&](unsigned p) -> Value {
+    Value all = rowsRead(p, constant(pf.chanWidth, pf.producerPort[p]), rowsFrame);
+    return specOf[p] < 0 ? all : specPick(p, all, rowsIndex(specOf[p]).frame);
+  };
   auto frameInputFor = [&](unsigned p, unsigned c) -> Value {
-    if (portRows && folded(p))
-      return rowsRead(p, constant(pf.chanWidth, pf.producerPort[p]),
-                      rowsRowFor(c));
+    if (portRows && folded(p)) {
+      Value all = rowsRead(p, constant(pf.chanWidth, pf.producerPort[p]),
+                           rowsRowFor(c));
+      if (specOf[p] < 0)
+        return all;
+      auto [indexFrame, indexPrev] = rowsIndexFor(specOf[p]);
+      Value index = readCtl(c).tail2
+                        ? Value(comb::MuxOp::create(b, rowsTail1(c), indexPrev,
+                                                    indexFrame))
+                        : indexFrame;
+      return specPick(p, all, index);
+    }
     if (!readCtl(c).tail2)
       return frameInputNext[p];
     // One per SLR group, in the group.
@@ -24719,10 +24770,35 @@ LogicalResult StaticFolder::buildSim() {
           rows[i] = pf.producerPort[sourceOf[i].first];
         Value bundle = copyReg(table(b, ctl.inst2, rows, pf.chanWidth),
                                consumer.name + "_bundle" + Twine(at));
-        data = b.createOrFold<comb::ExtractOp>(
-            b.getIntegerType(width),
-            rowsRead(first.first, bundle, rowsRowFor(c)),
-            first.second);
+        Value row = rowsRead(first.first, bundle, rowsRowFor(c));
+        if (specOf[first.first] >= 0) {
+          // Each bundle's field in its own spec group: the read bundle's
+          // group index picks the offered value its select chose.
+          unsigned field = pf.producerField[first.first];
+          SmallVector<Value> nows, prevs;
+          for (unsigned port = (1u << pf.chanWidth); port-- > 0;) {
+            int g = -1;
+            if (port < pf.ports)
+              for (unsigned q : pf.rspOf[port])
+                if (pf.producerField[q] == field)
+                  g = specOf[q];
+            if (g < 0)
+              g = specOf[first.first];
+            auto [now, prev] = rowsIndexFor(unsigned(g));
+            nows.push_back(now);
+            prevs.push_back(prev);
+          }
+          Value index = hw::ArrayGetOp::create(
+              b, hw::ArrayCreateOp::create(b, nows), bundle);
+          if (readCtl(c).tail2)
+            index = comb::MuxOp::create(
+                b, rowsTail1(c),
+                hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, prevs), bundle),
+                index);
+          row = specPick(first.first, row, index);
+        }
+        data = b.createOrFold<comb::ExtractOp>(b.getIntegerType(width), row,
+                                               first.second);
       } else if (sources.size() > 1) {
         SmallVector<uint64_t> rows(threads, 0);
         for (unsigned i = 0; i < threads; ++i)
@@ -25142,7 +25218,11 @@ LogicalResult StaticFolder::buildSim() {
   for (auto [k, consumer] : llvm::enumerate(consumers)) {
     if (consumer.cls >= 0)
       continue;
-    if (portRowsReq && foldedOut(k))
+    // (With fold-ports-rows a folded output is built with the request rows
+    // below; a spec group's select output is also read here, for its
+    // group's select register alone.)
+    bool selectOnly = portRowsReq && foldedOut(k);
+    if (selectOnly && specSelect[k] < 0)
       continue;
     SmallVector<Value> bits;
     for (auto &piece : consumer.pieces[0]) {
@@ -25153,10 +25233,7 @@ LogicalResult StaticFolder::buildSim() {
       auto &producer = producers[piece.producer];
       if (producer.cls < 0) {
         Value in = portRows && folded(piece.producer)
-                       ? rowsRead(piece.producer,
-                                  constant(pf.chanWidth,
-                                           pf.producerPort[piece.producer]),
-                                  rowsFrame)
+                       ? rowsFrameValue(piece.producer)
                        : frameInput[piece.producer];
         bits.push_back(b.createOrFold<comb::ExtractOp>(
             b.getIntegerType(piece.width), in, piece.low));
@@ -25194,9 +25271,12 @@ LogicalResult StaticFolder::buildSim() {
       auto selNext = backedges.get(i1);
       Value sel = resetReg(selNext, consumer.name + "_select", 0);
       selNext.setValue(comb::MuxOp::create(b, push, data, sel));
+      unsigned v = specGroups[g].valid;
       groupSelect[g].setValue(comb::AndOp::create(
-          b, frameInput[specGroups[g].valid], sel));
+          b, portRows && folded(v) ? rowsFrameValue(v) : frameInput[v], sel));
     }
+    if (selectOnly)
+      continue;
     Value readyIn = foldedOut(k) ? Value(reqSent[pf.consumerPort[k]])
                                  : body->getArgument(outputReady[k]);
     uint64_t initCount = outputEarly[k] ? 1 : 0;
