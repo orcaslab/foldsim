@@ -4,8 +4,9 @@
 # domain's share of the SLR's sites of every kind it uses (LUT, block RAM, ultra RAM, DSP), measured on the open
 # synthesized design; a domain with child domains is striped again inside its own stripe (nested pblocks, as the
 # domains nest). Soft pblocks: the placer may spill a cell
-# rather than fail. Sourced after floorplan.tcl (the groups' USER_SLR_ASSIGNMENT) by ooc.tcl / pre_opt_hook.tcl when
-# FOLDSIM_DOMAIN_PBLOCKS names the driver's foldsim_domain_pblocks.tcl (the data: fs_domain_roots).
+# rather than fail. The driver appends this file, after its data (fs_domain_roots), to the gen's foldsim_floorplan.tcl,
+# which the flows source after the groups' USER_SLR_ASSIGNMENT (ooc.tcl, pre_opt_hook.tcl): no flow change. Alone it
+# reads the data from FOLDSIM_DOMAIN_PBLOCKS (the driver's foldsim_domain_pblocks.tcl).
 #
 # fs_domain_roots: {SLR {root cell name suffix ...}} pairs, e.g. {SLR1 {foldsim_slr1/fs_dom_X foldsim_slr1/fs_dom_Y}}.
 
@@ -43,13 +44,20 @@ proc fs_dom_demand {cell} {
 # share of the parent's stripe and the parent's own logic the rest (at the right). A domain with two or more child
 # domains (fs_dom_* instances) is striped again inside its own stripe: the pblocks nest as the domains do.
 proc fs_dom_stripes {slr cols cells xs parent} {
-  global fs_dom_k
+  global fs_dom_k fs_dom_min_lut
   set dem [dict create]; set tot [dict create lut 0 bram 0 uram 0 dsp 0]
+  set big {}
   foreach r $cells {
     set d [fs_dom_demand $r]
+    # (a domain below the least stripe, FOLDSIM_DOMAIN_MIN_LUT LUTs, stays in its parent's area: a stripe a column
+    # wide and the SLR high is the wrong shape for it)
+    if {[dict get $d lut] < $fs_dom_min_lut && $parent ne ""} continue
+    lappend big $r
     dict set dem $r $d
     foreach k {lut bram uram dsp} { dict incr tot $k [dict get $d $k] }
   }
+  set cells $big
+  if {[llength $cells] < ($parent eq "" ? 2 : 1)} return
   # the share base: the parent's demand (its own logic keeps the rest of its stripe), else the siblings' total
   set base [expr {$parent eq "" ? $tot : $parent}]
   set cap [dict create lut 0 bram 0 uram 0 dsp 0]
@@ -104,8 +112,11 @@ proc fs_dom_stripes {slr cols cells xs parent} {
 }
 
 set fs_dom_k 0
-if {[info exists ::env(FOLDSIM_DOMAIN_PBLOCKS)] && $::env(FOLDSIM_DOMAIN_PBLOCKS) ne ""} {
+set fs_dom_min_lut [expr {[info exists ::env(FOLDSIM_DOMAIN_MIN_LUT)] ? $::env(FOLDSIM_DOMAIN_MIN_LUT) : 20000}]
+if {[info exists ::env(FOLDSIM_DOMAIN_PBLOCKS)] && $::env(FOLDSIM_DOMAIN_PBLOCKS) ne "" && ![info exists fs_domain_roots]} {
   source $::env(FOLDSIM_DOMAIN_PBLOCKS)
+}
+if {[info exists fs_domain_roots]} {
   foreach {slr roots} $fs_domain_roots {
     set cells {}
     foreach r $roots {

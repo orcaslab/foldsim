@@ -67,6 +67,14 @@
 # PB-DAG: SLR2 {foldsim_slr0/fs_dom_Core_model}
 # PB-DAG: SLR1 {foldsim_slr1/fs_dom_Sm_model}
 # PB-DAG: SLR0 {foldsim_slr2/fs_dom_Top_model}
+# The gen's floorplan (sourced by the flows after the groups' assignments) carries
+# them: the data and the procedures that apply it.
+# RUN: FileCheck %s --check-prefix=FP < %t/gpb/foldsim_floorplan.tcl
+# FP: USER_SLR_ASSIGNMENT
+# FP: # Physical domains as nested soft pblocks (--domain-pblocks).
+# FP: set fs_domain_roots {
+# FP: proc fs_dom_stripes
+# FP: if {[info exists fs_domain_roots]} {
 # RUN: FileCheck %s --check-prefix=GJSON < %t/gdom/foldsim_domains.json
 # GJSON-DAG: "path": "foldsim_slr0/fs_dom_Core_model/fs_dom_Alu"
 # GJSON-DAG: "path": "foldsim_slr1/fs_dom_Sm_model/fs_dom_L1"

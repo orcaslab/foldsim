@@ -3313,6 +3313,13 @@ def main():
         if getattr(a, 'domain_pblocks', False):
             names = [n for n, _ in slr_region_capacities(a.slr_region)] if a.slr_region else None
             k = write_domain_pblocks(doms, names, out('foldsim_domain_pblocks.tcl'))
+            # (the floorplan the flows source carries them: the data, then the Tcl that applies it)
+            if k and os.path.exists(out('foldsim_floorplan.tcl')):
+                tcl = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'flow', 'v80', 'domain_pblocks.tcl')
+                with open(out('foldsim_floorplan.tcl'), 'a') as f:
+                    f.write('# Physical domains as nested soft pblocks (--domain-pblocks).\n')
+                    f.write(open(out('foldsim_domain_pblocks.tcl')).read())
+                    f.write(open(tcl).read())
             print(f'foldsim: domain pblocks: {k} SLR groups striped ({out("foldsim_domain_pblocks.tcl")})', file=sys.stderr)
 
     threads = re.search(r'foldsim\.threads = \[(.*?)\]', sim_text).group(1)
