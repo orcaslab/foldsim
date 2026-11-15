@@ -24018,6 +24018,9 @@ LogicalResult StaticFolder::buildSim() {
     return box.lanes.back().out;
   };
 
+  // Element inputs' link reads of a single-instance producer, by (producer,
+  // low, width, reader class): one link for all of a class's element inputs.
+  std::map<std::tuple<unsigned, unsigned, unsigned, unsigned>, Value> indexLinkReads;
   // Each model input: its pieces at positions common to every instance; at
   // each, the sources the instances take it from, each read at the slot's
   // instance's producer instance, chosen by the instance, into the read
@@ -24189,12 +24192,19 @@ LogicalResult StaticFolder::buildSim() {
           continue;
         }
         // Each instance's source at each index: a constant (by value), a
-        // frame input's bits, or a class output's link (by producer port
-        // and bits, with the producer instance read).
+        // frame input's bits, or a class output's bits (by producer port and
+        // bits). A producer port's bits are read from one link of the span
+        // they cover (its entry the producer instance the instance and the
+        // index name), the bits then chosen: one link per port and reader,
+        // shared by the class's element inputs where it has one instance.
         SmallVector<Value> values;
         std::map<std::string, unsigned> constIndex;
         std::map<std::pair<unsigned, unsigned>, unsigned> frameIndex, linkIndex;
-        std::map<std::pair<unsigned, unsigned>, SmallVector<SmallVector<uint64_t>>> linkRows;
+        struct PortRead {
+          unsigned lo = ~0u, hi = 0;
+          SmallVector<SmallVector<uint64_t>> rows;
+        };
+        std::map<unsigned, PortRead> portReads;
         SmallVector<SmallVector<uint64_t>> sel(all.size(), SmallVector<uint64_t>(n, 0));
         bool anyFrame = false, anyLink = false;
         for (unsigned i = 0; i < all.size(); ++i)
@@ -24220,25 +24230,43 @@ LogicalResult StaticFolder::buildSim() {
               continue;
             }
             auto [it, fresh] = linkIndex.try_emplace({p, low}, values.size());
-            if (fresh) {
+            if (fresh)
               values.push_back(Value());
-              linkRows[{p, low}].assign(all.size(), SmallVector<uint64_t>(n, 0));
-            }
-            linkRows[{p, low}][i][e] = x->inst;
+            auto &pr = portReads[p];
+            if (pr.rows.empty())
+              pr.rows.assign(all.size(), SmallVector<uint64_t>(n, 0));
+            pr.lo = std::min(pr.lo, low);
+            pr.hi = std::max(pr.hi, low + width);
+            pr.rows[i][e] = x->inst;
             sel[i][e] = it->second;
             anyLink = true;
           }
-        for (auto &[key, idx] : linkIndex) {
-          auto [p, low] = key;
+        for (auto &[p, pr] : portReads) {
           auto &producer = producers[p];
           unsigned pThreads = classes[producer.cls].threads();
-          Value address;
-          if (pThreads > 1)
-            address = table2(linkRows[key], llvm::Log2_32_Ceil(pThreads));
-          values[idx] = linkRead(
-              p, low, width, [&]() { return address; }, bank,
-              producer.name + "_to_" + consumer.name + "_ix" + Twine(at), to);
-          ++indexedLinks;
+          Value word;
+          std::tuple<unsigned, unsigned, unsigned, unsigned> cacheKey{
+              p, pr.lo, pr.hi - pr.lo, c};
+          if (pThreads <= 1)
+            if (auto hit = indexLinkReads.find(cacheKey); hit != indexLinkReads.end())
+              word = hit->second;
+          if (!word) {
+            Value address;
+            if (pThreads > 1)
+              address = table2(pr.rows, llvm::Log2_32_Ceil(pThreads));
+            word = linkRead(p, pr.lo, pr.hi - pr.lo, [&]() { return address; },
+                            bank,
+                            producer.name + "_to_" + consumer.name + "_ix" +
+                                Twine(at),
+                            to);
+            ++indexedLinks;
+            if (pThreads <= 1)
+              indexLinkReads[cacheKey] = word;
+          }
+          for (auto &[key, idx] : linkIndex)
+            if (key.first == p)
+              values[idx] = b.createOrFold<comb::ExtractOp>(
+                  b.getIntegerType(width), word, key.second - pr.lo);
         }
         if (values.size() == 1) {
           segments.push_back(values[0]);

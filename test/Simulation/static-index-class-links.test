@@ -18,7 +18,7 @@
 # RUN: foldsim --srcs top_links.f --top Top --out %t/k --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --index-class-inputs --index-class-links Unit Arb > %t/k.log 2>&1
 # RUN: FileCheck %s --check-prefix=KLOG < %t/k.log
 # KLOG: foldsim-index-class-inputs: Arb.data_in: 4 x 17 b read at 2 index(es), 6 instance(s)
-# KLOG: indexed inputs 2 (0 rows, 0 tables, 4 choices, 22 link reads)
+# KLOG: indexed inputs 2 (0 rows, 0 tables, 4 choices, 8 link reads)
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/k -Mdir %t/k/obj %S/Inputs/tb_ports.sv top_links.sv %t/k/foldsim_sim.sv > %t/k/build.log 2>&1
 # RUN: %t/k/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +lo=1 +hi=1 | FileCheck %s --check-prefix=S1
 # RUN: %t/k/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s --check-prefix=S2
