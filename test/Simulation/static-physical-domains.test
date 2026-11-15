@@ -72,9 +72,10 @@
 # down to SLR0's Top and L2).
 # PB: set fs_domain_axis y
 # PB: set fs_domain_affinity {
-# PB: set fs_domain_adapters {
 # PB-DAG: foldsim_slr0/fs_dom_Core_model -{{[1-9][0-9]*}}
 # PB-DAG: foldsim_slr2/fs_dom_Top_model {{[1-9][0-9]*}}
+# The class's memory adapters (none here) after them.
+# PB: set fs_domain_adapters {
 # The gen's floorplan (sourced by the flows after the groups' assignments) carries
 # them: the data and the procedures that apply it.
 # RUN: FileCheck %s --check-prefix=FP < %t/gpb/foldsim_floorplan.tcl
