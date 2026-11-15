@@ -1624,6 +1624,32 @@ def write_slr_groups(sv, path, names=None):
                     f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT {where} $c }}\n')
 
 
+def domain_tree(sv):
+    """--physical-domains: the simulator's domain tree from its Verilog: [{'class', 'path' (instance path below
+    foldsim_sim), 'parent' (the enclosing domain's class or None), 'module' (the enclosing module: foldsim_sim or an SLR
+    group's foldsim_sim_slr<g>), 'group' (g or None), 'copies' (the class copies it instantiates)}], parents first."""
+    mods = {}
+    for m in re.finditer(r'^module (\w+)\((.*?)^endmodule', sv, re.M | re.S):
+        mods[m.group(1)] = m.group(2)
+    def insts(name):
+        return re.findall(r'^\s+(\w+) (\w+) \(', mods.get(name, ''), re.M)
+    out = []
+    def walk(module, prefix, parent, top, group):
+        for mt, inst in insts(module):
+            if mt.startswith('foldsim_sim_dom_'):
+                cls = mt[len('foldsim_sim_dom_'):]
+                copies = [i[:-len('_copy')] for t, i in insts(mt) if i.endswith('_copy')]
+                out.append({'class': cls, 'path': prefix + inst, 'parent': parent, 'module': top, 'group': group,
+                            'copies': copies})
+                walk(mt, prefix + inst + '/', cls, top, group)
+    walk('foldsim_sim', '', None, 'foldsim_sim', None)
+    for mt, inst in insts('foldsim_sim'):
+        m = re.match(r'foldsim_slr(\d+)$', inst)
+        if m:
+            walk(mt, inst + '/', None, mt, int(m.group(1)))
+    return out
+
+
 # An AXI4 device-memory master's wires (512-bit data, 64-bit address, 8-bit
 # IDs) where the region gives none (its noc section's master_bits).
 VMEM_MASTER_BITS = 1290
@@ -3254,6 +3280,12 @@ def main():
             write_slr_memory_ports(out('foldsim_sp.txt'), a.slr_region, names, ngroups, level)
     if split_plan:
         write_slr_split(split_plan, out('foldsim_floorplan.tcl'))
+    if getattr(a, 'physical_domains', False):
+        doms = domain_tree(open(out('foldsim_sim.sv')).read())
+        with open(out('foldsim_domains.json'), 'w') as f:
+            json.dump({'domains': doms}, f, indent=1)
+        print(f'foldsim: physical domains: {len(doms)} ({sum(d["parent"] is None for d in doms)} roots) in '
+              f'{out("foldsim_domains.json")}', file=sys.stderr)
 
     threads = re.search(r'foldsim\.threads = \[(.*?)\]', sim_text).group(1)
     info = {

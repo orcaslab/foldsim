@@ -18,6 +18,10 @@
 # LOG-DAG: domain L2 (in Top_model): {{[0-9]+}} ops, 0 child domains
 # LOG-DAG: domain Top_model (in foldsim_sim): {{[0-9]+}} ops, 2 child domains
 # LOG: physical domains of foldsim_sim: 7 domains
+# The driver's domain tree (foldsim_domains.json): seven domains, one root.
+# RUN: FileCheck %s --check-prefix=JSON < %t/dom/foldsim_domains.json
+# JSON-DAG: "path": "fs_dom_Top_model/fs_dom_Sm_model/fs_dom_Core_model/fs_dom_Alu"
+# JSON-DAG: "path": "fs_dom_Top_model/fs_dom_L2"
 # The nesting in the Verilog: Top's domain instantiates Sm's and L2's, Sm's
 # the core's, the LSU's and the L1's; the simulator only Top's.
 # RUN: FileCheck %s --check-prefix=SV < %t/dom/foldsim_sim.sv
@@ -55,6 +59,9 @@
 # RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gflat --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env > %t/gflat.log 2>&1
 # RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gdom --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --physical-domains > %t/gdom.log 2>&1
 # RUN: FileCheck %s --check-prefix=GLOG < %t/gdom.log
+# RUN: FileCheck %s --check-prefix=GJSON < %t/gdom/foldsim_domains.json
+# GJSON-DAG: "path": "foldsim_slr0/fs_dom_Core_model/fs_dom_Alu"
+# GJSON-DAG: "path": "foldsim_slr1/fs_dom_Sm_model/fs_dom_L1"
 # GLOG-DAG: domain Alu (in Core_model)
 # GLOG-DAG: domain Core_model (in foldsim_sim_slr0)
 # GLOG-DAG: domain Sm_model (in foldsim_sim_slr1): {{[0-9]+}} ops, 2 child domains
