@@ -2010,6 +2010,35 @@ def MemoriesToRegisters
   ];
 }
 
+def TableRoms : Pass<"foldsim-table-roms", "::circt::hw::HWModuleOp"> {
+  let summary = "A register index's constant tables as one registered block ROM";
+  let description = [{
+    The constant tables (hw.aggregate_constant) of one depth that a module
+    reads at one register index -- or at any of its replicas (the same next
+    value, reset, reset value and clock) -- become one table of their rows
+    side by side, read at the index's next value (its reset applied) and
+    registered: the register holds, in every host cycle, what each old read
+    gave, and each old read becomes a slice of it. The table is a wire with
+    rom_style "block": a block RAM ROM with its output register instead of a
+    LUT select per table and replica. Exact by construction. Applies to
+    modules whose name starts with `prefix` (the simulator level and its SLR
+    group modules), tables of at least `min-depth` entries, ROMs of at least
+    `min-bits` bits.
+  }];
+  let options = [
+    Option<"prefix", "prefix", "std::string", "\"foldsim_sim\"",
+           "Only modules whose name starts with this">,
+    Option<"minDepth", "min-depth", "uint64_t", "512",
+           "The fewest entries a table merged into a ROM has">,
+    Option<"minBits", "min-bits", "uint64_t", "18432",
+           "The fewest bits a ROM holds (a RAMB18)">,
+    Option<"verbose", "verbose", "bool", "true",
+           "Report each module's ROMs on stderr">,
+  ];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect",
+                           "circt::seq::SeqDialect", "circt::sv::SVDialect"];
+}
+
 def ReplicateControls
     : Pass<"foldsim-replicate-controls", "::circt::hw::HWModuleOp"> {
   let summary = "Bound the loads of the static fold's slot controls by replicas";

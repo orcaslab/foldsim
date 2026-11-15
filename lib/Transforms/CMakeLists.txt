@@ -25,6 +25,7 @@ add_mlir_library(FoldsimTransforms
   OutlineScopes.cpp
   RemoveDeadState.cpp
   ReplicateControls.cpp
+  TableRoms.cpp
   SlrSplit.cpp
   Sort.cpp
   PassSplit.cpp

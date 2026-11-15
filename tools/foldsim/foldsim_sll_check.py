@@ -209,6 +209,8 @@ def netlist_resources(sim, copies, region, synthesis=None):
         m = mods[lv]
         rest['lut'] += float(os.environ.get('FOLDSIM_COST_LEVEL_SCALE', foldsim_cost.LEVEL_LOGIC_SYNTH)) * \
             sum(v for k, v in m.lut.items() if k != 'array_get') + reads.get(lv, (0.0, {}))[0]
+        # (foldsim-table-roms' block ROMs: their RAMB36.)
+        rest['bram'] += reads.get(lv, (0.0, {}))[1].get('rom_bram', 0.0)
         for rec in m.mems:
             o = owner(rec[0])
             add_memory(link[o] if o else rest, rec)

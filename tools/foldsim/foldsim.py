@@ -2399,6 +2399,12 @@ def build_parser():
                          '(through logic) alone is moved into that group, not replicated; the level and the other '
                          'groups read it there (foldsim-fold-static slr-group-home): a virtual memory\'s pending bit '
                          'read ahead sits beside its copy, the same values in every host cycle')
+    ap.add_argument('--table-roms', type=int, default=0, metavar='BITS',
+                    help='with --static: the simulator level\'s constant tables read at one register index (or its '
+                         'replicas) as one block ROM of at least BITS bits, read at the index\'s next value and '
+                         'registered (foldsim-table-roms): a block RAM instead of LUT selects; exact. 0: off')
+    ap.add_argument('--table-roms-min-depth', type=int, default=512, metavar='N',
+                    help='with --table-roms: the fewest entries a merged table has')
     ap.add_argument('--slr-group-cut', action='store_true',
                     help='with --slr-group-own and --slr-group-reset: a value a group reads whose closure is past '
                          '--slr-group-own\'s limit is computed by the level two host cycles ahead (its next-value logic '
@@ -3180,7 +3186,9 @@ def main():
         replicate = f'hw.module(foldsim-replicate-controls{{{rc}}})'
         merge = ([f'hw.module(foldsim-merge-memories{{max-bits={a.csf_merge_links}}})']
                  if getattr(a, 'csf_merge_links', 0) else [])
-        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}'] + merge + [SPLIT, replicate,
+        roms = ([f'hw.module(foldsim-table-roms{{min-depth={a.table_roms_min_depth} min-bits={a.table_roms}}})']
+                if getattr(a, 'table_roms', 0) else [])
+        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}'] + merge + [SPLIT, replicate] + roms + [
                                         'canonicalize', 'foldsim-sort', 'cse']
         if a.copies == 'auto' or a.slr_groups or region:
             sim_input = out('models.mlir')

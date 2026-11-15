@@ -1,0 +1,28 @@
+# REQUIRES: verilator
+# foldsim-table-roms (a32-S26X-C3): the constant tables of one depth read at one register index or at its replicas
+# become one registered block ROM read at the index's next value (reset applied); each old read a slice of its
+# register. The tables at idx and its replica (t1 twice, t2) -> one ROM of 512 x 13 bits; t3 (256 entries) stays;
+# t4 at another register -> a ROM of its own. Verilator: the module before and after, side by side, the same outputs
+# in every cycle of 5,000 with random indices and resets (presets too); the mutant reading at the index itself (a host
+# cycle late) differs.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: python3 %S/Inputs/table_roms_gen.py > %t/in.mlir
+# RUN: foldsim-opt %t/in.mlir --pass-pipeline='builtin.module(hw.module(foldsim-table-roms{min-depth=512 min-bits=2048}))' -o %t/out.mlir 2> %t/log.txt
+# RUN: FileCheck %s --check-prefix=LOG < %t/log.txt
+# LOG: foldsim-table-roms: foldsim_sim: 4 table reads -> 2 block ROMs (9728 bits)
+# RUN: FileCheck %s --check-prefix=IR < %t/out.mlir
+# IR-DAG: hw.wire {{.*}} {sv.attributes = [#sv.attribute<"rom_style" = "\22block\22">]} : !hw.array<512xi13>
+# IR-DAG: %idx_rom_q = seq.firreg {{.*}} preset
+# IR-DAG: hw.array_get %{{[0-9a-z_]+}}[%{{[0-9]+}}] : !hw.array<256xi3>, i8
+# RUN: sed -e 's/@foldsim_sim(/@foldsim_sim_roms(/' %t/out.mlir > %t/out2.mlir
+# RUN: firtool --format=mlir %t/in.mlir -o %t/in.sv
+# RUN: firtool --format=mlir %t/out2.mlir -o %t/out.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/obj %S/Inputs/tb_table_roms.sv %t/in.sv %t/out.sv > %t/build.log 2>&1
+# RUN: %t/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# CHECK: MATCH 5000 cycles
+# RUN: env FOLDSIM_TABLE_ROMS_LATE=1 foldsim-opt %t/in.mlir --pass-pipeline='builtin.module(hw.module(foldsim-table-roms{min-depth=512 min-bits=2048}))' -o %t/mut.mlir 2> /dev/null
+# RUN: sed -e 's/@foldsim_sim(/@foldsim_sim_roms(/' %t/mut.mlir > %t/mut2.mlir
+# RUN: firtool --format=mlir %t/mut2.mlir -o %t/mut.sv
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/mobj %S/Inputs/tb_table_roms.sv %t/in.sv %t/mut.sv > %t/mbuild.log 2>&1
+# RUN: %t/mobj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s --check-prefix=MUT
+# MUT: MISMATCH
