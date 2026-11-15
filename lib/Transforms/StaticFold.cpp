@@ -28070,6 +28070,7 @@ LogicalResult StaticFolder::extractGroups() {
     SmallVector<std::pair<unsigned, seq::FirRegOp>> regs;
   };
   llvm::MapVector<Value, Cut> cuts;
+  unsigned cutLogic = 0;
   if (slrGroupOwn) {
     DenseSet<Operation *> inGroups;
     for (auto &ops : opsOf)
@@ -28231,9 +28232,26 @@ LogicalResult StaticFolder::extractGroups() {
                   llvm::errs() << " " << n << " x" << c;
               llvm::errs() << "\n";
             }
-            // `slr-group-cut`: the group takes the value from a register of
-            // its own, loaded below (once the level's reset is in place)
-            // from a level register of the value two host cycles ahead.
+            // `slr-group-cut`: logic is cloned into the group, an op at a
+            // time (its operands are the group's reads in turn), so that
+            // the cut falls on the level's registers: a register's lead is
+            // its next-value logic composed twice, a logic value's would
+            // add the value's own cone (the frame decision's AND of every
+            // port's tokens) on top, past the timing screen.
+            if (order.empty() && slrGroupCut && isLevelLogic(def) &&
+                def->getNumResults() == 1) {
+              auto *clone = cb.clone(*def);
+              clone->removeAttr("inner_sym");
+              local[value] = clone->getResult(0);
+              opsOf[g].push_back(clone);
+              inGroups.insert(clone);
+              ++cutLogic;
+              operand.set(clone->getResult(0));
+              continue;
+            }
+            // A register: the group takes it from a register of its own,
+            // loaded below (once the level's reset is in place) from a
+            // level register of its value two host cycles ahead.
             if (order.empty() && slrGroupCut && hw::getBitWidth(value.getType()) > 0 &&
                 isa<IntegerType>(value.getType())) {
               Location loc = simModule.getLoc();
@@ -28684,7 +28702,8 @@ LogicalResult StaticFolder::extractGroups() {
     llvm::errs() << "foldsim-fold-static: slr-group-cut: " << built
                  << " values read by the groups from a lead-" << lead
                  << " register (" << bits << " bits, " << groupRegs
-                 << " group registers, " << leadOps << " lead ops in the level)";
+                 << " group registers, " << leadOps << " lead ops in the level; "
+                 << cutLogic << " level ops cloned into the groups before them)";
     if (failed) {
       llvm::errs() << ", " << failed << " without a lead (read as they are:";
       for (auto &n : failedNames)
