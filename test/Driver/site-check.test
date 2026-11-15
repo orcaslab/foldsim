@@ -1,0 +1,17 @@
+# foldsim_site_check.py: a memory's cascade against the tallest RAM column of its SLR (a32-S26X-F26 B7, after the
+# g16i1p1 Place 30-8312 of 11-14: a 262,144 x 32 URAM local memory = a 64-high cascade in SLR0, whose URAM columns are 24
+# high). Region rows split at 20 (SLR0 below): URAM columns SLR0 10 (X0Y0-9; X1Y2-5 is 4), SLR1 20; RAMB36 SLR0 20, SLR1 40.
+# Leaf (group 1 -> SLR0): 65,536 x 32 URAM = 16 high > 10: REFUSE; 262,144 x 9 block RAM = 64 x 4K x 9 (the fewest
+# RAMB36, fewer than 72 x 32K x 1) = 64 high > 20: REFUSE. Top_model (group 0 -> SLR1): 4,096 x 144 URAM = 1 high, 2 columns: ok.
+# RUN: not python3 %foldsim_tools/foldsim_site_check.py %S/Inputs/site-check --sll %S/Inputs/site-check/sll.txt --xdc %S/Inputs/site-check/impl.xdc --slr-rows 20 > %t.txt
+# RUN: FileCheck %s < %t.txt
+# CHECK: columns (tallest run per SLR): URAM288 {'SLR0': 10, 'SLR1': 20}, RAMB36 {'SLR0': 20, 'SLR1': 40}
+# CHECK-DAG: REFUSE block bram_262144x9: 262144x9: cascade 64 x 1 col(s) in SLR0 (tallest column 20)
+# CHECK-DAG: REFUSE ultra big_65536x32: 65536x32: cascade 16 x 1 col(s) in SLR0 (tallest column 10)
+# CHECK-DAG: ok     ultra small_4096x144: 4096x144: cascade 1 x 2 col(s) in SLR1 (tallest column 20)
+# CHECK: site check: REFUSE: 2 memory cascade(s)
+# The synthesis caps (FOLDSIM_URAM_CASCADE_MAX / -max_bram_cascade_height): within the columns, OK.
+# RUN: python3 %foldsim_tools/foldsim_site_check.py %S/Inputs/site-check --sll %S/Inputs/site-check/sll.txt --xdc %S/Inputs/site-check/impl.xdc --slr-rows 20 --uram-cap 8 --bram-cap 16 | FileCheck %s --check-prefix=CAP
+# CAP: ok     ultra big_65536x32: 65536x32: cascade 16 -> 8 x 1 col(s) in SLR0 (tallest column 10)
+# CAP: site check: OK: 0 memory cascade(s)
+# CAP-NOT: REFUSE
