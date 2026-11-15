@@ -28,3 +28,10 @@
 # ANY: virtual memories: none
 # RUN: foldsim --srcs top.f --top Top --out %t/hi --static --min-ii 128 --state auto --state-home hybrid --hybrid-row-bits 1024 Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=ANY < %t/hi/state.txt
+# --hbm-calibration (the card's measured asl9 HBM, every SLR busy): the
+# policy's rate is the SLRs' read rates summed (42.9 GB/s = 214.6 B a host
+# cycle at 200 MHz, not the assumed 640) and its round trip the loaded one
+# (2,401 ns = 481 host cycles): the large RAM's reads wait in bubbles.
+# RUN: foldsim --srcs top.f --top Top --out %t/cal --static --min-ii 128 --state auto --state-home hybrid --hybrid-row-bits 512 --hbm-calibration %foldsim_tools/calibrations/hbm-asl9-20261114.json Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=CAL < %t/cal/state.txt
+# CAL: frame 128: projected H {{[0-9]+}} (II 128, HBM 512 bytes a frame = 3 host cycles at 214.6 B, bubbles at most {{[1-9][0-9]+}})

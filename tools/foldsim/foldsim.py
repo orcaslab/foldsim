@@ -32,6 +32,7 @@ import argparse
 import collections
 import fnmatch
 import json
+import math
 import os
 import re
 import shlex
@@ -914,6 +915,17 @@ def state_policy(a, out):
         foldsim_degree.storage.ONCHIP_ONLY = True
     if a.state_home == 'hybrid':
         foldsim_degree.HYBRID_ROW_BITS = a.hybrid_row_bits
+    if a.hbm_calibration:
+        # The HBM the card measured (calibrations/hbm-*.json): the policy's
+        # rate (every SLR's ports at once, `busy`, or `alone`) in bytes a host
+        # cycle, and its round trip (the loaded latency when busy) in cycles.
+        hc = json.load(open(a.hbm_calibration))
+        clk = hc.get('clock_hz', 200e6)
+        mode = a.hbm_mode
+        rate = sum(x[mode]['read_gbs'] for x in hc['slrs'].values()) * 1e9 / clk
+        lat = max(x['loaded_latency_ns' if mode == 'busy' else 'latency_ns'] for x in hc['slrs'].values())
+        foldsim_degree.storage.HBM_BYTES_PER_CYCLE = round(rate, 1)
+        foldsim_degree.storage.HBM_ROUND_TRIP = math.ceil(lat * 1e-9 * clk)
     if a.state_measured:
         if not foldsim_degree.STATE_CAL:
             sys.exit('--state-measured needs a --state-calibration')
@@ -2579,6 +2591,13 @@ def build_parser():
                          'it can (read in instance order), pages and memories below --hybrid-row-bits on chip -- and '
                          'every memory of at least --hybrid-row-bits an instance that HBM can hold (a registered read) '
                          'as a virtual memory, its rows read from HBM on demand')
+    ap.add_argument('--hbm-calibration', default='', metavar='JSON',
+                    help="with --state auto: the HBM the card measured (e.g. calibrations/hbm-asl9-20261114.json) "
+                         "in place of the policy's assumed 640 B a host cycle and 64-cycle round trip: the sum of "
+                         "the SLRs' read rates and the longest round trip, in the mode --hbm-mode names")
+    ap.add_argument('--hbm-mode', choices=('busy', 'alone'), default='busy',
+                    help="with --hbm-calibration: every SLR's ports moving at once (busy: the loaded round trip) "
+                         "or one SLR's (alone: the unloaded one)")
     ap.add_argument('--hybrid-row-bits', type=int, default=4096, metavar='BITS',
                     help='with --state-home hybrid: the memories of at least BITS an instance go to HBM (default '
                          '4096: R26, the RAMs of at most 4 kbit stream with the flip-flops)')
