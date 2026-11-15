@@ -59,6 +59,9 @@ configure_file(foldsim_xcheck.py ${CMAKE_BINARY_DIR}/bin/foldsim_xcheck.py COPYO
 install(PROGRAMS foldsim_xcheck.py DESTINATION bin)
 configure_file(foldsim_site_check.py ${CMAKE_BINARY_DIR}/bin/foldsim_site_check.py COPYONLY)
 install(PROGRAMS foldsim_site_check.py DESTINATION bin)
+# The part's RAM sites per column and clock region (foldsim_site_check.py's --device default).
+configure_file(foldsim_v80_ram_sites.json ${CMAKE_BINARY_DIR}/bin/foldsim_v80_ram_sites.json COPYONLY)
+install(FILES foldsim_v80_ram_sites.json DESTINATION bin)
 # The fit calibration database (every synthesis of a netlist against its count) and the bound check of a fold
 # against its region (floor, median, upper bound; per copy against the SLRs; the image's post-synthesis gate).
 configure_file(foldsim_fitdb.py ${CMAKE_BINARY_DIR}/bin/foldsim_fitdb.py COPYONLY)

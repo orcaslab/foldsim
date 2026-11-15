@@ -1,0 +1,5 @@
+gen: SLRs SLR1,SLR0
+    SLR1 as placed: lut 10 (1 %), lutram 0 (0 %), ff 10 (0 %), uram 20.0 (50 %), bram 1.0 (1 %)
+    SLR0 as placed: lut 10 (1 %), lutram 0 (0 %), ff 10 (0 %), uram 20.0 (50 %), bram 0.0 (0 %)
+    slr0 -> SLR1 (named): lut 10 (1 % of the SLR): B B_copy1
+    slr1 -> SLR0 (named): lut 10 (1 % of the SLR): A

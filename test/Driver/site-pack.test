@@ -1,0 +1,31 @@
+# foldsim_site_check.py packs every cascade of an SLR into that SLR's runs of free RAM sites (a32-S26X-F26 B7, after
+# g16i1p1d's Place 30-8361 of 11-15 01:30: two 16-high URAM cascades in SLR0, whose 24 pblock rows are two clock-region
+# halves of 12, rows 60-71 and 72-83; the column check passed it). A toy part (Inputs/site-pack/device.json): clock
+# regions of 12 rows, SLR1 from row 24, URAM column X2 has no sites in SLR0. The region: X0 rows 2-23 (runs 10 + 12),
+# X2 rows 0-35 (only 24-35 exist), clock region X1Y3 (columns X1, X2, rows 24-35), the shell's PROHIBIT on X1Y30-31.
+# A (group 1 -> SLR0): 65,536 x 72 URAM, 16 high; 16,384 x 72 at its cascade_height 2: two of 2.
+# B, B_copy1 (group 0 -> SLR1): 32,768 x 72 URAM each, 8 high, in runs 12 (X2), 6 and 4 (X1 around the prohibited
+# sites): one fits, the other has no run of 8 left; the fit gate's 'as placed' 20 less the memories' 16: 4 other sites.
+# RUN: not python3 %foldsim_tools/foldsim_site_check.py %S/Inputs/site-pack --sll %S/Inputs/site-pack/sll.txt --xdc %S/Inputs/site-pack/impl.xdc --device %S/Inputs/site-pack/device.json --cr-cross none > %t.txt
+# RUN: FileCheck %s < %t.txt
+# CHECK: runs per SLR (columns cut at clock regions), tallest: URAM288 {'SLR0': 12, 'SLR1': 12}, RAMB36 {'SLR0': 12, 'SLR1': 12}; reserved URAM 2, RAMB36 0
+# CHECK-DAG: REFUSE ultra mem_a_65536x72: 65536x72: cascade 16 x 1 col(s) x 1 in SLR0
+# CHECK-DAG: REFUSE ultra mem_b_32768x72: 32768x72: cascade 8 x 1 col(s) x 2 in SLR1
+# CHECK-DAG: ok     ultra mem_c_16384x72: 16384x72: cascade 4 -> 2 x 2 x 1 col(s) x 1 in SLR0
+# CHECK-DAG: REFUSE pack SLR0 URAM288: 2 runs (1 x 12 + 1 x 10; 22 sites), cascades 1 x 16 + 2 x 2 (20 sites), other 0, free after 18; no run of free sites for: 16 (mem_a_65536x72)
+# CHECK-DAG: REFUSE pack SLR1 URAM288: 3 runs (1 x 12 + 1 x 6 + 1 x 4; 22 sites), cascades 2 x 8 (16 sites), other 4, free after 10; no run of free sites for: 8 (mem_b_32768x72)
+# CHECK: site check: REFUSE: 2 memory cascade(s) or SLR(s) without legal sites (3 placements; tallest URAM cascade 16, RAMB36 0; clock regions cut)
+# Clock regions crossed: A's 16 fits X0's 22 rows; B still has no second run of 8.
+# RUN: not python3 %foldsim_tools/foldsim_site_check.py %S/Inputs/site-pack --sll %S/Inputs/site-pack/sll.txt --xdc %S/Inputs/site-pack/impl.xdc --device %S/Inputs/site-pack/device.json --cr-cross any | FileCheck %s --check-prefix=ANY
+# ANY: ok     pack SLR0 URAM288: 1 runs (1 x 22; 22 sites), cascades 1 x 16 + 2 x 2 (20 sites), other 0, free after 2
+# ANY: REFUSE pack SLR1 URAM288
+# ANY: site check: REFUSE: 1 memory cascade(s)
+# The synthesis cap 4 (the RTL's cascade_height 2 still wins for mem_c): every cascade packs; 2 sites left in each SLR.
+# RUN: python3 %foldsim_tools/foldsim_site_check.py %S/Inputs/site-pack --sll %S/Inputs/site-pack/sll.txt --xdc %S/Inputs/site-pack/impl.xdc --device %S/Inputs/site-pack/device.json --cr-cross none --uram-cap 4 | FileCheck %s --check-prefix=CAP
+# CAP: ok     pack SLR0 URAM288: 2 runs (1 x 12 + 1 x 10; 22 sites), cascades 4 x 4 + 2 x 2 (20 sites), other 0, free after 2
+# CAP: ok     pack SLR1 URAM288: 3 runs (1 x 12 + 1 x 6 + 1 x 4; 22 sites), cascades 4 x 4 (16 sites), other 4, free after 2
+# CAP: site check: OK
+# A shell reservation of 4 more sites in SLR0 (X0 rows 2-5): the 4 x 4 + 2 x 2 no longer pack into 12 + 6.
+# RUN: not python3 %foldsim_tools/foldsim_site_check.py %S/Inputs/site-pack --sll %S/Inputs/site-pack/sll.txt --xdc %S/Inputs/site-pack/impl.xdc --device %S/Inputs/site-pack/device.json --cr-cross none --uram-cap 4 --reserve URAM288_X0Y2:URAM288_X0Y5 | FileCheck %s --check-prefix=RES
+# RES: reserved URAM 6
+# RES: REFUSE pack SLR0 URAM288: 2 runs (1 x 12 + 1 x 6; 18 sites), cascades 4 x 4 + 2 x 2 (20 sites)
