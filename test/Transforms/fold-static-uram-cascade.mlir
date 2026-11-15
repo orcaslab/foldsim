@@ -6,6 +6,11 @@
 // block RAM states none.
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top storage=Leaf:mem=ultra,Leaf:small=ultra})' | FileCheck %s
 // RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top storage=Leaf:mem=block,Leaf:small=ultra})' | FileCheck %s --check-prefix=BLOCK
+// uram-cascade-max: the cascade at most that high (a longer chain cannot be
+// placed in a URAM column's run of sites: 16 SMs, 11-14, a chain of 32 in
+// SLR0): with 1, the 8,192-deep memory states a cascade of 1.
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(foldsim-fold-static{module=Top storage=Leaf:mem=ultra,Leaf:small=ultra uram-cascade-max=1})' | FileCheck %s --check-prefix=CAP
+// CAP: %mem = seq.firmem 1, 1, old, undefined {sv.attributes = [#sv.attribute<"ram_style" = "\22ultra\22">, #sv.attribute<"cascade_height" = "1">]} : <8192 x 8, mask 1>
 // CHECK: %mem = seq.firmem 1, 1, old, undefined {sv.attributes = [#sv.attribute<"ram_style" = "\22ultra\22">, #sv.attribute<"cascade_height" = "2">]} : <8192 x 8, mask 1>
 // CHECK: %small = seq.firmem 1, 1, old, undefined {sv.attributes = [#sv.attribute<"ram_style" = "\22ultra\22">]} : <4096 x 8, mask 1>
 // BLOCK-NOT: cascade_height

@@ -755,6 +755,19 @@ def slr_masters(weights, total):
     return out
 
 
+def tall_uram_chains(sim, limit):
+    """The netlist's ultra RAMs whose cascade_height is past `limit`: [(name, height)]."""
+    out = []
+    if not sim or not os.path.exists(sim):
+        return out
+    for line in open(sim):
+        m = re.search(r'#sv\.attribute<"cascade_height" = "(\d+)">', line)
+        if m and int(m.group(1)) > limit:
+            n = re.search(r'%([\w.$-]+) = seq\.firmem', line)
+            out.append((n.group(1) if n else '?', int(m.group(1))))
+    return out
+
+
 def master_ports(noc):
     """The NoC ports a device-memory master of the kernel can be bound to: those reaching HBM, and of them, when
     the region's noc section names `masters_to` (linker tags), only those tags' (the asl9 shell's per-SLR ports reach
@@ -1403,7 +1416,16 @@ def main():
     if mode != 'netlist':
         finish(lines, 'ESTIMATE (schedule resources, not a verdict): '
                       + ('an assignment within the SLRs' if groups is not None else 'no assignment'))
-    if over and not guide:
+    # Primitive shapes, not only totals: an ultra RAM's cascade is one vertical run of a URAM column's sites, and the
+    # placer finds none for a chain past the region's run (16 SMs, 11-14: a chain of 32 in SLR0 at 50 % of its URAM).
+    tall = tall_uram_chains(sim, region.get('uram_cascade_max', 8)) if mode == 'netlist' else []
+    if tall:
+        lines.append(f'  URAM cascades past the region\'s {region.get("uram_cascade_max", 8)}: ' +
+                     ', '.join(f'{n} ({h})' for n, h in tall[:6]) + (' ...' if len(tall) > 6 else ''))
+    if tall:
+        verdict = (f'REFUSE: {len(tall)} ultra RAM cascades past the region\'s {region.get("uram_cascade_max", 8)} '
+                   'URAM288 (no legal place in a URAM column: rebuild with foldsim-fold-static uram-cascade-max)')
+    elif over and not guide:
         verdict = 'REFUSE: ' + '; '.join(f'{c} fits no SLR whole (the nearest, {s}: over its {"/".join(r)})'
                                          for c, s, r in over) + \
             ' (a copy past its SLR is cut by the placer, its SLLs unknown: r16c failed so)'

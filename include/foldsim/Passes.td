@@ -819,6 +819,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "values end it). Replicas hold their originals' values in every "
            "host cycle: nothing moves. No level register then fans out over "
            "the groups. 0: off">,
+    Option<"uramCascadeMax", "uram-cascade-max", "unsigned", "8",
+           "The highest URAM288 cascade an ultra RAM states (cascade_height): "
+           "a deeper memory is built of several chains at most this high. A "
+           "cascade is one vertical run of a URAM column's sites: on the V80 "
+           "a chain of 32 found no legal place in SLR0 and crosses clock-region "
+           "row breaks anywhere; chains of 8 place">,
     Option<"slrGroupHome", "slr-group-home", "bool", "false",
            "With slr-group-own: a level register whose next value reads, "
            "through the level's logic, more outputs of one group's instances "

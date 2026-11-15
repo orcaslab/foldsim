@@ -12791,13 +12791,25 @@ static std::pair<double, unsigned> landingPrices(uint64_t depth, unsigned width,
 /// 8K rows in 3 URAM288 and 24K in 9, against 2 and 6 cascaded, no LUTs
 /// either way; every copy of the A100-32 fold with such memories 1.48x its
 /// counted URAM).
+///
+/// The cascade is at most gUramCascadeMax URAM288 high (`uram-cascade-max`):
+/// a cascade is one vertical chain of a URAM column, and a longer one than the
+/// column's run of sites in the region cannot be placed (16 SMs, 11-14: the
+/// folded LMEM, 262,144 x 32, asked for 64; Vivado 2025.2 on the V80: 'no
+/// legal location to place the URAM chain with height 32' in SLR0, and 'too
+/// long to fit within a single clock region' -- hold risk -- where it could).
+/// A deeper memory is then built of several chains (Vivado muxes their
+/// reads), each at most that high: the same URAM288, a few LUTs more.
+static unsigned gUramCascadeMax = 8;
 static void setRamStyle(Operation *op, StringRef kind) {
   auto *context = op->getContext();
   unsigned cascade = 0;
   if (kind == "ultra")
     if (auto mem = dyn_cast<seq::FirMemOp>(op))
       if (mem.getType().getDepth() > 4096)
-        cascade = unsigned(llvm::divideCeil(mem.getType().getDepth(), 4096));
+        cascade = std::min<unsigned>(
+            unsigned(llvm::divideCeil(mem.getType().getDepth(), 4096)),
+            std::max(1u, gUramCascadeMax));
   sv::modifySVAttributes(op, [&](SmallVectorImpl<sv::SVAttributeAttr> &attrs) {
     llvm::erase_if(attrs, [](sv::SVAttributeAttr attr) {
       return attr.getName().getValue() == "ram_style" ||
@@ -28359,6 +28371,7 @@ void FoldStaticPass::runOnOperation() {
   folder.slrGroupLocal = slrGroupLocal;
   folder.slrGroupOwn = slrGroupOwn;
   folder.slrGroupHome = slrGroupHome;
+  gUramCascadeMax = uramCascadeMax;
   folder.slrGroupEnv = slrGroupEnv;
   folder.slrKept = std::max(1u, unsigned(slrKept));
   for (auto [spec, out, name] :
