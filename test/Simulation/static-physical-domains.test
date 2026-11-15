@@ -67,6 +67,13 @@
 # PB-DAG: SLR2 {foldsim_slr0/fs_dom_Core_model}
 # PB-DAG: SLR1 {foldsim_slr1/fs_dom_Sm_model}
 # PB-DAG: SLR0 {foldsim_slr2/fs_dom_Top_model}
+# Row bands by default, each domain's affinity its wires to higher SLRs less
+# those to lower ones (group 1 is SLR1: Sm's links go up to SLR2's core and
+# down to SLR0's Top and L2).
+# PB: set fs_domain_axis y
+# PB: set fs_domain_affinity {
+# PB-DAG: foldsim_slr0/fs_dom_Core_model -{{[1-9][0-9]*}}
+# PB-DAG: foldsim_slr2/fs_dom_Top_model {{[1-9][0-9]*}}
 # The gen's floorplan (sourced by the flows after the groups' assignments) carries
 # them: the data and the procedures that apply it.
 # RUN: FileCheck %s --check-prefix=FP < %t/gpb/foldsim_floorplan.tcl
