@@ -1,13 +1,15 @@
 # REQUIRES: verilator
 # The S26 hybrid as a state-home policy (foldsim --state auto --state-home
 # hybrid, Driver/Inputs/hybrid): a class's flip-flops and its small RAM (8 x 8
-# = 64 bits) stay on chip (their kinds the policy's), its large RAM (64 x 8 =
-# 512 bits, at least --hybrid-row-bits) leaves
+# = 64 bits) stay on chip (their kinds the policy's), its large RAM (65,536 x 8
+# = 512 kbit, at least --hybrid-row-bits) leaves
 # the chip as a virtual memory, its rows read from HBM on demand (here the
 # testbench's model: latency 1-60 host cycles, stalls, a full controller).
 # The simulator matches the target. Mutants: without the hybrid rule the policy
-# keeps everything on chip (no virtual memory); at --hybrid-row-bits 1024 the
-# large RAM is below the line and stays too.
+# keeps everything on chip (no virtual memory); at --hybrid-row-bits 1048576
+# the large RAM is below the line and stays too. At --hybrid-row-bits 32 the
+# small RAM is past the line but its controller would cost more of the chip
+# than the RAM: it stays.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/hybrid
 # RUN: foldsim --srcs top.f --top Top --out %t/h --static --min-ii 128 --state auto --state-home hybrid --hybrid-row-bits 512 Leaf > %t/h.log 2>&1
 # RUN: FileCheck %s --check-prefix=POL < %t/h/state.txt
@@ -16,7 +18,7 @@
 # POL: storage: {{.*}}Leaf:u_small/mem=block
 # RUN: FileCheck %s --check-prefix=VH < %t/h/foldsim_sim.vh
 # VH: `define FOLDSIM_VMEM_COUNT 1
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=6 -Mdir %t/h/obj %S/Inputs/tb_vmem.sv top.sv %t/h/foldsim_sim.sv > %t/h/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DROWW=16 -Mdir %t/h/obj %S/Inputs/tb_vmem.sv top.sv %t/h/foldsim_sim.sv > %t/h/build.log 2>&1
 # RUN: %t/h/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
 # RUN: %t/h/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | FileCheck %s
 # RUN: %t/h/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | FileCheck %s
@@ -26,8 +28,11 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/any --static --min-ii 128 --state auto Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=ANY < %t/any/state.txt
 # ANY: virtual memories: none
-# RUN: foldsim --srcs top.f --top Top --out %t/hi --static --min-ii 128 --state auto --state-home hybrid --hybrid-row-bits 1024 Leaf > /dev/null 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/hi --static --min-ii 128 --state auto --state-home hybrid --hybrid-row-bits 1048576 Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=ANY < %t/hi/state.txt
+# RUN: foldsim --srcs top.f --top Top --out %t/lo --static --min-ii 128 --state auto --state-home hybrid --hybrid-row-bits 32 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=LO < %t/lo/state.txt
+# LO: virtual memories: ^(Leaf:u_big/mem)$
 # --hbm-calibration (the card's measured asl9 HBM, every SLR busy): the
 # policy's rate is the SLRs' read rates summed (42.9 GB/s = 214.6 B a host
 # cycle at 200 MHz, not the assumed 640) and its round trip the loaded one

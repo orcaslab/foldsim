@@ -1,6 +1,6 @@
 // The S26 hybrid (foldsim --state auto --state-home hybrid): a class whose
 // state is flip-flops (a counter and a delay line), a small RAM (8 x 8 bits)
-// and a large one (64 x 8 bits, read through a register), both inside a
+// and a large one (65,536 x 8 bits, read through a register), both inside a
 // RAM module (so the memories have names the rules carry). Four leaves in a
 // chain. The hybrid keeps the flip-flops and the small RAM on chip and makes
 // the large RAM a virtual memory (rows in HBM, read on demand).
@@ -18,7 +18,7 @@ module Leaf(input logic clk, input logic [7:0] d, output logic [7:0] q);
   logic [7:0] small_rd;
   logic [7:0] big_rd;
   dpram #(.D(8), .W(8)) u_small(.clk, .we(d[0]), .wa(d[3:1]), .ra(d[6:4]), .wd(d ^ dl1), .rd(small_rd));
-  dpram #(.D(64), .W(8)) u_big(.clk, .we(d[1]), .wa({d[7:5], cnt[2:0]}), .ra(d[5:0] ^ cnt), .wd(d ^ dl0), .rd(big_rd));
+  dpram #(.D(65536), .W(8)) u_big(.clk, .we(d[1]), .wa({d, dl0}), .ra({dl0, d ^ {2'd0, cnt}}), .wd(d ^ dl1), .rd(big_rd));
   always_ff @(posedge clk) begin
     cnt <= cnt + {5'd0, d[2]} + 6'd1;
     dl0 <= d;

@@ -506,12 +506,23 @@ def fix_given(units):
             u['given'] = True
 
 
+def on_chip_share(c):
+    """A kind's cost (kind_cost / vmem_cost) as its share of the region on
+    chip: block and ultra RAM over the region's, LUTs and LUTRAM over its
+    LUT sites (a LUTRAM LUT LUTRAM_SITES of them)."""
+    reg = storage.REGION
+    return (c.get('bram', 0.0) / reg['bram'] + c.get('uram', 0.0) / reg['uram'] +
+            (c.get('lut', 0.0) + storage.LUTRAM_SITES * c.get('lutram', 0.0)) / reg['sites'])
+
+
 def hybrid_units(units):
     """HYBRID_ROW_BITS: each unit's home by the hybrid's rule (the S26
     hybrid: R26's engine keeps flip-flop records and RAMs below a few kbit in
     the record, on chip, and fetches larger RAMs' rows from HBM): a memory of
-    at least HYBRID_ROW_BITS an instance that HBM can hold is fixed there; any
-    other store loses the HBM kind, the policy choosing its kind on chip (the
+    at least HYBRID_ROW_BITS an instance that HBM can hold is fixed there
+    unless its controller costs more of the chip than the memory itself in its
+    cheapest kind (on_chip_share: a FIFO every slot reads, say); any other
+    store loses the HBM kind, the policy choosing its kind on chip (the
     records themselves, packed per instance in RAM rows, are --state-in-ram's:
     a register store priced alone in ultra RAM would take a 72-bit column a
     register). Given rules (--storage) and units the compiler cannot name stay
@@ -522,7 +533,9 @@ def hybrid_units(units):
         if u.get('link') or u.get('given') or u.get('fixed') is not None and u.get('fixed') != 'hbm':
             continue
         big = u.get('bits') is not None and u['bits'] >= HYBRID_ROW_BITS
-        if big and 'hbm' in u['costs']:
+        if big and 'hbm' in u['costs'] and on_chip_share(u['costs']['hbm']) < min(
+                (on_chip_share(c) for k, c in u['costs'].items() if k != 'hbm' and c is not None),
+                default=float('inf')):
             u['fixed'] = 'hbm'
             continue
         u['costs'].pop('hbm', None)
@@ -2564,7 +2577,9 @@ def page_pick(est, classes, frame, kinds=('block', 'ultra'), sched=None):
             continue
         top = min(max(1, int(PAGE_PORT_SHARE * frame) // n), frame - 4)
         info = (sched or {}).get(c)
-        if info and info.get('state'):
+        if info and info.get('state') and HYBRID_ROW_BITS is None:
+            # (The hybrid streams its records: a frame of P passes an
+            # instance is its H, not a stretched arc to avoid.)
             top = min(top, max(1, state_span(info['state'], frame) // n))
         if top < 1:
             return None
