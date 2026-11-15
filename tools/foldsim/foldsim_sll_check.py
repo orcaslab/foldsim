@@ -190,6 +190,10 @@ def netlist_resources(sim, copies, region, synthesis=None):
     # The simulator's level: @foldsim_sim and the SLR group modules under it.
     level = [m for m in ['foldsim_sim'] + [ch for ch, _ in mods['foldsim_sim'].insts
                                             if ch in mods and ch not in statics]] if 'foldsim_sim' in mods else []
+    # (--physical-domains: the domain modules, foldsim_sim_dom_<class>, nested in the level and the SLR groups' modules,
+    # are the level's too: their links charged to their readers, their controls the level's rest, as without them.)
+    for lv in level:
+        level += [ch for ch, _ in mods[lv].insts if ch.startswith('foldsim_sim_dom_') and ch in mods and ch not in level]
     names = sorted(copies, key=len, reverse=True)
 
     def owner(n):
