@@ -385,14 +385,47 @@ STATE_CAL = None
 GIVEN = None
 
 
+# The frame the policy prices (area()'s `ii`): STATE_CAL's logic factors grow with it (frame_factor). The
+# schedule's II when choose_state set it (STATE_II): the instances a copy serves are the schedule's, a longer frame
+# (pages off chip, HBM bytes) adds none.
+STATE_FRAME = None
+STATE_II = None
+
+
+def frame_factor():
+    """STATE_CAL's logic growth with the frame (`logic_per_doubling` past `logic_ref_frame`): the synthesized
+    logic of the copies and the level per counted grows with the instances a copy serves (its state's read
+    selects, slot tables and link word selects scale with the frame, the class estimate does not): 1.04 / 1.16 /
+    1.31 of the y8b fit at frames 128 / 256 / 512 (a32-S26X-F26 B8: e4b, e8h, g16i1p1 post-synthesis)."""
+    if not STATE_CAL or not STATE_CAL.get('logic_per_doubling') or not STATE_FRAME:
+        return 1.0
+    ref = STATE_CAL.get('logic_ref_frame') or STATE_FRAME
+    return max(0.5, 1.0 + STATE_CAL['logic_per_doubling'] * math.log2(max(STATE_FRAME, 1) / ref))
+
+
 def state_factors(c):
-    """STATE_CAL's (logic, LUTRAM) factors of a class (its copies' model)."""
+    """STATE_CAL's (logic, LUTRAM) factors of a class (its copies' model), the logic's at the frame priced."""
     if not STATE_CAL:
         return 1.0, 1.0
     m = (STATE_CAL.get('classes') or {}).get(re.sub(r'_copy\d+$', '', c))
     if m:
         return m['logic'], m['lutram']
-    return STATE_CAL.get('copy_logic', 1.0), STATE_CAL.get('copy_lutram', 1.0)
+    return STATE_CAL.get('copy_logic', 1.0) * frame_factor(), STATE_CAL.get('copy_lutram', 1.0)
+
+
+def state_kernel():
+    """STATE_CAL's kernel and shell glue beside the simulator: (logic, LUTRAM, RAMB36). With a folded memory
+    endpoint and the fold's way count (`fold_ways`, set by the driver) and a per-way fit (`kernel_fold_logic`,
+    `kernel_fold_logic_per_way`, ...: a32-S26X-F26 B8 on e4b / e8h / g16i1p1, 4 / 8 / 16 ways), that fit; else
+    the fit point's kernel (`kernel_logic`, `kernel_lutram`) and its memory ports past it (state_kernel_ports)."""
+    if not STATE_CAL:
+        return 0.0, 0.0, 0.0
+    w = STATE_CAL.get('fold_ways')
+    if w and 'kernel_fold_logic' in STATE_CAL:
+        return (STATE_CAL['kernel_fold_logic'] + STATE_CAL.get('kernel_fold_logic_per_way', 0.0) * w,
+                STATE_CAL.get('kernel_fold_lutram', 0.0),
+                STATE_CAL.get('kernel_fold_bram', 0.0) + STATE_CAL.get('kernel_fold_bram_per_way', 0.0) * w)
+    return STATE_CAL.get('kernel_logic', 0.0) + state_kernel_ports(), STATE_CAL.get('kernel_lutram', 0.0), 0.0
 
 
 def state_kernel_ports():
@@ -474,7 +507,8 @@ def state_units(units, lev=1.0):
     if not STATE_CAL:
         return
     for u in units:
-        fl, fr = (lev, lev) if u.get('link') else state_factors(u['class'])
+        # (a link's LUTRAM by the level's factor alone: the frame's growth is logic's.)
+        fl, fr = (lev, lev / frame_factor()) if u.get('link') else state_factors(u['class'])
 
         def scale(c, k):
             if c is None or k == 'hbm' and not u.get('link'):
@@ -1006,12 +1040,16 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     units, copy_logic, base_lutram = [], {}, 0.0
     # The state-home policy's calibration (STATE_CAL): the level's factor on
     # the rest and the links, the kernel and glue beside the simulator.
-    lev = STATE_CAL.get('level', 1.0) if STATE_CAL else 1.0
+    global STATE_FRAME
+    STATE_FRAME = STATE_II or ii or None
+    lev = STATE_CAL.get('level', 1.0) * frame_factor() if STATE_CAL else 1.0
     logic *= lev
-    if STATE_CAL:
-        logic += STATE_CAL.get('kernel_logic', 0.0) + state_kernel_ports()
-        base_lutram += STATE_CAL.get('kernel_lutram', 0.0)
     kernel_uram = kernel_bram = 0.0
+    if STATE_CAL:
+        kl, klr, kb = state_kernel()
+        logic += kl
+        base_lutram += klr
+        kernel_bram += kb
     if KERNEL['on']:
         if KERNEL['fold_ports'] and KERNEL['folded_measured']:
             fm = KERNEL['folded_measured']
@@ -2583,6 +2621,8 @@ def choose_state(cal, est, classes, sched, ii, route=True, entries=2, uram=True,
     the tiers moves links yet (paging them, written and read at fixed slots,
     is the next tier). When the links alone (with the logic outside the
     copies) leave no room, nothing fits at any frame: None at once."""
+    global STATE_II
+    STATE_II = ii
     est = copy_estimates(est, classes)
     rest = rest_of(cal, sum(e['lut'] for e in {id(e): e for e in est.values()}.values()))
     # Traffic of the memories already virtual (est has them under 'vmems').

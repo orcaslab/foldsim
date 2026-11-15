@@ -296,9 +296,17 @@ def kernel_resources(gdir, region):
         return dict(lut=k.get('lut', 0.0), lutram=0.0, ff=k.get('ff', 0.0), bram=0.0, parts={'flat': k.get('lut', 0.0)})
     path = os.path.join(gdir, 'foldsim_sim.json')
     j = json.load(open(path)) if os.path.exists(path) else {}
+    fold_bram = 0.0
     if j.get('port_bundles'):
-        mem = k['mem_fold_lut']
-        mem_what = 'folded memory endpoint'
+        # A per-way fit (11-14, a32-S26X-F26 B8 / G B6: e4b, e8h, g16i1p1 at 4 / 8 / 16 ways): base + a way each.
+        ways = (j['port_bundles'] or {}).get('count', 0) if isinstance(j['port_bundles'], dict) else 0
+        if 'mem_fold_lut_per_way' in k and ways:
+            mem = k['mem_fold_lut_base'] + k['mem_fold_lut_per_way'] * ways
+            fold_bram = k.get('mem_fold_bram', 0.0) + k.get('mem_fold_bram_per_way', 0.0) * ways
+            mem_what = f'folded memory endpoint ({ways} ways)'
+        else:
+            mem = k['mem_fold_lut']
+            mem_what = 'folded memory endpoint'
     else:
         ports = {m.group(1) for m in (re.match(r'(m_axi_mem_\d+)_', p.get('name', '')) for p in j.get('ports', [])) if m}
         mem = k['mem_port_lut'] * len(ports)
@@ -307,9 +315,9 @@ def kernel_resources(gdir, region):
     cl = sum(c['logic'] for c in ctl)
     cr = sum(c['lutram'] for c in ctl)
     cb = sum(c['bram'] for c in ctl)
-    return dict(lut=k['base_lut'] + mem + cl + cr, lutram=cr, ff=k.get('ff', 0.0), bram=cb,
-                parts={'base': k['base_lut'], mem_what: mem, f'{len(ctl)} controllers': cl + cr,
-                       'controller RAMB36': cb})
+    return dict(lut=k['base_lut'] + mem + cl + cr, lutram=cr, ff=k.get('ff', 0.0), bram=cb + fold_bram,
+                parts=dict({'base': k['base_lut'], mem_what: mem, f'{len(ctl)} controllers': cl + cr,
+                            'controller RAMB36': cb}, **({'endpoint RAMB36': fold_bram} if fold_bram else {})))
 
 
 PARSED = {}
