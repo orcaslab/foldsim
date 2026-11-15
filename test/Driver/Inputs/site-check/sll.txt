@@ -1,0 +1,3 @@
+gen: SLRs SLR1,SLR0
+    slr0 -> SLR1 (named): lut 10 (1 % of the SLR): Top_model
+    slr1 -> SLR0 (named): lut 10 (1 % of the SLR): Leaf

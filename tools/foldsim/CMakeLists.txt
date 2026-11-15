@@ -57,6 +57,8 @@ configure_file(foldsim_locality.py ${CMAKE_BINARY_DIR}/bin/foldsim_locality.py C
 install(PROGRAMS foldsim_locality.py DESTINATION bin)
 configure_file(foldsim_xcheck.py ${CMAKE_BINARY_DIR}/bin/foldsim_xcheck.py COPYONLY)
 install(PROGRAMS foldsim_xcheck.py DESTINATION bin)
+configure_file(foldsim_site_check.py ${CMAKE_BINARY_DIR}/bin/foldsim_site_check.py COPYONLY)
+install(PROGRAMS foldsim_site_check.py DESTINATION bin)
 # The fit calibration database (every synthesis of a netlist against its count) and the bound check of a fold
 # against its region (floor, median, upper bound; per copy against the SLRs; the image's post-synthesis gate).
 configure_file(foldsim_fitdb.py ${CMAKE_BINARY_DIR}/bin/foldsim_fitdb.py COPYONLY)
