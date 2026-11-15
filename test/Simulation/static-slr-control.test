@@ -155,3 +155,22 @@
 # RUN: not foldsim --srcs top.f --top Top --out %t/rams2 --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-sites %t/rams2.json --slr-level 0 Leaf > %t/rams2.log 2>&1
 # RUN: FileCheck %s --check-prefix=RAMS2 < %t/rams2.log
 # RAMS2: slr-groups: no assignment
+# --slr-group-env: each environment channel enters through one register
+# stage in the level and one per group behind a one-token elastic buffer, the
+# reset through one level register (preset): no input port loads more than one
+# SLR. foldsim_locality.py (kernel a region of its own): no refusal, the
+# stages register to registers only; the testbench's stalling environment
+# (random stalls up to 90 %, random power-on state) sees the same tokens.
+# RUN: foldsim --srcs top.f --top Top --out %t/env --static --nest --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env Leaf > %t/env.log 2>&1
+# RUN: FileCheck %s --check-prefix=ENVLOG < %t/env.log
+# ENVLOG: slr-group-env: 1 input and 1 output channels staged
+# ENVLOG-NOT: left as they are
+# RUN: python3 %foldsim_tools/foldsim_locality.py %t/env --out %t/env/l > /dev/null
+# RUN: FileCheck %s --check-prefix=ENVLOC < %t/env/l/locality.txt
+# ENVLOC: L3 global fanout
+# ENVLOC-NOT: REFUSE
+# ENVLOC: %x_env1 (reg, 1 b) over {{.*}} -> level
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/env/obj %S/Inputs/tb_late.sv top.sv %t/env/foldsim_sim.sv > %t/env/build.log 2>&1
+# RUN: %t/env/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 | FileCheck %s
+# RUN: %t/env/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s
+# RUN: %t/env/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +stall=90 | FileCheck %s

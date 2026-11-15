@@ -819,6 +819,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "values end it). Replicas hold their originals' values in every "
            "host cycle: nothing moves. No level register then fans out over "
            "the groups. 0: off">,
+    Option<"slrGroupEnv", "slr-group-env", "bool", "false",
+           "With SLR groups: each environment channel (P_valid / P_<data> / "
+           "P_ready) enters through one register stage in the level and one "
+           "per group (replicated with slr-group-own), behind a one-token "
+           "elastic buffer (credit in, present-and-confirm out), and the "
+           "reset through one level register: no input port loads more than "
+           "one SLR. The same tokens in the same order; host cycles move">,
     Option<"slrGroupReset", "slr-group-reset", "bool", "false",
            "With SLR groups: the simulator's reset registered once in each "
            "group (inside the group's module) and once for the level, so that "

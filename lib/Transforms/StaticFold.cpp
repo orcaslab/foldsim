@@ -900,6 +900,9 @@ public:
   /// not), with their next-value cones, replicated into the group (ops per
   /// closure at most; 0 off).
   unsigned slrGroupOwn = 0;
+  /// `slr-group-env`: the environment's channels and reset enter the
+  /// simulator through one register stage in the level, then one per group.
+  bool slrGroupEnv = false;
   struct LinkCandidate {
     std::tuple<unsigned, unsigned, uint64_t> key;
     /// Its rows and columns in block or ultra RAM (paged as built), and its
@@ -27195,6 +27198,157 @@ LogicalResult StaticFolder::extractGroups() {
       opsOf[attr.getInt()].push_back(&op);
       op.removeAttr(kSlrAttr);
     }
+  // `slr-group-env`: no input port of the simulator loads more than one
+  // SLR. Each environment channel gets a boundary at the simulator's ports:
+  // what the environment drives (an input channel's valid and data, an
+  // output channel's ready) is captured by one register stage in the level
+  // (beside the kernel, --slr-level) and a second that `slr-group-own`
+  // replicates into each group that reads it, so a port drives one
+  // register and that register only registers. Behind the stages, a
+  // one-token elastic buffer keeps the channel's tokens and their order:
+  //  - input channel P (P_valid, P_<data> in, P_ready out): P_ready offers
+  //    room only with the buffer empty and no transfer in the two stages
+  //    (credit), a transfer is pushed two host cycles after it happened, and
+  //    the simulator takes the token from the buffer (valid = full);
+  //  - output channel Q (Q_valid, Q_<data> out, Q_ready in): the simulator
+  //    pushes into the buffer (its ready = empty); the buffer presents its
+  //    token, then waits two host cycles for whether the environment took
+  //    it (Q_valid and Q_ready as presented, through the stages), and pops
+  //    it or presents it again.
+  // The environment sees the same tokens in the same order; only host cycles
+  // move. The handshakes are low while the simulator is in reset.
+  constexpr StringLiteral kEnvStage1 = "foldsim.env_stage1";
+  if (slrGroupEnv) {
+    auto *term = body->getTerminator();
+    OpBuilder b(term);
+    Location loc = simModule.getLoc();
+    Value clk = body->getArgument(0), rst = body->getArgument(1);
+    llvm::StringMap<unsigned> inIdx, outIdx;
+    for (unsigned i = 0, e = simModule.getNumInputPorts(); i < e; ++i)
+      inIdx[simModule.getInputName(i)] = i;
+    for (unsigned i = 0, e = simModule.getNumOutputPorts(); i < e; ++i)
+      outIdx[simModule.getOutputName(i)] = i;
+    auto one = [&]() { return hw::ConstantOp::create(b, loc, b.getI1Type(), 1); };
+    auto notOf = [&](Value v) { return comb::XorOp::create(b, loc, v, one()).getResult(); };
+    auto andOf = [&](ArrayRef<Value> vs) { return comb::AndOp::create(b, loc, ValueRange(vs), false).getResult(); };
+    auto rreg = [&](Value next, const Twine &name) -> seq::FirRegOp {
+      auto type = next.getType();
+      return keep(seq::FirRegOp::create(
+          b, loc, next, clk, b.getStringAttr(name), rst,
+          hw::ConstantOp::create(b, loc, type, 0), hw::InnerSymAttr{},
+          /*isAsync=*/false));
+    };
+    auto stage1 = [&](Value next, const Twine &name) -> seq::FirRegOp {
+      auto r = rreg(next, name + "_env1");
+      r->setAttr(kEnvStage1, UnitAttr::get(context));
+      return r;
+    };
+    auto stage2 = [&](Value next, const Twine &name) -> Value {
+      return rreg(next, name + "_env2");
+    };
+    auto ceReg = [&](Value d, Value en, const Twine &name) -> Value {
+      auto r = seq::CompRegClockEnabledOp::create(
+          b, loc, d.getType(), d, clk, en, b.getStringAttr(name), Value(),
+          Value(), Value(), hw::InnerSymAttr{});
+      sv::addSVAttributes(r, {sv::SVAttributeAttr::get(context, "keep",
+                                                       R"("true")", false)});
+      return r;
+    };
+    auto prefixed = [&](StringRef chan, auto &idx, StringRef skip) {
+      SmallVector<std::pair<StringRef, unsigned>> out;
+      for (auto &e : idx)
+        if (e.getKey().starts_with((chan + "_").str()) && e.getKey() != skip &&
+            !e.getKey().ends_with("_valid") && !e.getKey().ends_with("_ready"))
+          out.push_back({e.getKey(), e.getValue()});
+      llvm::sort(out);
+      return out;
+    };
+    unsigned inChans = 0, outChans = 0;
+    SmallVector<std::string> inNames, outNames;
+    for (auto &e : inIdx)
+      if (e.getKey().ends_with("_valid"))
+        inNames.push_back(e.getKey().str());
+    for (auto &e : outIdx)
+      if (e.getKey().ends_with("_valid"))
+        outNames.push_back(e.getKey().str());
+    llvm::sort(inNames);
+    llvm::sort(outNames);
+    DenseSet<unsigned> taken;
+    // Input channels.
+    for (auto &validName : inNames) {
+      StringRef chan = StringRef(validName).drop_back(6);
+      auto readyIt = outIdx.find((chan + "_ready").str());
+      if (readyIt == outIdx.end())
+        continue;
+      ++inChans;
+      Value v = body->getArgument(inIdx[validName]);
+      Value innerReady = term->getOperand(readyIt->second);
+      auto e1 = stage1(v, chan);
+      auto a1 = stage1(v, chan + "_ready");        // next set below
+      Value e2 = stage2(e1, chan), a2 = stage2(a1, chan + "_ready");
+      Value push = andOf({e2, a2});
+      auto full = rreg(push, chan + "_envfull");   // next set below
+      Value pop = andOf({full, innerReady});
+      full.getNextMutable().assign(comb::OrOp::create(
+          b, loc, push, andOf({full, notOf(pop)})));
+      // Room only with the buffer empty and no offer of the last two host
+      // cycles unresolved (registers of the ready's own, not the stages).
+      auto q1 = rreg(push, chan + "_envoffer1");
+      Value q2 = rreg(q1, chan + "_envoffer2");
+      Value r = andOf({notOf(full), notOf(q1), notOf(q2), notOf(rst)});
+      q1.getNextMutable().assign(r);
+      a1.getNextMutable().assign(r);
+      v.replaceAllUsesExcept(full, e1);
+      for (auto [name, i] : prefixed(chan, inIdx, validName)) {
+        Value d = body->getArgument(i);
+        auto d1 = stage1(d, name);
+        Value data = ceReg(stage2(d1, name), push, name + "_envbuf");
+        d.replaceAllUsesExcept(data, d1);
+        taken.insert(i);
+      }
+      taken.insert(inIdx[validName]);
+      term->setOperand(readyIt->second, r);
+    }
+    // Output channels.
+    for (auto &validName : outNames) {
+      StringRef chan = StringRef(validName).drop_back(6);
+      auto readyIt = inIdx.find((chan + "_ready").str());
+      if (readyIt == inIdx.end())
+        continue;
+      ++outChans;
+      unsigned vi = outIdx[validName];
+      Value y = body->getArgument(readyIt->second);
+      Value innerValid = term->getOperand(vi);
+      auto y1 = stage1(y, chan + "_ready");
+      Value y2 = stage2(y1, chan + "_ready");
+      auto o1 = stage1(y, chan);                   // next set below
+      Value o2 = stage2(o1, chan);
+      Value fired = andOf({o2, y2});
+      auto full = rreg(fired, chan + "_envfull");  // next set below
+      Value push = andOf({innerValid, notOf(full)});
+      full.getNextMutable().assign(comb::OrOp::create(
+          b, loc, push, andOf({full, notOf(fired)})));
+      auto p1 = rreg(fired, chan + "_envshown");    // next set below
+      Value o = andOf({full, notOf(p1), notOf(fired), notOf(rst)});
+      p1.getNextMutable().assign(o);
+      o1.getNextMutable().assign(o);
+      y.replaceAllUsesExcept(notOf(full), y1);
+      term->setOperand(vi, o);
+      for (auto [name, i] : prefixed(chan, outIdx, validName))
+        term->setOperand(i, ceReg(term->getOperand(i), push, name + "_envbuf"));
+      taken.insert(readyIt->second);
+    }
+    SmallVector<std::string> others;
+    for (unsigned i = 2, e = simModule.getNumInputPorts(); i < e; ++i)
+      if (!taken.contains(i) && !body->getArgument(i).use_empty())
+        others.push_back(simModule.getInputName(i).str());
+    llvm::errs() << "foldsim-fold-static: slr-group-env: " << inChans
+                 << " input and " << outChans << " output channels staged";
+    if (!others.empty())
+      llvm::errs() << "; inputs not on a channel, left as they are: "
+                   << llvm::join(others, ", ");
+    llvm::errs() << "\n";
+  }
   // `slr-group-own`: each group owns the level's control it reads. A level
   // register a group reads -- directly or through the level's logic -- is
   // replicated into the group with its next-value cone, and so on back
@@ -27217,7 +27371,9 @@ LogicalResult StaticFolder::extractGroups() {
       return op && op->getBlock() == body && !inGroups.contains(op);
     };
     auto isLevelReg = [&](Operation *op) {
-      return isLevel(op) && isa<seq::FirRegOp, seq::CompRegOp>(op);
+      return isLevel(op) &&
+             isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(op) &&
+             !op->hasAttr(kEnvStage1);
     };
     auto isLevelLogic = [&](Operation *op) {
       return isLevel(op) && op->getNumRegions() == 0 &&
@@ -27279,7 +27435,7 @@ LogicalResult StaticFolder::extractGroups() {
                 reg.setNameAttr(cb.getStringAttr(reg.getName() + "_g" + Twine(g)));
                 keep(reg);
               }
-              if (isa<seq::FirRegOp, seq::CompRegOp>(clone))
+              if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(clone))
                 ++replicatedRegs;
               else
                 ++replicatedOps;
@@ -27393,16 +27549,32 @@ LogicalResult StaticFolder::extractGroups() {
   // moves, and no reset net spans the device. Kept: the registers are equal,
   // and merged they would be one net again.
   Value hostClock = body->getArgument(0), hostReset = body->getArgument(1);
+  Value resetIn = hostReset;
   if (slrGroupReset) {
     DenseSet<Operation *> grouped;
     for (auto &ops : opsOf)
       grouped.insert(ops.begin(), ops.end());
     OpBuilder rb = OpBuilder::atBlockBegin(body);
+    // (`slr-group-env`: hostReset drives one register, in the level, and the
+    // level's and groups' reset registers take that: two host cycles.)
+    if (slrGroupEnv) {
+      // (Their power-on value is reset: hostReset's first host cycle after
+      // configuration reaches them two host cycles late.)
+      auto pre = keep(seq::FirRegOp::create(rb, simModule.getLoc(), hostReset,
+                                            hostClock,
+                                            rb.getStringAttr("reset_pre"),
+                                            hw::InnerSymAttr{},
+                                            rb.getIntegerAttr(rb.getI1Type(), 1)));
+      hostReset.replaceAllUsesExcept(pre, pre);
+      resetIn = pre;
+    }
     auto levelReset = keep(seq::FirRegOp::create(
-        rb, simModule.getLoc(), hostReset, hostClock,
-        rb.getStringAttr("reset_level")));
-    hostReset.replaceUsesWithIf(levelReset, [&](OpOperand &use) {
+        rb, simModule.getLoc(), resetIn, hostClock,
+        rb.getStringAttr("reset_level"), hw::InnerSymAttr{},
+        slrGroupEnv ? rb.getIntegerAttr(rb.getI1Type(), 1) : IntegerAttr()));
+    resetIn.replaceUsesWithIf(levelReset, [&](OpOperand &use) {
       return use.getOwner() != levelReset &&
+             use.getOwner() != resetIn.getDefiningOp() &&
              !grouped.contains(use.getOwner());
     });
     // The host cycle after hostReset falls the simulator is still in reset:
@@ -27464,7 +27636,7 @@ LogicalResult StaticFolder::extractGroups() {
       }
     // (`slr-group-reset`: a group that takes the reset registers it, so it
     // takes the clock too.)
-    bool groupReset = slrGroupReset && isInput.contains(hostReset);
+    bool groupReset = slrGroupReset && isInput.contains(resetIn);
     if (groupReset && isInput.insert(hostClock).second)
       inputs.push_back(hostClock);
     for (auto *op : ops)
@@ -27518,10 +27690,11 @@ LogicalResult StaticFolder::extractGroups() {
         if (auto mapped = map.lookupOrNull(operand.get()))
           operand.set(mapped);
     if (groupReset) {
-      Value groupResetIn = map.lookup(hostReset);
+      Value groupResetIn = map.lookup(resetIn);
       auto groupResetReg = keep(seq::FirRegOp::create(
           gb, simModule.getLoc(), groupResetIn, map.lookup(hostClock),
-          gb.getStringAttr("reset_slr" + Twine(g))));
+          gb.getStringAttr("reset_slr" + Twine(g)), hw::InnerSymAttr{},
+          slrGroupEnv ? gb.getIntegerAttr(gb.getI1Type(), 1) : IntegerAttr()));
       groupResetIn.replaceAllUsesExcept(groupResetReg, groupResetReg);
     }
     SmallVector<Value> results;
@@ -27976,6 +28149,7 @@ void FoldStaticPass::runOnOperation() {
   folder.slrGroupReset = slrGroupReset;
   folder.slrGroupLocal = slrGroupLocal;
   folder.slrGroupOwn = slrGroupOwn;
+  folder.slrGroupEnv = slrGroupEnv;
   folder.slrKept = std::max(1u, unsigned(slrKept));
   for (auto [spec, out, name] :
        {std::tuple{std::string(linkKindGroups), &folder.linkKindGroupCap, "link-kind-groups"},
