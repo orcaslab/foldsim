@@ -509,5 +509,7 @@
    "ff": 0.818
   }
  },
- "uram_cascade_max": 8
+ "uram_cascade_max": 8,
+  "hbm_calibration": "hbm-asl9-20261114.json",
+  "about_hbm_calibration": "11-15 (a32-S26X-C3): the HBM this shell measured on the card (calibrations/, a32-BW 11-14 asl9 run): the state policy's HBM rate and round trip come from it unless --hbm-calibration names another (before: an assumed 640 B a host cycle, about 3x the measured every-SLR-busy 214.6 B)."
 }
