@@ -12529,6 +12529,30 @@ static seq::FirRegOp keep(seq::FirRegOp reg) {
   return reg;
 }
 
+/// A register replicated into SLR group `g` (slr-group-own / -home): named
+/// for its group, without its original's inner symbol, and kept apart from
+/// its equals whatever its kind (synthesis merges equal registers across a
+/// flattened hierarchy).
+static void keepReplica(Operation *clone, unsigned g) {
+  clone->removeAttr("inner_sym");
+  auto *context = clone->getContext();
+  auto suffixed = [&](StringRef name) {
+    return StringAttr::get(context, name + "_g" + Twine(g));
+  };
+  if (auto reg = dyn_cast<seq::FirRegOp>(clone)) {
+    reg.setNameAttr(suffixed(reg.getName()));
+    keep(reg);
+    return;
+  }
+  if (!isa<seq::CompRegOp, seq::CompRegClockEnabledOp>(clone))
+    return;
+  if (auto name = clone->getAttrOfType<StringAttr>("name"))
+    clone->setAttr("name", suffixed(name.getValue()));
+  sv::addSVAttributes(clone, {sv::SVAttributeAttr::get(context, "keep",
+                                                       R"("true")",
+                                                       /*emitAsComment=*/false)});
+}
+
 /// `pp-sync-banks`: a PP bank (a memory read combinationally, its only read's
 /// address, enable and instance clock-enabled registers) whose threaded read
 /// is registered from those registers' next values: the data a host cycle
@@ -27510,7 +27534,8 @@ LogicalResult StaticFolder::extractGroups() {
             groupOf[op] = g;
       SmallVector<std::pair<Operation *, unsigned>> moves;
       for (auto &op : body->without_terminator()) {
-        if (!isLevelReg(&op))
+        // (A register with an inner symbol stays: something may refer to it.)
+        if (!isLevelReg(&op) || op.hasAttr("inner_sym"))
           continue;
         // The instance outputs the next value reads, by group (each output
         // once). The frame decision every register's next value may read
@@ -27560,11 +27585,7 @@ LogicalResult StaticFolder::extractGroups() {
       OpBuilder hb(body->getTerminator());
       for (auto [op, g] : moves) {
         auto *clone = hb.clone(*op);
-        clone->removeAttr("inner_sym");
-        if (auto reg = dyn_cast<seq::FirRegOp>(clone)) {
-          reg.setNameAttr(hb.getStringAttr(reg.getName() + "_g" + Twine(g)));
-          keep(reg);
-        }
+        keepReplica(clone, g);
         op->getResult(0).replaceAllUsesWith(clone->getResult(0));
         op->erase();
         opsOf[g].push_back(clone);
@@ -27599,16 +27620,19 @@ LogicalResult StaticFolder::extractGroups() {
         }
         return order;
       };
+      // (Values whose closure is past the limit: tried once a group.)
+      DenseSet<Value> tooLarge;
       for (unsigned i = 0; i < opsOf[g].size(); ++i) {
         Operation *user = opsOf[g][i];
         for (auto &operand : user->getOpOperands()) {
           Value value = operand.get();
           auto *def = value.getDefiningOp();
-          if (!ownable(def))
+          if (!ownable(def) || tooLarge.contains(value))
             continue;
           if (!local.count(value)) {
             auto order = closure(def);
             if (order.empty()) {
+              tooLarge.insert(value);
               ++left;
               continue;
             }
@@ -27619,11 +27643,7 @@ LogicalResult StaticFolder::extractGroups() {
               if (local.count(op->getResult(0)))
                 continue;
               auto *clone = cb.clone(*op);
-              clone->removeAttr("inner_sym");
-              if (auto reg = dyn_cast<seq::FirRegOp>(clone)) {
-                reg.setNameAttr(cb.getStringAttr(reg.getName() + "_g" + Twine(g)));
-                keep(reg);
-              }
+              keepReplica(clone, g);
               if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(clone))
                 ++replicatedRegs;
               else
