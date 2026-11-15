@@ -852,6 +852,12 @@ def array_reads(path, modules, per_read=None):
         elif op == 'hw.array_create' and res:
             ops = re.findall(SSA, rhs.split(' : ')[0])
             arrays[res[0]] = ('create', sum(1 for o in ops if o not in consts))
+        elif op == 'hw.wire' and res and re.search(r'rom_style" = "\\22block\\22', rhs):
+            # (foldsim-table-roms: a constant table as a rom_style "block" wire, read into a register: a block RAM
+            # ROM, its output register absorbed; no LUTs, its RAMB36 in the kinds' 'rom_bram'.)
+            ops = re.findall(SSA, rhs.split(' : ')[0])
+            if ops and ops[0] in arrays and arrays[ops[0]][0] == 'const':
+                arrays[res[0]] = ('rom',)
         elif op == 'hw.array_get':
             mm = re.search(r'!hw\.array<(\d+)x(.*)>\s*,', rhs)
             idx = re.findall(r'\[(' + SSA + r')\]', rhs)
@@ -860,6 +866,11 @@ def array_reads(path, modules, per_read=None):
                 continue
             n, w = int(mm.group(1)), width(mm.group(2))
             src = arrays.get(ops[0])
+            if src and src[0] == 'rom':
+                out[cur][1]['rom_bram'] = out[cur][1].get('rom_bram', 0.0) + bram_blocks(n, w)
+                if per_read is not None and res:
+                    per_read[(cur, res[0])] = ('rom', 0.0)
+                continue
             if src and src[0] == 'const':
                 kind = 'const'
                 if TABLE_BLOCKS and src[2] is not None and len(src[2]) == n:
