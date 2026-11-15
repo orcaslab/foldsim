@@ -383,6 +383,12 @@ STATE_CAL = None
 # Such a store is priced in its kind and never moved; the choice emits no
 # rule for it (the given one stays the only one).
 GIVEN = None
+# --state-home hybrid (the S26 hybrid): records on chip, rows in HBM, by rule.
+# HYBRID_ROW_BITS: a memory of at least these bits an instance (and that a
+# virtual memory can hold: a registered read) leaves the chip, its rows read
+# on demand; every register store, page and smaller memory stays on chip.
+# None: off.
+HYBRID_ROW_BITS = None
 
 
 # The frame the policy prices (area()'s `ii`): STATE_CAL's logic factors grow with it (frame_factor). The
@@ -498,6 +504,31 @@ def fix_given(units):
         if kind is not None:
             u['fixed'] = kind
             u['given'] = True
+
+
+def hybrid_units(units):
+    """HYBRID_ROW_BITS: each unit's home by the hybrid's rule (the S26
+    hybrid: R26's engine keeps flip-flop records and RAMs below a few kbit in
+    the record, on chip, and fetches larger RAMs' rows from HBM): a memory of
+    at least HYBRID_ROW_BITS an instance that HBM can hold is fixed there; any
+    other store loses the HBM kind, the policy choosing its kind on chip (the
+    records themselves, packed per instance in RAM rows, are --state-in-ram's:
+    a register store priced alone in ultra RAM would take a 72-bit column a
+    register). Given rules (--storage) and units the compiler cannot name stay
+    as they are."""
+    if HYBRID_ROW_BITS is None:
+        return
+    for u in units:
+        if u.get('link') or u.get('given') or u.get('fixed') is not None and u.get('fixed') != 'hbm':
+            continue
+        big = u.get('bits') is not None and u['bits'] >= HYBRID_ROW_BITS
+        if big and 'hbm' in u['costs']:
+            u['fixed'] = 'hbm'
+            continue
+        u['costs'].pop('hbm', None)
+        u.get('per', {}).pop('hbm', None)
+        if u.get('fixed') == 'hbm':
+            u['fixed'] = None
 
 
 def state_units(units, lev=1.0):
@@ -818,7 +849,8 @@ def paged_state(est):
     bits, luts, rest = est['ff'], 0.0, []
     for m in est['mems']:
         (_, d, w, r, _, rl, *_) = m
-        if rl <= 1 and d * w <= PAGE_MEMORY_BITS:
+        if rl <= 1 and d * w <= PAGE_MEMORY_BITS and \
+                not (HYBRID_ROW_BITS is not None and d * w >= HYBRID_ROW_BITS):
             bits += d * w + (w * r if rl == 1 else 0)
             luts += max(r, 1) * w * math.ceil((d - 1) / 3) if d > 1 else 0
         else:
@@ -1185,7 +1217,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             per = []
             for j, t, f, gap in forms:
                 # A paged copy's small memories are rows of its pages.
-                if f == 'paged' and rl <= 1 and d * w <= PAGE_MEMORY_BITS:
+                if f == 'paged' and rl <= 1 and d * w <= PAGE_MEMORY_BITS and \
+                        not (HYBRID_ROW_BITS is not None and d * w >= HYBRID_ROW_BITS):
                     continue
                 th = 1 << (t - 1).bit_length() if t > 1 else 1
                 per.append((j, dict(depth=d * th, width=w, rports=r, wports=wr, rlat=rl,
@@ -1200,6 +1233,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             nameable = named and not re.search(r'[,=:{}\s]', name)
             u = unit(c, name, per, lam, None if nameable else default)
             u['default'] = default
+            u['bits'] = d * w
             if tiers is not None and not tiers.get('as_built') and nameable and \
                     len(per) == len(forms) and all(
                     not storage.vmem_eligible((name, d, w, r, wr, rl, st, mask, named), gap)
@@ -1311,6 +1345,10 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                           storage.HBM_BYTES_PER_CYCLE - tiers.get('base_hbm', 0.0) - built_hbm)
         caps['bubbles'] = max(0.0, storage.BUBBLE_SHARE * tiers['frame'] -
                               tiers.get('base_bubbles', 0.0))
+        if HYBRID_ROW_BITS is not None:
+            # The hybrid's rows leave the chip by rule: their traffic and the
+            # bubbles of their round trips are its H (projected), not a limit.
+            caps['hbm'] = caps['bubbles'] = 1e15
         for u in units:
             if u['store'] == 'pages' and u['class'] in tiers.get('force_pages', ()):
                 u['fixed'] = 'hbm'
@@ -1343,6 +1381,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     calibrate_units(units)
     state_units(units, lev)
     fix_given(units)
+    hybrid_units(units)
     if KERNEL['calibration']:
         # The links' LUTRAM in the base (those no tier chooses) too.
         lk = dict(lk, lutram=lk['lutram'] * KERNEL['calibration']['link_lutram'])

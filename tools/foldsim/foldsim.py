@@ -912,6 +912,8 @@ def state_policy(a, out):
     cap = foldsim_degree.state_policy(calp, budget, region, rf, ram)
     if a.state_home == 'onchip':
         foldsim_degree.storage.ONCHIP_ONLY = True
+    if a.state_home == 'hybrid':
+        foldsim_degree.HYBRID_ROW_BITS = a.hybrid_row_bits
     if a.state_measured:
         if not foldsim_degree.STATE_CAL:
             sys.exit('--state-measured needs a --state-calibration')
@@ -2569,10 +2571,17 @@ def build_parser():
                          'by default), its block and ultra RAM within the region\'s margin of it; a copy over '
                          'moves stores to block or ultra RAM first (registered reads), then to HBM; default '
                          '0.75, 0: none')
-    ap.add_argument('--state-home', choices=('any', 'onchip'), default='any',
+    ap.add_argument('--state-home', choices=('any', 'onchip', 'hybrid'), default='any',
                     help="with --state auto: onchip: the policy never moves state off chip (no virtual memories or "
                          "pages in HBM chosen; the HBM tier's relief is not admissible), e.g. the rule that up to 16 "
-                         "SMs the state lives in block / ultra RAM; any (default): on chip first, then HBM")
+                         "SMs the state lives in block / ultra RAM; any (default): on chip first, then HBM; "
+                         "hybrid (the S26 hybrid, R26's engine): records on chip -- every register store in ultra RAM where "
+                         'it can (read in instance order), pages and memories below --hybrid-row-bits on chip -- and '
+                         'every memory of at least --hybrid-row-bits an instance that HBM can hold (a registered read) '
+                         'as a virtual memory, its rows read from HBM on demand')
+    ap.add_argument('--hybrid-row-bits', type=int, default=4096, metavar='BITS',
+                    help='with --state-home hybrid: the memories of at least BITS an instance go to HBM (default '
+                         '4096: R26, the RAMs of at most 4 kbit stream with the flip-flops)')
     ap.add_argument('--state-region-budget', default='0.65', metavar='FRAC',
                     help="with --state auto and a copy budget: the whole region's LUTs (copies, level, kernel; "
                          'LUTRAM a LUT each, synthesized) at most FRAC of the region\'s, the state moved into block '
