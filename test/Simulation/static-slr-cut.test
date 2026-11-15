@@ -14,7 +14,7 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/cut --static --nest --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 2 --slr-group-cut --slr-group-env Leaf > %t/cut.log 2>&1
 # RUN: FileCheck %s --check-prefix=CUTLOG < %t/cut.log
 # CUTLOG: slr-group-own: {{[0-9]+}} level registers and {{[0-9]+}} level ops replicated into groups, 0 closures left
-# CUTLOG: slr-group-cut: {{[1-9][0-9]*}} values read by the groups from a lead-2 register ({{[0-9]+}} bits, {{[1-9][0-9]*}} group registers, {{[1-9][0-9]*}} lead ops in the level)
+# CUTLOG: slr-group-cut: {{[1-9][0-9]*}} values read by the groups from a lead-2 register ({{[0-9]+}} bits, {{[1-9][0-9]*}} group registers, {{[1-9][0-9]*}} lead ops in the level; {{[0-9]+}} level ops cloned into the groups before them)
 # CUTLOG-NOT: warning: slr-group
 # RUN: FileCheck %s --check-prefix=CUTSV < %t/cut/foldsim_sim.sv
 # CUTSV-LABEL: module foldsim_sim_slr0(
