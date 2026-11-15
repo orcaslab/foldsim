@@ -40,3 +40,12 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/cal --static --min-ii 128 --state auto --state-home hybrid --hybrid-row-bits 512 --hbm-calibration %foldsim_tools/calibrations/hbm-asl9-20261114.json Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=CAL < %t/cal/state.txt
 # CAL: frame 128: projected H {{[0-9]+}} (II 128, HBM 512 bytes a frame = 3 host cycles at 214.6 B, bubbles at most {{[1-9][0-9]+}})
+# Without --hbm-calibration, the region's own (the asl9 region names its card
+# run, hbm_calibration): the same measured rate, not the assumed 640 B; a
+# region without one keeps 640 and says so.
+# RUN: foldsim --srcs top.f --top Top --out %t/reg --static --min-ii 128 --state auto --state-home hybrid --hybrid-row-bits 512 --slr-region %foldsim_tools/foldsim_v80_asl9_slr.json Leaf > %t/reg.log 2>&1
+# RUN: FileCheck %s --check-prefix=CAL < %t/reg/state.txt
+# RUN: not grep -q 'no measured HBM' %t/reg.log
+# RUN: foldsim --srcs top.f --top Top --out %t/noreg --static --min-ii 128 --state auto --state-home hybrid --hybrid-row-bits 512 Leaf > %t/noreg.log 2>&1
+# RUN: FileCheck %s --check-prefix=NOCAL < %t/noreg.log
+# NOCAL: foldsim: state auto: no measured HBM (--hbm-calibration, or a region that names one): the policy assumes 640 B a host cycle

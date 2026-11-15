@@ -917,11 +917,25 @@ def state_policy(a, out):
         foldsim_degree.storage.ONCHIP_ONLY = True
     if a.state_home == 'hybrid':
         foldsim_degree.HYBRID_ROW_BITS = a.hybrid_row_bits
-    if a.hbm_calibration:
+    # The HBM the card measured: --hbm-calibration, else the one the region
+    # names (its `hbm_calibration`, a file of calibrations/: the asl9 shell's
+    # region names its card run). Only a region without a measurement keeps
+    # the policy's assumed 640 B a host cycle and 64-cycle round trip -- about
+    # 3x the measured every-SLR-busy rate (a32-S26X-C3 11-15: the planner
+    # priced HBM traffic at 128 GB/s against 42.9 measured), and says so.
+    hcal = a.hbm_calibration
+    if not hcal and region not in ('', 'v80') and os.path.isfile(region):
+        named = json.load(open(region)).get('hbm_calibration')
+        if named:
+            hcal = named if os.path.isabs(named) else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'calibrations', named)
+    if not hcal and a.state_home == 'hybrid':
+        print('foldsim: state auto: no measured HBM (--hbm-calibration, or a region that names one): the policy '
+              f'assumes {foldsim_degree.storage.HBM_BYTES_PER_CYCLE} B a host cycle', file=sys.stderr)
+    if hcal:
         # The HBM the card measured (calibrations/hbm-*.json): the policy's
         # rate (every SLR's ports at once, `busy`, or `alone`) in bytes a host
         # cycle, and its round trip (the loaded latency when busy) in cycles.
-        hc = json.load(open(a.hbm_calibration))
+        hc = json.load(open(hcal))
         clk = hc.get('clock_hz', 200e6)
         mode = a.hbm_mode
         rate = sum(x[mode]['read_gbs'] for x in hc['slrs'].values()) * 1e9 / clk
