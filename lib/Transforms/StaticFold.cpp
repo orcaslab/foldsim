@@ -27583,6 +27583,49 @@ LogicalResult StaticFolder::extractGroups() {
   // A closure of more than slrGroupOwn ops is left in the level (reported;
   // slr-group-local may still clone its logic). Replicas are kept apart
   // from their originals (`keep`), as synthesis would merge equal registers.
+  // A level memory a group reads (fold-ports-rows' response rows: written by
+  // the level, read by the classes in their groups) cannot be a port of the
+  // group's module: each group that reads it gets its own copy, with the
+  // memory's write ports (the same writes, so the same contents in every
+  // host cycle); the level keeps it for its own reads. With slr-group-own the
+  // writes' operands are then owned like any other the group reads.
+  {
+    DenseSet<Operation *> grouped;
+    for (auto &ops : opsOf)
+      grouped.insert(ops.begin(), ops.end());
+    unsigned copied = 0;
+    for (unsigned g = 0; g < slrGroups; ++g) {
+      DenseMap<Operation *, Operation *> copyOf;
+      OpBuilder mb(body->getTerminator());
+      for (unsigned i = 0, e = opsOf[g].size(); i < e; ++i) {
+        auto read = dyn_cast<seq::FirMemReadOp>(opsOf[g][i]);
+        if (!read)
+          continue;
+        auto mem = read.getMemory().getDefiningOp<seq::FirMemOp>();
+        if (!mem || mem->getBlock() != body || grouped.contains(mem))
+          continue;
+        Operation *&copy = copyOf[mem];
+        if (!copy) {
+          copy = mb.clone(*mem);
+          copy->removeAttr("inner_sym");
+          if (auto name = copy->getAttrOfType<StringAttr>("name"))
+            copy->setAttr("name", StringAttr::get(context, name.getValue() + "_g" + Twine(g)));
+          opsOf[g].push_back(copy);
+          for (auto *user : mem->getUsers())
+            if (isa<seq::FirMemWriteOp>(user)) {
+              auto *w = mb.clone(*user);
+              w->setOperand(0, copy->getResult(0));
+              opsOf[g].push_back(w);
+            }
+          ++copied;
+        }
+        read->setOperand(0, copy->getResult(0));
+      }
+    }
+    if (copied)
+      llvm::errs() << "foldsim-fold-static: " << copied
+                   << " level memories copied into the groups that read them\n";
+  }
   if (slrGroupOwn) {
     DenseSet<Operation *> inGroups;
     for (auto &ops : opsOf)

@@ -52,6 +52,16 @@
 # SP4: {{^}}MATCH 196 cycles in 12129 host cycles
 # SP5: {{^}}MATCH 196 cycles in 69743 host cycles
 # SP8: {{^}}MATCH 196 cycles in 34310 host cycles
+# With SLR groups (the S26 recipe): a group reads the response rows the level
+# writes, so each reading group gets its own copy of every rows memory with its
+# write ports (a memory cannot be a port of the group's module; it crashed
+# canonicalization before); with --slr-group-own / -env too. MATCH.
+# RUN: foldsim --srcs top.f --top Top --out %t/spg --static --nest --modulo --spec-groups mp_0_ack=mp_0_rvalid:mp_0_rdata,mp_1_ack=mp_1_rvalid:mp_1_rdata,mp_2_ack=mp_2_rvalid:mp_2_rdata,mp_3_ack=mp_3_rvalid:mp_3_rdata --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --fold-ports-rows --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env Unit > %t/spg.log 2>&1
+# RUN: FileCheck %s --check-prefix=SPG < %t/spg.log
+# SPG: 4 level memories copied into the groups that read them
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/spg -DSPEC -Mdir %t/spg/obj %S/Inputs/tb_ports.sv top.sv %t/spg/foldsim_sim.sv > %t/spg/build.log 2>&1
+# RUN: %t/spg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 +stall=30 | FileCheck %s
+# RUN: %t/spg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=100 +hi=400 | FileCheck %s
 # SV-DAG: reg ports_held0
 # SV-DAG: reg ports_held3
 # SV-DAG: reg {{.*}}ports_held_count
