@@ -31,7 +31,7 @@ proc fs_dom_enclosing {cell} {
 proc fs_dom_columns {slr axis parent} {
   set prop [expr {$axis eq "y" ? "RPM_Y" : "RPM_X"}]
   set cols [dict create]
-  foreach {kind pat} {lut SLICE* bram RAMB36* uram URAM288* dsp DSP*} {
+  foreach {kind pat} {lut SLICE* lutram SLICEM bram RAMB36* uram URAM288* dsp DSP*} {
     set by [dict create]
     set ss [get_sites -quiet -of_objects [get_slrs $slr] -filter "SITE_TYPE =~ $pat"]
     if {[llength $ss]} {
@@ -78,10 +78,10 @@ proc fs_dom_ranges {sites} {
 proc fs_dom_demand {cell} {
   # One utilization report of the cell (a few seconds even on a full device); its LUT, RAMB36-equivalent, URAM and DSP
   # rows. A row the report lacks counts the leaf cells instead.
-  set d [dict create lut 0 bram 0 uram 0 dsp 0]
+  set d [dict create lut 0 lutram 0 bram 0 uram 0 dsp 0]
   set rpt [report_utilization -quiet -cells [get_cells $cell] -return_string]
   set got 0
-  foreach {k re} {lut {\|\s*CLB LUTs\*?\s*\|\s*(\d+)} bram {\|\s*Block RAM Tile\s*\|\s*([\d.]+)}
+  foreach {k re} {lut {\|\s*CLB LUTs\*?\s*\|\s*(\d+)} lutram {\|\s*LUT as (?:Distributed RAM|Memory)\s*\|\s*(\d+)} bram {\|\s*Block RAM Tile\s*\|\s*([\d.]+)}
                   uram {\|\s*URAM\s*\|\s*(\d+)} dsp {\|\s*DSP[\w ]*\|\s*(\d+)}} {
     if {[regexp $re $rpt -> v]} { dict set d $k [expr {int(ceil($v))}]; incr got }
   }
@@ -109,7 +109,7 @@ proc fs_dom_aff {cell} {
 
 proc fs_dom_stripes {slr cols cells xs parent {pcell ""}} {
   global fs_dom_k fs_dom_min_lut
-  set dem [dict create]; set tot [dict create lut 0 bram 0 uram 0 dsp 0]
+  set dem [dict create]; set tot [dict create lut 0 lutram 0 bram 0 uram 0 dsp 0]
   set big {}
   foreach r $cells {
     set d [fs_dom_demand $r]
@@ -118,7 +118,7 @@ proc fs_dom_stripes {slr cols cells xs parent {pcell ""}} {
     if {[dict get $d lut] < $fs_dom_min_lut} continue
     lappend big $r
     dict set dem $r $d
-    foreach k {lut bram uram dsp} { dict incr tot $k [dict get $d $k] }
+    foreach k {lut lutram bram uram dsp} { dict incr tot $k [dict get $d $k] }
   }
   set cells $big
   if {[llength $cells] < ($parent eq "" ? 2 : 1)} return
@@ -138,8 +138,8 @@ proc fs_dom_stripes {slr cols cells xs parent {pcell ""}} {
   }
   # the share base: the parent's demand (its own logic keeps the rest of its stripe), else the siblings' total
   set base [expr {$parent eq "" ? $tot : $parent}]
-  set cap [dict create lut 0 bram 0 uram 0 dsp 0]
-  foreach x $xs { foreach k {lut bram uram dsp} {
+  set cap [dict create lut 0 lutram 0 bram 0 uram 0 dsp 0]
+  foreach x $xs { foreach k {lut lutram bram uram dsp} {
     if {[dict exists [dict get $cols $k] $x]} { dict incr cap $k [llength [dict get [dict get $cols $k] $x]] } } }
   # Each domain's need: its largest share of the base over the kinds it uses (a URAM-heavy domain needs as many rows
   # as its URAM share, whatever its LUTs); the parent's own logic needs its own largest share. When the needs add up
@@ -148,7 +148,7 @@ proc fs_dom_stripes {slr cols cells xs parent {pcell ""}} {
   set need [dict create]; set sum 0.0
   foreach r $cells {
     set n 0.0
-    foreach k {lut bram uram dsp} {
+    foreach k {lut lutram} {
       set t [dict get $base $k]
       if {$t > 0 && [dict get $cap $k] > 0} { set n [expr {max($n, double([dict get [dict get $dem $r] $k]) / $t)}] }
     }
@@ -156,7 +156,7 @@ proc fs_dom_stripes {slr cols cells xs parent {pcell ""}} {
   }
   if {$parent ne ""} {
     set n 0.0
-    foreach k {lut bram uram dsp} {
+    foreach k {lut lutram} {
       set t [dict get $base $k]; set own $t
       foreach r $cells { set own [expr {$own - [dict get [dict get $dem $r] $k]}] }
       if {$t > 0 && [dict get $cap $k] > 0} { set n [expr {max($n, double(max(0, $own)) / $t)}] }
@@ -185,10 +185,12 @@ proc fs_dom_stripes {slr cols cells xs parent {pcell ""}} {
     lassign $s r rxs d
     set x0 [tcl::mathfunc::min {*}$rxs]; set x1 [tcl::mathfunc::max {*}$rxs]
     set pb [create_pblock fs_dom_pb_[incr fs_dom_k]]
+    # (logic sites of the band; block RAM, ultra RAM and DSP sites of the whole region: a row band holds them only in
+    # proportion, and a RAM-heavy domain next to logic-heavy ones would be short of them -- a pblock past its RAM
+    # capacity stops placement even when soft, Place 30-2958. The RAMs follow their logic.)
     set sites {}
-    foreach kind {lut bram uram dsp} {
-      dict for {x l} [dict get $cols $kind] { if {$x >= $x0 && $x <= $x1} { lappend sites {*}$l } }
-    }
+    dict for {x l} [dict get $cols lut] { if {$x >= $x0 && $x <= $x1} { lappend sites {*}$l } }
+    foreach kind {bram uram dsp} { dict for {x l} [dict get $cols $kind] { lappend sites {*}$l } }
     resize_pblock $pb -add [fs_dom_ranges $sites]
     set encl [fs_dom_enclosing $r]
     if {$encl ne ""} { set_property PARENT [get_property NAME $encl] $pb }
@@ -217,7 +219,7 @@ if {[info exists fs_domain_roots]} {
     set cols [fs_dom_columns $slr [expr {[info exists fs_domain_axis] ? $fs_domain_axis : "x"}] \
                   [expr {[llength $cells] ? [fs_dom_enclosing [lindex $cells 0]] : ""}]]
     set xs {}
-    foreach kind {lut bram uram dsp} { foreach x [dict keys [dict get $cols $kind]] { if {$x >= 0} { lappend xs $x } } }
+    foreach x [dict keys [dict get $cols lut]] { if {$x >= 0} { lappend xs $x } }
     set xs [lsort -integer -unique $xs]
     puts "INFO: foldsim domain pblocks: $slr: sites read ([clock format [clock seconds] -format %T])"
     # a single root: striped inside (its children), else the roots side by side
