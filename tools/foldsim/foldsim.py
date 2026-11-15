@@ -2324,6 +2324,13 @@ def build_parser():
                     help='with --fold-ports: the bundles\' response tokens as rows of one memory (bundle, frame), read '
                          'at the reading instance\'s bundle; a held bit per bundle and one counter instead of token, '
                          'frame and previous-frame registers per bundle and field (foldsim-fold-static fold-ports-rows)')
+    ap.add_argument('--index-class-inputs', action='store_true',
+                    help='a class\'s array input that the class reads only at indices it computes (a crossbar '
+                         'arbiter\'s data_in[grant]) becomes an index output and an element input per read; the '
+                         'simulator reads that element in the evaluation\'s host cycle (with --fold-ports-rows: one '
+                         'rows read per index), not the whole array per instance (foldsim-index-class-inputs)')
+    ap.add_argument('--index-min-elements', type=int, default=4, metavar='N',
+                    help='with --index-class-inputs: arrays of at least N elements')
     ap.add_argument('--fold-ports-reset', default='reset', metavar='INPUT',
                     help='with --fold-ports: the netlist input whose frame token rides on each request record')
     ap.add_argument('--link-kind-cost', action='store_true',
@@ -2966,6 +2973,8 @@ def main():
         passes.append(f'hw.module(comb-balance-mux{{mux-chain-threshold={a.balance_mux}}})')
     if a.compress_adds:
         passes.append(f'hw.module(foldsim-compress-add-trees{{min-operands={a.compress_adds}}})')
+    if getattr(a, 'index_class_inputs', False):
+        passes.append(f'foldsim-index-class-inputs{{module={a.top} min-elements={a.index_min_elements} verbose}}')
     compose = f'module={a.top} sim=foldsim_sim'
     # With registered state the next thread is picked a host cycle earlier, from
     # inputs a cycle older: on classes of 16 threads that costs 37.5 % more host

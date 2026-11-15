@@ -1753,6 +1753,48 @@ def LowerWideNegation : Pass<"foldsim-lower-wide-negation",
   let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
 }
 
+def IndexClassInputs : Pass<"foldsim-index-class-inputs", "::mlir::ModuleOp"> {
+  let summary = "A model's array input read only at indices: an index output and an element input per read";
+  let description = [{
+    For each model that the netlist `module` instantiates (and nothing else
+    does), at least `min-instances` times: an input of type
+    `!hw.array<N x iW>` (N a power of two, at least `min-elements`) whose
+    every use is a read -- `hw.array_get` of the input, or of constant,
+    in-range `hw.array_slice`s of it, at an index the model computes, of a
+    power-of-two array -- and that has fewer reads than elements, and (with
+    `inputs-only`) that every instance drives with wiring of the netlist's
+    inputs and constants. Each read becomes an output `<input>_index<r>`
+    (the element's index in the whole array: the slices' low indices plus
+    the get's) and an input `<input>_at<r>` (the element), which every
+    instance's netlist drives with `hw.array_get` of the array it passed at
+    that index output; the array input is erased. Exact: the model and the
+    netlist compute the same values on every cycle (an index of a
+    power-of-two array is always in range). The netlist then has a
+    combinational path out of the instance and back in, through no logic of
+    the model's (the element feeds nothing the index reads).
+
+    For a folded simulator (`foldsim-fold-static`): a crossbar's port
+    arbiters each read every bank's data (a class input of N elements per
+    instance, held for every instance) but use one element per read; with
+    this rewrite the simulator reads that element, at the index the class's
+    evaluation computes, in the same host cycle -- one read per index, the
+    banks' storage independent of the readers.
+  }];
+  let options = [
+    Option<"module", "module", "std::string", "\"\"",
+           "The netlist (the module that instantiates the models)">,
+    Option<"minElements", "min-elements", "unsigned", "4",
+           "Arrays of at least this many elements">,
+    Option<"minInstances", "min-instances", "unsigned", "1",
+           "Models of at least this many instances">,
+    Option<"inputsOnly", "inputs-only", "bool", "true",
+           "Only arrays driven by the netlist's inputs and constants">,
+    Option<"verbose", "verbose", "bool", "false",
+           "Print each input rewritten">,
+  ];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
+}
+
 def NarrowShiftAmounts : Pass<"foldsim-narrow-shift-amounts",
                               "::circt::hw::HWModuleOp"> {
   let summary = "Shift amounts narrowed to log2 of the width";
