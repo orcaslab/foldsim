@@ -618,6 +618,9 @@ def copy_cap_pools(units, caps, base, copy_logic=None, region_luts=0.0):
                     c['lut@region'] = c.get('lut', 0.0) + c.get('lutram', 0.0)
 
 
+VPORT_DROPIN_SCALE = 192.9 / 269.8
+
+
 def read_built(path):
     """BUILT from a foldsim_sim.json (and its foldsim_sim.vh /
     foldsim_kernel.vh): dict(controllers=[...], logic, lutram, bram, forward,
@@ -635,6 +638,11 @@ def read_built(path):
     m = re.search(r'FOLDSIM_MEM_MASTERS (\d+)', vh) or re.search(r'FOLDSIM_MEM_PORTS (\d+)', vh)
     ports = int(m.group(1)) if m else None
     ctls = j.get('vmem_groups') or j.get('vmem') or []
+    # The drop-in static port (--vmem-controller vport, FOLDSIM_VMEM_VPORT: foldsim_vport_ctl in each controller's
+    # place, in order, one AXI id, counter fences, no host cache or write buffer): its controllers at
+    # VPORT_DROPIN_SCALE of the dynamic controller's logic and LUTRAM (a32-VA 11-11, yosys of all 86 controllers of
+    # y64d1/y128d1 with row-bucket fences and known-zero answers: 269.8k -> 192.9k LUT), no host-cache RAM.
+    dropin = 'FOLDSIM_VMEM_VPORT' in vh
     save = storage.CTL_FORWARD
     storage.CTL_FORWARD = forward
     out = dict(controllers=[], logic=0.0, lutram=0.0, bram=0.0, forward=forward, mem_ports=ports,
@@ -645,8 +653,10 @@ def read_built(path):
         kz = 0
         if c.get('known_zero'):
             kz = -(-((1 << c['row_width']) * c['instances']) // (1 << c.get('kz_shift', 0)))
-        x = storage.ctl_cost(kind, c['data_width'], c.get('cache_rows', 0) or 0, c.get('size', 1) or 1,
-                             kz=kz)
+        x = storage.ctl_cost(kind, c['data_width'], 0 if dropin else (c.get('cache_rows', 0) or 0),
+                             c.get('size', 1) or 1, kz=kz)
+        if dropin:
+            x = dict(x, logic=x['logic'] * VPORT_DROPIN_SCALE, lutram=x['lutram'] * VPORT_DROPIN_SCALE)
         out['controllers'].append(dict(kind=kind, dw=c['data_width'], cache_rows=c.get('cache_rows', 0), **x))
         out['counts'][kind] = out['counts'].get(kind, 0) + 1
         for key in ('logic', 'lutram', 'bram'):
