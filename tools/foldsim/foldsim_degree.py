@@ -407,10 +407,14 @@ def state_factors(c):
     """STATE_CAL's (logic, LUTRAM) factors of a class (its copies' model), the logic's at the frame priced."""
     if not STATE_CAL:
         return 1.0, 1.0
-    m = (STATE_CAL.get('classes') or {}).get(re.sub(r'_copy\d+$', '', c))
+    model = re.sub(r'_copy\d+$', '', c)
+    m = (STATE_CAL.get('classes') or {}).get(model)
     if m:
         return m['logic'], m['lutram']
-    return STATE_CAL.get('copy_logic', 1.0) * frame_factor(), STATE_CAL.get('copy_lutram', 1.0)
+    # `class_scale`: a class's own factor on both, where a calibration measured its copies against the SLR check
+    # (B12b: the 16-SM netlist counts).
+    s = (STATE_CAL.get('class_scale') or {}).get(model, 1.0)
+    return STATE_CAL.get('copy_logic', 1.0) * frame_factor() * s, STATE_CAL.get('copy_lutram', 1.0) * s
 
 
 def state_kernel():
@@ -1030,6 +1034,9 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     STATE_FRAME = STATE_II or ii or None
     lev = STATE_CAL.get('level', 1.0) * frame_factor() if STATE_CAL else 1.0
     logic *= lev
+    if STATE_CAL and STATE_CAL.get('level_measured'):
+        # (--state-measured: the level as the same recipe's SLR check counted it, in place of the estimate.)
+        logic = STATE_CAL['level_measured']
     kernel_uram = kernel_bram = 0.0
     if STATE_CAL:
         kl, klr, kb = state_kernel()

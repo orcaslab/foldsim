@@ -865,7 +865,11 @@ def choose_pages(a, foldsim_opt, flat, passes, out, fold):
 # (foldsim_degree.STATE_CAL: fitted on the 8-SM y8b image's post-synthesis
 # hierarchy, foldsim_degree.py state-fit).
 STATE_CALIBRATION = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'calibrations',
-                                 'state-v80-y8b-20261113.json')
+                                 'state-v80-s26b-20261115.json')
+
+
+# The SLR check's by-part scales of the region json (netlist_scales.copy, placed_per_synthesized.lut), set by state_policy.
+REGION_SCALES = {}
 
 
 def state_measured(path, cal):
@@ -878,6 +882,12 @@ def state_measured(path, cal):
     prev = json.load(open(os.path.join(path, 'state.json')))
     counted = foldsim_degree.count_copies(os.path.join(path, 'foldsim_sim.mlir'))
     k = (cal or {}).get('count_to_synth', 1.0)
+    kl = kr = k
+    # (a32-S26X-F26 B12b) With the SLR check's by-part scales (its region's netlist_scales and placed per synthesized),
+    # the copies as the check counts them, so that the closed loop agrees with the check that judges the image.
+    region = REGION_SCALES.get('copy')
+    if region:
+        kl, kr = region['logic'] * REGION_SCALES.get('placed', 1.0), region['lutram'] * REGION_SCALES.get('placed', 1.0)
     sums = {}
     for key, v in prev['copies'].items():
         c = key.rpartition('#')[0]
@@ -885,8 +895,8 @@ def state_measured(path, cal):
             continue
         model = re.sub(r'_copy\d+$', '', c)
         x = sums.setdefault(model, [0.0, 0.0, 0.0, 0.0])
-        x[0] += (counted[c]['lut'] - counted[c]['lutram']) * k
-        x[1] += counted[c]['lutram'] * k
+        x[0] += (counted[c]['lut'] - counted[c]['lutram']) * kl
+        x[1] += counted[c]['lutram'] * kr
         x[2] += v['logic'] + v['store_lut']
         x[3] += v['store_lutram']
     out = {}
@@ -913,9 +923,26 @@ def state_policy(a, out):
     if a.state_home == 'onchip':
         foldsim_degree.storage.ONCHIP_ONLY = True
     if a.state_measured:
+        try:
+            rj = json.load(open(a.slr_region if a.slr_region not in ('', 'v80') else
+                                os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')))
+            if rj.get('netlist_scales', {}).get('copy'):
+                REGION_SCALES.update(copy=rj['netlist_scales']['copy'],
+                                     placed=rj.get('placed_per_synthesized', {}).get('lut', 1.0))
+        except (OSError, ValueError):
+            pass
         if not foldsim_degree.STATE_CAL:
             sys.exit('--state-measured needs a --state-calibration')
         foldsim_degree.STATE_CAL['classes'] = state_measured(a.state_measured, foldsim_degree.STATE_CAL)
+        # The simulator level as that generation's SLR check counted it (its sll.json: the level and the kernel beside
+        # it, less the kernel): the level's own logic (S26: the groups' replicated control, the environment's stages,
+        # the folded bundles' tokens) the class estimates cannot see (a32-S26X-F26 B12b).
+        sj = os.path.join(a.state_measured, 'sll', 'sll.json')
+        if os.path.exists(sj):
+            j = json.load(open(sj))
+            lv = (j.get('top') or {}).get('lut', 0.0) - (j.get('top_kernel') or {}).get('lut', 0.0)
+            if lv > 0:
+                foldsim_degree.STATE_CAL['level_measured'] = lv
     if a.storage and a.storage != 'auto':
         foldsim_degree.GIVEN = foldsim_degree.given_rules(a.storage)
     return ('calibration ' + (os.path.basename(calp) if calp else 'none')
@@ -923,6 +950,7 @@ def state_policy(a, out):
             + (f", region {cap['region_lut']:.0f} LUTs (x{cap['region_frac']:g})" if cap and cap.get('region_lut') else '')
             + (f", region RAM x{cap['region_ram']:g}" if cap and cap.get('region_ram') else '')
             + (f", measured {a.state_measured}" if a.state_measured else '')
+            + (f" (level {foldsim_degree.STATE_CAL['level_measured']:.0f} LUTs)" if foldsim_degree.STATE_CAL and foldsim_degree.STATE_CAL.get('level_measured') else '')
             + (', state on chip only' if a.state_home == 'onchip' else ''))
 
 
@@ -2573,7 +2601,7 @@ def build_parser():
     ap.add_argument('--state-calibration', default='', metavar='JSON|none',
                     help="with --state auto: the area model's calibration to synthesized LUTs (copies' logic "
                          'and LUTRAM, the level, the kernel beside the simulator: foldsim_degree.py state-fit; '
-                         'default calibrations/state-v80-y8b-20261113.json)')
+                         'default calibrations/state-v80-s26b-20261115.json: the 11-14 fit, per-class scales)')
     ap.add_argument('--state-measured', default='', metavar='DIR',
                     help='with --state auto: per class factors from a generation of the same recipe (its out '
                          'dir: state.json and foldsim_sim.mlir), its copies as counted against as priced')
