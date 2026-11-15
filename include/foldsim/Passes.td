@@ -1763,7 +1763,11 @@ def IndexClassInputs : Pass<"foldsim-index-class-inputs", "::mlir::ModuleOp"> {
     in-range `hw.array_slice`s of it, at an index the model computes, of a
     power-of-two array -- and that has fewer reads than elements, and (with
     `inputs-only`) that every instance drives with wiring of the netlist's
-    inputs and constants. Each read becomes an output `<input>_index<r>`
+    inputs and constants (else: and of the outputs of at most
+    `max-producers` instances -- default 1: a folded simulator reads a
+    multi-instance producer's elements from a link of every producer
+    instance, uncompacted, which costs more than the read registers it
+    saves; measured at 32 SMs, l2fs: +343k link memory bits for -4k FF). Each read becomes an output `<input>_index<r>`
     (the element's index in the whole array: the slices' low indices plus
     the get's) and an input `<input>_at<r>` (the element), which every
     instance's netlist drives with `hw.array_get` of the array it passed at
@@ -1789,6 +1793,9 @@ def IndexClassInputs : Pass<"foldsim-index-class-inputs", "::mlir::ModuleOp"> {
            "Models of at least this many instances">,
     Option<"inputsOnly", "inputs-only", "bool", "true",
            "Only arrays driven by the netlist's inputs and constants">,
+    Option<"maxProducers", "max-producers", "unsigned", "1",
+           "With inputs-only=false: arrays of the outputs of at most this many "
+           "instances (in each instance's array)">,
     Option<"verbose", "verbose", "bool", "false",
            "Print each input rewritten">,
   ];

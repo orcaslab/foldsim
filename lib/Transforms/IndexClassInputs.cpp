@@ -51,8 +51,9 @@ struct IndexClassInputsPass
   void runOnOperation() override;
 };
 
-/// Whether `value` is wiring of the netlist's inputs and constants.
-static bool wiringOfInputs(Value value) {
+/// Whether `value` is wiring of the netlist's inputs and constants, and (with
+/// `instances`) of the outputs of instances, which it collects.
+static bool wiringOf(Value value, DenseSet<Operation *> *instances = nullptr) {
   SmallVector<Value> stack{value};
   DenseSet<Value> seen;
   while (!stack.empty()) {
@@ -64,6 +65,10 @@ static bool wiringOfInputs(Value value) {
     auto *op = v.getDefiningOp();
     if (isa<hw::ConstantOp, hw::AggregateConstantOp>(op))
       continue;
+    if (instances && isa<hw::InstanceOp>(op)) {
+      instances->insert(op);
+      continue;
+    }
     if (!isa<comb::ExtractOp, comb::ConcatOp, comb::ReplicateOp, hw::BitcastOp>(op))
       return false;
     for (auto operand : op->getOperands())
@@ -150,8 +155,13 @@ void IndexClassInputsPass::runOnOperation() {
       auto found = readsOf(arg);
       if (!found || found->size() >= type.getNumElements())
         continue;
-      if (inputsOnly && !llvm::all_of(instances, [&](hw::InstanceOp instance) {
-            return wiringOfInputs(instance.getOperand(i));
+      // The array: the netlist's inputs and constants, or (inputs-only=false)
+      // outputs of at most `max-producers` instances besides.
+      if (!llvm::all_of(instances, [&](hw::InstanceOp instance) {
+            DenseSet<Operation *> producers;
+            if (!wiringOf(instance.getOperand(i), inputsOnly ? nullptr : &producers))
+              return false;
+            return producers.size() <= maxProducers;
           }))
         continue;
       unsigned n = type.getNumElements(), w = llvm::Log2_64(n);
