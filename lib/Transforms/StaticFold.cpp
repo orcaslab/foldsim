@@ -904,6 +904,10 @@ public:
   /// reads one group's instance outputs through logic is moved into that
   /// group (its home); the others read it there.
   bool slrGroupHome = false;
+  /// `slr-group-cut`: with slr-group-own, a group's read whose closure is
+  /// past the limit is broadcast from a register of its value two host
+  /// cycles ahead (lead 2) instead of left in the level.
+  bool slrGroupCut = false;
   /// `slr-group-env`: the environment's channels and reset enter the
   /// simulator through one register stage in the level, then one per group.
   bool slrGroupEnv = false;
@@ -27626,6 +27630,13 @@ LogicalResult StaticFolder::extractGroups() {
       llvm::errs() << "foldsim-fold-static: " << copied
                    << " level memories copied into the groups that read them\n";
   }
+  // `slr-group-cut`: the values whose closure is past the limit, by value,
+  // with each reading group's register of them.
+  struct Cut {
+    std::string name;
+    SmallVector<std::pair<unsigned, seq::FirRegOp>> regs;
+  };
+  llvm::MapVector<Value, Cut> cuts;
   if (slrGroupOwn) {
     DenseSet<Operation *> inGroups;
     for (auto &ops : opsOf)
@@ -27786,6 +27797,29 @@ LogicalResult StaticFolder::extractGroups() {
                 if (k++ < 12)
                   llvm::errs() << " " << n << " x" << c;
               llvm::errs() << "\n";
+            }
+            // `slr-group-cut`: the group takes the value from a register of
+            // its own, loaded below (once the level's reset is in place)
+            // from a level register of the value two host cycles ahead.
+            if (order.empty() && slrGroupCut && hw::getBitWidth(value.getType()) > 0 &&
+                isa<IntegerType>(value.getType())) {
+              Location loc = simModule.getLoc();
+              auto &entry = cuts[value];
+              if (entry.name.empty()) {
+                entry.name = isa<seq::FirRegOp>(def) ? cast<seq::FirRegOp>(def).getName().str()
+                                                     : "cut" + std::to_string(cuts.size() - 1);
+              }
+              auto zero = hw::ConstantOp::create(cb, loc, value.getType(), 0);
+              auto reg = seq::FirRegOp::create(
+                  cb, loc, zero, body->getArgument(0),
+                  cb.getStringAttr(entry.name + "_cut_g" + Twine(g)));
+              keep(reg);
+              entry.regs.push_back({g, reg});
+              opsOf[g].push_back(reg);
+              inGroups.insert(reg);
+              local[value] = reg;
+              operand.set(reg);
+              continue;
             }
             if (order.empty()) {
               tooLarge.insert(value);
@@ -27979,6 +28013,259 @@ LogicalResult StaticFolder::extractGroups() {
       output->setOperand(i, comb::AndOp::create(ob, simModule.getLoc(),
                                                 operand, running));
     }
+  }
+  // `slr-group-cut` (S26X, a32-S26X-C3): a value V a group reads whose
+  // closure is past slr-group-own's limit. Its lead L2(V) -- V two host
+  // cycles ahead -- is built in the level by the next-value rule applied
+  // twice: Lk(register r) = mux(L(k-1)(reset), L(k-1)(reset value),
+  // L(k-1)(next)) (a clock enable as a mux to L(k-1)(r)), Lk(logic f(a, ..))
+  // = f(Lk(a), ..), L0(x) = x, constants their own lead. A level register S
+  // takes L2(V); each reading group's register G takes S:
+  // G(t) = S(t-1) = L2(V)(t-2) = V(t). One copy of the cone (in the level),
+  // a register a group, both ends of the crossing registered; no value or
+  // host cycle moves. It runs after the reset is in place: the level's reset
+  // register (slr-group-reset; with slr-group-env two of them) is what lets a
+  // register's lead read the reset a host cycle ahead. A lead that reaches a
+  // port, an instance output, a memory read or a group's value before its
+  // last register stage is not built: the group reads V as it is (reported).
+  // FOLDSIM_CUT_LEAD (a test hook): another lead (1: a mutant one host cycle
+  // late).
+  if (!cuts.empty()) {
+    DenseSet<Operation *> grouped;
+    for (auto &ops : opsOf)
+      grouped.insert(ops.begin(), ops.end());
+    auto isLevelOp = [&](Operation *op) {
+      return op->getBlock() == body && !grouped.contains(op);
+    };
+    auto isLevelLogicOp = [&](Operation *op) {
+      return isLevelOp(op) && op->getNumRegions() == 0 &&
+             !isa<hw::ConstantOp>(op) && !isa<hw::InstanceOp, hw::OutputOp>(op) &&
+             op->getDialect()->getNamespace() != "seq" &&
+             op->getDialect()->getNamespace() != "sv" &&
+             mlir::isMemoryEffectFree(op);
+    };
+    OpBuilder lb(body->getTerminator());
+    Location loc = simModule.getLoc();
+    unsigned lead = 2;
+    if (const char *e = getenv("FOLDSIM_CUT_LEAD"))
+      lead = std::max(1, atoi(e));
+    using Key = std::pair<Value, unsigned>;
+    DenseMap<Key, Value> memo;              // null: no lead
+    DenseMap<std::pair<Operation *, unsigned>, Operation *> clonedAt;
+    std::map<std::string, unsigned> why;    // the first leaf each failure met
+    std::map<std::string, std::string> whyExample;
+    uint64_t leadOps = 0;
+    constexpr uint64_t kMaxLeadOps = 4u << 20;
+    // A level register the leads read as it is, that also feeds the
+    // groups (an environment channel's first stage, the reset's): the leads
+    // read a copy of their own (the same next value and reset, kept apart),
+    // so the register's fanout over the SLRs stays registers only.
+    DenseMap<Value, Value> privateOf;
+    auto asIs = [&](Value v) -> Value {
+      auto *op = v.getDefiningOp();
+      if (!op || !isLevelOp(op) ||
+          !isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(op))
+        return v;
+      bool shared = v == resetIn || llvm::any_of(op->getUsers(), [&](Operation *u) {
+                      return grouped.contains(u);
+                    });
+      if (!shared)
+        return v;
+      Value &copy = privateOf[v];
+      if (!copy) {
+        auto *clone = lb.clone(*op);
+        clone->removeAttr("inner_sym");
+        if (auto reg = dyn_cast<seq::FirRegOp>(clone)) {
+          reg.setNameAttr(lb.getStringAttr(reg.getName() + "_leadsrc"));
+          keep(reg);
+        } else {
+          if (auto name = clone->getAttrOfType<StringAttr>("name"))
+            clone->setAttr("name", lb.getStringAttr(name.getValue() + "_leadsrc"));
+          sv::addSVAttributes(clone, {sv::SVAttributeAttr::get(context, "keep", R"("true")",
+                                                               /*emitAsComment=*/false)});
+        }
+        copy = clone->getResult(0);
+      }
+      return copy;
+    };
+    auto leadOf = [&](Value root, unsigned depth) -> Value {
+      struct Item {
+        Value value;
+        unsigned k;
+        bool expanded;
+      };
+      auto known = [&](Value v, unsigned k) { return k == 0 || memo.count({v, k}); };
+      auto get = [&](Value v, unsigned k) { return k == 0 ? asIs(v) : memo.lookup({v, k}); };
+      SmallVector<Item> stack{{root, depth, false}};
+      while (!stack.empty()) {
+        Item item = stack.pop_back_val();
+        Value v = item.value;
+        unsigned k = item.k;
+        if (!item.expanded && known(v, k))
+          continue;
+        Operation *op = v.getDefiningOp();
+        auto fail = [&](StringRef kind, const Twine &example) {
+          memo[{v, k}] = Value();
+          if (!why[kind.str()]++)
+            whyExample[kind.str()] = example.str();
+        };
+        if (!op) {
+          auto arg = cast<BlockArgument>(v);
+          fail("a port", simModule.getInputName(arg.getArgNumber()));
+          continue;
+        }
+        if (isa<hw::ConstantOp, hw::AggregateConstantOp>(op)) {
+          memo[{v, k}] = v;
+          continue;
+        }
+        // What the lead of v at k reads: (value, lead) pairs.
+        SmallVector<Key, 6> deps;
+        Value next, reset, resetValue, enable;
+        bool isReg = false;
+        if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
+          if (!isLevelOp(op) || reg.getIsAsync() || reg.getClk() != hostClock) {
+            fail(isLevelOp(op) ? "an async or other-clock register" : "a group's register",
+                 reg.getName());
+            continue;
+          }
+          isReg = true;
+          next = reg.getNext();
+          reset = reg.getReset();
+          resetValue = reg.getResetValue();
+        } else if (auto reg = dyn_cast<seq::CompRegOp>(op)) {
+          if (!isLevelOp(op) || reg.getClk() != hostClock) {
+            fail("a group's or other-clock register", reg.getName().value_or(""));
+            continue;
+          }
+          isReg = true;
+          next = reg.getInput();
+          reset = reg.getReset();
+          resetValue = reg.getResetValue();
+        } else if (auto reg = dyn_cast<seq::CompRegClockEnabledOp>(op)) {
+          if (!isLevelOp(op) || reg.getClk() != hostClock) {
+            fail("a group's or other-clock register", reg.getName().value_or(""));
+            continue;
+          }
+          isReg = true;
+          next = reg.getInput();
+          enable = reg.getClockEnable();
+          reset = reg.getReset();
+          resetValue = reg.getResetValue();
+        } else if (!isLevelLogicOp(op)) {
+          StringRef kind = isa<hw::InstanceOp>(op)          ? "an instance output"
+                           : isa<seq::FirMemReadOp>(op)     ? "a memory read"
+                           : !isLevelOp(op)                 ? "a group's value"
+                                                            : "an op of no lead";
+          fail(kind, op->getName().getStringRef());
+          continue;
+        }
+        if (isReg) {
+          deps.push_back({next, k - 1});
+          if (enable) {
+            deps.push_back({enable, k - 1});
+            deps.push_back({v, k - 1});
+          }
+          if (reset) {
+            deps.push_back({reset, k - 1});
+            deps.push_back({resetValue, k - 1});
+          }
+        } else {
+          for (Value o : op->getOperands())
+            deps.push_back({o, k});
+        }
+        if (!item.expanded) {
+          stack.push_back({v, k, true});
+          for (auto [d, dk] : deps)
+            if (!known(d, dk))
+              stack.push_back({d, dk, false});
+          continue;
+        }
+        if (llvm::any_of(deps, [&](Key d) { return !get(d.first, d.second); })) {
+          memo[{v, k}] = Value();
+          continue;
+        }
+        if (++leadOps > kMaxLeadOps) {
+          fail("the op limit", Twine(kMaxLeadOps));
+          continue;
+        }
+        if (isReg) {
+          Value r = get(next, k - 1);
+          if (enable)
+            r = comb::MuxOp::create(lb, loc, get(enable, k - 1), r, get(v, k - 1));
+          if (reset)
+            r = comb::MuxOp::create(lb, loc, get(reset, k - 1), get(resetValue, k - 1), r);
+          memo[{v, k}] = r;
+          continue;
+        }
+        bool same = llvm::all_of(op->getOperands(), [&](Value o) { return get(o, k) == o; });
+        if (same) {
+          memo[{v, k}] = v;
+          continue;
+        }
+        Operation *&clone = clonedAt[{op, k}];
+        if (!clone) {
+          IRMapping mapping;
+          for (Value o : op->getOperands())
+            mapping.map(o, get(o, k));
+          clone = lb.clone(*op, mapping);
+          clone->removeAttr("inner_sym");
+        }
+        memo[{v, k}] = clone->getResult(cast<OpResult>(v).getResultNumber());
+      }
+      return get(root, depth);
+    };
+    unsigned built = 0, failed = 0, groupRegs = 0;
+    uint64_t bits = 0;
+    std::vector<std::string> failedNames;
+    for (auto &[value, cut] : cuts) {
+      Value led = leadOf(value, lead);
+      if (!led) {
+        // The groups read the value as it is (as without the option).
+        ++failed;
+        if (failedNames.size() < 8)
+          failedNames.push_back(cut.name);
+        for (auto &[g, reg] : cut.regs) {
+          reg.getResult().replaceAllUsesWith(value);
+          llvm::erase(opsOf[g], reg.getOperation());
+          Operation *zero = reg.getNext().getDefiningOp();
+          reg.erase();
+          if (zero && zero->use_empty())
+            zero->erase();
+        }
+        continue;
+      }
+      auto source = keep(seq::FirRegOp::create(lb, loc, led, hostClock,
+                                               lb.getStringAttr(cut.name + "_lead")));
+      for (auto &[g, reg] : cut.regs) {
+        Operation *zero = reg.getNext().getDefiningOp();
+        reg.getNextMutable().assign(source);
+        if (zero && zero->use_empty()) {
+          llvm::erase(opsOf[g], zero);
+          zero->erase();
+        }
+        ++groupRegs;
+      }
+      ++built;
+      bits += hw::getBitWidth(value.getType());
+    }
+    llvm::errs() << "foldsim-fold-static: slr-group-cut: " << built
+                 << " values read by the groups from a lead-" << lead
+                 << " register (" << bits << " bits, " << groupRegs
+                 << " group registers, " << leadOps << " lead ops in the level)";
+    if (failed) {
+      llvm::errs() << ", " << failed << " without a lead (read as they are:";
+      for (auto &n : failedNames)
+        llvm::errs() << " " << n;
+      llvm::errs() << "; leaves:";
+      for (auto &[kind, n] : why)
+        llvm::errs() << " " << kind << " x" << n << " (" << whyExample[kind] << ")";
+      llvm::errs() << ")";
+    }
+    llvm::errs() << "\n";
+    if (failed)
+      llvm::errs() << "foldsim-fold-static: warning: slr-group-cut: " << failed
+                   << " values without a lead stay in the level: the level control "
+                      "they read fans out over the SLR groups unregistered\n";
   }
   // A name for the port of a value: its op's name, if any.
   auto nameOf = [&](Value value) -> std::string {
@@ -28532,6 +28819,7 @@ void FoldStaticPass::runOnOperation() {
   folder.slrGroupLocal = slrGroupLocal;
   folder.slrGroupOwn = slrGroupOwn;
   folder.slrGroupHome = slrGroupHome;
+  folder.slrGroupCut = slrGroupCut;
   gUramCascadeMax = uramCascadeMax;
   folder.slrGroupEnv = slrGroupEnv;
   folder.slrKept = std::max(1u, unsigned(slrKept));
