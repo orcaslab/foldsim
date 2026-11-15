@@ -96,6 +96,15 @@
 # OWN0: REFUSE control   %pos0
 # RUN: python3 %foldsim_tools/foldsim_locality.py %t/own --out %t/own/l --kernel-slr SLR0 > /dev/null
 # RUN: FileCheck %s --check-prefix=OWN < %t/own/l/locality.txt
+# Past the limit (--slr-group-own 2): the closures stay in the level, said
+# loudly (a warning naming their roots), and the locality check refuses the
+# fan-out they leave.
+# RUN: foldsim --srcs top.f --top Top --out %t/own2 --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 2 Leaf > %t/own2.log 2>&1
+# RUN: FileCheck %s --check-prefix=OWN2 < %t/own2.log
+# OWN2: slr-group-own: {{[0-9]+}} level registers and {{[0-9]+}} level ops replicated into groups, {{[1-9][0-9]*}} closures left
+# OWN2-NEXT: warning: slr-group-own: {{[1-9][0-9]*}} closures past 2 ops stay in the level: the level control they read fans out over the SLR groups unregistered (roots: {{.*}}pos
+# RUN: not python3 %foldsim_tools/foldsim_locality.py %t/own2 --out %t/own2/l --kernel-slr SLR0 > /dev/null
+# RUN: FileCheck %s --check-prefix=OWN0 < %t/own2/l/locality.txt
 # A class whose parent sits in another group loads posD's next position
 # (every sequencer holds posD's value), its group's own: no other group's
 # sequencer enters a group.

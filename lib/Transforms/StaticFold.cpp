@@ -27649,6 +27649,7 @@ LogicalResult StaticFolder::extractGroups() {
       return isLevelReg(op) || isLevelLogic(op);
     };
     unsigned replicatedRegs = 0, replicatedOps = 0, left = 0;
+    std::set<std::string> leftRoots;
     // `slr-group-home`: a level register whose next-value logic (the
     // level's logic back to registers, ports and instances) reads, through
     // at least one op, more outputs of one group's instances than of all
@@ -27766,9 +27767,34 @@ LogicalResult StaticFolder::extractGroups() {
             continue;
           if (!local.count(value)) {
             auto order = closure(def);
+            static const bool ownLog = getenv("FOLDSIM_OWN_LOG");
+            if (ownLog && order.size() > 512) {
+              std::map<std::string, unsigned> regs;
+              for (auto *op : order)
+                if (auto r = dyn_cast<seq::FirRegOp>(op)) {
+                  std::string n = r.getName().str();
+                  for (auto &ch : n)
+                    if (isdigit(ch))
+                      ch = '#';
+                  ++regs[n.substr(0, 40)];
+                }
+              llvm::errs() << "slr-group-own closure g" << g << " " << order.size() << " ops, root "
+                           << (isa<seq::FirRegOp>(def) ? cast<seq::FirRegOp>(def).getName() : def->getName().getStringRef())
+                           << ":";
+              unsigned k = 0;
+              for (auto &[n, c] : regs)
+                if (k++ < 12)
+                  llvm::errs() << " " << n << " x" << c;
+              llvm::errs() << "\n";
+            }
             if (order.empty()) {
               tooLarge.insert(value);
               ++left;
+              if (leftRoots.size() < 8) {
+                std::string n = isa<seq::FirRegOp>(def) ? cast<seq::FirRegOp>(def).getName().str()
+                                                        : def->getName().getStringRef().str();
+                leftRoots.insert(n);
+              }
               continue;
             }
             // Clone first (a register's cone may read the register), then
@@ -27804,6 +27830,18 @@ LogicalResult StaticFolder::extractGroups() {
                  << " level ops replicated into groups, " << left
                  << " closures left in the level (past " << slrGroupOwn
                  << " ops)\n";
+    if (left) {
+      // A closure past the limit is not owned: the level's control it reads
+      // still fans out over the groups, unregistered (the locality check
+      // refuses it, L3). Never silent.
+      llvm::errs() << "foldsim-fold-static: warning: slr-group-own: " << left
+                   << " closures past " << slrGroupOwn
+                   << " ops stay in the level: the level control they read fans out over the "
+                      "SLR groups unregistered (roots:";
+      for (auto &n : leftRoots)
+        llvm::errs() << " " << n;
+      llvm::errs() << ")\n";
+    }
   }
   // `slr-group-local`: a group's operand that the level computes with logic
   // (not a register, memory, instance, constant or port) is computed in the
