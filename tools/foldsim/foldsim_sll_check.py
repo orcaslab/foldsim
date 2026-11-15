@@ -755,6 +755,15 @@ def slr_masters(weights, total):
     return out
 
 
+def master_ports(noc):
+    """The NoC ports a device-memory master of the kernel can be bound to: those reaching HBM, and of them, when
+    the region's noc section names `masters_to` (linker tags), only those tags' (the asl9 shell's per-SLR ports reach
+    a quarter of the HBM pseudo-channels each, which the kernel's memory map cannot use yet: its masters bind to MEM
+    in SLR2, a32-S26X G 11-14)."""
+    tags = noc.get('masters_to')
+    return [p for p in noc.get('ports', []) if 'HBM' in p.get('targets', ()) and (not tags or p.get('tag') in tags)]
+
+
 def vmem_slls(ctrls, shares, top_spread, names, noc, mode, masters=0, pinned=None):
     """Each boundary's SLLs of the virtual-memory wiring with the controllers
     placed by `mode` (--vmem-engines), and each controller's placement.
@@ -775,7 +784,7 @@ def vmem_slls(ctrls, shares, top_spread, names, noc, mode, masters=0, pinned=Non
     per boundary], [{name, cls, slr, slls}])."""
     n = len(names)
     at = {nm: i for i, nm in enumerate(names)}
-    hbm = sorted({at[p['slr']] for p in noc.get('ports', []) if 'HBM' in p.get('targets', ()) and p.get('slr') in at})
+    hbm = sorted({at[p['slr']] for p in master_ports(noc) if p.get('slr') in at})
     if not hbm:
         raise SystemExit('foldsim_sll_check.py: the region\'s noc section names no NMU reaching HBM')
     near = lambda i: min(hbm, key=lambda j: (abs(i - j), j))
@@ -825,7 +834,7 @@ def vmem_slls(ctrls, shares, top_spread, names, noc, mode, masters=0, pinned=Non
         rows.append(dict(name=c['name'], cls=c['cls'], slr=names[g], slls=x))
     if mode == 'slr':
         weights = [sum(r['port_bits'] for r in rows if r['slr'] == nm) for nm in names]
-        total = masters or sum(1 for p in noc.get('ports', []) if 'HBM' in p.get('targets', ()))
+        total = masters or len(master_ports(noc))
         ms = slr_masters(weights, total)
         if not masters and pinned and pinned['masters'] and all(w in at for w in pinned['masters']):
             ms = [sum(1 for w in pinned['masters'] if w == nm) for nm in names]

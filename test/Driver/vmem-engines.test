@@ -20,6 +20,9 @@
 # The V80 region's noc section: the compute shell's 8 HBM ports all in SLR2.
 # RUN: python3 -c "import json,sys; n=json.load(open(sys.argv[1]))['noc']; print(sorted({p['slr'] for p in n['ports'] if 'HBM' in p['targets']}), n['master_bits'])" %foldsim_tools/foldsim_v80_slr.json | FileCheck %s --check-prefix=V80
 # V80: ['SLR2'] 1290
+# The asl9 any-SLR region: HBM ports in every SLR, the masters bound to MEM (SLR2) alone.
+# RUN: python3 -c "import json,sys; sys.path.insert(0, sys.argv[2]); import foldsim_sll_check as sc; n=json.load(open(sys.argv[1]))['noc']; print(sorted({p['slr'] for p in n['ports'] if 'HBM' in p['targets']}), sorted({p['slr'] for p in sc.master_ports(n)}))" %foldsim_tools/foldsim_v80_asl9_slr.json %foldsim_tools | FileCheck %s --check-prefix=ASL9
+# ASL9: ['SLR0', 'SLR1', 'SLR2'] ['SLR2']
 #
 # foldsim_sll_check.vmem_slls (placed, 11-11): a wide copy's controller
 # (16,440 port bits) in SLR1, a narrow one's (1,050) in SLR0, a page engine's
@@ -43,6 +46,9 @@
 # PRICE-NEXT: per-slr placer: 121 121 | G0:SLR1 G1:SLR0 G2:SLR2
 # PRICE-NEXT: per-slr nmu: 121 121 | G0:SLR1 G1:SLR0 G2:SLR2
 # PRICE-NEXT: per-slr local: 121 121 | G0:SLR1 G1:SLR0 G2:SLR2
+# PRICE-NEXT: asl9 placer: 1652 362 | G0:SLR1 G1:SLR2 G2:SLR2
+# PRICE-NEXT: asl9 nmu: 4143 362 | G0:SLR2 G1:SLR2 G2:SLR2
+# PRICE-NEXT: asl9 local: 2701 1411 | G0:SLR1 G1:SLR0 G2:SLR2
 # PRICE-NEXT: engine members: __pages0 1042 [('narrow', 0.5), ('wide', 1.5)]
 # PRICE-NEXT: engine placed: SLR2 240 60
 # PRICE-NEXT: port links from wires: {('wide', 'narrow'): 96}

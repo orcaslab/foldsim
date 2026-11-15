@@ -1504,8 +1504,9 @@ def slr_level_group(spec, region, groups):
             os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
         r = json.load(open(path))
         order = [slr['name'] for slr in r['slrs']]
+        tags = r.get('noc', {}).get('masters_to')
         hbm = collections.Counter(p['slr'] for p in r.get('noc', {}).get('ports', [])
-                                  if 'HBM' in p.get('targets', []))
+                                  if 'HBM' in p.get('targets', []) and (not tags or p.get('tag') in tags))
         if hbm:
             best = max(order, key=lambda n: (hbm.get(n, 0), -order.index(n)))
             if order.index(best) < groups:
