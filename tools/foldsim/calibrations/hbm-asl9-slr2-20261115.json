@@ -1,0 +1,29 @@
+{
+  "name": "hbm-asl9-slr2-20261115",
+  "addendum_to": "hbm-asl9-20261114",
+  "source": "a32-BW3 card run 2026-11-16 00:17 (s26_1113/bwtest/RESULTS_slr2.md, image slr2/runs/img16): asl9 shell, 512-bit masters at 200 MHz, OUT 64, 1 KB bursts, 16 rotating AXI ids, N masters on MEM spread by the linker over vNoC units 1..N (unit 0 shared with m_axi_mem_0 via SmartConnect) [measured on the V80]",
+  "clock_hz": 200000000,
+  "SLR2_by_masters": {
+    "1": {"ports": ["MEM(u1)"], "alone": {"read_gbs": 12.22, "write_gbs": 12.80, "mixed_read_gbs": 11.92, "mixed_write_gbs": 12.80},
+          "busy": {"read_gbs": 6.90, "write_gbs": 8.13, "mixed_read_gbs": 4.18, "mixed_write_gbs": 5.00}, "latency_ns": 173, "loaded_latency_ns": 864},
+    "2": {"ports": ["MEM(u1,u2)"], "alone": {"read_gbs": 22.36, "write_gbs": 25.30, "mixed_read_gbs": 19.43, "mixed_write_gbs": 19.74},
+          "busy": {"read_gbs": 8.25, "write_gbs": 11.50, "mixed_read_gbs": 6.38, "mixed_write_gbs": 8.14}, "latency_ns": 175, "loaded_latency_ns": 948},
+    "4": {"ports": ["MEM(u1..u4)"], "alone": {"read_gbs": 38.21, "write_gbs": 38.86, "mixed_read_gbs": 30.53, "mixed_write_gbs": 30.25},
+          "busy": {"read_gbs": 16.03, "write_gbs": 19.51, "mixed_read_gbs": 13.42, "mixed_write_gbs": 12.11}, "latency_ns": 172, "loaded_latency_ns": 1126},
+    "8": {"ports": ["MEM(u1..u7,u0 shared)"], "alone": {"read_gbs": 45.73, "write_gbs": 43.94, "mixed_read_gbs": 32.64, "mixed_write_gbs": 29.54},
+          "busy": {"read_gbs": 22.19, "write_gbs": 28.21, "mixed_read_gbs": 19.34, "mixed_write_gbs": 15.27}, "latency_ns": 189, "loaded_latency_ns": 2117},
+    "8_part": {"ports": ["MEM(u1..u7,u0 shared)"], "pc_sets": "master k: PCs k, k+8, k+16, k+24",
+          "alone": {"read_gbs": 51.55, "write_gbs": 44.71, "mixed_read_gbs": 41.37, "mixed_write_gbs": 31.20},
+          "busy": {"read_gbs": 28.53, "write_gbs": 29.07, "mixed_read_gbs": 23.20, "mixed_write_gbs": 14.10}, "latency_ns": 192, "loaded_latency_ns": 1869}
+  },
+  "SLR0_SLR1_busy_with_SLR2_8_part": {
+    "SLR0": {"read_gbs": 12.34, "write_gbs": 13.12, "mixed_read_gbs": 10.75, "mixed_write_gbs": 6.75},
+    "SLR1": {"read_gbs": 12.35, "write_gbs": 10.51, "mixed_read_gbs": 10.75, "mixed_write_gbs": 5.31}
+  },
+  "SLR0_SLR1_busy_with_SLR2_4": {
+    "SLR0": {"read_gbs": 15.59, "write_gbs": 16.87, "mixed_read_gbs": 13.90, "mixed_write_gbs": 11.71},
+    "SLR1": {"read_gbs": 15.63, "write_gbs": 13.65, "mixed_read_gbs": 13.91, "mixed_write_gbs": 9.38}
+  },
+  "recommended": {"SLR2_masters": 8, "pc_partition": "stride 8", "fallback": "4 masters (one per VNoC column, units 1-4)"},
+  "notes": "two MEM units in one VNoC column share ~16 GB/s; unit 0 (SmartConnect with mem_0) alone: 11.2 rd / 6.2 wr; OUT 16..127 identical; no per-unit MEM tag in the linker (sp order decides)"
+}

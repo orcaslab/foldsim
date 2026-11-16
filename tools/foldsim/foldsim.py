@@ -1842,7 +1842,10 @@ def s28_layout(vmems, meta, names=None):
             mems.append({'vm': int(f[1]), 'group': int(f[2]), 'cls': int(f[3]), 'mem': int(f[4])})
     offset = 0
     out = []
-    for g in sorted(regions):
+    # (The regions over more PCs first in lin, SLR2's (its masters over all 32 PCs) before SLR0 / SLR1's (16): a
+    # PC's share of a region is its lin range over the region's PCs, so the shares of regions on common PCs never
+    # meet; vmem_ports.py's binding checks it.)
+    for g in sorted(regions, key=lambda g: (regions[g]['slr'] in ('SLR0', 'SLR1'), g)):
         r = regions[g]
         r['inputs'] = sorted(ins.get(g, []), key=lambda x: x['index'])
         r['lin_base'] = offset

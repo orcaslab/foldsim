@@ -1,0 +1,48 @@
+# S28's binding (flow/v80/vmem_ports.py, S28 regions): the SLR2 region's masters first, right after the memory
+# ports' master (the linker spreads MEM masters over the NoC's HBM INIs in sp= order), 8 by default (BW3 11-15),
+# master k on PCs k, k+8, k+16, k+24; SLR0 / SLR1 4 masters, master m on PCs = m (mod 4) from PC 4 (a Vortex image's
+# target keeps PCs 0-3); one grain for all, the region over more PCs first in lin so the PCs' shares never meet.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/s28-pcmap/sim.vh --mem-ports 4 --spread-target-pcs 4 > %t/kernel.vh
+# RUN: FileCheck %s < %t/kernel.vh
+# CHECK: `define FOLDSIM_VMEM_MASTERS 16
+# CHECK-NEXT: `define FOLDSIM_S28_MASTER_REPEAT(f,s) `f(4, 0, 0) `s `f(5, 0, 1) {{.*}} `f(11, 0, 7) `s `f(12, 1, 0) {{.*}} `f(19, 2, 3)
+# CHECK: `define FOLDSIM_S28_R0_NM 8
+# CHECK: `define FOLDSIM_S28_R0_PC_LOG 2
+# CHECK-NEXT: `define FOLDSIM_S28_R0_PC_FIRST 0
+# CHECK-NEXT: `define FOLDSIM_S28_R0_PC_STRIDE 8
+# CHECK: `define FOLDSIM_S28_R1_NM 4
+# CHECK: `define FOLDSIM_S28_R1_PC_FIRST 4
+# CHECK-NEXT: `define FOLDSIM_S28_R1_PC_STRIDE 4
+# CHECK: `define FOLDSIM_VMEM_PCMASK 32'hffffffff
+# CHECK-NEXT: `define FOLDSIM_VMEM_PCBYTES 100352
+# Every grain of every region, mapped as the region controller maps it, lands on its master's own PCs in their
+# reserved halves; all 16 masters reached.
+# RUN: python3 %S/Inputs/s28-pcmap/trace.py %foldsim_tools/flow/v80 %t/kernel.vh %S/Inputs/s28-pcmap/sim.vh > %t/ok.axi
+# RUN: python3 %foldsim_tools/foldsim_s28_axi_check.py %t/ok.axi %t/kernel.vh | FileCheck %s --check-prefix=OK
+# OK: master 4 (region 0 master 0): AR {{[0-9]+}} AW 0; PCs 0:{{[0-9]+}} 8:{{[0-9]+}} 16:{{[0-9]+}} 24:{{[0-9]+}}
+# OK: master 12 (region 1 master 0): AR {{[0-9]+}} AW 0; PCs 4:{{[0-9]+}}
+# OK: 0 violations, 0 S28 masters without traffic
+# Mutant: the SLR2 region mapped with the SLR0/1 stride (4): its masters leave their PCs, the check refuses.
+# RUN: python3 %S/Inputs/s28-pcmap/trace.py %foldsim_tools/flow/v80 %t/kernel.vh %S/Inputs/s28-pcmap/sim.vh mutant > %t/bad.axi
+# RUN: not python3 %foldsim_tools/foldsim_s28_axi_check.py %t/bad.axi %t/kernel.vh | FileCheck %s --check-prefix=BAD
+# BAD: VIOLATION master 5 (region 0 master 1, PCs [1, 9, 17, 25])
+# The area fallback: 4 SLR2 masters, master k on PCs = k (mod 4).
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/s28-pcmap/sim.vh --mem-ports 4 --s28-slr2-masters 4 | FileCheck %s --check-prefix=FOUR
+# FOUR: `define FOLDSIM_S28_R0_NM 4
+# FOUR: `define FOLDSIM_S28_R0_PC_LOG 3
+# FOUR-NEXT: `define FOLDSIM_S28_R0_PC_FIRST 0
+# FOUR-NEXT: `define FOLDSIM_S28_R0_PC_STRIDE 4
+# The cfg's sp lines: the S28 masters in master order right after m_axi_mem_0, each its tag.
+# RUN: python3 -c "print('[connectivity]'); [print(f'sp=foldsim_afu_0.m_axi_mem_{i}:MEM') for i in [0, 19, 4] + list(range(5, 19))]" > %t/c.cfg
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/s28-pcmap/sim.vh --mem-ports 4 --spread-target-pcs 4 --sp-cfg %t/c.cfg
+# RUN: FileCheck %s --check-prefix=SP < %t/c.cfg
+# SP: sp=foldsim_afu_0.m_axi_mem_0:MEM
+# SP-NEXT: sp=foldsim_afu_0.m_axi_mem_4:MEM
+# SP: sp=foldsim_afu_0.m_axi_mem_11:MEM
+# SP-NEXT: sp=foldsim_afu_0.m_axi_mem_12:MEM_SLR1_0
+# SP: sp=foldsim_afu_0.m_axi_mem_19:MEM_SLR0_3
+# Regions on common PCs whose shares would meet (the SLR0 region laid out before the SLR2 one): refused.
+# RUN: sed -e "s/R0_LIN_BASE 64'h0/R0_LIN_BASE 64'h188000/" -e "s/R2_LIN_BASE 64'h88000/R2_LIN_BASE 64'h0/" %S/Inputs/s28-pcmap/sim.vh > %t/swap.vh
+# RUN: not python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %t/swap.vh --mem-ports 4 --spread-target-pcs 4 2>&1 | FileCheck %s --check-prefix=OVL
+# OVL: share PCs and their PC shares overlap
