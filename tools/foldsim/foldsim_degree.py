@@ -409,14 +409,36 @@ def frame_factor():
     return max(0.5, 1.0 + STATE_CAL['logic_per_doubling'] * math.log2(max(STATE_FRAME, 1) / ref))
 
 
+# The frame the policy prices (area()'s `ii`): STATE_CAL's logic factors grow with it (frame_factor). The
+# schedule's II when choose_state set it (STATE_II): the instances a copy serves are the schedule's, a longer frame
+# (pages off chip, HBM bytes) adds none.
+STATE_FRAME = None
+STATE_II = None
+
+
+def frame_factor():
+    """STATE_CAL's logic growth with the frame (`logic_per_doubling` past `logic_ref_frame`): the synthesized
+    logic of the copies and the level per counted grows with the instances a copy serves (its state's read
+    selects, slot tables and link word selects scale with the frame, the class estimate does not): 1.04 / 1.16 /
+    1.31 of the y8b fit at frames 128 / 256 / 512 (a32-S26X-F26 B8: e4b, e8h, g16i1p1 post-synthesis)."""
+    if not STATE_CAL or not STATE_CAL.get('logic_per_doubling') or not STATE_FRAME:
+        return 1.0
+    ref = STATE_CAL.get('logic_ref_frame') or STATE_FRAME
+    return max(0.5, 1.0 + STATE_CAL['logic_per_doubling'] * math.log2(max(STATE_FRAME, 1) / ref))
+
+
 def state_factors(c):
     """STATE_CAL's (logic, LUTRAM) factors of a class (its copies' model), the logic's at the frame priced."""
     if not STATE_CAL:
         return 1.0, 1.0
-    m = (STATE_CAL.get('classes') or {}).get(re.sub(r'_copy\d+$', '', c))
+    model = re.sub(r'_copy\d+$', '', c)
+    m = (STATE_CAL.get('classes') or {}).get(model)
     if m:
         return m['logic'], m['lutram']
-    return STATE_CAL.get('copy_logic', 1.0) * frame_factor(), STATE_CAL.get('copy_lutram', 1.0)
+    # `class_scale`: a class's own factor on both, where a calibration measured its copies against the SLR check
+    # (B12b: the 16-SM netlist counts).
+    s = (STATE_CAL.get('class_scale') or {}).get(model, 1.0)
+    return STATE_CAL.get('copy_logic', 1.0) * frame_factor() * s, STATE_CAL.get('copy_lutram', 1.0) * s
 
 
 def state_kernel():
@@ -1106,6 +1128,9 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     STATE_FRAME = STATE_II or ii or None
     lev = STATE_CAL.get('level', 1.0) * frame_factor() if STATE_CAL else 1.0
     logic *= lev
+    if STATE_CAL and STATE_CAL.get('level_measured'):
+        # (--state-measured: the level as the same recipe's SLR check counted it, in place of the estimate.)
+        logic = STATE_CAL['level_measured']
     kernel_uram = kernel_bram = 0.0
     if STATE_CAL:
         kl, klr, kb = state_kernel()

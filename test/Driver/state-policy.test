@@ -1,4 +1,5 @@
 # The state-home policy of --state auto (foldsim_degree.state_policy): each
+# (The policy mechanics on the y8b calibration, pinned: the default became state-v80-s26b-20261115.json on 11-15, a32-S26X-F26 B12b.)
 # class copy's LUTs (its logic, its stores' LUTs and LUTRAM, calibrated to
 # synthesized LUTs) at most a share of the smallest SLR it may sit in
 # (--state-copy-budget, 0.75 by default); a copy past it moves stores into
@@ -41,12 +42,12 @@
 # the copy's own logic refused, the copy named; a --storage rule given kept
 # alone for its store.
 # RUN: cd %S/Inputs/paged
-# RUN: foldsim --srcs top.f --top Top --out %t/b --static --bubbles --state auto --state-copy-budget 0.001 Leaf 2>&1 | FileCheck %s --check-prefix=DRV
+# RUN: foldsim --srcs top.f --top Top --out %t/b --static --bubbles --state auto --state-calibration %foldsim_tools/calibrations/state-v80-y8b-20261113.json --state-copy-budget 0.001 Leaf 2>&1 | FileCheck %s --check-prefix=DRV
 # RUN: FileCheck %s --check-prefix=TABLE < %t/b/state.txt
 # RUN: FileCheck %s --check-prefix=BUDGET < %t/b/state_budget.txt
-# RUN: not foldsim --srcs top.f --top Top --out %t/x --static --bubbles --state auto --state-copy-budget 0.0005 Leaf 2>&1 | FileCheck %s --check-prefix=REFUSE
-# RUN: foldsim --srcs top.f --top Top --out %t/g --static --bubbles --storage "Leaf:ram=block,Leaf:regs>=8=distributed" --state auto --state-copy-budget 0.002 Leaf 2>&1 | FileCheck %s --check-prefix=GIVEN
-# RUN: foldsim --srcs top.f --top Top --out %t/m --static --bubbles --state auto --state-copy-budget 0.001 --state-measured %t/b Leaf 2>&1 | FileCheck %s --check-prefix=MEASURED
+# RUN: not foldsim --srcs top.f --top Top --out %t/x --static --bubbles --state auto --state-calibration %foldsim_tools/calibrations/state-v80-y8b-20261113.json --state-copy-budget 0.0005 Leaf 2>&1 | FileCheck %s --check-prefix=REFUSE
+# RUN: foldsim --srcs top.f --top Top --out %t/g --static --bubbles --storage "Leaf:ram=block,Leaf:regs>=8=distributed" --state auto --state-calibration %foldsim_tools/calibrations/state-v80-y8b-20261113.json --state-copy-budget 0.002 Leaf 2>&1 | FileCheck %s --check-prefix=GIVEN
+# RUN: foldsim --srcs top.f --top Top --out %t/m --static --bubbles --state auto --state-calibration %foldsim_tools/calibrations/state-v80-y8b-20261113.json --state-copy-budget 0.001 --state-measured %t/b Leaf 2>&1 | FileCheck %s --check-prefix=MEASURED
 # DRV: foldsim: state auto: frame [[F:[0-9]+]] (II [[F]]), H at most [[F]];
 # DRV: foldsim: state budget: largest copy Leaf {{[0-9]+}} LUTs ({{[0-9]+}} % of the budget, counted x 0.791); see
 # DRV-NOT: past it

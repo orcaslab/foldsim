@@ -1,0 +1,5 @@
+{"about": "a toy part: clock regions of 12 RAM rows, SLR1 from row 24; URAM column X2 has no sites in SLR0",
+ "slr_rows": [24], "cr_rows": {"1": [0, 11], "2": [12, 23], "3": [24, 35]},
+ "kinds": {"URAM288": {"0": {"cr_x": 0, "rows": [[0, 23]]}, "1": {"cr_x": 1, "rows": [[0, 35]]},
+                       "2": {"cr_x": 1, "rows": [[24, 35]]}},
+           "RAMB36": {"0": {"cr_x": 0, "rows": [[0, 35]]}}}}

@@ -13,3 +13,10 @@
 # RUN: rm -rf %t && mkdir -p %t && echo '{"port_bundles": {"count": 16, "chan_width": 4, "req": [], "rsp": []}}' > %t/foldsim_sim.json
 # RUN: python3 -c "import sys, json; sys.path.insert(0, sys.argv[1]); import foldsim_sll_check as s; r = json.load(open(sys.argv[1] + '/foldsim_v80_asl9_slr.json')); k = s.kernel_resources(sys.argv[2], r); print('sll kernel', round(k['lut']), round(k['bram'], 2))" %foldsim_tools %t | FileCheck %s --check-prefix=SLL
 # SLL: sll kernel 105980 85.48
+# (4) B12b (11-15): the s26b calibration, the default since: per-class scales on the s26 factors (each class copy priced
+# against the SLR check's count of its own module on the 16-SM S26 generation), the frame growth kept; the measured
+# level (--state-measured) in place of the estimate.
+# RUN: python3 -c "import sys, json; sys.path.insert(0, sys.argv[1]); import foldsim_degree as d; d.STATE_CAL = json.load(open(sys.argv[1] + '/calibrations/state-v80-s26b-20261115.json')); d.STATE_FRAME = 512; print('tcu', [round(x, 3) for x in d.state_factors('VX_tcu_core_model_copy1')], 'other', [round(x, 3) for x in d.state_factors('Unknown')])" %foldsim_tools | FileCheck %s --check-prefix=S26B
+# S26B: tcu [2.404, 1.302] other [1.675, 0.907]
+# RUN: grep -o "'state-v80-s26b-20261115.json'" %foldsim_tools/foldsim | FileCheck %s --check-prefix=DEFAULT
+# DEFAULT: 'state-v80-s26b-20261115.json'
