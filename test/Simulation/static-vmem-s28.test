@@ -139,3 +139,10 @@
 # RUN: cd %S/../Driver/Inputs/vmem && not foldsim --srcs top.f --top Top --out %t/bad2 --static --vmem-controller s28 Leaf > %t/bad2.txt 2>&1
 # RUN: FileCheck %s --check-prefix=BAD2 < %t/bad2.txt
 # BAD2: --vmem-controller s28 needs --virtual-memories
+# Stage A has no path for a page column (its host cycle's read and write may be of two instances; the adapter keeps
+# one instance an entry) nor for rings: refused, never folded wrong.
+# RUN: not foldsim-opt %S/../Transforms/fold-static-paged.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page-memory-bits=0 page=Leaf:2 storage=Leaf:pages=hbm page-hbm-column-bits=32 vmem-s28})' 2>&1 | FileCheck %s --check-prefix=PAGES
+# PAGES: error: vmem-s28: vm0_ ({{.*}}:pages) is a ring's image, a tagged port or a page column
+# RUN: cd %S/../Driver/Inputs/vmem && not foldsim --srcs top.f --top Top --out %t/bad3 --static --virtual-memories ram --vmem-rings 16 --vmem-controller s28 Leaf > %t/bad3.txt 2>&1
+# RUN: FileCheck %s --check-prefix=BAD3 < %t/bad3.txt
+# BAD3: --vmem-controller s28: --vmem-rings does not apply

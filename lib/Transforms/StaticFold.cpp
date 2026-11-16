@@ -28026,6 +28026,16 @@ LogicalResult StaticFolder::buildS28() {
              << port << " (" << cast<StringAttr>(attr).getValue()
              << ") is not a class memory's port (stage A has no images, link "
                 "streams or page engines)";
+    // (Stage A's adapter keeps one instance per entry, for the host cycle's
+    // read and write alike, and no tag: a ring's image (`<memory>_img`),
+    // a tagged port or a page column, whose read and write may be of two
+    // instances, have no S28 path yet.)
+    if (f[0].ends_with("_img") || (f.size() > 8 && f[8] != "0") ||
+        (f.size() > 9 && f[9] == "pages"))
+      return netlist.emitError("vmem-s28: ")
+             << port << " (" << cast<StringAttr>(attr).getValue()
+             << ") is a ring's image, a tagged port or a page column: the S28 "
+                "adapter (stage A) keeps one instance per entry and no tag";
     Mem m;
     m.k = k;
     m.cls = c->second;
