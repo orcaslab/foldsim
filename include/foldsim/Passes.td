@@ -1489,6 +1489,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "child, to one input of its children), the sources share one set "
            "of read registers, loaded at each reader pass's landing, and the "
            "reader chooses no source (constant registers and selects)">,
+    Option<"linkUniformRows", "link-uniform-rows", "bool", "false",
+           "A link source's read table gives a reader instance that does not "
+           "take it the entry of its own producer instance (the one it takes "
+           "from another source of that producer class), not entry 0: the "
+           "read is never chosen, and the sources of a reader input read at "
+           "one table, so their memories have equal ports and "
+           "foldsim-merge-memories can lay them side by side">,
     Option<"linkRings", "link-rings", "unsigned", "0",
            "Constant-shell fold: a link memory whose entries are each live "
            "for a short window of the frame (from the write a read takes to "

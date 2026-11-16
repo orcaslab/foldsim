@@ -744,6 +744,11 @@ public:
   /// (`linkRing`). An early link's ring has one bank: its reads come before
   /// their entry's next write.
   unsigned linkRings = 0;
+  /// `link-uniform-rows`: a reader instance that does not take a link
+  /// source reads its own producer instance's entry (not entry 0), so the
+  /// sources of a reader input share one read table and their memories
+  /// have equal ports (foldsim-merge-memories merges them).
+  bool linkUniformRows = false;
   /// A ring link's plan: K ring entries (an entry e at e mod K) and the
   /// held entries (sorted), each at K + its index among them; `depth` the
   /// memory's entries, 0 for none.
@@ -25087,6 +25092,19 @@ LogicalResult StaticFolder::buildSim() {
             }
           }
         }
+        // link-uniform-rows: a reader instance that does not take this
+        // source reads, at its pass, the entry of its own producer instance
+        // (the one it takes from another source of the producer's class)
+        // instead of entry 0. Its read is never chosen, so the value is the
+        // same; the sources of the reader's inputs then read at one table
+        // of the reader's instance, and their memories have equal ports
+        // (foldsim-merge-memories lays them side by side).
+        if (linkUniformRows && kept.empty() && !ring)
+          for (unsigned i = 0; i < threads; ++i)
+            if (!takes[i] && sourceOf[i].first >= 0 &&
+                producers[sourceOf[i].first].cls == producer.cls &&
+                producerInst[i] < pThreads)
+              entryRows[i] = producerInst[i];
         unsigned styleDepth = ring ? ring.depth : linkDepth(pThreads, !producer.late);
         // A link between SLR groups is written crossLatency host cycles
         // later (its data, enable, entry and bank), from registered bits in
@@ -30144,6 +30162,7 @@ void FoldStaticPass::runOnOperation() {
   folder.csfMailboxLatency = csfMailboxLatency;
   folder.csfSingleBank = csfSingleBank;
   folder.linkRings = std::min(unsigned(linkRings), 1u << 16);
+  folder.linkUniformRows = linkUniformRows;
   folder.csfMailboxBuilder = csfMailboxBuilder;
   folder.csfMailboxHbm = csfMailboxHbm;
   folder.csfMailboxHbmChains = csfMailboxHbmChains;

@@ -1,0 +1,20 @@
+# REQUIRES: verilator
+# `--link-uniform-rows`: a reader input with a source per producer port
+# (reader (j, o) takes producer j's port o, Driver/Inputs/fanrows): each
+# source's read table gives the instances that do not take it their own
+# producer instance's entry, so every source reads at one table and
+# foldsim-merge-memories (`--csf-merge-links`) lays all their memories side
+# by side (8 into 1; without the option the tables differ: 8 into 4). Exact
+# against the target, channels stalled or not.
+# (Mutant check: the reader instance's index mod the producer's instances in
+# place of its producer instance, for every reader, gives MISMATCH.)
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/fanrows
+# RUN: foldsim --srcs top.f --top Top --out %t/base --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --compact-links --csf-merge-links 512 Prod Rd 2>&1 | FileCheck %s --check-prefix=BASE
+# RUN: foldsim --srcs top.f --top Top --out %t/uni --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --compact-links --csf-merge-links 512 --link-uniform-rows Prod Rd 2>&1 | FileCheck %s --check-prefix=UNI
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/uni/obj %S/Inputs/tb_reset.sv top.sv %t/uni/foldsim_sim.sv > %t/uni/build.log 2>&1
+# RUN: %t/uni/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +stall=0 | FileCheck %s
+# RUN: %t/uni/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +stall=30 | FileCheck %s
+# BASE: merge-memories: 8 memories into 4
+# UNI: merge-memories: 8 memories into 1
+# CHECK: {{^}}MATCH
+# CHECK-NOT: MISMATCH

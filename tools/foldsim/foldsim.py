@@ -672,6 +672,8 @@ def frame_options(a):
         fold += ' csf-mailbox-hbm-share'
     if getattr(a, 'link_rings', 0):
         fold += f' link-rings={a.link_rings}'
+    if getattr(a, 'link_uniform_rows', False):
+        fold += ' link-uniform-rows'
     if getattr(a, 'csf_mailbox_builder', False):
         fold += ' csf-mailbox-builder'
     if getattr(a, 'csf_mailbox_hbm', False):
@@ -3054,6 +3056,10 @@ def build_parser():
                          'frame keeps at most K entries (a power of two), the entry index mod K, where the schedule '
                          'shows no other entry of that address written in any read\'s window; early links drop their '
                          'banks (foldsim-fold-static link-rings)')
+    ap.add_argument('--link-uniform-rows', action='store_true',
+                    help='a link source\'s read table gives the reader instances that do not take it their own '
+                         'producer instance\'s entry, so the sources of a reader input read at one table and their '
+                         'memories merge under --csf-merge-links (foldsim-fold-static link-uniform-rows)')
     ap.add_argument('--csf-merge-links', type=int, default=0, metavar='BITS',
                     help='constant-shell fold: link memories of equal ports (a producer and reader class '
                          'pair) merged side by side into mailboxes of at most BITS bits '
