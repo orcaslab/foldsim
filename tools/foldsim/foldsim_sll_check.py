@@ -258,6 +258,12 @@ def netlist_resources(sim, copies, region, synthesis=None):
     # The kernel beside the simulator (its memory endpoints, virtual memory
     # controllers, host interface): not in the netlist, placed with it.
     kr = kernel_resources(os.path.dirname(os.path.abspath(sim)), region)
+    for g, x in (kr.get('s28') or {}).items():
+        # (Each S28 group's region controller and units with the group's domain root, placed in its SLR; the
+        # level's spread where the root is no copy here.)
+        tgt = out.get(x['root']) if x['root'] in out else rest
+        for r in ('lut', 'lutram', 'bram'):
+            tgt[r] = tgt.get(r, 0.0) + x[r] * (pl.get(r, 1.0) if r != 'bram' else 1.0)
     placed = {r: 0.0 for r in RESOURCES}
     for r in ('lut', 'lutram', 'ff', 'bram'):
         placed[r] = kr[r] * (pl.get(r, 1.0) if r in ('lut', 'lutram', 'ff') else 1.0)
@@ -281,7 +287,11 @@ def ctl_scaled(path, k):
     sizes += [1] * len(j.get('vports') or [])   # (static ports: read_built lists them last; scale `vport`, else engine's)
     sc = k['ctl_lut_scale']
     out = []
-    for c, n in zip(foldsim_degree.read_built(path)['controllers'], sizes):
+    built = foldsim_degree.read_built(path)['controllers']
+    if j.get('s28'):
+        # (S28's units are priced as measured placed (foldsim_degree.S28_*): no synthesized scale.)
+        return [dict(c) for c in built]
+    for c, n in zip(built, sizes):
         key = c['kind'] if c['kind'] in ('engine', 'vport') else ('vmem_group' if n > 1 else 'vmem')
         if key == 'vport' and isinstance(sc, dict) and 'vport' not in sc:
             key = 'engine'
@@ -318,12 +328,24 @@ def kernel_resources(gdir, region):
         mem = k['mem_port_lut'] * len(ports)
         mem_what = f'{len(ports)} memory port endpoints'
     ctl = ctl_scaled(path, k) if j else []
+    # S28 (--vmem-controller s28): the region controllers and the simulator's units sit in their region's group, not
+    # beside the level: apart (`s28`, by group), each group's added to its domain root's copy by the caller.
+    s28 = {}
+    if j.get('s28'):
+        roots = {r['group']: (r['inputs'][0]['root'] if r['inputs'] else None) for r in j['s28']['regions']}
+        for c in ctl:
+            x = s28.setdefault(c['group'], dict(root=roots.get(c['group']), lut=0.0, lutram=0.0, bram=0.0))
+            x['lut'] += c['logic'] + c['lutram']
+            x['lutram'] += c['lutram']
+            x['bram'] += c['bram']
+        ctl = []
     cl = sum(c['logic'] for c in ctl)
     cr = sum(c['lutram'] for c in ctl)
     cb = sum(c['bram'] for c in ctl)
-    return dict(lut=k['base_lut'] + mem + cl + cr, lutram=cr, ff=k.get('ff', 0.0), bram=cb + fold_bram,
+    return dict(lut=k['base_lut'] + mem + cl + cr, lutram=cr, ff=k.get('ff', 0.0), bram=cb + fold_bram, s28=s28,
                 parts=dict({'base': k['base_lut'], mem_what: mem, f'{len(ctl)} controllers': cl + cr,
-                            'controller RAMB36': cb}, **({'endpoint RAMB36': fold_bram} if fold_bram else {})))
+                            'controller RAMB36': cb}, **({'endpoint RAMB36': fold_bram} if fold_bram else {}),
+                           **({f'S28 group {g} (with {x["root"]})': x['lut'] for g, x in s28.items()})))
 
 
 PARSED = {}
@@ -1462,7 +1484,8 @@ def main():
                     if 'ctl_lut_scale' in kk:
                         built = ctl_scaled(os.path.join(gdir, 'foldsim_sim.json'), kk)
                         die = defaultdict(lambda: [0.0, 0.0])
-                        for row, c in zip(vmem_rows, built):
+                        for row, c in zip(vmem_rows, built) if not any('group' in c for c in built) else \
+                                [(dict(slr=names[c['group']]), c) for c in built]:
                             die[row['slr']][0] += c['logic'] + c['lutram']
                             die[row['slr']][1] += c['bram']
                         lines.append('  kernel controllers as placed: ' + ', '.join(

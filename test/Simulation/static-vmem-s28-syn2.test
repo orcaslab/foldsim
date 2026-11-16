@@ -40,3 +40,8 @@
 # RUN: FileCheck %s --check-prefix=LOC < %t/g/loc/locality.txt
 # LOC-NOT: REFUSE
 # LOC: g: locality WARN
+# The SLR check prices S28's units as measured (foldsim_degree.S28_*: a region controller of its masters, a local
+# switch of its banks' entry bits, a central switch an input), each group's with its domain root, in its SLR.
+# RUN: FileCheck %s --check-prefix=PRICE < %t/g/sll/sll.txt
+# PRICE: kernel controllers as placed: SLR0 LUT {{[0-9,]+}} RAMB36 7.5, SLR1 LUT {{[0-9,]+}} RAMB36 7.5, SLR2 LUT {{[0-9,]+}} RAMB36 7.5
+# PRICE: S28 group 0 (with Top_model) {{[0-9,]+}}, S28 group 1 (with Core) {{[0-9,]+}}, S28 group 2 (with Cache) {{[0-9,]+}}

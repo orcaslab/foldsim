@@ -650,6 +650,51 @@ def copy_cap_pools(units, caps, base, copy_logic=None, region_luts=0.0):
 VPORT_DROPIN_SCALE = 192.9 / 269.8
 
 
+# S28 units (--vmem-controller s28), measured: Vivado 2025.2 OOC, placed, RTL fsd-S28 8c0d7761d (a32-S28B
+# ooc/unit_costs.txt, 11-16). The region controller: NM 1 5,577 LUT (4,606 logic / 943 LUTRAM), NM 4 10,028 (7,574 /
+# 2,418): per master 989 logic + 492 LUTRAM over a base; its response ring now one a region (fsd-S28 3c352770f):
+# 7.5 RAMB36 (NM 1's, 512 x 512 b; RSP_DEPTH 256 halves it, pending a re-measure). A local switch bank (FIFO 16 of
+# 2 + 2 IW + 2 MAW + MDW + MMW bits an entry): LUTRAM ~0.30 and logic ~0.40 of a bank's entry bits (N 4), 39 logic at
+# N 1. A central switch: ~230 LUT an input. The adapter: registers only (~0 LUT).
+S28_REGION = dict(logic_base=3617.0, logic_master=989.0, lutram_base=451.0, lutram_master=492.0, bram=7.5)
+S28_LSW = dict(lutram_per_bit=0.30, logic_per_bit=0.40, logic_min=39.0)
+S28_CSW_LOGIC = 230.0
+
+
+def read_built_s28(j, forward, ports, vmasters):
+    """read_built for --vmem-controller s28: the kernel's region controllers (one a region, its masters from the
+    kernel header's FOLDSIM_S28_R<r>_NM, else 4 for SLR0 / SLR1 and 8 for SLR2) and the simulator's S28 units (a local
+    switch per class with memories, a central switch per input of a region; external modules the netlist count does
+    not see), priced as measured (S28_REGION, S28_LSW, S28_CSW_LOGIC). Each item carries its region's group."""
+    out = dict(controllers=[], logic=0.0, lutram=0.0, bram=0.0, forward=0, mem_ports=ports,
+               vmem_masters=vmasters, counts={})
+    vm = j.get('vmem', [])
+    def add(kind, group, **x):
+        out['controllers'].append(dict(kind=kind, group=group, dw=x.pop('dw', 0), cache_rows=0, **x))
+        out['counts'][kind] = out['counts'].get(kind, 0) + 1
+        for key in ('logic', 'lutram', 'bram'):
+            out[key] += x.get(key, 0.0)
+    for r in j['s28']['regions']:
+        nm = r.get('nm') or (4 if r.get('slr') in ('SLR0', 'SLR1') else 8)
+        add('s28-region', r['group'], logic=S28_REGION['logic_base'] + S28_REGION['logic_master'] * nm,
+            lutram=S28_REGION['lutram_base'] + S28_REGION['lutram_master'] * nm, bram=S28_REGION['bram'])
+        by_cls = {}
+        for e in r['entries']:
+            by_cls.setdefault(e['cls'], []).append(e)
+        for cls, es in by_cls.items():
+            bits = 0
+            for e in es:
+                v = vm[e['vm']]
+                mw = (e['dw'] // 8) if e.get('lanes', 1) > 1 else v['mask_width']
+                bits += 16 * (2 + 2 * v['inst_width'] + 2 * v['row_width'] + e['dw'] + mw)
+            add('s28-lsw', r['group'], dw=max(e['dw'] for e in es),
+                logic=max(S28_LSW['logic_min'], S28_LSW['logic_per_bit'] * bits / 16) if len(es) > 1
+                else S28_LSW['logic_min'], lutram=S28_LSW['lutram_per_bit'] * bits / 16, bram=0.0)
+        for x in r['inputs']:
+            add('s28-csw', r['group'], logic=S28_CSW_LOGIC * bin(x['class_mask']).count('1'), lutram=0.0, bram=0.0)
+    return out
+
+
 def read_built(path):
     """BUILT from a foldsim_sim.json (and its foldsim_sim.vh /
     foldsim_kernel.vh): dict(controllers=[...], logic, lutram, bram, forward,
@@ -666,6 +711,8 @@ def read_built(path):
     # folded); a kernel.vh before it bound one per port.
     m = re.search(r'FOLDSIM_MEM_MASTERS (\d+)', vh) or re.search(r'FOLDSIM_MEM_PORTS (\d+)', vh)
     ports = int(m.group(1)) if m else None
+    if j.get('s28'):
+        return read_built_s28(j, forward, ports, vmasters)
     ctls = j.get('vmem_groups') or j.get('vmem') or []
     # The drop-in static port (--vmem-controller vport, FOLDSIM_VMEM_VPORT: foldsim_vport_ctl in each controller's
     # place, in order, one AXI id, counter fences, no host cache or write buffer): its controllers at
