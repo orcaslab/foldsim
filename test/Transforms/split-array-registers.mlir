@@ -1,4 +1,4 @@
-// RUN: foldsim-opt %s --pass-pipeline='builtin.module(hw.module(foldsim-split-array-registers{modules=Sw}),canonicalize)' | FileCheck %s
+// RUN: foldsim-opt %s --pass-pipeline='builtin.module(hw.module(foldsim-split-array-registers{modules=Sw,Out}),canonicalize)' | FileCheck %s
 
 // A 2 x 2 array register written whole each cycle (an RTL array assigned in a
 // loop) and read only at constant indices becomes a register per element, its
@@ -15,6 +15,12 @@
 // CHECK:         hw.output
 // CHECK-LABEL: hw.module @Other(
 // CHECK:         seq.firreg {{%.+}} clock %clk : !hw.array<2xi8>
+// An array register the module outputs whole keeps its array, and the
+// module keeps its terminator (hw.output, a user with no result, is never
+// taken for dead logic).
+// CHECK-LABEL: hw.module @Out(
+// CHECK:         %r = seq.firreg %w clock %clk : !hw.array<2xi8>
+// CHECK:         hw.output %r : !hw.array<2xi8>
 hw.module @Sw(in %clk : !seq.clock, in %rst : i1, in %a : i8, in %b : i8, in %i : i1, out o0 : i8, out o1 : i8, out o2 : i8) {
   %c0 = hw.constant 0 : i1
   %c1 = hw.constant 1 : i1
@@ -36,4 +42,9 @@ hw.module @Other(in %clk : !seq.clock, in %a : i8, out o : i8) {
   %r = seq.firreg %w clock %clk : !hw.array<2xi8>
   %e = hw.array_get %r[%c0] : !hw.array<2xi8>, i1
   hw.output %e : i8
+}
+hw.module @Out(in %clk : !seq.clock, in %a : i8, out o : !hw.array<2xi8>) {
+  %w = hw.array_create %a, %a : i8
+  %r = seq.firreg %w clock %clk : !hw.array<2xi8>
+  hw.output %r : !hw.array<2xi8>
 }

@@ -54,12 +54,13 @@ struct SplitArrayRegistersPass
     if (n < 2 || (maxElements && n > maxElements))
       return false;
     // (Logic left dead by an earlier split -- the next value of a register it
-    // replaced -- goes first: it is no reader.)
+    // replaced -- goes first: it is no reader. Only ops with results: a
+    // terminator such as hw.output has none and is never dead.)
     for (bool erased = true; erased;) {
       erased = false;
       for (Operation *user : llvm::make_early_inc_range(reg->getUsers()))
-        if (user->use_empty() && user != reg && isMemoryEffectFree(user) &&
-            user->getNumRegions() == 0) {
+        if (user->getNumResults() && user->use_empty() && user != reg &&
+            isMemoryEffectFree(user) && user->getNumRegions() == 0) {
           user->erase();
           erased = true;
         }
