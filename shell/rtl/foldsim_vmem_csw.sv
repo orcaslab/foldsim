@@ -27,7 +27,8 @@
 //    idle, no word here.
 module foldsim_vmem_csw #(
     parameter K                 = 2,
-    // The words' instance and row fields (foldsim_vmem_s28.vh: per design).
+    // The words' memory, instance and row fields (foldsim_vmem_s28.vh: per design).
+    parameter MEM_W  = 4,
     parameter INST_W = 16,
     parameter ROW_W  = 12,
     // Input k's classes in bits [k*64 +: 64].

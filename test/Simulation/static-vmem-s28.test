@@ -31,6 +31,7 @@
 # SV-NEXT: .DW(8),
 # SV-NEXT: .MW(1),
 # SV-NEXT: .LANES(1),
+# SV-NEXT: .MEM_W(4),
 # SV-NEXT: .INST_W(2),
 # SV-NEXT: .ROW_W(4)
 # SV-NEXT: ) s28_ad_vm0_Leaf (
@@ -41,6 +42,7 @@
 # SV: foldsim_vmem_csw #(
 # SV-NEXT: .K(1),
 # SV-NEXT: .ICLSM(64'd1),
+# SV-NEXT: .MEM_W(4),
 # SV-NEXT: .INST_W(2),
 # SV-NEXT: .ROW_W(4)
 # SV-NEXT: ) s28_csw_r0_0 (
@@ -51,6 +53,7 @@
 # VH-NEXT: `define FOLDSIM_S28_REGIONS 1
 # VH-NEXT: `define FOLDSIM_S28_INST_W 2
 # VH-NEXT: `define FOLDSIM_S28_ROW_W 4
+# VH-NEXT: `define FOLDSIM_S28_MEM_W 4
 # VH-NEXT: `define FOLDSIM_S28_REQ_W 597
 # VH-NEXT: `define FOLDSIM_S28_RSP_W 528
 # VH-NEXT: `define FOLDSIM_S28_REPEAT(f,s) `f(0)
@@ -200,6 +203,7 @@
 # RUN: FileCheck %s --check-prefix=W17 < %t/w17/foldsim_sim.vh
 # W17: `define FOLDSIM_S28_INST_W 1
 # W17-NEXT: `define FOLDSIM_S28_ROW_W 17
+# W17-NEXT: `define FOLDSIM_S28_MEM_W 4
 # W17-NEXT: `define FOLDSIM_S28_REQ_W 609
 # W17-NEXT: `define FOLDSIM_S28_RSP_W 527
 # RUN: FileCheck %s --check-prefix=W17SV < %t/w17/foldsim_sim.sv
@@ -242,6 +246,24 @@
 # FITV-NOT: S28 region controllers
 # FITV: the kernel beside the simulator (166000 LUTs, measured)
 # FITV: SLR groups' URAM288 / RAMB36 (tenths) at most SLR2 4216/5407
+# A class of 20 memories (more than a 4-bit mem field holds; FSD's ToR switch has 33 port buffers): MEM_W is the most
+# memories a class has (5 bits here; at least 4, the units' default, so kernels without the parameter still match), the
+# request 587 + MEM_W + INST_W + ROW_W bits. Exact against the target; units built at MEM_W 4 refuse the class.
+# RUN: cd %S/../Driver/Inputs/vmem20 && foldsim --srcs top.f --top Top --out %t/m20 --static --virtual-memories ram --vmem-controller s28 --ready-ahead --room-ahead Leaf > %t/m20.log 2>&1
+# RUN: FileCheck %s --check-prefix=M20 < %t/m20/foldsim_sim.vh
+# M20: `define FOLDSIM_S28_MEM_W 5
+# M20-NEXT: `define FOLDSIM_S28_REQ_W 597
+# M20-NEXT: `define FOLDSIM_S28_RSP_W 528
+# RUN: grep -A3 'foldsim_vmem_lsw #' %t/m20/foldsim_sim.sv | FileCheck %s --check-prefix=M20N
+# M20N: .N(20),
+# RUN: cd %S/../Driver/Inputs/vmem20 && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -I%t/m20 -Mdir %t/m20/obj %S/Inputs/tb_s28.sv top.sv %t/m20/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/m20/build.log 2>&1
+# RUN: %t/m20/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
+# RUN: %t/m20/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +mstall=30 +hold=10 | FileCheck %s
+# RUN: sed 's/\.MEM_W(5)/.MEM_W(4)/' %t/m20/foldsim_sim.sv > %t/m20/mutant.sv
+# RUN: cd %S/../Driver/Inputs/vmem20 && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -I%t/m20 -Mdir %t/m20/objm %S/Inputs/tb_s28.sv top.sv %t/m20/mutant.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/m20/buildm.log 2>&1
+# RUN: not %t/m20/objm/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 > %t/m20/mut.txt 2>&1
+# RUN: FileCheck %s --check-prefix=M20M < %t/m20/mut.txt
+# M20M: foldsim_vmem_lsw: N 20 {{.*}}past the word's fields
 # Rings have no S28 path: refused, never folded wrong.
 # RUN: cd %S/../Driver/Inputs/vmem && not foldsim --srcs top.f --top Top --out %t/bad3 --static --virtual-memories ram --vmem-rings 16 --vmem-controller s28 Leaf > %t/bad3.txt 2>&1
 # RUN: FileCheck %s --check-prefix=BAD3 < %t/bad3.txt

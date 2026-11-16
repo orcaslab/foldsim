@@ -37,7 +37,11 @@ module foldsim_vmem_adapter #(
     parameter DW    = 512,
     parameter MW    = DW / 8,
     parameter LANES = 1,
-    // The words' instance and row fields (foldsim_vmem_s28.vh: per design).
+    // The words' memory, instance and row fields (foldsim_vmem_s28.vh: per design;
+    // the memory field is the local switch's).
+    /* verilator lint_off UNUSEDPARAM */
+    parameter MEM_W  = 4,
+    /* verilator lint_on UNUSEDPARAM */
     parameter INST_W = 16,
     parameter ROW_W  = 12,
     localparam DB   = (DW + 7) / 8 * 8,

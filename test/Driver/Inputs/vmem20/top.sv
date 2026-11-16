@@ -1,0 +1,72 @@
+// A leaf with 20 small RAMs (one class with more memories than a 4-bit S28 mem field holds): RAM i writes the leaf's
+// input at row d[7:4] ^ i when bit 0 is set and reads row d[3:0] ^ i; the output mixes every read with the input.
+module Leaf(input logic clk, input logic [7:0] d, output logic [7:0] q);
+  logic [7:0] ram0 [16]; logic [7:0] rd0;
+  logic [7:0] ram1 [16]; logic [7:0] rd1;
+  logic [7:0] ram2 [16]; logic [7:0] rd2;
+  logic [7:0] ram3 [16]; logic [7:0] rd3;
+  logic [7:0] ram4 [16]; logic [7:0] rd4;
+  logic [7:0] ram5 [16]; logic [7:0] rd5;
+  logic [7:0] ram6 [16]; logic [7:0] rd6;
+  logic [7:0] ram7 [16]; logic [7:0] rd7;
+  logic [7:0] ram8 [16]; logic [7:0] rd8;
+  logic [7:0] ram9 [16]; logic [7:0] rd9;
+  logic [7:0] ram10 [16]; logic [7:0] rd10;
+  logic [7:0] ram11 [16]; logic [7:0] rd11;
+  logic [7:0] ram12 [16]; logic [7:0] rd12;
+  logic [7:0] ram13 [16]; logic [7:0] rd13;
+  logic [7:0] ram14 [16]; logic [7:0] rd14;
+  logic [7:0] ram15 [16]; logic [7:0] rd15;
+  logic [7:0] ram16 [16]; logic [7:0] rd16;
+  logic [7:0] ram17 [16]; logic [7:0] rd17;
+  logic [7:0] ram18 [16]; logic [7:0] rd18;
+  logic [7:0] ram19 [16]; logic [7:0] rd19;
+  always_ff @(posedge clk) begin
+    if (d[0]) ram0[d[7:4] ^ 4'd0] <= d + 8'd0;
+    rd0 <= ram0[d[3:0] ^ 4'd0];
+    if (d[0]) ram1[d[7:4] ^ 4'd1] <= d + 8'd1;
+    rd1 <= ram1[d[3:0] ^ 4'd7];
+    if (d[0]) ram2[d[7:4] ^ 4'd2] <= d + 8'd2;
+    rd2 <= ram2[d[3:0] ^ 4'd14];
+    if (d[0]) ram3[d[7:4] ^ 4'd3] <= d + 8'd3;
+    rd3 <= ram3[d[3:0] ^ 4'd5];
+    if (d[0]) ram4[d[7:4] ^ 4'd4] <= d + 8'd4;
+    rd4 <= ram4[d[3:0] ^ 4'd12];
+    if (d[0]) ram5[d[7:4] ^ 4'd5] <= d + 8'd5;
+    rd5 <= ram5[d[3:0] ^ 4'd3];
+    if (d[0]) ram6[d[7:4] ^ 4'd6] <= d + 8'd6;
+    rd6 <= ram6[d[3:0] ^ 4'd10];
+    if (d[0]) ram7[d[7:4] ^ 4'd7] <= d + 8'd7;
+    rd7 <= ram7[d[3:0] ^ 4'd1];
+    if (d[0]) ram8[d[7:4] ^ 4'd8] <= d + 8'd8;
+    rd8 <= ram8[d[3:0] ^ 4'd8];
+    if (d[0]) ram9[d[7:4] ^ 4'd9] <= d + 8'd9;
+    rd9 <= ram9[d[3:0] ^ 4'd15];
+    if (d[0]) ram10[d[7:4] ^ 4'd10] <= d + 8'd10;
+    rd10 <= ram10[d[3:0] ^ 4'd6];
+    if (d[0]) ram11[d[7:4] ^ 4'd11] <= d + 8'd11;
+    rd11 <= ram11[d[3:0] ^ 4'd13];
+    if (d[0]) ram12[d[7:4] ^ 4'd12] <= d + 8'd12;
+    rd12 <= ram12[d[3:0] ^ 4'd4];
+    if (d[0]) ram13[d[7:4] ^ 4'd13] <= d + 8'd13;
+    rd13 <= ram13[d[3:0] ^ 4'd11];
+    if (d[0]) ram14[d[7:4] ^ 4'd14] <= d + 8'd14;
+    rd14 <= ram14[d[3:0] ^ 4'd2];
+    if (d[0]) ram15[d[7:4] ^ 4'd15] <= d + 8'd15;
+    rd15 <= ram15[d[3:0] ^ 4'd9];
+    if (d[0]) ram16[d[7:4] ^ 4'd0] <= d + 8'd16;
+    rd16 <= ram16[d[3:0] ^ 4'd0];
+    if (d[0]) ram17[d[7:4] ^ 4'd1] <= d + 8'd17;
+    rd17 <= ram17[d[3:0] ^ 4'd7];
+    if (d[0]) ram18[d[7:4] ^ 4'd2] <= d + 8'd18;
+    rd18 <= ram18[d[3:0] ^ 4'd14];
+    if (d[0]) ram19[d[7:4] ^ 4'd3] <= d + 8'd19;
+    rd19 <= ram19[d[3:0] ^ 4'd5];
+  end
+  assign q = d ^ (rd0 + 8'd0) ^ (rd1 + 8'd1) ^ (rd2 + 8'd2) ^ (rd3 + 8'd3) ^ (rd4 + 8'd4) ^ (rd5 + 8'd5) ^ (rd6 + 8'd6) ^ (rd7 + 8'd7) ^ (rd8 + 8'd8) ^ (rd9 + 8'd9) ^ (rd10 + 8'd10) ^ (rd11 + 8'd11) ^ (rd12 + 8'd12) ^ (rd13 + 8'd13) ^ (rd14 + 8'd14) ^ (rd15 + 8'd15) ^ (rd16 + 8'd16) ^ (rd17 + 8'd17) ^ (rd18 + 8'd18) ^ (rd19 + 8'd19);
+endmodule
+module Top(input logic clk, input logic [7:0] x, output logic [7:0] y);
+  logic [7:0] a;
+  Leaf l0(.clk, .d(x), .q(a));
+  Leaf l1(.clk, .d(a), .q(y));
+endmodule
