@@ -37,19 +37,20 @@ module Core #(parameter W = 128, D = 32) (input logic clk, input logic rst, inpu
     r0 <= gpr0[ra]; r1 <= gpr1[ra]; r2 <= gpr2[rb]; r3 <= gpr3[rc];
     h0 <= v0[ra]; h1 <= v1[ra]; h2 <= v2[rb]; h3 <= v3[rc];
     for (int i = 0; i < W; i++) begin
-      if (x[0] && be[i]) gpr0[ra][8*i +: 8] <= wd[8*i +: 8];
-      if (x[1] && be[i]) gpr1[ra][8*i +: 8] <= ~wd[8*i +: 8];
-      if (x[3] && be[i]) gpr2[rb][8*i +: 8] <= wd[8*i +: 8] + 8'(i);
-      if (x[4] && be[i]) gpr3[rc][8*i +: 8] <= wd[8*i +: 8] ^ 8'(i);
+      // (A row's first write after reset takes every byte: a valid row never shows bytes of before the reset.)
+      if (x[0] && (be[i] || !v0[ra])) gpr0[ra][8*i +: 8] <= wd[8*i +: 8];
+      if (x[1] && (be[i] || !v1[ra])) gpr1[ra][8*i +: 8] <= ~wd[8*i +: 8];
+      if (x[3] && (be[i] || !v2[rb])) gpr2[rb][8*i +: 8] <= wd[8*i +: 8] + 8'(i);
+      if (x[4] && (be[i] || !v3[rc])) gpr3[rc][8*i +: 8] <= wd[8*i +: 8] ^ 8'(i);
     end
   end
   always_ff @(posedge clk)
     if (rst) begin v0 <= '0; v1 <= '0; v2 <= '0; v3 <= '0; end
     else begin
-      if (x[0] && |be) v0[ra] <= 1'b1;
-      if (x[1] && |be) v1[ra] <= 1'b1;
-      if (x[3] && |be) v2[rb] <= 1'b1;
-      if (x[4] && |be) v3[rc] <= 1'b1;
+      if (x[0]) v0[ra] <= 1'b1;
+      if (x[1]) v1[ra] <= 1'b1;
+      if (x[3]) v2[rb] <= 1'b1;
+      if (x[4]) v3[rc] <= 1'b1;
     end
   function automatic logic [15:0] fold16(input logic [8*W-1:0] v);
     logic [15:0] s = '0;
@@ -113,9 +114,10 @@ module L2 #(parameter S = 256) (input logic clk, input logic rst,
     t <= tg[req_a[I-1:0]];
     hv <= vld[req_a[I-1:0]];
     // read-first: the row read this cycle is written this cycle too
+    // (t only where its row was written: a never-written row's bits are no part of any value.)
     if (req_v) begin
-      data[req_a[I-1:0]] <= {32{req_a ^ 16'(t)}};
-      tg[req_a[I-1:0]] <= {req_a, t[63:16]};
+      data[req_a[I-1:0]] <= {32{req_a ^ 16'(hv ? t : 64'h0)}};
+      tg[req_a[I-1:0]] <= {req_a, (hv ? t[63:16] : 48'h0)};
     end
   end
   always_ff @(posedge clk) if (rst) vld <= '0; else if (req_v) vld[req_a[I-1:0]] <= 1'b1;
