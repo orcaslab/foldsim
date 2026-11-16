@@ -28,7 +28,7 @@
 # RUN: FileCheck %s --check-prefix=SLL < %t/g/sll/sll.txt
 # SLL: memory paths (S28): 22, 0 crossing an SLR boundary (0 bits)
 # RUN: python3 %S/Inputs/tb_s28_beats.py %t/g/foldsim_sim.json %t/g/beats.hex %t/g/lanes.hex
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -DRST_IN '-DS28_BUSES=`S28_BUS(0, 0) `S28_BUS(1, 0) `S28_BUS(2, 0) `S28_BUS(2, 1)' -I%S/../../shell/rtl -Mdir %t/g/obj %S/Inputs/tb_s28.sv syn2.sv %t/g/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/g/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -DRST_IN '-DS28_BUSES=`S28_BUS(0, 0) `S28_BUS(1, 0) `S28_BUS(2, 0) `S28_BUS(2, 1)' -I%S/../../shell/rtl -I%t/g -Mdir %t/g/obj %S/Inputs/tb_s28.sv syn2.sv %t/g/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/g/build.log 2>&1
 # RUN: %t/g/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +beats=%t/g/beats.hex +lanes=%t/g/lanes.hex +lo=1 | FileCheck %s
 # RUN: %t/g/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +beats=%t/g/beats.hex +lanes=%t/g/lanes.hex +lo=5 +hi=60 +mstall=30 | FileCheck %s
 # RUN: %t/g/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +beats=%t/g/beats.hex +lanes=%t/g/lanes.hex +lo=1 +hi=30 +stall=20 +hold=10 +rstevery=37 | FileCheck %s

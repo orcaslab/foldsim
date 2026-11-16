@@ -27980,13 +27980,16 @@ LogicalResult StaticFolder::buildSim() {
 /// controller of that group's SLR (the kernel's) takes it. The adapters keep
 /// the native vm<k> port: its requests (the copy's outputs) go in, its
 /// answers and `free` come out where the simulator's inputs were.
-/// Words (foldsim_vmem_s28.vh): request 619 bits {cls 6, mem 4, inst 12,
-/// row 16, beat 3, last 1, we 1, wmask 64, wdata 512}, response 538 bits.
+/// Words (foldsim_vmem_s28.vh): request {cls 6, mem 4, inst INST_W, row
+/// ROW_W, beat 3, last 1, we 1, wmask 64, wdata 512} (591 + INST_W + ROW_W
+/// bits), response {cls 6, mem 4, inst INST_W, beat 3, last 1, data 512}
+/// (526 + INST_W), INST_W and ROW_W the design's widest memory's instance
+/// and row fields (parameters of every unit, FOLDSIM_S28_INST_W / _ROW_W).
 /// `cls` is the class's number in its region, `mem` the memory's index in
 /// its class's local switch.
 LogicalResult StaticFolder::buildS28() {
-  constexpr unsigned kReqW = 619, kRspW = 542, kClsMax = 64, kMemMax = 16;
-  constexpr unsigned kInstMax = 16, kRowMax = 12, kBeatW = 3;
+  constexpr unsigned kClsMax = 64, kMemMax = 16;
+  constexpr unsigned kInstMax = 32, kRowMax = 32, kBeatW = 3;
   auto *context = top.getContext();
   auto sim = simModule;
   auto *body = sim.getBodyBlock();
@@ -28066,6 +28069,13 @@ LogicalResult StaticFolder::buildS28() {
              << ", mask " << m.mw << " bits) is past the S28 word's fields";
     mems.push_back(m);
   }
+  // The words' instance and row fields: the widest memory's (at least a bit).
+  unsigned instW = 1, rowW = 1;
+  for (auto &m : mems) {
+    instW = std::max(instW, m.iw);
+    rowW = std::max(rowW, m.aw);
+  }
+  const unsigned kReqW = 591 + instW + rowW, kRspW = 526 + instW;
   // Regions (groups), their classes with memories (a class's number in its
   // region, in class order), each class's domain root: the topmost ancestor
   // in its group, where extractDomains nests it.
@@ -28227,7 +28237,8 @@ LogicalResult StaticFolder::buildS28() {
                       {{"rsp_valid", 1}, {"rsp_inst", m.iw}, {"rsp_data", m.dw}, {"free", 16},
                        {"e_valid", 1}, {"e_rd", 1}, {"e_wr", 1}, {"e_rinst", m.iw}, {"e_winst", m.iw},
                        {"e_rrow", m.aw}, {"e_wrow", m.aw}, {"e_wdata", m.rdw}, {"e_wmask", m.rmw}},
-                      {{"IW", 32}, {"AW", 32}, {"DW", 32}, {"MW", 32}, {"LANES", 32}},
+                      {{"IW", 32}, {"AW", 32}, {"DW", 32}, {"MW", 32}, {"LANES", 32},
+                       {"INST_W", 32}, {"ROW_W", 32}},
                       // (rsp_data: the row register itself, or with lanes its
                       // lane's select: logic.)
                       m.lanes > 1
@@ -28252,7 +28263,8 @@ LogicalResult StaticFolder::buildS28() {
       m.adapter = cast<hw::InstanceOp>(place(hw::InstanceOp::create(
           b, ext, "s28_ad_" + m.port + classes[c].name, ins,
           b.getArrayAttr({param32("IW", m.iw), param32("AW", m.aw), param32("DW", m.dw),
-                          param32("MW", m.mw), param32("LANES", m.lanes)}))));
+                          param32("MW", m.mw), param32("LANES", m.lanes),
+                          param32("INST_W", instW), param32("ROW_W", rowW)}))));
       auto r = m.adapter.getResults();
       eValid.push_back(r[4]);
       eRd.push_back(r[5]);
@@ -28278,7 +28290,8 @@ LogicalResult StaticFolder::buildS28() {
                     {{"e_free", 16 * n}, {"o_valid", 1}, {"o_word", kReqW}, {"idle", 1}, {"a_valid", n},
                      {"a_inst", iw}, {"a_beat", kBeatW}, {"a_last", 1}, {"a_data", 512}},
                     {{"N", 32}, {"CLS", 32}, {"IW", 32}, {"AW", 32}, {"DW", 32}, {"MW", 32},
-                     {"MAW", 32 * n}, {"MDW", 32 * n}, {"MMW", 32 * n}, {"RDW_READ_FIRST", 32 * n}},
+                     {"MAW", 32 * n}, {"MDW", 32 * n}, {"MMW", 32 * n}, {"RDW_READ_FIRST", 32 * n},
+                     {"INST_W", 32}, {"ROW_W", 32}},
                     {"e_free=reg", "o_valid=reg", "o_word=reg", "idle=reg", "a_valid=reg", "a_inst=reg",
                      "a_beat=reg", "a_last=reg", "a_data=reg"});
     Lsw l{hw::InstanceOp(), edge(1), edge(1), edge(1), edge(kRspW)};
@@ -28289,7 +28302,8 @@ LogicalResult StaticFolder::buildS28() {
         b.getArrayAttr({param32("N", n), param32("CLS", regionCls[c]), param32("IW", iw),
                         param32("AW", aw), param32("DW", dw), param32("MW", mw),
                         paramArray("MAW", maw, 32), paramArray("MDW", mdw, 32),
-                        paramArray("MMW", mmw, 32), paramArray("RDW_READ_FIRST", rf, 32)}))));
+                        paramArray("MMW", mmw, 32), paramArray("RDW_READ_FIRST", rf, 32),
+                        param32("INST_W", instW), param32("ROW_W", rowW)}))));
     auto r = l.inst.getResults();
     free.setValue(r[0]);
     aValid.setValue(r[4]);
@@ -28303,6 +28317,7 @@ LogicalResult StaticFolder::buildS28() {
   // its bus (s28r<g>_<j>_*).
   SmallVector<std::pair<StringAttr, Value>> newOutputs;
   SmallVector<Attribute> meta;
+  meta.push_back(b.getStringAttr("words:" + Twine(instW) + ":" + Twine(rowW)));
   std::string text;
   llvm::raw_string_ostream os(text);
   for (unsigned g = 0; g < regions; ++g) {
@@ -28336,12 +28351,13 @@ LogicalResult StaticFolder::buildS28() {
                        {"o_ready", 1}, {"o_hold", 1}, {"r_valid", 1}, {"r_word", kRspW}},
                       {{"i_ready", k}, {"i_hold", 1}, {"o_valid", 1}, {"o_word", kReqW}, {"o_idle", 1},
                        {"ri_valid", k}, {"ri_word", kRspW}},
-                      {{"K", 32}, {"ICLSM", 64 * k}},
+                      {{"K", 32}, {"ICLSM", 64 * k}, {"INST_W", 32}, {"ROW_W", 32}},
                       {"i_hold=reg", "o_valid=reg", "o_word=reg", "o_idle=reg", "ri_valid=reg", "ri_word=reg"});
       auto csw = cast<hw::InstanceOp>(place(hw::InstanceOp::create(
           b, ext, ("s28_csw_r" + Twine(g) + "_" + Twine(j)).str(),
           {clk, packed(iValid), packed(iWord), packed(iIdle), reqRdy, hold, rspV, rspWord},
-          b.getArrayAttr({param32("K", k), paramArray("ICLSM", iclsm, 64)}))));
+          b.getArrayAttr({param32("K", k), paramArray("ICLSM", iclsm, 64),
+                          param32("INST_W", instW), param32("ROW_W", rowW)}))));
       auto r = csw.getResults();
       std::string classesText;
       uint64_t mask = 0;

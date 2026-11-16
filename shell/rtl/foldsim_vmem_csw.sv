@@ -27,6 +27,9 @@
 //    idle, no word here.
 module foldsim_vmem_csw #(
     parameter K                 = 2,
+    // The words' instance and row fields (foldsim_vmem_s28.vh: per design).
+    parameter INST_W = 16,
+    parameter ROW_W  = 12,
     // Input k's classes in bits [k*64 +: 64].
     parameter logic [K*64-1:0] ICLSM = '1
 ) (

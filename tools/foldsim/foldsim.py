@@ -1844,9 +1844,12 @@ def s28_layout(vmems, meta, names=None):
     entries (E_*) are its memories, its LIN_BASE and BYTES their extent (the zero fill's). The region's SLR: its
     group's, by name (the compiler's group g is the region JSON's g-th SLR: group 0 = SLR2 on the V80)."""
     regions, ins, mems = {}, {}, []
+    words = (16, 12)  # (a netlist from before `words:`: A2's fixed fields)
     for e in meta:
         f = e.split(':')
-        if f[0] == 'region':
+        if f[0] == 'words':
+            words = (int(f[1]), int(f[2]))
+        elif f[0] == 'region':
             regions[int(f[1])] = {'group': int(f[1]), 'slr': names[int(f[1])] if names else '', 'classes': int(f[3]),
                                   'inputs': [], 'entries': []}
         elif f[0] == 'in':
@@ -1881,7 +1884,10 @@ def s28_layout(vmems, meta, names=None):
             offset += -(-v['bytes'] // 4096) * 4096
         r['bytes'] = offset - r['lin_base']
         out.append(r)
-    return {'regions': out, 'bytes': offset}
+    # The words' instance and row fields (the design's widest memory's): request 591 + INST_W + ROW_W bits,
+    # response 526 + INST_W (foldsim_vmem_s28.vh).
+    return {'regions': out, 'bytes': offset, 'inst_w': words[0], 'row_w': words[1],
+            'req_w': 591 + words[0] + words[1], 'rsp_w': 526 + words[0]}
 
 
 def write_s28_vh(f, s28):
@@ -1890,6 +1896,8 @@ def write_s28_vh(f, s28):
     (masters, PC map, sp tags) is the flow's (vmem_ports.py)."""
     f.write('`define FOLDSIM_S28\n')
     f.write(f'`define FOLDSIM_S28_REGIONS {len(s28["regions"])}\n')
+    f.write(f'`define FOLDSIM_S28_INST_W {s28["inst_w"]}\n`define FOLDSIM_S28_ROW_W {s28["row_w"]}\n')
+    f.write(f'`define FOLDSIM_S28_REQ_W {s28["req_w"]}\n`define FOLDSIM_S28_RSP_W {s28["rsp_w"]}\n')
     f.write('`define FOLDSIM_S28_REPEAT(f,s) ' + ' `s '.join(f'`f({r["group"]})' for r in s28['regions']) + '\n')
     arr = lambda vals, fmt=str: "'{" + ', '.join(fmt(v) for v in vals) + '}'
     hex64 = lambda v: "64'h%x" % v

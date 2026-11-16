@@ -37,6 +37,9 @@ module foldsim_vmem_adapter #(
     parameter DW    = 512,
     parameter MW    = DW / 8,
     parameter LANES = 1,
+    // The words' instance and row fields (foldsim_vmem_s28.vh: per design).
+    parameter INST_W = 16,
+    parameter ROW_W  = 12,
     localparam DB   = (DW + 7) / 8 * 8,
     localparam RDW  = (LANES > 1) ? LANES * DB : DW,       // the row's data bits
     localparam RMW  = (LANES > 1) ? LANES * DB / 8 : MW,   // the row's mask bits

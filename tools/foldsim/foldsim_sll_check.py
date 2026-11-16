@@ -768,11 +768,11 @@ def s28_memory_paths(gdir, fpath, names=None):
             csw = f's28_csw_r{g}_{x["index"]}'
             for c, lsw in sorted(by_cls.items()):
                 if x['class_mask'] >> c & 1:
-                    out.append((lsw, csw, 619 + 538 + 4, at.get(lsw) != at.get(csw)))
+                    out.append((lsw, csw, s28.get('req_w', 619) + s28.get('rsp_w', 542) + 4, at.get(lsw) != at.get(csw)))
             # The region controller: at its pin (an SLR, or its group's fs_slr<g>).
             cplace = at.get(csw)
             same = cplace == rplace or (rplace == f'fs_slr{g}' and cplace == pins.get(f'foldsim_slr{g}', rplace))
-            out.append((csw, f's28_region_{g}', 619 + 538 + 4, not same))
+            out.append((csw, f's28_region_{g}', s28.get('req_w', 619) + s28.get('rsp_w', 542) + 4, not same))
         # Masters: the region's SLR against its group's ports (foldsim_sp.txt).
         if g in sp and re.fullmatch(r'SLR\d+', rplace or ''):
             out.append((f's28_region_{g}', f'{sp[g]} HBM ports', 1290, sp[g] != rplace))

@@ -14,7 +14,7 @@
 `include "foldsim_vmem_s28.vh"
 
 // foldsim_vmem_lsw: the local switch of one class (S28): its N type
-// adapters' entries onto one request bus of 619-bit words, one a cycle.
+// adapters' entries onto one request bus of words (foldsim_vmem_s28.vh), one a cycle.
 //
 // Buffer. A class copy evaluates one instance a host cycle but may access
 // all its memories in it (the operand collector: 4 GPR banks), so up to N
@@ -62,6 +62,9 @@ module foldsim_vmem_lsw #(
     parameter logic [N*32-1:0] RDW_READ_FIRST = {N{32'd1}},
     // Entries per adapter bank, a power of two of at least 8.
     parameter FIFO         = 16,
+    // The words' instance and row fields (foldsim_vmem_s28.vh: per design).
+    parameter INST_W = 16,
+    parameter ROW_W  = 12,
     localparam GW          = $clog2(FIFO + 1)
 ) (
     input  wire                   clk,

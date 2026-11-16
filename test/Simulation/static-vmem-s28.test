@@ -21,16 +21,18 @@
 # SV-DAG: s28r0_0_req_rdy,
 # SV-DAG: s28r0_0_hold,
 # SV-DAG: s28r0_0_rsp_v,
-# SV-DAG: input {{ *}}[541:0] s28r0_0_rsp_word,
+# SV-DAG: input {{ *}}[527:0] s28r0_0_rsp_word,
 # SV-DAG: output {{ *}}s28r0_0_req_v,
-# SV-DAG: output {{ *}}[618:0] s28r0_0_req_word,
+# SV-DAG: output {{ *}}[596:0] s28r0_0_req_word,
 # SV-DAG: output {{ *}}s28r0_0_idle
 # SV: foldsim_vmem_adapter #(
 # SV-NEXT: .IW(2),
 # SV-NEXT: .AW(4),
 # SV-NEXT: .DW(8),
 # SV-NEXT: .MW(1),
-# SV-NEXT: .LANES(1)
+# SV-NEXT: .LANES(1),
+# SV-NEXT: .INST_W(2),
+# SV-NEXT: .ROW_W(4)
 # SV-NEXT: ) s28_ad_vm0_Leaf (
 # SV: foldsim_vmem_lsw #(
 # SV-NEXT: .N(1),
@@ -38,13 +40,19 @@
 # SV: ) s28_lsw_Leaf (
 # SV: foldsim_vmem_csw #(
 # SV-NEXT: .K(1),
-# SV-NEXT: .ICLSM(64'd1)
+# SV-NEXT: .ICLSM(64'd1),
+# SV-NEXT: .INST_W(2),
+# SV-NEXT: .ROW_W(4)
 # SV-NEXT: ) s28_csw_r0_0 (
 # The kernel's header: the region, its bus, its memory table (class, memory, instances, row bytes' log2, data bits,
 # lin offset); no per-memory controllers.
 # RUN: FileCheck %s --check-prefix=VH < %t/one/foldsim_sim.vh
 # VH: `define FOLDSIM_S28
 # VH-NEXT: `define FOLDSIM_S28_REGIONS 1
+# VH-NEXT: `define FOLDSIM_S28_INST_W 2
+# VH-NEXT: `define FOLDSIM_S28_ROW_W 4
+# VH-NEXT: `define FOLDSIM_S28_REQ_W 597
+# VH-NEXT: `define FOLDSIM_S28_RSP_W 528
 # VH-NEXT: `define FOLDSIM_S28_REPEAT(f,s) `f(0)
 # VH: `define FOLDSIM_S28_R0_NIN 1
 # VH-NEXT: `define FOLDSIM_S28_R0_IN_REPEAT(f,s) `f(0, 0)
@@ -62,7 +70,7 @@
 # Without SLR groups the region controller sits with the level: no path crosses.
 # RUN: FileCheck %s --check-prefix=SLL1 < %t/one/sll/sll.txt
 # SLL1: memory paths (S28): 3, 0 crossing an SLR boundary (0 bits)
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -Mdir %t/one/obj %S/Inputs/tb_s28.sv top.sv %t/one/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/one/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -I%t/one -Mdir %t/one/obj %S/Inputs/tb_s28.sv top.sv %t/one/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/one/build.log 2>&1
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +mstall=30 | FileCheck %s
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=30 +stall=20 +hold=10 | FileCheck %s
@@ -102,7 +110,7 @@
 # EPFP-NEXT: USER_SLR_ASSIGNMENT SLR1
 # EPFP: -hierarchical mem_pcdemux]
 # EPFP-NEXT: USER_SLR_ASSIGNMENT SLR1
-# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb '-DS28_BUSES=`S28_BUS(0, 0) `S28_BUS(1, 0)' -I%S/../../shell/rtl -Mdir %t/two/obj %S/Inputs/tb_s28.sv top.sv %t/two/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/two/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb '-DS28_BUSES=`S28_BUS(0, 0) `S28_BUS(1, 0)' -I%S/../../shell/rtl -I%t/two -Mdir %t/two/obj %S/Inputs/tb_s28.sv top.sv %t/two/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/two/build.log 2>&1
 # RUN: %t/two/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
 # RUN: %t/two/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +mstall=30 | FileCheck %s
 # RUN: %t/two/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=30 +stall=20 +hold=10 | FileCheck %s
@@ -115,8 +123,8 @@
 # SLL: two: OK:
 # RUN: sed '/s28_region_1\]/{n;s/fs_slr1/fs_slr0/}' %t/two/foldsim_floorplan.tcl > %t/two/fp_bad.tcl
 # RUN: not python3 %foldsim_tools/foldsim_sll_check.py %t/two --log %t/two.log --slr-region v80 --out %t/two/sll_bad --floorplan %t/two/fp_bad.tcl | FileCheck %s --check-prefix=BADFP
-# BADFP: memory paths (S28): 6, 1 crossing an SLR boundary (1,161 bits)
-# BADFP-NEXT: crossing: s28_csw_r1_0 -> s28_region_1 (1161 bits)
+# BADFP: memory paths (S28): 6, 1 crossing an SLR boundary (1,127 bits)
+# BADFP-NEXT: crossing: s28_csw_r1_0 -> s28_region_1 (1127 bits)
 # BADFP: two: REFUSE: 1 memory paths cross an SLR boundary
 #
 # Domains and --domain-merge-lut (the GPU-like target of static-physical-domains.test, the L1's data and tags
@@ -139,8 +147,8 @@
 # M300-COUNT-4: foldsim_sim_slr1( foldsim_vmem_
 # RUN: FileCheck %s --check-prefix=SLLM < %t/m100/sll/sll.txt
 # SLLM: memory paths (S28): 4, 0 crossing an SLR boundary (0 bits)
-# RUN: cd %S/../Driver/Inputs/domains && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -DRST_IN '-DS28_BUSES=`S28_BUS(1, 0)' -I%S/../../shell/rtl -Mdir %t/m100/obj %S/Inputs/tb_s28.sv gpu.sv %t/m100/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/m100/build.log 2>&1
-# RUN: cd %S/../Driver/Inputs/domains && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -DRST_IN '-DS28_BUSES=`S28_BUS(1, 0)' -I%S/../../shell/rtl -Mdir %t/m300/obj %S/Inputs/tb_s28.sv gpu.sv %t/m300/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/m300/build.log 2>&1
+# RUN: cd %S/../Driver/Inputs/domains && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -DRST_IN '-DS28_BUSES=`S28_BUS(1, 0)' -I%S/../../shell/rtl -I%t/m100 -Mdir %t/m100/obj %S/Inputs/tb_s28.sv gpu.sv %t/m100/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/m100/build.log 2>&1
+# RUN: cd %S/../Driver/Inputs/domains && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -DRST_IN '-DS28_BUSES=`S28_BUS(1, 0)' -I%S/../../shell/rtl -I%t/m300 -Mdir %t/m300/obj %S/Inputs/tb_s28.sv gpu.sv %t/m300/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/m300/build.log 2>&1
 # RUN: %t/m100/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
 # RUN: %t/m100/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +mstall=30 +hold=5 | FileCheck %s
 # RUN: %t/m300/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
@@ -172,18 +180,45 @@
 # RUN: python3 %S/Inputs/tb_s28_beats.py %t/pg2/foldsim_sim.json %t/pg2/beats.hex %t/pg2/lanes.hex
 # RUN: python3 %S/Inputs/tb_s28_beats.py %t/pgc/foldsim_sim.json %t/pgc/beats.hex %t/pgc/lanes.hex
 # RUN: python3 %S/Inputs/tb_s28_beats.py %t/pgb/foldsim_sim.json %t/pgb/beats.hex %t/pgb/lanes.hex
-# RUN: cd %S/../Driver/Inputs/paged && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -Mdir %t/pg2/obj %S/Inputs/tb_s28.sv top.sv %t/pg2/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/pg2/build.log 2>&1
-# RUN: cd %S/../Driver/Inputs/paged && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -Mdir %t/pgc/obj %S/Inputs/tb_s28.sv top.sv %t/pgc/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/pgc/build.log 2>&1
-# RUN: cd %S/../Driver/Inputs/paged && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION -DBUBBLES --top-module tb -I%S/../../shell/rtl -Mdir %t/pgb/obj %S/Inputs/tb_s28.sv top.sv %t/pgb/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/pgb/build.log 2>&1
+# RUN: cd %S/../Driver/Inputs/paged && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -I%t/pg2 -Mdir %t/pg2/obj %S/Inputs/tb_s28.sv top.sv %t/pg2/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/pg2/build.log 2>&1
+# RUN: cd %S/../Driver/Inputs/paged && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -I%t/pgc -Mdir %t/pgc/obj %S/Inputs/tb_s28.sv top.sv %t/pgc/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/pgc/build.log 2>&1
+# RUN: cd %S/../Driver/Inputs/paged && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION -DBUBBLES --top-module tb -I%S/../../shell/rtl -I%t/pgb -Mdir %t/pgb/obj %S/Inputs/tb_s28.sv top.sv %t/pgb/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/pgb/build.log 2>&1
 # RUN: %t/pg2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +beats=%t/pg2/beats.hex +lanes=%t/pg2/lanes.hex +lo=1 | FileCheck %s
 # RUN: %t/pg2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +beats=%t/pg2/beats.hex +lanes=%t/pg2/lanes.hex +lo=5 +hi=60 +mstall=30 +hold=10 | FileCheck %s
 # RUN: %t/pgc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +beats=%t/pgc/beats.hex +lanes=%t/pgc/lanes.hex +lo=1 +hi=40 +stall=20 | FileCheck %s
 # RUN: %t/pgb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +beats=%t/pgb/beats.hex +lanes=%t/pgb/lanes.hex +lo=5 +hi=40 +bubble=30 +hold=10 | FileCheck %s
 # RUN: sed 's/\.LANES(4)/.LANES(2)/' %t/pg2/foldsim_sim.sv > %t/pg2/mutant.sv
-# RUN: cd %S/../Driver/Inputs/paged && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -Mdir %t/pg2/objm %S/Inputs/tb_s28.sv top.sv %t/pg2/mutant.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/pg2/buildm.log 2>&1
+# RUN: cd %S/../Driver/Inputs/paged && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -I%t/pg2 -Mdir %t/pg2/objm %S/Inputs/tb_s28.sv top.sv %t/pg2/mutant.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/pg2/buildm.log 2>&1
 # RUN: %t/pg2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +beats=%t/pg2/beats.hex +lanes=%t/pg2/lanes.hex +lo=1 > /dev/null
 # RUN: %t/pg2/objm/Vtb +verilator+rand+reset+0 +verilator+seed+3 +beats=%t/pg2/beats.hex +lanes=%t/pg2/lanes.hex +lo=1 | FileCheck %s --check-prefix=MUT
 # MUT: {{^}}MISMATCH
+# Rows of 17 bits (2^17-row RAMs; A2's fixed row field had 12): the words' instance and row fields are the design's
+# widest memory's (INST_W 1, ROW_W 17: a 609-bit request, a 527-bit response), parameters of every unit and the
+# kernel's (foldsim_sim.vh). Exact against the target; a model that keeps 12 row bits aliases rows and mismatches; units
+# built at ROW_W 12 refuse the 17-bit memory.
+# RUN: cd %S/../Driver/Inputs/vmem17 && foldsim --srcs top.f --top Top --out %t/w17 --static --virtual-memories ram --vmem-controller s28 --ready-ahead --room-ahead Leaf > %t/w17.log 2>&1
+# RUN: FileCheck %s --check-prefix=W17 < %t/w17/foldsim_sim.vh
+# W17: `define FOLDSIM_S28_INST_W 1
+# W17-NEXT: `define FOLDSIM_S28_ROW_W 17
+# W17-NEXT: `define FOLDSIM_S28_REQ_W 609
+# W17-NEXT: `define FOLDSIM_S28_RSP_W 527
+# RUN: FileCheck %s --check-prefix=W17SV < %t/w17/foldsim_sim.sv
+# W17SV-DAG: output {{ *}}[608:0] s28r0_0_req_word,
+# W17SV-DAG: input {{ *}}[526:0] s28r0_0_rsp_word,
+# W17SV: foldsim_vmem_adapter #(
+# W17SV-NEXT: .IW(1),
+# W17SV-NEXT: .AW(17),
+# W17SV: .ROW_W(17)
+# W17SV-NEXT: ) s28_ad_vm0_Leaf (
+# RUN: cd %S/../Driver/Inputs/vmem17 && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -I%t/w17 -Mdir %t/w17/obj %S/Inputs/tb_s28.sv top.sv %t/w17/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/w17/build.log 2>&1
+# RUN: %t/w17/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
+# RUN: %t/w17/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +mstall=30 +hold=10 | FileCheck %s
+# RUN: %t/w17/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +rowbits=12 | FileCheck %s --check-prefix=MUT
+# RUN: sed 's/\.ROW_W(17)/.ROW_W(12)/' %t/w17/foldsim_sim.sv > %t/w17/mutant.sv
+# RUN: cd %S/../Driver/Inputs/vmem17 && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -I%t/w17 -Mdir %t/w17/objm %S/Inputs/tb_s28.sv top.sv %t/w17/mutant.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/w17/buildm.log 2>&1
+# RUN: not %t/w17/objm/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 > %t/w17/mut.txt 2>&1
+# RUN: FileCheck %s --check-prefix=W17M < %t/w17/mut.txt
+# W17M: {{foldsim_vmem_(adapter|lsw)}}: {{.*}}AW 17 {{.*}}past the word's fields
 # Rings have no S28 path: refused, never folded wrong.
 # RUN: cd %S/../Driver/Inputs/vmem && not foldsim --srcs top.f --top Top --out %t/bad3 --static --virtual-memories ram --vmem-rings 16 --vmem-controller s28 Leaf > %t/bad3.txt 2>&1
 # RUN: FileCheck %s --check-prefix=BAD3 < %t/bad3.txt

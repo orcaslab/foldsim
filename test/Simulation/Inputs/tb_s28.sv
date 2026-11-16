@@ -6,13 +6,14 @@
 // foldsim_vmem_{adapter,lsw,csw}.sv); each of its region buses
 // (s28r<g>_<j>_*, listed by S28_BUSES as `S28_BUS(g, j)) is served here by
 // `s28_region_model`, a behavioural region controller:
-//  * request words (619 bits {cls 6, mem 4, inst 16, row 12, beat 3, last 1,
-//    we 1, wmask 64, wdata 512}: foldsim_vmem_s28.vh) are taken when `req_rdy` (+stall=<percent>
+//  * request words (591 + INST_W + ROW_W bits {cls 6, mem 4, inst INST_W, row ROW_W, beat 3, last 1,
+//    we 1, wmask 64, wdata 512}: foldsim_vmem_s28.vh; INST_W / ROW_W the design's, FOLDSIM_S28_INST_W /
+//    _ROW_W of its foldsim_sim.vh, found on the include path) are taken when `req_rdy` (+stall=<percent>
 //    of the host cycles low) and applied in arrival order: a write beat's
 //    bytes under its mask; a read takes the row's beats as of its arrival;
 //  * each read is answered +lo=<n> to +hi=<n> host cycles after it arrives,
-//    in arrival order, its beats back to back (542-bit words {cls 6, mem 4,
-//    inst 16, beat 3, last 1, data 512}); each row its memory's beats, from
+//    in arrival order, its beats back to back (526 + INST_W-bit words {cls 6, mem 4,
+//    inst INST_W, beat 3, last 1, data 512}); each row its memory's beats, from
 //    +beats=<file> ($readmemh, entry {g 4, cls 6, mem 4}: the beats of region g's
 //    class cls's memory mem; tb_s28_beats.py writes it from foldsim_sim.json),
 //    else 1; a page column's K lanes share a row as the region controller
@@ -24,23 +25,34 @@
 // (the simulator's `rst` channel), as in tb_reset.sv; with +rstevery=<n> also for two of every n cycles.
 // Prints MATCH or the first difference; WORDS, the request words taken.
 `include "foldsim_vmem_s28.vh"
+`include "foldsim_sim.vh"
+`ifndef FOLDSIM_S28_INST_W
+`define FOLDSIM_S28_INST_W 16
+`define FOLDSIM_S28_ROW_W 12
+`endif
 `ifndef S28_BUSES
 `define S28_BUSES `S28_BUS(0, 0)
 `endif
 
-module s28_region_model #(parameter G = 0) (
+module s28_region_model #(parameter G = 0, INST_W = 16, ROW_W = 12) (
     input logic clk, rst,
     input int cyc, lo, hi, stall, hold_pct,
     input logic req_v, input logic [`S28_REQ_W-1:0] req_word, input logic idle,
     output logic req_rdy, output logic hold,
     output logic rsp_v, output logic [`S28_RSP_W-1:0] rsp_word,
     output int words);
-  logic [511:0] mem [bit [40:0]];
-  typedef struct { int due; logic [25:0] hdr; int beats; logic [511:0] data [8]; } rd_t;
+  logic [511:0] mem [bit [80:0]];
+  typedef struct { int due; logic [9 + INST_W:0] hdr; int beats; logic [511:0] data [8]; } rd_t;
   rd_t q [$];
   int beat = 0;
   initial words = 0;
   logic [3:0] beats [1 << 14], lanes [1 << 14];
+  // +rowbits=<n>: the model keeps only a row's low n bits (rows alias: a mutant of a narrower row field).
+  int rowbits;
+  initial if (!$value$plusargs("rowbits=%d", rowbits)) rowbits = 32;
+  function automatic logic [31:0] row_of(logic [ROW_W-1:0] r);
+    return rowbits >= 32 ? 32'(r) : 32'(r) & ((32'd1 << rowbits) - 1);
+  endfunction
   initial begin
     automatic string f;
     for (int i = 0; i < (1 << 14); i++) begin beats[i] = 4'd1; lanes[i] = 4'd0; end
@@ -67,11 +79,11 @@ module s28_region_model #(parameter G = 0) (
     if (req_v && req_rdy) begin
       automatic logic [5:0] c = req_word[`S28_Q_CLS];
       automatic logic [3:0] m = req_word[`S28_Q_MEM];
-      automatic logic [15:0] i = req_word[`S28_Q_INST];
-      automatic logic [11:0] r = req_word[`S28_Q_ROW];
+      automatic logic [INST_W-1:0] i = req_word[`S28_Q_INST];
+      automatic logic [ROW_W-1:0] r = req_word[`S28_Q_ROW];
       automatic logic [2:0] b = req_word[`S28_Q_BEAT];
-      automatic logic [15:0] ri = i >> lanes[{4'(G), c, m}];
-      automatic bit [40:0] key = {c, m, ri, r, b};
+      automatic logic [31:0] ri = 32'(i) >> lanes[{4'(G), c, m}];
+      automatic bit [80:0] key = {c, m, ri, row_of(r), b};
       words++;
       if (req_word[`S28_Q_WE]) begin
         automatic logic [511:0] old = mem.exists(key) ? mem[key] : '0;
@@ -83,7 +95,7 @@ module s28_region_model #(parameter G = 0) (
         rd.hdr = {c, m, i};
         rd.beats = beats_of(c, m);
         for (int k = 0; k < rd.beats; k++) begin
-          automatic bit [40:0] kk = {c, m, ri, r, 3'(k)};
+          automatic bit [80:0] kk = {c, m, ri, row_of(r), 3'(k)};
           rd.data[k] = mem.exists(kk) ? mem[kk] : '0;
         end
         rd.due = cyc + lo + int'($urandom % (hi - lo + 1));
@@ -95,7 +107,7 @@ module s28_region_model #(parameter G = 0) (
 endmodule
 
 module tb;
-  localparam T = 200, W = 4;
+  localparam T = 200, W = 4, INST_W = `FOLDSIM_S28_INST_W, ROW_W = `FOLDSIM_S28_ROW_W;
   function automatic logic [7:0] stim_x(int t);
     logic [31:0] v = 32'(t) * 32'h9e3779b9;
     v ^= v >> 15; v *= 32'h2c1b3c6d; v ^= v >> 12;
@@ -139,7 +151,7 @@ module tb;
 `define S28_BUS(g, j) \
   wire s28r``g``_``j``_req_v, s28r``g``_``j``_idle, s28r``g``_``j``_req_rdy, s28r``g``_``j``_hold, s28r``g``_``j``_rsp_v; \
   wire [`S28_REQ_W-1:0] s28r``g``_``j``_req_word; wire [`S28_RSP_W-1:0] s28r``g``_``j``_rsp_word; int words_``g``_``j; \
-  s28_region_model #(.G(g)) m_``g``_``j (.clk, .rst, .cyc, .lo, .hi, .stall(mstall), .hold_pct, \
+  s28_region_model #(.G(g), .INST_W(INST_W), .ROW_W(ROW_W)) m_``g``_``j (.clk, .rst, .cyc, .lo, .hi, .stall(mstall), .hold_pct, \
     .req_v(s28r``g``_``j``_req_v), .req_word(s28r``g``_``j``_req_word), .idle(s28r``g``_``j``_idle), \
     .req_rdy(s28r``g``_``j``_req_rdy), .hold(s28r``g``_``j``_hold), .rsp_v(s28r``g``_``j``_rsp_v), \
     .rsp_word(s28r``g``_``j``_rsp_word), .words(words_``g``_``j));
