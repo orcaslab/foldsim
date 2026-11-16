@@ -8,7 +8,8 @@ and enters the next one into a register. A design that fits and is not local fai
 cluster of class copies joined by zero-latency links, pinned as one blob; FSD E3: the level's control, the kernel's
 token channels and reset fanning out unregistered over the SLRs, WNS -5.3 ns at 200 MHz).
 
-The netlist's simulator level (foldsim_sim and the SLR group modules foldsim_sim_slr<g> under it, inlined) is read as
+The netlist's simulator level (foldsim_sim and the SLR group modules foldsim_sim_slr<g> under it, and the physical
+domains foldsim_sim_dom_<class> under either (--physical-domains: the same netlist, its hierarchy only), inlined) is read as
 a graph: registers, memories (a read of latency 0 is logic on its address, the memory a register), logic and wires
 (foldsim_cost.FREE), the class copies' pins (`<class>_copy` of `<class>_static`, each copy's ports judged inside its
 module: an input registered where every use is a register's or a memory write's operand through wires alone, an
@@ -240,7 +241,8 @@ class Graph:
 
 def build_level(path, sim='foldsim_sim'):
     """The simulator level as a Graph, the SLR group modules inlined; {copy: (class, group)}; copy port maps."""
-    level_mods = modules(path, lambda n: n == sim or re.fullmatch(re.escape(sim) + r'_slr\d+', n) is not None)
+    level_mods = modules(path, lambda n: n == sim or re.fullmatch(re.escape(sim) + r'_slr\d+', n) is not None
+                         or n.startswith(sim + '_dom_'))
     if sim not in level_mods:
         raise SystemExit(f'foldsim_locality.py: {path} has no module {sim}')
     g = Graph()
@@ -270,7 +272,9 @@ def build_level(path, sim='foldsim_sim'):
                 if op == 'hw.instance':
                     iname, mod, ins, outl = instance(rest)
                     if mod in level_mods:
-                        gi = int(re.search(r'_slr(\d+)$', mod).group(1))
+                        # (A physical domain stays in the group of the module that instantiates it.)
+                        mg = re.search(r'_slr(\d+)$', mod)
+                        gi = int(mg.group(1)) if mg else group
                         amap = {p: g.node(key(v)) for p, v, _ in ins}
                         sub = walk(mod, prefix + iname + '/', gi, amap)
                         for r, (on, w) in zip(res, outl):

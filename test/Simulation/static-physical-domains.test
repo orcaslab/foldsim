@@ -59,6 +59,13 @@
 # RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gflat --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env > %t/gflat.log 2>&1
 # RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gdom --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --physical-domains > %t/gdom.log 2>&1
 # RUN: FileCheck %s --check-prefix=GLOG < %t/gdom.log
+# foldsim_locality.py reads the domains inlined into their group (the same netlist): the grouped netlist with and
+# without --physical-domains gets the same findings (a domain module read as a black box made every input of it
+# reach every output: false fan-outs over the SLRs, the 4-SM b10m of a32-S26X-F26).
+# RUN: python3 %foldsim_tools/foldsim_locality.py %t/gflat --floorplan %t/gflat/foldsim_floorplan.tcl --out %t/locflat --json %t/locflat.json --warn-only > /dev/null
+# RUN: python3 %foldsim_tools/foldsim_locality.py %t/gdom --floorplan %t/gdom/foldsim_floorplan.tcl --out %t/locdom --json %t/locdom.json --warn-only > /dev/null
+# RUN: python3 -c "import json, sys; f = [json.load(open(x)) for x in sys.argv[1:]]; k = lambda d: (d['verdict'], sorted((e['signal'], e['verdict']) for e in d['global_fanout']), sorted((e['src'], e['dst'], e['kind'], e['bits']) for e in d['crossings'])); print('LOCALITY', 'SAME' if k(f[0]) == k(f[1]) else 'DIFFERENT', f[1]['verdict'])" %t/locflat.json %t/locdom.json | FileCheck %s --check-prefix=LOC
+# LOC: LOCALITY SAME
 # --domain-pblocks: each SLR group's root domains for flow/v80/domain_pblocks.tcl (the
 # region's SLR names: group g on the region's g-th SLR).
 # RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gpb --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --physical-domains --domain-pblocks > %t/gpb.log 2>&1
