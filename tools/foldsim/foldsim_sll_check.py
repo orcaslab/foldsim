@@ -678,6 +678,85 @@ def vmem_controllers(gdir, stext=''):
             for k, v in enumerate(vm)] + ports
 
 
+S28_UNIT = re.compile(r'\)\s+(s28_(?:ad_vm(\d+)_\w+|lsw_\w+|csw_r(\d+)_(\d+)))\s*\(')
+
+
+def s28_memory_paths(gdir, fpath, names=None):
+    """--vmem-controller s28 (fold-static vmem-s28): every memory path of the S28 tree, from the generated netlist
+    (foldsim_sim.sv) and the floorplan, and whether it crosses an SLR boundary. The paths: memory k's adapter to its
+    class's local switch, that switch to its domain root's central switch, that switch to its region's controller
+    (the kernel's s28_region_<r>, pinned by the floorplan), and the region controller to its masters' HBM ports
+    (foldsim_sp.txt: group r's SLR and tags). Each end's place: the SLR group whose module (foldsim_sim_slr<g>,
+    nested domains included) instantiates it, by the floorplan's pin of foldsim_slr<g> (fs_slr<g>: the placer's
+    choice, still one place), or the simulator level. Returns None without an S28 tree, else {'paths': [(from, to,
+    bits, crosses)], 'crossings': n, 'bits': crossing bits}."""
+    jpath = os.path.join(gdir, 'foldsim_sim.json')
+    svp = os.path.join(gdir, 'foldsim_sim.sv')
+    if not (os.path.exists(jpath) and os.path.exists(svp)):
+        return None
+    j = json.load(open(jpath))
+    s28 = j.get('s28')
+    if not s28:
+        return None
+    sv = open(svp).read()
+    mods = {m.group(1): m.group(2) for m in re.finditer(r'^module (\w+)\((.*?)^endmodule', sv, re.M | re.S)}
+    children = {m: [(c, i) for c, i in re.findall(r'^\s+(\w+)\s+(\w+)\s*\(', body, re.M) if c in mods]
+                for m, body in mods.items()}
+    pins = dict(re.findall(r'-hierarchical (\w+)\]\s*\n[^\n]*USER_SLR_ASSIGNMENT (\S+) \$c',
+                           open(fpath).read())) if fpath and os.path.exists(fpath) else {}
+    # Each module's place: the group of the foldsim_slr<g> instance above it (the level: None).
+    place, todo = {'foldsim_sim': None}, ['foldsim_sim']
+    while todo:
+        m = todo.pop()
+        for c, inst in children.get(m, []):
+            g = re.fullmatch(r'foldsim_slr(\d+)', inst)
+            where = (pins.get(inst) or f'fs_slr{g.group(1)}') if g else place[m]
+            if c not in place:
+                place[c] = where
+                todo.append(c)
+    level = pins.get('level') or 'level'
+    at = {}
+    for m, body in mods.items():
+        for mm in S28_UNIT.finditer(body):
+            at[mm.group(1)] = place.get(m, level) or level
+    vm = j.get('vmem', [])
+    sp = {}
+    spath = os.path.join(gdir, 'foldsim_sp.txt')
+    if os.path.exists(spath):
+        for line in open(spath):
+            f = line.split()
+            if len(f) >= 3 and f[0] == 'group':
+                sp[int(f[1])] = f[2]
+    out = []
+    for r in s28['regions']:
+        g = r['group']
+        rplace = pins.get(f's28_region_{g}') or f'fs_slr{g}'
+        by_cls = {}
+        for e in r['entries']:
+            v = vm[e['vm']]
+            ad = next((n for n in at if n.startswith(f's28_ad_vm{e["vm"]}_')), f's28_ad_vm{e["vm"]}')
+            lsw = f's28_lsw_{v["class"]}'
+            by_cls[e['cls']] = lsw
+            for x, y, bits in ((ad, lsw, 2 * v['data_width'] + 2 * v['row_width'] + 2 * v['inst_width'] + 512),):
+                out.append((x, y, bits, at.get(x) != at.get(y)))
+        for x in r['inputs']:
+            csw = f's28_csw_r{g}_{x["index"]}'
+            for c, lsw in sorted(by_cls.items()):
+                if x['class_mask'] >> c & 1:
+                    out.append((lsw, csw, 619 + 538 + 4, at.get(lsw) != at.get(csw)))
+            # The region controller: at its pin (an SLR, or its group's fs_slr<g>).
+            cplace = at.get(csw)
+            same = cplace == rplace or (rplace == f'fs_slr{g}' and cplace == pins.get(f'foldsim_slr{g}', rplace))
+            out.append((csw, f's28_region_{g}', 619 + 538 + 4, not same))
+        # Masters: the region's SLR against its group's ports (foldsim_sp.txt).
+        if g in sp and re.fullmatch(r'SLR\d+', rplace or ''):
+            out.append((f's28_region_{g}', f'{sp[g]} HBM ports', 1290, sp[g] != rplace))
+    n = sum(1 for p_ in out if p_[3])
+    return {'paths': out, 'crossings': n, 'bits': sum(p_[2] for p_ in out if p_[3]),
+            'missing': sorted({x for p_ in out for x in p_[:2] if x and x.startswith('s28_') and
+                               not x.startswith('s28_region_') and x not in at})}
+
+
 def floorplan_copies(path):
     """The class copies the floorplan pins one by one (foldsim_pin_copies.py: the `# foldsim pinned copies` section,
     a USER_SLR_ASSIGNMENT of each `<class>_copy` to an SLR by name): {class: SLR name}, or None without it."""
@@ -1049,6 +1128,7 @@ def main():
     # the log (y8b, 11-12: the check judged its own 3-SLR assignment while the floorplan pinned 2 groups whole at
     # 94.5 % / 90 % of SLR2 / SLR1's LUTs; the route failed).
     fpath = a.floorplan or os.path.join(gdir, 'foldsim_floorplan.tcl')
+    vmem_cross = None
     fpg = floorplan_groups(fpath, stext)
     grouped = grouped or fpg is not None
     # Class copies pinned one by one (foldsim_pin_copies.py): the assignment as given, not one of the check's own
@@ -1362,6 +1442,8 @@ def main():
                     vm, vmem_rows = vmem_slls(vmem_controllers(gdir, stext), shares, top_spread, names,
                                               region['noc'], a.vmem_engines, a.vmem_masters,
                                               vpins if a.vmem_engines == 'slr' else None)
+                    vmem_cross = (sum(1 for r in vmem_rows if r['cls'] and sum(r['slls']) > 0.5),
+                                  [r for r in vmem_rows if r['cls']])
                     mrow = [r for r in vmem_rows if r['name'] == 'masters' and not r['cls']]
                     vmem_rows = [r for r in vmem_rows if r not in mrow]
                     if vpins is not None:
@@ -1472,6 +1554,24 @@ def main():
             verdict = f'WARN: {worst:,.0f} SLLs projected over {where} (budget {budget}){cutn}'
         else:
             verdict = f'OK: {worst:,.0f} SLLs projected over {where}, within the {budget} budget'
+    # Memory paths that cross an SLR boundary (S28's rule: none). S28: each path of the tree, from the netlist and
+    # the floorplan; else the kernel controllers whose port wires the projection above takes over a boundary.
+    mp = s28_memory_paths(gdir, fpath)
+    if mp is not None:
+        lines.append(f'  memory paths (S28): {len(mp["paths"])}, {mp["crossings"]} crossing an SLR boundary '
+                     f'({mp["bits"]:,} bits)')
+        for x, y, bits, cr in mp['paths']:
+            if cr:
+                lines.append(f'    crossing: {x} -> {y} ({bits} bits)')
+        if mp['missing']:
+            lines.append('    not in the netlist: ' + ', '.join(mp['missing']))
+        if (mp['crossings'] or mp['missing']) and not verdict.startswith('REFUSE'):
+            verdict = (f'REFUSE: {mp["crossings"]} memory paths cross an SLR boundary ({mp["bits"]:,} bits)'
+                       + (f', {len(mp["missing"])} S28 units missing' if mp['missing'] else '')
+                       + ' (S28: each region\'s memory tree stays in its SLR)')
+    elif vmem_cross is not None:
+        lines.append(f'  memory paths (kernel controllers): {len(vmem_cross[1])}, {vmem_cross[0]} crossing an SLR '
+                     'boundary (port wires projected over a boundary)')
     finish(lines, verdict)
 
 

@@ -1,0 +1,141 @@
+# REQUIRES: verilator
+# --vmem-controller s28 (fold-static vmem-s28, S28 stage A): the class memories' controller side built into the
+# simulator per SLR group. Memory k's type adapter (foldsim_vmem_adapter) keeps its native vm<k> port inside the
+# simulator; its class's local switch (foldsim_vmem_lsw) and its domain root's central switch (foldsim_vmem_csw)
+# follow, each instantiated in the class's (the root's) domain and group; the vm<k> ports give way to each root's
+# bus s28r<g>_<j>_* for the kernel's region controller of group g. tb_s28.sv serves the buses with a behavioural
+# region controller (random latency, request stalls, hold) on the units of shell/rtl: exact against the target.
+#
+# One group: the four leaves' RAM, one class (Leaf x4), one local and one central switch.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem
+# RUN: foldsim --srcs top.f --top Top --out %t/one --static --virtual-memories ram --vmem-controller s28 --ready-ahead --room-ahead Leaf > %t/one.log 2>&1
+# RUN: FileCheck %s --check-prefix=ONE < %t/one.log
+# ONE: foldsim-fold-static: vmem-s28: 1 memories:
+# ONE-NEXT: region 0: 1 classes, 1 central switches
+# ONE-NEXT: csw 0 (root Leaf): Leaf
+# ONE: foldsim: vmem s28: region 0 (-): 1 central switches, 1 memories, 4096 bytes
+# The vm0 ports are gone; the bus's are there, and the units with the port's widths and the class's parameters.
+# RUN: FileCheck %s --check-prefix=SV < %t/one/foldsim_sim.sv
+# SV-LABEL: module foldsim_sim(
+# SV-NOT: vm0_
+# SV-DAG: s28r0_0_req_rdy,
+# SV-DAG: s28r0_0_hold,
+# SV-DAG: s28r0_0_rsp_v,
+# SV-DAG: input {{ *}}[537:0] s28r0_0_rsp_word,
+# SV-DAG: output {{ *}}s28r0_0_req_v,
+# SV-DAG: output {{ *}}[618:0] s28r0_0_req_word,
+# SV-DAG: output {{ *}}s28r0_0_idle
+# SV: foldsim_vmem_adapter #(
+# SV-NEXT: .IW(2),
+# SV-NEXT: .AW(4),
+# SV-NEXT: .DW(8),
+# SV-NEXT: .MW(1)
+# SV-NEXT: ) s28_ad_vm0_Leaf (
+# SV: foldsim_vmem_lsw #(
+# SV-NEXT: .N(1),
+# SV-NEXT: .CLS(0),
+# SV: ) s28_lsw_Leaf (
+# SV: foldsim_vmem_csw #(
+# SV-NEXT: .K(1),
+# SV-NEXT: .ICLSM(64'd1)
+# SV-NEXT: ) s28_csw_r0_0 (
+# The kernel's header: the region, its bus, its memory table (class, memory, instances, row bytes' log2, data bits,
+# lin offset); no per-memory controllers.
+# RUN: FileCheck %s --check-prefix=VH < %t/one/foldsim_sim.vh
+# VH: `define FOLDSIM_S28
+# VH-NEXT: `define FOLDSIM_S28_REGIONS 1
+# VH-NEXT: `define FOLDSIM_S28_REPEAT(f,s) `f(0)
+# VH: `define FOLDSIM_S28_R0_NIN 1
+# VH-NEXT: `define FOLDSIM_S28_R0_IN_REPEAT(f,s) `f(0, 0)
+# VH-NEXT: `define FOLDSIM_S28_R0_ICLSM '{64'h1}
+# VH-NEXT: `define FOLDSIM_S28_R0_NE 1
+# VH-NEXT: `define FOLDSIM_S28_R0_E_CLS '{0}
+# VH-NEXT: `define FOLDSIM_S28_R0_E_MEM '{0}
+# VH-NEXT: `define FOLDSIM_S28_R0_E_INST '{4}
+# VH-NEXT: `define FOLDSIM_S28_R0_E_RB '{6}
+# VH-NEXT: `define FOLDSIM_S28_R0_E_DW '{8}
+# VH-NEXT: `define FOLDSIM_S28_R0_E_OFF '{64'h0}
+# VH: `define FOLDSIM_S28_R0_BYTES 64'h1000
+# VH-NOT: FOLDSIM_VMEM_COUNT
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -Mdir %t/one/obj %S/Inputs/tb_s28.sv top.sv %t/one/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/one/build.log 2>&1
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +mstall=30 | FileCheck %s
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=30 +stall=20 +hold=10 | FileCheck %s
+# CHECK: {{^}}MATCH 196 cycles
+#
+# Two SLR groups (the leaves' two copies), --room-regions and --physical-domains: each group gets its own region
+# and bus, and every unit sits in its class's domain module inside its group's module.
+# RUN: foldsim --srcs top.f --top Top --out %t/two --static --virtual-memories ram --vmem-controller s28 --ready-ahead --room-ahead --room-regions --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --physical-domains Leaf > %t/two.log 2>&1
+# RUN: FileCheck %s --check-prefix=TWO < %t/two.log
+# TWO: region 0: 1 classes, 1 central switches
+# TWO-NEXT: csw 0 (root Leaf): Leaf
+# TWO-NEXT: region 1: 1 classes, 1 central switches
+# TWO-NEXT: csw 0 (root Leaf_copy1): Leaf_copy1
+# TWO: foldsim: vmem s28: 2 region controllers pinned to their groups' SLRs in foldsim_floorplan.tcl
+# RUN: awk '/^module /{m=$2} /foldsim_vmem_(adapter|lsw|csw) #/{print m, $1} /^  foldsim_sim_dom_[A-Za-z_0-9]* /{print m, $1}' %t/two/foldsim_sim.sv | FileCheck %s --check-prefix=WHERE
+# WHERE-DAG: foldsim_sim_dom_Leaf( foldsim_vmem_adapter
+# WHERE-DAG: foldsim_sim_dom_Leaf( foldsim_vmem_lsw
+# WHERE-DAG: foldsim_sim_dom_Leaf( foldsim_vmem_csw
+# WHERE-DAG: foldsim_sim_slr0( foldsim_sim_dom_Leaf
+# WHERE-DAG: foldsim_sim_dom_Leaf_copy1( foldsim_vmem_adapter
+# WHERE-DAG: foldsim_sim_dom_Leaf_copy1( foldsim_vmem_lsw
+# WHERE-DAG: foldsim_sim_dom_Leaf_copy1( foldsim_vmem_csw
+# WHERE-DAG: foldsim_sim_slr1( foldsim_sim_dom_Leaf_copy1
+# RUN: FileCheck %s --check-prefix=FP < %t/two/foldsim_floorplan.tcl
+# FP: # S28 region controllers with their groups (--vmem-controller s28).
+# FP-NEXT: -hierarchical s28_region_0]
+# FP-NEXT: USER_SLR_ASSIGNMENT fs_slr0
+# FP-NEXT: -hierarchical s28_region_1]
+# FP-NEXT: USER_SLR_ASSIGNMENT fs_slr1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb '-DS28_BUSES=`S28_BUS(0, 0) `S28_BUS(1, 0)' -I%S/../../shell/rtl -Mdir %t/two/obj %S/Inputs/tb_s28.sv top.sv %t/two/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/two/build.log 2>&1
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +mstall=30 | FileCheck %s
+# RUN: %t/two/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=30 +stall=20 +hold=10 | FileCheck %s
+#
+# The SLL check counts the memory paths: adapter -> local switch -> central switch -> region controller, none
+# crossing; with the region controller of group 1 pinned in group 0's place, its central switch's path crosses and
+# the check refuses.
+# RUN: FileCheck %s --check-prefix=SLL < %t/two/sll/sll.txt
+# SLL: memory paths (S28): 6, 0 crossing an SLR boundary (0 bits)
+# SLL: two: OK:
+# RUN: sed '/s28_region_1\]/{n;s/fs_slr1/fs_slr0/}' %t/two/foldsim_floorplan.tcl > %t/two/fp_bad.tcl
+# RUN: not python3 %foldsim_tools/foldsim_sll_check.py %t/two --log %t/two.log --slr-region v80 --out %t/two/sll_bad --floorplan %t/two/fp_bad.tcl | FileCheck %s --check-prefix=BADFP
+# BADFP: memory paths (S28): 6, 1 crossing an SLR boundary (1,161 bits)
+# BADFP-NEXT: crossing: s28_csw_r1_0 -> s28_region_1 (1161 bits)
+# BADFP: two: REFUSE: 1 memory paths cross an SLR boundary
+#
+# Domains and --domain-merge-lut (the GPU-like target of static-physical-domains.test, the L1's data and tags
+# virtual, the SMs' subtree in group 1): one local switch for the L1's two memories (N 2), the central switch at
+# the subtree's root (Sm_model, merged: in the group's own logic). L1 kept (merge below 100 LUTs): the adapters and
+# the local switch in L1's domain; L1 merged too (below 300): in the group's own logic. Exact either way.
+# RUN: cd %S/../Driver/Inputs/domains && foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/m100 --static --nest --zero-latency-links --zero-latency-chains --virtual-memories 'L1:(data|tag)' --vmem-controller s28 --ready-ahead --room-ahead --room-regions --slr-groups --slr-count 2 --slr-assign Top_model:0,L2:0,Sm_model:1,Core_model:1,Lsu:1,L1:1,Alu:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --physical-domains --domain-merge-lut 100 > %t/m100.log 2>&1
+# RUN: cd %S/../Driver/Inputs/domains && foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/m300 --static --nest --zero-latency-links --zero-latency-chains --virtual-memories 'L1:(data|tag)' --vmem-controller s28 --ready-ahead --room-ahead --room-regions --slr-groups --slr-count 2 --slr-assign Top_model:0,L2:0,Sm_model:1,Core_model:1,Lsu:1,L1:1,Alu:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --physical-domains --domain-merge-lut 300 > %t/m300.log 2>&1
+# RUN: FileCheck %s --check-prefix=MERGE < %t/m100.log
+# MERGE: region 1: 1 classes, 1 central switches
+# MERGE-NEXT: csw 0 (root Sm_model): L1
+# RUN: awk '/^module /{m=$2} /foldsim_vmem_(adapter|lsw|csw) #/{print m, $1}' %t/m100/foldsim_sim.sv | FileCheck %s --check-prefix=M100
+# M100: foldsim_sim_dom_L1( foldsim_vmem_adapter
+# M100-NEXT: foldsim_sim_dom_L1( foldsim_vmem_adapter
+# M100-NEXT: foldsim_sim_dom_L1( foldsim_vmem_lsw
+# M100-NEXT: foldsim_sim_slr1( foldsim_vmem_csw
+# RUN: grep -A3 'foldsim_vmem_lsw #' %t/m100/foldsim_sim.sv | FileCheck %s --check-prefix=N2
+# N2: .N(2),
+# RUN: awk '/^module /{m=$2} /foldsim_vmem_(adapter|lsw|csw) #/{print m, $1}' %t/m300/foldsim_sim.sv | FileCheck %s --check-prefix=M300
+# M300-COUNT-4: foldsim_sim_slr1( foldsim_vmem_
+# RUN: FileCheck %s --check-prefix=SLLM < %t/m100/sll/sll.txt
+# SLLM: memory paths (S28): 4, 0 crossing an SLR boundary (0 bits)
+# RUN: cd %S/../Driver/Inputs/domains && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -DRST_IN '-DS28_BUSES=`S28_BUS(1, 0)' -I%S/../../shell/rtl -Mdir %t/m100/obj %S/Inputs/tb_s28.sv gpu.sv %t/m100/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/m100/build.log 2>&1
+# RUN: cd %S/../Driver/Inputs/domains && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -DRST_IN '-DS28_BUSES=`S28_BUS(1, 0)' -I%S/../../shell/rtl -Mdir %t/m300/obj %S/Inputs/tb_s28.sv gpu.sv %t/m300/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/m300/build.log 2>&1
+# RUN: %t/m100/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
+# RUN: %t/m100/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +mstall=30 +hold=5 | FileCheck %s
+# RUN: %t/m300/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
+# RUN: %t/m300/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=30 +stall=20 +hold=10 | FileCheck %s
+#
+# Refused: what the region controllers replace (controller groups, their placement), and a design whose memories
+# are not class memories.
+# RUN: cd %S/../Driver/Inputs/vmem && not foldsim --srcs top.f --top Top --out %t/bad --static --virtual-memories ram --vmem-controller s28 --vmem-group copy Leaf > %t/bad.txt 2>&1
+# RUN: FileCheck %s --check-prefix=BAD < %t/bad.txt
+# BAD: --vmem-controller s28: --vmem-group does not apply
+# RUN: cd %S/../Driver/Inputs/vmem && not foldsim --srcs top.f --top Top --out %t/bad2 --static --vmem-controller s28 Leaf > %t/bad2.txt 2>&1
+# RUN: FileCheck %s --check-prefix=BAD2 < %t/bad2.txt
+# BAD2: --vmem-controller s28 needs --virtual-memories

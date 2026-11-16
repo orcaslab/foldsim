@@ -1047,6 +1047,17 @@ public:
   /// `room-regions` (with room-ahead): the controllers' `free` registered as
   /// it enters, the compare after it (four entries more).
   bool roomRegions = false;
+  /// `vmem-s28` (S28 stage A): each class virtual memory's controller side
+  /// is built into the simulator as a tree that stays in its SLR group: a
+  /// type adapter per memory (foldsim_vmem_adapter) and a local switch per
+  /// class (foldsim_vmem_lsw) in the class's domain, a central switch per
+  /// domain root (foldsim_vmem_csw) in the root's. The vm<k> ports give way
+  /// to each root's request and response bus (s28r<g>_<j>_*), which the
+  /// kernel's region controller of group g's SLR serves.
+  bool vmemS28 = false;
+  /// vmem-s28: the report (schedule report and stderr).
+  std::string s28Report;
+  LogicalResult buildS28();
   unsigned deadInputs = 0, partlyDeadInputs = 0;
   /// Element inputs read at an index (foldsim-index-class-inputs), and
   /// their pieces: read from the rows, of constants, chosen of the frame's.
@@ -27961,6 +27972,407 @@ LogicalResult StaticFolder::buildSim() {
   return success();
 }
 
+/// `vmem-s28` (S28 stage A, VMEM S28 page sections 7.1-7.3): the class
+/// virtual memories' controller side inside the simulator, as a tree per SLR
+/// group (region): memory k's type adapter and its class's local switch in
+/// the class's domain, the central switch of each domain root in the root's,
+/// so that every memory request stays in its group until the region
+/// controller of that group's SLR (the kernel's) takes it. The adapters keep
+/// the native vm<k> port: its requests (the copy's outputs) go in, its
+/// answers and `free` come out where the simulator's inputs were.
+/// Words (foldsim_vmem_s28.vh): request 619 bits {cls 6, mem 4, inst 12,
+/// row 16, beat 3, last 1, we 1, wmask 64, wdata 512}, response 538 bits.
+/// `cls` is the class's number in its region, `mem` the memory's index in
+/// its class's local switch.
+LogicalResult StaticFolder::buildS28() {
+  constexpr unsigned kReqW = 619, kRspW = 538, kClsMax = 64, kMemMax = 16;
+  constexpr unsigned kInstMax = 12, kRowMax = 16, kBeatW = 3;
+  auto *context = top.getContext();
+  auto sim = simModule;
+  auto *body = sim.getBodyBlock();
+  auto output = cast<hw::OutputOp>(body->getTerminator());
+  Location loc = sim.getLoc();
+  if (sim->getAttr("foldsim.vports"))
+    return netlist.emitError("vmem-s28: vport-engines have no S28 path");
+  auto vmems = sim->getAttrOfType<ArrayAttr>("foldsim.vmems");
+  if (!vmems || vmems.empty())
+    return netlist.emitError("vmem-s28: the simulator has no virtual memories");
+  llvm::StringMap<unsigned> inIdx, outIdx, clsOf;
+  for (unsigned i = 0, e = sim.getNumInputPorts(); i < e; ++i)
+    inIdx[sim.getInputName(i)] = i;
+  for (unsigned i = 0, e = sim.getNumOutputPorts(); i < e; ++i)
+    outIdx[sim.getOutputName(i)] = i;
+  for (auto [c, cls] : llvm::enumerate(classes))
+    clsOf[cls.name] = c;
+  auto groupOf = [&](unsigned c) -> unsigned { return slrOf.empty() ? 0 : unsigned(slrOf[c]); };
+  // Each memory: its class, its port's widths, its read-write order.
+  struct Mem {
+    unsigned k, cls, iw, aw, dw, mw, mem = 0;
+    bool readFirst;
+    std::string port;
+    SmallVector<Value> rsp;  // rsp_valid, rsp_inst, rsp_data, free (uses)
+    hw::InstanceOp adapter;
+  };
+  SmallVector<Mem> mems;
+  auto width = [&](Type t) { return unsigned(hw::getBitWidth(t)); };
+  for (auto [k, attr] : llvm::enumerate(vmems)) {
+    SmallVector<StringRef> f;
+    cast<StringAttr>(attr).getValue().split(f, ':');
+    std::string port = ("vm" + Twine(k) + "_").str();
+    auto c = f.size() > 1 ? clsOf.find(f[1]) : clsOf.end();
+    if (f.size() < 8 || c == clsOf.end() || !inIdx.count(port + "rsp_valid") ||
+        !outIdx.count(port + "rd_valid"))
+      return netlist.emitError("vmem-s28: ")
+             << port << " (" << cast<StringAttr>(attr).getValue()
+             << ") is not a class memory's port (stage A has no images, link "
+                "streams or page engines)";
+    Mem m;
+    m.k = k;
+    m.cls = c->second;
+    m.port = port;
+    m.iw = width(sim.getOutputTypes()[outIdx[port + "rd_inst"]]);
+    m.aw = width(sim.getOutputTypes()[outIdx[port + "rd_row"]]);
+    m.dw = width(sim.getOutputTypes()[outIdx[port + "wr_data"]]);
+    m.mw = width(sim.getOutputTypes()[outIdx[port + "wr_mask"]]);
+    m.readFirst = f[6] == "1";
+    if (m.iw > kInstMax || m.aw > kRowMax || (m.dw + 511) / 512 > (1u << kBeatW) ||
+        (m.mw != 1 && m.mw * 8 != m.dw))
+      return netlist.emitError("vmem-s28: ")
+             << port << " (instance " << m.iw << ", row " << m.aw << ", data " << m.dw
+             << ", mask " << m.mw << " bits) is past the S28 word's fields";
+    mems.push_back(m);
+  }
+  // Regions (groups), their classes with memories (a class's number in its
+  // region, in class order), each class's domain root: the topmost ancestor
+  // in its group, where extractDomains nests it.
+  unsigned regions = slrOf.empty() ? 1 : slrGroups;
+  SmallVector<SmallVector<unsigned>> memsOfCls(classes.size());
+  for (auto [i, m] : llvm::enumerate(mems)) {
+    m.mem = memsOfCls[m.cls].size();
+    memsOfCls[m.cls].push_back(i);
+    if (m.mem >= kMemMax)
+      return netlist.emitError("vmem-s28: class ")
+             << classes[m.cls].name << " has more than " << kMemMax << " memories";
+  }
+  auto rootOf = [&](unsigned c) {
+    unsigned root = c;
+    for (int a = classes[c].parent; a >= 0; a = classes[a].parent)
+      if (groupOf(a) == groupOf(c))
+        root = a;
+    return root;
+  };
+  SmallVector<int> regionCls(classes.size(), -1);
+  // Per region: the roots (a central switch each) and each root's classes.
+  SmallVector<llvm::MapVector<unsigned, SmallVector<unsigned>>> roots(regions);
+  SmallVector<unsigned> clsCount(regions, 0);
+  for (unsigned c = 0; c < classes.size(); ++c) {
+    if (memsOfCls[c].empty())
+      continue;
+    unsigned g = groupOf(c);
+    regionCls[c] = clsCount[g]++;
+    if (unsigned(regionCls[c]) >= kClsMax)
+      return netlist.emitError("vmem-s28: more than ")
+             << kClsMax << " classes with memories in group " << g;
+    roots[g][rootOf(c)].push_back(c);
+  }
+  Value clk = body->getArgument(0), reset = body->getArgument(1);
+  // The units' external modules, one per port signature (Verilog: the
+  // unit's name, its parameters the instance's).
+  OpBuilder mb(sim);
+  llvm::StringMap<hw::HWModuleExternOp> externs;
+  auto unit = [&](StringRef verilog, ArrayRef<std::pair<StringRef, unsigned>> ins,
+                  ArrayRef<std::pair<StringRef, unsigned>> outs,
+                  ArrayRef<std::pair<StringRef, unsigned>> params) {
+    std::string key = verilog.str();
+    for (auto &p : ins)
+      key += "_" + Twine(p.second).str();
+    for (auto &p : outs)
+      key += "_" + Twine(p.second).str();
+    auto &ext = externs[key];
+    if (ext)
+      return ext;
+    SmallVector<hw::PortInfo> ports;
+    for (auto &p : ins) {
+      hw::PortInfo pi;
+      pi.name = StringAttr::get(context, p.first);
+      pi.dir = hw::ModulePort::Direction::Input;
+      pi.type = p.first == "clk" ? Type(clk.getType()) : Type(IntegerType::get(context, p.second));
+      ports.push_back(pi);
+    }
+    for (auto &p : outs) {
+      hw::PortInfo pi;
+      pi.name = StringAttr::get(context, p.first);
+      pi.dir = hw::ModulePort::Direction::Output;
+      pi.type = IntegerType::get(context, p.second);
+      ports.push_back(pi);
+    }
+    SmallVector<Attribute> decls;
+    for (auto &p : params)
+      decls.push_back(hw::ParamDeclAttr::get(StringAttr::get(context, p.first),
+                                             IntegerType::get(context, p.second)));
+    std::string sym = (verilog + "_s" + Twine(externs.size())).str();
+    ext = hw::HWModuleExternOp::create(mb, loc, StringAttr::get(context, sym),
+                                       hw::ModulePortInfo(ports), verilog,
+                                       mb.getArrayAttr(decls));
+    ext.setPrivate();
+    return ext;
+  };
+  auto param = [&](StringRef name, const APInt &value) -> Attribute {
+    return hw::ParamDeclAttr::get(name, IntegerType::get(context, value.getBitWidth()),
+                                  IntegerAttr::get(IntegerType::get(context, value.getBitWidth()), value));
+  };
+  auto param32 = [&](StringRef name, uint64_t v) { return param(name, APInt(32, v)); };
+  // A packed array parameter: field i of `bits` at [i * bits +: bits].
+  auto paramArray = [&](StringRef name, ArrayRef<uint64_t> vals, unsigned bits) {
+    APInt v(bits * vals.size(), 0);
+    for (auto [i, x] : llvm::enumerate(vals))
+      v.insertBits(APInt(bits, x), unsigned(i) * bits);
+    return param(name, v);
+  };
+  // Everything built here goes to its group and domain.
+  ImplicitLocOpBuilder b(loc, output);
+  int curGroup = -1, curDom = -1;
+  auto place = [&](Operation *op) {
+    if (!slrOf.empty())
+      tagGroup(op, curGroup);
+    if (physicalDomains)
+      tagDomain(op, curDom);
+    return op;
+  };
+  auto placed = [&](Value v) {
+    if (auto *op = v.getDefiningOp())
+      place(op);
+    return v;
+  };
+  auto constant = [&](unsigned w, uint64_t v) {
+    return placed(hw::ConstantOp::create(b, b.getIntegerType(w), v));
+  };
+  auto zext = [&](Value v, unsigned w) {
+    unsigned have = width(v.getType());
+    return have == w ? v : placed(comb::ConcatOp::create(b, constant(w - have, 0), v));
+  };
+  // Field i of a packed array at [i * w +: w].
+  auto packed = [&](ArrayRef<Value> vals) {
+    SmallVector<Value> rev(vals.rbegin(), vals.rend());
+    return rev.size() == 1 ? rev[0] : placed(comb::ConcatOp::create(b, rev));
+  };
+  auto field = [&](Value v, unsigned i, unsigned w) {
+    return placed(comb::ExtractOp::create(b, v, i * w, w));
+  };
+  BackedgeBuilder backedges(b, loc);
+  auto edge = [&](unsigned w) -> Backedge { return backedges.get(b.getIntegerType(w)); };
+  // Per class with memories: the adapters, then the local switch.
+  struct Lsw {
+    hw::InstanceOp inst;
+    Backedge ready, hold, rValid, rWord;
+  };
+  std::map<unsigned, Lsw> lsws;
+  for (unsigned c = 0; c < classes.size(); ++c) {
+    if (memsOfCls[c].empty())
+      continue;
+    curGroup = int(groupOf(c));
+    curDom = int(c);
+    auto &list = memsOfCls[c];
+    unsigned n = list.size(), iw = 1, aw = 1, dw = 1, mw = 1;
+    for (unsigned i : list) {
+      iw = std::max(iw, mems[i].iw);
+      aw = std::max(aw, mems[i].aw);
+      dw = std::max(dw, mems[i].dw);
+      mw = std::max(mw, mems[i].mw);
+    }
+    // The local switch's outputs, to its adapters, through backedges.
+    Backedge free = edge(16 * n), aValid = edge(n), aInst = edge(iw), aBeat = edge(kBeatW),
+             aLast = edge(1), aData = edge(512);
+    SmallVector<Value> eValid, eRd, eWr, eInst, eRrow, eWrow, eData, eMask;
+    for (auto [j, i] : llvm::enumerate(list)) {
+      auto &m = mems[i];
+      auto ext = unit("foldsim_vmem_adapter",
+                      {{"clk", 1}, {"reset", 1}, {"rd_valid", 1}, {"rd_inst", m.iw}, {"rd_row", m.aw},
+                       {"wr_valid", 1}, {"wr_inst", m.iw}, {"wr_row", m.aw}, {"wr_data", m.dw},
+                       {"wr_mask", m.mw}, {"e_free", 16}, {"r_valid", 1}, {"r_inst", m.iw},
+                       {"r_beat", kBeatW}, {"r_last", 1}, {"r_data", 512}},
+                      {{"rsp_valid", 1}, {"rsp_inst", m.iw}, {"rsp_data", m.dw}, {"free", 16},
+                       {"e_valid", 1}, {"e_rd", 1}, {"e_wr", 1}, {"e_inst", m.iw}, {"e_rrow", m.aw},
+                       {"e_wrow", m.aw}, {"e_wdata", m.dw}, {"e_wmask", m.mw}},
+                      {{"IW", 32}, {"AW", 32}, {"DW", 32}, {"MW", 32}});
+      unsigned o = outIdx[m.port + "rd_valid"];
+      SmallVector<Value> ins{clk, reset};
+      for (unsigned q = 0; q < 8; ++q)
+        ins.push_back(output.getOperand(o + q));
+      ins.push_back(field(free, j, 16));
+      ins.push_back(field(aValid, j, 1));
+      ins.push_back(aInst);
+      if (m.iw < iw)
+        ins.back() = field(aInst, 0, m.iw);
+      ins.append({Value(aBeat), Value(aLast), Value(aData)});
+      m.adapter = cast<hw::InstanceOp>(place(hw::InstanceOp::create(
+          b, ext, "s28_ad_" + m.port + classes[c].name, ins,
+          b.getArrayAttr({param32("IW", m.iw), param32("AW", m.aw), param32("DW", m.dw),
+                          param32("MW", m.mw)}))));
+      auto r = m.adapter.getResults();
+      eValid.push_back(r[4]);
+      eRd.push_back(r[5]);
+      eWr.push_back(r[6]);
+      eInst.push_back(zext(r[7], iw));
+      eRrow.push_back(zext(r[8], aw));
+      eWrow.push_back(zext(r[9], aw));
+      eData.push_back(zext(r[10], dw));
+      eMask.push_back(zext(r[11], mw));
+    }
+    SmallVector<uint64_t> maw, mdw, mmw, rf;
+    for (unsigned i : list) {
+      maw.push_back(mems[i].aw);
+      mdw.push_back(mems[i].dw);
+      mmw.push_back(mems[i].mw);
+      rf.push_back(mems[i].readFirst);
+    }
+    auto ext = unit("foldsim_vmem_lsw",
+                    {{"clk", 1}, {"e_valid", n}, {"e_rd", n}, {"e_wr", n}, {"e_inst", n * iw},
+                     {"e_rrow", n * aw}, {"e_wrow", n * aw}, {"e_wdata", n * dw}, {"e_wmask", n * mw},
+                     {"o_ready", 1}, {"hold", 1}, {"r_valid", 1}, {"r_word", kRspW}},
+                    {{"e_free", 16 * n}, {"o_valid", 1}, {"o_word", kReqW}, {"idle", 1}, {"a_valid", n},
+                     {"a_inst", iw}, {"a_beat", kBeatW}, {"a_last", 1}, {"a_data", 512}},
+                    {{"N", 32}, {"CLS", 32}, {"IW", 32}, {"AW", 32}, {"DW", 32}, {"MW", 32},
+                     {"MAW", 32 * n}, {"MDW", 32 * n}, {"MMW", 32 * n}, {"RDW_READ_FIRST", 32 * n}});
+    Lsw l{hw::InstanceOp(), edge(1), edge(1), edge(1), edge(kRspW)};
+    l.inst = cast<hw::InstanceOp>(place(hw::InstanceOp::create(
+        b, ext, "s28_lsw_" + classes[c].name,
+        {clk, packed(eValid), packed(eRd), packed(eWr), packed(eInst), packed(eRrow), packed(eWrow),
+         packed(eData), packed(eMask), l.ready, l.hold, l.rValid, l.rWord},
+        b.getArrayAttr({param32("N", n), param32("CLS", regionCls[c]), param32("IW", iw),
+                        param32("AW", aw), param32("DW", dw), param32("MW", mw),
+                        paramArray("MAW", maw, 32), paramArray("MDW", mdw, 32),
+                        paramArray("MMW", mmw, 32), paramArray("RDW_READ_FIRST", rf, 32)}))));
+    auto r = l.inst.getResults();
+    free.setValue(r[0]);
+    aValid.setValue(r[4]);
+    aInst.setValue(r[5]);
+    aBeat.setValue(r[6]);
+    aLast.setValue(r[7]);
+    aData.setValue(r[8]);
+    lsws.emplace(c, l);
+  }
+  // Per region and root: the central switch, and the simulator's ports of
+  // its bus (s28r<g>_<j>_*).
+  SmallVector<std::pair<StringAttr, Value>> newOutputs;
+  SmallVector<Attribute> meta;
+  std::string text;
+  llvm::raw_string_ostream os(text);
+  for (unsigned g = 0; g < regions; ++g) {
+    if (roots[g].empty())
+      continue;
+    meta.push_back(b.getStringAttr("region:" + Twine(g) + ":" + Twine(roots[g].size()) + ":" +
+                                   Twine(clsCount[g])));
+    os << "  region " << g << ": " << clsCount[g] << " classes, " << roots[g].size()
+       << " central switches\n";
+    for (auto [j, entry] : llvm::enumerate(roots[g])) {
+      auto &[root, list] = entry;
+      curGroup = int(g);
+      curDom = int(root);
+      std::string pre = ("s28r" + Twine(g) + "_" + Twine(j) + "_").str();
+      Value reqRdy = sim.appendInput(pre + "req_rdy", b.getI1Type()).second;
+      Value hold = sim.appendInput(pre + "hold", b.getI1Type()).second;
+      Value rspV = sim.appendInput(pre + "rsp_v", b.getI1Type()).second;
+      Value rspWord = sim.appendInput(pre + "rsp_word", b.getIntegerType(kRspW)).second;
+      unsigned k = list.size();
+      SmallVector<Value> iValid, iWord, iIdle;
+      SmallVector<uint64_t> iclsm;
+      for (unsigned c : list) {
+        auto r = lsws.at(c).inst.getResults();
+        iValid.push_back(r[1]);
+        iWord.push_back(r[2]);
+        iIdle.push_back(r[3]);
+        iclsm.push_back(uint64_t(1) << regionCls[c]);
+      }
+      auto ext = unit("foldsim_vmem_csw",
+                      {{"clk", 1}, {"i_valid", k}, {"i_word", k * kReqW}, {"i_idle", k},
+                       {"o_ready", 1}, {"o_hold", 1}, {"r_valid", 1}, {"r_word", kRspW}},
+                      {{"i_ready", k}, {"i_hold", 1}, {"o_valid", 1}, {"o_word", kReqW}, {"o_idle", 1},
+                       {"ri_valid", k}, {"ri_word", kRspW}},
+                      {{"K", 32}, {"ICLSM", 64 * k}});
+      auto csw = cast<hw::InstanceOp>(place(hw::InstanceOp::create(
+          b, ext, ("s28_csw_r" + Twine(g) + "_" + Twine(j)).str(),
+          {clk, packed(iValid), packed(iWord), packed(iIdle), reqRdy, hold, rspV, rspWord},
+          b.getArrayAttr({param32("K", k), paramArray("ICLSM", iclsm, 64)}))));
+      auto r = csw.getResults();
+      std::string classesText;
+      uint64_t mask = 0;
+      for (auto [i, c] : llvm::enumerate(list)) {
+        auto &l = lsws.at(c);
+        curDom = int(c);
+        l.ready.setValue(field(r[0], i, 1));
+        l.hold.setValue(r[1]);
+        l.rValid.setValue(field(r[5], i, 1));
+        l.rWord.setValue(r[6]);
+        mask |= iclsm[i];
+        classesText += (i ? "," : "") + classes[c].name;
+      }
+      newOutputs.push_back({b.getStringAttr(pre + "req_v"), r[2]});
+      newOutputs.push_back({b.getStringAttr(pre + "req_word"), r[3]});
+      newOutputs.push_back({b.getStringAttr(pre + "idle"), r[4]});
+      meta.push_back(b.getStringAttr("in:" + Twine(g) + ":" + Twine(j) + ":" + classes[root].name +
+                                     ":" + llvm::utohexstr(mask)));
+      os << "    csw " << j << " (root " << classes[root].name << "): " << classesText << "\n";
+    }
+  }
+  for (auto &m : mems) {
+    unsigned g = groupOf(m.cls);
+    meta.push_back(b.getStringAttr("mem:" + Twine(m.k) + ":" + Twine(g) + ":" +
+                                   Twine(regionCls[m.cls]) + ":" + Twine(m.mem)));
+  }
+  // The memories' answers and room: the adapters' outputs, where the
+  // simulator's inputs were; the vm<k> ports go.
+  SmallVector<unsigned> eraseIn, eraseOut;
+  for (auto &m : mems) {
+    static constexpr StringLiteral rspNames[] = {"rsp_valid", "rsp_inst", "rsp_data", "free"};
+    for (auto [q, name] : llvm::enumerate(rspNames)) {
+      unsigned i = inIdx[m.port + name.str()];
+      body->getArgument(i).replaceAllUsesWith(m.adapter.getResult(q));
+      eraseIn.push_back(i);
+    }
+    for (unsigned q = 0; q < 8; ++q)
+      eraseOut.push_back(outIdx[m.port + "rd_valid"] + q);
+  }
+  llvm::sort(eraseIn);
+  llvm::sort(eraseOut);
+  SmallVector<Value> keptOutputs;
+  for (unsigned i = 0, e = output.getNumOperands(); i < e; ++i)
+    if (!llvm::binary_search(eraseOut, i))
+      keptOutputs.push_back(output.getOperand(i));
+  for (auto &[name, v] : newOutputs)
+    keptOutputs.push_back(v);
+  sim.modifyPorts({}, {}, eraseIn, eraseOut);
+  llvm::BitVector erased(body->getNumArguments());
+  for (unsigned i : eraseIn)
+    erased.set(i);
+  body->eraseArguments(erased);
+  output->setOperands(keptOutputs);
+  {
+    SmallVector<std::pair<StringAttr, Value>> none;
+    // (the new outputs' ports, their operands already set above)
+    SmallVector<std::pair<unsigned, hw::PortInfo>> ins;
+    unsigned at = sim.getNumOutputPorts();
+    for (auto &[name, v] : newOutputs) {
+      hw::PortInfo pi;
+      pi.name = name;
+      pi.dir = hw::ModulePort::Direction::Output;
+      pi.type = v.getType();
+      ins.push_back({at, pi});
+    }
+    sim.modifyPorts({}, ins, {}, {});
+  }
+  sim->setAttr("foldsim.s28", b.getArrayAttr(meta));
+  s28Report = os.str();
+  llvm::errs() << "foldsim-fold-static: vmem-s28: " << mems.size() << " memories:\n" << s28Report;
+  if (!reportPath.empty()) {
+    std::error_code ec;
+    llvm::raw_fd_ostream file(reportPath, ec, llvm::sys::fs::OF_Append);
+    if (!ec)
+      file << "vmem-s28: " << mems.size() << " memories\n" << s28Report;
+  }
+  return success();
+}
+
 LogicalResult StaticFolder::extractGroups() {
   auto *context = top.getContext();
   auto *body = simModule.getBodyBlock();
@@ -29579,6 +29991,8 @@ LogicalResult StaticFolder::run() {
   if (linkKindCost)
     llvm::errs() << "foldsim-fold-static: link-kind-cost: the build asked " << linkKindAsked[1]
                  << " links' kinds of the plan, " << linkKindAsked[0] << " outside it (thresholds)\n";
+  if (vmemS28 && failed(buildS28()))
+    return failure();
   if (!slrOf.empty() && failed(extractGroups()))
     return failure();
   if (physicalDomains) {
@@ -29814,6 +30228,7 @@ void FoldStaticPass::runOnOperation() {
   folder.readyAhead = readyAhead;
   folder.roomAhead = roomAhead;
   folder.roomRegions = roomRegions;
+  folder.vmemS28 = vmemS28;
   if (roomRegions && !roomAhead) {
     getOperation().emitError("fold-static: room-regions needs room-ahead");
     return signalPassFailure();

@@ -424,6 +424,8 @@ def frame_options(a):
         if re.search(r'[\s{}]', a.virtual_memories):
             sys.exit('--virtual-memories: a regex without spaces or braces')
         fold += f' virtual-memories={a.virtual_memories}'
+        if getattr(a, 'vmem_controller', 'vmem') == 's28':
+            fold += ' vmem-s28'
         if getattr(a, 'vmem_merge_lanes', False):
             fold += ' vmem-merge-lanes'
         if getattr(a, 'vmem_skip_held_reads', False):
@@ -1821,6 +1823,82 @@ def vmem_engine_groups(sv):
     return out
 
 
+def s28_layout(vmems, meta, names=None):
+    """--vmem-controller s28: the regions of the simulator's S28 memory tree (fold-static vmem-s28's foldsim.s28:
+    `region:<g>:<inputs>:<classes>`, `in:<g>:<j>:<root>:<class mask>`, `mem:<k>:<g>:<cls>:<mem>`) and their
+    memories' rows in the kernel's vmem space: region by region (group order), each memory's rows 4 KiB aligned as
+    the controllers' layout has them (row r of instance i at ((r * INSTANCES + i) << log2 ROW_BYTES)). A region's
+    entries (E_*) are its memories, its LIN_BASE and BYTES their extent (the zero fill's). The region's SLR: its
+    group's, by name (the compiler's group g is the region JSON's g-th SLR: group 0 = SLR2 on the V80)."""
+    regions, ins, mems = {}, {}, []
+    for e in meta:
+        f = e.split(':')
+        if f[0] == 'region':
+            regions[int(f[1])] = {'group': int(f[1]), 'slr': names[int(f[1])] if names else '', 'classes': int(f[3]),
+                                  'inputs': [], 'entries': []}
+        elif f[0] == 'in':
+            ins.setdefault(int(f[1]), []).append({'index': int(f[2]), 'root': f[3], 'class_mask': int(f[4], 16)})
+        elif f[0] == 'mem':
+            mems.append({'vm': int(f[1]), 'group': int(f[2]), 'cls': int(f[3]), 'mem': int(f[4])})
+    offset = 0
+    out = []
+    for g in sorted(regions):
+        r = regions[g]
+        r['inputs'] = sorted(ins.get(g, []), key=lambda x: x['index'])
+        r['lin_base'] = offset
+        for m in sorted((m for m in mems if m['group'] == g), key=lambda m: (m['cls'], m['mem'])):
+            v = vmems[m['vm']]
+            rb = v['row_bytes']
+            if rb & (rb - 1) or not 64 <= rb <= 4096:
+                sys.exit(f'foldsim: --vmem-controller s28: {v["port"]} rows of {rb} bytes (64 to 4096, a power of two)')
+            r['entries'].append({'vm': m['vm'], 'cls': m['cls'], 'mem': m['mem'], 'instances': v['instances'],
+                                 'rb': rb.bit_length() - 1, 'dw': v['data_width'], 'off': offset})
+            v.update(base=offset, s28_region=g)
+            offset += -(-v['bytes'] // 4096) * 4096
+        r['bytes'] = offset - r['lin_base']
+        out.append(r)
+    return {'regions': out, 'bytes': offset}
+
+
+def write_s28_vh(f, s28):
+    """foldsim_sim.vh for --vmem-controller s28: the kernel's region controllers (one per region, `s28_region_<r>`,
+    region r the compiler's group) and the simulator's buses each serves (`f(r, j)`: s28r<r>_<j>_*). The binding
+    (masters, PC map, sp tags) is the flow's (vmem_ports.py)."""
+    f.write('`define FOLDSIM_S28\n')
+    f.write(f'`define FOLDSIM_S28_REGIONS {len(s28["regions"])}\n')
+    f.write('`define FOLDSIM_S28_REPEAT(f,s) ' + ' `s '.join(f'`f({r["group"]})' for r in s28['regions']) + '\n')
+    arr = lambda vals, fmt=str: "'{" + ', '.join(fmt(v) for v in vals) + '}'
+    hex64 = lambda v: "64'h%x" % v
+    for r in s28['regions']:
+        p = f'`define FOLDSIM_S28_R{r["group"]}_'
+        f.write(f'{p}SLR_NAME "{r["slr"]}"\n')
+        if r['slr'].startswith('SLR'):
+            f.write(f'{p}SLR {r["slr"][3:]}\n')
+        f.write(f'{p}NIN {len(r["inputs"])}\n')
+        f.write(f'{p}IN_REPEAT(f,s) ' + ' `s '.join(f'`f({r["group"]}, {x["index"]})' for x in r['inputs']) + '\n')
+        f.write(f'{p}ICLSM {arr([x["class_mask"] for x in r["inputs"]], hex64)}\n')
+        f.write(f'{p}NE {len(r["entries"])}\n')
+        for key, d in (('E_CLS', 'cls'), ('E_MEM', 'mem'), ('E_INST', 'instances'), ('E_RB', 'rb'), ('E_DW', 'dw')):
+            f.write(f'{p}{key} {arr([e[d] for e in r["entries"]])}\n')
+        f.write(f'{p}E_OFF {arr([e["off"] for e in r["entries"]], hex64)}\n')
+        f.write(f'{p}E_VM {arr([e["vm"] for e in r["entries"]])}\n')
+        f.write(f"{p}LIN_BASE 64'h{r['lin_base']:x}\n")
+        f.write(f"{p}BYTES 64'h{r['bytes']:x}\n")
+        f.write(f'{p}MAX_RB {max(e["rb"] for e in r["entries"])}\n')
+    f.write(f"`define FOLDSIM_VMEM_BYTES 64'h{s28['bytes']:x}\n")
+
+
+def write_s28_regions(s28, path):
+    """Appends to the floorplan (write_slr_groups) each S28 region controller (the kernel's s28_region_<r>) in its
+    group's SLR: the region's buses meet it there, and its masters are that SLR's own HBM ports."""
+    with open(path, 'a') as f:
+        f.write('# S28 region controllers with their groups (--vmem-controller s28).\n')
+        for r in s28['regions']:
+            where = r['slr'] or f'fs_slr{r["group"]}'
+            f.write(f'set c [get_cells -quiet -hierarchical s28_region_{r["group"]}]\n'
+                    f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT {where} $c }}\n')
+
+
 def write_vmem_engines(sv, info, path, mode, master_bits, names=None):
     """Appends to the floorplan (write_slr_groups) the virtual-memory
     controllers placed with their class copy (--vmem-engines local, or auto
@@ -2377,12 +2455,16 @@ def build_parser():
     ap.add_argument('--vmem-known-zero-bits', type=int, default=1 << 16, metavar='N',
                     help="with --virtual-memories: each controller's known-zero bits at most (a bit per "
                          "block of rows, the smallest block within N; default %(default)s); 0: none")
-    ap.add_argument('--vmem-controller', choices=('vmem', 'vport'), default='vmem',
+    ap.add_argument('--vmem-controller', choices=('vmem', 'vport', 's28'), default='vmem',
                     help="the kernel's controller of each virtual memory (group, page engine): foldsim_vmem "
                          "(default), or vport: a static port in its place (shell foldsim_vport_ctl: one AXI id, "
                          "in-order, counter fences instead of hazard tables and write buffers, a zero fill of "
                          "the image after a reset instead of known-zero bits; FOLDSIM_VMEM_VPORT and each "
-                         "image's bytes in foldsim_sim.vh)")
+                         "image's bytes in foldsim_sim.vh), or s28 (S28 stage A): the controller side built "
+                         "into the simulator per SLR group (fold-static vmem-s28: a type adapter per memory, a "
+                         "local switch per class, a central switch per domain root) and one region controller "
+                         "per group in the kernel, pinned to the group's SLR, on that SLR's own HBM ports "
+                         "(FOLDSIM_S28_* in foldsim_sim.vh; rows of at least 64 bytes)")
     ap.add_argument('--vmem-forward', type=int, choices=(0, 1), default=1,
                     help="with virtual memories (or page engines, link streams): whether a read is "
                          "answered from its controller's write buffer (1, default) or waits for the "
@@ -3331,6 +3413,19 @@ def main():
     m = a.vmem_row_bytes_min
     if m < 1 or m & (m - 1):
         sys.exit('--vmem-row-bytes-min: a power of two')
+    if a.vmem_controller == 's28':
+        # S28 stage A: class memories alone; the region controllers replace the controller groups,
+        # their host caches and their placement (s28 pins each region to its group's SLR itself).
+        if not a.virtual_memories:
+            sys.exit('--vmem-controller s28 needs --virtual-memories')
+        for bad, why in ((a.vmem_group is not None, '--vmem-group'), (a.vmem_cache_rows not in (None, 0), '--vmem-cache-rows'),
+                         (a.vmem_engines != 'placer', '--vmem-engines'),
+                         (getattr(a, 'page_engines', 0), '--page-engines'), (getattr(a, 'vmem_rings', 0), '--vmem-rings'),
+                         (getattr(a, 'vmem_slr_groups', ''), '--vmem-slr-groups')):
+            if bad:
+                sys.exit(f'--vmem-controller s28: {why} does not apply (the region controllers group, place '
+                         'and bind the memories)')
+        a.vmem_row_bytes_min = max(a.vmem_row_bytes_min, 64)
     if a.vmem_controller == 'vport' and a.vmem_row_bytes_min < 64:
         # A static port moves whole 64-byte beats: rows of at least a beat.
         a.vmem_row_bytes_min = 64
@@ -3542,6 +3637,16 @@ def main():
             v['known_zero'], v['kz_shift'] = 0, 0
         offset += -(-size // 4096) * 4096
     info['vmem_bytes'] = offset
+    if getattr(a, 'vmem_controller', 'vmem') == 's28':
+        s28 = re.search(r'foldsim\.s28 = \[(.*?)\]', sim_text)
+        if not s28 or not info['vmem']:
+            sys.exit('foldsim: --vmem-controller s28: the simulator has no S28 memory tree (foldsim.s28)')
+        snames = [n for n, _ in slr_region_capacities(a.slr_region)] if a.slr_region else None
+        info['s28'] = s28_layout(info['vmem'], re.findall(r'"([^"]*)"', s28.group(1)), snames)
+        info['vmem_bytes'] = info['s28']['bytes']
+        print('foldsim: vmem s28: ' + '; '.join(
+            f'region {r["group"]} ({r["slr"] or "-"}): {len(r["inputs"])} central switches, {len(r["entries"])} memories, '
+            f'{r["bytes"]} bytes' for r in info['s28']['regions']), file=sys.stderr)
     if a.vmem_group is not None and info['vmem']:
         weights = json.load(open(a.vmem_weights)) if a.vmem_weights else None
         info['vmem_groups'] = vmem_groups(info['vmem'], a.vmem_group, weights, a.vmem_known_zero_bits)
@@ -3590,6 +3695,10 @@ def main():
         for e in entries[1:]:
             kind, name, lo, w = e.split(':')
             info['port_bundles'][kind.lower()].append({'name': name, 'lo': int(lo), 'width': int(w)})
+    if a.slr_groups and info.get('s28') and os.path.exists(out('foldsim_floorplan.tcl')):
+        write_s28_regions(info['s28'], out('foldsim_floorplan.tcl'))
+        print(f'foldsim: vmem s28: {len(info["s28"]["regions"])} region controllers pinned to their groups\' SLRs '
+              f'in foldsim_floorplan.tcl', file=sys.stderr)
     if a.slr_groups and a.vmem_engines in ('local', 'auto'):
         noc = json.load(open(region)).get('noc', {}) if region else {}
         placed = write_vmem_engines(open(out('foldsim_sim.sv')).read(), info, out('foldsim_floorplan.tcl'),
@@ -3639,7 +3748,9 @@ def main():
                 f.write(f'`define FOLDSIM_VPORT{p_}_SLR {g}\n')
             if info.get('vport_slr') and info.get('vmem_slr_names') and not info['vmem']:
                 f.write(f'`define FOLDSIM_VMEM_SLR_NAMES "{" ".join(info["vmem_slr_names"])}"\n')
-        if info['vmem']:
+        if info.get('s28'):
+            write_s28_vh(f, info['s28'])
+        elif info['vmem']:
             f.write(f'`define FOLDSIM_VMEM_COUNT {len(info["vmem"])}\n')
             if not a.vmem_forward:
                 f.write('`define FOLDSIM_VMEM_FORWARD 0\n')

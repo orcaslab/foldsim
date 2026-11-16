@@ -1226,6 +1226,18 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "cycles old: the term asks for six entries more (three decisions' "
            "read and write). Exact; host cycles move only while a controller "
            "is within six entries of full, and twice more after reset">,
+    Option<"vmemS28", "vmem-s28", "bool", "false",
+           "With virtual memories (S28 stage A): each class memory's "
+           "controller side built into the simulator, in its SLR group: a "
+           "type adapter per memory (foldsim_vmem_adapter) and a local "
+           "switch per class (foldsim_vmem_lsw) in the class's domain, a "
+           "central switch per domain root (foldsim_vmem_csw) in the root's. "
+           "The vm<k> ports give way to each root's request and response "
+           "bus (s28r<g>_<j>_*: req_v, req_word, idle out; req_rdy, hold, "
+           "rsp_v, rsp_word in) for the kernel's region controller of group "
+           "g's SLR (foldsim.s28 lists them): no memory path leaves its "
+           "group. The adapters keep the native port, so schedules and host "
+           "cycles are those of the same controllers' latencies">,
     Option<"dropDeadInputs", "drop-dead-inputs", "bool", "true",
            "A model input its body never reads (left over from a class cut: "
            "its bits go to a sibling class directly) takes no link, no "
