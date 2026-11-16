@@ -10,6 +10,12 @@
 // row), and `free` low on
 // +full=<percent> of the host cycles. The channels stall on +stall=<percent>
 // of the host cycles; with BUBBLES, `advance` is low on +bubble=<percent>.
+// With +queue=<n> (n > 0) `free` is instead a request queue's room: every
+// read and write the simulator issues takes an entry, and each host cycle the
+// oldest entry leaves once it is +qlat=<n> host cycles old (default 4) and
+// with +drain=<percent> chance (default 100); a request that finds the queue
+// full prints OVERFLOW (the simulator's room terms must keep that from
+// happening) and fails the run.
 // Prints MATCH or the first difference, and PROTOCOL if the simulator issues
 // a read of an instance whose read is still outstanding; then READS, the reads
 // issued, and FEWER where they are at most +maxreads=<n>. ROWW: row bits.
@@ -21,7 +27,7 @@
 `endif
 module vmem_model #(parameter IW = 2, ROWS = 1 << `ROWW) (
     input logic clk, rst,
-    input int cyc, lo, hi, full,
+    input int cyc, lo, hi, full, queue, qlat, drain,
     output logic rsp_valid, output logic [IW-1:0] rsp_inst, output logic [7:0] rsp_data,
     output logic [15:0] free,
     input logic rd_valid, input logic [IW-1:0] rd_inst, input logic [`ROWW-1:0] rd_row,
@@ -31,6 +37,7 @@ module vmem_model #(parameter IW = 2, ROWS = 1 << `ROWW) (
   localparam INSTS = 1 << IW;
   logic [7:0] mem [INSTS][ROWS];
   bit outstanding [INSTS];
+  int qage [$];
   int due [INSTS];
   logic [7:0] data [INSTS];
   initial begin
@@ -41,7 +48,12 @@ module vmem_model #(parameter IW = 2, ROWS = 1 << `ROWW) (
     end
   end
   always @(negedge clk) begin
-    free = ($urandom % 100 >= full) ? 16'd64 : 16'd0;
+    if (queue > 0) begin
+      if (qage.size() != 0 && cyc - qage[0] >= qlat && int'($urandom % 100) < drain)
+        void'(qage.pop_front());
+      free = 16'(queue - qage.size());
+    end else
+      free = ($urandom % 100 >= full) ? 16'd64 : 16'd0;
     // One due response a host cycle, any instance.
     rsp_valid = 0;
     for (int i = 0; i < INSTS; i++)
@@ -54,6 +66,14 @@ module vmem_model #(parameter IW = 2, ROWS = 1 << `ROWW) (
 `ifdef WRITE_FIRST
     if (wr_valid && wr_mask) mem[wr_inst][wr_row] = wr_data;
 `endif
+    if (queue > 0)
+      for (int n = 0; n < int'(rd_valid) + int'(wr_valid); n++) begin
+        if (qage.size() >= queue) begin
+          if (ok) $display("OVERFLOW: a request into a full queue of %0d at host cycle %0d", queue, cyc);
+          ok = 0;
+        end
+        qage.push_back(cyc);
+      end
     if (rd_valid) begin
       reads++;
       if (outstanding[rd_inst]) begin
@@ -139,10 +159,14 @@ module tb;
   int burst = 1, brun = 0;
   initial if (!$value$plusargs("burst=%d", burst)) burst = 1;
   initial if (!$value$plusargs("full=%d", full)) full = 0;
+  int queue = 0, qlat = 4, drain = 100;
+  initial if (!$value$plusargs("queue=%d", queue)) queue = 0;
+  initial if (!$value$plusargs("qlat=%d", qlat)) qlat = 4;
+  initial if (!$value$plusargs("drain=%d", drain)) drain = 100;
   initial if (!$value$plusargs("lo=%d", lo)) lo = 1;
   initial if (!$value$plusargs("hi=%d", hi)) hi = lo;
   for (genvar k = 0; k < V; k++) begin : g_vm
-    vmem_model #(.IW(`IW)) model(.clk, .rst, .cyc, .lo, .hi, .full,
+    vmem_model #(.IW(`IW)) model(.clk, .rst, .cyc, .lo, .hi, .full, .queue, .qlat, .drain,
       .rsp_valid(rsp_valid[k]), .rsp_inst(rsp_inst[k]), .rsp_data(rsp_data[k]), .free(free[k]),
       .rd_valid(rd_valid[k]), .rd_inst(rd_inst[k]), .rd_row(rd_row[k]),
       .wr_valid(wr_valid[k]), .wr_inst(wr_inst[k]), .wr_row(wr_row[k]),

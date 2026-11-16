@@ -1,0 +1,37 @@
+# REQUIRES: verilator
+# --room-regions (with --room-ahead): each controller's `free` enters as an environment input does under
+# --slr-group-env: a first register (vfree_q<k>_env1, foldsim.env_stage1: --slr-group-own never replicates it, so
+# the kernel's port loads one SLR) and a second (vfree_q<k>) that --slr-group-own replicates into each group reading
+# it; the room compare reads the second. `free` is three host cycles old there, so the term asks for six entries more
+# (three decisions' read and write each). Exact; host cycles move only near a full controller (and twice more after
+# reset).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem
+# RUN: foldsim --srcs top.f --top Top --out %t/rr --static --virtual-memories ram --ready-ahead --room-ahead --room-regions Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=IR < %t/rr/foldsim_sim.mlir
+# The first stage takes the kernel's input as it is, the second the first; the compare reads the second.
+# IR: %vfree_q0_env1 = seq.firreg %vm{{[0-9]*}}_free clock %hostClock reset sync %hostReset{{.*}}{foldsim.env_stage1}
+# IR: %vfree_q0 = seq.firreg %vfree_q0_env1 clock %hostClock reset sync %hostReset
+# IR: = comb.{{[a-z]+}} %vfree_q0
+# IR: %vroom_ahead0 = seq.firreg %{{[0-9]+}} clock %hostClock reset sync %hostReset
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -Mdir %t/rr/obj %S/Inputs/tb_vmem.sv top.sv %t/rr/foldsim_sim.sv > %t/rr/build.log 2>&1
+# RUN: %t/rr/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=FAST
+# RUN: %t/rr/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | FileCheck %s
+# RUN: %t/rr/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +lo=1 +hi=30 +full=60 +stall=20 | FileCheck %s
+# RUN: %t/rr/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +lo=1 +hi=10 +full=90 | FileCheck %s
+# FAST: {{^}}MATCH 196 cycles in {{[0-9]+}} host cycles
+# CHECK: {{^}}MATCH
+# The margin, against a controller whose `free` is a real queue count (tb_vmem +queue=<n>: every read and write takes
+# an entry, the oldest leaves +qlat host cycles on with +drain % chance; OVERFLOW on a request into a full queue):
+# sixteen leaves writing and reading every target cycle (Driver/Inputs/vmem16) keep the queue at its room terms'
+# bound. With six entries more the queue never overflows; two (the room-ahead margin on a three-host-cycle-old
+# `free`, mutant 11-15) overflowed at host cycle 16-19 of this run.
+# RUN: cd %S/../Driver/Inputs/vmem16 && foldsim --srcs top.f --top Top --out %t/dense --static --virtual-memories ram --ready-ahead --room-ahead --room-regions Leaf > /dev/null 2>&1
+# RUN: cd %S/../Driver/Inputs/vmem16 && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW=4 -Mdir %t/dense/obj %S/Inputs/tb_vmem.sv top.sv %t/dense/foldsim_sim.sv > %t/dense/build.log 2>&1
+# RUN: %t/dense/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=4 +queue=16 +qlat=6 +drain=30 | FileCheck %s --check-prefix=DENSE
+# RUN: %t/dense/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=1 +hi=4 +queue=20 +qlat=6 +drain=30 | FileCheck %s --check-prefix=DENSE
+# DENSE-NOT: OVERFLOW
+# DENSE: {{^}}MATCH
+# Without --room-ahead the option is refused.
+# RUN: cd %S/../Driver/Inputs/vmem && not foldsim --srcs top.f --top Top --out %t/bad --static --virtual-memories ram --room-regions Leaf > %t/bad.txt 2>&1
+# RUN: FileCheck %s --check-prefix=BAD < %t/bad.txt
+# BAD: --room-regions needs --room-ahead

@@ -1044,6 +1044,9 @@ public:
   bool readyAhead = false;
   /// `room-ahead`: the controllers' room terms registered (two entries more).
   bool roomAhead = false;
+  /// `room-regions` (with room-ahead): the controllers' `free` registered as
+  /// it enters, the compare after it (four entries more).
+  bool roomRegions = false;
   unsigned deadInputs = 0, partlyDeadInputs = 0;
   /// Element inputs read at an index (foldsim-index-class-inputs), and
   /// their pieces: read from the rows, of constants, chosen of the frame's.
@@ -27155,7 +27158,31 @@ LogicalResult StaticFolder::buildSim() {
       // (it may only wait longer). `free` comes from the kernel's controller,
       // which may sit anywhere: its compare stays off the decision's path.
       Value free = body->getArgument(v.firstInput + 3);
-      if (roomAhead)
+      // `room-regions`: `free` crosses into the SLR regions the way an
+      // environment input does (slr-group-env's two stages): a first
+      // register in the level, which slr-group-own does not replicate
+      // (foldsim.env_stage1: the kernel's port then loads one SLR), and a
+      // second that it replicates into each group reading it (that stage
+      // reads the first by wires alone; the compare is the group's own).
+      // The room term then sees `free` three host cycles old: it has lost at
+      // most three decisions' requests since (a read and a write each), so
+      // the term asks for six more. A room past what an idle controller
+      // shows would never come: refused.
+      if (roomAhead && roomRegions) {
+        if (room + 6 > kStaggerRoom + 2) {
+          return netlist.emitError("room-regions: a controller's room ")
+                 << room << " + 6 is past the " << kStaggerRoom + 2
+                 << " entries an idle controller shows";
+        }
+        unsigned i = &v - simVirtuals.data();
+        Value q1 = resetReg(free, "vfree_q" + Twine(i) + "_env1", 0);
+        q1.getDefiningOp()->setAttr("foldsim.env_stage1", UnitAttr::get(context));
+        Value q2 = resetReg(q1, "vfree_q" + Twine(i), 0);
+        terms.push_back(resetReg(
+            comb::ICmpOp::create(b, comb::ICmpPredicate::uge, q2,
+                                 constant(kVirtualFreeWidth, room + 6)),
+            "vroom_ahead" + Twine(i), 0));
+      } else if (roomAhead)
         terms.push_back(resetReg(
             comb::ICmpOp::create(b, comb::ICmpPredicate::uge, free,
                                  constant(kVirtualFreeWidth, room + 2)),
@@ -29786,6 +29813,11 @@ void FoldStaticPass::runOnOperation() {
   folder.lookaheadTables = lookaheadTables;
   folder.readyAhead = readyAhead;
   folder.roomAhead = roomAhead;
+  folder.roomRegions = roomRegions;
+  if (roomRegions && !roomAhead) {
+    getOperation().emitError("fold-static: room-regions needs room-ahead");
+    return signalPassFailure();
+  }
   folder.affineSlots = affineSlots;
   folder.affineAuto = affineAuto;
   folder.affineAutoBits = affineAutoBits;
