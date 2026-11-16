@@ -575,7 +575,13 @@ def state_units(units, lev=1.0):
         return
     for u in units:
         # (a link's LUTRAM by the level's factor alone: the frame's growth is logic's.)
-        fl, fr = (lev, lev / level_frame_factor()) if u.get('link') else state_factors(u['class'])
+        # (`link_lutram`, where the calibration fits it: a link's LUTRAM by its own factor -- distributed RAM as
+        # the copies build it -- and only its select logic by the level's.)
+        if u.get('link'):
+            fl = lev
+            fr = STATE_CAL['link_lutram'] if 'link_lutram' in STATE_CAL else lev / level_frame_factor()
+        else:
+            fl, fr = state_factors(u['class'])
 
         def scale(c, k):
             if c is None or k == 'hbm' and not u.get('link'):
@@ -1125,6 +1131,11 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     if STATE_CAL and STATE_CAL.get('level_measured'):
         # (--state-measured: the level as the same recipe's SLR check counted it, in place of the estimate.)
         logic = STATE_CAL['level_measured']
+    # `level_logic_per_frame` (11-16, a32-S26X-P32): the level's own logic -- slot tables, sequencers, link word
+    # selects, SLR crossings, which the class estimate never priced -- per host cycle of the frame, at least
+    # `level_logic_min` (measured: 61.8k / 77.9k / 190.8k / 175.9k at frames 128 / 256 / 580 / 580).
+    elif STATE_CAL and 'level_logic_per_frame' in STATE_CAL:
+        logic += max(STATE_CAL.get('level_logic_min', 0.0), STATE_CAL['level_logic_per_frame'] * (STATE_FRAME or 0))
     kernel_uram = kernel_bram = 0.0
     if STATE_CAL:
         kl, klr, kb = state_kernel()
@@ -3326,8 +3337,17 @@ def state_fit(state, hier, sim='sim', afu='foldsim_afu_0', top='top_wrapper'):
     m_level = hier[sim]['lut'] - m_copies
     k_lut = hier[top]['lut'] - hier[sim]['lut']
     k_lutram = hier[top]['lutram'] - hier[sim]['lutram']
+    # The level apart: its logic (the simulator's logic less the copies') against the outcome's logic outside
+    # the copies, and the links' LUTRAM (the simulator's LUTRAM less the copies') against the outcome's.
+    res = state['res']
+    out_level_logic = res.get('logic', 0) - sum(v['logic'] + v['store_lut'] for v in copies.values())
+    out_link_lutram = res.get('lutram', 0) - sum(v['store_lutram'] for v in copies.values())
+    m_level_logic = (hier[sim]['lut'] - hier[sim]['lutram']) - sum(r['m_logic'] for r in rows)
+    m_link_lutram = hier[sim]['lutram'] - sum(r['m_lutram'] for r in rows)
     cal = dict(copy_logic=round(fl, 3), copy_lutram=round(fr, 3),
                level=round(m_level / max(out_level, 1), 3),
+               level_logic=round(m_level_logic / max(out_level_logic, 1), 3),
+               link_lutram=round(m_link_lutram / max(out_link_lutram, 1), 3),
                kernel_logic=round(k_lut - k_lutram), kernel_lutram=round(k_lutram),
                placed_per_priced=1.02)
     for r in rows:
