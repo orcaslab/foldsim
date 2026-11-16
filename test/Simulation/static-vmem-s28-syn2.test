@@ -1,0 +1,40 @@
+# REQUIRES: verilator
+# syn2 (a32-S28C): every vmem feature S28 stage A folds, at once (Driver/Inputs/s28syn2/syn2.sv): a 3-deep class tree
+# with 9 virtual memories in three SLR groups (each a region: SLR2 the L2's 576-bit data+tag lanes and a 26-bit
+# narrow RAM, MW 1; SLR1 a core's GPR banks: two 1,024-bit lanes merged into one 2,048-bit memory (4 beats) and two
+# 1,024-bit banks of their own addresses, byte masks, held reads, read-first; SLR0 a second copy of the core and the
+# cache's 544-bit data+tag), --copies, --vmem-merge-lanes, --vmem-skip-held-reads, --ready-ahead, --room-ahead,
+# --room-regions, physical domains with a merge, the SLR group crossings registered. Exact against the target with
+# random memory latency, request stalls, holds and target resets every n cycles (tb_s28.sv, each memory's beats from
+# tb_s28_beats.py).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/s28syn2
+# RUN: foldsim Sm Core Cache L2 --srcs top.f --top Top --out %t/g --static --nest --zero-latency-links --zero-latency-chains --virtual-memories 'Core:gpr[0-3]|Cache:(data|tag)|L2:(data|tg)|Top_model:nar' --vmem-controller s28 --vmem-skip-held-reads --vmem-merge-lanes --ready-ahead --room-ahead --room-regions --copies Core:2 --slr-groups --slr-region %foldsim_tools/foldsim_v80_asl9_slr.json --slr-assign Top_model:0,L2:0,Sm_model:0,Core:1,Core_copy1:2,Cache:2 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --slr-group-home --physical-domains --domain-merge-lut 100 > %t/g.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/g.log
+# LOG: region 0: 2 classes, 1 central switches
+# LOG-NEXT: csw 0 (root Top_model): Top_model,L2
+# LOG-NEXT: region 1: 1 classes, 1 central switches
+# LOG-NEXT: csw 0 (root Core): Core
+# LOG-NEXT: region 2: 2 classes, 2 central switches
+# LOG: foldsim: vmem s28: region 0 (SLR2): 1 central switches, 2 memories, {{.*}}; region 1 (SLR1): 1 central switches, 3 memories, {{.*}}; region 2 (SLR0): 2 central switches, 4 memories
+# The memories: a merged pair of lanes (gpr0_x2, 2,048 bits), banks of their own, the narrow RAM (MW 1).
+# RUN: FileCheck %s --check-prefix=VM < %t/g/foldsim_sim.vh
+# VM-DAG: `define FOLDSIM_S28_R1_E_DW '{2048, 1024, 1024}
+# VM-DAG: `define FOLDSIM_S28_R0_E_DW '{26, 576}
+# The units' output contract for the netlist's tools (foldsim_locality.py): registers, or wires from an input.
+# RUN: FileCheck %s --check-prefix=UNITS < %t/g/foldsim_sim.mlir
+# UNITS: hw.module.extern private @foldsim_vmem_adapter_s{{[0-9]+}}<{{.*}}foldsim.unit_outputs = ["rsp_valid=reg", "rsp_inst=reg", "rsp_data=reg", "free=in:e_free",
+# RUN: FileCheck %s --check-prefix=SLL < %t/g/sll/sll.txt
+# SLL: memory paths (S28): 21, 0 crossing an SLR boundary (0 bits)
+# RUN: python3 %S/Inputs/tb_s28_beats.py %t/g/foldsim_sim.json %t/g/beats.hex
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -DRST_IN '-DS28_BUSES=`S28_BUS(0, 0) `S28_BUS(1, 0) `S28_BUS(2, 0) `S28_BUS(2, 1)' -I%S/../../shell/rtl -Mdir %t/g/obj %S/Inputs/tb_s28.sv syn2.sv %t/g/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/g/build.log 2>&1
+# RUN: %t/g/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +beats=%t/g/beats.hex +lo=1 | FileCheck %s
+# RUN: %t/g/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +beats=%t/g/beats.hex +lo=5 +hi=60 +mstall=30 | FileCheck %s
+# RUN: %t/g/obj/Vtb +verilator+rand+reset+0 +verilator+seed+9 +beats=%t/g/beats.hex +lo=1 +hi=30 +stall=20 +hold=10 +rstevery=37 | FileCheck %s
+# RUN: %t/g/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +beats=%t/g/beats.hex +lo=20 +hi=300 +mstall=50 +rstevery=50 | FileCheck %s
+# CHECK: {{^}}MATCH 196 cycles
+# Locality reads the units' contract: the buses' inputs end in the central switches' registers, the answers leave
+# the adapters' registers (before 11-16: modelled as logic, 4 bus inputs "fanned out" over every SLR: REFUSE).
+# RUN: python3 %foldsim_tools/foldsim_locality.py %t/g --floorplan %t/g/foldsim_floorplan.tcl --sll-json %t/g/sll/sll.json --slr-region %foldsim_tools/foldsim_v80_asl9_slr.json --out %t/g/loc --warn-only > %t/g/loc.txt 2>&1
+# RUN: FileCheck %s --check-prefix=LOC < %t/g/loc/locality.txt
+# LOC-NOT: REFUSE
+# LOC: g: locality WARN

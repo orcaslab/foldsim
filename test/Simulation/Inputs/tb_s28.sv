@@ -12,21 +12,20 @@
 //    bytes under its mask; a read takes the row's beats as of its arrival;
 //  * each read is answered +lo=<n> to +hi=<n> host cycles after it arrives,
 //    in arrival order, its beats back to back (538-bit words {cls 6, mem 4,
-//    inst 12, beat 3, last 1, data 512}); BEATS(cls, mem) beats a row, from
-//    S28_BEATS (a function of the bus's cls and mem, default 1);
+//    inst 12, beat 3, last 1, data 512}); each row its memory's beats, from
+//    +beats=<file> ($readmemh, entry {g 4, cls 6, mem 4}: the beats of region g's
+//    class cls's memory mem; tb_s28_beats.py writes it from foldsim_sim.json),
+//    else 1;
 //  * `hold` is high in reset and on +hold=<percent> of the host cycles.
 // Rows are zero at start (the target's with +verilator+rand+reset+0).
 // With RST_IN the target has a reset input, high for its first two cycles
-// (the simulator's `rst` channel), as in tb_reset.sv.
+// (the simulator's `rst` channel), as in tb_reset.sv; with +rstevery=<n> also for two of every n cycles.
 // Prints MATCH or the first difference; WORDS, the request words taken.
 `ifndef S28_BUSES
 `define S28_BUSES `S28_BUS(0, 0)
 `endif
-`ifndef S28_BEATS
-`define S28_BEATS 1
-`endif
 
-module s28_region_model (
+module s28_region_model #(parameter G = 0) (
     input logic clk, rst,
     input int cyc, lo, hi, stall, hold_pct,
     input logic req_v, input logic [618:0] req_word, input logic idle,
@@ -38,8 +37,14 @@ module s28_region_model (
   rd_t q [$];
   int beat = 0;
   initial words = 0;
+  logic [3:0] beats [1 << 14];
+  initial begin
+    automatic string f;
+    for (int i = 0; i < (1 << 14); i++) beats[i] = 4'd1;
+    if ($value$plusargs("beats=%s", f)) $readmemh(f, beats);
+  end
   function automatic int beats_of(logic [5:0] cls, logic [3:0] m);
-    return `S28_BEATS;
+    return int'(beats[{4'(G), cls, m}]);
   endfunction
   always @(negedge clk) begin
     req_rdy = !rst && ($urandom % 100 >= stall);
@@ -105,7 +110,7 @@ module tb;
   initial begin
     for (int t = 0; t < T; t++) begin
       rx = stim_x(t);
-      rrst = t < 2;
+      rrst = t < 2 || (rstevery > 0 && t % rstevery < 2);
       #1; ref_y[t] = ry; rclk = 1; #1; rclk = 0;
     end
     ref_done = 1;
@@ -117,7 +122,8 @@ module tb;
   logic vx, yr, vr;
   wire xr, yv, rr;
   wire [7:0] yb;
-  int stall = 0, lo = 1, hi = 1, mstall = 0, hold_pct = 0;
+  int stall = 0, lo = 1, hi = 1, mstall = 0, hold_pct = 0, rstevery = 0;
+  initial if (!$value$plusargs("rstevery=%d", rstevery)) rstevery = 0;
   initial if (!$value$plusargs("stall=%d", stall)) stall = 0;
   initial if (!$value$plusargs("mstall=%d", mstall)) mstall = 0;
   initial if (!$value$plusargs("hold=%d", hold_pct)) hold_pct = 0;
@@ -126,7 +132,7 @@ module tb;
 `define S28_BUS(g, j) \
   wire s28r``g``_``j``_req_v, s28r``g``_``j``_idle, s28r``g``_``j``_req_rdy, s28r``g``_``j``_hold, s28r``g``_``j``_rsp_v; \
   wire [618:0] s28r``g``_``j``_req_word; wire [537:0] s28r``g``_``j``_rsp_word; int words_``g``_``j; \
-  s28_region_model m_``g``_``j (.clk, .rst, .cyc, .lo, .hi, .stall(mstall), .hold_pct, \
+  s28_region_model #(.G(g)) m_``g``_``j (.clk, .rst, .cyc, .lo, .hi, .stall(mstall), .hold_pct, \
     .req_v(s28r``g``_``j``_req_v), .req_word(s28r``g``_``j``_req_word), .idle(s28r``g``_``j``_idle), \
     .req_rdy(s28r``g``_``j``_req_rdy), .hold(s28r``g``_``j``_hold), .rsp_v(s28r``g``_``j``_rsp_v), \
     .rsp_word(s28r``g``_``j``_rsp_word), .words(words_``g``_``j));
@@ -138,7 +144,7 @@ module tb;
   foldsim_sim dut(.hostClock(clk), .hostReset(rst),
     .x_valid(vx), .x_bits(stim_x(ix)), .x_ready(xr),
 `ifdef RST_IN
-    .rst_valid(vr), .rst_bits(ir < 2), .rst_ready(rr),
+    .rst_valid(vr), .rst_bits(ir < 2 || (rstevery > 0 && ir % rstevery < 2)), .rst_ready(rr),
 `endif
     .y_ready(yr), .y_valid(yv), .y_bits(yb),
     `S28_BUSES

@@ -240,6 +240,19 @@ class Graph:
         return i
 
 
+def unit_outputs(path):
+    """{external module: {output: 'reg' | 'in:<input>'}} of the externals whose foldsim.unit_outputs states how their
+    RTL drives each output (fold-static vmem-s28's units): a register, wires from an input; others are logic."""
+    out = {}
+    rx = re.compile(r'^  hw\.module\.extern(?:\s+private)?\s+@([\w$.]+).*foldsim\.unit_outputs = \[([^\]]*)\]')
+    with open(path) as f:
+        for line in f:
+            m = rx.match(line)
+            if m:
+                out[m.group(1)] = dict(x.split('=', 1) for x in re.findall(r'"([^"]*)"', m.group(2)))
+    return out
+
+
 def build_level(path, sim='foldsim_sim'):
     """The simulator level as a Graph, the SLR group modules inlined; {copy: (class, group)}; copy port maps."""
     level_mods = modules(path, lambda n: n == sim or re.fullmatch(re.escape(sim) + r'_slr\d+', n) is not None
@@ -247,6 +260,7 @@ def build_level(path, sim='foldsim_sim'):
     if sim not in level_mods:
         raise SystemExit(f'foldsim_locality.py: {path} has no module {sim}')
     g = Graph()
+    units = unit_outputs(path)
     copies = {}
     pins = []   # (copy, port, node, width)
     couts = []  # (copy, port, node)
@@ -291,11 +305,24 @@ def build_level(path, sim='foldsim_sim'):
                             g.copy[i] = iname
                             couts.append((iname, on, i))
                         continue
-                    # another module (a black box, a kernel helper): its outputs are logic on its inputs
+                    # another module (a black box, a kernel helper): its outputs are logic on its inputs, unless its
+                    # contract (foldsim.unit_outputs) says an output is a register (its inputs then end in it) or
+                    # wires from one input
                     pre = [g.node(key(v)) for _, v, _ in ins]
+                    kinds = units.get(mod, {})
+                    byname = {p: g.node(key(v)) for p, v, _ in ins}
                     for r, (on, w) in zip(res, outl):
-                        i = g.node(key(r), 'logic', r, w, group)
-                        g.preds[i] = pre
+                        k = kinds.get(on, '')
+                        if k == 'reg':
+                            i = g.node(key(r), 'reg', r, w, group)
+                            for v in pre:
+                                g.sinks.append(('store', v, w, r, i))
+                        elif k.startswith('in:') and k[3:] in byname:
+                            i = g.node(key(r), 'wire', r, w, group)
+                            g.preds[i] = [byname[k[3:]]]
+                        else:
+                            i = g.node(key(r), 'logic', r, w, group)
+                            g.preds[i] = pre
                     continue
                 if op == 'seq.firmem':
                     mm = re.match(r'\s*(\d+)', rest)

@@ -28090,9 +28090,14 @@ LogicalResult StaticFolder::buildS28() {
   // unit's name, its parameters the instance's).
   OpBuilder mb(sim);
   llvm::StringMap<hw::HWModuleExternOp> externs;
+  // Each unit's outputs as its RTL drives them (the units' contract, for
+  // the netlist's tools: foldsim.unit_outputs on the external module):
+  // `<out>=reg` a register (or wires from one), `<out>=in:<in>` wires from an
+  // input; an output not listed is logic on the inputs.
   auto unit = [&](StringRef verilog, ArrayRef<std::pair<StringRef, unsigned>> ins,
                   ArrayRef<std::pair<StringRef, unsigned>> outs,
-                  ArrayRef<std::pair<StringRef, unsigned>> params) {
+                  ArrayRef<std::pair<StringRef, unsigned>> params,
+                  ArrayRef<StringRef> outputKinds) {
     std::string key = verilog.str();
     for (auto &p : ins)
       key += "_" + Twine(p.second).str();
@@ -28125,6 +28130,10 @@ LogicalResult StaticFolder::buildS28() {
                                        hw::ModulePortInfo(ports), verilog,
                                        mb.getArrayAttr(decls));
     ext.setPrivate();
+    SmallVector<Attribute> kinds;
+    for (auto k : outputKinds)
+      kinds.push_back(StringAttr::get(context, k));
+    ext->setAttr("foldsim.unit_outputs", ArrayAttr::get(context, kinds));
     return ext;
   };
   auto param = [&](StringRef name, const APInt &value) -> Attribute {
@@ -28204,7 +28213,10 @@ LogicalResult StaticFolder::buildS28() {
                       {{"rsp_valid", 1}, {"rsp_inst", m.iw}, {"rsp_data", m.dw}, {"free", 16},
                        {"e_valid", 1}, {"e_rd", 1}, {"e_wr", 1}, {"e_inst", m.iw}, {"e_rrow", m.aw},
                        {"e_wrow", m.aw}, {"e_wdata", m.dw}, {"e_wmask", m.mw}},
-                      {{"IW", 32}, {"AW", 32}, {"DW", 32}, {"MW", 32}});
+                      {{"IW", 32}, {"AW", 32}, {"DW", 32}, {"MW", 32}},
+                      {"rsp_valid=reg", "rsp_inst=reg", "rsp_data=reg", "free=in:e_free", "e_valid=reg",
+                       "e_rd=reg", "e_wr=reg", "e_inst=reg", "e_rrow=reg", "e_wrow=reg", "e_wdata=reg",
+                       "e_wmask=reg"});
       unsigned o = outIdx[m.port + "rd_valid"];
       SmallVector<Value> ins{clk, reset};
       for (unsigned q = 0; q < 8; ++q)
@@ -28243,7 +28255,9 @@ LogicalResult StaticFolder::buildS28() {
                     {{"e_free", 16 * n}, {"o_valid", 1}, {"o_word", kReqW}, {"idle", 1}, {"a_valid", n},
                      {"a_inst", iw}, {"a_beat", kBeatW}, {"a_last", 1}, {"a_data", 512}},
                     {{"N", 32}, {"CLS", 32}, {"IW", 32}, {"AW", 32}, {"DW", 32}, {"MW", 32},
-                     {"MAW", 32 * n}, {"MDW", 32 * n}, {"MMW", 32 * n}, {"RDW_READ_FIRST", 32 * n}});
+                     {"MAW", 32 * n}, {"MDW", 32 * n}, {"MMW", 32 * n}, {"RDW_READ_FIRST", 32 * n}},
+                    {"e_free=reg", "o_valid=reg", "o_word=reg", "idle=reg", "a_valid=reg", "a_inst=reg",
+                     "a_beat=reg", "a_last=reg", "a_data=reg"});
     Lsw l{hw::InstanceOp(), edge(1), edge(1), edge(1), edge(kRspW)};
     l.inst = cast<hw::InstanceOp>(place(hw::InstanceOp::create(
         b, ext, "s28_lsw_" + classes[c].name,
@@ -28299,7 +28313,8 @@ LogicalResult StaticFolder::buildS28() {
                        {"o_ready", 1}, {"o_hold", 1}, {"r_valid", 1}, {"r_word", kRspW}},
                       {{"i_ready", k}, {"i_hold", 1}, {"o_valid", 1}, {"o_word", kReqW}, {"o_idle", 1},
                        {"ri_valid", k}, {"ri_word", kRspW}},
-                      {{"K", 32}, {"ICLSM", 64 * k}});
+                      {{"K", 32}, {"ICLSM", 64 * k}},
+                      {"i_hold=reg", "o_valid=reg", "o_word=reg", "o_idle=reg", "ri_valid=reg", "ri_word=reg"});
       auto csw = cast<hw::InstanceOp>(place(hw::InstanceOp::create(
           b, ext, ("s28_csw_r" + Twine(g) + "_" + Twine(j)).str(),
           {clk, packed(iValid), packed(iWord), packed(iIdle), reqRdy, hold, rspV, rspWord},
