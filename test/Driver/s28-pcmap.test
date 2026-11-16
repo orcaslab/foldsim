@@ -18,7 +18,7 @@
 # CHECK-NEXT: `define FOLDSIM_S28_R1_PC_STRIDE 4
 # CHECK: `define FOLDSIM_S28_R1_RSP_DEPTH 256
 # CHECK: `define FOLDSIM_VMEM_PCMASK 32'hff0ffff0
-# CHECK-NEXT: `define FOLDSIM_VMEM_PCBYTES 100352
+# CHECK-NEXT: `define FOLDSIM_VMEM_PCBYTES 102400
 # Every grain of every region, mapped as the region controller maps it, lands on its master's own PCs in their
 # reserved halves; all 16 masters reached.
 # RUN: python3 %S/Inputs/s28-pcmap/trace.py %foldsim_tools/flow/v80 %t/kernel.vh %S/Inputs/s28-pcmap/sim.vh > %t/ok.axi
@@ -49,7 +49,8 @@
 # SP: sp=foldsim_afu_0.m_axi_mem_11:MEM
 # SP-NEXT: sp=foldsim_afu_0.m_axi_mem_12:MEM_SLR1_0
 # SP: sp=foldsim_afu_0.m_axi_mem_19:MEM_SLR0_3
-# Regions on common PCs whose shares would meet (the SLR0 region laid out before the SLR2 one): refused.
+# (Every map spreads a region over as many PCs (16 with a target's PCs, else 32), so shares of regions laid out one
+# after another never meet: the binding's overlap refusal guards maps to come. Swapping the regions' order is fine.)
 # RUN: sed -e "s/R0_LIN_BASE 64'h0/R0_LIN_BASE 64'h188000/" -e "s/R2_LIN_BASE 64'h88000/R2_LIN_BASE 64'h0/" %S/Inputs/s28-pcmap/sim.vh > %t/swap.vh
-# RUN: not python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %t/swap.vh --mem-ports 4 --spread-target-pcs 4 2>&1 | FileCheck %s --check-prefix=OVL
-# OVL: share PCs and their PC shares overlap
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %t/swap.vh --mem-ports 4 --spread-target-pcs 4 | FileCheck %s --check-prefix=SWAP
+# SWAP: `define FOLDSIM_VMEM_PCBYTES

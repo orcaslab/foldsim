@@ -476,6 +476,38 @@ def s28_pc(b, lin):
     return m, b['pc_first'] + m + b['pc_stride'] * slot, share
 
 
+def s28_pc(b, lin):
+    """S28: the (master, PC, offset in the PC's upper half) of region binding `b`'s lin address, as the region
+    controller maps it (master m = (lin >> GRAIN_LOG) mod NM; within it, the B10 PC map on lin with the master bits
+    removed: slot = the next PC_LOG bits, PC = PC_FIRST + m + PC_STRIDE * slot, share = the bits above and the grain's
+    offset). A linear region (PC_LOG 0): (lin mod NM grains' master, None, lin)."""
+    g, nm, pl = b['grain_log'], b['nm'], b['pc_log']
+    lm = (nm - 1).bit_length()
+    m = (lin >> g) % nm
+    if not pl:
+        return m, None, lin
+    rest = ((lin >> (g + lm)) << g) | (lin & ((1 << g) - 1))
+    slot = (rest >> g) & ((1 << pl) - 1)
+    share = ((rest >> (g + pl)) << g) | (rest & ((1 << g) - 1))
+    return m, b['pc_first'] + m + b['pc_stride'] * slot, share
+
+
+def s28_pc(b, lin):
+    """S28: the (master, PC, offset in the PC's upper half) of region binding `b`'s lin address, as the region
+    controller maps it (master m = (lin >> GRAIN_LOG) mod NM; within it, the B10 PC map on lin with the master bits
+    removed: slot = the next PC_LOG bits, PC = PC_FIRST + m + PC_STRIDE * slot, share = the bits above and the grain's
+    offset). A linear region (PC_LOG 0): (lin mod NM grains' master, None, lin)."""
+    g, nm, pl = b['grain_log'], b['nm'], b['pc_log']
+    lm = (nm - 1).bit_length()
+    m = (lin >> g) % nm
+    if not pl:
+        return m, None, lin
+    rest = ((lin >> (g + lm)) << g) | (lin & ((1 << g) - 1))
+    slot = (rest >> g) & ((1 << pl) - 1)
+    share = ((rest >> (g + pl)) << g) | (rest & ((1 << g) - 1))
+    return m, b['pc_first'] + m + b['pc_stride'] * slot, share
+
+
 def s28_binding(a, first):
     """S28: each region's masters (from port `first`, the SLR2 region's first: right after the memory ports' master,
     as the linker spreads MEM masters over the NoC's HBM INIs in sp= order), tags and PC map (see S28_DOC).
@@ -517,15 +549,19 @@ def s28_binding(a, first):
                 sys.exit(f'vmem_ports.py: S28 region {x["r"]}: PCs past the 32 pseudo-channels')
             # The PCs' shares of this region: its lin range over its PCs (grain rounded), in the upper half.
             n = nm << pc_log
-            b['share'] = (x['lin_base'] // n, (-(-(x['lin_base'] + x['bytes']) // n) + (1 << grain) - 1) >> grain << grain)
+            b['share'] = (x['lin_base'] // n, -(-(x['lin_base'] + x['bytes']) // n))
+            # (PCBYTES ends on 4 KiB: the runtime reserves whole pages of each PC's upper half.)
+            b['pc_bytes'] = -(-b['share'][1] // max(1 << grain, 4096)) * max(1 << grain, 4096)
             b['pcs'] = {pc_first + m + stride * i for m in range(nm) for i in range(1 << pc_log)}
-            if b['share'][1] > (512 << 20):
-                sys.exit(f'vmem_ports.py: S28 region {x["r"]}: {b["share"][1]} bytes a PC, past the half PC (512 MB)')
+            if b['pc_bytes'] > (512 << 20):
+                sys.exit(f'vmem_ports.py: S28 region {x["r"]}: {b["pc_bytes"]} bytes a PC, past the half PC (512 MB)')
         out.append(b)
         port += nm
     for i, p in enumerate(out):
         for q in out[i + 1:]:
-            if p['pc_log'] and q['pc_log'] and p['pcs'] & q['pcs'] and \
+            # (Two regions of one map (masters, PCs, stride, grain) never meet: the map is one-to-one on lin.)
+            same = all(p[k] == q[k] for k in ('nm', 'pc_first', 'pc_stride', 'pc_log', 'grain_log'))
+            if p['pc_log'] and q['pc_log'] and not same and p['pcs'] & q['pcs'] and \
                     p['share'][0] < q['share'][1] and q['share'][0] < p['share'][1]:
                 sys.exit(f'vmem_ports.py: S28 regions {p["r"]} and {q["r"]} share PCs and their PC shares overlap '
                          f'({p["share"]} / {q["share"]}): lay out the region over more PCs first')
@@ -569,7 +605,7 @@ def s28_main(a, first=None):
             f'm_axi_mem_{b["mport"] + m}:{t}' for m, t in enumerate(b['tags'])))
         if b['pc_log']:
             mask |= sum(1 << p for p in b['pcs'])
-            pcbytes = max(pcbytes, b['share'][1])
+            pcbytes = max(pcbytes, b['pc_bytes'])
     if mask:
         print('`define FOLDSIM_VMEM_PCMAP')
         print(f"`define FOLDSIM_VMEM_PCMASK 32'h{mask:08x}")
