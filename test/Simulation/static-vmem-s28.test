@@ -21,7 +21,7 @@
 # SV-DAG: s28r0_0_req_rdy,
 # SV-DAG: s28r0_0_hold,
 # SV-DAG: s28r0_0_rsp_v,
-# SV-DAG: input {{ *}}[537:0] s28r0_0_rsp_word,
+# SV-DAG: input {{ *}}[541:0] s28r0_0_rsp_word,
 # SV-DAG: output {{ *}}s28r0_0_req_v,
 # SV-DAG: output {{ *}}[618:0] s28r0_0_req_word,
 # SV-DAG: output {{ *}}s28r0_0_idle
@@ -29,7 +29,8 @@
 # SV-NEXT: .IW(2),
 # SV-NEXT: .AW(4),
 # SV-NEXT: .DW(8),
-# SV-NEXT: .MW(1)
+# SV-NEXT: .MW(1),
+# SV-NEXT: .LANES(1)
 # SV-NEXT: ) s28_ad_vm0_Leaf (
 # SV: foldsim_vmem_lsw #(
 # SV-NEXT: .N(1),
@@ -54,6 +55,7 @@
 # VH-NEXT: `define FOLDSIM_S28_R0_E_INST '{4}
 # VH-NEXT: `define FOLDSIM_S28_R0_E_RB '{6}
 # VH-NEXT: `define FOLDSIM_S28_R0_E_DW '{8}
+# VH-NEXT: `define FOLDSIM_S28_R0_E_LANES '{1}
 # VH-NEXT: `define FOLDSIM_S28_R0_E_OFF '{64'h0}
 # VH: `define FOLDSIM_S28_R0_BYTES 64'h1000
 # VH-NOT: FOLDSIM_VMEM_COUNT
@@ -142,10 +144,37 @@
 # RUN: cd %S/../Driver/Inputs/vmem && not foldsim --srcs top.f --top Top --out %t/bad2 --static --vmem-controller s28 Leaf > %t/bad2.txt 2>&1
 # RUN: FileCheck %s --check-prefix=BAD2 < %t/bad2.txt
 # BAD2: --vmem-controller s28 needs --virtual-memories
-# Stage A has no path for a page column (its host cycle's read and write may be of two instances; the adapter keeps
-# one instance an entry) nor for rings: refused, never folded wrong.
-# RUN: not foldsim-opt %S/../Transforms/fold-static-paged.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top page-memory-bits=0 page=Leaf:2 storage=Leaf:pages=hbm page-hbm-column-bits=32 vmem-s28})' 2>&1 | FileCheck %s --check-prefix=PAGES
-# PAGES: error: vmem-s28: vm0_ ({{.*}}:pages) is a ring's image, a tagged port or a page column
+# Page columns (state paged to HBM, --storage <class>:pages=hbm; S28 A2): a column's read and write of one host cycle
+# may be of two instances (the adapter carries both); K instances share an HBM row, lane = inst mod K (K the most
+# whole-byte lanes in a 512-bit beat, at most the instances), each write masked to its lane. Driver/Inputs/paged:
+# 128-bit page words (K 4), 64-bit columns (K 4, three columns on one local switch with the RAM), 32-bit columns with
+# bubbles (K 16). Exact; the table's E_LANES, the rows' instances / K. Mutant: the adapter's lanes 2 for 4 (lane =
+# inst mod 2): a lane's write lands on another instance's bytes and the run mismatches.
+# RUN: cd %S/../Driver/Inputs/paged && foldsim --srcs top.f --top Top --out %t/pg2 --static --page 2 --storage Leaf:pages=hbm --virtual-memories Leaf:ram --vmem-controller s28 Leaf > %t/pg2.log 2>&1
+# RUN: cd %S/../Driver/Inputs/paged && foldsim --srcs top.f --top Top --out %t/pgc --static --page 1 --page-hbm-column-bits 64 --storage Leaf:pages=hbm --virtual-memories Leaf:ram --vmem-controller s28 Leaf > %t/pgc.log 2>&1
+# RUN: cd %S/../Driver/Inputs/paged && foldsim --srcs top.f --top Top --out %t/pgb --static --page 3 --bubbles --modulo --page-hbm-column-bits 32 --storage Leaf:pages=hbm --virtual-memories Leaf:ram --vmem-controller s28 Leaf > %t/pgb.log 2>&1
+# RUN: FileCheck %s --check-prefix=PG2 < %t/pg2/foldsim_sim.vh
+# PG2: `define FOLDSIM_S28_R0_E_INST '{4, 2}
+# PG2: `define FOLDSIM_S28_R0_E_DW '{8, 512}
+# PG2: `define FOLDSIM_S28_R0_E_LANES '{1, 4}
+# RUN: FileCheck %s --check-prefix=PGB < %t/pgb/foldsim_sim.vh
+# PGB: `define FOLDSIM_S28_R0_E_LANES '{1, 16, 16}
+# RUN: python3 %S/Inputs/tb_s28_beats.py %t/pg2/foldsim_sim.json %t/pg2/beats.hex %t/pg2/lanes.hex
+# RUN: python3 %S/Inputs/tb_s28_beats.py %t/pgc/foldsim_sim.json %t/pgc/beats.hex %t/pgc/lanes.hex
+# RUN: python3 %S/Inputs/tb_s28_beats.py %t/pgb/foldsim_sim.json %t/pgb/beats.hex %t/pgb/lanes.hex
+# RUN: cd %S/../Driver/Inputs/paged && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -Mdir %t/pg2/obj %S/Inputs/tb_s28.sv top.sv %t/pg2/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/pg2/build.log 2>&1
+# RUN: cd %S/../Driver/Inputs/paged && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -Mdir %t/pgc/obj %S/Inputs/tb_s28.sv top.sv %t/pgc/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/pgc/build.log 2>&1
+# RUN: cd %S/../Driver/Inputs/paged && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION -DBUBBLES --top-module tb -I%S/../../shell/rtl -Mdir %t/pgb/obj %S/Inputs/tb_s28.sv top.sv %t/pgb/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/pgb/build.log 2>&1
+# RUN: %t/pg2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +beats=%t/pg2/beats.hex +lanes=%t/pg2/lanes.hex +lo=1 | FileCheck %s
+# RUN: %t/pg2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +beats=%t/pg2/beats.hex +lanes=%t/pg2/lanes.hex +lo=5 +hi=60 +mstall=30 +hold=10 | FileCheck %s
+# RUN: %t/pgc/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +beats=%t/pgc/beats.hex +lanes=%t/pgc/lanes.hex +lo=1 +hi=40 +stall=20 | FileCheck %s
+# RUN: %t/pgb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +beats=%t/pgb/beats.hex +lanes=%t/pgb/lanes.hex +lo=5 +hi=40 +bubble=30 +hold=10 | FileCheck %s
+# RUN: sed 's/\.LANES(4)/.LANES(2)/' %t/pg2/foldsim_sim.sv > %t/pg2/mutant.sv
+# RUN: cd %S/../Driver/Inputs/paged && %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -Mdir %t/pg2/objm %S/Inputs/tb_s28.sv top.sv %t/pg2/mutant.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/pg2/buildm.log 2>&1
+# RUN: %t/pg2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +beats=%t/pg2/beats.hex +lanes=%t/pg2/lanes.hex +lo=1 > /dev/null
+# RUN: %t/pg2/objm/Vtb +verilator+rand+reset+0 +verilator+seed+3 +beats=%t/pg2/beats.hex +lanes=%t/pg2/lanes.hex +lo=1 | FileCheck %s --check-prefix=MUT
+# MUT: {{^}}MISMATCH
+# Rings have no S28 path: refused, never folded wrong.
 # RUN: cd %S/../Driver/Inputs/vmem && not foldsim --srcs top.f --top Top --out %t/bad3 --static --virtual-memories ram --vmem-rings 16 --vmem-controller s28 Leaf > %t/bad3.txt 2>&1
 # RUN: FileCheck %s --check-prefix=BAD3 < %t/bad3.txt
 # BAD3: --vmem-controller s28: --vmem-rings does not apply

@@ -1839,7 +1839,8 @@ def s28_layout(vmems, meta, names=None):
         elif f[0] == 'in':
             ins.setdefault(int(f[1]), []).append({'index': int(f[2]), 'root': f[3], 'class_mask': int(f[4], 16)})
         elif f[0] == 'mem':
-            mems.append({'vm': int(f[1]), 'group': int(f[2]), 'cls': int(f[3]), 'mem': int(f[4])})
+            mems.append({'vm': int(f[1]), 'group': int(f[2]), 'cls': int(f[3]), 'mem': int(f[4]),
+                         'lanes': int(f[5]) if len(f) > 5 else 1})
     offset = 0
     out = []
     # (The regions over more PCs first in lin, SLR2's (its masters over all 32 PCs) before SLR0 / SLR1's (16): a
@@ -1851,11 +1852,18 @@ def s28_layout(vmems, meta, names=None):
         r['lin_base'] = offset
         for m in sorted((m for m in mems if m['group'] == g), key=lambda m: (m['cls'], m['mem'])):
             v = vmems[m['vm']]
+            # A page column's lanes: K instances an HBM row (lane = inst mod K), INSTANCES / K rows of K lanes.
+            k = m['lanes']
+            if k > 1:
+                db = (v['data_width'] + 7) // 8
+                v['row_bytes'] = max(64, 1 << (k * db - 1).bit_length())
+                v['bytes'] = (-(-v['instances'] // k) << v['row_width']) * v['row_bytes']
             rb = v['row_bytes']
             if rb & (rb - 1) or not 64 <= rb <= 4096:
                 sys.exit(f'foldsim: --vmem-controller s28: {v["port"]} rows of {rb} bytes (64 to 4096, a power of two)')
-            r['entries'].append({'vm': m['vm'], 'cls': m['cls'], 'mem': m['mem'], 'instances': v['instances'],
-                                 'rb': rb.bit_length() - 1, 'dw': v['data_width'], 'off': offset})
+            r['entries'].append({'vm': m['vm'], 'cls': m['cls'], 'mem': m['mem'], 'instances': -(-v['instances'] // k),
+                                 'rb': rb.bit_length() - 1, 'off': offset, 'lanes': k,
+                                 'dw': k * ((v['data_width'] + 7) // 8 * 8) if k > 1 else v['data_width']})
             v.update(base=offset, s28_region=g)
             offset += -(-v['bytes'] // 4096) * 4096
         r['bytes'] = offset - r['lin_base']
@@ -1881,7 +1889,8 @@ def write_s28_vh(f, s28):
         f.write(f'{p}IN_REPEAT(f,s) ' + ' `s '.join(f'`f({r["group"]}, {x["index"]})' for x in r['inputs']) + '\n')
         f.write(f'{p}ICLSM {arr([x["class_mask"] for x in r["inputs"]], hex64)}\n')
         f.write(f'{p}NE {len(r["entries"])}\n')
-        for key, d in (('E_CLS', 'cls'), ('E_MEM', 'mem'), ('E_INST', 'instances'), ('E_RB', 'rb'), ('E_DW', 'dw')):
+        for key, d in (('E_CLS', 'cls'), ('E_MEM', 'mem'), ('E_INST', 'instances'), ('E_RB', 'rb'), ('E_DW', 'dw'),
+                       ('E_LANES', 'lanes')):
             f.write(f'{p}{key} {arr([e[d] for e in r["entries"]])}\n')
         f.write(f'{p}E_OFF {arr([e["off"] for e in r["entries"]], hex64)}\n')
         f.write(f'{p}E_VM {arr([e["vm"] for e in r["entries"]])}\n')

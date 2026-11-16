@@ -21,7 +21,9 @@
 // entries arrive in a cycle. Each adapter has its own bank of FIFO entries
 // (a memory with one write port: a buffer shared by the N adapters would
 // need N write ports, and its room rule could not hold, see below). An
-// entry is the adapter's read and write of a host cycle, kept whole; the
+// entry is the adapter's read and write of a host cycle, kept whole, each
+// with its own instance (a page column's read and write-back are of
+// different {instance, page}); the
 // drain cuts it into words: a read is one word, a write ceil(DW/512) beats,
 // in RDW_READ_FIRST's order (a read-first pair's read first).
 //
@@ -68,7 +70,8 @@ module foldsim_vmem_lsw #(
     input  wire [N-1:0]           e_valid,
     input  wire [N-1:0]           e_rd,
     input  wire [N-1:0]           e_wr,
-    input  wire [N*IW-1:0]        e_inst,
+    input  wire [N*IW-1:0]        e_rinst,
+    input  wire [N*IW-1:0]        e_winst,
     input  wire [N*AW-1:0]        e_rrow,
     input  wire [N*AW-1:0]        e_wrow,
     input  wire [N*DW-1:0]        e_wdata,
@@ -133,14 +136,15 @@ module foldsim_vmem_lsw #(
         wire          ev = e_valid[m];
         wire          erd = e_rd[m];
         wire          ewr = e_wr[m];
-        wire [IW-1:0] ein = e_inst[m*IW +: IW];
+        wire [IW-1:0] eri = e_rinst[m*IW +: IW];
+        wire [IW-1:0] ewi = e_winst[m*IW +: IW];
         wire [AW-1:0] err = e_rrow[m*AW +: AW];
         wire [AW-1:0] ewr_row = e_wrow[m*AW +: AW];
         wire [DW-1:0] ewd = e_wdata[m*DW +: DW];
         wire [MW-1:0] ewm = e_wmask[m*MW +: MW];
         localparam DB = (D + 7) / 8 * 8;
         localparam B  = (DB + 511) / 512;
-        localparam EW = 2 + IW + 2 * A + D + K;
+        localparam EW = 2 + 2 * IW + 2 * A + D + K;
         reg  [EW-1:0] mem [FIFO];
         reg  [PW-1:0] wp, rp;
         reg  [GW-1:0] cnt;
@@ -155,7 +159,7 @@ module foldsim_vmem_lsw #(
         wire [GW-1:0] cnt_in   = cnt + GW'(ev);
         always @(posedge clk) begin
             if (ev) begin
-                mem[wp] <= {erd, ewr, ein, err[A-1:0], ewr_row[A-1:0], ewd[D-1:0], ewm[K-1:0]};
+                mem[wp] <= {erd, ewr, eri, ewi, err[A-1:0], ewr_row[A-1:0], ewd[D-1:0], ewm[K-1:0]};
                 wp <= wp + 1'b1;
             end
             if (pop[m])
@@ -171,9 +175,9 @@ module foldsim_vmem_lsw #(
         // The head entry's word `widx` (0 unless this adapter is granted).
         wire [EW-1:0]  h = mem[rp];
         wire           h_rd, h_wr;
-        wire [IW-1:0]  h_inst;
+        wire [IW-1:0]  h_rinst, h_winst;
         wire [A-1:0]   h_rrow, h_wrow;
-        assign {h_rd, h_wr, h_inst, h_rrow, h_wrow} = h[EW-1 -: 2 + IW + 2 * A];
+        assign {h_rd, h_wr, h_rinst, h_winst, h_rrow, h_wrow} = h[EW-1 -: 2 + 2 * IW + 2 * A];
         wire [B*512-1:0] h_data = (B*512)'(h[K +: D]);
         wire [B*64-1:0]  h_mask;
         if (K == 1) begin : g_row_en
@@ -188,11 +192,11 @@ module foldsim_vmem_lsw #(
         wire [2:0]     beat    = is_rd ? 3'd0 : wbeat[2:0];
         assign wlast[m] = (x == nw - 1'b1);
         if (B > 1) begin : g_slice
-            assign word[m] = {`S28_CLS_W'(CLS), `S28_MEM_W'(m), `S28_INST_W'(h_inst),
+            assign word[m] = {`S28_CLS_W'(CLS), `S28_MEM_W'(m), `S28_INST_W'(is_rd ? h_rinst : h_winst),
                               `S28_ROW_W'(is_rd ? h_rrow : h_wrow), beat, wlast[m], ~is_rd,
                               h_mask[32'(beat) * 64 +: 64], h_data[32'(beat) * 512 +: 512]};
         end else begin : g_one
-            assign word[m] = {`S28_CLS_W'(CLS), `S28_MEM_W'(m), `S28_INST_W'(h_inst),
+            assign word[m] = {`S28_CLS_W'(CLS), `S28_MEM_W'(m), `S28_INST_W'(is_rd ? h_rinst : h_winst),
                               `S28_ROW_W'(is_rd ? h_rrow : h_wrow), beat, wlast[m], ~is_rd,
                               h_mask, h_data};
         end

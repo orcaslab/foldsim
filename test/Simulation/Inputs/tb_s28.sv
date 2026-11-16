@@ -6,21 +6,24 @@
 // foldsim_vmem_{adapter,lsw,csw}.sv); each of its region buses
 // (s28r<g>_<j>_*, listed by S28_BUSES as `S28_BUS(g, j)) is served here by
 // `s28_region_model`, a behavioural region controller:
-//  * request words (619 bits {cls 6, mem 4, inst 12, row 16, beat 3, last 1,
-//    we 1, wmask 64, wdata 512}) are taken when `req_rdy` (+stall=<percent>
+//  * request words (619 bits {cls 6, mem 4, inst 16, row 12, beat 3, last 1,
+//    we 1, wmask 64, wdata 512}: foldsim_vmem_s28.vh) are taken when `req_rdy` (+stall=<percent>
 //    of the host cycles low) and applied in arrival order: a write beat's
 //    bytes under its mask; a read takes the row's beats as of its arrival;
 //  * each read is answered +lo=<n> to +hi=<n> host cycles after it arrives,
-//    in arrival order, its beats back to back (538-bit words {cls 6, mem 4,
-//    inst 12, beat 3, last 1, data 512}); each row its memory's beats, from
+//    in arrival order, its beats back to back (542-bit words {cls 6, mem 4,
+//    inst 16, beat 3, last 1, data 512}); each row its memory's beats, from
 //    +beats=<file> ($readmemh, entry {g 4, cls 6, mem 4}: the beats of region g's
 //    class cls's memory mem; tb_s28_beats.py writes it from foldsim_sim.json),
-//    else 1;
+//    else 1; a page column's K lanes share a row as the region controller
+//    has them: rows by inst >> log2 K (+lanes=<file>, the same entries, log2 K);
 //  * `hold` is high in reset and on +hold=<percent> of the host cycles.
 // Rows are zero at start (the target's with +verilator+rand+reset+0).
+// With BUBBLES the simulator's `advance` is low on +bubble=<percent> of the host cycles.
 // With RST_IN the target has a reset input, high for its first two cycles
 // (the simulator's `rst` channel), as in tb_reset.sv; with +rstevery=<n> also for two of every n cycles.
 // Prints MATCH or the first difference; WORDS, the request words taken.
+`include "foldsim_vmem_s28.vh"
 `ifndef S28_BUSES
 `define S28_BUSES `S28_BUS(0, 0)
 `endif
@@ -28,20 +31,21 @@
 module s28_region_model #(parameter G = 0) (
     input logic clk, rst,
     input int cyc, lo, hi, stall, hold_pct,
-    input logic req_v, input logic [618:0] req_word, input logic idle,
+    input logic req_v, input logic [`S28_REQ_W-1:0] req_word, input logic idle,
     output logic req_rdy, output logic hold,
-    output logic rsp_v, output logic [537:0] rsp_word,
+    output logic rsp_v, output logic [`S28_RSP_W-1:0] rsp_word,
     output int words);
   logic [511:0] mem [bit [40:0]];
-  typedef struct { int due; logic [33:0] hdr; int beats; logic [511:0] data [8]; } rd_t;
+  typedef struct { int due; logic [25:0] hdr; int beats; logic [511:0] data [8]; } rd_t;
   rd_t q [$];
   int beat = 0;
   initial words = 0;
-  logic [3:0] beats [1 << 14];
+  logic [3:0] beats [1 << 14], lanes [1 << 14];
   initial begin
     automatic string f;
-    for (int i = 0; i < (1 << 14); i++) beats[i] = 4'd1;
+    for (int i = 0; i < (1 << 14); i++) begin beats[i] = 4'd1; lanes[i] = 4'd0; end
     if ($value$plusargs("beats=%s", f)) $readmemh(f, beats);
+    if ($value$plusargs("lanes=%s", f)) $readmemh(f, lanes);
   end
   function automatic int beats_of(logic [5:0] cls, logic [3:0] m);
     return int'(beats[{4'(G), cls, m}]);
@@ -52,7 +56,7 @@ module s28_region_model #(parameter G = 0) (
     rsp_v = 0;
     if (!rst && q.size() != 0 && cyc >= q[0].due) begin
       rsp_v = 1;
-      rsp_word = {q[0].hdr[33:12], 3'(beat), 1'(beat == q[0].beats - 1), q[0].data[beat]};
+      rsp_word = {q[0].hdr, 3'(beat), 1'(beat == q[0].beats - 1), q[0].data[beat]};
     end
   end
   always @(posedge clk) if (!rst) begin
@@ -61,24 +65,25 @@ module s28_region_model #(parameter G = 0) (
       else beat++;
     end
     if (req_v && req_rdy) begin
-      automatic logic [5:0] c = req_word[618:613];
-      automatic logic [3:0] m = req_word[612:609];
-      automatic logic [11:0] i = req_word[608:597];
-      automatic logic [15:0] r = req_word[596:581];
-      automatic logic [2:0] b = req_word[580:578];
-      automatic bit [40:0] key = {c, m, i, r, b};
+      automatic logic [5:0] c = req_word[`S28_Q_CLS];
+      automatic logic [3:0] m = req_word[`S28_Q_MEM];
+      automatic logic [15:0] i = req_word[`S28_Q_INST];
+      automatic logic [11:0] r = req_word[`S28_Q_ROW];
+      automatic logic [2:0] b = req_word[`S28_Q_BEAT];
+      automatic logic [15:0] ri = i >> lanes[{4'(G), c, m}];
+      automatic bit [40:0] key = {c, m, ri, r, b};
       words++;
-      if (req_word[576]) begin
+      if (req_word[`S28_Q_WE]) begin
         automatic logic [511:0] old = mem.exists(key) ? mem[key] : '0;
         for (int y = 0; y < 64; y++)
           if (req_word[512 + y]) old[8 * y +: 8] = req_word[8 * y +: 8];
         mem[key] = old;
       end else begin
         automatic rd_t rd;
-        rd.hdr = {c, m, i, 12'b0};
+        rd.hdr = {c, m, i};
         rd.beats = beats_of(c, m);
         for (int k = 0; k < rd.beats; k++) begin
-          automatic bit [40:0] kk = {c, m, i, r, 3'(k)};
+          automatic bit [40:0] kk = {c, m, ri, r, 3'(k)};
           rd.data[k] = mem.exists(kk) ? mem[kk] : '0;
         end
         rd.due = cyc + lo + int'($urandom % (hi - lo + 1));
@@ -122,7 +127,9 @@ module tb;
   logic vx, yr, vr;
   wire xr, yv, rr;
   wire [7:0] yb;
-  int stall = 0, lo = 1, hi = 1, mstall = 0, hold_pct = 0, rstevery = 0;
+  int stall = 0, lo = 1, hi = 1, mstall = 0, hold_pct = 0, rstevery = 0, bubble = 0;
+  logic adv;
+  initial if (!$value$plusargs("bubble=%d", bubble)) bubble = 0;
   initial if (!$value$plusargs("rstevery=%d", rstevery)) rstevery = 0;
   initial if (!$value$plusargs("stall=%d", stall)) stall = 0;
   initial if (!$value$plusargs("mstall=%d", mstall)) mstall = 0;
@@ -131,7 +138,7 @@ module tb;
   initial if (!$value$plusargs("hi=%d", hi)) hi = lo;
 `define S28_BUS(g, j) \
   wire s28r``g``_``j``_req_v, s28r``g``_``j``_idle, s28r``g``_``j``_req_rdy, s28r``g``_``j``_hold, s28r``g``_``j``_rsp_v; \
-  wire [618:0] s28r``g``_``j``_req_word; wire [537:0] s28r``g``_``j``_rsp_word; int words_``g``_``j; \
+  wire [`S28_REQ_W-1:0] s28r``g``_``j``_req_word; wire [`S28_RSP_W-1:0] s28r``g``_``j``_rsp_word; int words_``g``_``j; \
   s28_region_model #(.G(g)) m_``g``_``j (.clk, .rst, .cyc, .lo, .hi, .stall(mstall), .hold_pct, \
     .req_v(s28r``g``_``j``_req_v), .req_word(s28r``g``_``j``_req_word), .idle(s28r``g``_``j``_idle), \
     .req_rdy(s28r``g``_``j``_req_rdy), .hold(s28r``g``_``j``_hold), .rsp_v(s28r``g``_``j``_rsp_v), \
@@ -146,6 +153,9 @@ module tb;
 `ifdef RST_IN
     .rst_valid(vr), .rst_bits(ir < 2 || (rstevery > 0 && ir % rstevery < 2)), .rst_ready(rr),
 `endif
+`ifdef BUBBLES
+    .advance(adv),
+`endif
     .y_ready(yr), .y_valid(yv), .y_bits(yb),
     `S28_BUSES
     .profile_finish());
@@ -153,6 +163,7 @@ module tb;
   always @(negedge clk) begin
     vx = ix < T && ($urandom % 100 >= stall);
     vr = ir < T && ($urandom % 100 >= stall);
+    adv = $urandom % 100 >= bubble;
     yr = $urandom % 100 >= stall;
   end
   always @(posedge clk) begin

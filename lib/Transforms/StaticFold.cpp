@@ -27985,8 +27985,8 @@ LogicalResult StaticFolder::buildSim() {
 /// `cls` is the class's number in its region, `mem` the memory's index in
 /// its class's local switch.
 LogicalResult StaticFolder::buildS28() {
-  constexpr unsigned kReqW = 619, kRspW = 538, kClsMax = 64, kMemMax = 16;
-  constexpr unsigned kInstMax = 12, kRowMax = 16, kBeatW = 3;
+  constexpr unsigned kReqW = 619, kRspW = 542, kClsMax = 64, kMemMax = 16;
+  constexpr unsigned kInstMax = 16, kRowMax = 12, kBeatW = 3;
   auto *context = top.getContext();
   auto sim = simModule;
   auto *body = sim.getBodyBlock();
@@ -28008,6 +28008,10 @@ LogicalResult StaticFolder::buildS28() {
   // Each memory: its class, its port's widths, its read-write order.
   struct Mem {
     unsigned k, cls, iw, aw, dw, mw, mem = 0;
+    // A page column's lanes (K instances an HBM row, lane = inst mod K) and
+    // the row's data and mask bits (K lanes of whole bytes; one lane: the
+    // port's own).
+    unsigned lanes = 1, rdw = 0, rmw = 0;
     bool readFirst;
     std::string port;
     SmallVector<Value> rsp;  // rsp_valid, rsp_inst, rsp_data, free (uses)
@@ -28026,16 +28030,16 @@ LogicalResult StaticFolder::buildS28() {
              << port << " (" << cast<StringAttr>(attr).getValue()
              << ") is not a class memory's port (stage A has no images, link "
                 "streams or page engines)";
-    // (Stage A's adapter keeps one instance per entry, for the host cycle's
-    // read and write alike, and no tag: a ring's image (`<memory>_img`),
-    // a tagged port or a page column, whose read and write may be of two
-    // instances, have no S28 path yet.)
-    if (f[0].ends_with("_img") || (f.size() > 8 && f[8] != "0") ||
-        (f.size() > 9 && f[9] == "pages"))
+    // (The adapter carries a host cycle's read and write instances apart (a
+    // page column's may differ) but no tag: a ring's image (`<memory>_img`)
+    // or a tagged port (link streams, page engines) has no S28 path yet.)
+    if (f[0].ends_with("_img") || (f.size() > 8 && f[8] != "0"))
       return netlist.emitError("vmem-s28: ")
              << port << " (" << cast<StringAttr>(attr).getValue()
-             << ") is a ring's image, a tagged port or a page column: the S28 "
-                "adapter (stage A) keeps one instance per entry and no tag";
+             << ") is a ring's image or a tagged port: the S28 adapter carries no tag";
+    bool pages = f.size() > 9 && f[9] == "pages";
+    unsigned instances = 0;
+    f[7].getAsInteger(10, instances);
     Mem m;
     m.k = k;
     m.cls = c->second;
@@ -28045,7 +28049,17 @@ LogicalResult StaticFolder::buildS28() {
     m.dw = width(sim.getOutputTypes()[outIdx[port + "wr_data"]]);
     m.mw = width(sim.getOutputTypes()[outIdx[port + "wr_mask"]]);
     m.readFirst = f[6] == "1";
-    if (m.iw > kInstMax || m.aw > kRowMax || (m.dw + 511) / 512 > (1u << kBeatW) ||
+    // A page column (one per column; its instance field {instance, page}, a
+    // dense index below INSTANCES): K of them an HBM row, K the most whose
+    // whole-byte lanes fit a 512-bit beat (a power of two, at most the
+    // instances), lane = inst mod K, its writes masked to its lane.
+    unsigned db = (m.dw + 7) / 8 * 8;
+    if (pages)
+      while (m.lanes * 2 * db <= 512 && m.lanes * 2 <= std::max(instances, 1u))
+        m.lanes *= 2;
+    m.rdw = m.lanes > 1 ? m.lanes * db : m.dw;
+    m.rmw = m.lanes > 1 ? m.lanes * db / 8 : m.mw;
+    if (m.iw > kInstMax || m.aw > kRowMax || (m.rdw + 511) / 512 > (1u << kBeatW) ||
         (m.mw != 1 && m.mw * 8 != m.dw))
       return netlist.emitError("vmem-s28: ")
              << port << " (instance " << m.iw << ", row " << m.aw << ", data " << m.dw
@@ -28196,13 +28210,13 @@ LogicalResult StaticFolder::buildS28() {
     for (unsigned i : list) {
       iw = std::max(iw, mems[i].iw);
       aw = std::max(aw, mems[i].aw);
-      dw = std::max(dw, mems[i].dw);
-      mw = std::max(mw, mems[i].mw);
+      dw = std::max(dw, mems[i].rdw);
+      mw = std::max(mw, mems[i].rmw);
     }
     // The local switch's outputs, to its adapters, through backedges.
     Backedge free = edge(16 * n), aValid = edge(n), aInst = edge(iw), aBeat = edge(kBeatW),
              aLast = edge(1), aData = edge(512);
-    SmallVector<Value> eValid, eRd, eWr, eInst, eRrow, eWrow, eData, eMask;
+    SmallVector<Value> eValid, eRd, eWr, eRinst, eWinst, eRrow, eWrow, eData, eMask;
     for (auto [j, i] : llvm::enumerate(list)) {
       auto &m = mems[i];
       auto ext = unit("foldsim_vmem_adapter",
@@ -28211,12 +28225,20 @@ LogicalResult StaticFolder::buildS28() {
                        {"wr_mask", m.mw}, {"e_free", 16}, {"r_valid", 1}, {"r_inst", m.iw},
                        {"r_beat", kBeatW}, {"r_last", 1}, {"r_data", 512}},
                       {{"rsp_valid", 1}, {"rsp_inst", m.iw}, {"rsp_data", m.dw}, {"free", 16},
-                       {"e_valid", 1}, {"e_rd", 1}, {"e_wr", 1}, {"e_inst", m.iw}, {"e_rrow", m.aw},
-                       {"e_wrow", m.aw}, {"e_wdata", m.dw}, {"e_wmask", m.mw}},
-                      {{"IW", 32}, {"AW", 32}, {"DW", 32}, {"MW", 32}},
-                      {"rsp_valid=reg", "rsp_inst=reg", "rsp_data=reg", "free=in:e_free", "e_valid=reg",
-                       "e_rd=reg", "e_wr=reg", "e_inst=reg", "e_rrow=reg", "e_wrow=reg", "e_wdata=reg",
-                       "e_wmask=reg"});
+                       {"e_valid", 1}, {"e_rd", 1}, {"e_wr", 1}, {"e_rinst", m.iw}, {"e_winst", m.iw},
+                       {"e_rrow", m.aw}, {"e_wrow", m.aw}, {"e_wdata", m.rdw}, {"e_wmask", m.rmw}},
+                      {{"IW", 32}, {"AW", 32}, {"DW", 32}, {"MW", 32}, {"LANES", 32}},
+                      // (rsp_data: the row register itself, or with lanes its
+                      // lane's select: logic.)
+                      m.lanes > 1
+                          ? ArrayRef<StringRef>{"rsp_valid=reg", "rsp_inst=reg", "free=in:e_free",
+                                                "e_valid=reg", "e_rd=reg", "e_wr=reg", "e_rinst=reg",
+                                                "e_winst=reg", "e_rrow=reg", "e_wrow=reg", "e_wdata=reg",
+                                                "e_wmask=reg"}
+                          : ArrayRef<StringRef>{"rsp_valid=reg", "rsp_inst=reg", "rsp_data=reg",
+                                                "free=in:e_free", "e_valid=reg", "e_rd=reg", "e_wr=reg",
+                                                "e_rinst=reg", "e_winst=reg", "e_rrow=reg", "e_wrow=reg",
+                                                "e_wdata=reg", "e_wmask=reg"});
       unsigned o = outIdx[m.port + "rd_valid"];
       SmallVector<Value> ins{clk, reset};
       for (unsigned q = 0; q < 8; ++q)
@@ -28230,26 +28252,27 @@ LogicalResult StaticFolder::buildS28() {
       m.adapter = cast<hw::InstanceOp>(place(hw::InstanceOp::create(
           b, ext, "s28_ad_" + m.port + classes[c].name, ins,
           b.getArrayAttr({param32("IW", m.iw), param32("AW", m.aw), param32("DW", m.dw),
-                          param32("MW", m.mw)}))));
+                          param32("MW", m.mw), param32("LANES", m.lanes)}))));
       auto r = m.adapter.getResults();
       eValid.push_back(r[4]);
       eRd.push_back(r[5]);
       eWr.push_back(r[6]);
-      eInst.push_back(zext(r[7], iw));
-      eRrow.push_back(zext(r[8], aw));
-      eWrow.push_back(zext(r[9], aw));
-      eData.push_back(zext(r[10], dw));
-      eMask.push_back(zext(r[11], mw));
+      eRinst.push_back(zext(r[7], iw));
+      eWinst.push_back(zext(r[8], iw));
+      eRrow.push_back(zext(r[9], aw));
+      eWrow.push_back(zext(r[10], aw));
+      eData.push_back(zext(r[11], dw));
+      eMask.push_back(zext(r[12], mw));
     }
     SmallVector<uint64_t> maw, mdw, mmw, rf;
     for (unsigned i : list) {
       maw.push_back(mems[i].aw);
-      mdw.push_back(mems[i].dw);
-      mmw.push_back(mems[i].mw);
+      mdw.push_back(mems[i].rdw);
+      mmw.push_back(mems[i].rmw);
       rf.push_back(mems[i].readFirst);
     }
     auto ext = unit("foldsim_vmem_lsw",
-                    {{"clk", 1}, {"e_valid", n}, {"e_rd", n}, {"e_wr", n}, {"e_inst", n * iw},
+                    {{"clk", 1}, {"e_valid", n}, {"e_rd", n}, {"e_wr", n}, {"e_rinst", n * iw}, {"e_winst", n * iw},
                      {"e_rrow", n * aw}, {"e_wrow", n * aw}, {"e_wdata", n * dw}, {"e_wmask", n * mw},
                      {"o_ready", 1}, {"hold", 1}, {"r_valid", 1}, {"r_word", kRspW}},
                     {{"e_free", 16 * n}, {"o_valid", 1}, {"o_word", kReqW}, {"idle", 1}, {"a_valid", n},
@@ -28261,7 +28284,7 @@ LogicalResult StaticFolder::buildS28() {
     Lsw l{hw::InstanceOp(), edge(1), edge(1), edge(1), edge(kRspW)};
     l.inst = cast<hw::InstanceOp>(place(hw::InstanceOp::create(
         b, ext, "s28_lsw_" + classes[c].name,
-        {clk, packed(eValid), packed(eRd), packed(eWr), packed(eInst), packed(eRrow), packed(eWrow),
+        {clk, packed(eValid), packed(eRd), packed(eWr), packed(eRinst), packed(eWinst), packed(eRrow), packed(eWrow),
          packed(eData), packed(eMask), l.ready, l.hold, l.rValid, l.rWord},
         b.getArrayAttr({param32("N", n), param32("CLS", regionCls[c]), param32("IW", iw),
                         param32("AW", aw), param32("DW", dw), param32("MW", mw),
@@ -28343,7 +28366,7 @@ LogicalResult StaticFolder::buildS28() {
   for (auto &m : mems) {
     unsigned g = groupOf(m.cls);
     meta.push_back(b.getStringAttr("mem:" + Twine(m.k) + ":" + Twine(g) + ":" +
-                                   Twine(regionCls[m.cls]) + ":" + Twine(m.mem)));
+                                   Twine(regionCls[m.cls]) + ":" + Twine(m.mem) + ":" + Twine(m.lanes)));
   }
   // The memories' answers and room: the adapters' outputs, where the
   // simulator's inputs were; the vm<k> ports go.
