@@ -20032,6 +20032,8 @@ static DenseMap<Value, TableSource> gTableSource;
 
 static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                        unsigned width, unsigned site, ArrayRef<uint8_t> care);
+/// A one-bit table with at most this many set rows is emitted as index compares.
+static constexpr size_t kSparseTableRows = 4;
 static Value tableCare(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                        ArrayRef<uint8_t> care, unsigned width,
                        unsigned site = __builtin_LINE());
@@ -20327,6 +20329,27 @@ static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> 
   // that many bits, each its own constant, read at the same index.
   uint64_t kMaxConstantBits = gMaxTableBits;
   uint64_t entries = elements.size();
+  // A one-bit table of a few set rows (a staged link's or an env output's
+  // write at its one position of the frame: FSD 1,024 has 1,029 such
+  // 8,192-row tables) is that many index compares, not a 2^n-row constant:
+  // the same function (synthesis makes the compares of it anyway), but no
+  // pricing or elaboration of a frame-deep array for a single slot.
+  if (width == 1 && rows.size() <= entries) {
+    SmallVector<uint64_t> ones;
+    for (uint64_t k = 0; k < rows.size() && ones.size() <= kSparseTableRows; ++k)
+      if (rows[k] & 1)
+        ones.push_back(k);
+    if (ones.size() <= kSparseTableRows) {
+      SmallVector<Value> hits;
+      for (auto k : ones)
+        hits.push_back(comb::ICmpOp::create(
+            b, comb::ICmpPredicate::eq, index,
+            hw::ConstantOp::create(b, index.getType(), k)));
+      if (hits.size() == 1)
+        return hits[0];
+      return comb::OrOp::create(b, ValueRange(hits), false);
+    }
+  }
   if (entries * width <= kMaxConstantBits || width <= 1) {
     auto arrayType = hw::ArrayType::get(type, entries);
     Value array = hw::AggregateConstantOp::create(b, arrayType,
