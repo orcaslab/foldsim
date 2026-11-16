@@ -415,6 +415,10 @@ def frame_options(a):
         fold += ' ready-ahead'
     if getattr(a, 'room_ahead', False):
         fold += ' room-ahead'
+        if getattr(a, 'room_regions', False):
+            fold += ' room-regions'
+    elif getattr(a, 'room_regions', False):
+        sys.exit('foldsim: --room-regions needs --room-ahead (fold-static room-regions)')
     if getattr(a, 'virtual_memories', None):
         if re.search(r'[\s{}]', a.virtual_memories):
             sys.exit('--virtual-memories: a regex without spaces or braces')
@@ -2073,6 +2077,11 @@ def build_parser():
                     help='with --static and virtual memories: each controller\'s room term of the frame decision '
                          'registered (free a host cycle before, two entries more); exact, may add host cycles '
                          'near a full controller (fold-static room-ahead)')
+    ap.add_argument('--room-regions', action='store_true',
+                    help='with --room-ahead: each controller\'s free count through two register stages, as an '
+                         'environment input under --slr-group-env (the first in the level, kept whole; the second '
+                         'replicated into each SLR group that reads it), the room compare after them; the term then '
+                         'asks for six entries more (fold-static room-regions)')
     ap.add_argument('--bubbles', action='store_true',
                     help='with --static: an input `advance`; a host cycle it is low puts an idle '
                          'slot in the frame (for slots that wait on data, e.g. memories off-chip)')

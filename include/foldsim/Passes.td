@@ -1166,6 +1166,16 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "the kernel's `free` stays off the decision's path. Exact (a "
            "position may only wait longer); host cycles move only while a "
            "controller is within two entries of full, and once after reset">,
+    Option<"roomRegions", "room-regions", "bool", "false",
+           "With room-ahead: each controller's `free` crosses into the SLR "
+           "regions as an environment input does under slr-group-env: a "
+           "first register in the level that slr-group-own does not "
+           "replicate (the kernel's port loads one SLR), and a second that it "
+           "replicates into each group reading it (wires alone between the "
+           "two; the compare is the group's own). `free` is then three host "
+           "cycles old: the term asks for six entries more (three decisions' "
+           "read and write). Exact; host cycles move only while a controller "
+           "is within six entries of full, and twice more after reset">,
     Option<"dropDeadInputs", "drop-dead-inputs", "bool", "true",
            "A model input its body never reads (left over from a class cut: "
            "its bits go to a sibling class directly) takes no link, no "
