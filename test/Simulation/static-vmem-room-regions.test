@@ -20,7 +20,18 @@
 # RUN: %t/rr/obj/Vtb +verilator+rand+reset+0 +verilator+seed+11 +lo=1 +hi=10 +full=90 | FileCheck %s
 # FAST: {{^}}MATCH 196 cycles in {{[0-9]+}} host cycles
 # CHECK: {{^}}MATCH
+# The margin, against a controller whose `free` is a real queue count (tb_vmem +queue=<n>: every read and write takes
+# an entry, the oldest leaves +qlat host cycles on with +drain % chance; OVERFLOW on a request into a full queue):
+# sixteen leaves writing and reading every target cycle (Driver/Inputs/vmem16) keep the queue at its room terms'
+# bound. With six entries more the queue never overflows; two (the room-ahead margin on a three-host-cycle-old
+# `free`, mutant 11-15) overflowed at host cycle 16-19 of this run.
+# RUN: cd %S/../Driver/Inputs/vmem16 && foldsim --srcs top.f --top Top --out %t/dense --static --virtual-memories ram --ready-ahead --room-ahead --room-regions Leaf > /dev/null 2>&1
+# RUN: cd %S/../Driver/Inputs/vmem16 && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DIW=4 -Mdir %t/dense/obj %S/Inputs/tb_vmem.sv top.sv %t/dense/foldsim_sim.sv > %t/dense/build.log 2>&1
+# RUN: %t/dense/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=4 +queue=16 +qlat=6 +drain=30 | FileCheck %s --check-prefix=DENSE
+# RUN: %t/dense/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=1 +hi=4 +queue=20 +qlat=6 +drain=30 | FileCheck %s --check-prefix=DENSE
+# DENSE-NOT: OVERFLOW
+# DENSE: {{^}}MATCH
 # Without --room-ahead the option is refused.
-# RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --virtual-memories ram --room-regions Leaf > %t/bad.txt 2>&1
+# RUN: cd %S/../Driver/Inputs/vmem && not foldsim --srcs top.f --top Top --out %t/bad --static --virtual-memories ram --room-regions Leaf > %t/bad.txt 2>&1
 # RUN: FileCheck %s --check-prefix=BAD < %t/bad.txt
 # BAD: --room-regions needs --room-ahead
