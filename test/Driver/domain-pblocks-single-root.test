@@ -1,0 +1,11 @@
+# flow/v80/domain_pblocks.tcl (a32-S26X-PH): an SLR whose roots include only one
+# past the least stripe (FOLDSIM_DOMAIN_MIN_LUT, 20,000 LUTs) bands that root's
+# child domains, as a single root's, and theirs in turn (the 16-SM fold's SLR0:
+# VX_core with small roots beside it got no band before). Vivado stubbed
+# (Inputs/pblocks/stub.tcl): the core's compute slice is banded, then its ALU
+# and SFU inside it; the small roots and the LSU-sized child stay unbanded.
+# RUN: tclsh %S/Inputs/pblocks/stub.tcl %foldsim_tools/flow/v80/domain_pblocks.tcl | FileCheck %s
+# CHECK: PBLOCK fs_dom_pb_1 g2/fs_dom_core/fs_dom_cs
+# CHECK-DAG: PBLOCK fs_dom_pb_{{[23]}} g2/fs_dom_core/fs_dom_cs/fs_dom_alu
+# CHECK-DAG: PBLOCK fs_dom_pb_{{[23]}} g2/fs_dom_core/fs_dom_cs/fs_dom_sfu
+# CHECK: PBLOCKS 3

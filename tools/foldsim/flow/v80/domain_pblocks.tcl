@@ -121,6 +121,14 @@ proc fs_dom_stripes {slr cols cells xs parent {pcell ""}} {
     foreach k {lut lutram bram uram dsp} { dict incr tot $k [dict get $d $k] }
   }
   set cells $big
+  # Roots of an SLR of which one alone is past the least stripe: that root is the SLR's single root, striped inside
+  # (its child domains), as when it is the only root (the small roots stay in the SLR's area).
+  if {$parent eq "" && [llength $cells] == 1} {
+    set r [lindex $cells 0]
+    set kids [get_cells -quiet $r/fs_dom_*]
+    if {[llength $kids] >= 1} { fs_dom_stripes $slr $cols $kids $xs [dict get $dem $r] $r }
+    return
+  }
   if {[llength $cells] < ($parent eq "" ? 2 : 1)} return
   # Bands (fs_domain_axis y): bottom to top by each domain's affinity (its link wires to the SLRs above minus those to
   # the SLRs below, fs_domain_affinity, by instance path suffix): a domain lands next to the boundary its crossings use.
