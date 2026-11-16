@@ -3418,7 +3418,7 @@ def main():
         # their host caches and their placement (s28 pins each region to its group's SLR itself).
         if not a.virtual_memories:
             sys.exit('--vmem-controller s28 needs --virtual-memories')
-        for bad, why in ((a.vmem_group is not None, '--vmem-group'), (a.vmem_cache_rows not in (None, 0), '--vmem-cache-rows'),
+        for bad, why in ((a.vmem_group is not None, '--vmem-group'), (a.vmem_cache_rows not in (None, '0'), '--vmem-cache-rows'),
                          (a.vmem_engines != 'placer', '--vmem-engines'),
                          (getattr(a, 'page_engines', 0), '--page-engines'), (getattr(a, 'vmem_rings', 0), '--vmem-rings'),
                          (getattr(a, 'vmem_slr_groups', ''), '--vmem-slr-groups')):
