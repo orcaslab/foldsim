@@ -5,14 +5,28 @@ request of the S28 region controllers' masters checked against the port it is bo
 FOLDSIM_S28_MASTER_REPEAT `f(port, r, m)`. A region with PC_LOG > 0 (FOLDSIM_S28_R<r>_PC_LOG / _PC_FIRST, 4 masters on
 MEM_SLR<s>_0..3; an SLR2 region's N masters on MEM): each of master m's addresses must lie in its PCs,
 PC_FIRST + m + PC_STRIDE i (i < 2^PC_LOG), in the upper half (512 MB in) of that PC's 1 GB window at 0x40_0000_0000 + p GB,
-below 512 MB + FOLDSIM_VMEM_PCBYTES. A linear region (PC_LOG 0, on MEM) must stay outside every spread PC half.
+below 512 MB + FOLDSIM_VMEM_PCBYTES. A linear region (PC_LOG 0, on MEM): its addresses are the runtime's virtual-memory
+base + lin, so each must lie in [VBASE + LIN_BASE, VBASE + LIN_BASE + BYTES) (FOLDSIM_S28_R<r>_LIN_BASE / _BYTES of the
+gen's foldsim_sim.vh beside the kernel header) and outside every spread PC half. VBASE (--vmem-base, default
+0x41_0000_0000) is where the runtime places the space on the V80 and in avedsim alike: kMemBase + the target's 4 GiB, its
+high word written after the move (VMEM_BASE_LO, then VMEM_BASE_HI): a controller that takes the base before the high word
+lands its requests below the HBM window, and fails here.
 Prints per master the requests and the PCs seen; exit 1 on any violation, 2 when an S28 master issued nothing."""
 import collections
 import re
 import sys
 
-trace, kvh = sys.argv[1:3]
+import os
+args = [a for a in sys.argv[1:] if not a.startswith('--vmem-base')]
+trace, kvh = args[:2]
+VBASE = next((int(a.split('=', 1)[1], 0) for a in sys.argv[1:] if a.startswith('--vmem-base=')), 0x41_0000_0000)
 vh = open(kvh).read()
+svh = os.path.join(os.path.dirname(kvh), 'foldsim_sim.vh')
+if os.path.exists(svh):
+    vh += open(svh).read()
+def get64(r, k):
+    m = re.search(rf"^`define FOLDSIM_S28_R{r}_{k} 64'h([0-9a-fA-F]+)", vh, re.M)
+    return int(m.group(1), 16) if m else None
 get = lambda r, k: int(re.search(rf'^`define FOLDSIM_S28_R{r}_{k} (\d+)', vh, re.M).group(1))
 rep = re.search(r'^`define FOLDSIM_S28_MASTER_REPEAT\(f,s\) (.*)$', vh, re.M).group(1)
 masters = {int(p): (int(r), int(m)) for p, r, m in re.findall(r'`f\((\d+), (\d+), (\d+)\)', rep)}
@@ -39,8 +53,13 @@ for ln in open(trace):
         ok = {get(r, 'PC_FIRST') + m + (int(st.group(1)) if st else 4) * i for i in range(1 << get(r, 'PC_LOG'))}
         if a < BASE or pc not in ok or not (512 << 20) <= off < (512 << 20) + pcb:
             bad.append(f'master {k} (region {r} master {m}, PCs {sorted(ok)}) {mm.group(3)} 0x{a:x}: PC {pc} offset 0x{off:x}')
-    elif a >= BASE and mask >> pc & 1 and off >= (512 << 20):
-        bad.append(f'master {k} (region {r}, linear) {mm.group(3)} 0x{a:x}: in spread PC {pc}\'s reserved half')
+    else:
+        lo, n = get64(r, 'LIN_BASE'), get64(r, 'BYTES')
+        if lo is not None and n is not None and not VBASE + lo <= a < VBASE + lo + n:
+            bad.append(f'master {k} (region {r}, linear) {mm.group(3)} 0x{a:x}: outside the region\'s space '
+                       f'0x{VBASE + lo:x}..0x{VBASE + lo + n:x} (runtime base 0x{VBASE:x} + lin)')
+        elif a >= BASE and mask >> pc & 1 and off >= (512 << 20):
+            bad.append(f'master {k} (region {r}, linear) {mm.group(3)} 0x{a:x}: in spread PC {pc}\'s reserved half')
 for k in sorted({k for k, _ in reqs} | set(masters)):
     who = f'region {masters[k][0]} master {masters[k][1]}' if k in masters else 'not S28'
     print(f'master {k} ({who}): AR {reqs[(k, "AR")]} AW {reqs[(k, "AW")]}; PCs ' +

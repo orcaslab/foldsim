@@ -30,6 +30,18 @@
 # RUN: python3 %S/Inputs/s28-pcmap/trace.py %foldsim_tools/flow/v80 %t/kernel.vh %S/Inputs/s28-pcmap/sim.vh mutant > %t/bad.axi
 # RUN: not python3 %foldsim_tools/foldsim_s28_axi_check.py %t/bad.axi %t/kernel.vh | FileCheck %s --check-prefix=BAD
 # BAD: VIOLATION master 5 (region 0 master 1, PCs [9, 25])
+# A linear SLR2 region (one master, PC_LOG 0): its addresses are the runtime's base (kMemBase + 4 GiB, the high word
+# written after the move) + lin, inside the region's space. Mutant: the base without its high word (taken before the
+# runtime wrote VMEM_BASE_HI, the syn2 t2 card hang): below the HBM window, the check refuses.
+# RUN: mkdir -p %t/lin && cp %S/Inputs/s28-pcmap/sim.vh %t/lin/foldsim_sim.vh
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/s28-pcmap/sim.vh --mem-ports 4 --s28-slr2-masters 1 > %t/lin/foldsim_kernel.vh
+# RUN: python3 %S/Inputs/s28-pcmap/trace.py %foldsim_tools/flow/v80 %t/lin/foldsim_kernel.vh %S/Inputs/s28-pcmap/sim.vh > %t/lin/ok.axi
+# RUN: python3 %foldsim_tools/foldsim_s28_axi_check.py %t/lin/ok.axi %t/lin/foldsim_kernel.vh | FileCheck %s --check-prefix=LIN
+# LIN: master 4 (region 0 master 0): AR {{[0-9]+}} AW 0; PCs 4:{{[0-9]+}}{{$}}
+# LIN: 0 violations, 0 S28 masters without traffic
+# RUN: python3 %S/Inputs/s28-pcmap/trace.py %foldsim_tools/flow/v80 %t/lin/foldsim_kernel.vh %S/Inputs/s28-pcmap/sim.vh lowbase > %t/lin/bad.axi
+# RUN: not python3 %foldsim_tools/foldsim_s28_axi_check.py %t/lin/bad.axi %t/lin/foldsim_kernel.vh | FileCheck %s --check-prefix=LOWBASE
+# LOWBASE: VIOLATION master 4 (region 0, linear) AR 0x0: outside the region's space 0x4100000000..0x4100080000
 # Without a target's PCs: SLR2 master k on PCs k, k+8, k+16, k+24. The area fallback: 4 SLR2 masters, PCs = k (mod 4).
 # RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/s28-pcmap/sim.vh --mem-ports 4 | FileCheck %s --check-prefix=EIGHT
 # EIGHT: `define FOLDSIM_S28_R0_PC_LOG 2
