@@ -658,6 +658,15 @@ VPORT_DROPIN_SCALE = 192.9 / 269.8
 # N 1. A central switch: ~230 LUT an input. The adapter: registers only (~0 LUT).
 S28_REGION = dict(logic_base=3617.0, logic_master=989.0, lutram_base=451.0, lutram_master=492.0, bram=7.5)
 S28_LSW = dict(lutram_per_bit=0.30, logic_per_bit=0.40, logic_min=39.0)
+# The fit driver's region controller (11-16, S28B's OOC of v2/v3 at 3.333 ns: 6.7k / 11.5k / 17.8k LUT at 1 / 4 / 8
+# masters, a line of 5,114 + 1,586 a master within 1 %; its response ring 7.5 RAMB36 (or 8 URAM288), A3's known-zero
+# epochs and write-data forward up to 3 RAMB36 more): one a region, in its SLR.
+S28_REGION_FIT = dict(lut_base=5114.0, lut_master=1586.0, bram=7.5 + 3.0)
+
+
+def s28_region_fit(masters):
+    """The fit driver's price of one S28 region controller of `masters` masters: (LUT, RAMB36)."""
+    return S28_REGION_FIT['lut_base'] + S28_REGION_FIT['lut_master'] * masters, S28_REGION_FIT['bram']
 S28_CSW_LOGIC = 230.0
 
 

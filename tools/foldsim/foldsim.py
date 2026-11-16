@@ -1244,6 +1244,11 @@ def slr_options(a, foldsim_opt, models, fold, out):
                           round(10 * max(0.0, top.get('bram', 0) - kernel.get('bram', 0))))
             measured = measured['copies']
             rams = {c: (round(10 * m.get('uram', 0)), round(10 * m.get('bram', 0))) for c, m in measured.items()}
+            # (--vmem-controller s28: the site file's kernel holds its recipe's own virtual-memory controllers; the
+            # kernel here is that recipe's rest (host control, memory endpoints: foldsim_sll_check.kernel_resources on
+            # the site file's netlist) and the region controllers, one an SLR in that SLR (s28_regions below).)
+            if getattr(a, 'vmem_controller', 'vmem') == 's28' and kernel:
+                kernel = s28_kernel_rest(a, rj, kernel)
         for c in sites:
             if c in measured:
                 sites[c] = round(measured[c]['lut'] * spl)
@@ -1283,6 +1288,17 @@ def slr_options(a, foldsim_opt, models, fold, out):
             print(f"foldsim: the kernel beside the simulator ({kernel.get('lut', 0):.0f} LUTs, measured) spread over "
                   'the SLRs by their LUTs' + (f', {pin_l:.0f} of them in {pin_n} (--slr-kernel-slr)' if pin_n else ''),
                   file=sys.stderr)
+        s28r = s28_regions(a, a.slr_region if a.slr_region not in ('', 'v80') else None, len(caps)) \
+            if getattr(a, 'vmem_controller', 'vmem') == 's28' else []
+        for g, (lut_, _) in enumerate(s28r):
+            n, c = caps[g]
+            caps[g] = (n, max(0, c - round(lut_ * json.load(open(
+                a.slr_region if a.slr_region not in ('', 'v80') else os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')))['sites_per_lut'])))
+        if s28r:
+            print('foldsim: S28 region controllers (one an SLR, in it): '
+                  + ', '.join(f'{caps[g][0]} {lut_:.0f} LUTs / {b:.1f} RAMB36' for g, (lut_, b) in enumerate(s28r)),
+                  file=sys.stderr)
         caps_more = None
         if a.slr_sites and rams:
             rj2 = a.slr_region if a.slr_region != 'v80' else rj
@@ -1297,6 +1313,8 @@ def slr_options(a, foldsim_opt, models, fold, out):
                     for j, (key, tkey) in enumerate((('uram', 'uram'), ('bram', 'ramb36'))):
                         tot = sum(x[tkey] for x in r2['slrs']) or 1
                         caps_more[g][j] = max(0, caps_more[g][j] - round(10 * kernel.get(key, 0) * slr[tkey] / tot))
+            for g, (_, b) in enumerate(s28r[:len(caps_more)]):
+                caps_more[g][1] = max(0, caps_more[g][1] - round(10 * b))
             print('foldsim: SLR groups\' URAM288 / RAMB36 (tenths) at most '
                   + ', '.join(f'{n} {u}/{b}' for (n, _), (u, b) in zip(caps, caps_more)), file=sys.stderr)
         print(f'foldsim: {len(caps)} SLR groups of at most '
@@ -1326,6 +1344,39 @@ def slr_options(a, foldsim_opt, models, fold, out):
     if a.slr_serialize:
         opts += f' slr-serialize={a.slr_serialize}'
     return opts
+
+
+def s28_kernel_rest(a, region_path, kernel):
+    """--vmem-controller s28 with an sll.json as --slr-sites: the kernel of the site file's recipe less its own
+    virtual-memory controllers (its host control and memory endpoints, as foldsim_sll_check.kernel_resources prices them
+    on the site file's netlist, <gen>/sll/sll.json's <gen>), the S28 region controllers being priced apart, per SLR
+    (s28_regions). Without that netlist: the region's host-control residue (`kernel.base_lut`) only."""
+    import foldsim_sll_check
+    region = json.load(open(region_path))
+    gdir = os.path.dirname(os.path.dirname(os.path.abspath(a.slr_sites)))
+    if os.path.exists(os.path.join(gdir, 'foldsim_sim.json')) and 'ctl_lut_scale' in region.get('kernel', {}):
+        kr = foldsim_sll_check.kernel_resources(gdir, region)
+        parts = kr.get('parts', {})
+        rest = sum(v for k, v in parts.items() if k == 'base' or 'endpoint' in k and 'RAMB36' not in k)
+        rest_bram = parts.get('endpoint RAMB36', 0.0)
+        what = ', '.join(f'{k} {v:.0f}' for k, v in parts.items() if k == 'base' or 'endpoint' in k)
+    else:
+        rest, rest_bram = region.get('kernel', {}).get('base_lut', 0.0), 0.0
+        what = f'base {rest:.0f} (no netlist beside {a.slr_sites})'
+    print(f"foldsim: --vmem-controller s28: the kernel is the site file's less its controllers ({kernel.get('lut', 0):.0f} "
+          f"-> {rest:.0f} LUTs, {kernel.get('bram', 0):.1f} -> {rest_bram:.1f} RAMB36: {what}) and the S28 region "
+          'controllers', file=sys.stderr)
+    return dict(lut=rest, lutram=0.0, ff=kernel.get('ff', 0.0), uram=0.0, bram=rest_bram)
+
+
+def s28_regions(a, region_path, groups):
+    """--vmem-controller s28: the region controllers the fit books, one an SLR group in that group's SLR: [(LUT, RAMB36)]
+    (foldsim_degree.s28_region_fit), SLR2's of --s28-slr2-masters masters (the flow's binding, default 8), the others' 4."""
+    import foldsim_degree
+    if region_path is None:
+        region_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
+    names = [s['name'] for s in json.load(open(region_path))['slrs']][:groups]
+    return [foldsim_degree.s28_region_fit(getattr(a, 's28_slr2_masters', 8) if n == 'SLR2' else 4) for n in names]
 
 
 def slr_region_capacities(path, fill=None):
@@ -3148,6 +3199,9 @@ def build_parser():
                          'fail. strict: the 11-08 hard rule (a straddle fails, foldsim_sim.sv renamed '
                          'foldsim_sim.sv.slr-refused, only --allow-slr-straddle overrides it; the other refusals '
                          'fail with --sll-check, else warn)')
+    ap.add_argument('--s28-slr2-masters', type=int, default=8, metavar='N',
+                    help="with --vmem-controller s28 and --slr-region: the SLR2 region controller's masters the fit "
+                         "prices (the flow's binding, vmem_ports.py --s28-slr2-masters; default 8)")
     ap.add_argument('--slr-sites', default='', metavar='JSON',
                     help="with --slr-groups: each copy's LUTs measured on a generated netlist of the same recipe "
                          '(JSON {copy: {"lut": n}}, foldsim_sll_check.py netlist resources) instead of the '

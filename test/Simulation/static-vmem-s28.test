@@ -219,6 +219,29 @@
 # RUN: not %t/w17/objm/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 > %t/w17/mut.txt 2>&1
 # RUN: FileCheck %s --check-prefix=W17M < %t/w17/mut.txt
 # W17M: {{foldsim_vmem_(adapter|lsw)}}: {{.*}}AW 17 {{.*}}past the word's fields
+# The fit with --slr-sites (an sll.json of an earlier recipe, its kernel holding that recipe's own controllers: 166k LUT,
+# 523 RAMB36 here): with --vmem-controller s28 the kernel is that recipe's rest (host control and memory endpoints, from
+# the netlist beside the site file, else the region's base) and one region controller an SLR, in that SLR, at its
+# measured cost (1 / 4 / 8 masters: 6.7k / 11.5k / 17.8k LUT, 10.5 RAMB36 with A3's); the site file gives sites only.
+# RUN: mkdir -p %t/fit/s/sll %t/fit/n/sll
+# RUN: echo '{"copies": {"Leaf": {"lut": 10, "uram": 0, "bram": 1}, "Leaf_copy1": {"lut": 10, "uram": 0, "bram": 1}}, "top": {"lut": 200000, "uram": 0, "bram": 600}, "top_kernel": {"lut": 166000, "uram": 0, "bram": 523}}' > %t/fit/s/sll/sll.json
+# RUN: cp %t/fit/s/sll/sll.json %t/fit/n/sll/ && cp %t/one/foldsim_sim.json %t/fit/n/
+# RUN: cd %S/../Driver/Inputs/vmem && foldsim --srcs top.f --top Top --out %t/fit/os --static --virtual-memories ram --vmem-controller s28 --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-region v80 --slr-sites %t/fit/s/sll/sll.json --slr-level 0 Leaf > %t/fit/s.log 2>&1
+# RUN: FileCheck %s --check-prefix=FITS < %t/fit/s.log
+# FITS: --vmem-controller s28: the kernel is the site file's less its controllers (166000 -> 4200 LUTs, 523.0 -> 0.0 RAMB36: base 4200 (no netlist beside
+# FITS: the kernel beside the simulator (4200 LUTs, measured)
+# FITS: S28 region controllers (one an SLR, in it): SLR2 17802 LUTs / 10.5 RAMB36, SLR1 11458 LUTs / 10.5 RAMB36, SLR0 11458 LUTs / 10.5 RAMB36
+# FITS: SLR groups' URAM288 / RAMB36 (tenths) at most SLR2 4216/7413, SLR1 4344/8769, SLR0 1734/3261
+# RUN: cd %S/../Driver/Inputs/vmem && foldsim --srcs top.f --top Top --out %t/fit/on --static --virtual-memories ram --vmem-controller s28 --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-region v80 --slr-sites %t/fit/n/sll/sll.json --slr-level 0 --s28-slr2-masters 1 Leaf > %t/fit/n.log 2>&1
+# RUN: FileCheck %s --check-prefix=FITN < %t/fit/n.log
+# FITN: the kernel is the site file's less its controllers (166000 -> 4200 LUTs, 523.0 -> 0.0 RAMB36: base 4200, 0 memory port endpoints 0)
+# FITN: S28 region controllers (one an SLR, in it): SLR2 6700 LUTs / 10.5 RAMB36, SLR1 11458 LUTs
+# Without --vmem-controller s28 the site file's kernel stands.
+# RUN: cd %S/../Driver/Inputs/vmem && foldsim --srcs top.f --top Top --out %t/fit/ov --static --virtual-memories ram --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-region v80 --slr-sites %t/fit/s/sll/sll.json --slr-level 0 Leaf > %t/fit/v.log 2>&1
+# RUN: FileCheck %s --check-prefix=FITV < %t/fit/v.log
+# FITV-NOT: S28 region controllers
+# FITV: the kernel beside the simulator (166000 LUTs, measured)
+# FITV: SLR groups' URAM288 / RAMB36 (tenths) at most SLR2 4216/5407
 # Rings have no S28 path: refused, never folded wrong.
 # RUN: cd %S/../Driver/Inputs/vmem && not foldsim --srcs top.f --top Top --out %t/bad3 --static --virtual-memories ram --vmem-rings 16 --vmem-controller s28 Leaf > %t/bad3.txt 2>&1
 # RUN: FileCheck %s --check-prefix=BAD3 < %t/bad3.txt
