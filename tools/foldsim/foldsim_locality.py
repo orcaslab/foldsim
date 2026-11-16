@@ -97,7 +97,8 @@ def port_list(ports):
 
 def instance(rest):
     """(instance name, module, [(port, operand, width)], [(out port, width)]) of an hw.instance's text."""
-    m = re.match(r'\s*"([^"]*)"(?:\s+sym\s+@\S+)?\s+@([\w$.]+)\(', rest)
+    # (A parameterized module's instance: its parameters `<NAME: type = value, ...>` before the operands.)
+    m = re.match(r'\s*"([^"]*)"(?:\s+sym\s+@\S+)?\s+@([\w$.]+)(?:<[^(]*>)?\(', rest)
     i = m.end() - 1
     j = match_paren(rest, i)
     ins = []
