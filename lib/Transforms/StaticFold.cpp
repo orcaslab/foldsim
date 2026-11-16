@@ -929,6 +929,9 @@ public:
   /// `physical-domains`: the simulator as a tree of modules mirroring the
   /// class tree (extractDomains).
   bool physicalDomains = false;
+  /// `domain-merge`: the classes with no domain of their own (each with its
+  /// copy's LUT price, 0 unknown); their ops join the nearest domain ancestor.
+  llvm::StringMap<uint64_t> domainMerge;
   /// `slr-adjacent`: no link between SLR groups more than one SLR apart.
   bool slrAdjacent = false;
   /// `slr-level-group`: the group the simulator level sits with (-1 unknown).
@@ -28944,6 +28947,19 @@ LogicalResult StaticFolder::extractDomains(hw::HWModuleOp mod, StringRef suffix)
       if (inst.getInstanceName() == classes[c].name + "_copy")
         present[c] = true;
   }
+  // domain-merge: a merged class present here has no domain of its own; its
+  // ops go to its nearest ancestor class that has one (or this module's own
+  // logic), and its child classes' domains nest there.
+  SmallVector<bool> hasDom(present);
+  for (unsigned c = 0; c < n; ++c)
+    if (present[c] && domainMerge.count(classes[c].name))
+      hasDom[c] = false;
+  auto host = [&](int c) {
+    for (int a = c; a >= 0; a = classes[a].parent)
+      if (hasDom[a])
+        return a;
+    return -1;
+  };
   // Each op's domain class here (-1: this module's own logic).
   DenseMap<Operation *, int> domOf;
   for (auto &op : body->without_terminator()) {
@@ -28953,7 +28969,8 @@ LogicalResult StaticFolder::extractDomains(hw::HWModuleOp mod, StringRef suffix)
     op.removeAttr(kDomAttr);
     int c = attr.getInt();
     if (c >= 0 && unsigned(c) < n && present[c])
-      domOf[&op] = c;
+      if (int h = host(c); h >= 0)
+        domOf[&op] = h;
   }
   // A memory and its ports stay in one module (its handle is no value a port
   // can carry): where they were built in different domains, all of them go to
@@ -28961,7 +28978,7 @@ LogicalResult StaticFolder::extractDomains(hw::HWModuleOp mod, StringRef suffix)
   auto ancestors = [&](int c) {
     SmallVector<int> chain;
     for (int a = c; a >= 0; a = classes[a].parent)
-      if (present[a])
+      if (hasDom[a])
         chain.push_back(a);
     return chain;
   };
@@ -29004,13 +29021,13 @@ LogicalResult StaticFolder::extractDomains(hw::HWModuleOp mod, StringRef suffix)
   // here (-1: a domain root of this module).
   auto domParent = [&](unsigned c) -> int {
     for (int a = classes[c].parent; a >= 0; a = classes[a].parent)
-      if (present[a])
+      if (hasDom[a])
         return a;
     return -1;
   };
   SmallVector<unsigned> order;
   for (unsigned c = 0; c < n; ++c)
-    if (present[c])
+    if (hasDom[c])
       order.push_back(c);
   // Deepest first: a domain's children are modules before it is built.
   llvm::stable_sort(order, [&](unsigned x, unsigned y) {
@@ -29181,11 +29198,26 @@ LogicalResult StaticFolder::extractDomains(hw::HWModuleOp mod, StringRef suffix)
        << " not from a register), out " << outBits << " bits (" << outUnreg
        << " not from a register)\n";
   }
+  for (unsigned c = 0; c < n; ++c)
+    if (present[c] && !hasDom[c]) {
+      int h = host(c);
+      uint64_t luts = domainMerge.lookup(classes[c].name);
+      rs << "    merged " << classes[c].name << suffix;
+      if (luts)
+        rs << " (copy priced " << luts << " LUTs)";
+      rs << " into "
+         << (h >= 0 ? "domain " + classes[h].name : std::string(mod.getModuleName()))
+         << ": no domain of its own\n";
+    }
   if (memsMoved)
     rs << "  physical domains of " << mod.getModuleName() << ": " << memsMoved
        << " memories with ports built in different domains kept whole in their common domain\n";
+  unsigned mergedHere = 0;
+  for (unsigned c = 0; c < n; ++c)
+    mergedHere += present[c] && !hasDom[c];
   rs << "  physical domains of " << mod.getModuleName() << ": " << built
-     << " domains, boundary in " << allIn << " bits (" << unregIn
+     << " domains" << (mergedHere ? " (" + std::to_string(mergedHere) + " classes merged)" : std::string())
+     << ", boundary in " << allIn << " bits (" << unregIn
      << " not from a register), out " << allOut << " bits (" << unregOut
      << " not from a register)\n";
   return success();
@@ -29646,6 +29678,19 @@ void FoldStaticPass::runOnOperation() {
   gUramCascadeMax = uramCascadeMax;
   folder.slrGroupEnv = slrGroupEnv;
   folder.physicalDomains = physicalDomains;
+  for (auto &spec : domainMerge) {
+    auto [name, price] = StringRef(spec).split(':');
+    uint64_t luts = 0;
+    if (!price.empty() && price.getAsInteger(10, luts)) {
+      getOperation().emitError("domain-merge: '") << spec << "' is not <class>[:<LUTs>]";
+      return signalPassFailure();
+    }
+    folder.domainMerge[name] = luts;
+  }
+  if (!folder.domainMerge.empty() && !physicalDomains) {
+    getOperation().emitError("domain-merge: needs physical-domains");
+    return signalPassFailure();
+  }
   folder.slrAdjacent = slrAdjacent;
   folder.slrLevelGroup = slrLevelGroup;
   folder.slrKept = std::max(1u, unsigned(slrKept));
