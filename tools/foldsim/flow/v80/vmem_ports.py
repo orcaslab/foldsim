@@ -460,13 +460,30 @@ def s28_pc(b, lin):
     return m, b['pc_first'] + m + b['pc_stride'] * slot, share
 
 
+def s28_pc(b, lin):
+    """S28: the (master, PC, offset in the PC's upper half) of region binding `b`'s lin address, as the region
+    controller maps it (master m = (lin >> GRAIN_LOG) mod NM; within it, the B10 PC map on lin with the master bits
+    removed: slot = the next PC_LOG bits, PC = PC_FIRST + m + PC_STRIDE * slot, share = the bits above and the grain's
+    offset). A linear region (PC_LOG 0): (lin mod NM grains' master, None, lin)."""
+    g, nm, pl = b['grain_log'], b['nm'], b['pc_log']
+    lm = (nm - 1).bit_length()
+    m = (lin >> g) % nm
+    if not pl:
+        return m, None, lin
+    rest = ((lin >> (g + lm)) << g) | (lin & ((1 << g) - 1))
+    slot = (rest >> g) & ((1 << pl) - 1)
+    share = ((rest >> (g + pl)) << g) | (rest & ((1 << g) - 1))
+    return m, b['pc_first'] + m + b['pc_stride'] * slot, share
+
+
 def s28_binding(a, first):
     """S28: each region's masters (from port `first`, the SLR2 region's first: right after the memory ports' master,
     as the linker spreads MEM masters over the NoC's HBM INIs in sp= order), tags and PC map (see S28_DOC).
 
     SLR0 / SLR1: 4 masters on MEM_SLR<s>_0..3, master m on PCs = m (mod 4): stride 4, PC_LOG 3 from PC m (2 from
     m + 4 with --spread-target-pcs 4). SLR2 (or an SLR without ports of its own): --s28-slr2-masters N on MEM, master k
-    on PCs = k (mod N): stride N, PC_LOG log2(32 / N) from PC k (N = 1: linear, base + lin). Every spread region takes
+    on PCs = k (mod N): stride N, PC_LOG log2(32 / N) from PC k (N = 1: linear, base + lin); with --spread-target-pcs
+    4 (the target's PCs 0-3 are whole) from PC 8: 8 masters on 8 + k and 24 + k, 4 on 8 + k + 4 i. Every spread region takes
     one grain (the largest row of them all, at least 64 bytes); a PC's share of a region is its lin range over the
     region's PCs, so regions on common PCs must have disjoint shares: refused otherwise (the layout puts the region
     over the most PCs first)."""
@@ -481,12 +498,20 @@ def s28_binding(a, first):
         nm = 4 if own else a.s28_slr2_masters
         if own:
             stride, pc_log, pc_first = 4, 2 if a.spread_target_pcs else 3, a.spread_target_pcs
+        elif nm > 1 and a.spread_target_pcs:
+            # (A Vortex image's target holds PCs 0-3 whole, so its upper halves are no vmem space (the runtime
+            # refuses them): PCs from 8, each master k still on PCs = k (mod 8): 8 + k and 24 + k with 8 masters,
+            # 8 + k + 4 i with 4.)
+            stride, pc_log, pc_first = (16, 1, 8) if nm == 8 else (nm, (16 // nm - 1).bit_length(), 8)
         elif nm > 1:
             stride, pc_log, pc_first = nm, (32 // nm - 1).bit_length(), 0
         else:
             stride, pc_log, pc_first = 1, 0, 0
         b = dict(x, nm=nm, mport=port, tags=[f'MEM_{x["slr"]}_{m}' if own else 'MEM' for m in range(nm)],
-                 pc_log=pc_log, pc_first=pc_first, pc_stride=stride, grain_log=grain if pc_log else max(6, x['max_rb']))
+                 pc_log=pc_log, pc_first=pc_first, pc_stride=stride, grain_log=grain if pc_log else max(6, x['max_rb']),
+                 # (The region's response ring, one per region in issue order: SLR2's loaded round trip is the
+                 # shorter (hbm-asl9-20261114: ~314 vs ~480 host cycles).)
+                 rsp_depth=256 if own else 128)
         if pc_log:
             if pc_first + nm - 1 + stride * ((1 << pc_log) - 1) > 31:
                 sys.exit(f'vmem_ports.py: S28 region {x["r"]}: PCs past the 32 pseudo-channels')
@@ -538,7 +563,7 @@ def s28_main(a, first=None):
         f'`f({b["mport"] + m}, {b["r"]}, {m})' for b in regions for m in range(b['nm'])))
     mask, pcbytes = 0, 0
     for b in regions:
-        for key in ('nm', 'mport', 'pc_log', 'pc_first', 'pc_stride', 'grain_log'):
+        for key in ('nm', 'mport', 'pc_log', 'pc_first', 'pc_stride', 'grain_log', 'rsp_depth'):
             print(f'`define FOLDSIM_S28_R{b["r"]}_{key.upper()} {b[key]}')
         print(f'// S28 region {b["r"]} ({b["slr"] or "no SLR"}): masters ' + ' '.join(
             f'm_axi_mem_{b["mport"] + m}:{t}' for m, t in enumerate(b['tags'])))
@@ -549,6 +574,7 @@ def s28_main(a, first=None):
         print('`define FOLDSIM_VMEM_PCMAP')
         print(f"`define FOLDSIM_VMEM_PCMASK 32'h{mask:08x}")
         print(f'`define FOLDSIM_VMEM_PCBYTES {pcbytes}')
+
 
 if __name__ == '__main__':
     main()
