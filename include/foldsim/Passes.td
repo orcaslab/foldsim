@@ -876,6 +876,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "those not from a register or memory read). Every domain is a "
            "placement unit (a pblock, an SLR assignment). The same netlist "
            "apart from the hierarchy: no value or host cycle moves">,
+    ListOption<"domainMerge", "domain-merge", "std::string",
+               "With physical-domains: the classes (<class>[:<LUTs>], the "
+               "driver's per-copy LUT price, from --domain-merge-lut) that get "
+               "no domain of their own: a merged class's copies, controls, "
+               "incoming links and memories are emitted in its nearest domain "
+               "ancestor's module (or the group's own logic), and its child "
+               "classes' domains nest there. The domain report names each "
+               "merged class and its host. The same netlist apart from the "
+               "hierarchy">,
     Option<"slrGroupReset", "slr-group-reset", "bool", "false",
            "With SLR groups: the simulator's reset registered once in each "
            "group (inside the group's module) and once for the level, so that "

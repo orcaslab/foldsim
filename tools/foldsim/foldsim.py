@@ -1142,6 +1142,51 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
     return fold
 
 
+def domain_merge(a, foldsim_opt, flat, passes, fold, out):
+    """--domain-merge-lut N (with --physical-domains): the fold-static
+    domain-merge option, the classes whose copy is priced below N LUTs, each
+    with its price. The price is the per-copy LUT price of --state auto
+    (state.json `total`: logic, store LUTs and LUTRAM, as synthesized),
+    else the calibrated LUT sites of copy_sites on a schedule without the
+    merge. A class's largest copy decides."""
+    import foldsim_degree
+    price = {}
+    sj = out('state.json')
+    if a.state == 'auto' and os.path.exists(sj):
+        for key, v in json.load(open(sj)).get('copies', {}).items():
+            c = key.rpartition('#')[0] or key
+            price[c] = max(price.get(c, 0), round(v['total']))
+        src = 'the --state auto copy prices (state.json)'
+    else:
+        models = out('models.mlir')
+        if not os.path.exists(models):
+            run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
+                 '-o', models])
+        base = out('schedule_domain_merge.txt')
+        plain = fold.replace(f' report={out("schedule.txt")}', '')
+        r = subprocess.run([foldsim_opt, models, f'--pass-pipeline=builtin.module('
+                            f'foldsim-fold-static{{{plain} report={base} schedule-only}})',
+                            '-o', os.devnull], capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(r.stderr)
+        text = open(base).read()
+        ii, classes, _ = foldsim_degree.parse_schedule(text)
+        info = foldsim_degree.parse_classes(text)
+        path = a.degree_calibration or DEGREE_CALIBRATION
+        cal = json.load(open(path)) if path != 'none' and os.path.exists(path) else None
+        entries = a.register_state_entries if a.register_state_entries is not None else 2
+        of = {c: re.sub(r'_copy\d+$', '', c) for c in classes}
+        est = foldsim_degree.class_estimates(models, sorted(set(of.values())))
+        for c, n in classes.items():
+            v = round(foldsim_degree.copy_sites(cal, est[of[c]], of[c], n, entries, info.get(c), ii))
+            price[c] = max(price.get(c, 0), v)
+        src = 'calibrated copy LUT sites (copy_sites)'
+    merged = sorted((c for c, v in price.items() if v < a.domain_merge_lut), key=lambda c: price[c])
+    print(f'foldsim: domain merge below {a.domain_merge_lut} LUTs ({src}): {len(merged)} of {len(price)} classes'
+          + (': ' + ', '.join(f'{c} ({price[c]})' for c in merged) if merged else ''), file=sys.stderr)
+    return f" domain-merge={','.join(f'{c}:{price[c]}' for c in merged)}" if merged else ''
+
+
 def slr_options(a, foldsim_opt, models, fold, out):
     """The fold-static options of --slr-groups: each copy's LUT sites, from a
     schedule without groups (the copies and their instances) and the V80
@@ -2573,6 +2618,11 @@ def build_parser():
                     help='emit the simulator as a tree of modules mirroring the class tree (foldsim-fold-static '
                          'physical-domains): a class\'s domain fs_dom_<class> holds its copies, its controls, the links '
                          'read into it and its child classes\' domains; each domain is a placement unit')
+    ap.add_argument('--domain-merge-lut', type=int, default=0, metavar='N',
+                    help='with --physical-domains: a class whose copy is priced below N LUTs (the per-copy price of '
+                         '--state auto, else the calibrated copy LUT sites) gets no domain of its own: its copy, '
+                         'controls, incoming links and memories join its nearest domain ancestor\'s module, its '
+                         'child classes\' domains nest there (foldsim-fold-static domain-merge). 0: off')
     ap.add_argument('--slr-group-env', action='store_true',
                     help='with --slr-groups and --slr-group-own: each environment channel enters through one '
                          'register stage in the level and one per group behind a one-token elastic buffer, the '
@@ -3281,6 +3331,8 @@ def main():
         sys.exit('--storage needs --static')
     if a.schedule_only and not a.static:
         sys.exit('--schedule-only needs --static')
+    if getattr(a, 'domain_merge_lut', 0) and not getattr(a, 'physical_domains', False):
+        sys.exit('--domain-merge-lut needs --physical-domains')
     # The SLR check's region (--region): the check runs on every static fold's netlist (--slr-policy).
     region = check_region(a)
     if a.static:
@@ -3330,6 +3382,8 @@ def main():
                         else fold + f' storage={",".join(hbm)}')
         if a.state == 'auto':
             fold = choose_state(a, foldsim_opt, flat, passes, out, fold)
+        if getattr(a, 'physical_domains', False) and getattr(a, 'domain_merge_lut', 0) > 0:
+            fold += domain_merge(a, foldsim_opt, flat, passes, fold, out)
         if a.slr_groups or region:
             if a.copies != 'auto':
                 run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
