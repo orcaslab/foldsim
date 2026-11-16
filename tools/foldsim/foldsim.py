@@ -1265,11 +1265,24 @@ def slr_options(a, foldsim_opt, models, fold, out):
         if a.slr_sites and kernel:
             r3 = json.load(open(a.slr_region if a.slr_region != 'v80' else rj))
             tot = sum(x['luts'] for x in r3['slrs'])
+            # --slr-kernel-slr SLR[:LUTS]: LUTS of the kernel (default all of it) pinned in that SLR (the folded
+            # memory endpoint beside the target's memory ports there), the rest spread.
+            pin_n, pin_l = None, 0.0
+            pin = getattr(a, 'slr_kernel_slr', '')
+            if not pin and getattr(a, 'mem_endpoint_slr', ''):
+                # (--mem-endpoint-slr: the kernel but its host-control residue is the folded memory endpoint there.)
+                base = json.load(open(a.slr_region if a.slr_region != 'v80' else rj)).get('kernel', {}).get('base_lut', 0)
+                pin = f'{a.mem_endpoint_slr}:{max(0.0, kernel.get("lut", 0) - base)}'
+            if pin:
+                pin_n, _, pl_ = pin.partition(':')
+                pin_l = min(float(pl_) if pl_ else kernel.get('lut', 0), kernel.get('lut', 0))
             for g, slr in enumerate(r3['slrs'][:len(caps)]):
                 n, c = caps[g]
-                caps[g] = (n, max(0, c - round(kernel.get('lut', 0) * spl * slr['luts'] / tot)))
+                share = (kernel.get('lut', 0) - pin_l) * slr['luts'] / tot + (pin_l if n == pin_n else 0.0)
+                caps[g] = (n, max(0, c - round(share * spl)))
             print(f"foldsim: the kernel beside the simulator ({kernel.get('lut', 0):.0f} LUTs, measured) spread over "
-                  'the SLRs by their LUTs', file=sys.stderr)
+                  'the SLRs by their LUTs' + (f', {pin_l:.0f} of them in {pin_n} (--slr-kernel-slr)' if pin_n else ''),
+                  file=sys.stderr)
         caps_more = None
         if a.slr_sites and rams:
             rj2 = a.slr_region if a.slr_region != 'v80' else rj
@@ -3137,6 +3150,16 @@ def build_parser():
                          "reader takes them K host cycles later and the producer's passes of a kind are kept "
                          'K apart (foldsim-fold-static slr-serialize); auto[:KMAX] (default 8): each class the '
                          'largest K <= KMAX with K x instances <= the ungrouped modulo lower bound')
+    ap.add_argument('--mem-endpoint-slr', default='', metavar='SLR',
+                    help='with --slr-groups and --slr-region: the folded memory endpoint (the kernel\'s mem_fold_ep and '
+                         'its PC demux mem_pcdemux) pinned in this SLR, beside the target model, on that SLR\'s own HBM '
+                         'ports: no target-memory path crosses an SLR (FOLDSIM_MEM_ENDPOINT_SLR in foldsim_sim.vh: the '
+                         'flow binds the endpoint\'s 4 masters to MEM_<SLR>_0..3 through the PC demux); the fit model '
+                         'counts the kernel but its host control there (as --slr-kernel-slr)')
+    ap.add_argument('--slr-kernel-slr', default='', metavar='SLR[:LUTS]',
+                    help='with --slr-groups, --slr-region and --slr-sites: LUTS of the measured kernel (default all) '
+                         'in that SLR (e.g. the folded memory endpoint beside the target memory ports of SLR1), the '
+                         'rest spread over the SLRs by their LUTs')
     ap.add_argument('--slr-assign', default='',
                     help='with --slr-groups: <class>:<group>,...: classes pinned to a group '
                          '(copy j > 0 of a class is <class>_copy<j>)')
@@ -3711,6 +3734,12 @@ def main():
         write_s28_regions(info['s28'], out('foldsim_floorplan.tcl'))
         print(f'foldsim: vmem s28: {len(info["s28"]["regions"])} region controllers pinned to their groups\' SLRs '
               f'in foldsim_floorplan.tcl', file=sys.stderr)
+    if a.slr_groups and getattr(a, 'mem_endpoint_slr', '') and os.path.exists(out('foldsim_floorplan.tcl')):
+        with open(out('foldsim_floorplan.tcl'), 'a') as f:
+            f.write(f'# The folded memory endpoint and its PC demux beside the target model (--mem-endpoint-slr).\n')
+            for cell in ('mem_fold_ep', 'mem_pcdemux'):
+                f.write(f'set c [get_cells -quiet -hierarchical {cell}]\n'
+                        f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT {a.mem_endpoint_slr} $c }}\n')
     if a.slr_groups and a.vmem_engines in ('local', 'auto'):
         noc = json.load(open(region)).get('noc', {}) if region else {}
         placed = write_vmem_engines(open(out('foldsim_sim.sv')).read(), info, out('foldsim_floorplan.tcl'),
@@ -3760,6 +3789,8 @@ def main():
                 f.write(f'`define FOLDSIM_VPORT{p_}_SLR {g}\n')
             if info.get('vport_slr') and info.get('vmem_slr_names') and not info['vmem']:
                 f.write(f'`define FOLDSIM_VMEM_SLR_NAMES "{" ".join(info["vmem_slr_names"])}"\n')
+        if getattr(a, 'mem_endpoint_slr', ''):
+            f.write(f'`define FOLDSIM_MEM_ENDPOINT_SLR "{a.mem_endpoint_slr}"\n')
         if info.get('s28'):
             write_s28_vh(f, info['s28'])
         elif info['vmem']:

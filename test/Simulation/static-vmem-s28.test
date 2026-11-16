@@ -92,6 +92,16 @@
 # FP-NEXT: USER_SLR_ASSIGNMENT fs_slr0
 # FP-NEXT: -hierarchical s28_region_1]
 # FP-NEXT: USER_SLR_ASSIGNMENT fs_slr1
+# --mem-endpoint-slr: the folded memory endpoint and its PC demux pinned beside the target (the kernel's mem_fold_ep,
+# mem_pcdemux), FOLDSIM_MEM_ENDPOINT_SLR for the flow's binding (its 4 masters on that SLR's ports).
+# RUN: cd %S/../Driver/Inputs/vmem && foldsim --srcs top.f --top Top --out %t/ep --static --virtual-memories ram --vmem-controller s28 --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --mem-endpoint-slr SLR1 Leaf > %t/ep.log 2>&1
+# RUN: FileCheck %s --check-prefix=EPVH < %t/ep/foldsim_sim.vh
+# EPVH: `define FOLDSIM_MEM_ENDPOINT_SLR "SLR1"
+# RUN: FileCheck %s --check-prefix=EPFP < %t/ep/foldsim_floorplan.tcl
+# EPFP: -hierarchical mem_fold_ep]
+# EPFP-NEXT: USER_SLR_ASSIGNMENT SLR1
+# EPFP: -hierarchical mem_pcdemux]
+# EPFP-NEXT: USER_SLR_ASSIGNMENT SLR1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb '-DS28_BUSES=`S28_BUS(0, 0) `S28_BUS(1, 0)' -I%S/../../shell/rtl -Mdir %t/two/obj %S/Inputs/tb_s28.sv top.sv %t/two/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/two/build.log 2>&1
 # RUN: %t/two/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
 # RUN: %t/two/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +mstall=30 | FileCheck %s

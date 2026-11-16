@@ -54,3 +54,19 @@
 # RUN: sed -e "s/R0_LIN_BASE 64'h0/R0_LIN_BASE 64'h188000/" -e "s/R2_LIN_BASE 64'h88000/R2_LIN_BASE 64'h0/" %S/Inputs/s28-pcmap/sim.vh > %t/swap.vh
 # RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %t/swap.vh --mem-ports 4 --spread-target-pcs 4 | FileCheck %s --check-prefix=SWAP
 # SWAP: `define FOLDSIM_VMEM_PCBYTES
+# The folded memory endpoint in SLR1 (foldsim --mem-endpoint-slr SLR1): its 4 masters through the kernel's PC demux
+# (master k the target's PC k) on MEM_SLR1_0..3, the S28 masters after them.
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/s28-pcmap/endpoint.vh --mem-ports 16 --port-masters | FileCheck %s --check-prefix=EPM
+# EPM: {{^}}4{{$}}
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/s28-pcmap/endpoint.vh --mem-ports 16 --spread-target-pcs 4 | FileCheck %s --check-prefix=EP
+# EP: `define FOLDSIM_MEM_PC_DEMUX 4
+# EP-NEXT: `define FOLDSIM_VMEM_MASTERS 16
+# EP-NEXT: `define FOLDSIM_S28_MASTER_REPEAT(f,s) `f(4, 0, 0)
+# RUN: python3 -c "print('[connectivity]'); [print(f'sp=foldsim_afu_0.m_axi_mem_{i}:MEM') for i in range(20)]" > %t/ep.cfg
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/s28-pcmap/endpoint.vh --mem-ports 16 --spread-target-pcs 4 --sp-cfg %t/ep.cfg
+# RUN: FileCheck %s --check-prefix=EPSP < %t/ep.cfg
+# EPSP: sp=foldsim_afu_0.m_axi_mem_0:MEM_SLR1_0
+# EPSP-NEXT: sp=foldsim_afu_0.m_axi_mem_1:MEM_SLR1_1
+# EPSP-NEXT: sp=foldsim_afu_0.m_axi_mem_2:MEM_SLR1_2
+# EPSP-NEXT: sp=foldsim_afu_0.m_axi_mem_3:MEM_SLR1_3
+# EPSP-NEXT: sp=foldsim_afu_0.m_axi_mem_4:MEM

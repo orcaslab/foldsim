@@ -112,11 +112,21 @@ def vmem_count(sim_vh):
     return int(m.group(1)) if m else 0
 
 
+def endpoint_slr(sim_vh):
+    """foldsim --mem-endpoint-slr: the SLR (SLR0 / SLR1) the folded memory endpoint sits in, else None."""
+    m = re.search(r'^`define FOLDSIM_MEM_ENDPOINT_SLR "(SLR[01])"', open(sim_vh).read(), re.M)
+    return m.group(1) if m else None
+
+
 def port_masters(sim_vh, mem_ports):
     """The memory ports' device-memory masters: one where the simulator's
-    ports are folded (FOLDSIM_PORTS), else one per port."""
+    ports are folded (FOLDSIM_PORTS), else one per port; with the endpoint in
+    an SLR of its own ports (foldsim --mem-endpoint-slr), 4 through its PC
+    demux (master k: the target's PC k, on MEM_<SLR>_k)."""
     with open(sim_vh) as f:
         folded = re.search(r'^`define FOLDSIM_PORTS \d+\s*$', f.read(), re.M)
+    if folded and endpoint_slr(sim_vh):
+        return 4
     return 1 if folded else mem_ports
 
 
@@ -290,7 +300,10 @@ def main():
                     help='S28: the masters of a region on MEM (SLR2; default 8)')
     a = ap.parse_args()
     if s28_regions(a.sim_vh) is not None:
-        return s28_main(a, port_masters(a.sim_vh, a.mem_ports) if 'port_masters' in globals() else None)
+        if a.port_masters:
+            print(port_masters(a.sim_vh, a.mem_ports))
+            return
+        return s28_main(a, port_masters(a.sim_vh, a.mem_ports))
     groups = vmem_groups(a.sim_vh)
     nm = len(groups) if groups is not None else vmem_count(a.sim_vh)
     nv = 0 if a.direct_vports else vport_count(a.sim_vh)
@@ -571,7 +584,8 @@ def s28_binding(a, first):
 
 
 def s28_main(a, first=None):
-    regions, masters = s28_binding(a, a.mem_ports if first is None else first)
+    first = a.mem_ports if first is None else first
+    regions, masters = s28_binding(a, first)
     if a.masters:
         print(masters)
         return
@@ -579,6 +593,10 @@ def s28_main(a, first=None):
         # The S28 masters' sp lines right after the memory ports' (m_axi_mem_0 first), in master order, each its tag.
         lines = open(a.sp_cfg).read().split('\n')
         tag = {b['mport'] + m: t for b in regions for m, t in enumerate(b['tags'])}
+        ep = endpoint_slr(a.sim_vh)
+        if ep and first == 4:
+            # (The folded endpoint's 4 masters through its PC demux: master k reaches the target's PC k on MEM_<SLR>_k.)
+            tag.update({k: f'MEM_{ep}_{k}' for k in range(4)})
         rx = re.compile(r'^sp=(\S+)\.m_axi_mem_(\d+):(\S+)$')
         sp = [(i, rx.match(l)) for i, l in enumerate(lines)]
         sp = [(i, mm) for i, mm in sp if mm]
@@ -594,6 +612,8 @@ def s28_main(a, first=None):
         return
     # (The emulator serves the kernel's masters up to FOLDSIM_MEM_MASTERS + FOLDSIM_VMEM_MASTERS: the regions' all.
     # Alone on its line: the flow reads it back verbatim.)
+    if endpoint_slr(a.sim_vh) and first == 4:
+        print('`define FOLDSIM_MEM_PC_DEMUX 4')
     print(f'`define FOLDSIM_VMEM_MASTERS {sum(b["nm"] for b in regions)}')
     print('`define FOLDSIM_S28_MASTER_REPEAT(f,s) ' + ' `s '.join(
         f'`f({b["mport"] + m}, {b["r"]}, {m})' for b in regions for m in range(b['nm'])))
