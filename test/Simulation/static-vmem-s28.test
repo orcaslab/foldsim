@@ -57,6 +57,9 @@
 # VH-NEXT: `define FOLDSIM_S28_R0_E_OFF '{64'h0}
 # VH: `define FOLDSIM_S28_R0_BYTES 64'h1000
 # VH-NOT: FOLDSIM_VMEM_COUNT
+# Without SLR groups the region controller sits with the level: no path crosses.
+# RUN: FileCheck %s --check-prefix=SLL1 < %t/one/sll/sll.txt
+# SLL1: memory paths (S28): 3, 0 crossing an SLR boundary (0 bits)
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION --top-module tb -I%S/../../shell/rtl -Mdir %t/one/obj %S/Inputs/tb_s28.sv top.sv %t/one/foldsim_sim.sv %S/../../shell/rtl/foldsim_vmem_adapter.sv %S/../../shell/rtl/foldsim_vmem_lsw.sv %S/../../shell/rtl/foldsim_vmem_csw.sv > %t/one/build.log 2>&1
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 | FileCheck %s
 # RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=60 +mstall=30 | FileCheck %s

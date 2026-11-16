@@ -705,11 +705,13 @@ def s28_memory_paths(gdir, fpath, names=None):
     pins = dict(re.findall(r'-hierarchical (\w+)\]\s*\n[^\n]*USER_SLR_ASSIGNMENT (\S+) \$c',
                            open(fpath).read())) if fpath and os.path.exists(fpath) else {}
     # Each module's place: the group of the foldsim_slr<g> instance above it (the level: None).
-    place, todo = {'foldsim_sim': None}, ['foldsim_sim']
+    place, todo, grouped = {'foldsim_sim': None}, ['foldsim_sim'], set()
     while todo:
         m = todo.pop()
         for c, inst in children.get(m, []):
             g = re.fullmatch(r'foldsim_slr(\d+)', inst)
+            if g:
+                grouped.add(int(g.group(1)))
             where = (pins.get(inst) or f'fs_slr{g.group(1)}') if g else place[m]
             if c not in place:
                 place[c] = where
@@ -730,7 +732,8 @@ def s28_memory_paths(gdir, fpath, names=None):
     out = []
     for r in s28['regions']:
         g = r['group']
-        rplace = pins.get(f's28_region_{g}') or f'fs_slr{g}'
+        # (Unpinned: its group's place, or beside the level without SLR groups.)
+        rplace = pins.get(f's28_region_{g}') or (f'fs_slr{g}' if g in grouped else level)
         by_cls = {}
         for e in r['entries']:
             v = vm[e['vm']]
