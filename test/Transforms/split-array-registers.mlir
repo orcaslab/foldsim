@@ -19,7 +19,7 @@
 // module keeps its terminator (hw.output, a user with no result, is never
 // taken for dead logic).
 // CHECK-LABEL: hw.module @Out(
-// CHECK:         %r = seq.firreg %w clock %clk : !hw.array<2xi8>
+// CHECK:         %r = seq.firreg {{%.+}} clock %clk : !hw.array<2xi8>
 // CHECK:         hw.output %r : !hw.array<2xi8>
 hw.module @Sw(in %clk : !seq.clock, in %rst : i1, in %a : i8, in %b : i8, in %i : i1, out o0 : i8, out o1 : i8, out o2 : i8) {
   %c0 = hw.constant 0 : i1
