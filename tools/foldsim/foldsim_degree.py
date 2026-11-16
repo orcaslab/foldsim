@@ -383,6 +383,12 @@ STATE_CAL = None
 # Such a store is priced in its kind and never moved; the choice emits no
 # rule for it (the given one stays the only one).
 GIVEN = None
+# --state-home hybrid (the S26 hybrid): records on chip, rows in HBM, by rule.
+# HYBRID_ROW_BITS: a memory of at least these bits an instance (and that a
+# virtual memory can hold: a registered read) leaves the chip, its rows read
+# on demand; every register store, page and smaller memory stays on chip.
+# None: off.
+HYBRID_ROW_BITS = None
 
 
 # The frame the policy prices (area()'s `ii`): STATE_CAL's logic factors grow with it (frame_factor). The
@@ -483,6 +489,13 @@ def given_rules(text):
     return out
 
 
+def given_kind(u):
+    """The kind GIVEN names for a memory unit (None: no rule, a link, pages or registers)."""
+    if not GIVEN or u.get('link') or u['store'] == 'pages' or u['store'].startswith('regs'):
+        return None
+    return GIVEN['mem'].get((re.sub(r'_copy\d+$', '', u['class']), u['store']))
+
+
 def fix_given(units):
     """The units GIVEN names: fixed at the given kind (a register store by
     width: the largest bound at most its width, as the compiler takes it)."""
@@ -502,6 +515,44 @@ def fix_given(units):
         if kind is not None:
             u['fixed'] = kind
             u['given'] = True
+
+
+def on_chip_share(c):
+    """A kind's cost (kind_cost / vmem_cost) as its share of the region on
+    chip: block and ultra RAM over the region's, LUTs and LUTRAM over its
+    LUT sites (a LUTRAM LUT LUTRAM_SITES of them)."""
+    reg = storage.REGION
+    return (c.get('bram', 0.0) / reg['bram'] + c.get('uram', 0.0) / reg['uram'] +
+            (c.get('lut', 0.0) + storage.LUTRAM_SITES * c.get('lutram', 0.0)) / reg['sites'])
+
+
+def hybrid_units(units):
+    """HYBRID_ROW_BITS: each unit's home by the hybrid's rule (the S26
+    hybrid: R26's engine keeps flip-flop records and RAMs below a few kbit in
+    the record, on chip, and fetches larger RAMs' rows from HBM): a memory of
+    at least HYBRID_ROW_BITS an instance that HBM can hold is fixed there
+    unless its controller costs more of the chip than the memory itself in its
+    cheapest kind (on_chip_share: a FIFO every slot reads, say); any other
+    store loses the HBM kind, the policy choosing its kind on chip (the
+    records themselves, packed per instance in RAM rows, are --state-in-ram's:
+    a register store priced alone in ultra RAM would take a 72-bit column a
+    register). Given rules (--storage) and units the compiler cannot name stay
+    as they are."""
+    if HYBRID_ROW_BITS is None:
+        return
+    for u in units:
+        if u.get('link') or u.get('given') or u.get('fixed') is not None and u.get('fixed') != 'hbm':
+            continue
+        big = u.get('bits') is not None and u['bits'] >= HYBRID_ROW_BITS
+        if big and 'hbm' in u['costs'] and on_chip_share(u['costs']['hbm']) < min(
+                (on_chip_share(c) for k, c in u['costs'].items() if k != 'hbm' and c is not None),
+                default=float('inf')):
+            u['fixed'] = 'hbm'
+            continue
+        u['costs'].pop('hbm', None)
+        u.get('per', {}).pop('hbm', None)
+        if u.get('fixed') == 'hbm':
+            u['fixed'] = None
 
 
 def state_units(units, lev=1.0):
@@ -578,6 +629,9 @@ def copy_cap_pools(units, caps, base, copy_logic=None, region_luts=0.0):
                     c['lut@region'] = c.get('lut', 0.0) + c.get('lutram', 0.0)
 
 
+VPORT_DROPIN_SCALE = 192.9 / 269.8
+
+
 def read_built(path):
     """BUILT from a foldsim_sim.json (and its foldsim_sim.vh /
     foldsim_kernel.vh): dict(controllers=[...], logic, lutram, bram, forward,
@@ -595,6 +649,11 @@ def read_built(path):
     m = re.search(r'FOLDSIM_MEM_MASTERS (\d+)', vh) or re.search(r'FOLDSIM_MEM_PORTS (\d+)', vh)
     ports = int(m.group(1)) if m else None
     ctls = j.get('vmem_groups') or j.get('vmem') or []
+    # The drop-in static port (--vmem-controller vport, FOLDSIM_VMEM_VPORT: foldsim_vport_ctl in each controller's
+    # place, in order, one AXI id, counter fences, no host cache or write buffer): its controllers at
+    # VPORT_DROPIN_SCALE of the dynamic controller's logic and LUTRAM (a32-VA 11-11, yosys of all 86 controllers of
+    # y64d1/y128d1 with row-bucket fences and known-zero answers: 269.8k -> 192.9k LUT), no host-cache RAM.
+    dropin = 'FOLDSIM_VMEM_VPORT' in vh
     save = storage.CTL_FORWARD
     storage.CTL_FORWARD = forward
     out = dict(controllers=[], logic=0.0, lutram=0.0, bram=0.0, forward=forward, mem_ports=ports,
@@ -605,8 +664,10 @@ def read_built(path):
         kz = 0
         if c.get('known_zero'):
             kz = -(-((1 << c['row_width']) * c['instances']) // (1 << c.get('kz_shift', 0)))
-        x = storage.ctl_cost(kind, c['data_width'], c.get('cache_rows', 0) or 0, c.get('size', 1) or 1,
-                             kz=kz)
+        x = storage.ctl_cost(kind, c['data_width'], 0 if dropin else (c.get('cache_rows', 0) or 0),
+                             c.get('size', 1) or 1, kz=kz)
+        if dropin:
+            x = dict(x, logic=x['logic'] * VPORT_DROPIN_SCALE, lutram=x['lutram'] * VPORT_DROPIN_SCALE)
         out['controllers'].append(dict(kind=kind, dw=c['data_width'], cache_rows=c.get('cache_rows', 0), **x))
         out['counts'][kind] = out['counts'].get(kind, 0) + 1
         for key in ('logic', 'lutram', 'bram'):
@@ -771,15 +832,29 @@ def area(cal, est, classes, degree, rest, sched=None, ii=0, entries=2, store='fi
                            slrs, cache, tiers)
         if tiers is not None and res.get('vmem_new') and vmem:
             # The host caches of the memories it moved off chip: priced again
-            # with them in the base (their lines are block RAM).
-            more = vmem_bram(split_virtual(est, tiers_pattern(res['vmem_new'])), classes,
-                             degree, vmem, vg, rbm)
-            if more > cache:
-                cache = more
+            # with them in the base (their lines are block RAM). The caches are
+            # a speed-up, not state: where they make the choice miss the region
+            # or the router (32 SMs, a32-S26X 11-14: 120 RAMB36 of caches turned
+            # the one choice that routes into one that does not, so every frame
+            # was refused), their budget halves, down to none -- the choice
+            # without caches, which the first pricing already found.
+            first, budget = res, vmem[1]
+            vms = split_virtual(est, tiers_pattern(res['vmem_new']))
+            while True:
+                more = vmem_bram(vms, classes, degree, (vmem[0], budget), vg, rbm)
+                if more <= cache:
+                    res = first
+                    break
                 res = storage_area(cal, est, classes, degree, rest, sched, ii, entries, route,
-                                   uram, slrs, cache, dict(tiers, force=res['vmem_new'],
-                                                           force_pages=res['pages_offchip'],
-                                                           force_rows=res['rows_new']))
+                                   uram, slrs, more, dict(tiers, force=first['vmem_new'],
+                                                          force_pages=first['pages_offchip'],
+                                                          force_rows=first['rows_new']))
+                if res.get('fits') and (not route or storage.fold_congestion(
+                        res['luts'], res['bram'], res.get('uram', 0), slrs) <= storage.ROUTE_LIMIT):
+                    cache = more
+                    break
+                budget = budget // 2 if budget > 1 else 0
+            res['vmem_cache_budget'] = budget
     else:
         res = fixed_area(cal, est, classes, degree, rest, sched, ii, entries, cache)
     if cache:
@@ -808,7 +883,8 @@ def paged_state(est):
     bits, luts, rest = est['ff'], 0.0, []
     for m in est['mems']:
         (_, d, w, r, _, rl, *_) = m
-        if rl <= 1 and d * w <= PAGE_MEMORY_BITS:
+        if rl <= 1 and d * w <= PAGE_MEMORY_BITS and \
+                not (HYBRID_ROW_BITS is not None and d * w >= HYBRID_ROW_BITS):
             bits += d * w + (w * r if rl == 1 else 0)
             luts += max(r, 1) * w * math.ceil((d - 1) / 3) if d > 1 else 0
         else:
@@ -1178,7 +1254,8 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             per = []
             for j, t, f, gap in forms:
                 # A paged copy's small memories are rows of its pages.
-                if f == 'paged' and rl <= 1 and d * w <= PAGE_MEMORY_BITS:
+                if f == 'paged' and rl <= 1 and d * w <= PAGE_MEMORY_BITS and \
+                        not (HYBRID_ROW_BITS is not None and d * w >= HYBRID_ROW_BITS):
                     continue
                 th = 1 << (t - 1).bit_length() if t > 1 else 1
                 per.append((j, dict(depth=d * th, width=w, rports=r, wports=wr, rlat=rl,
@@ -1193,6 +1270,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             nameable = named and not re.search(r'[,=:{}\s]', name)
             u = unit(c, name, per, lam, None if nameable else default)
             u['default'] = default
+            u['bits'] = d * w
             if tiers is not None and not tiers.get('as_built') and nameable and \
                     len(per) == len(forms) and all(
                     not storage.vmem_eligible((name, d, w, r, wr, rl, st, mask, named), gap)
@@ -1264,10 +1342,12 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
             u['costs'].pop('ultra', None)
     if KERNEL['on'] and not KERNEL['uram_memories']:
         # Memories (not pages, not links) in ultra RAM: Vivado inferred block
-        # RAM for most of them; priced as it builds them.
+        # RAM for most of them; priced as it builds them. A memory a --storage
+        # rule puts in ultra RAM (GIVEN, fixed below by fix_given) keeps the
+        # kind: the compiler states ram_style ultra and Vivado builds it so.
         for u in units:
             if (not u.get('link') and u['store'] != 'pages' and len(u['costs']) > 1 and
-                    u.get('fixed') != 'ultra'):
+                    u.get('fixed') != 'ultra' and given_kind(u) != 'ultra'):
                 u['costs'].pop('ultra', None)
                 u['per'].pop('ultra', None)
     caps = storage.capacities()
@@ -1304,6 +1384,10 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
                           storage.HBM_BYTES_PER_CYCLE - tiers.get('base_hbm', 0.0) - built_hbm)
         caps['bubbles'] = max(0.0, storage.BUBBLE_SHARE * tiers['frame'] -
                               tiers.get('base_bubbles', 0.0))
+        if HYBRID_ROW_BITS is not None:
+            # The hybrid's rows leave the chip by rule: their traffic and the
+            # bubbles of their round trips are its H (projected), not a limit.
+            caps['hbm'] = caps['bubbles'] = 1e15
         for u in units:
             if u['store'] == 'pages' and u['class'] in tiers.get('force_pages', ()):
                 u['fixed'] = 'hbm'
@@ -1336,6 +1420,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     calibrate_units(units)
     state_units(units, lev)
     fix_given(units)
+    hybrid_units(units)
     if KERNEL['calibration']:
         # The links' LUTRAM in the base (those no tier chooses) too.
         lk = dict(lk, lutram=lk['lutram'] * KERNEL['calibration']['link_lutram'])
@@ -2518,7 +2603,9 @@ def page_pick(est, classes, frame, kinds=('block', 'ultra'), sched=None):
             continue
         top = min(max(1, int(PAGE_PORT_SHARE * frame) // n), frame - 4)
         info = (sched or {}).get(c)
-        if info and info.get('state'):
+        if info and info.get('state') and HYBRID_ROW_BITS is None:
+            # (The hybrid streams its records: a frame of P passes an
+            # instance is its H, not a stretched arc to avoid.)
             top = min(top, max(1, state_span(info['state'], frame) // n))
         if top < 1:
             return None

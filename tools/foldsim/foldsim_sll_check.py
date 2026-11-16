@@ -190,6 +190,10 @@ def netlist_resources(sim, copies, region, synthesis=None):
     # The simulator's level: @foldsim_sim and the SLR group modules under it.
     level = [m for m in ['foldsim_sim'] + [ch for ch, _ in mods['foldsim_sim'].insts
                                             if ch in mods and ch not in statics]] if 'foldsim_sim' in mods else []
+    # (--physical-domains: the domain modules, foldsim_sim_dom_<class>, nested in the level and the SLR groups' modules,
+    # are the level's too: their links charged to their readers, their controls the level's rest, as without them.)
+    for lv in level:
+        level += [ch for ch, _ in mods[lv].insts if ch.startswith('foldsim_sim_dom_') and ch in mods and ch not in level]
     names = sorted(copies, key=len, reverse=True)
 
     def owner(n):
@@ -209,6 +213,8 @@ def netlist_resources(sim, copies, region, synthesis=None):
         m = mods[lv]
         rest['lut'] += float(os.environ.get('FOLDSIM_COST_LEVEL_SCALE', foldsim_cost.LEVEL_LOGIC_SYNTH)) * \
             sum(v for k, v in m.lut.items() if k != 'array_get') + reads.get(lv, (0.0, {}))[0]
+        # (foldsim-table-roms' block ROMs: their RAMB36.)
+        rest['bram'] += reads.get(lv, (0.0, {}))[1].get('rom_bram', 0.0)
         for rec in m.mems:
             o = owner(rec[0])
             add_memory(link[o] if o else rest, rec)
@@ -763,6 +769,28 @@ def slr_masters(weights, total):
     return out
 
 
+def tall_uram_chains(sim, limit):
+    """The netlist's ultra RAMs whose cascade_height is past `limit`: [(name, height)]."""
+    out = []
+    if not sim or not os.path.exists(sim):
+        return out
+    for line in open(sim):
+        m = re.search(r'#sv\.attribute<"cascade_height" = "(\d+)">', line)
+        if m and int(m.group(1)) > limit:
+            n = re.search(r'%([\w.$-]+) = seq\.firmem', line)
+            out.append((n.group(1) if n else '?', int(m.group(1))))
+    return out
+
+
+def master_ports(noc):
+    """The NoC ports a device-memory master of the kernel can be bound to: those reaching HBM, and of them, when
+    the region's noc section names `masters_to` (linker tags), only those tags' (the asl9 shell's per-SLR ports reach
+    a quarter of the HBM pseudo-channels each, which the kernel's memory map cannot use yet: its masters bind to MEM
+    in SLR2, a32-S26X G 11-14)."""
+    tags = noc.get('masters_to')
+    return [p for p in noc.get('ports', []) if 'HBM' in p.get('targets', ()) and (not tags or p.get('tag') in tags)]
+
+
 def vmem_slls(ctrls, shares, top_spread, names, noc, mode, masters=0, pinned=None):
     """Each boundary's SLLs of the virtual-memory wiring with the controllers
     placed by `mode` (--vmem-engines), and each controller's placement.
@@ -783,7 +811,7 @@ def vmem_slls(ctrls, shares, top_spread, names, noc, mode, masters=0, pinned=Non
     per boundary], [{name, cls, slr, slls}])."""
     n = len(names)
     at = {nm: i for i, nm in enumerate(names)}
-    hbm = sorted({at[p['slr']] for p in noc.get('ports', []) if 'HBM' in p.get('targets', ()) and p.get('slr') in at})
+    hbm = sorted({at[p['slr']] for p in master_ports(noc) if p.get('slr') in at})
     if not hbm:
         raise SystemExit('foldsim_sll_check.py: the region\'s noc section names no NMU reaching HBM')
     near = lambda i: min(hbm, key=lambda j: (abs(i - j), j))
@@ -833,7 +861,7 @@ def vmem_slls(ctrls, shares, top_spread, names, noc, mode, masters=0, pinned=Non
         rows.append(dict(name=c['name'], cls=c['cls'], slr=names[g], slls=x))
     if mode == 'slr':
         weights = [sum(r['port_bits'] for r in rows if r['slr'] == nm) for nm in names]
-        total = masters or sum(1 for p in noc.get('ports', []) if 'HBM' in p.get('targets', ()))
+        total = masters or len(master_ports(noc))
         ms = slr_masters(weights, total)
         if not masters and pinned and pinned['masters'] and all(w in at for w in pinned['masters']):
             ms = [sum(1 for w in pinned['masters'] if w == nm) for nm in names]
@@ -1402,7 +1430,16 @@ def main():
     if mode != 'netlist':
         finish(lines, 'ESTIMATE (schedule resources, not a verdict): '
                       + ('an assignment within the SLRs' if groups is not None else 'no assignment'))
-    if over and not guide:
+    # Primitive shapes, not only totals: an ultra RAM's cascade is one vertical run of a URAM column's sites, and the
+    # placer finds none for a chain past the region's run (16 SMs, 11-14: a chain of 32 in SLR0 at 50 % of its URAM).
+    tall = tall_uram_chains(sim, region.get('uram_cascade_max', 8)) if mode == 'netlist' else []
+    if tall:
+        lines.append(f'  URAM cascades past the region\'s {region.get("uram_cascade_max", 8)}: ' +
+                     ', '.join(f'{n} ({h})' for n, h in tall[:6]) + (' ...' if len(tall) > 6 else ''))
+    if tall:
+        verdict = (f'REFUSE: {len(tall)} ultra RAM cascades past the region\'s {region.get("uram_cascade_max", 8)} '
+                   'URAM288 (no legal place in a URAM column: rebuild with foldsim-fold-static uram-cascade-max)')
+    elif over and not guide:
         verdict = 'REFUSE: ' + '; '.join(f'{c} fits no SLR whole (the nearest, {s}: over its {"/".join(r)})'
                                          for c, s, r in over) + \
             ' (a copy past its SLR is cut by the placer, its SLLs unknown: r16c failed so)'

@@ -32,6 +32,7 @@ import argparse
 import collections
 import fnmatch
 import json
+import math
 import os
 import re
 import shlex
@@ -591,8 +592,14 @@ def frame_options(a):
         fold += f' slr-group-own={a.slr_group_own}'
     if getattr(a, 'slr_group_home', False):
         fold += ' slr-group-home'
+    if getattr(a, 'slr_group_cut', False):
+        fold += ' slr-group-cut'
     if getattr(a, 'slr_group_env', False):
         fold += ' slr-group-env'
+    if getattr(a, 'physical_domains', False):
+        fold += ' physical-domains'
+    if getattr(a, 'slr_adjacent', False):
+        fold += ' slr-adjacent'
     if getattr(a, 'registered_links', ''):
         fold += f' registered-links={a.registered_links}'
     if getattr(a, 'split_latency', ''):
@@ -926,6 +933,33 @@ def state_policy(a, out):
     cap = foldsim_degree.state_policy(calp, budget, region, rf, ram)
     if a.state_home == 'onchip':
         foldsim_degree.storage.ONCHIP_ONLY = True
+    if a.state_home == 'hybrid':
+        foldsim_degree.HYBRID_ROW_BITS = a.hybrid_row_bits
+    # The HBM the card measured: --hbm-calibration, else the one the region
+    # names (its `hbm_calibration`, a file of calibrations/: the asl9 shell's
+    # region names its card run). Only a region without a measurement keeps
+    # the policy's assumed 640 B a host cycle and 64-cycle round trip -- about
+    # 3x the measured every-SLR-busy rate (a32-S26X-C3 11-15: the planner
+    # priced HBM traffic at 128 GB/s against 42.9 measured), and says so.
+    hcal = a.hbm_calibration
+    if not hcal and region not in ('', 'v80') and os.path.isfile(region):
+        named = json.load(open(region)).get('hbm_calibration')
+        if named:
+            hcal = named if os.path.isabs(named) else os.path.join(os.path.dirname(os.path.abspath(__file__)), 'calibrations', named)
+    if not hcal and a.state_home == 'hybrid':
+        print('foldsim: state auto: no measured HBM (--hbm-calibration, or a region that names one): the policy '
+              f'assumes {foldsim_degree.storage.HBM_BYTES_PER_CYCLE} B a host cycle', file=sys.stderr)
+    if hcal:
+        # The HBM the card measured (calibrations/hbm-*.json): the policy's
+        # rate (every SLR's ports at once, `busy`, or `alone`) in bytes a host
+        # cycle, and its round trip (the loaded latency when busy) in cycles.
+        hc = json.load(open(hcal))
+        clk = hc.get('clock_hz', 200e6)
+        mode = a.hbm_mode
+        rate = sum(x[mode]['read_gbs'] for x in hc['slrs'].values()) * 1e9 / clk
+        lat = max(x['loaded_latency_ns' if mode == 'busy' else 'latency_ns'] for x in hc['slrs'].values())
+        foldsim_degree.storage.HBM_BYTES_PER_CYCLE = round(rate, 1)
+        foldsim_degree.storage.HBM_ROUND_TRIP = math.ceil(lat * 1e-9 * clk)
     if a.state_measured:
         try:
             rj = json.load(open(a.slr_region if a.slr_region not in ('', 'v80') else
@@ -1037,8 +1071,14 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
         if over:
             # The copies whose own logic leaves no room in their budget, with
             # every store moved.
-            over = [f"{c} ({last['copies'].get(c, {}).get('total', 0):.0f} LUTs at the schedule's frame)"
-                    if c in last['copies'] else c for c in over]
+            # (each with the resources past its cap: lut, uram, bram...)
+            res_of = {}
+            for p in last.get('over', []):
+                if '#' in p:
+                    res_of.setdefault(p.partition('@')[2], []).append(p.partition('@')[0])
+            over = [f"{c} ({'/'.join(res_of.get(c, []))} past its cap; {last['copies'].get(c, {}).get('total', 0):.0f} LUTs, "
+                    f"{last['copies'].get(c, {}).get('uram', 0)} URAM, {last['copies'].get(c, {}).get('bram', 0)} RAMB36 "
+                    f"at the schedule's frame)" if c in last['copies'] else c for c in over]
         sys.exit(f'--state auto: nothing fits the V80 region (II {ii})'
                  + (f" with the links' {links['lutram']:.0f} LUTRAM LUTs, {links['bram']} RAMB36, "
                     f"{links['uram']} URAM288" if links else '') + f' ({policy})'
@@ -1062,6 +1102,14 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
     if over:
         sys.exit(f'--state auto: copies past the per-copy budget ({policy}): {", ".join(over)}; '
                  f'see {out("state.txt")}')
+    # The virtual memories' host caches at the budget the choice was priced
+    # with (it halves the caches where they would make the choice miss).
+    used = res['res'].get('vmem_cache_budget')
+    if used is not None and vmem and used != a.vmem_cache_budget:
+        print(f'foldsim: state auto: the virtual memories\' host caches within {used} RAMB36 '
+              f'(of --vmem-cache-budget {a.vmem_cache_budget}): more would miss the region or the router',
+              file=sys.stderr)
+        a.vmem_cache_budget = used
     h = res['h']
     print(f"foldsim: state auto: frame {res['frame']} (II {ii}), H at most {h['h']}; page "
           f"{len(res['page'].split(',')) if res['page'] else 0} models, {len(res['rows_new'])} "
@@ -1096,6 +1144,51 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
             fold = (fold.replace(m.group(0), f" storage={m.group(1)},{rules}") if m
                     else fold + f" storage={rules}")
     return fold
+
+
+def domain_merge(a, foldsim_opt, flat, passes, fold, out):
+    """--domain-merge-lut N (with --physical-domains): the fold-static
+    domain-merge option, the classes whose copy is priced below N LUTs, each
+    with its price. The price is the per-copy LUT price of --state auto
+    (state.json `total`: logic, store LUTs and LUTRAM, as synthesized),
+    else the calibrated LUT sites of copy_sites on a schedule without the
+    merge. A class's largest copy decides."""
+    import foldsim_degree
+    price = {}
+    sj = out('state.json')
+    if a.state == 'auto' and os.path.exists(sj):
+        for key, v in json.load(open(sj)).get('copies', {}).items():
+            c = key.rpartition('#')[0] or key
+            price[c] = max(price.get(c, 0), round(v['total']))
+        src = 'the --state auto copy prices (state.json)'
+    else:
+        models = out('models.mlir')
+        if not os.path.exists(models):
+            run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
+                 '-o', models])
+        base = out('schedule_domain_merge.txt')
+        plain = fold.replace(f' report={out("schedule.txt")}', '')
+        r = subprocess.run([foldsim_opt, models, f'--pass-pipeline=builtin.module('
+                            f'foldsim-fold-static{{{plain} report={base} schedule-only}})',
+                            '-o', os.devnull], capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(r.stderr)
+        text = open(base).read()
+        ii, classes, _ = foldsim_degree.parse_schedule(text)
+        info = foldsim_degree.parse_classes(text)
+        path = a.degree_calibration or DEGREE_CALIBRATION
+        cal = json.load(open(path)) if path != 'none' and os.path.exists(path) else None
+        entries = a.register_state_entries if a.register_state_entries is not None else 2
+        of = {c: re.sub(r'_copy\d+$', '', c) for c in classes}
+        est = foldsim_degree.class_estimates(models, sorted(set(of.values())))
+        for c, n in classes.items():
+            v = round(foldsim_degree.copy_sites(cal, est[of[c]], of[c], n, entries, info.get(c), ii))
+            price[c] = max(price.get(c, 0), v)
+        src = 'calibrated copy LUT sites (copy_sites)'
+    merged = sorted((c for c, v in price.items() if v < a.domain_merge_lut), key=lambda c: price[c])
+    print(f'foldsim: domain merge below {a.domain_merge_lut} LUTs ({src}): {len(merged)} of {len(price)} classes'
+          + (': ' + ', '.join(f'{c} ({price[c]})' for c in merged) if merged else ''), file=sys.stderr)
+    return f" domain-merge={','.join(f'{c}:{price[c]}' for c in merged)}" if merged else ''
 
 
 def slr_options(a, foldsim_opt, models, fold, out):
@@ -1203,6 +1296,9 @@ def slr_options(a, foldsim_opt, models, fold, out):
                     + ','.join(f'{c}:{s}' for c, s in sites.items()))
         opts += (''
                 + f' slr-sll-budget={slr_region_sll_budget(a.slr_region)}')
+        # (--slr-adjacent: the level's group is a fixed end of the classes' port bits)
+        if getattr(a, 'slr_adjacent', False) and level is not None:
+            opts += f' slr-level-group={level}'
     else:
         capacity = a.slr_capacity or round(foldsim_degree.PLACE_MARGIN *
                                            foldsim_degree.PLACE_SITES / a.slr_count)
@@ -1539,8 +1635,9 @@ def slr_level_group(spec, region, groups):
             os.path.dirname(os.path.abspath(__file__)), 'foldsim_v80_slr.json')
         r = json.load(open(path))
         order = [slr['name'] for slr in r['slrs']]
+        tags = r.get('noc', {}).get('masters_to')
         hbm = collections.Counter(p['slr'] for p in r.get('noc', {}).get('ports', [])
-                                  if 'HBM' in p.get('targets', []))
+                                  if 'HBM' in p.get('targets', []) and (not tags or p.get('tag') in tags))
         if hbm:
             best = max(order, key=lambda n: (hbm.get(n, 0), -order.index(n)))
             if order.index(best) < groups:
@@ -1613,6 +1710,98 @@ def write_slr_groups(sv, path, names=None):
             where = names[int(g[len('foldsim_slr'):])] if names else f'fs_{g[len("foldsim_"):]}'
             f.write(f'set c [get_cells -quiet -hierarchical {g}]\n'
                     f'if {{[llength $c] == 1}} {{ set_property USER_SLR_ASSIGNMENT {where} $c }}\n')
+
+
+def domain_tree(sv):
+    """--physical-domains: the simulator's domain tree from its Verilog: [{'class', 'path' (instance path below
+    foldsim_sim), 'parent' (the enclosing domain's class or None), 'module' (the enclosing module: foldsim_sim or an SLR
+    group's foldsim_sim_slr<g>), 'group' (g or None), 'copies' (the class copies it instantiates)}], parents first."""
+    mods = {}
+    for m in re.finditer(r'^module (\w+)\((.*?)^endmodule', sv, re.M | re.S):
+        mods[m.group(1)] = m.group(2)
+    def insts(name):
+        return re.findall(r'^\s+(\w+) (\w+) \(', mods.get(name, ''), re.M)
+    out = []
+    def walk(module, prefix, parent, top, group):
+        for mt, inst in insts(module):
+            if mt.startswith('foldsim_sim_dom_'):
+                cls = mt[len('foldsim_sim_dom_'):]
+                copies = [i[:-len('_copy')] for t, i in insts(mt) if i.endswith('_copy')]
+                out.append({'class': cls, 'path': prefix + inst, 'parent': parent, 'module': top, 'group': group,
+                            'copies': copies})
+                walk(mt, prefix + inst + '/', cls, top, group)
+    walk('foldsim_sim', '', None, 'foldsim_sim', None)
+    for mt, inst in insts('foldsim_sim'):
+        m = re.match(r'foldsim_slr(\d+)$', inst)
+        if m:
+            walk(mt, inst + '/', None, mt, int(m.group(1)))
+    return out
+
+
+def domain_affinity(doms, schedule, names):
+    """{domain path: its classes' link wires to the SLR groups on higher SLRs minus those on lower ones} from the
+    schedule report (`slr<g> (... sites): <classes>`, and the registered links `<A> -> <B>: ... on <w> wires`), the
+    groups' SLRs by the region's names (SLR<n>): a domain holds its class and its descendant domains' classes."""
+    grp = {}
+    for m in re.finditer(r'^\s+slr(\d+) \(\d+ sites\): (.*)$', schedule, re.M):
+        for c in m.group(2).split():
+            grp[c] = int(m.group(1))
+    def slr_index(g):
+        m = re.match(r'SLR(\d+)$', names[g]) if names and g is not None and g < len(names) else None
+        return int(m.group(1)) if m else g
+    wires = collections.Counter()
+    # (serialized links name their wires, `..., <k> host cycles on <w> wires`; others are their bits)
+    for m in re.finditer(r'^\s+(\S+) -> (\S+): \d+ links, (\d+) bits(?:, \d+ host cycles? on (\d+) wires)?$',
+                         schedule, re.M):
+        wires[(m.group(1), m.group(2))] += int(m.group(4) or m.group(3))
+    out = {}
+    for d in doms:
+        mine = {x['class'] for x in doms if x['path'] == d['path'] or x['path'].startswith(d['path'] + '/')}
+        a = 0
+        for (p, q), w in wires.items():
+            for x, y in ((p, q), (q, p)):
+                if x in mine and y not in mine and x in grp and y in grp and grp[x] != grp[y]:
+                    a += w if slr_index(grp[y]) > slr_index(grp[x]) else -w
+        out[d['path']] = a
+    return out
+
+
+def domain_adapters(info):
+    """{class: [kernel cell regex]}: the virtual-memory controllers (adapters, static ports) of each class's memories, the
+    kernel's instances write_vmem_engines names (a group's g_vg<g>..., else a memory's vmem_<k>/vport_<k>): they join
+    their class's domain pblock (--domain-pblocks), so a memory's adapter sits with the logic it serves."""
+    out = collections.OrderedDict()
+    if info.get('vmem_groups'):
+        for g, x in enumerate(info['vmem_groups']):
+            out.setdefault(x['class'], []).append(f'.*/g_vg{g}[./](g_vp[./])?(vmem|group|vport)$')
+    else:
+        for k, v in enumerate(info.get('vmem') or []):
+            out.setdefault(v['class'], []).append(f'.*/(vmem|vport)_{k}$')
+    return out
+
+
+def write_domain_pblocks(doms, names, path, default_slr='SLR1', axis='y', affinity=None, adapters=None):
+    """--domain-pblocks: the data of flow/v80/domain_pblocks.tcl, fs_domain_roots: for each SLR group (its SLR by
+    the region's names, else default_slr for a simulator without groups), its root domains in the class tree's order
+    (the Tcl stripes them side by side, a single one's children inside it, and every domain's children again inside
+    its own stripe)."""
+    by = collections.OrderedDict()
+    for d in doms:
+        if d['parent'] is None:
+            by.setdefault(d['group'], []).append(d)
+    lines = []
+    for g, roots in by.items():
+        level = roots
+        slr = names[g] if (names and g is not None) else default_slr
+        lines.append(f'  {slr} {{{" ".join(d["path"] for d in level)}}}')
+    with open(path, 'w') as f:
+        f.write('# Generated by foldsim (--domain-pblocks). Do not edit. Read by flow/v80/domain_pblocks.tcl.\n'
+                'set fs_domain_roots {\n' + '\n'.join(lines) + '\n}\n'
+                f'set fs_domain_axis {axis}\n'
+                'set fs_domain_affinity {\n' + ''.join(f'  {p} {v}\n' for p, v in (affinity or {}).items()) + '}\n'
+                'set fs_domain_adapters {\n' + ''.join(f'  {c} {{{" ".join("{" + r + "}" for r in rs)}}}\n'
+                                                     for c, rs in (adapters or {}).items()) + '}\n')
+    return len(lines)
 
 
 # An AXI4 device-memory master's wires (512-bit data, 64-bit address, 8-bit
@@ -1955,6 +2144,10 @@ def build_parser():
                     help='an output of a module that only wires out its classes\' outputs, its inputs and constants (a '
                          'port bundle of a child passed straight out of the top) is wired so in the netlist, not passed '
                          'through the module\'s own model (foldsim-extract-models direct-outputs)')
+    ap.add_argument('--outline-scopes', default='', metavar='MODULE:PREFIX=NAME,...',
+                    help='a generate loop of a flat module (its registers named PREFIX<i>.): each iteration, with the '
+                         'logic that feeds it alone, an instance of a new module NAME, folded as a class '
+                         '(foldsim-outline-scopes; the iterations must be the same logic)')
     ap.add_argument('--absorb-registers', action='store_true',
                     help="with --absorb-exclusive: the logic a model input alone reads may pass "
                          "through registers (a per-port pipeline register and the select in front "
@@ -2348,6 +2541,21 @@ def build_parser():
                     help='with --fold-ports: the bundles\' response tokens as rows of one memory (bundle, frame), read '
                          'at the reading instance\'s bundle; a held bit per bundle and one counter instead of token, '
                          'frame and previous-frame registers per bundle and field (foldsim-fold-static fold-ports-rows)')
+    ap.add_argument('--index-class-inputs', action='store_true',
+                    help='a class\'s array input that the class reads only at indices it computes (a crossbar '
+                         'arbiter\'s data_in[grant]) becomes an index output and an element input per read; the '
+                         'simulator reads that element in the evaluation\'s host cycle (with --fold-ports-rows: one '
+                         'rows read per index), not the whole array per instance (foldsim-index-class-inputs)')
+    ap.add_argument('--index-class-links', action='store_true',
+                    help='with --index-class-inputs: also arrays of other classes\' outputs (a crossbar arbiter fed by '
+                         'models): each element read from its producer\'s link in the evaluation\'s host cycle at the '
+                         'producer instance the index names (foldsim-index-class-inputs inputs-only=false)')
+    ap.add_argument('--index-max-producers', type=int, default=1, metavar='N',
+                    help='with --index-class-links: arrays of the outputs of at most N instances (default 1: a '
+                         'multi-instance producer\'s elements are read from an uncompacted link, costlier than the '
+                         'read registers saved)')
+    ap.add_argument('--index-min-elements', type=int, default=4, metavar='N',
+                    help='with --index-class-inputs: arrays of at least N elements')
     ap.add_argument('--fold-ports-reset', default='reset', metavar='INPUT',
                     help='with --fold-ports: the netlist input whose frame token rides on each request record')
     ap.add_argument('--link-kind-cost', action='store_true',
@@ -2392,6 +2600,38 @@ def build_parser():
                          '(through logic) alone is moved into that group, not replicated; the level and the other '
                          'groups read it there (foldsim-fold-static slr-group-home): a virtual memory\'s pending bit '
                          'read ahead sits beside its copy, the same values in every host cycle')
+    ap.add_argument('--table-roms', type=int, default=0, metavar='BITS',
+                    help='with --static: the simulator level\'s constant tables read at one register index (or its '
+                         'replicas) as one block ROM of at least BITS bits, read at the index\'s next value and '
+                         'registered (foldsim-table-roms): a block RAM instead of LUT selects; exact. 0: off')
+    ap.add_argument('--table-roms-min-depth', type=int, default=512, metavar='N',
+                    help='with --table-roms: the fewest entries a merged table has')
+    ap.add_argument('--slr-group-cut', action='store_true',
+                    help='with --slr-group-own and --slr-group-reset: a value a group reads whose closure is past '
+                         '--slr-group-own\'s limit is computed by the level two host cycles ahead (its next-value logic '
+                         'applied twice), registered, and registered again in each reading group (foldsim-fold-static '
+                         'slr-group-cut): one cone, every crossing registered at both ends, the same values in every '
+                         'host cycle')
+    ap.add_argument('--domain-pblock-axis', choices=('x', 'y'), default='y',
+                    help='--domain-pblocks: y (default) stacks each SLR\'s domains in row bands ordered by where their '
+                         'SLR crossings go (a domain whose links cross to the SLR above at the top); x: full-height '
+                         'column stripes')
+    ap.add_argument('--domain-pblocks', action='store_true',
+                    help='with --physical-domains: <out>/foldsim_domain_pblocks.tcl, each SLR group\'s root domains in '
+                         'side-by-side full-height column stripes of its SLR sized by their measured demand (soft '
+                         'pblocks, flow/v80/domain_pblocks.tcl with FOLDSIM_DOMAIN_PBLOCKS)')
+    ap.add_argument('--slr-adjacent', action='store_true',
+                    help='with --slr-groups and an SLR region: no link between groups more than one SLR apart '
+                         '(foldsim-fold-static slr-adjacent)')
+    ap.add_argument('--physical-domains', action='store_true',
+                    help='emit the simulator as a tree of modules mirroring the class tree (foldsim-fold-static '
+                         'physical-domains): a class\'s domain fs_dom_<class> holds its copies, its controls, the links '
+                         'read into it and its child classes\' domains; each domain is a placement unit')
+    ap.add_argument('--domain-merge-lut', type=int, default=0, metavar='N',
+                    help='with --physical-domains: a class whose copy is priced below N LUTs (the per-copy price of '
+                         '--state auto, else the calibrated copy LUT sites) gets no domain of its own: its copy, '
+                         'controls, incoming links and memories join its nearest domain ancestor\'s module, its '
+                         'child classes\' domains nest there (foldsim-fold-static domain-merge). 0: off')
     ap.add_argument('--slr-group-env', action='store_true',
                     help='with --slr-groups and --slr-group-own: each environment channel enters through one '
                          'register stage in the level and one per group behind a one-token elastic buffer, the '
@@ -2593,10 +2833,24 @@ def build_parser():
                          'by default), its block and ultra RAM within the region\'s margin of it; a copy over '
                          'moves stores to block or ultra RAM first (registered reads), then to HBM; default '
                          '0.75, 0: none')
-    ap.add_argument('--state-home', choices=('any', 'onchip'), default='any',
+    ap.add_argument('--state-home', choices=('any', 'onchip', 'hybrid'), default='any',
                     help="with --state auto: onchip: the policy never moves state off chip (no virtual memories or "
                          "pages in HBM chosen; the HBM tier's relief is not admissible), e.g. the rule that up to 16 "
-                         "SMs the state lives in block / ultra RAM; any (default): on chip first, then HBM")
+                         "SMs the state lives in block / ultra RAM; any (default): on chip first, then HBM; "
+                         "hybrid (the S26 hybrid, R26's engine): records on chip -- every register store in ultra RAM where "
+                         'it can (read in instance order), pages and memories below --hybrid-row-bits on chip -- and '
+                         'every memory of at least --hybrid-row-bits an instance that HBM can hold (a registered read) '
+                         'as a virtual memory, its rows read from HBM on demand')
+    ap.add_argument('--hbm-calibration', default='', metavar='JSON',
+                    help="with --state auto: the HBM the card measured (e.g. calibrations/hbm-asl9-20261114.json) "
+                         "in place of the policy's assumed 640 B a host cycle and 64-cycle round trip: the sum of "
+                         "the SLRs' read rates and the longest round trip, in the mode --hbm-mode names")
+    ap.add_argument('--hbm-mode', choices=('busy', 'alone'), default='busy',
+                    help="with --hbm-calibration: every SLR's ports moving at once (busy: the loaded round trip) "
+                         "or one SLR's (alone: the unloaded one)")
+    ap.add_argument('--hybrid-row-bits', type=int, default=4096, metavar='BITS',
+                    help='with --state-home hybrid: the memories of at least BITS an instance go to HBM (default '
+                         '4096: R26, the RAMs of at most 4 kbit stream with the flip-flops)')
     ap.add_argument('--state-region-budget', default='0.65', metavar='FRAC',
                     help="with --state auto and a copy budget: the whole region's LUTs (copies, level, kernel; "
                          'LUTRAM a LUT each, synthesized) at most FRAC of the region\'s, the state moved into block '
@@ -2924,6 +3178,19 @@ def main():
         for cell in re.findall(r'^lane-scan: cell (\S+)$', r.stderr, re.M):
             modules.append(cell)
             a.classes.append(cell)
+    # A flat module's generate loops outlined: each iteration's registers and the logic that feeds them alone an
+    # instance of one module, a class of its own (foldsim-outline-scopes).
+    if getattr(a, 'outline_scopes', ''):
+        specs = [x for x in a.outline_scopes.split(',') if x]
+        r = run([foldsim_opt, flat, '--pass-pipeline=builtin.module(foldsim-outline-scopes{scopes='
+                 + ','.join(specs) + '},canonicalize,cse)', '-o', flat + '.os'], check=False, capture_output=True)
+        sys.stderr.write(r.stderr)
+        if r.returncode:
+            sys.exit('foldsim: outline-scopes failed')
+        os.replace(flat + '.os', flat)
+        for cell in re.findall(r'^outline-scopes: cell (\S+) ', r.stderr, re.M):
+            modules.append(cell)
+            a.classes.append(cell)
     text = open(flat).read()
 
     # Each module with class instances, innermost first, becomes a netlist.
@@ -2977,6 +3244,10 @@ def main():
         passes.append(f'hw.module(comb-balance-mux{{mux-chain-threshold={a.balance_mux}}})')
     if a.compress_adds:
         passes.append(f'hw.module(foldsim-compress-add-trees{{min-operands={a.compress_adds}}})')
+    if getattr(a, 'index_class_inputs', False):
+        links = (f' inputs-only=false max-producers={a.index_max_producers}'
+                 if getattr(a, 'index_class_links', False) else '')
+        passes.append(f'foldsim-index-class-inputs{{module={a.top} min-elements={a.index_min_elements}{links} verbose}}')
     compose = f'module={a.top} sim=foldsim_sim'
     # With registered state the next thread is picked a host cycle earlier, from
     # inputs a cycle older: on classes of 16 threads that costs 37.5 % more host
@@ -3069,6 +3340,8 @@ def main():
         sys.exit('--storage needs --static')
     if a.schedule_only and not a.static:
         sys.exit('--schedule-only needs --static')
+    if getattr(a, 'domain_merge_lut', 0) and not getattr(a, 'physical_domains', False):
+        sys.exit('--domain-merge-lut needs --physical-domains')
     # The SLR check's region (--region): the check runs on every static fold's netlist (--slr-policy).
     region = check_region(a)
     if a.static:
@@ -3118,6 +3391,8 @@ def main():
                         else fold + f' storage={",".join(hbm)}')
         if a.state == 'auto':
             fold = choose_state(a, foldsim_opt, flat, passes, out, fold)
+        if getattr(a, 'physical_domains', False) and getattr(a, 'domain_merge_lut', 0) > 0:
+            fold += domain_merge(a, foldsim_opt, flat, passes, fold, out)
         if a.slr_groups or region:
             if a.copies != 'auto':
                 run([foldsim_opt, flat, f'--pass-pipeline=builtin.module({",".join(passes + OPTIMIZE)})',
@@ -3136,7 +3411,9 @@ def main():
         replicate = f'hw.module(foldsim-replicate-controls{{{rc}}})'
         merge = ([f'hw.module(foldsim-merge-memories{{max-bits={a.csf_merge_links}}})']
                  if getattr(a, 'csf_merge_links', 0) else [])
-        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}'] + merge + [SPLIT, replicate,
+        roms = ([f'hw.module(foldsim-table-roms{{min-depth={a.table_roms_min_depth} min-bits={a.table_roms}}})']
+                if getattr(a, 'table_roms', 0) else [])
+        pipeline = passes + OPTIMIZE + [f'foldsim-fold-static{{{fold}}}'] + merge + [SPLIT, replicate] + roms + [
                                         'canonicalize', 'foldsim-sort', 'cse']
         if a.copies == 'auto' or a.slr_groups or region:
             sim_input = out('models.mlir')
@@ -3182,6 +3459,28 @@ def main():
             write_slr_memory_ports(out('foldsim_sp.txt'), a.slr_region, names, ngroups, level)
     if split_plan:
         write_slr_split(split_plan, out('foldsim_floorplan.tcl'))
+    if getattr(a, 'physical_domains', False):
+        doms = domain_tree(open(out('foldsim_sim.sv')).read())
+        with open(out('foldsim_domains.json'), 'w') as f:
+            json.dump({'domains': doms}, f, indent=1)
+        print(f'foldsim: physical domains: {len(doms)} ({sum(d["parent"] is None for d in doms)} roots) in '
+              f'{out("foldsim_domains.json")}', file=sys.stderr)
+        if getattr(a, 'domain_pblocks', False):
+            names = [n for n, _ in slr_region_capacities(a.slr_region)] if a.slr_region else None
+            aff = domain_affinity(doms, open(out('schedule.txt')).read(), names) \
+                if os.path.exists(out('schedule.txt')) else {}
+            info_j = json.load(open(out('foldsim_sim.json'))) if os.path.exists(out('foldsim_sim.json')) else {}
+            k = write_domain_pblocks(doms, names, out('foldsim_domain_pblocks.tcl'),
+                                     axis=getattr(a, 'domain_pblock_axis', 'y'), affinity=aff,
+                                     adapters=domain_adapters(info_j))
+            # (the floorplan the flows source carries them: the data, then the Tcl that applies it)
+            if k and os.path.exists(out('foldsim_floorplan.tcl')):
+                tcl = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'flow', 'v80', 'domain_pblocks.tcl')
+                with open(out('foldsim_floorplan.tcl'), 'a') as f:
+                    f.write('# Physical domains as nested soft pblocks (--domain-pblocks).\n')
+                    f.write(open(out('foldsim_domain_pblocks.tcl')).read())
+                    f.write(open(tcl).read())
+            print(f'foldsim: domain pblocks: {k} SLR groups striped ({out("foldsim_domain_pblocks.tcl")})', file=sys.stderr)
 
     threads = re.search(r'foldsim\.threads = \[(.*?)\]', sim_text).group(1)
     info = {

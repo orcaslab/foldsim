@@ -1,0 +1,68 @@
+# REQUIRES: verilator
+# --slr-group-cut (S26X, a32-S26X-C3): a value a group reads whose closure is
+# past --slr-group-own's limit (at 32 SMs the frame sequencer's: it reads
+# every memory port's tokens, so it grows with N) is not left in the level to
+# fan out over the SLRs unregistered: the level computes it two host cycles
+# ahead (its next-value logic applied twice), registers that (`<v>_lead`),
+# and each reading group registers it again (`<v>_cut_g<g>`): one cone, both
+# ends of every crossing registered, the same value in every host cycle.
+# Here --slr-group-own 2 puts every closure past the limit (the sequencer's
+# pos3, the decision's go): the same MATCH in exactly the host cycles of the
+# replicated closures (--slr-group-own 1000), with stalls up to 90 %.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/late
+# RUN: foldsim --srcs top.f --top Top --out %t/own --static --nest --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env Leaf > %t/own.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/cut --static --nest --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 2 --slr-group-cut --slr-group-env Leaf > %t/cut.log 2>&1
+# RUN: FileCheck %s --check-prefix=CUTLOG < %t/cut.log
+# CUTLOG: slr-group-own: {{[0-9]+}} level registers and {{[0-9]+}} level ops replicated into groups, 0 closures left
+# CUTLOG: slr-group-cut: {{[1-9][0-9]*}} values read by the groups from a lead-2 register ({{[0-9]+}} bits, {{[1-9][0-9]*}} group registers, {{[1-9][0-9]*}} lead ops in the level; {{[0-9]+}} level ops cloned into the groups before them)
+# CUTLOG-NOT: warning: slr-group
+# RUN: FileCheck %s --check-prefix=CUTSV < %t/cut/foldsim_sim.sv
+# CUTSV-LABEL: module foldsim_sim_slr0(
+# CUTSV: pos3_cut_g0 <= pos3_lead;
+# CUTSV-LABEL: module foldsim_sim(
+# CUTSV: pos3_lead <=
+# The registers the leads read as they are and that also feed the groups (the
+# reset's first stage) are read through copies of their own: every fanout over
+# the SLRs is registers only (locality: no refusal; xcheck: no logic crossing).
+# RUN: grep -q 'reset_pre_leadsrc <= hostReset' %t/cut/foldsim_sim.sv
+# RUN: python3 %foldsim_tools/foldsim_locality.py %t/cut --out %t/cut/l > /dev/null
+# RUN: FileCheck %s --check-prefix=LOC < %t/cut/l/locality.txt
+# LOC: L3 global fanout
+# LOC-NOT: REFUSE
+# RUN: python3 %foldsim_tools/foldsim_xcheck.py %t/cut/foldsim_sim.mlir | FileCheck %s --check-prefix=X
+# X: cross-group edges: {{.*}} LOGIC 0 (0 bits); group outputs read by the level: {{[0-9]+}}, LOGIC 0
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/own/obj %S/Inputs/tb_late.sv top.sv %t/own/foldsim_sim.sv > %t/own/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/cut/obj %S/Inputs/tb_late.sv top.sv %t/cut/foldsim_sim.sv > %t/cut/build.log 2>&1
+# RUN: %t/own/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 | grep MATCH > %t/own/r1.txt
+# RUN: %t/own/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | grep MATCH > %t/own/r2.txt
+# RUN: %t/own/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +stall=90 | grep MATCH > %t/own/r3.txt
+# RUN: %t/cut/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 | grep MATCH > %t/cut/r1.txt
+# RUN: %t/cut/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | grep MATCH > %t/cut/r2.txt
+# RUN: %t/cut/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +stall=90 | grep MATCH > %t/cut/r3.txt
+# RUN: FileCheck %s < %t/cut/r1.txt
+# RUN: diff %t/own/r1.txt %t/cut/r1.txt
+# RUN: diff %t/own/r2.txt %t/cut/r2.txt
+# RUN: diff %t/own/r3.txt %t/cut/r3.txt
+# CHECK: {{^}}MATCH
+# Closures within the limit: the option changes nothing (the same netlist).
+# RUN: foldsim --srcs top.f --top Top --out %t/small --static --nest --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-cut --slr-group-env Leaf > %t/small.log 2>&1
+# RUN: not grep -q 'foldsim-fold-static: slr-group-cut' %t/small.log
+# RUN: sed -e 's#[[:space:]]*//.*##' %t/own/foldsim_sim.sv > %t/own/sim.nocomment.sv
+# RUN: sed -e 's#[[:space:]]*//.*##' %t/small/foldsim_sim.sv > %t/small/sim.nocomment.sv
+# RUN: diff %t/own/sim.nocomment.sv %t/small/sim.nocomment.sv
+# Mutant (FOLDSIM_CUT_LEAD=1: the group's register a host cycle late): MISMATCH.
+# RUN: env FOLDSIM_CUT_LEAD=1 foldsim --srcs top.f --top Top --out %t/mut --static --nest --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 2 --slr-group-cut --slr-group-env Leaf > %t/mut.log 2>&1
+# RUN: FileCheck %s --check-prefix=MUTLOG < %t/mut.log
+# MUTLOG: slr-group-cut: {{[1-9][0-9]*}} values read by the groups from a lead-1 register
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/mut/obj %S/Inputs/tb_late.sv top.sv %t/mut/foldsim_sim.sv > %t/mut/build.log 2>&1
+# RUN: %t/mut/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 | FileCheck %s --check-prefix=MUT
+# MUT: MISMATCH
+# A lead that reaches a port within two register stages (--bubbles: the
+# decision reads the kernel's `advance` as it is) is not built: the value stays
+# in the level, said loudly, and the run is the same as without the option.
+# RUN: foldsim --srcs top.f --top Top --out %t/bub --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 2 --slr-group-cut --slr-group-env Leaf > %t/bub.log 2>&1
+# RUN: FileCheck %s --check-prefix=BUB < %t/bub.log
+# BUB: slr-group-cut: {{[0-9]+}} values read by the groups from a lead-2 register ({{.*}}), {{[1-9][0-9]*}} without a lead (read as they are: {{.*}}pos3{{.*}}; leaves: a port x{{[0-9]+}} (advance))
+# BUB-NEXT: warning: slr-group-cut: {{[1-9][0-9]*}} values without a lead stay in the level
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_late.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
+# RUN: %t/bub/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 +bubble=30 +burst=4 | FileCheck %s

@@ -32,6 +32,10 @@
 # CHECK: onchip-only first True: ['distributed']
 # CHECK: onchip-only first False: ['distributed']
 # CHECK: fit {'copy_logic': 1.323, 'copy_lutram': 1.5, 'level': 1.225, 'kernel_logic': 450, 'kernel_lutram': 50}
+# The host caches shrink (budget halved) until the choice fits, down to none.
+# CHECK: caches within 20: budget 30 fits True bram 15.0
+# CHECK: caches within 100: budget 120 fits True bram 60.0
+# CHECK: caches within 0: budget 0 fits True bram 0.0
 # Through the driver (Inputs/paged, four leaves): within 0.1 % of SLR0 (256
 # LUTs) the leaves' register stores from 8 bits go to block RAM; the copy as
 # counted in the netlist within the budget (state_budget.txt); a budget below
@@ -53,7 +57,7 @@
 # TABLE-NEXT: Leaf#0
 # BUDGET: copy budget 256 LUTs, 128 LUTRAM (x0.001 of SLR0); counted x 0.791
 # BUDGET-NOT: OVER
-# REFUSE: --state auto: nothing fits the V80 region {{.*}} copy budget 128 LUTs (x0.0005 of SLR0){{.*}}); past their copy budget: Leaf#0 ({{[0-9]+}} LUTs at the schedule's frame)
+# REFUSE: --state auto: nothing fits the V80 region {{.*}} copy budget 128 LUTs (x0.0005 of SLR0){{.*}}); past their copy budget: Leaf#0 ({{[a-z/]+}} past its cap; {{[0-9]+}} LUTs, {{.*}} at the schedule's frame)
 # GIVEN: foldsim-fold-static{{.*}} storage=Leaf:ram=block,Leaf:regs>=8=distributed{{[ }]}}
 # GIVEN-NOT: Leaf:ram=distributed
 # GIVEN-NOT: storage: no memory

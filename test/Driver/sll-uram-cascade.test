@@ -1,0 +1,8 @@
+# The SLL check refuses an ultra RAM whose cascade is past the region's
+# uram_cascade_max (a cascade is one vertical run of a URAM column's sites:
+# 16 SMs, 11-14, a chain of 32 found no legal place in SLR0 although the SLR's
+# URAM totals were at 50 %); the V80 regions accept 8.
+# RUN: python3 -c "import sys; sys.path.insert(0, sys.argv[1]); import foldsim_sll_check as c; print(c.tall_uram_chains(sys.argv[2], 8), c.tall_uram_chains(sys.argv[2], 64))" %foldsim_tools %S/Inputs/sll-uram-cascade/sim.mlir | FileCheck %s
+# CHECK: [('lmem', 64)] []
+# RUN: python3 -c "import json, sys; print([json.load(open(sys.argv[1] + '/' + f))['uram_cascade_max'] for f in ('foldsim_v80_slr.json', 'foldsim_v80_asl9_slr.json')])" %foldsim_tools | FileCheck %s --check-prefix=REGION
+# REGION: [8, 8]

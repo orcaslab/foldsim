@@ -265,6 +265,12 @@ def main():
                          "0: none, on the memory ports' masters)")
     ap.add_argument('--floorplan', action='store_true',
                     help="print the floorplan Tcl of the controllers and their masters' shares (SLR groups)")
+    ap.add_argument('--sp', metavar='FOLDSIM_SP',
+                    help="print each device-memory master's HBM port (linker tag) from foldsim's foldsim_sp.txt: "
+                         "the memory ports' masters the level's ports, each SLR group's controller masters its own "
+                         "SLR's ports in turn (an unnamed group's the level's); with --sp-kernel, as `sp=` lines")
+    ap.add_argument('--sp-kernel', default='', metavar='NAME',
+                    help='with --sp: the kernel instance the `sp=<NAME>.m_axi_mem_<i>:<tag>` lines name')
     a = ap.parse_args()
     groups = vmem_groups(a.sim_vh)
     nm = len(groups) if groups is not None else vmem_count(a.sim_vh)
@@ -291,6 +297,33 @@ def main():
                      f'masters; the kernel has at most {MAX_MASTERS}')
         if m == n and not nv:
             of = mslr = None
+    if a.sp:
+        tags, level = {}, []
+        for line in open(a.sp):
+            f = line.split()
+            if len(f) >= 4 and f[0] == 'group':
+                tags[int(f[1])] = f[3:]
+            elif len(f) >= 3 and f[0] == 'level':
+                level = f[2:]
+        if not level:
+            sys.exit(f'vmem_ports.py: {a.sp} has no level line')
+        if of is not None:
+            mgroup = mslr
+        elif slr is not None and m == n:
+            mgroup = [slr.get(k, -1) for k in range(n)]
+        else:
+            mgroup = [-1] * m
+        out, used = [], {}
+        for i in range(p):
+            out.append(level[i % len(level)])
+        for j in range(m):
+            g = mgroup[j]
+            t = tags.get(g, level) if g >= 0 else level
+            out.append(t[used.get(g, 0) % len(t)])
+            used[g] = used.get(g, 0) + 1
+        for i, t in enumerate(out):
+            print(f'sp={a.sp_kernel}.m_axi_mem_{i}:{t}' if a.sp_kernel else f'm_axi_mem_{i} {t}')
+        return
     if a.port_masters:
         print(p)
         return

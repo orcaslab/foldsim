@@ -154,6 +154,10 @@ def count(gen):
     copies = {s[:-len('_static')]: subtree(mods, s, statics - {s}, new()) for s in sorted(statics)}
     # The simulator's level: @foldsim_sim and the SLR group modules under it (modules that are not copies).
     level = ['foldsim_sim'] + [ch for ch, _ in mods['foldsim_sim'].insts if ch in mods and ch not in statics]
+    # (--physical-domains: the domain modules, foldsim_sim_dom_<class>, nested in the level and the SLR groups' modules,
+    # are the level's too: their links charged to their readers, their controls the level's rest, as without them.)
+    for lv in level:
+        level += [ch for ch, _ in mods[lv].insts if ch.startswith('foldsim_sim_dom_') and ch in mods and ch not in level]
     names = sorted(copies, key=len, reverse=True)
 
     def owner(n):

@@ -1,0 +1,28 @@
+# REQUIRES: verilator
+# --slr-adjacent (S26X W1, a32-S26X-PH): no link between SLR groups more than
+# one SLR apart; with --slr-level the level's group is a fixed end of the
+# classes' port bits (slr-level-group). g16i1p1e (11-15) routed SLR0<->SLR2
+# links over all of SLR1 (9-18 % of the wirelength over SLR1's congested
+# windows). Here the synthetic GPU (Driver/Inputs/domains) with Alu pinned to
+# group 0 and L2 to group 2: unconstrained, the rest lands in group 0 with
+# links Top/L1 -> L2 two SLRs apart; adjacent, it moves to group 1. The fold
+# stays exact.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/domains
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/free --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-group-control --slr-group-reset --slr-level 1 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --slr-assign Alu:0,L2:2 > %t/free.log 2>&1
+# RUN: FileCheck %s --check-prefix=FREE < %t/free/schedule.txt
+# FREE: slr0 ({{[0-9]+}} sites): Top_model Sm_model Core_model Alu Lsu L1
+# FREE: slr2 ({{[0-9]+}} sites): L2
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/adj --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-group-control --slr-group-reset --slr-level 1 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --slr-assign Alu:0,L2:2 --slr-adjacent --physical-domains > %t/adj.log 2>&1
+# RUN: FileCheck %s --check-prefix=ADJ < %t/adj/schedule.txt
+# ADJ: slr0 ({{[0-9]+}} sites): Alu
+# ADJ: slr1 ({{[0-9]+}} sites): Top_model Sm_model Core_model Lsu L1
+# ADJ: slr2 ({{[0-9]+}} sites): L2
+# RUN: grep -q ' slr-adjacent' %t/adj.log
+# RUN: grep -q ' slr-level-group=1' %t/adj.log
+# Pins that leave no adjacent assignment: refused, the reason named.
+# RUN: not foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/bad --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-group-control --slr-group-reset --slr-level 1 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --slr-assign Alu:0,Core_model:2 --slr-adjacent > %t/bad.log 2>&1
+# RUN: FileCheck %s --check-prefix=BAD < %t/bad.log
+# BAD: error: slr-groups: no assignment {{.*}} with a link more than one SLR apart (slr-adjacent)
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/adj/obj %S/Inputs/tb_reset.sv gpu.sv %t/adj/foldsim_sim.sv > %t/adj/build.log 2>&1
+# RUN: %t/adj/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 | FileCheck %s
+# CHECK: {{^}}MATCH

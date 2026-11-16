@@ -1,0 +1,96 @@
+# REQUIRES: verilator
+# --domain-merge-lut N (with --physical-domains, a32-S26X-PH): a class whose
+# copy is priced below N LUTs gets no domain of its own. Its copy, controls,
+# incoming links and memories are emitted in its nearest domain ancestor's
+# module (or its group's own logic); its child classes' domains nest there.
+# The domain report names each merged class and its host. The same netlist
+# apart from the hierarchy: the same MATCH in exactly the host cycles of the
+# flat build. The small GPU-like target of static-physical-domains.test, its
+# copies priced (calibrated copy LUT sites, no --state auto): Sm_model 0,
+# Top_model 24, Alu 88, Lsu 91, L1 272, Core_model 407, L2 1046.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/domains
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/flat --static --nest --zero-latency-links --zero-latency-chains > %t/flat.log 2>&1
+#
+# Below 10 LUTs: only Sm_model merges, into Top's domain; its children (the
+# core with its ALU, the LSU, the L1) keep their own domains, nested in Top's.
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/m10 --static --nest --zero-latency-links --zero-latency-chains --physical-domains --domain-merge-lut 10 > %t/m10.log 2>&1
+# RUN: FileCheck %s --check-prefix=M10 < %t/m10.log
+# M10: foldsim: domain merge below 10 LUTs ({{.*}}): 1 of 7 classes: Sm_model (0)
+# M10-DAG: domain Alu (in Core_model): {{[0-9]+}} ops, 0 child domains
+# M10-DAG: domain Core_model (in Top_model): {{[0-9]+}} ops, 1 child domains
+# M10-DAG: domain Lsu (in Top_model)
+# M10-DAG: domain L1 (in Top_model)
+# M10-DAG: domain L2 (in Top_model)
+# M10-DAG: domain Top_model (in foldsim_sim): {{[0-9]+}} ops, 4 child domains
+# M10-DAG: merged Sm_model into domain Top_model: no domain of its own
+# M10: physical domains of foldsim_sim: 6 domains (1 classes merged)
+# RUN: FileCheck %s --check-prefix=J10 < %t/m10/foldsim_domains.json
+# J10-DAG: "path": "fs_dom_Top_model/fs_dom_Core_model/fs_dom_Alu"
+# J10-DAG: "path": "fs_dom_Top_model/fs_dom_L1"
+# J10-NOT: fs_dom_Sm_model
+# RUN: FileCheck %s --check-prefix=S10 < %t/m10/foldsim_sim.sv
+# S10-NOT: module foldsim_sim_dom_Sm_model(
+# S10-LABEL: module foldsim_sim_dom_Top_model(
+# S10-DAG: Sm_model_static Sm_model_copy (
+# S10-DAG: foldsim_sim_dom_Core_model fs_dom_Core_model (
+# S10-DAG: foldsim_sim_dom_L1 fs_dom_L1 (
+# S10: endmodule
+#
+# Below 100 LUTs: Top, Sm, the ALU and the LSU merge. The ALU's copy lands in
+# the core's domain; the LSU, Sm and Top in the simulator's own logic, where
+# the core, the L1 and the L2 become roots.
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/m100 --static --nest --zero-latency-links --zero-latency-chains --physical-domains --domain-merge-lut 100 > %t/m100.log 2>&1
+# RUN: FileCheck %s --check-prefix=M100 < %t/m100.log
+# M100: 4 of 7 classes: Sm_model (0), Top_model (24), Alu (88), Lsu (91)
+# M100-DAG: domain Core_model (in foldsim_sim): {{[0-9]+}} ops, 0 child domains
+# M100-DAG: domain L1 (in foldsim_sim)
+# M100-DAG: domain L2 (in foldsim_sim)
+# M100-DAG: merged Alu (copy priced 88 LUTs) into domain Core_model: no domain of its own
+# M100-DAG: merged Lsu (copy priced 91 LUTs) into foldsim_sim: no domain of its own
+# M100-DAG: merged Top_model (copy priced 24 LUTs) into foldsim_sim
+# M100: physical domains of foldsim_sim: 3 domains (4 classes merged)
+# RUN: FileCheck %s --check-prefix=S100 < %t/m100/foldsim_sim.sv
+# S100-NOT: module foldsim_sim_dom_Alu(
+# S100-LABEL: module foldsim_sim_dom_Core_model(
+# S100-DAG: Core_model_static Core_model_copy (
+# S100-DAG: Alu_static Alu_copy (
+# S100: endmodule
+#
+# With SLR groups (the pinned assignment of static-physical-domains.test):
+# merging stays inside a group; the pblock roots are the remaining domains.
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gflat --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env > %t/gflat.log 2>&1
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gm100 --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --physical-domains --domain-merge-lut 100 --domain-pblocks > %t/gm100.log 2>&1
+# RUN: FileCheck %s --check-prefix=G100 < %t/gm100.log
+# G100-DAG: domain Core_model (in foldsim_sim_slr0)
+# G100-DAG: merged Alu (copy priced 88 LUTs) into domain Core_model
+# G100-DAG: domain L1 (in foldsim_sim_slr1)
+# G100-DAG: merged Lsu (copy priced 91 LUTs) into foldsim_sim_slr1
+# G100-DAG: merged Sm_model into foldsim_sim_slr1
+# G100-DAG: domain L2 (in foldsim_sim_slr2)
+# G100-DAG: merged Top_model (copy priced 24 LUTs) into foldsim_sim_slr2
+# RUN: FileCheck %s --check-prefix=PB < %t/gm100/foldsim_domain_pblocks.tcl
+# PB: set fs_domain_roots {
+# PB-DAG: SLR2 {foldsim_slr0/fs_dom_Core_model}
+# PB-DAG: SLR1 {foldsim_slr1/fs_dom_L1}
+# PB-DAG: SLR0 {foldsim_slr2/fs_dom_L2}
+#
+# Exact: every merged build matches the flat build's MATCH lines, cycles included.
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/flat/obj %S/Inputs/tb_reset.sv gpu.sv %t/flat/foldsim_sim.sv > %t/flat/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/m10/obj %S/Inputs/tb_reset.sv gpu.sv %t/m10/foldsim_sim.sv > %t/m10/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/m100/obj %S/Inputs/tb_reset.sv gpu.sv %t/m100/foldsim_sim.sv > %t/m100/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/gflat/obj %S/Inputs/tb_reset.sv gpu.sv %t/gflat/foldsim_sim.sv > %t/gflat/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/gm100/obj %S/Inputs/tb_reset.sv gpu.sv %t/gm100/foldsim_sim.sv > %t/gm100/build.log 2>&1
+# RUN: %t/flat/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | grep MATCH > %t/flat/r.txt
+# RUN: %t/m10/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | grep MATCH > %t/m10/r.txt
+# RUN: %t/m100/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | grep MATCH > %t/m100/r.txt
+# RUN: %t/gflat/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=30 | grep MATCH > %t/gflat/r.txt
+# RUN: %t/gm100/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=30 | grep MATCH > %t/gm100/r.txt
+# RUN: FileCheck %s < %t/m100/r.txt
+# RUN: diff %t/flat/r.txt %t/m10/r.txt
+# RUN: diff %t/flat/r.txt %t/m100/r.txt
+# RUN: diff %t/gflat/r.txt %t/gm100/r.txt
+# CHECK: {{^}}MATCH
+#
+# The flag needs --physical-domains; the pass option likewise.
+# RUN: not foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/bad --static --nest --domain-merge-lut 10 2>&1 | FileCheck %s --check-prefix=BAD
+# BAD: --domain-merge-lut needs --physical-domains

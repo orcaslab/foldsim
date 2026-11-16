@@ -430,6 +430,21 @@ struct Consumer {
   unsigned port = 0, width = 0;
   /// Each instance's bits, low ones first.
   SmallVector<Pieces> pieces;
+  /// An element input of `foldsim-index-class-inputs`: the netlist drives it
+  /// with an element of an array at an index output of the same instance
+  /// (`indexOutput`, -1 otherwise); each element's bits (every instance
+  /// reads the same array). `pieces` holds a non-constant element's, for
+  /// the analyses that read an input's sources.
+  int indexOutput = -1;
+  SmallVector<Pieces> elements;
+  /// Each instance's elements (`elements` is instance 0's), and whether
+  /// every instance reads the same array.
+  SmallVector<SmallVector<Pieces>> instElements;
+  bool sameElements = true;
+  /// A ghost of element input `ghostOf` (another element's bits, each
+  /// instance's in `pieces`): read by the analyses (the schedule's waits, the
+  /// links' storage), never built -- the element input builds its reads.
+  int ghostOf = -1;
 };
 
 /// Host cycles from a link's write to the first slot that reads it: the write
@@ -904,9 +919,25 @@ public:
   /// reads one group's instance outputs through logic is moved into that
   /// group (its home); the others read it there.
   bool slrGroupHome = false;
+  /// `slr-group-cut`: with slr-group-own, a group's read whose closure is
+  /// past the limit is broadcast from a register of its value two host
+  /// cycles ahead (lead 2) instead of left in the level.
+  bool slrGroupCut = false;
   /// `slr-group-env`: the environment's channels and reset enter the
   /// simulator through one register stage in the level, then one per group.
   bool slrGroupEnv = false;
+  /// `physical-domains`: the simulator as a tree of modules mirroring the
+  /// class tree (extractDomains).
+  bool physicalDomains = false;
+  /// `domain-merge`: the classes with no domain of their own (each with its
+  /// copy's LUT price, 0 unknown); their ops join the nearest domain ancestor.
+  llvm::StringMap<uint64_t> domainMerge;
+  /// `slr-adjacent`: no link between SLR groups more than one SLR apart.
+  bool slrAdjacent = false;
+  /// `slr-level-group`: the group the simulator level sits with (-1 unknown).
+  int slrLevelGroup = -1;
+  /// physical-domains: the domain report (schedule report and stderr).
+  std::string domainReport;
   struct LinkCandidate {
     std::tuple<unsigned, unsigned, uint64_t> key;
     /// Its rows and columns in block or ultra RAM (paged as built), and its
@@ -1017,6 +1048,13 @@ public:
   /// it enters, the compare after it (four entries more).
   bool roomRegions = false;
   unsigned deadInputs = 0, partlyDeadInputs = 0;
+  /// Element inputs read at an index (foldsim-index-class-inputs), and
+  /// their pieces: read from the rows, of constants, chosen of the frame's.
+  unsigned indexedInputs = 0, indexedRows = 0, indexedTables = 0,
+           indexedChoices = 0, indexedLinks = 0;
+  /// The element inputs' (class, input): never zero-latency (the reader's
+  /// evaluation chooses the source).
+  std::set<std::pair<unsigned, unsigned>> indexedPorts;
   uint64_t deadInputBits = 0;
   /// `link-hbm-min-lead`: the least room (positions from a row's write to its
   /// landing) a member is streamed with (0: the decision lead + 6). A
@@ -1199,6 +1237,10 @@ private:
   /// Moves each SLR group's logic of the simulator into a module of its
   /// own, instantiated as `slr<g>`.
   LogicalResult extractGroups();
+  /// physical-domains: moves each class's tagged ops of `mod` (the
+  /// simulator or an SLR group's module) into a module of its own, nested as
+  /// the class tree.
+  LogicalResult extractDomains(hw::HWModuleOp mod, StringRef suffix);
   /// Whether a link from class `p` to class `c` crosses SLR groups: it is
   /// then registered on both sides and taken a host cycle later.
   bool crosses(int p, int c) const {
@@ -2371,6 +2413,8 @@ static bool isStateless(hw::HWModuleOp model) {
 
 LogicalResult StaticFolder::collect() {
   auto *body = netlist.getBodyBlock();
+  // Element inputs' other elements (consumer, element), for their ghosts.
+  SmallVector<std::pair<unsigned, unsigned>> ghosts;
   for (auto aggregate :
        llvm::make_early_inc_range(body->getOps<hw::AggregateConstantOp>())) {
     OpBuilder builder(aggregate);
@@ -2385,6 +2429,19 @@ LogicalResult StaticFolder::collect() {
   for (auto &op : body->without_terminator()) {
     auto instance = dyn_cast<hw::InstanceOp>(op);
     if (!instance) {
+      // An element read at an index output of the instance that takes it
+      // (foldsim-index-class-inputs).
+      if (auto get = dyn_cast<hw::ArrayGetOp>(op)) {
+        auto index = dyn_cast<OpResult>(get.getIndex());
+        auto owner = index ? dyn_cast<hw::InstanceOp>(index.getOwner())
+                           : hw::InstanceOp();
+        if (owner && llvm::all_of(get->getUses(), [&](OpOperand &use) {
+              return use.getOwner() == owner.getOperation();
+            }))
+          continue;
+        return op.emitError("an array read in a netlist must be an element "
+                            "input of the instance whose output is its index");
+      }
       if (!isa<hw::ConstantOp, comb::ExtractOp, comb::ConcatOp,
                comb::ReplicateOp, hw::BitcastOp>(op))
         return op.emitError("not wiring or a model in a netlist");
@@ -2475,6 +2532,64 @@ LogicalResult StaticFolder::collect() {
         deadInputBits += consumer.width;
         continue;
       }
+      // An element input (foldsim-index-class-inputs): the array's elements,
+      // the same in every instance, read at the instance's index output.
+      if (auto get = cls.instances[0].getOperand(i).getDefiningOp<hw::ArrayGetOp>()) {
+        unsigned o = cast<OpResult>(get.getIndex()).getResultNumber();
+        consumer.indexOutput = o;
+        unsigned n = cast<hw::ArrayType>(get.getInput().getType()).getNumElements();
+        auto same = [](const Pieces &x, const Pieces &y) {
+          return x.size() == y.size() &&
+                 llvm::all_of(llvm::zip(x, y), [](auto pair) {
+                   auto &[a, b] = pair;
+                   return a.producer == b.producer && a.inst == b.inst &&
+                          a.low == b.low && a.width == b.width &&
+                          (a.producer >= 0 || a.constant == b.constant);
+                 });
+        };
+        for (auto instance : cls.instances) {
+          auto g = instance.getOperand(i).getDefiningOp<hw::ArrayGetOp>();
+          if (!g || g.getIndex() != instance.getResult(o) ||
+              g.getInput().getType() != get.getInput().getType())
+            return instance.emitError("an element input read at another index "
+                                      "in another instance");
+          auto &elements = consumer.instElements.emplace_back(n);
+          for (unsigned e = 0; e < n; ++e)
+            if (failed(decompose(g.getInput(), e * consumer.width, consumer.width,
+                                 elements[e])))
+              return failure();
+          if (consumer.instElements.size() > 1)
+            consumer.sameElements &= llvm::all_of(
+                llvm::seq<unsigned>(0, n), [&](unsigned e) {
+                  return same(elements[e], consumer.instElements[0][e]);
+                });
+        }
+        consumer.elements = consumer.instElements[0];
+        // The analyses see one element's bits as the input's (one with a
+        // producer in every instance) and the others' as ghosts.
+        auto produced = [](const Pieces &pieces) {
+          return llvm::any_of(pieces, [](auto &piece) { return piece.producer >= 0; });
+        };
+        int shown = -1;
+        for (unsigned e = 0; e < n && shown < 0; ++e)
+          if (llvm::all_of(consumer.instElements,
+                           [&](auto &elements) { return produced(elements[e]); }))
+            shown = e;
+        if (shown < 0)
+          return cls.instances[0].emitError(
+              "an element input none of whose elements has a producer in every "
+              "instance (not supported)");
+        for (auto &elements : consumer.instElements)
+          consumer.pieces.push_back(elements[shown]);
+        for (unsigned e = 0; e < n; ++e)
+          if (int(e) != shown &&
+              llvm::any_of(consumer.instElements,
+                           [&](auto &elements) { return produced(elements[e]); }))
+            ghosts.push_back({unsigned(consumers.size() - 1), e});
+        indexedPorts.insert({unsigned(c), unsigned(i)});
+        ++indexedInputs;
+        continue;
+      }
       for (auto instance : cls.instances)
         if (failed(decompose(instance.getOperand(i), 0, consumer.width,
                              consumer.pieces.emplace_back())))
@@ -2527,6 +2642,25 @@ LogicalResult StaticFolder::collect() {
       }
     }
   }
+  // The element inputs' other elements, as ghost consumers.
+  for (auto [k, e] : ghosts) {
+    Consumer ghost;
+    auto &of = consumers[k];
+    ghost.name = of.name + "_element" + std::to_string(e);
+    ghost.cls = of.cls;
+    ghost.port = of.port;
+    ghost.width = of.width;
+    ghost.ghostOf = k;
+    for (auto &elements : of.instElements) {
+      Pieces pieces = elements[e];
+      // (Constant bits of an instance's element: as the analyses take an
+      // input that is constant there.)
+      if (pieces.empty())
+        pieces.push_back(Piece{-1, 0, 0, of.width, APInt::getZero(of.width)});
+      ghost.pieces.push_back(std::move(pieces));
+    }
+    consumers.push_back(std::move(ghost));
+  }
   auto *output = body->getTerminator();
   for (auto [index, operand] : llvm::enumerate(output->getOperands())) {
     auto &consumer = consumers.emplace_back();
@@ -2556,17 +2690,33 @@ LogicalResult StaticFolder::collect() {
         }
       }
     }
-    for (auto &consumer : consumers)
+    for (auto &consumer : consumers) {
       for (auto &pieces : consumer.pieces)
         for (auto &piece : pieces)
           if (piece.producer >= 0)
             piece.producer = canonical[piece.producer];
+      for (auto &pieces : consumer.elements)
+        for (auto &piece : pieces)
+          if (piece.producer >= 0)
+            piece.producer = canonical[piece.producer];
+      for (auto &elements : consumer.instElements)
+        for (auto &pieces : elements)
+          for (auto &piece : pieces)
+            if (piece.producer >= 0)
+              piece.producer = canonical[piece.producer];
+    }
   }
-  for (auto &consumer : consumers)
+  for (auto &consumer : consumers) {
     for (auto &pieces : consumer.pieces)
       for (auto &piece : pieces)
         if (piece.producer >= 0)
           producers[piece.producer].read = true;
+    for (auto &elements : consumer.instElements)
+      for (auto &pieces : elements)
+        for (auto &piece : pieces)
+          if (piece.producer >= 0)
+            producers[piece.producer].read = true;
+  }
   return success();
 }
 
@@ -6565,6 +6715,9 @@ bool StaticFolder::zeroLink(unsigned p, unsigned c, unsigned input) const {
   // Between SLR groups a link is registered on both sides of the crossing.
   if (crosses(producer.cls, c))
     return false;
+  // An element input's source is chosen by its reader's evaluation.
+  if (indexedPorts.count({c, input}))
+    return false;
   // A staged reader reads its inputs from their read registers, its stages
   // before its state pass.
   if (classes[c].stages)
@@ -6779,8 +6932,47 @@ void StaticFolder::linkUses(std::vector<LinkUse> &uses) const {
   // starts or ends, each run of bits read from each class producer (and the
   // low bit there) its own link, at the producer instances the reader's
   // instances take.
+  // An element input (its ghosts are not read): as the element input builds
+  // its class outputs' reads, a link per producer port of the span of its
+  // bits there, at every producer instance any element names; a
+  // single-instance producer's once for all of the class's element inputs.
+  std::set<std::tuple<unsigned, unsigned, unsigned, unsigned>> indexedSeen;
   for (auto &consumer : consumers) {
-    if (consumer.cls < 0)
+    if (consumer.cls < 0 || consumer.ghostOf >= 0 || consumer.indexOutput < 0)
+      continue;
+    struct Span {
+      unsigned lo = ~0u, hi = 0;
+      std::set<uint64_t> rows;
+    };
+    std::map<unsigned, Span> spans;
+    for (auto &elements : consumer.instElements)
+      for (auto &pieces : elements)
+        for (auto &piece : pieces)
+          if (piece.producer >= 0 && producers[piece.producer].cls >= 0) {
+            auto &sp = spans[piece.producer];
+            sp.lo = std::min(sp.lo, piece.low);
+            sp.hi = std::max(sp.hi, piece.low + piece.width);
+            sp.rows.insert(piece.inst);
+          }
+    for (auto &[p, sp] : spans) {
+      bool single = classes[producers[p].cls].threads() <= 1;
+      if (single && !indexedSeen.insert({p, sp.lo, sp.hi - sp.lo, unsigned(consumer.cls)}).second)
+        continue;
+      LinkUse use{p, sp.lo, sp.hi - sp.lo, unsigned(consumer.cls),
+                  classes[consumer.cls].inputNames[consumer.port],
+                  SmallVector<uint64_t>(sp.rows.begin(), sp.rows.end()), {}, {}};
+      for (unsigned i = 0; i < consumer.instElements.size(); ++i) {
+        use.readers.push_back(i);
+        use.readerRows.push_back(*sp.rows.begin());
+      }
+      use.port = consumer.port;
+      use.sources = 2;
+      use.at = 0;
+      uses.push_back(std::move(use));
+    }
+  }
+  for (auto &consumer : consumers) {
+    if (consumer.cls < 0 || consumer.ghostOf >= 0 || consumer.indexOutput >= 0)
       continue;
     unsigned threads = classes[consumer.cls].threads();
     std::set<unsigned> cuts{consumer.width};
@@ -9539,6 +9731,22 @@ LogicalResult StaticFolder::chooseGroups() {
   SmallVector<SmallVector<uint64_t>> bits;
   SmallVector<SmallVector<unsigned>> links;
   linkBits(bits, links);
+  // `slr-level-group`: each class's bits to and from the netlist's ports,
+  // a link to the level's group.
+  SmallVector<uint64_t> envBits(n, 0);
+  if (slrLevelGroup >= 0) {
+    for (auto &consumer : consumers)
+      for (auto &pieces : consumer.pieces)
+        for (auto &piece : pieces) {
+          if (piece.producer < 0)
+            continue;
+          int from = producers[piece.producer].cls;
+          if (consumer.cls >= 0 && from < 0)
+            envBits[consumer.cls] += piece.width;
+          else if (consumer.cls < 0 && from >= 0)
+            envBits[from] += piece.width;
+        }
+  }
 
   // The ungrouped schedule's modulo lower bound: no assignment's frame is
   // shorter (groups only add the crossings' latencies and spacing; the
@@ -9614,7 +9822,7 @@ LogicalResult StaticFolder::chooseGroups() {
   // Why candidates were pruned, for the message when none is left: by a
   // group's capacity, by an SLR boundary's link budget (and the least
   // overflow of a boundary seen, and which).
-  uint64_t prunedCapacity = 0, prunedBudget = 0;
+  uint64_t prunedCapacity = 0, prunedBudget = 0, prunedFar = 0;
   uint64_t leastOver = std::numeric_limits<uint64_t>::max();
   unsigned leastOverAt = 0;
   // Ranked by (the frame's bound from serialized crossings, at least the
@@ -9658,7 +9866,8 @@ LogicalResult StaticFolder::chooseGroups() {
           auto wires = [&](unsigned x, unsigned y) {
             return serialWires(x, bits[x][y]) + serialWires(y, bits[y][x]);
           };
-          uint64_t more = 0, bound2 = bound;
+          uint64_t more = slrLevelGroup >= 0 && int(g) != slrLevelGroup ? envBits[c] : 0;
+          uint64_t bound2 = bound;
           for (unsigned j = 0; j < k; ++j) {
             unsigned d = order[j];
             if (group[d] != int(g)) {
@@ -9667,6 +9876,23 @@ LogicalResult StaticFolder::chooseGroups() {
                 bound2 = std::max(bound2, serialBound(c));
               if (bits[d][c])
                 bound2 = std::max(bound2, serialBound(d));
+            }
+          }
+          // `slr-adjacent`: a link to a class placed more than one SLR away
+          // would cross an SLR it does not use (the level's group counts as a
+          // class's, slr-level-group).
+          if (slrAdjacent && !slrCapacitySpecs.empty()) {
+            bool far = slrLevelGroup >= 0 && envBits[c] &&
+                       (g > unsigned(slrLevelGroup) ? g - unsigned(slrLevelGroup)
+                                                    : unsigned(slrLevelGroup) - g) > 1;
+            for (unsigned j = 0; j < k && !far; ++j) {
+              unsigned d = order[j];
+              unsigned h = group[d];
+              far = (g > h ? g - h : h - g) > 1 && (bits[c][d] || bits[d][c]);
+            }
+            if (far) {
+              ++prunedFar;
+              continue;
             }
           }
           SmallVector<uint64_t> added(boundary.size(), 0);
@@ -9741,6 +9967,9 @@ LogicalResult StaticFolder::chooseGroups() {
                                                   std::to_string(leastOverAt + 1) + ")"
                                             : std::string())
                         : std::string())
+           << (slrAdjacent ? ", " + std::to_string(prunedFar) +
+                                 " with a link more than one SLR apart (slr-adjacent)"
+                           : std::string())
            << (visited > 20'000'000 ? "; the search stopped at 20,000,000 nodes" : "");
   }
 
@@ -12532,6 +12761,30 @@ static seq::FirRegOp keep(seq::FirRegOp reg) {
   return reg;
 }
 
+/// A register replicated into SLR group `g` (slr-group-own / -home): named
+/// for its group, without its original's inner symbol, and kept apart from
+/// its equals whatever its kind (synthesis merges equal registers across a
+/// flattened hierarchy).
+static void keepReplica(Operation *clone, unsigned g) {
+  clone->removeAttr("inner_sym");
+  auto *context = clone->getContext();
+  auto suffixed = [&](StringRef name) {
+    return StringAttr::get(context, name + "_g" + Twine(g));
+  };
+  if (auto reg = dyn_cast<seq::FirRegOp>(clone)) {
+    reg.setNameAttr(suffixed(reg.getName()));
+    keep(reg);
+    return;
+  }
+  if (!isa<seq::CompRegOp, seq::CompRegClockEnabledOp>(clone))
+    return;
+  if (auto name = clone->getAttrOfType<StringAttr>("name"))
+    clone->setAttr("name", suffixed(name.getValue()));
+  sv::addSVAttributes(clone, {sv::SVAttributeAttr::get(context, "keep",
+                                                       R"("true")",
+                                                       /*emitAsComment=*/false)});
+}
+
 /// `pp-sync-banks`: a PP bank (a memory read combinationally, its only read's
 /// address, enable and instance clock-enabled registers) whose threaded read
 /// is registered from those registers' next values: the data a host cycle
@@ -12552,6 +12805,17 @@ static void tagGroup(Operation *op, int group) {
   if (group >= 0 && !op->hasAttr(kSlrAttr))
     op->setAttr(kSlrAttr, IntegerAttr::get(
                               IntegerType::get(op->getContext(), 32), group));
+}
+
+/// physical-domains: the class whose domain an op of the simulator is built
+/// in (its copy, controls, the links read into it), until `extractDomains`
+/// moves it there. The first tag wins.
+static constexpr StringLiteral kDomAttr = "foldsim.dom";
+
+static void tagDomain(Operation *op, int cls) {
+  if (cls >= 0 && !op->hasAttr(kDomAttr))
+    op->setAttr(kDomAttr, IntegerAttr::get(
+                              IntegerType::get(op->getContext(), 32), cls));
 }
 
 static Value asBits(ImplicitLocOpBuilder &b, Value value) {
@@ -12770,13 +13034,25 @@ static std::pair<double, unsigned> landingPrices(uint64_t depth, unsigned width,
 /// 8K rows in 3 URAM288 and 24K in 9, against 2 and 6 cascaded, no LUTs
 /// either way; every copy of the A100-32 fold with such memories 1.48x its
 /// counted URAM).
+///
+/// The cascade is at most gUramCascadeMax URAM288 high (`uram-cascade-max`):
+/// a cascade is one vertical chain of a URAM column, and a longer one than the
+/// column's run of sites in the region cannot be placed (16 SMs, 11-14: the
+/// folded LMEM, 262,144 x 32, asked for 64; Vivado 2025.2 on the V80: 'no
+/// legal location to place the URAM chain with height 32' in SLR0, and 'too
+/// long to fit within a single clock region' -- hold risk -- where it could).
+/// A deeper memory is then built of several chains (Vivado muxes their
+/// reads), each at most that high: the same URAM288, a few LUTs more.
+static unsigned gUramCascadeMax = 8;
 static void setRamStyle(Operation *op, StringRef kind) {
   auto *context = op->getContext();
   unsigned cascade = 0;
   if (kind == "ultra")
     if (auto mem = dyn_cast<seq::FirMemOp>(op))
       if (mem.getType().getDepth() > 4096)
-        cascade = unsigned(llvm::divideCeil(mem.getType().getDepth(), 4096));
+        cascade = std::min<unsigned>(
+            unsigned(llvm::divideCeil(mem.getType().getDepth(), 4096)),
+            std::max(1u, gUramCascadeMax));
   sv::modifySVAttributes(op, [&](SmallVectorImpl<sv::SVAttributeAttr> &attrs) {
     llvm::erase_if(attrs, [](sv::SVAttributeAttr attr) {
       return attr.getName().getValue() == "ram_style" ||
@@ -21271,13 +21547,16 @@ LogicalResult StaticFolder::buildSim() {
   auto lastOp = [&]() -> Operation * {
     return body->empty() ? nullptr : &body->back();
   };
-  auto tagSince = [&](Operation *mark, int group) {
-    if (group < 0)
+  auto tagSince = [&](Operation *mark, int group, int cls = -1) {
+    int dom = physicalDomains ? cls : -1;
+    if (group < 0 && dom < 0)
       return;
     for (Operation *op = mark ? mark->getNextNode() : &body->front(); op;
          op = op->getNextNode())
-      if (!isa<hw::ConstantOp>(op))
+      if (!isa<hw::ConstantOp>(op)) {
         tagGroup(op, group);
+        tagDomain(op, dom);
+      }
   };
 
   // The frame's position three host cycles ahead: a slot, or `ii` between
@@ -21457,7 +21736,7 @@ LogicalResult StaticFolder::buildSim() {
           hw::ConstantOp::create(b, type, ii), hw::InnerSymAttr{},
           /*isAsync=*/false, b.getIntegerAttr(type, ii)));
       posCounters.addReg(sequencer[c], load);
-      tagSince(mark, controlGroup(c));
+      tagSince(mark, controlGroup(c), int(c));
     }
   }
   // Overlapped frames: a slot past the frame runs in the next frame's, for
@@ -21886,7 +22165,7 @@ LogicalResult StaticFolder::buildSim() {
         ctl.ppPrefSlot3 = byRank(pfSet, pfRank, pfSlotRow, pfValid, cls.ppSlotBits());
       }
     }
-    tagSince(controlMark, controlGroup(c));
+    tagSince(controlMark, controlGroup(c), int(c));
   }
 
   // The netlist's inputs: each token taken into a holding queue as it comes,
@@ -21955,11 +22234,9 @@ LogicalResult StaticFolder::buildSim() {
       return netlist.emitError("fold-ports-rows: needs a frame of at least 4 "
                                "host cycles (II ")
              << ii << ")";
-    for (unsigned port = 0; port < pf.ports; ++port)
-      for (unsigned p : pf.rspOf[port])
-        if (specOf[p] >= 0)
-          return netlist.emitError("fold-ports-rows: input '")
-                 << producers[p].name << "' is in a spec group";
+    // (A field in a spec group -- its environment offers a token for each
+    // value of the group's select -- keeps every offered value in its row;
+    // the frame's read picks the one its group's select chose, below.)
     unsigned cw = pf.chanWidth;
     rowsAddrWidth = cw + 2;
     Value chan = body->getArgument(rspPort + 1);
@@ -22153,7 +22430,7 @@ LogicalResult StaticFolder::buildSim() {
   }
   // The frame's input as a class's evaluation a host cycle ahead reads it:
   // in a slot past the frame, the frame before's.
-  std::map<std::pair<unsigned, int>, Value> prevFrameInputNext;
+  std::map<std::pair<unsigned, int>, Value> prevFrameInputNext, prevFrameInput;
   DenseMap<unsigned, Value> classTail1;
   // fold-ports-rows: input `p`'s field in the row of bundle `port` (a
   // value) and frame `row` (mod 4).
@@ -22177,19 +22454,74 @@ LogicalResult StaticFolder::buildSim() {
         b, rowsTail1(c),
         comb::SubOp::create(b, rowsFrameNext, constant(2, 1)), rowsFrameNext);
   };
+  // fold-ports-rows with spec groups: each group's select index as the
+  // frame loaded then has it (a host cycle ahead, as rowsFrameNext), and the
+  // frame's before (a slot past the frame reads that one's row).
+  // (Also the index of the frame loaded now, for reads at rowsFrame.)
+  struct RowsIndex {
+    Value frameNext, prevNext, frame;
+  };
+  DenseMap<unsigned, RowsIndex> rowsIndexOf;
+  auto rowsIndex = [&](unsigned g) -> RowsIndex & {
+    auto &e = rowsIndexOf[g];
+    if (!e.frameNext) {
+      Type t = groupIndex[g].getType();
+      auto frameNext = backedges.get(t), prevNext = backedges.get(t);
+      Value frame = reg(frameNext, "ports_rows_index" + Twine(g));
+      Value prev = reg(prevNext, "ports_rows_index_prev" + Twine(g));
+      Value fn = comb::MuxOp::create(b, load, groupIndex[g], frame);
+      Value pn = comb::MuxOp::create(b, load, frame, prev);
+      frameNext.setValue(fn);
+      prevNext.setValue(pn);
+      e = {fn, pn, frame};
+    }
+    return e;
+  };
+  auto rowsIndexFor = [&](unsigned g) -> std::pair<Value, Value> {
+    auto &e = rowsIndex(g);
+    return {e.frameNext, e.prevNext};
+  };
+  // The offered value a spec group's select chose, of a row of every value.
+  auto specPick = [&](unsigned p, Value all, Value index) -> Value {
+    unsigned w = producers[p].width;
+    SmallVector<Value> values;
+    for (unsigned v = specValues(); v-- > 0;)
+      values.push_back(comb::ExtractOp::create(b, b.getIntegerType(w), all, v * w));
+    if (specDepth == 1)
+      return comb::MuxOp::create(b, index, values[0], values[1]);
+    return hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, values), index);
+  };
+  // fold-ports-rows: a folded input's value in the frame loaded now (what
+  // frameInput holds otherwise): its row at rowsFrame, the offered value its
+  // spec group chose.
+  auto rowsFrameValue = [&](unsigned p) -> Value {
+    Value all = rowsRead(p, constant(pf.chanWidth, pf.producerPort[p]), rowsFrame);
+    return specOf[p] < 0 ? all : specPick(p, all, rowsIndex(specOf[p]).frame);
+  };
   auto frameInputFor = [&](unsigned p, unsigned c) -> Value {
-    if (portRows && folded(p))
-      return rowsRead(p, constant(pf.chanWidth, pf.producerPort[p]),
-                      rowsRowFor(c));
+    if (portRows && folded(p)) {
+      Value all = rowsRead(p, constant(pf.chanWidth, pf.producerPort[p]),
+                           rowsRowFor(c));
+      if (specOf[p] < 0)
+        return all;
+      auto [indexFrame, indexPrev] = rowsIndexFor(specOf[p]);
+      Value index = readCtl(c).tail2
+                        ? Value(comb::MuxOp::create(b, rowsTail1(c), indexPrev,
+                                                    indexFrame))
+                        : indexFrame;
+      return specPick(p, all, index);
+    }
     if (!readCtl(c).tail2)
       return frameInputNext[p];
     // One per SLR group, in the group.
-    Value &prevNext = prevFrameInputNext[{p, slrOf.empty() ? -1 : slrOf[c]}];
+    std::pair<unsigned, int> key{p, slrOf.empty() ? -1 : slrOf[c]};
+    Value &prevNext = prevFrameInputNext[key];
     if (!prevNext) {
       auto next = backedges.get(frameInput[p].getType());
       Value prev = reg(next, producers[p].name + "_prev");
       prevNext = comb::MuxOp::create(b, load, frameInput[p], prev);
       next.setValue(prevNext);
+      prevFrameInput[key] = prev;
     }
     Value &tail1 = classTail1[c];
     if (!tail1)
@@ -22496,6 +22828,8 @@ LogicalResult StaticFolder::buildSim() {
                                        operands);
     if (!slrOf.empty())
       tagGroup(copies[c], slrOf[c]);
+    if (physicalDomains)
+      tagDomain(copies[c], int(c));
   }
 
   // Groups of links, each with its own copy of its producer's controls and of
@@ -22715,11 +23049,15 @@ LogicalResult StaticFolder::buildSim() {
         if (!registered) {
           if (auto *op = data.getDefiningOp())
             tagGroup(op, slrOf[c]);
+          if (auto *op = data.getDefiningOp(); op && physicalDomains)
+            tagDomain(op, int(c));
           std::string crossName = producer.name + "_slr" + std::to_string(to) +
                                   "_" + std::to_string(low + at);
           if (serial <= 1) {
             registered = copyReg(data, crossName);
             tagGroup(registered.getDefiningOp(), slrOf[c]);
+            if (physicalDomains)
+              tagDomain(registered.getDefiningOp(), int(c));
           } else {
             // slr-serialize: the producer's group holds the bits of its
             // pass (host cycle T) and sends chunk j of them in a register
@@ -22765,8 +23103,11 @@ LogicalResult StaticFolder::buildSim() {
               next = comb::MuxOp::create(b, step[j + 1], chunk(hold, j), next);
             Value sent = copyReg(next, crossName);
             for (auto *op = mark->getNextNode(); op; op = op->getNextNode())
-              if (!isa<hw::ConstantOp>(op))
+              if (!isa<hw::ConstantOp>(op)) {
                 tagGroup(op, slrOf[c]);
+                if (physicalDomains)
+                  tagDomain(op, int(c));
+              }
             // The reader's side (tagged with the reader's group by the
             // input): chunk j shifted k - 1 - j times.
             SmallVector<Value> parts{sent};
@@ -23799,6 +24140,9 @@ LogicalResult StaticFolder::buildSim() {
     return box.lanes.back().out;
   };
 
+  // Element inputs' link reads of a single-instance producer, by (producer,
+  // low, width, reader class): one link for all of a class's element inputs.
+  std::map<std::tuple<unsigned, unsigned, unsigned, unsigned>, Value> indexLinkReads;
   // Each model input: its pieces at positions common to every instance; at
   // each, the sources the instances take it from, each read at the slot's
   // instance's producer instance, chosen by the instance, into the read
@@ -23814,16 +24158,272 @@ LogicalResult StaticFolder::buildSim() {
     unsigned threads = cls.threads();
     int to = slrOf.empty() ? -1 : slrOf[c];
     // What this input builds is in its class's SLR group, but for the
-    // producers' registers of links from other groups.
+    // producers' registers of links from other groups (tagged before);
+    // physical-domains: in its class's domain likewise.
     Operation *mark = body->empty() ? nullptr : &body->back();
     llvm::scope_exit tagBuilt([&] {
-      if (to < 0)
+      if (to < 0 && !physicalDomains)
         return;
       for (auto *op = mark ? mark->getNextNode() : &body->front(); op;
            op = op->getNextNode())
-        if (!isa<hw::ConstantOp>(op))
+        if (!isa<hw::ConstantOp>(op)) {
           tagGroup(op, to);
+          if (physicalDomains)
+            tagDomain(op, int(c));
+        }
     });
+    // A ghost of an element input: built by the element input.
+    if (consumer.ghostOf >= 0)
+      continue;
+    // An element input (foldsim-index-class-inputs): the element at the
+    // index the instance's evaluation computes, read in the host cycle of the
+    // evaluation (the copy's index output, through no register, back into
+    // its input), as the read register would hold it then. Each piece of
+    // the elements: one field of the folded bundles' rows, read at the
+    // index's bundle (fold-ports-rows); a table of constants; or else a
+    // choice, by the instance and the index, of constants, the frame's
+    // inputs and class outputs' links -- each link read in this host cycle
+    // at the producer instance the instance and the index name (one read
+    // per producer port and bits), at the bank and entry the read register
+    // would have read a host cycle ahead, registered: a write landing in
+    // between is one the read register's forward takes too.
+    if (consumer.indexOutput >= 0) {
+      if (cls.stages || cls.pp || cls.page || cls.folding)
+        return cls.instances[0].emitError(
+            "an element input read at an index (foldsim-index-class-inputs) "
+            "of a staged, paged, pass-partitioned or pipeline-folded class "
+            "(not supported: its index comes out after its input is read)");
+      Value index = asBits(b, copies[c].getResult(consumer.indexOutput));
+      auto choose = [&](ArrayRef<Value> values) -> Value {
+        if (llvm::all_of(values, [&](Value v) { return v == values[0]; }))
+          return values[0];
+        return hw::ArrayGetOp::create(
+            b, hw::ArrayCreateOp::create(
+                   b, SmallVector<Value>(values.rbegin(), values.rend())),
+            index);
+      };
+      auto &all = consumer.instElements;
+      auto &elements = consumer.elements;
+      unsigned n = elements.size();
+      std::set<unsigned> ends{consumer.width};
+      for (auto &elems : all)
+        for (auto &pieces : elems) {
+          unsigned end = 0;
+          for (auto &piece : pieces)
+            ends.insert(end += piece.width);
+        }
+      auto elementAt = [&](unsigned i, unsigned e, unsigned at) {
+        unsigned base = 0;
+        for (auto &piece : all[i][e]) {
+          if (at < base + piece.width)
+            return std::make_pair(&piece, at - base);
+          base += piece.width;
+        }
+        llvm_unreachable("a bit not covered by a piece");
+      };
+      // A table of the instance now and the index: rows[i][e], `w` bits.
+      auto table2 = [&](ArrayRef<SmallVector<uint64_t>> rows, unsigned w) -> Value {
+        bool uniform = llvm::all_of(rows, [&](auto &r) { return r == rows[0]; });
+        SmallVector<Value> cols;
+        for (unsigned e = 0; e < n; ++e) {
+          if (uniform) {
+            cols.push_back(constant(w, rows[0][e]));
+            continue;
+          }
+          SmallVector<uint64_t> column;
+          for (auto &r : rows)
+            column.push_back(r[e]);
+          cols.push_back(table(b, ctl.inst, column, w));
+        }
+        return choose(cols);
+      };
+      // The evaluation's host cycle: the frame's row, its tail bit and
+      // each spec group's index, a register of the read-ahead's.
+      Value rowNow, tailNow, bankNow;
+      std::map<unsigned, Value> specNow;
+      auto tail = [&]() -> Value {
+        if (!tailNow)
+          tailNow = reg(rowsTail1(c), cls.name + "_tail0");
+        return tailNow;
+      };
+      auto frameNow = [&](unsigned p) -> Value {
+        if (portRows && folded(p))
+          return classFrameInput(p, c);
+        if (!readCtl(c).tail2)
+          return frameInput[p];
+        frameInputFor(p, c);
+        Value prev = prevFrameInput[{p, slrOf.empty() ? -1 : slrOf[c]}];
+        return comb::MuxOp::create(b, tail(), prev, frameInput[p]);
+      };
+      // A link's bank now: the read register's (parity and tail a host
+      // cycle ahead), registered.
+      auto bank = [&]() -> Value {
+        if (!bankNow) {
+          std::string name = consumer.name + "_index_parity";
+          bankNow = copyReg(copyReg(par2, name + "1"), name + "0");
+          if (ctl.tail2)
+            bankNow = comb::XorOp::create(
+                b, bankNow,
+                copyReg(copyReg(ctl.tail2, name + "_tail1"), name + "_tail0"));
+        }
+        return bankNow;
+      };
+      SmallVector<Value> segments;
+      unsigned at = 0;
+      for (unsigned end : ends) {
+        if (end == at)
+          continue;
+        unsigned width = end - at;
+        SmallVector<const Piece *> piece(n);
+        SmallVector<unsigned> offset(n);
+        for (unsigned e = 0; e < n; ++e)
+          std::tie(piece[e], offset[e]) = elementAt(0, e, at);
+        bool rows =
+            consumer.sameElements && portRows &&
+            llvm::all_of(llvm::seq<unsigned>(0, n), [&](unsigned e) {
+              int p = piece[e]->producer, p0 = piece[0]->producer;
+              return p >= 0 && producers[p].cls < 0 && folded(p) &&
+                     pf.producerField[p] == pf.producerField[p0] &&
+                     piece[e]->low + offset[e] == piece[0]->low + offset[0] &&
+                     (specOf[p] < 0) == (specOf[p0] < 0);
+            });
+        if (rows) {
+          if (!rowNow)
+            rowNow = reg(rowsRowFor(c), cls.name + "_rows_row0");
+          unsigned p0 = piece[0]->producer;
+          SmallVector<Value> ports, specs;
+          for (unsigned e = 0; e < n; ++e) {
+            unsigned p = piece[e]->producer;
+            ports.push_back(constant(pf.chanWidth, pf.producerPort[p]));
+            if (specOf[p] < 0)
+              continue;
+            unsigned g = specOf[p];
+            Value &now = specNow[g];
+            if (!now) {
+              auto [indexFrame, indexPrev] = rowsIndexFor(g);
+              Value ahead = readCtl(c).tail2
+                                ? Value(comb::MuxOp::create(b, rowsTail1(c),
+                                                            indexPrev, indexFrame))
+                                : indexFrame;
+              now = reg(ahead, cls.name + "_rows_index0_" + Twine(g));
+            }
+            specs.push_back(now);
+          }
+          Value all = rowsRead(p0, choose(ports), rowNow);
+          Value value = specOf[p0] < 0 ? all : specPick(p0, all, choose(specs));
+          segments.push_back(b.createOrFold<comb::ExtractOp>(
+              b.getIntegerType(width), value, piece[0]->low + offset[0]));
+          ++indexedRows;
+          at = end;
+          continue;
+        }
+        // Each instance's source at each index: a constant (by value), a
+        // frame input's bits, or a class output's bits (by producer port and
+        // bits). A producer port's bits are read from one link of the span
+        // they cover (its entry the producer instance the instance and the
+        // index name), the bits then chosen: one link per port and reader,
+        // shared by the class's element inputs where it has one instance.
+        SmallVector<Value> values;
+        std::map<std::string, unsigned> constIndex;
+        std::map<std::pair<unsigned, unsigned>, unsigned> frameIndex, linkIndex;
+        struct PortRead {
+          unsigned lo = ~0u, hi = 0;
+          SmallVector<SmallVector<uint64_t>> rows;
+        };
+        std::map<unsigned, PortRead> portReads;
+        SmallVector<SmallVector<uint64_t>> sel(all.size(), SmallVector<uint64_t>(n, 0));
+        bool anyFrame = false, anyLink = false;
+        for (unsigned i = 0; i < all.size(); ++i)
+          for (unsigned e = 0; e < n; ++e) {
+            auto [x, off] = elementAt(i, e, at);
+            if (x->producer < 0) {
+              APInt v = x->constant.extractBits(width, off);
+              std::string key = llvm::toString(v, 16, false);
+              auto [it, fresh] = constIndex.try_emplace(key, values.size());
+              if (fresh)
+                values.push_back(hw::ConstantOp::create(b, v));
+              sel[i][e] = it->second;
+              continue;
+            }
+            unsigned p = x->producer, low = x->low + off;
+            if (producers[p].cls < 0) {
+              auto [it, fresh] = frameIndex.try_emplace({p, low}, values.size());
+              if (fresh)
+                values.push_back(b.createOrFold<comb::ExtractOp>(
+                    b.getIntegerType(width), frameNow(p), low));
+              sel[i][e] = it->second;
+              anyFrame = true;
+              continue;
+            }
+            auto [it, fresh] = linkIndex.try_emplace({p, low}, values.size());
+            if (fresh)
+              values.push_back(Value());
+            auto &pr = portReads[p];
+            if (pr.rows.empty())
+              pr.rows.assign(all.size(), SmallVector<uint64_t>(n, 0));
+            pr.lo = std::min(pr.lo, low);
+            pr.hi = std::max(pr.hi, low + width);
+            pr.rows[i][e] = x->inst;
+            sel[i][e] = it->second;
+            anyLink = true;
+          }
+        for (auto &[p, pr] : portReads) {
+          auto &producer = producers[p];
+          unsigned pThreads = classes[producer.cls].threads();
+          Value word;
+          std::tuple<unsigned, unsigned, unsigned, unsigned> cacheKey{
+              p, pr.lo, pr.hi - pr.lo, c};
+          if (pThreads <= 1)
+            if (auto hit = indexLinkReads.find(cacheKey); hit != indexLinkReads.end())
+              word = hit->second;
+          if (!word) {
+            Value address;
+            if (pThreads > 1)
+              address = table2(pr.rows, llvm::Log2_32_Ceil(pThreads));
+            word = linkRead(p, pr.lo, pr.hi - pr.lo, [&]() { return address; },
+                            bank,
+                            producer.name + "_to_" + consumer.name + "_ix" +
+                                Twine(at),
+                            to);
+            ++indexedLinks;
+            if (pThreads <= 1)
+              indexLinkReads[cacheKey] = word;
+          }
+          for (auto &[key, idx] : linkIndex)
+            if (key.first == p)
+              values[idx] = b.createOrFold<comb::ExtractOp>(
+                  b.getIntegerType(width), word, key.second - pr.lo);
+        }
+        if (values.size() == 1) {
+          segments.push_back(values[0]);
+        } else {
+          unsigned sw = llvm::Log2_32_Ceil(values.size());
+          while (values.size() < (1u << sw))
+            values.push_back(values[0]);
+          Value which = table2(sel, sw);
+          segments.push_back(hw::ArrayGetOp::create(
+              b, hw::ArrayCreateOp::create(
+                     b, SmallVector<Value>(values.rbegin(), values.rend())),
+              which));
+        }
+        if (anyFrame)
+          ++indexedChoices;
+        else if (!anyLink)
+          ++indexedTables;
+        at = end;
+      }
+      Value value = segments.size() == 1
+                        ? segments[0]
+                        : b.createOrFold<comb::ConcatOp>(
+                              SmallVector<Value>(segments.rbegin(), segments.rend()));
+      unsigned argIndex = 0;
+      for (unsigned i = 0; i < consumer.port; ++i)
+        if (int(i) != cls.clockInput)
+          ++argIndex;
+      copyInputs[c][argIndex].setValue(
+          b.createOrFold<hw::BitcastOp>(cls.inputTypes[consumer.port], value));
+      continue;
+    }
     std::set<unsigned> cuts{consumer.width};
     for (auto &pieces : consumer.pieces) {
       unsigned at = 0;
@@ -24686,10 +25286,35 @@ LogicalResult StaticFolder::buildSim() {
           rows[i] = pf.producerPort[sourceOf[i].first];
         Value bundle = copyReg(table(b, ctl.inst2, rows, pf.chanWidth),
                                consumer.name + "_bundle" + Twine(at));
-        data = b.createOrFold<comb::ExtractOp>(
-            b.getIntegerType(width),
-            rowsRead(first.first, bundle, rowsRowFor(c)),
-            first.second);
+        Value row = rowsRead(first.first, bundle, rowsRowFor(c));
+        if (specOf[first.first] >= 0) {
+          // Each bundle's field in its own spec group: the read bundle's
+          // group index picks the offered value its select chose.
+          unsigned field = pf.producerField[first.first];
+          SmallVector<Value> nows, prevs;
+          for (unsigned port = (1u << pf.chanWidth); port-- > 0;) {
+            int g = -1;
+            if (port < pf.ports)
+              for (unsigned q : pf.rspOf[port])
+                if (pf.producerField[q] == field)
+                  g = specOf[q];
+            if (g < 0)
+              g = specOf[first.first];
+            auto [now, prev] = rowsIndexFor(unsigned(g));
+            nows.push_back(now);
+            prevs.push_back(prev);
+          }
+          Value index = hw::ArrayGetOp::create(
+              b, hw::ArrayCreateOp::create(b, nows), bundle);
+          if (readCtl(c).tail2)
+            index = comb::MuxOp::create(
+                b, rowsTail1(c),
+                hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, prevs), bundle),
+                index);
+          row = specPick(first.first, row, index);
+        }
+        data = b.createOrFold<comb::ExtractOp>(b.getIntegerType(width), row,
+                                               first.second);
       } else if (sources.size() > 1) {
         SmallVector<uint64_t> rows(threads, 0);
         for (unsigned i = 0; i < threads; ++i)
@@ -25015,11 +25640,19 @@ LogicalResult StaticFolder::buildSim() {
       }
       lanes += box.lanes.size();
       banked += bank;
-      if (box.to >= 0)
+      // (physical-domains: a mailbox is its producer's output store, in its
+      // producer's domain: every lane has the same producer class.)
+      int boxDom = physicalDomains ? int(producers[box.lanes[0].producer].cls) : -1;
+      for (auto &lane : box.lanes)
+        if (int(producers[lane.producer].cls) != boxDom)
+          boxDom = -1;
+      if (box.to >= 0 || boxDom >= 0)
         for (auto *op = mark ? mark->getNextNode() : &body->front(); op;
              op = op->getNextNode())
-          if (!isa<hw::ConstantOp>(op))
+          if (!isa<hw::ConstantOp>(op)) {
             tagGroup(op, box.to);
+            tagDomain(op, boxDom);
+          }
     }
     llvm::raw_string_ostream os(mailboxReport);
     os << "  csf mailboxes: " << mailboxes.size() << " (" << banked
@@ -25053,6 +25686,10 @@ LogicalResult StaticFolder::buildSim() {
       os << "; staged " << stagedReads;
     if (stagedLinkDirect)
       os << " (read in place " << stagedDirectReads << ")";
+    if (indexedInputs)
+      os << "; indexed inputs " << indexedInputs << " (" << indexedRows
+         << " rows, " << indexedTables << " tables, " << indexedChoices
+         << " choices, " << indexedLinks << " link reads)";
     if (dropDeadInputs)
       os << "; dead inputs " << deadInputs << " + " << partlyDeadInputs
          << " in part (" << deadInputBits << " bits, no link)";
@@ -25109,7 +25746,11 @@ LogicalResult StaticFolder::buildSim() {
   for (auto [k, consumer] : llvm::enumerate(consumers)) {
     if (consumer.cls >= 0)
       continue;
-    if (portRowsReq && foldedOut(k))
+    // (With fold-ports-rows a folded output is built with the request rows
+    // below; a spec group's select output is also read here, for its
+    // group's select register alone.)
+    bool selectOnly = portRowsReq && foldedOut(k);
+    if (selectOnly && specSelect[k] < 0)
       continue;
     SmallVector<Value> bits;
     for (auto &piece : consumer.pieces[0]) {
@@ -25120,10 +25761,7 @@ LogicalResult StaticFolder::buildSim() {
       auto &producer = producers[piece.producer];
       if (producer.cls < 0) {
         Value in = portRows && folded(piece.producer)
-                       ? rowsRead(piece.producer,
-                                  constant(pf.chanWidth,
-                                           pf.producerPort[piece.producer]),
-                                  rowsFrame)
+                       ? rowsFrameValue(piece.producer)
                        : frameInput[piece.producer];
         bits.push_back(b.createOrFold<comb::ExtractOp>(
             b.getIntegerType(piece.width), in, piece.low));
@@ -25161,9 +25799,12 @@ LogicalResult StaticFolder::buildSim() {
       auto selNext = backedges.get(i1);
       Value sel = resetReg(selNext, consumer.name + "_select", 0);
       selNext.setValue(comb::MuxOp::create(b, push, data, sel));
+      unsigned v = specGroups[g].valid;
       groupSelect[g].setValue(comb::AndOp::create(
-          b, frameInput[specGroups[g].valid], sel));
+          b, portRows && folded(v) ? rowsFrameValue(v) : frameInput[v], sel));
     }
+    if (selectOnly)
+      continue;
     Value readyIn = foldedOut(k) ? Value(reqSent[pf.consumerPort[k]])
                                  : body->getArgument(outputReady[k]);
     uint64_t initCount = outputEarly[k] ? 1 : 0;
@@ -27494,6 +28135,57 @@ LogicalResult StaticFolder::extractGroups() {
   // A closure of more than slrGroupOwn ops is left in the level (reported;
   // slr-group-local may still clone its logic). Replicas are kept apart
   // from their originals (`keep`), as synthesis would merge equal registers.
+  // A level memory a group reads (fold-ports-rows' response rows: written by
+  // the level, read by the classes in their groups) cannot be a port of the
+  // group's module: each group that reads it gets its own copy, with the
+  // memory's write ports (the same writes, so the same contents in every
+  // host cycle); the level keeps it for its own reads. With slr-group-own the
+  // writes' operands are then owned like any other the group reads.
+  {
+    DenseSet<Operation *> grouped;
+    for (auto &ops : opsOf)
+      grouped.insert(ops.begin(), ops.end());
+    unsigned copied = 0;
+    for (unsigned g = 0; g < slrGroups; ++g) {
+      DenseMap<Operation *, Operation *> copyOf;
+      OpBuilder mb(body->getTerminator());
+      for (unsigned i = 0, e = opsOf[g].size(); i < e; ++i) {
+        auto read = dyn_cast<seq::FirMemReadOp>(opsOf[g][i]);
+        if (!read)
+          continue;
+        auto mem = read.getMemory().getDefiningOp<seq::FirMemOp>();
+        if (!mem || mem->getBlock() != body || grouped.contains(mem))
+          continue;
+        Operation *&copy = copyOf[mem];
+        if (!copy) {
+          copy = mb.clone(*mem);
+          copy->removeAttr("inner_sym");
+          if (auto name = copy->getAttrOfType<StringAttr>("name"))
+            copy->setAttr("name", StringAttr::get(context, name.getValue() + "_g" + Twine(g)));
+          opsOf[g].push_back(copy);
+          for (auto *user : mem->getUsers())
+            if (isa<seq::FirMemWriteOp>(user)) {
+              auto *w = mb.clone(*user);
+              w->setOperand(0, copy->getResult(0));
+              opsOf[g].push_back(w);
+            }
+          ++copied;
+        }
+        read->setOperand(0, copy->getResult(0));
+      }
+    }
+    if (copied)
+      llvm::errs() << "foldsim-fold-static: " << copied
+                   << " level memories copied into the groups that read them\n";
+  }
+  // `slr-group-cut`: the values whose closure is past the limit, by value,
+  // with each reading group's register of them.
+  struct Cut {
+    std::string name;
+    SmallVector<std::pair<unsigned, seq::FirRegOp>> regs;
+  };
+  llvm::MapVector<Value, Cut> cuts;
+  unsigned cutLogic = 0;
   if (slrGroupOwn) {
     DenseSet<Operation *> inGroups;
     for (auto &ops : opsOf)
@@ -27517,6 +28209,7 @@ LogicalResult StaticFolder::extractGroups() {
       return isLevelReg(op) || isLevelLogic(op);
     };
     unsigned replicatedRegs = 0, replicatedOps = 0, left = 0;
+    std::set<std::string> leftRoots;
     // `slr-group-home`: a level register whose next-value logic (the
     // level's logic back to registers, ports and instances) reads, through
     // at least one op, more outputs of one group's instances than of all
@@ -27537,7 +28230,8 @@ LogicalResult StaticFolder::extractGroups() {
             groupOf[op] = g;
       SmallVector<std::pair<Operation *, unsigned>> moves;
       for (auto &op : body->without_terminator()) {
-        if (!isLevelReg(&op))
+        // (A register with an inner symbol stays: something may refer to it.)
+        if (!isLevelReg(&op) || op.hasAttr("inner_sym"))
           continue;
         // The instance outputs the next value reads, by group (each output
         // once). The frame decision every register's next value may read
@@ -27587,11 +28281,7 @@ LogicalResult StaticFolder::extractGroups() {
       OpBuilder hb(body->getTerminator());
       for (auto [op, g] : moves) {
         auto *clone = hb.clone(*op);
-        clone->removeAttr("inner_sym");
-        if (auto reg = dyn_cast<seq::FirRegOp>(clone)) {
-          reg.setNameAttr(hb.getStringAttr(reg.getName() + "_g" + Twine(g)));
-          keep(reg);
-        }
+        keepReplica(clone, g);
         op->getResult(0).replaceAllUsesWith(clone->getResult(0));
         op->erase();
         opsOf[g].push_back(clone);
@@ -27626,17 +28316,85 @@ LogicalResult StaticFolder::extractGroups() {
         }
         return order;
       };
+      // (Values whose closure is past the limit: tried once a group.)
+      DenseSet<Value> tooLarge;
       for (unsigned i = 0; i < opsOf[g].size(); ++i) {
         Operation *user = opsOf[g][i];
         for (auto &operand : user->getOpOperands()) {
           Value value = operand.get();
           auto *def = value.getDefiningOp();
-          if (!ownable(def))
+          if (!ownable(def) || tooLarge.contains(value))
             continue;
           if (!local.count(value)) {
             auto order = closure(def);
+            static const bool ownLog = getenv("FOLDSIM_OWN_LOG");
+            if (ownLog && order.size() > 512) {
+              std::map<std::string, unsigned> regs;
+              for (auto *op : order)
+                if (auto r = dyn_cast<seq::FirRegOp>(op)) {
+                  std::string n = r.getName().str();
+                  for (auto &ch : n)
+                    if (isdigit(ch))
+                      ch = '#';
+                  ++regs[n.substr(0, 40)];
+                }
+              llvm::errs() << "slr-group-own closure g" << g << " " << order.size() << " ops, root "
+                           << (isa<seq::FirRegOp>(def) ? cast<seq::FirRegOp>(def).getName() : def->getName().getStringRef())
+                           << ":";
+              unsigned k = 0;
+              for (auto &[n, c] : regs)
+                if (k++ < 12)
+                  llvm::errs() << " " << n << " x" << c;
+              llvm::errs() << "\n";
+            }
+            // `slr-group-cut`: logic is cloned into the group, an op at a
+            // time (its operands are the group's reads in turn), so that
+            // the cut falls on the level's registers: a register's lead is
+            // its next-value logic composed twice, a logic value's would
+            // add the value's own cone (the frame decision's AND of every
+            // port's tokens) on top, past the timing screen.
+            if (order.empty() && slrGroupCut && isLevelLogic(def) &&
+                def->getNumResults() == 1) {
+              auto *clone = cb.clone(*def);
+              clone->removeAttr("inner_sym");
+              local[value] = clone->getResult(0);
+              opsOf[g].push_back(clone);
+              inGroups.insert(clone);
+              ++cutLogic;
+              operand.set(clone->getResult(0));
+              continue;
+            }
+            // A register: the group takes it from a register of its own,
+            // loaded below (once the level's reset is in place) from a
+            // level register of its value two host cycles ahead.
+            if (order.empty() && slrGroupCut && hw::getBitWidth(value.getType()) > 0 &&
+                isa<IntegerType>(value.getType())) {
+              Location loc = simModule.getLoc();
+              auto &entry = cuts[value];
+              if (entry.name.empty()) {
+                entry.name = isa<seq::FirRegOp>(def) ? cast<seq::FirRegOp>(def).getName().str()
+                                                     : "cut" + std::to_string(cuts.size() - 1);
+              }
+              auto zero = hw::ConstantOp::create(cb, loc, value.getType(), 0);
+              auto reg = seq::FirRegOp::create(
+                  cb, loc, zero, body->getArgument(0),
+                  cb.getStringAttr(entry.name + "_cut_g" + Twine(g)));
+              keep(reg);
+              entry.regs.push_back({g, reg});
+              opsOf[g].push_back(reg);
+              inGroups.insert(reg);
+              local[value] = reg;
+              operand.set(reg);
+              continue;
+            }
             if (order.empty()) {
+              tooLarge.insert(value);
               ++left;
+              if (leftRoots.size() < 8) {
+                std::string n = isa<seq::FirRegOp>(def) ? cast<seq::FirRegOp>(def).getName().str()
+                                                        : def->getName().getStringRef().str();
+                leftRoots.insert(n);
+              }
               continue;
             }
             // Clone first (a register's cone may read the register), then
@@ -27646,11 +28404,7 @@ LogicalResult StaticFolder::extractGroups() {
               if (local.count(op->getResult(0)))
                 continue;
               auto *clone = cb.clone(*op);
-              clone->removeAttr("inner_sym");
-              if (auto reg = dyn_cast<seq::FirRegOp>(clone)) {
-                reg.setNameAttr(cb.getStringAttr(reg.getName() + "_g" + Twine(g)));
-                keep(reg);
-              }
+              keepReplica(clone, g);
               if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(clone))
                 ++replicatedRegs;
               else
@@ -27676,6 +28430,18 @@ LogicalResult StaticFolder::extractGroups() {
                  << " level ops replicated into groups, " << left
                  << " closures left in the level (past " << slrGroupOwn
                  << " ops)\n";
+    if (left) {
+      // A closure past the limit is not owned: the level's control it reads
+      // still fans out over the groups, unregistered (the locality check
+      // refuses it, L3). Never silent.
+      llvm::errs() << "foldsim-fold-static: warning: slr-group-own: " << left
+                   << " closures past " << slrGroupOwn
+                   << " ops stay in the level: the level control they read fans out over the "
+                      "SLR groups unregistered (roots:";
+      for (auto &n : leftRoots)
+        llvm::errs() << " " << n;
+      llvm::errs() << ")\n";
+    }
   }
   // `slr-group-local`: a group's operand that the level computes with logic
   // (not a register, memory, instance, constant or port) is computed in the
@@ -27814,6 +28580,260 @@ LogicalResult StaticFolder::extractGroups() {
                                                 operand, running));
     }
   }
+  // `slr-group-cut` (S26X, a32-S26X-C3): a value V a group reads whose
+  // closure is past slr-group-own's limit. Its lead L2(V) -- V two host
+  // cycles ahead -- is built in the level by the next-value rule applied
+  // twice: Lk(register r) = mux(L(k-1)(reset), L(k-1)(reset value),
+  // L(k-1)(next)) (a clock enable as a mux to L(k-1)(r)), Lk(logic f(a, ..))
+  // = f(Lk(a), ..), L0(x) = x, constants their own lead. A level register S
+  // takes L2(V); each reading group's register G takes S:
+  // G(t) = S(t-1) = L2(V)(t-2) = V(t). One copy of the cone (in the level),
+  // a register a group, both ends of the crossing registered; no value or
+  // host cycle moves. It runs after the reset is in place: the level's reset
+  // register (slr-group-reset; with slr-group-env two of them) is what lets a
+  // register's lead read the reset a host cycle ahead. A lead that reaches a
+  // port, an instance output, a memory read or a group's value before its
+  // last register stage is not built: the group reads V as it is (reported).
+  // FOLDSIM_CUT_LEAD (a test hook): another lead (1: a mutant one host cycle
+  // late).
+  if (!cuts.empty()) {
+    DenseSet<Operation *> grouped;
+    for (auto &ops : opsOf)
+      grouped.insert(ops.begin(), ops.end());
+    auto isLevelOp = [&](Operation *op) {
+      return op->getBlock() == body && !grouped.contains(op);
+    };
+    auto isLevelLogicOp = [&](Operation *op) {
+      return isLevelOp(op) && op->getNumRegions() == 0 &&
+             !isa<hw::ConstantOp>(op) && !isa<hw::InstanceOp, hw::OutputOp>(op) &&
+             op->getDialect()->getNamespace() != "seq" &&
+             op->getDialect()->getNamespace() != "sv" &&
+             mlir::isMemoryEffectFree(op);
+    };
+    OpBuilder lb(body->getTerminator());
+    Location loc = simModule.getLoc();
+    unsigned lead = 2;
+    if (const char *e = getenv("FOLDSIM_CUT_LEAD"))
+      lead = std::max(1, atoi(e));
+    using Key = std::pair<Value, unsigned>;
+    DenseMap<Key, Value> memo;              // null: no lead
+    DenseMap<std::pair<Operation *, unsigned>, Operation *> clonedAt;
+    std::map<std::string, unsigned> why;    // the first leaf each failure met
+    std::map<std::string, std::string> whyExample;
+    uint64_t leadOps = 0;
+    constexpr uint64_t kMaxLeadOps = 4u << 20;
+    // A level register the leads read as it is, that also feeds the
+    // groups (an environment channel's first stage, the reset's): the leads
+    // read a copy of their own (the same next value and reset, kept apart),
+    // so the register's fanout over the SLRs stays registers only.
+    DenseMap<Value, Value> privateOf;
+    auto asIs = [&](Value v) -> Value {
+      auto *op = v.getDefiningOp();
+      if (!op || !isLevelOp(op) ||
+          !isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(op))
+        return v;
+      bool shared = v == resetIn || llvm::any_of(op->getUsers(), [&](Operation *u) {
+                      return grouped.contains(u);
+                    });
+      if (!shared)
+        return v;
+      Value &copy = privateOf[v];
+      if (!copy) {
+        auto *clone = lb.clone(*op);
+        clone->removeAttr("inner_sym");
+        if (auto reg = dyn_cast<seq::FirRegOp>(clone)) {
+          reg.setNameAttr(lb.getStringAttr(reg.getName() + "_leadsrc"));
+          keep(reg);
+        } else {
+          if (auto name = clone->getAttrOfType<StringAttr>("name"))
+            clone->setAttr("name", lb.getStringAttr(name.getValue() + "_leadsrc"));
+          sv::addSVAttributes(clone, {sv::SVAttributeAttr::get(context, "keep", R"("true")",
+                                                               /*emitAsComment=*/false)});
+        }
+        copy = clone->getResult(0);
+      }
+      return copy;
+    };
+    auto leadOf = [&](Value root, unsigned depth) -> Value {
+      struct Item {
+        Value value;
+        unsigned k;
+        bool expanded;
+      };
+      auto known = [&](Value v, unsigned k) { return k == 0 || memo.count({v, k}); };
+      auto get = [&](Value v, unsigned k) { return k == 0 ? asIs(v) : memo.lookup({v, k}); };
+      SmallVector<Item> stack{{root, depth, false}};
+      while (!stack.empty()) {
+        Item item = stack.pop_back_val();
+        Value v = item.value;
+        unsigned k = item.k;
+        if (!item.expanded && known(v, k))
+          continue;
+        Operation *op = v.getDefiningOp();
+        auto fail = [&](StringRef kind, const Twine &example) {
+          memo[{v, k}] = Value();
+          if (!why[kind.str()]++)
+            whyExample[kind.str()] = example.str();
+        };
+        if (!op) {
+          auto arg = cast<BlockArgument>(v);
+          fail("a port", simModule.getInputName(arg.getArgNumber()));
+          continue;
+        }
+        if (isa<hw::ConstantOp, hw::AggregateConstantOp>(op)) {
+          memo[{v, k}] = v;
+          continue;
+        }
+        // What the lead of v at k reads: (value, lead) pairs.
+        SmallVector<Key, 6> deps;
+        Value next, reset, resetValue, enable;
+        bool isReg = false;
+        if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
+          if (!isLevelOp(op) || reg.getIsAsync() || reg.getClk() != hostClock) {
+            fail(isLevelOp(op) ? "an async or other-clock register" : "a group's register",
+                 reg.getName());
+            continue;
+          }
+          isReg = true;
+          next = reg.getNext();
+          reset = reg.getReset();
+          resetValue = reg.getResetValue();
+        } else if (auto reg = dyn_cast<seq::CompRegOp>(op)) {
+          if (!isLevelOp(op) || reg.getClk() != hostClock) {
+            fail("a group's or other-clock register", reg.getName().value_or(""));
+            continue;
+          }
+          isReg = true;
+          next = reg.getInput();
+          reset = reg.getReset();
+          resetValue = reg.getResetValue();
+        } else if (auto reg = dyn_cast<seq::CompRegClockEnabledOp>(op)) {
+          if (!isLevelOp(op) || reg.getClk() != hostClock) {
+            fail("a group's or other-clock register", reg.getName().value_or(""));
+            continue;
+          }
+          isReg = true;
+          next = reg.getInput();
+          enable = reg.getClockEnable();
+          reset = reg.getReset();
+          resetValue = reg.getResetValue();
+        } else if (!isLevelLogicOp(op)) {
+          StringRef kind = isa<hw::InstanceOp>(op)          ? "an instance output"
+                           : isa<seq::FirMemReadOp>(op)     ? "a memory read"
+                           : !isLevelOp(op)                 ? "a group's value"
+                                                            : "an op of no lead";
+          fail(kind, op->getName().getStringRef());
+          continue;
+        }
+        if (isReg) {
+          deps.push_back({next, k - 1});
+          if (enable) {
+            deps.push_back({enable, k - 1});
+            deps.push_back({v, k - 1});
+          }
+          if (reset) {
+            deps.push_back({reset, k - 1});
+            deps.push_back({resetValue, k - 1});
+          }
+        } else {
+          for (Value o : op->getOperands())
+            deps.push_back({o, k});
+        }
+        if (!item.expanded) {
+          stack.push_back({v, k, true});
+          for (auto [d, dk] : deps)
+            if (!known(d, dk))
+              stack.push_back({d, dk, false});
+          continue;
+        }
+        if (llvm::any_of(deps, [&](Key d) { return !get(d.first, d.second); })) {
+          memo[{v, k}] = Value();
+          continue;
+        }
+        if (++leadOps > kMaxLeadOps) {
+          fail("the op limit", Twine(kMaxLeadOps));
+          continue;
+        }
+        if (isReg) {
+          Value r = get(next, k - 1);
+          if (enable)
+            r = comb::MuxOp::create(lb, loc, get(enable, k - 1), r, get(v, k - 1));
+          if (reset)
+            r = comb::MuxOp::create(lb, loc, get(reset, k - 1), get(resetValue, k - 1), r);
+          memo[{v, k}] = r;
+          continue;
+        }
+        bool same = llvm::all_of(op->getOperands(), [&](Value o) { return get(o, k) == o; });
+        if (same) {
+          memo[{v, k}] = v;
+          continue;
+        }
+        Operation *&clone = clonedAt[{op, k}];
+        if (!clone) {
+          IRMapping mapping;
+          for (Value o : op->getOperands())
+            mapping.map(o, get(o, k));
+          clone = lb.clone(*op, mapping);
+          clone->removeAttr("inner_sym");
+        }
+        memo[{v, k}] = clone->getResult(cast<OpResult>(v).getResultNumber());
+      }
+      return get(root, depth);
+    };
+    unsigned built = 0, failed = 0, groupRegs = 0;
+    uint64_t bits = 0;
+    std::vector<std::string> failedNames;
+    for (auto &[value, cut] : cuts) {
+      Value led = leadOf(value, lead);
+      if (!led) {
+        // The groups read the value as it is (as without the option).
+        ++failed;
+        if (failedNames.size() < 8)
+          failedNames.push_back(cut.name);
+        for (auto &[g, reg] : cut.regs) {
+          reg.getResult().replaceAllUsesWith(value);
+          llvm::erase(opsOf[g], reg.getOperation());
+          Operation *zero = reg.getNext().getDefiningOp();
+          reg.erase();
+          if (zero && zero->use_empty())
+            zero->erase();
+        }
+        continue;
+      }
+      auto source = keep(seq::FirRegOp::create(lb, loc, led, hostClock,
+                                               lb.getStringAttr(cut.name + "_lead")));
+      for (auto &[g, reg] : cut.regs) {
+        Operation *zero = reg.getNext().getDefiningOp();
+        reg.getNextMutable().assign(source);
+        if (zero && zero->use_empty()) {
+          llvm::erase(opsOf[g], zero);
+          zero->erase();
+        }
+        ++groupRegs;
+      }
+      ++built;
+      bits += hw::getBitWidth(value.getType());
+    }
+    llvm::errs() << "foldsim-fold-static: slr-group-cut: " << built
+                 << " values read by the groups from a lead-" << lead
+                 << " register (" << bits << " bits, " << groupRegs
+                 << " group registers, " << leadOps << " lead ops in the level; "
+                 << cutLogic << " level ops cloned into the groups before them)";
+    if (failed) {
+      llvm::errs() << ", " << failed << " without a lead (read as they are:";
+      for (auto &n : failedNames)
+        llvm::errs() << " " << n;
+      llvm::errs() << "; leaves:";
+      for (auto &[kind, n] : why)
+        llvm::errs() << " " << kind << " x" << n << " (" << whyExample[kind] << ")";
+      llvm::errs() << ")";
+    }
+    llvm::errs() << "\n";
+    if (failed)
+      llvm::errs() << "foldsim-fold-static: warning: slr-group-cut: " << failed
+                   << " values without a lead stay in the level: the level control "
+                      "they read fans out over the SLR groups unregistered\n";
+  }
   // A name for the port of a value: its op's name, if any.
   auto nameOf = [&](Value value) -> std::string {
     if (auto arg = dyn_cast<BlockArgument>(value))
@@ -27931,6 +28951,302 @@ LogicalResult StaticFolder::extractGroups() {
     for (auto *op : ops)
       op->erase();
   }
+  return success();
+}
+
+LogicalResult StaticFolder::extractDomains(hw::HWModuleOp mod, StringRef suffix) {
+  auto *context = top.getContext();
+  auto *body = mod.getBodyBlock();
+  // The classes whose copy is here: a copy instance (`<class>_copy`) tagged
+  // with its class. Ops tagged with a class whose copy is elsewhere (another
+  // SLR group's) stay in this module's own logic.
+  unsigned n = classes.size();
+  SmallVector<bool> present(n, false);
+  SmallVector<SmallVector<Operation *>> opsOf(n);
+  for (auto &op : body->without_terminator()) {
+    auto attr = op.getAttrOfType<IntegerAttr>(kDomAttr);
+    if (!attr)
+      continue;
+    int c = attr.getInt();
+    if (c < 0 || unsigned(c) >= n)
+      continue;
+    if (auto inst = dyn_cast<hw::InstanceOp>(op))
+      if (inst.getInstanceName() == classes[c].name + "_copy")
+        present[c] = true;
+  }
+  // domain-merge: a merged class present here has no domain of its own; its
+  // ops go to its nearest ancestor class that has one (or this module's own
+  // logic), and its child classes' domains nest there.
+  SmallVector<bool> hasDom(present);
+  for (unsigned c = 0; c < n; ++c)
+    if (present[c] && domainMerge.count(classes[c].name))
+      hasDom[c] = false;
+  auto host = [&](int c) {
+    for (int a = c; a >= 0; a = classes[a].parent)
+      if (hasDom[a])
+        return a;
+    return -1;
+  };
+  // Each op's domain class here (-1: this module's own logic).
+  DenseMap<Operation *, int> domOf;
+  for (auto &op : body->without_terminator()) {
+    auto attr = op.getAttrOfType<IntegerAttr>(kDomAttr);
+    if (!attr)
+      continue;
+    op.removeAttr(kDomAttr);
+    int c = attr.getInt();
+    if (c >= 0 && unsigned(c) < n && present[c])
+      if (int h = host(c); h >= 0)
+        domOf[&op] = h;
+  }
+  // A memory and its ports stay in one module (its handle is no value a port
+  // can carry): where they were built in different domains, all of them go to
+  // the domains' nearest common enclosing domain (or this module's logic).
+  auto ancestors = [&](int c) {
+    SmallVector<int> chain;
+    for (int a = c; a >= 0; a = classes[a].parent)
+      if (hasDom[a])
+        chain.push_back(a);
+    return chain;
+  };
+  unsigned memsMoved = 0;
+  for (auto &op : body->without_terminator()) {
+    auto mem = dyn_cast<seq::FirMemOp>(op);
+    if (!mem)
+      continue;
+    SmallVector<Operation *> group{&op};
+    for (auto *user : mem->getUsers())
+      if (user->getBlock() == body)
+        group.push_back(user);
+    auto domain = [&](Operation *o) {
+      auto it = domOf.find(o);
+      return it == domOf.end() ? -1 : it->second;
+    };
+    int first = domain(group[0]);
+    if (llvm::all_of(group, [&](Operation *o) { return domain(o) == first; }))
+      continue;
+    // The common chain: the first's ancestors present in every other's.
+    SmallVector<int> common = first >= 0 ? ancestors(first) : SmallVector<int>{};
+    for (auto *o : group) {
+      int d = domain(o);
+      SmallVector<int> mine = d >= 0 ? ancestors(d) : SmallVector<int>{};
+      llvm::erase_if(common, [&](int a) { return !llvm::is_contained(mine, a); });
+    }
+    int lca = common.empty() ? -1 : common.front();
+    for (auto *o : group) {
+      if (lca < 0)
+        domOf.erase(o);
+      else
+        domOf[o] = lca;
+    }
+    ++memsMoved;
+  }
+  for (auto &op : body->without_terminator())
+    if (auto it = domOf.find(&op); it != domOf.end())
+      opsOf[it->second].push_back(&op);
+  // Each present class's domain parent: its nearest ancestor class present
+  // here (-1: a domain root of this module).
+  auto domParent = [&](unsigned c) -> int {
+    for (int a = classes[c].parent; a >= 0; a = classes[a].parent)
+      if (hasDom[a])
+        return a;
+    return -1;
+  };
+  SmallVector<unsigned> order;
+  for (unsigned c = 0; c < n; ++c)
+    if (hasDom[c])
+      order.push_back(c);
+  // Deepest first: a domain's children are modules before it is built.
+  llvm::stable_sort(order, [&](unsigned x, unsigned y) {
+    return classes[x].depth > classes[y].depth;
+  });
+  auto nameOf = [&](Value value) -> std::string {
+    if (auto *def = value.getDefiningOp()) {
+      if (auto name = def->getAttrOfType<StringAttr>("name"))
+        return name.getValue().str();
+      if (auto inst = dyn_cast<hw::InstanceOp>(def))
+        return (inst.getInstanceName() + "_" +
+                inst.getOutputName(cast<OpResult>(value).getResultNumber()).getValue())
+            .str();
+    } else if (auto arg = dyn_cast<BlockArgument>(value)) {
+      return mod.getInputName(arg.getArgNumber()).str();
+    }
+    return "";
+  };
+  // A boundary bit is registered when its source is a register, a memory's
+  // read, a constant or a port of the enclosing module: what crosses then
+  // leaves a flop (or a RAM's output) and meets no logic before the boundary.
+  auto registered = [&](Value v) -> bool {
+    auto *def = v.getDefiningOp();
+    if (!def)
+      return true;
+    return isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp,
+               seq::FirMemReadOp, hw::ConstantOp>(def);
+  };
+  llvm::raw_string_ostream rs(domainReport);
+  SmallVector<SmallVector<Operation *>> childInstances(n);
+  unsigned built = 0;
+  uint64_t allIn = 0, allOut = 0, unregIn = 0, unregOut = 0;
+  for (unsigned c : order) {
+    auto ops = opsOf[c];
+    ops.append(childInstances[c].begin(), childInstances[c].end());
+    DenseSet<Operation *> inSet(ops.begin(), ops.end());
+    SmallVector<Value> inputs, outputs;
+    DenseSet<Value> isInput;
+    SetVector<Operation *> constants;
+    for (auto *op : ops)
+      op->walk([&](Operation *inner) {
+        for (auto operand : inner->getOperands()) {
+          auto *def = operand.getDefiningOp();
+          // (Values defined inside an op of the domain, e.g. an always
+          // block's region, stay inside.)
+          if (def && (inSet.contains(def) ||
+                      llvm::any_of(ops, [&](Operation *o) {
+                        return o != def && o->isProperAncestor(def);
+                      })))
+            continue;
+          if (!def && operand.getParentBlock() != body)
+            continue;
+          if (def && isa<hw::ConstantOp>(def)) {
+            constants.insert(def);
+            continue;
+          }
+          if (isInput.insert(operand).second)
+            inputs.push_back(operand);
+        }
+      });
+    for (auto *op : ops)
+      for (auto result : op->getResults())
+        if (llvm::any_of(result.getUsers(), [&](Operation *user) {
+              Operation *u = user;
+              while (u && u->getBlock() != body)
+                u = u->getParentOp();
+              return !u || !inSet.contains(u);
+            }))
+          outputs.push_back(result);
+    uint64_t inBits = 0, outBits = 0, inUnreg = 0, outUnreg = 0;
+    for (auto v : inputs) {
+      uint64_t w = std::max<int64_t>(0, hw::getBitWidth(v.getType()));
+      inBits += w;
+      if (!registered(v))
+        inUnreg += w;
+    }
+    for (auto v : outputs) {
+      uint64_t w = std::max<int64_t>(0, hw::getBitWidth(v.getType()));
+      outBits += w;
+      if (!registered(v))
+        outUnreg += w;
+    }
+    SmallVector<hw::PortInfo> ports;
+    llvm::StringSet<> names;
+    auto addPort = [&](Value value, bool isIn, size_t argNum) {
+      std::string base = nameOf(value);
+      if (base.empty())
+        base = isIn ? "in" : "out";
+      std::string name = base;
+      for (unsigned k = 1; !names.insert(name).second; ++k)
+        name = base + "_" + std::to_string(k);
+      hw::PortInfo port;
+      port.name = StringAttr::get(context, name);
+      port.type = value.getType();
+      port.dir = isIn ? hw::ModulePort::Direction::Input
+                      : hw::ModulePort::Direction::Output;
+      port.argNum = argNum;
+      ports.push_back(port);
+    };
+    for (auto [i, value] : llvm::enumerate(inputs))
+      addPort(value, true, i);
+    for (auto [i, value] : llvm::enumerate(outputs))
+      addPort(value, false, i);
+    OpBuilder mb(mod);
+    auto module = hw::HWModuleOp::create(
+        mb, mod.getLoc(),
+        StringAttr::get(context, simName + "_dom_" + classes[c].name + suffix),
+        hw::ModulePortInfo(ports));
+    module.setPrivate();
+    auto *domBody = module.getBodyBlock();
+    domBody->getTerminator()->erase();
+    IRMapping map;
+    for (auto [value, arg] : llvm::zip(inputs, domBody->getArguments()))
+      map.map(value, arg);
+    OpBuilder gb = OpBuilder::atBlockEnd(domBody);
+    for (auto *constant : constants)
+      gb.clone(*constant, map);
+    SmallVector<Operation *> clones;
+    for (auto *op : ops)
+      clones.push_back(gb.clone(*op, map));
+    // A graph region: an operand may be defined further down.
+    for (auto *clone : clones)
+      clone->walk([&](Operation *inner) {
+        for (auto &operand : inner->getOpOperands())
+          if (auto mapped = map.lookupOrNull(operand.get()))
+            operand.set(mapped);
+      });
+    SmallVector<Value> results;
+    for (auto value : outputs)
+      results.push_back(map.lookup(value));
+    hw::OutputOp::create(gb, mod.getLoc(), results);
+    OpBuilder ib(body->getTerminator());
+    // (FOLDSIM_DOM_MUTANT=1, a test's mutant: the first domain built takes
+    // zeros for its first input wider than a bit -- a wrong boundary.)
+    SmallVector<Value> operands(inputs.begin(), inputs.end());
+    if (!built && getenv("FOLDSIM_DOM_MUTANT"))
+      for (auto &v : operands)
+        if (hw::getBitWidth(v.getType()) > 1 && isa<IntegerType>(v.getType())) {
+          v = hw::ConstantOp::create(ib, mod.getLoc(), v.getType(), 0);
+          break;
+        }
+    auto instance = hw::InstanceOp::create(
+        ib, mod.getLoc(), module,
+        StringAttr::get(context, "fs_dom_" + classes[c].name), operands);
+    for (auto [value, result] : llvm::zip(outputs, instance.getResults()))
+      value.replaceUsesWithIf(result, [&](OpOperand &use) {
+        Operation *u = use.getOwner();
+        while (u && u->getBlock() != body)
+          u = u->getParentOp();
+        return !u || !inSet.contains(u);
+      });
+    for (auto *op : ops)
+      op->dropAllUses();
+    for (auto *op : ops)
+      op->erase();
+    int dp = domParent(c);
+    if (dp >= 0)
+      childInstances[dp].push_back(instance);
+    ++built;
+    allIn += inBits;
+    allOut += outBits;
+    unregIn += inUnreg;
+    unregOut += outUnreg;
+    rs << "    domain " << classes[c].name << suffix << " (in "
+       << (dp >= 0 ? classes[dp].name : std::string(mod.getModuleName()))
+       << "): " << opsOf[c].size() << " ops, " << childInstances[c].size()
+       << " child domains; boundary in " << inBits << " bits (" << inUnreg
+       << " not from a register), out " << outBits << " bits (" << outUnreg
+       << " not from a register)\n";
+  }
+  for (unsigned c = 0; c < n; ++c)
+    if (present[c] && !hasDom[c]) {
+      int h = host(c);
+      uint64_t luts = domainMerge.lookup(classes[c].name);
+      rs << "    merged " << classes[c].name << suffix;
+      if (luts)
+        rs << " (copy priced " << luts << " LUTs)";
+      rs << " into "
+         << (h >= 0 ? "domain " + classes[h].name : std::string(mod.getModuleName()))
+         << ": no domain of its own\n";
+    }
+  if (memsMoved)
+    rs << "  physical domains of " << mod.getModuleName() << ": " << memsMoved
+       << " memories with ports built in different domains kept whole in their common domain\n";
+  unsigned mergedHere = 0;
+  for (unsigned c = 0; c < n; ++c)
+    mergedHere += present[c] && !hasDom[c];
+  rs << "  physical domains of " << mod.getModuleName() << ": " << built
+     << " domains" << (mergedHere ? " (" + std::to_string(mergedHere) + " classes merged)" : std::string())
+     << ", boundary in " << allIn << " bits (" << unregIn
+     << " not from a register), out " << allOut << " bits (" << unregOut
+     << " not from a register)\n";
   return success();
 }
 
@@ -28265,6 +29581,25 @@ LogicalResult StaticFolder::run() {
                  << " links' kinds of the plan, " << linkKindAsked[0] << " outside it (thresholds)\n";
   if (!slrOf.empty() && failed(extractGroups()))
     return failure();
+  if (physicalDomains) {
+    // Each SLR group's module (their own trees), then the simulator's.
+    SmallVector<hw::HWModuleOp> mods;
+    if (!slrOf.empty())
+      for (unsigned g = 0; g < slrGroups; ++g)
+        if (auto m = top.lookupSymbol<hw::HWModuleOp>((simName + "_slr" + Twine(g)).str()))
+          mods.push_back(m);
+    mods.push_back(simModule);
+    for (auto m : mods)
+      if (failed(extractDomains(m, "")))
+        return failure();
+    llvm::errs() << "foldsim-fold-static: physical-domains:\n" << domainReport;
+    if (!reportPath.empty()) {
+      std::error_code ec;
+      llvm::raw_fd_ostream file(reportPath, ec, llvm::sys::fs::OF_Append);
+      if (!ec)
+        file << "physical domains:\n" << domainReport;
+    }
+  }
   netlist.erase();
   for (auto *callee : inlined)
     callee->erase();
@@ -28366,7 +29701,25 @@ void FoldStaticPass::runOnOperation() {
   folder.slrGroupLocal = slrGroupLocal;
   folder.slrGroupOwn = slrGroupOwn;
   folder.slrGroupHome = slrGroupHome;
+  folder.slrGroupCut = slrGroupCut;
+  gUramCascadeMax = uramCascadeMax;
   folder.slrGroupEnv = slrGroupEnv;
+  folder.physicalDomains = physicalDomains;
+  for (auto &spec : domainMerge) {
+    auto [name, price] = StringRef(spec).split(':');
+    uint64_t luts = 0;
+    if (!price.empty() && price.getAsInteger(10, luts)) {
+      getOperation().emitError("domain-merge: '") << spec << "' is not <class>[:<LUTs>]";
+      return signalPassFailure();
+    }
+    folder.domainMerge[name] = luts;
+  }
+  if (!folder.domainMerge.empty() && !physicalDomains) {
+    getOperation().emitError("domain-merge: needs physical-domains");
+    return signalPassFailure();
+  }
+  folder.slrAdjacent = slrAdjacent;
+  folder.slrLevelGroup = slrLevelGroup;
   folder.slrKept = std::max(1u, unsigned(slrKept));
   for (auto [spec, out, name] :
        {std::tuple{std::string(linkKindGroups), &folder.linkKindGroupCap, "link-kind-groups"},

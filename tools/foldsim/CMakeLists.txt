@@ -53,6 +53,8 @@ install(PROGRAMS foldsim_sll_check.py DESTINATION bin)
 # A floorplan that pins each class copy to its SLR from a given assignment (judged by foldsim_sll_check --floorplan).
 configure_file(foldsim_pin_copies.py ${CMAKE_BINARY_DIR}/bin/foldsim_pin_copies.py COPYONLY)
 install(PROGRAMS foldsim_pin_copies.py DESTINATION bin)
+configure_file(foldsim_hybrid_h.py ${CMAKE_BINARY_DIR}/bin/foldsim_hybrid_h.py COPYONLY)
+install(PROGRAMS foldsim_hybrid_h.py DESTINATION bin)
 configure_file(foldsim_locality.py ${CMAKE_BINARY_DIR}/bin/foldsim_locality.py COPYONLY)
 install(PROGRAMS foldsim_locality.py DESTINATION bin)
 configure_file(foldsim_xcheck.py ${CMAKE_BINARY_DIR}/bin/foldsim_xcheck.py COPYONLY)

@@ -81,3 +81,21 @@
 # AFU4-NEXT: master 1 sharer 1: controller 5 of 2
 # AFU4-NEXT: master 2 sharer 0: controller 2 of 1
 # AFU4-NEXT: master 3 sharer 0: controller 3 of 1
+#
+# --sp (the S26 hybrid's binding): each master's HBM port from foldsim_sp.txt,
+# the memory port's master the level's, each group's controller masters its
+# own SLR's ports in turn (group 0's two on MEM, group 1's on MEM_SLR1_0,
+# group 2's on MEM_SLR0_0), the unnamed group's the level's; one master a
+# controller (6): group 1's two controllers on MEM_SLR1_0 and MEM_SLR1_1.
+# RUN: printf 'group 0 SLR2 MEM\ngroup 1 SLR1 MEM_SLR1_0 MEM_SLR1_1 MEM_SLR1_2 MEM_SLR1_3\ngroup 2 SLR0 MEM_SLR0_0 MEM_SLR0_1 MEM_SLR0_2 MEM_SLR0_3\nlevel SLR2 MEM\n' > %t/sp.txt
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/vmem-slr/foldsim_sim.vh --mem-ports 1 --vmem-masters 5 --sp %t/sp.txt | FileCheck %s --check-prefix=SP5
+# SP5: m_axi_mem_0 MEM
+# SP5-NEXT: m_axi_mem_1 MEM
+# SP5-NEXT: m_axi_mem_2 MEM
+# SP5-NEXT: m_axi_mem_3 MEM_SLR1_0
+# SP5-NEXT: m_axi_mem_4 MEM_SLR0_0
+# SP5-NEXT: m_axi_mem_5 MEM
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %S/Inputs/vmem-slr/foldsim_sim.vh --mem-ports 1 --vmem-masters 6 --sp %t/sp.txt --sp-kernel k | FileCheck %s --check-prefix=SP6
+# SP6: sp=k.m_axi_mem_3:MEM_SLR1_0
+# SP6-NEXT: sp=k.m_axi_mem_4:MEM_SLR1_1
+# SP6-NEXT: sp=k.m_axi_mem_5:MEM_SLR0_0

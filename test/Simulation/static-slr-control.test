@@ -96,6 +96,15 @@
 # OWN0: REFUSE control   %pos0
 # RUN: python3 %foldsim_tools/foldsim_locality.py %t/own --out %t/own/l --kernel-slr SLR0 > /dev/null
 # RUN: FileCheck %s --check-prefix=OWN < %t/own/l/locality.txt
+# Past the limit (--slr-group-own 2): the closures stay in the level, said
+# loudly (a warning naming their roots), and the locality check refuses the
+# fan-out they leave.
+# RUN: foldsim --srcs top.f --top Top --out %t/own2 --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 2 Leaf > %t/own2.log 2>&1
+# RUN: FileCheck %s --check-prefix=OWN2 < %t/own2.log
+# OWN2: slr-group-own: {{[0-9]+}} level registers and {{[0-9]+}} level ops replicated into groups, {{[1-9][0-9]*}} closures left
+# OWN2-NEXT: warning: slr-group-own: {{[1-9][0-9]*}} closures past 2 ops stay in the level: the level control they read fans out over the SLR groups unregistered (roots: {{.*}}pos
+# RUN: not python3 %foldsim_tools/foldsim_locality.py %t/own2 --out %t/own2/l --kernel-slr SLR0 > /dev/null
+# RUN: FileCheck %s --check-prefix=OWN0 < %t/own2/l/locality.txt
 # A class whose parent sits in another group loads posD's next position
 # (every sequencer holds posD's value), its group's own: no other group's
 # sequencer enters a group.
@@ -151,6 +160,10 @@
 # RUN: FileCheck %s --check-prefix=RAMS < %t/rams.log
 # RAMS: SLR groups' URAM288 / RAMB36 (tenths) at most SLR2 4216/8258, SLR1 4344/8874, SLR0 1734/3366
 # RAMS: slr-capacities={{[0-9]+}}/4216/8258,{{[0-9]+}}/4344/8874,{{[0-9]+}}/1734/3366 slr-sites=Leaf:{{[0-9]+}}/10/20
+# --slr-ram-fill: the groups' URAM / RAMB36 at that fraction instead.
+# RUN: foldsim --srcs top.f --top Top --out %t/ramfill --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-sites %t/rams.json --slr-ram-fill 0.5 --slr-level 0 Leaf > %t/ramfill.log 2>&1
+# RUN: FileCheck %s --check-prefix=RAMFILL < %t/ramfill.log
+# RAMFILL: SLR groups' URAM288 / RAMB36 (tenths) at most SLR2 2480/4845, SLR1 2555/5220, SLR0 1020/1980
 # RUN: echo '{"copies": {"Leaf": {"lut": 10, "uram": 600, "bram": 2}}, "top": {"lut": 1000}}' > %t/rams2.json
 # RUN: not foldsim --srcs top.f --top Top --out %t/rams2 --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-sites %t/rams2.json --slr-level 0 Leaf > %t/rams2.log 2>&1
 # RUN: FileCheck %s --check-prefix=RAMS2 < %t/rams2.log
@@ -170,6 +183,11 @@
 # ENVLOC: L3 global fanout
 # ENVLOC-NOT: REFUSE
 # ENVLOC: %x_env1 (reg, 1 b) over {{.*}} -> level
+# A replica of every register kind is named for its group and kept apart
+# from its equals (the buffer's clock-enabled data register too).
+# RUN: grep -B1 'x_bits_envbuf_g0;' %t/env/foldsim_sim.sv | FileCheck %s --check-prefix=ENVKEEP
+# ENVKEEP: (* keep = "true" *)
+# ENVKEEP-NEXT: reg {{.*}} x_bits_envbuf_g0;
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/env/obj %S/Inputs/tb_late.sv top.sv %t/env/foldsim_sim.sv > %t/env/build.log 2>&1
 # RUN: %t/env/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 | FileCheck %s
 # RUN: %t/env/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s

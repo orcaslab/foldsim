@@ -1,0 +1,20 @@
+{
+  "name": "hbm-asl9-20261114",
+  "source": "a32-BW card run 2026-11-14 14:58 (s26_1113/bwtest/RESULTS.md): asl9 shell, 512-bit masters at 200 MHz, OUT 64, 1 KB bursts, each master over its port's 8 PCs (MEM: 32), 16 rotating AXI ids [measured on the V80]",
+  "clock_hz": 200000000,
+  "slrs": {
+    "SLR0": {"ports": ["MEM_SLR0_0", "MEM_SLR0_1", "MEM_SLR0_2", "MEM_SLR0_3"],
+             "alone": {"read_gbs": 28.47, "write_gbs": 34.12, "mixed_read_gbs": 24.87, "mixed_write_gbs": 31.52},
+             "busy": {"read_gbs": 18.00, "write_gbs": 21.20, "mixed_read_gbs": 17.04, "mixed_write_gbs": 15.74},
+             "latency_ns": 280, "loaded_latency_ns": 2395},
+    "SLR1": {"ports": ["MEM_SLR1_0", "MEM_SLR1_1", "MEM_SLR1_2", "MEM_SLR1_3"],
+             "alone": {"read_gbs": 31.50, "write_gbs": 33.77, "mixed_read_gbs": 27.81, "mixed_write_gbs": 30.38},
+             "busy": {"read_gbs": 18.03, "write_gbs": 17.41, "mixed_read_gbs": 17.03, "mixed_write_gbs": 12.76},
+             "latency_ns": 234, "loaded_latency_ns": 2401},
+    "SLR2": {"ports": ["MEM"],
+             "alone": {"read_gbs": 12.22, "write_gbs": 12.80, "mixed_read_gbs": 11.94, "mixed_write_gbs": 12.80},
+             "busy": {"read_gbs": 6.89, "write_gbs": 8.13, "mixed_read_gbs": 4.18, "mixed_write_gbs": 5.00},
+             "latency_ns": 173, "loaded_latency_ns": 1571}
+  },
+  "notes": "single AXI id: writes drop to 43-54 %; 1 PC per port: 16.0 GB/s read per SLR; 256 B bursts +2-17 %; OUT 8..127 identical (not outstanding-limited with 1 KB bursts)"
+}

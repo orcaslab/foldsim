@@ -1,0 +1,16 @@
+# foldsim_hybrid_h.py: the S26 hybrid's projected H per SLR region from the
+# card's measured HBM bandwidth (calibrations/hbm-asl9-20261114.json). Inputs:
+# Big (two memories, 64 instances, rows of 64 and 4 bytes: 128 beats of 64 B
+# read and written a frame) in group 1 = SLR1, Small_copy1 (16 instances of
+# 128-byte rows: 2,048 B) in group 2 = SLR0 by its class, II 256.
+# Busy SLR1: 18.03 / 17.41 GB/s = 90 / 87 B a host cycle at 200 MHz, 8,192 B
+# -> 94 cycles, under II; one class's loaded round trip (480 cycles) less the
+# gap (100) is its bubbles: H 256 + 380 = 636.
+# RUN: python3 %foldsim_tools/foldsim_hybrid_h.py %S/Inputs/hybrid-h --groups %S/Inputs/hybrid-h/sll.json --gap 100 | FileCheck %s
+# CHECK: SLR2: no rows in HBM, H 256
+# CHECK: SLR1: 2 memories of 1 classes, 8,192 B read + 8,192 B written a frame (alpha 1); busy 18.03 / 17.41 GB/s = 90 / 87 B a host cycle -> 94 cycles; bubbles 380 (loaded round trip 480 cycles, gap 100); H 636; reads in flight for the rate (Little) 677
+# CHECK: SLR0: 1 memories of 1 classes, 2,048 B read
+# CHECK: hybrid H 636 (II 256, worst SLR1, busy, alpha 1)
+# Alone (one SLR moving): the unloaded round trip.
+# RUN: python3 %foldsim_tools/foldsim_hybrid_h.py %S/Inputs/hybrid-h --groups %S/Inputs/hybrid-h/sll.json --gap 100 --mode alone | FileCheck %s --check-prefix=ALONE
+# ALONE: hybrid H 256 (II 256, worst the schedule, alone, alpha 1)

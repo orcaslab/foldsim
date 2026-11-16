@@ -1,0 +1,106 @@
+# REQUIRES: verilator
+# --physical-domains (S26X W1, a32-S26X-PH): the simulator as a tree of modules
+# mirroring the class tree. A small GPU-like target (Driver/Inputs/domains:
+# Top > Sm > Core > Alu, Sm > Lsu, Sm > L1, Top > L2; register files, queues
+# and caches as memories, links between all of them). Each class's domain
+# `foldsim_sim_dom_<class>` (instance fs_dom_<class>) holds its copy, its
+# controls, the links read into it and its child classes' domains; with SLR
+# groups each group's module holds its own trees. The same netlist apart from
+# the hierarchy: the same MATCH in exactly the host cycles of the flat build.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/domains
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/flat --static --nest --zero-latency-links --zero-latency-chains > %t/flat.log 2>&1
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/dom --static --nest --zero-latency-links --zero-latency-chains --physical-domains > %t/dom.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/dom.log
+# LOG: foldsim-fold-static: physical-domains:
+# LOG-DAG: domain Alu (in Core_model): {{[0-9]+}} ops, 0 child domains
+# LOG-DAG: domain Core_model (in Sm_model): {{[0-9]+}} ops, 1 child domains
+# LOG-DAG: domain Sm_model (in Top_model): {{[0-9]+}} ops, 3 child domains
+# LOG-DAG: domain L2 (in Top_model): {{[0-9]+}} ops, 0 child domains
+# LOG-DAG: domain Top_model (in foldsim_sim): {{[0-9]+}} ops, 2 child domains
+# LOG: physical domains of foldsim_sim: 7 domains
+# The driver's domain tree (foldsim_domains.json): seven domains, one root.
+# RUN: FileCheck %s --check-prefix=JSON < %t/dom/foldsim_domains.json
+# JSON-DAG: "path": "fs_dom_Top_model/fs_dom_Sm_model/fs_dom_Core_model/fs_dom_Alu"
+# JSON-DAG: "path": "fs_dom_Top_model/fs_dom_L2"
+# The nesting in the Verilog: Top's domain instantiates Sm's and L2's, Sm's
+# the core's, the LSU's and the L1's; the simulator only Top's.
+# RUN: FileCheck %s --check-prefix=SV < %t/dom/foldsim_sim.sv
+# SV-LABEL: module foldsim_sim_dom_Alu(
+# SV: Alu_static Alu_copy (
+# SV-LABEL: module foldsim_sim_dom_Core_model(
+# SV: foldsim_sim_dom_Alu fs_dom_Alu (
+# SV-LABEL: module foldsim_sim_dom_Sm_model(
+# SV-DAG: foldsim_sim_dom_Core_model fs_dom_Core_model (
+# SV-DAG: foldsim_sim_dom_Lsu fs_dom_Lsu (
+# SV-DAG: foldsim_sim_dom_L1 fs_dom_L1 (
+# SV-LABEL: module foldsim_sim_dom_Top_model(
+# SV-DAG: foldsim_sim_dom_Sm_model fs_dom_Sm_model (
+# SV-DAG: foldsim_sim_dom_L2 fs_dom_L2 (
+# SV-LABEL: module foldsim_sim(
+# SV: foldsim_sim_dom_Top_model fs_dom_Top_model (
+# SV-NOT: _copy (
+# SV: endmodule
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/flat/obj %S/Inputs/tb_reset.sv gpu.sv %t/flat/foldsim_sim.sv > %t/flat/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/dom/obj %S/Inputs/tb_reset.sv gpu.sv %t/dom/foldsim_sim.sv > %t/dom/build.log 2>&1
+# RUN: %t/flat/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | grep MATCH > %t/flat/r1.txt
+# RUN: %t/flat/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | grep MATCH > %t/flat/r2.txt
+# RUN: %t/flat/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=90 | grep MATCH > %t/flat/r3.txt
+# RUN: %t/dom/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | grep MATCH > %t/dom/r1.txt
+# RUN: %t/dom/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | grep MATCH > %t/dom/r2.txt
+# RUN: %t/dom/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=90 | grep MATCH > %t/dom/r3.txt
+# RUN: FileCheck %s < %t/dom/r2.txt
+# RUN: diff %t/flat/r1.txt %t/dom/r1.txt
+# RUN: diff %t/flat/r2.txt %t/dom/r2.txt
+# RUN: diff %t/flat/r3.txt %t/dom/r3.txt
+# CHECK: {{^}}MATCH
+# With SLR groups (pinned: the core subtree in group 0, Sm with its LSU and L1
+# in group 1, Top and L2 in group 2): each group's module holds the domains
+# of its classes, a class whose parent is in another group a root there.
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gflat --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env > %t/gflat.log 2>&1
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gdom --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --physical-domains > %t/gdom.log 2>&1
+# RUN: FileCheck %s --check-prefix=GLOG < %t/gdom.log
+# --domain-pblocks: each SLR group's root domains for flow/v80/domain_pblocks.tcl (the
+# region's SLR names: group g on the region's g-th SLR).
+# RUN: foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/gpb --static --nest --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Top_model:2,L2:2,Sm_model:1,Lsu:1,L1:1,Core_model:0,Alu:0 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env --physical-domains --domain-pblocks > %t/gpb.log 2>&1
+# RUN: FileCheck %s --check-prefix=PB < %t/gpb/foldsim_domain_pblocks.tcl
+# PB: set fs_domain_roots {
+# PB-DAG: SLR2 {foldsim_slr0/fs_dom_Core_model}
+# PB-DAG: SLR1 {foldsim_slr1/fs_dom_Sm_model}
+# PB-DAG: SLR0 {foldsim_slr2/fs_dom_Top_model}
+# Row bands by default, each domain's affinity its wires to higher SLRs less
+# those to lower ones (group 1 is SLR1: Sm's links go up to SLR2's core and
+# down to SLR0's Top and L2).
+# PB: set fs_domain_axis y
+# PB: set fs_domain_affinity {
+# PB-DAG: foldsim_slr0/fs_dom_Core_model -{{[1-9][0-9]*}}
+# PB-DAG: foldsim_slr2/fs_dom_Top_model {{[1-9][0-9]*}}
+# The class's memory adapters (none here) after them.
+# PB: set fs_domain_adapters {
+# The gen's floorplan (sourced by the flows after the groups' assignments) carries
+# them: the data and the procedures that apply it.
+# RUN: FileCheck %s --check-prefix=FP < %t/gpb/foldsim_floorplan.tcl
+# FP: USER_SLR_ASSIGNMENT
+# FP: # Physical domains as nested soft pblocks (--domain-pblocks).
+# FP: set fs_domain_roots {
+# FP: proc fs_dom_stripes
+# FP: if {[info exists fs_domain_roots]} {
+# RUN: FileCheck %s --check-prefix=GJSON < %t/gdom/foldsim_domains.json
+# GJSON-DAG: "path": "foldsim_slr0/fs_dom_Core_model/fs_dom_Alu"
+# GJSON-DAG: "path": "foldsim_slr1/fs_dom_Sm_model/fs_dom_L1"
+# GLOG-DAG: domain Alu (in Core_model)
+# GLOG-DAG: domain Core_model (in foldsim_sim_slr0)
+# GLOG-DAG: domain Sm_model (in foldsim_sim_slr1): {{[0-9]+}} ops, 2 child domains
+# GLOG-DAG: domain Top_model (in foldsim_sim_slr2): {{[0-9]+}} ops, 1 child domains
+# GLOG: physical domains of foldsim_sim: 0 domains
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/gflat/obj %S/Inputs/tb_reset.sv gpu.sv %t/gflat/foldsim_sim.sv > %t/gflat/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/gdom/obj %S/Inputs/tb_reset.sv gpu.sv %t/gdom/foldsim_sim.sv > %t/gdom/build.log 2>&1
+# RUN: %t/gflat/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=30 | grep MATCH > %t/gflat/r1.txt
+# RUN: %t/gdom/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=30 | grep MATCH > %t/gdom/r1.txt
+# RUN: FileCheck %s < %t/gdom/r1.txt
+# RUN: diff %t/gflat/r1.txt %t/gdom/r1.txt
+# Mutant (FOLDSIM_DOM_MUTANT=1: the first domain built takes zeros for one
+# input): MISMATCH.
+# RUN: env FOLDSIM_DOM_MUTANT=1 foldsim Sm Core Lsu L1 L2 Alu --srcs top.f --top Top --out %t/mut --static --nest --zero-latency-links --zero-latency-chains --physical-domains > %t/mut.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/mut/obj %S/Inputs/tb_reset.sv gpu.sv %t/mut/foldsim_sim.sv > %t/mut/build.log 2>&1
+# RUN: %t/mut/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 | FileCheck %s --check-prefix=MUT
+# MUT: MISMATCH

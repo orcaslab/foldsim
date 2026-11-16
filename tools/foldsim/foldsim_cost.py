@@ -621,8 +621,11 @@ def _parse(path, roms):
             st = re.search(r'ram_style" = "\\22(\w+)', rhs)
             mk = re.search(r'mask\s+(\d+)\s*>', rhs)
             ch = re.search(r'cascade_height" = "(\d+)"', rhs)
+            # (named: an explicit `name` attribute, or a result printed under its name -- the assembly elides the
+            # attribute when the name is a legal SSA identifier, e.g. a class whose memory sits at its top: `%ram = ...`)
+            named = bool(nm) or not re.fullmatch(r'%\d+(#\d+)?', res[0])
             rec = [nm.group(1) if nm else res[0][1:], int(mm.group(3)), int(mm.group(4)), 0, 0, int(mm.group(1)),
-                   st.group(1) if st else None, int(mk.group(1)) if mk else 1, bool(nm), int(ch.group(1)) if ch else None]
+                   st.group(1) if st else None, int(mk.group(1)) if mk else 1, named, int(ch.group(1)) if ch else None]
             mems[res[0]] = rec
             cur.mems.append(rec)
             continue
@@ -852,6 +855,12 @@ def array_reads(path, modules, per_read=None):
         elif op == 'hw.array_create' and res:
             ops = re.findall(SSA, rhs.split(' : ')[0])
             arrays[res[0]] = ('create', sum(1 for o in ops if o not in consts))
+        elif op == 'hw.wire' and res and re.search(r'rom_style" = "\\22block\\22', rhs):
+            # (foldsim-table-roms: a constant table as a rom_style "block" wire, read into a register: a block RAM
+            # ROM, its output register absorbed; no LUTs, its RAMB36 in the kinds' 'rom_bram'.)
+            ops = re.findall(SSA, rhs.split(' : ')[0])
+            if ops and ops[0] in arrays and arrays[ops[0]][0] == 'const':
+                arrays[res[0]] = ('rom',)
         elif op == 'hw.array_get':
             mm = re.search(r'!hw\.array<(\d+)x(.*)>\s*,', rhs)
             idx = re.findall(r'\[(' + SSA + r')\]', rhs)
@@ -860,6 +869,11 @@ def array_reads(path, modules, per_read=None):
                 continue
             n, w = int(mm.group(1)), width(mm.group(2))
             src = arrays.get(ops[0])
+            if src and src[0] == 'rom':
+                out[cur][1]['rom_bram'] = out[cur][1].get('rom_bram', 0.0) + bram_blocks(n, w)
+                if per_read is not None and res:
+                    per_read[(cur, res[0])] = ('rom', 0.0)
+                continue
             if src and src[0] == 'const':
                 kind = 'const'
                 if TABLE_BLOCKS and src[2] is not None and len(src[2]) == n:

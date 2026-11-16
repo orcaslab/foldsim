@@ -616,6 +616,19 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"slrSllBudget", "slr-sll-budget", "uint64_t", "0",
            "With slr-groups and slr-capacities, the most link bits an "
            "assignment may put over any one SLR boundary (its SLLs; 0: any)">,
+    Option<"slrAdjacent", "slr-adjacent", "bool", "false",
+           "With slr-groups and slr-capacities (group g on the region's g-th "
+           "SLR): no link between groups more than one SLR apart. Such a link "
+           "crosses an SLR it does not use on that SLR's own routing and SLLs "
+           "(g16i1p1e: the 1,334 bits between SLR0 and SLR2 were 9-18 % of the "
+           "wirelength over SLR1's congested windows); the assignment search "
+           "prunes it">,
+    Option<"slrLevelGroup", "slr-level-group", "int", "-1",
+           "With slr-groups: the group the simulator level and the "
+           "environment sit with (the driver's --slr-level): a class's bits to "
+           "and from the netlist's ports (its memory and token channels) are a "
+           "link to that group in the assignment's cut, and with slr-adjacent a "
+           "class with any is kept within one SLR of it. -1: unknown (ignored)">,
     ListOption<"slrSerialize", "slr-serialize", "std::string",
                "With slr-groups, the links between groups of the given classes "
                "(globs; a copy goes by its class's name) carried over k host "
@@ -819,6 +832,23 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "values end it). Replicas hold their originals' values in every "
            "host cycle: nothing moves. No level register then fans out over "
            "the groups. 0: off">,
+    Option<"slrGroupCut", "slr-group-cut", "bool", "false",
+           "With slr-group-own and slr-group-reset: a value a group reads whose "
+           "closure is past slr-group-own's limit (the frame sequencer's, which "
+           "reads every memory port's tokens) is not left in the level: the "
+           "level computes it two host cycles ahead (its next-value logic "
+           "applied twice: registers by their next values, logic over them), "
+           "registers that, and each reading group registers it again. One "
+           "cone in the level, every crossing registered at both ends, the "
+           "same value in every host cycle. A value whose lead reaches a "
+           "port, an instance output or a memory read within two register "
+           "stages stays in the level (reported)">,
+    Option<"uramCascadeMax", "uram-cascade-max", "unsigned", "8",
+           "The highest URAM288 cascade an ultra RAM states (cascade_height): "
+           "a deeper memory is built of several chains at most this high. A "
+           "cascade is one vertical run of a URAM column's sites: on the V80 "
+           "a chain of 32 found no legal place in SLR0 and crosses clock-region "
+           "row breaks anywhere; chains of 8 place">,
     Option<"slrGroupHome", "slr-group-home", "bool", "false",
            "With slr-group-own: a level register whose next value reads, "
            "through the level's logic, more outputs of one group's instances "
@@ -835,6 +865,26 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "elastic buffer (credit in, present-and-confirm out), and the "
            "reset through one level register: no input port loads more than "
            "one SLR. The same tokens in the same order; host cycles move">,
+    Option<"physicalDomains", "physical-domains", "bool", "false",
+           "Physical domains: the simulator emitted as a tree of modules "
+           "that mirrors the class tree. Class c's domain `<sim>_dom_<c>` "
+           "(instance `fs_dom_<c>`) holds its copies, its controls (its "
+           "sequencer, slot tables, register chains), the links read into it "
+           "and the domains of its child classes; a class whose parent is in "
+           "another module (another SLR group, with slr-groups) is a domain "
+           "root there. What crosses a domain boundary is reported (bits, and "
+           "those not from a register or memory read). Every domain is a "
+           "placement unit (a pblock, an SLR assignment). The same netlist "
+           "apart from the hierarchy: no value or host cycle moves">,
+    ListOption<"domainMerge", "domain-merge", "std::string",
+               "With physical-domains: the classes (<class>[:<LUTs>], the "
+               "driver's per-copy LUT price, from --domain-merge-lut) that get "
+               "no domain of their own: a merged class's copies, controls, "
+               "incoming links and memories are emitted in its nearest domain "
+               "ancestor's module (or the group's own logic), and its child "
+               "classes' domains nest there. The domain report names each "
+               "merged class and its host. The same netlist apart from the "
+               "hierarchy">,
     Option<"slrGroupReset", "slr-group-reset", "bool", "false",
            "With SLR groups: the simulator's reset registered once in each "
            "group (inside the group's module) and once for the level, so that "
@@ -1757,6 +1807,55 @@ def LowerWideNegation : Pass<"foldsim-lower-wide-negation",
   let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
 }
 
+def IndexClassInputs : Pass<"foldsim-index-class-inputs", "::mlir::ModuleOp"> {
+  let summary = "A model's array input read only at indices: an index output and an element input per read";
+  let description = [{
+    For each model that the netlist `module` instantiates (and nothing else
+    does), at least `min-instances` times: an input of type
+    `!hw.array<N x iW>` (N a power of two, at least `min-elements`) whose
+    every use is a read -- `hw.array_get` of the input, or of constant,
+    in-range `hw.array_slice`s of it, at an index the model computes, of a
+    power-of-two array -- and that has fewer reads than elements, and (with
+    `inputs-only`) that every instance drives with wiring of the netlist's
+    inputs and constants (else: and of the outputs of at most
+    `max-producers` instances -- default 1: a folded simulator reads a
+    multi-instance producer's elements from a link of every producer
+    instance, uncompacted, which costs more than the read registers it
+    saves; measured at 32 SMs, l2fs: +343k link memory bits for -4k FF). Each read becomes an output `<input>_index<r>`
+    (the element's index in the whole array: the slices' low indices plus
+    the get's) and an input `<input>_at<r>` (the element), which every
+    instance's netlist drives with `hw.array_get` of the array it passed at
+    that index output; the array input is erased. Exact: the model and the
+    netlist compute the same values on every cycle (an index of a
+    power-of-two array is always in range). The netlist then has a
+    combinational path out of the instance and back in, through no logic of
+    the model's (the element feeds nothing the index reads).
+
+    For a folded simulator (`foldsim-fold-static`): a crossbar's port
+    arbiters each read every bank's data (a class input of N elements per
+    instance, held for every instance) but use one element per read; with
+    this rewrite the simulator reads that element, at the index the class's
+    evaluation computes, in the same host cycle -- one read per index, the
+    banks' storage independent of the readers.
+  }];
+  let options = [
+    Option<"module", "module", "std::string", "\"\"",
+           "The netlist (the module that instantiates the models)">,
+    Option<"minElements", "min-elements", "unsigned", "4",
+           "Arrays of at least this many elements">,
+    Option<"minInstances", "min-instances", "unsigned", "1",
+           "Models of at least this many instances">,
+    Option<"inputsOnly", "inputs-only", "bool", "true",
+           "Only arrays driven by the netlist's inputs and constants">,
+    Option<"maxProducers", "max-producers", "unsigned", "1",
+           "With inputs-only=false: arrays of the outputs of at most this many "
+           "instances (in each instance's array)">,
+    Option<"verbose", "verbose", "bool", "false",
+           "Print each input rewritten">,
+  ];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect"];
+}
+
 def NarrowShiftAmounts : Pass<"foldsim-narrow-shift-amounts",
                               "::circt::hw::HWModuleOp"> {
   let summary = "Shift amounts narrowed to log2 of the width";
@@ -1954,6 +2053,35 @@ def MemoriesToRegisters
   ];
 }
 
+def TableRoms : Pass<"foldsim-table-roms", "::circt::hw::HWModuleOp"> {
+  let summary = "A register index's constant tables as one registered block ROM";
+  let description = [{
+    The constant tables (hw.aggregate_constant) of one depth that a module
+    reads at one register index -- or at any of its replicas (the same next
+    value, reset, reset value and clock) -- become one table of their rows
+    side by side, read at the index's next value (its reset applied) and
+    registered: the register holds, in every host cycle, what each old read
+    gave, and each old read becomes a slice of it. The table is a wire with
+    rom_style "block": a block RAM ROM with its output register instead of a
+    LUT select per table and replica. Exact by construction. Applies to
+    modules whose name starts with `prefix` (the simulator level and its SLR
+    group modules), tables of at least `min-depth` entries, ROMs of at least
+    `min-bits` bits.
+  }];
+  let options = [
+    Option<"prefix", "prefix", "std::string", "\"foldsim_sim\"",
+           "Only modules whose name starts with this">,
+    Option<"minDepth", "min-depth", "uint64_t", "512",
+           "The fewest entries a table merged into a ROM has">,
+    Option<"minBits", "min-bits", "uint64_t", "18432",
+           "The fewest bits a ROM holds (a RAMB18)">,
+    Option<"verbose", "verbose", "bool", "true",
+           "Report each module's ROMs on stderr">,
+  ];
+  let dependentDialects = ["circt::comb::CombDialect", "circt::hw::HWDialect",
+                           "circt::seq::SeqDialect", "circt::sv::SVDialect"];
+}
+
 def ReplicateControls
     : Pass<"foldsim-replicate-controls", "::circt::hw::HWModuleOp"> {
   let summary = "Bound the loads of the static fold's slot controls by replicas";
@@ -2085,6 +2213,30 @@ def SlrSplit : Pass<"foldsim-slr-split", "::mlir::ModuleOp"> {
   ];
   let dependentDialects = ["circt::hw::HWDialect", "circt::seq::SeqDialect",
                            "circt::sv::SVDialect"];
+}
+
+def OutlineScopes : Pass<"foldsim-outline-scopes", "::mlir::ModuleOp"> {
+  let summary = "Outline the iterations of a generate loop of a flat module";
+  let description = [{
+    A generate loop (`for (genvar i ...) begin : g_in`) of a module leaves,
+    once the module is flat, registers named `g_in_<i>.<...>` and no module
+    of its own. For each `MODULE:PREFIX=NAME` of `scopes`, the registers of
+    MODULE named PREFIX<i>.<...> are grouped by i; each group, with the
+    logic whose users are all in it (back from the registers' next and reset
+    values), becomes an instance `PREFIX<i>.NAME` of one generated module NAME,
+    when the iterations are the same logic: an op whose attributes differ
+    between iterations (an extract of each iteration's own bit) stays in the
+    parent, its result an input; constants that differ are inputs. The same
+    ops on the same values. Prints `outline-scopes: cell NAME (...)`; the
+    module can then be folded as a class (a loop's iterations its
+    instances).
+  }];
+  let options = [
+    ListOption<"scopes", "scopes", "std::string",
+               "MODULE:PREFIX=NAME: the generate loop of MODULE whose "
+               "registers are named PREFIX<i>. and the module to make of it">,
+  ];
+  let dependentDialects = ["circt::hw::HWDialect", "circt::seq::SeqDialect"];
 }
 
 def RemoveDeadState : Pass<"foldsim-remove-dead-state", "::circt::hw::HWModuleOp"> {

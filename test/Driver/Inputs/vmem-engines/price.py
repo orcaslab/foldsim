@@ -16,7 +16,10 @@ shares = {'wide': {'lut': [0.0, 1.0, 0.0]}, 'narrow': {'lut': [0.0, 0.0, 1.0]}}
 top = [{'lut': 50.0}, {'lut': 0.0}, {'lut': 50.0}]
 v80 = json.load(open(os.path.join(here, 'foldsim_v80_slr.json')))['noc']
 per_slr = dict(v80, ports=[dict(name=f'hbm_{s}', slr=s, targets=['HBM']) for s in names])
-for title, noc in (('v80', v80), ('per-slr', per_slr)):
+# The asl9 shell: an HBM port in every SLR, the masters bound to SLR2's alone (masters_to): priced as the V80's.
+asl9 = dict(v80, ports=[dict(name=f'hbm_{s}', slr=s, targets=['HBM'], tag='MEM' if s == 'SLR2' else f'MEM_{s}_0')
+                        for s in names], masters_to=['MEM'])
+for title, noc in (('v80', v80), ('per-slr', per_slr), ('asl9', asl9)):
     for mode in ('placer', 'nmu', 'local'):
         tot, rows = sc.vmem_slls(ctrls, shares, top, names, noc, mode)
         print(f'{title} {mode}: ' + ' '.join(f'{x:.0f}' for x in tot) + ' | '

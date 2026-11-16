@@ -34,8 +34,34 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/bu --static --nest --modulo --bubbles --direct-outputs --fold-ports mp_ --fold-ports-reset rst --fold-ports-rows Unit > %t/bu.log 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/bu -DBUBBLES -Mdir %t/bu/obj %S/Inputs/tb_ports.sv top.sv %t/bu/foldsim_sim.sv > %t/bu/build.log 2>&1
 # RUN: %t/bu/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +lo=1 +hi=30 +bubble=30 +stall=30 | FileCheck %s
-# Error: a spec group over a bundle's inputs.
-# RUN: not foldsim --srcs top.f --top Top --out %t/sp --static --nest --modulo --spec-groups mp_0_ack=mp_0_rvalid:mp_0_rdata,mp_1_ack=mp_1_rvalid:mp_1_rdata,mp_2_ack=mp_2_rvalid:mp_2_rdata,mp_3_ack=mp_3_rvalid:mp_3_rdata --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --fold-ports-rows Unit 2>&1 | FileCheck %s --check-prefix=SPEC
+# Spec groups (a32-S26X B11, 11-14: every Vortex recipe has --axi-spec): a
+# row keeps every value the environment offers; a read picks the one its
+# bundle's group select chose (index registers latched at the load, array-
+# indexed by the read bundle), and a group's select output -- itself in the
+# request rows -- is also read for its select register. No per-bundle token,
+# frame or previous-frame register; MATCH in the host cycles of the
+# per-bundle spec build (static-fold-ports.test's sp runs).
+# RUN: foldsim --srcs top.f --top Top --out %t/sp --static --nest --modulo --spec-groups mp_0_ack=mp_0_rvalid:mp_0_rdata,mp_1_ack=mp_1_rvalid:mp_1_rdata,mp_2_ack=mp_2_rvalid:mp_2_rdata,mp_3_ack=mp_3_rvalid:mp_3_rdata --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --fold-ports-rows Unit > %t/sp.log 2>&1
+# RUN: not grep -E 'reg .*mp_[0-9]+_[a-z]+_(token|frame|prev)[0-9]*\b' %t/sp/foldsim_sim.sv
+# RUN: FileCheck %s --check-prefix=SPSV < %t/sp/foldsim_sim.sv
+# SPSV: reg {{.*}}ports_rows_index0
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/sp -DSPEC -Mdir %t/sp/obj %S/Inputs/tb_ports.sv top.sv %t/sp/foldsim_sim.sv > %t/sp/build.log 2>&1
+# RUN: %t/sp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 +stall=30 | FileCheck %s --check-prefix=SP4
+# RUN: %t/sp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=100 +hi=400 | FileCheck %s --check-prefix=SP5
+# RUN: %t/sp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +lo=1 +hi=200 +stall=50 | FileCheck %s --check-prefix=SP8
+# SP4: {{^}}MATCH 196 cycles in 12129 host cycles
+# SP5: {{^}}MATCH 196 cycles in 69743 host cycles
+# SP8: {{^}}MATCH 196 cycles in 34310 host cycles
+# With SLR groups (the S26 recipe): a group reads the response rows the level
+# writes, so each reading group gets its own copy of every rows memory with its
+# write ports (a memory cannot be a port of the group's module; it crashed
+# canonicalization before); with --slr-group-own / -env too. MATCH.
+# RUN: foldsim --srcs top.f --top Top --out %t/spg --static --nest --modulo --spec-groups mp_0_ack=mp_0_rvalid:mp_0_rdata,mp_1_ack=mp_1_rvalid:mp_1_rdata,mp_2_ack=mp_2_rvalid:mp_2_rdata,mp_3_ack=mp_3_rvalid:mp_3_rdata --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --fold-ports-rows --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env Unit > %t/spg.log 2>&1
+# RUN: FileCheck %s --check-prefix=SPG < %t/spg.log
+# SPG: 4 level memories copied into the groups that read them
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/spg -DSPEC -Mdir %t/spg/obj %S/Inputs/tb_ports.sv top.sv %t/spg/foldsim_sim.sv > %t/spg/build.log 2>&1
+# RUN: %t/spg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 +stall=30 | FileCheck %s
+# RUN: %t/spg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +lo=100 +hi=400 | FileCheck %s
 # SV-DAG: reg ports_held0
 # SV-DAG: reg ports_held3
 # SV-DAG: reg {{.*}}ports_held_count
@@ -46,7 +72,6 @@
 # SV-DAG: ports_addr_16x8 ports_addr_ext (
 # SV-DAG: Unit_addr_to_ports_addr_0_4x8 Unit_addr_to_ports_addr_0_ext (
 # SV-DAG: Unit_data_to_ports_data_0_8x16 Unit_data_to_ports_data_0_ext (
-# SPEC: error: fold-ports-rows: input 'mp_0_rvalid' is in a spec group
 # CHECK-NOT: ORDER
 # CHECK: {{^}}MATCH 196 cycles
 # ON1: {{^}}MATCH 196 cycles in 1999 host cycles
