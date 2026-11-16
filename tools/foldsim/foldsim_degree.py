@@ -398,6 +398,18 @@ STATE_FRAME = None
 STATE_II = None
 
 
+def level_frame_factor():
+    """STATE_CAL's level growth with the frame: `level_per_doubling` past `logic_ref_frame` where the calibration
+    measures the level apart from the copies (11-16, a32-S26X-P32: the copies' synthesized logic per priced is flat
+    with the frame, 0.87 / 0.95 / 0.91 at 128 / 256 / 580, the level's grows, 1.77 / 2.42 / 2.92); else frame_factor."""
+    if not STATE_CAL or 'level_per_doubling' not in STATE_CAL:
+        return frame_factor()
+    if not STATE_FRAME:
+        return 1.0
+    ref = STATE_CAL.get('logic_ref_frame') or STATE_FRAME
+    return max(0.5, 1.0 + STATE_CAL['level_per_doubling'] * math.log2(max(STATE_FRAME, 1) / ref))
+
+
 def frame_factor():
     """STATE_CAL's logic growth with the frame (`logic_per_doubling` past `logic_ref_frame`): the synthesized
     logic of the copies and the level per counted grows with the instances a copy serves (its state's read
@@ -563,7 +575,7 @@ def state_units(units, lev=1.0):
         return
     for u in units:
         # (a link's LUTRAM by the level's factor alone: the frame's growth is logic's.)
-        fl, fr = (lev, lev / frame_factor()) if u.get('link') else state_factors(u['class'])
+        fl, fr = (lev, lev / level_frame_factor()) if u.get('link') else state_factors(u['class'])
 
         def scale(c, k):
             if c is None or k == 'hbm' and not u.get('link'):
@@ -1108,7 +1120,7 @@ def storage_area(cal, est, classes, degree, rest, sched, ii, entries, route, ura
     # the rest and the links, the kernel and glue beside the simulator.
     global STATE_FRAME
     STATE_FRAME = STATE_II or ii or None
-    lev = STATE_CAL.get('level', 1.0) * frame_factor() if STATE_CAL else 1.0
+    lev = STATE_CAL.get('level', 1.0) * level_frame_factor() if STATE_CAL else 1.0
     logic *= lev
     if STATE_CAL and STATE_CAL.get('level_measured'):
         # (--state-measured: the level as the same recipe's SLR check counted it, in place of the estimate.)
