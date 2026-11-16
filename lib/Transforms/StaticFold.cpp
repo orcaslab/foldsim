@@ -928,8 +928,9 @@ public:
   /// past the limit is broadcast from a register of its value two host
   /// cycles ahead (lead 2) instead of left in the level.
   bool slrGroupCut = false;
-  /// `slr-group-env`: the environment's channels and reset enter the
-  /// simulator through one register stage in the level, then one per group.
+  /// `slr-group-env`: the environment's channels, reset and the bubble input
+  /// `advance` enter the simulator through one register stage in the level,
+  /// then one per group.
   bool slrGroupEnv = false;
   /// `physical-domains`: the simulator as a tree of modules mirroring the
   /// class tree (extractDomains).
@@ -28622,12 +28623,31 @@ LogicalResult StaticFolder::extractGroups() {
         term->setOperand(i, ceReg(term->getOperand(i), push, name + "_envbuf"));
       taken.insert(readyIt->second);
     }
+    // The bubble input `advance` (--bubbles: low holds the frame's position
+    // for a host cycle) fans out to every group's sequencer like a channel's
+    // valid: the same two stages (one in the level, one that slr-group-own
+    // replicates into each reading group), so no SLR reads the port through
+    // logic. Every reader sees it two host cycles late, all alike: a bubble
+    // pattern delayed is a bubble pattern, and the fold is exact under any
+    // (only host cycles move). Low in reset and the two cycles after.
+    bool advanceStaged = false;
+    if (auto it = inIdx.find("advance"); it != inIdx.end()) {
+      Value adv = body->getArgument(it->second);
+      if (!adv.use_empty()) {
+        auto a1 = stage1(adv, "advance");
+        Value a2 = stage2(a1, "advance");
+        adv.replaceAllUsesExcept(a2, a1);
+        taken.insert(it->second);
+        advanceStaged = true;
+      }
+    }
     SmallVector<std::string> others;
     for (unsigned i = 2, e = simModule.getNumInputPorts(); i < e; ++i)
       if (!taken.contains(i) && !body->getArgument(i).use_empty())
         others.push_back(simModule.getInputName(i).str());
     llvm::errs() << "foldsim-fold-static: slr-group-env: " << inChans
-                 << " input and " << outChans << " output channels staged";
+                 << " input and " << outChans << " output channels staged"
+                 << (advanceStaged ? ", advance staged" : "");
     if (!others.empty())
       llvm::errs() << "; inputs not on a channel, left as they are: "
                    << llvm::join(others, ", ");

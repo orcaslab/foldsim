@@ -1,0 +1,24 @@
+# REQUIRES: verilator
+# --slr-group-env with --bubbles (a32-F28, FSD 1,024): the bubble input `advance` reaches every group's sequencer.
+# Unstaged, the simulator's port fans out over the SLR groups through logic (the locality rule refuses it: FSD
+# S9b8/S10s8 "env/token advance over SLR0/SLR1/SLR2: 54 sinks, through logic"). slr-group-env stages it as it stages
+# a channel's valid: `advance_env1` in the level, `advance_env2` that slr-group-own replicates into each reading group.
+# Every reader sees advance two host cycles late, all alike: the same MATCH under bubbles and stalls.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/late
+# RUN: foldsim --srcs top.f --top Top --out %t/env --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 1000 --slr-group-env Leaf > %t/env.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/env.log
+# LOG: slr-group-env: {{[0-9]+}} input and {{[0-9]+}} output channels staged, advance staged
+# LOG-NOT: left as they are: {{.*}}advance
+# RUN: FileCheck %s --check-prefix=SV < %t/env/foldsim_sim.sv
+# SV: advance_env1
+# SV: advance_env2
+# RUN: python3 %foldsim_tools/foldsim_locality.py %t/env --out %t/env/l > /dev/null
+# RUN: FileCheck %s --check-prefix=LOC < %t/env/l/locality.txt
+# LOC-NOT: REFUSE env/token advance
+# RUN: python3 %foldsim_tools/foldsim_xcheck.py %t/env/foldsim_sim.mlir | FileCheck %s --check-prefix=X
+# X: cross-group edges: {{.*}} LOGIC 0 (0 bits); group outputs read by the level: {{[0-9]+}}, LOGIC 0
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/env/obj %S/Inputs/tb_late.sv top.sv %t/env/foldsim_sim.sv > %t/env/build.log 2>&1
+# RUN: %t/env/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 +bubble=30 +burst=4 | FileCheck %s
+# RUN: %t/env/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=0 +bubble=0 | FileCheck %s
+# RUN: %t/env/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +stall=90 +bubble=60 | FileCheck %s
+# CHECK: MATCH
