@@ -57,12 +57,15 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/mut/obj %S/Inputs/tb_late.sv top.sv %t/mut/foldsim_sim.sv > %t/mut/build.log 2>&1
 # RUN: %t/mut/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 | FileCheck %s --check-prefix=MUT
 # MUT: MISMATCH
-# A lead that reaches a port within two register stages (--bubbles: the
-# decision reads the kernel's `advance` as it is) is not built: the value stays
-# in the level, said loudly, and the run is the same as without the option.
+# With --bubbles, slr-group-env stages the kernel's `advance` like a channel's
+# valid (two registers), so the decision's closure reaches no port and every
+# value gets its lead: none stays in the level, and the run is the same.
+# (Before the staging: "N without a lead (... leaves: a port (advance))" and
+# a warning that they stay in the level.)
 # RUN: foldsim --srcs top.f --top Top --out %t/bub --static --nest --bubbles --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-region v80 --slr-assign Leaf:0,Leaf_copy1:1,Leaf_copy2:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-local 1000 --slr-group-own 2 --slr-group-cut --slr-group-env Leaf > %t/bub.log 2>&1
 # RUN: FileCheck %s --check-prefix=BUB < %t/bub.log
-# BUB: slr-group-cut: {{[0-9]+}} values read by the groups from a lead-2 register ({{.*}}), {{[1-9][0-9]*}} without a lead (read as they are: {{.*}}pos3{{.*}}; leaves: a port x{{[0-9]+}} (advance))
-# BUB-NEXT: warning: slr-group-cut: {{[1-9][0-9]*}} values without a lead stay in the level
+# BUB: slr-group-env: {{.*}}, advance staged
+# BUB: slr-group-cut: {{[1-9][0-9]*}} values read by the groups from a lead-2 register
+# BUB-NOT: without a lead
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/bub/obj %S/Inputs/tb_late.sv top.sv %t/bub/foldsim_sim.sv > %t/bub/build.log 2>&1
 # RUN: %t/bub/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=30 +bubble=30 +burst=4 | FileCheck %s
