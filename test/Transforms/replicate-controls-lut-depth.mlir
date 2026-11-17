@@ -90,3 +90,22 @@ hw.module @Banks(in %clk: !seq.clock, in %inst2: i1, in %row: i8, in %d: i2,
   %rd = seq.firmem.read_port %dmem[%addr], clock %clk : <512 x 2>
   hw.output %rd : i2
 }
+
+// A depth that is not a power of two, masked: 200 entries are banks of 64, 64,
+// 64 and a last part of 8 (its entries past 200 never addressed); the mask
+// stays with each part, then each bank is split by bits in whole mask bits.
+// CHECK-LABEL: hw.module @Masked
+// CHECK: %mem_b0_p0 = seq.firmem 0, 1, undefined, undefined : <64 x 8, mask 1>
+// CHECK: %mem_b2_p1 = seq.firmem 0, 1, undefined, undefined : <64 x 8, mask 1>
+// CHECK: %mem_b3 = seq.firmem 0, 1, undefined, undefined : <8 x 16, mask 2>
+// CHECK: hw.array_get %{{.+}}[%{{.+}}] : !hw.array<4xi16>, i2
+hw.module @Masked(in %clk: !seq.clock, in %inst2: i1, in %row: i7, in %d: i16,
+                  in %m: i2, out r: i16) {
+  %true = hw.constant true
+  %idx = seq.firreg %inst2 clock %clk {foldsim.control} : i1
+  %mem = seq.firmem 0, 1, undefined, undefined : <200 x 16, mask 2>
+  %addr = comb.concat %row, %idx : i7, i1
+  seq.firmem.write_port %mem[%addr] = %d, clock %clk enable %true mask %m : <200 x 16, mask 2>, i2
+  %rd = seq.firmem.read_port %mem[%addr], clock %clk : <200 x 16, mask 2>
+  hw.output %rd : i16
+}
