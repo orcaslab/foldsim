@@ -220,6 +220,112 @@ void splitMemory(seq::FirMemOp memory, uint64_t loads) {
   memory.erase();
 }
 
+/// Splits a LUT memory deeper than one LUT RAM (64 entries) by depth into
+/// parts of whole 64-entry banks, the most banks whose port is still within
+/// `loads` (at least one), and returns the parts; returns the memory itself
+/// when it needs no depth split or cannot take one (a read of latency other
+/// than 0: its part select would need the address of the read's cycle).
+///
+/// Synthesis builds such a memory of 64-entry LUT RAM banks, each with its
+/// own write enable (a control set: a CLE control pin reached through the
+/// interconnect's CNODEs). Split by bits, every part keeps all the banks, so
+/// that a part of b bits has a write enable per bank for b bits: a 2,048 x 80
+/// memory split to 1-bit parts is 2,560 enables of one LUT RAM each, which the
+/// CNODEs of the region cannot all reach (the FSD 1,024 route failures of
+/// 11-14..11-17: 48,230 control sets of fewer than 4 BELs). Split by depth,
+/// a part's port drives only its banks: the enables stay one per bank, and
+/// the parts' controls take replicas of their own as with a bit split. The
+/// read data is the part the address's high bits select, the select a
+/// synthesized deep LUT memory has between its banks anyway.
+SmallVector<seq::FirMemOp> splitMemoryByDepth(seq::FirMemOp memory,
+                                              uint64_t loads) {
+  auto type = memory.getType();
+  uint64_t depth = type.getDepth(), width = type.getWidth();
+  if (depth <= kLutMemoryDepth || memory.getReadLatency() != 0)
+    return {memory};
+  // The part depth: a power of two of whole banks, the largest whose port is
+  // within `loads` (memoryLoads of a LUT memory), at least a bank.
+  uint64_t partDepth = kLutMemoryDepth;
+  while (partDepth * 2 < depth &&
+         memoryLoads(seq::FirMemType::get(memory.getContext(), partDepth * 2,
+                                          width, type.getMaskWidth()),
+                     true, width) <= loads)
+    partDepth *= 2;
+  if (partDepth >= depth)
+    return {memory};
+  unsigned lowBits = llvm::Log2_64(partDepth);
+  unsigned addrBits = llvm::Log2_64_Ceil(depth);
+  unsigned highBits = addrBits - lowBits;
+  uint64_t count = llvm::divideCeil(depth, partDepth);
+  OpBuilder b(memory);
+  SmallVector<seq::FirMemOp> parts;
+  for (uint64_t k = 0; k < count; ++k) {
+    uint64_t bankDepth = std::min(partDepth, depth - k * partDepth);
+    // A last part shallower than a power of two keeps the parts' address
+    // width (its entries past `depth` are never addressed).
+    bankDepth = std::max<uint64_t>(llvm::PowerOf2Ceil(bankDepth), 2);
+    auto partType = seq::FirMemType::get(b.getContext(),
+                                         std::min(bankDepth, partDepth), width,
+                                         type.getMaskWidth());
+    auto part = seq::FirMemOp::create(
+        b, memory.getLoc(), partType, memory.getReadLatency(),
+        memory.getWriteLatency(), memory.getRuw(), memory.getWuw(),
+        b.getStringAttr(memory.getName().value_or("mem") + "_b" + Twine(k)),
+        hw::InnerSymAttr{}, seq::FirMemInitAttr{}, memory.getPrefixAttr(),
+        memory.getOutputFileAttr());
+    part->setDialectAttrs(memory->getDialectAttrs());
+    parts.push_back(part);
+  }
+  auto low = [&](OpBuilder &ub, Location loc, Value address,
+                 seq::FirMemOp part) -> Value {
+    unsigned bits = llvm::Log2_64_Ceil(part.getType().getDepth());
+    return comb::ExtractOp::create(ub, loc, address, 0, bits);
+  };
+  for (auto *user : llvm::make_early_inc_range(memory->getUsers())) {
+    OpBuilder ub(user);
+    auto loc = user->getLoc();
+    Value high = comb::ExtractOp::create(
+        ub, loc,
+        isa<seq::FirMemReadOp>(user) ? cast<seq::FirMemReadOp>(user).getAddress()
+                                     : cast<seq::FirMemWriteOp>(user).getAddress(),
+        lowBits, highBits);
+    if (auto read = dyn_cast<seq::FirMemReadOp>(user)) {
+      SmallVector<Value> data;
+      for (auto part : parts)
+        data.push_back(seq::FirMemReadOp::create(
+            ub, loc, part, low(ub, loc, read.getAddress(), part),
+            read.getClk(), read.getEnable()));
+      // hw.array_create lists the highest index first; indices past the
+      // parts read the last part (never addressed).
+      uint64_t size = uint64_t(1) << highBits;
+      SmallVector<Value> elements;
+      for (uint64_t i = size; i-- > 0;)
+        elements.push_back(data[std::min<uint64_t>(i, count - 1)]);
+      Value array = hw::ArrayCreateOp::create(ub, loc, elements);
+      read.getData().replaceAllUsesWith(
+          hw::ArrayGetOp::create(ub, loc, array, high).getResult());
+    } else {
+      auto write = cast<seq::FirMemWriteOp>(user);
+      for (auto [k, part] : llvm::enumerate(parts)) {
+        Value mine = comb::ICmpOp::create(
+            ub, loc, comb::ICmpPredicate::eq, high,
+            hw::ConstantOp::create(ub, loc, ub.getIntegerType(highBits), k));
+        Value enable = write.getEnable()
+                           ? Value(comb::AndOp::create(ub, loc,
+                                                       write.getEnable(), mine))
+                           : mine;
+        seq::FirMemWriteOp::create(ub, loc, part,
+                                   low(ub, loc, write.getAddress(), part),
+                                   write.getClk(), enable, write.getData(),
+                                   write.getMask());
+      }
+    }
+    user->erase();
+  }
+  memory.erase();
+  return parts;
+}
+
 /// Splits a select by bits into selects of at most `loads` bits.
 void splitMux(comb::MuxOp mux, uint64_t loads) {
   uint64_t width = widthOf(mux.getResult());
@@ -314,8 +420,10 @@ struct ReplicateControlsPass
           memories.insert(op);
       }
     }
+    // A deep LUT memory by depth first (its banks), then each part by bits.
     for (auto *op : memories)
-      splitMemory(cast<seq::FirMemOp>(op), loads);
+      for (auto part : splitMemoryByDepth(cast<seq::FirMemOp>(op), loads))
+        splitMemory(part, loads);
     for (auto *op : muxes)
       splitMux(cast<comb::MuxOp>(op), loads);
   }
