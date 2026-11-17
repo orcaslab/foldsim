@@ -1124,7 +1124,26 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
     if res['rows']:
         fold += f" page-rows={res['rows']}"
     if res.get('link_kinds'):
-        fold = re.sub(r' link-kinds=\S+', '', fold) + f" link-kinds={res['link_kinds']}"
+        # The policy's kinds for the pairs the recipe left open; a pair the
+        # recipe names (--link-kinds P:R:KIND) keeps the recipe's kind: the
+        # policy does not price a kind's latency in the frame (a block-RAM link
+        # read in a chain costs host cycles every frame), the recipe's author
+        # may have.
+        user = {':'.join(r.split(':')[:2]): r for r in (a.link_kinds or '').split(',') if r.count(':') >= 2}
+        rules, kept = [], []
+        for r in res['link_kinds'].split(','):
+            pr = ':'.join(r.split(':')[:2])
+            if pr in user:
+                if user[pr] != r:
+                    kept.append(f'{user[pr]} (policy: {r})')
+                rules.append(user.pop(pr))
+            else:
+                rules.append(r)
+        rules += user.values()
+        if kept:
+            print(f"foldsim: state auto: --link-kinds kept for {len(kept)} pairs the recipe names: "
+                  f"{', '.join(kept)}", file=sys.stderr)
+        fold = re.sub(r' link-kinds=\S+', '', fold) + f" link-kinds={','.join(rules)}"
     if res['pattern'] and res['pattern'] != pattern:
         if m:
             fold = fold.replace(m.group(0), f" virtual-memories={res['pattern']}")
