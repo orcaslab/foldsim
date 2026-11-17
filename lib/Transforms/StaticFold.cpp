@@ -20032,8 +20032,11 @@ static DenseMap<Value, TableSource> gTableSource;
 
 static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                        unsigned width, unsigned site, ArrayRef<uint8_t> care);
-/// A one-bit table with at most this many set rows is emitted as index compares.
+/// A one-bit table of at least kSparseTableMinEntries rows with at most
+/// kSparseTableRows set rows is emitted as index compares (a small table is a
+/// few LUTs either way).
 static constexpr size_t kSparseTableRows = 4;
+static constexpr uint64_t kSparseTableMinEntries = 1024;
 static Value tableCare(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> rows,
                        ArrayRef<uint8_t> care, unsigned width,
                        unsigned site = __builtin_LINE());
@@ -20329,12 +20332,12 @@ static Value tableBody(ImplicitLocOpBuilder &b, Value index, ArrayRef<uint64_t> 
   // that many bits, each its own constant, read at the same index.
   uint64_t kMaxConstantBits = gMaxTableBits;
   uint64_t entries = elements.size();
-  // A one-bit table of a few set rows (a staged link's or an env output's
+  // A frame-deep one-bit table of a few set rows (a staged link's or an env output's
   // write at its one position of the frame: FSD 1,024 has 1,029 such
   // 8,192-row tables) is that many index compares, not a 2^n-row constant:
   // the same function (synthesis makes the compares of it anyway), but no
   // pricing or elaboration of a frame-deep array for a single slot.
-  if (width == 1 && rows.size() <= entries) {
+  if (width == 1 && entries >= kSparseTableMinEntries && rows.size() <= entries) {
     SmallVector<uint64_t> ones;
     for (uint64_t k = 0; k < rows.size() && ones.size() <= kSparseTableRows; ++k)
       if (rows[k] & 1)
