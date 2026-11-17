@@ -67,6 +67,9 @@ def main():
     ap.add_argument('--slices', default='', help='SLR group slices, e.g. slr0=106000,slr1=102500,slr2=106700 (all=N for an ungrouped design)')
     ap.add_argument('--warn', type=float, default=0.06)
     ap.add_argument('--refuse', type=float, default=0.08)
+    ap.add_argument('--max-total', type=int, default=10000,
+                    help='REFUSE past this many predicted write-enable control sets in the whole design (default 10,000:\n'
+                         'LKG 4,580 routed; S11s8 66,883 failed; the placed design adds ~14k of its own: shell, CE/SR)')
     ap.add_argument('--json')
     a = ap.parse_args()
     mods, memdecl = parse(a.sv)
@@ -101,6 +104,9 @@ def main():
     print(f'foldsim_ctrl_check: {a.sv}: predicted LUT-RAM write-enable control sets {total[0]:,} '
           f'({total[1]:,} tiny: banks narrower than a LUT-RAM slice) over {total[2]:,} LUT memories')
     worst = 0.0
+    if total[0] > a.max_total:
+        out['verdict'] = 'REFUSE'
+        print(f'foldsim_ctrl_check: REFUSE: {total[0]:,} predicted control sets > --max-total {a.max_total:,}')
     for g in tops:
         cs, tiny, n = roll(g)
         key = g.replace('foldsim_sim_', '') if g != 'foldsim_sim' else 'all'
@@ -113,7 +119,7 @@ def main():
         out['groups'][key] = {'control_sets': cs, 'tiny': tiny, 'memories': n, 'slices': sl, 'fraction': frac, 'verdict': v}
         print(f'  {key}: {cs:,} control sets ({tiny:,} tiny) over {n:,} LUT memories' +
               (f'; {100 * frac:.1f} % of {int(sl):,} SLICEs -> {v}' if frac is not None else ''))
-    if slices:
+    if slices and out['verdict'] != 'REFUSE':
         out['verdict'] = 'REFUSE' if worst > a.refuse else 'WARN' if worst > a.warn else 'OK'
         print(f'foldsim_ctrl_check: {out["verdict"]} (worst group {100 * worst:.1f} % of its SLICEs; warn {100 * a.warn:.0f} %, refuse {100 * a.refuse:.0f} %)')
     # the largest contributors
