@@ -70,8 +70,26 @@ def main():
     ap.add_argument('--max-total', type=int, default=10000,
                     help='REFUSE past this many predicted write-enable control sets in the whole design (default 10,000:\n'
                          'LKG 4,580 routed; S11s8 66,883 failed; the placed design adds ~14k of its own: shell, CE/SR)')
+    ap.add_argument('--calibration', metavar='JSON',
+                    help='per-scale calibration of the design total (calibrations/ctrl-sets-*.json): with --family, the\n'
+                         "family's max_total and the verdict past it (REFUSE or WARN), from its routed / failed images")
+    ap.add_argument('--family', default='', help="the design family in --calibration (default: --max-total, REFUSE)")
     ap.add_argument('--json')
     a = ap.parse_args()
+    # The design total's limit: --max-total (the FSD 1,024 calibration, REFUSE) unless a calibration names the family.
+    # A family's total is calibrated on its own built images (a4/a8: e4b 13,036 predicted routed at 198.9 MHz, R4 P1
+    # 13,284 routed clean): past it the verdict is the family's (WARN at 4/8 SMs, where the per-SLR fraction is the
+    # physical limit), never a silent pass.
+    past, cal_note = 'REFUSE', ''
+    if a.calibration and a.family:
+        fams = json.load(open(a.calibration)).get('families', {})
+        if a.family not in fams:
+            sys.exit(f'foldsim_ctrl_check: no family {a.family!r} in {a.calibration} ({", ".join(sorted(fams))})')
+        f = fams[a.family]
+        a.max_total, past = int(f['max_total']), f.get('past', 'REFUSE')
+        cal_note = f' (family {a.family}: {f.get("basis", "")})'
+    elif a.calibration or a.family:
+        sys.exit('foldsim_ctrl_check: --calibration and --family go together')
     mods, memdecl = parse(a.sv)
     own = {}
     for m, d in memdecl.items():
@@ -104,9 +122,12 @@ def main():
     print(f'foldsim_ctrl_check: {a.sv}: predicted LUT-RAM write-enable control sets {total[0]:,} '
           f'({total[1]:,} tiny: banks narrower than a LUT-RAM slice) over {total[2]:,} LUT memories')
     worst = 0.0
-    if total[0] > a.max_total:
-        out['verdict'] = 'REFUSE'
-        print(f'foldsim_ctrl_check: REFUSE: {total[0]:,} predicted control sets > --max-total {a.max_total:,}')
+    over_total = total[0] > a.max_total
+    if over_total:
+        out['verdict'] = past
+        print(f'foldsim_ctrl_check: {past}: {total[0]:,} predicted control sets > max total {a.max_total:,}{cal_note}')
+    elif cal_note:
+        print(f'foldsim_ctrl_check: total {total[0]:,} within {a.max_total:,}{cal_note}')
     for g in tops:
         cs, tiny, n = roll(g)
         key = g.replace('foldsim_sim_', '') if g != 'foldsim_sim' else 'all'
@@ -120,7 +141,8 @@ def main():
         print(f'  {key}: {cs:,} control sets ({tiny:,} tiny) over {n:,} LUT memories' +
               (f'; {100 * frac:.1f} % of {int(sl):,} SLICEs -> {v}' if frac is not None else ''))
     if slices and out['verdict'] != 'REFUSE':
-        out['verdict'] = 'REFUSE' if worst > a.refuse else 'WARN' if worst > a.warn else 'OK'
+        v = 'REFUSE' if worst > a.refuse else 'WARN' if worst > a.warn else 'OK'
+        out['verdict'] = 'WARN' if v == 'OK' and over_total else v
         print(f'foldsim_ctrl_check: {out["verdict"]} (worst group {100 * worst:.1f} % of its SLICEs; warn {100 * a.warn:.0f} %, refuse {100 * a.refuse:.0f} %)')
     # the largest contributors
     contrib = sorted(((roll(m)[0], m) for m in memo if m not in groups and m != 'foldsim_sim'), reverse=True)[:8]

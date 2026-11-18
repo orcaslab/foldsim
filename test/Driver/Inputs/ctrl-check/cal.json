@@ -1,0 +1,2 @@
+{"families": {"small-routed": {"max_total": 5, "past": "WARN", "basis": "a routed point of 5"},
+              "big": {"max_total": 100, "past": "WARN", "basis": "a routed point of 100"}}}

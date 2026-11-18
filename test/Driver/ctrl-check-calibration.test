@@ -1,0 +1,12 @@
+# foldsim_ctrl_check's design total: past --max-total a REFUSE (the FSD calibration's default); with --calibration
+# and --family the family's own total from its built images and its verdict past it (WARN at small scale), reported.
+# RUN: not python3 %foldsim_tools/foldsim_ctrl_check.py %S/Inputs/ctrl-check/sim.sv --max-total 5 | FileCheck %s --check-prefix=REF
+# RUN: python3 %foldsim_tools/foldsim_ctrl_check.py %S/Inputs/ctrl-check/sim.sv --calibration %S/Inputs/ctrl-check/cal.json --family small-routed | FileCheck %s --check-prefix=WARN
+# RUN: python3 %foldsim_tools/foldsim_ctrl_check.py %S/Inputs/ctrl-check/sim.sv --calibration %S/Inputs/ctrl-check/cal.json --family big | FileCheck %s --check-prefix=OK
+# RUN: not python3 %foldsim_tools/foldsim_ctrl_check.py %S/Inputs/ctrl-check/sim.sv --calibration %S/Inputs/ctrl-check/cal.json --family nope 2>&1 | FileCheck %s --check-prefix=NOFAM
+# REF: predicted LUT-RAM write-enable control sets 6
+# REF: REFUSE: 6 predicted control sets > max total 5
+# WARN: WARN: 6 predicted control sets > max total 5 (family small-routed: a routed point of 5)
+# OK: total 6 within 100 (family big: a routed point of 100)
+# OK-NOT: REFUSE
+# NOFAM: no family 'nope'

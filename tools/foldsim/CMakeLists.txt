@@ -101,3 +101,9 @@ install(FILES foldsim_v80_asl9_slr.json DESTINATION bin)
 # be classes, on a rewritten copy of the sources (needs pyslang).
 configure_file(foldsim_lift.py ${CMAKE_BINARY_DIR}/bin/foldsim-lift COPYONLY)
 install(PROGRAMS foldsim_lift.py DESTINATION bin RENAME foldsim-lift)
+# The gate checks beside the tools (a32-V48): the LUT-RAM write-enable control sets of a netlist per SLR group, with
+# its family's calibration (calibrations/ctrl-sets-*.json), and a gate's H against the generation's II and projection.
+foreach(t foldsim_ctrl_check.py foldsim_h_check.py)
+  configure_file(${t} ${CMAKE_BINARY_DIR}/bin/${t} COPYONLY)
+  install(PROGRAMS ${t} DESTINATION bin)
+endforeach()
