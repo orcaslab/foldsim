@@ -416,6 +416,10 @@ def frame_options(a):
         fold += ' ready-ahead'
     if getattr(a, 'advance_partials', False):
         fold += ' advance-partials'
+        if getattr(a, 'advance_partials_at', None):
+            fold += f' advance-partials-at={a.advance_partials_at}'
+        if getattr(a, 'advance_partials_plain', False):
+            fold += ' advance-partials-cofactor=false'
     if getattr(a, 'room_ahead', False):
         fold += ' room-ahead'
         if getattr(a, 'room_regions', False):
@@ -2561,6 +2565,12 @@ def build_parser():
                          '(the partial), replicated into each group that reads it; every group\'s advance '
                          'one AND of its own registers. Exact (no host cycle moves); the pending terms need '
                          '--ready-ahead to be registers (fold-static advance-partials)')
+    ap.add_argument('--advance-partials-at', choices=['source', 'reader'],
+                    help='with --advance-partials and SLR groups: the replica of a partial another group reads '
+                         'beside the partial (source, default) or in the reading group (reader)')
+    ap.add_argument('--advance-partials-plain', action='store_true',
+                    help='with --advance-partials: a partial\'s next value the plain AND of its terms, not a '
+                         'select by advance and go of their cofactors\' ANDs')
     ap.add_argument('--room-ahead', action='store_true',
                     help='with --static and virtual memories: each controller\'s room term of the frame decision '
                          'registered (free a host cycle before, two entries more); exact, may add host cycles '

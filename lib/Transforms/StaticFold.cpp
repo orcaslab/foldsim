@@ -1052,6 +1052,12 @@ public:
   /// registers, one partial register per source SLR group (buildPartials),
   /// replicated into each consuming group (extractGroups).
   bool advancePartials = false;
+  /// `advance-partials-at`: where a partial's replica for another group is
+  /// (true: in that reading group; false: in the source group, beside the
+  /// original). `advance-partials-cofactor`: its next a select by the
+  /// decision's late values (advance, go) of ANDs of the cofactors.
+  bool advancePartialsAtReader = false;
+  bool advancePartialsCofactor = true;
   unsigned partialTerms = 0, partialLeft = 0, partialRegs = 0, partialReplicas = 0;
   /// `room-ahead`: the controllers' room terms registered (two entries more).
   bool roomAhead = false;
@@ -26340,8 +26346,9 @@ LogicalResult StaticFolder::buildSim() {
   // room for one.
   SmallVector<Value> goTerms(inputValid.begin(), inputValid.end());
   goTerms.append(roomTerms.begin(), roomTerms.end());
-  go.setValue(goTerms.empty() ? constant(1, 1)
-                              : comb::AndOp::create(b, goTerms, false));
+  Value goValue = goTerms.empty() ? constant(1, 1)
+                                  : Value(comb::AndOp::create(b, goTerms, false));
+  go.setValue(goValue);
 
   // A position runs only when, for each class of virtual memories, the
   // instance it loads has no read pending, and each controller has room for
@@ -27517,9 +27524,94 @@ LogicalResult StaticFolder::buildSim() {
         it->second = it->second && rv.getValue().isOne();
         ++partialTerms;
       }
+      // The decision's own late values -- `advance` (the partials' AND,
+      // after this) and `go` (the frame's start: every environment
+      // channel's token and room, deep where there are many) -- reach the
+      // leads through their registers' next values. Each partial's next is
+      // built as a select by them of four ANDs, each of the leads with
+      // `advance` and `go` constant (the leads' logic cloned where it reads
+      // them, folded by canonicalization): `advance` and `go` then meet the
+      // partial's register in one LUT, the terms' own logic beside them. The
+      // same function: no value moves. (A lead whose cone is past the clone
+      // budget is ANDed as it is.)
+      SmallVector<Value> late;
+      if (advance)
+        late.push_back(advance);
+      if (goValue && !goValue.getDefiningOp<hw::ConstantOp>())
+        late.push_back(goValue);
+      auto cofactor = [&](Value root, ArrayRef<std::pair<Value, bool>> at) -> Value {
+        DenseMap<Value, Value> memo;
+        for (auto [v, c] : at)
+          memo[v] = constant(1, c);
+        unsigned budget = 1 << 16;
+        std::function<Value(Value)> rec = [&](Value v) -> Value {
+          if (auto it = memo.find(v); it != memo.end())
+            return it->second;
+          Operation *def = v.getDefiningOp();
+          Value r = v;
+          if (def && budget && def->getNumRegions() == 0 && def->getNumOperands() &&
+              (def->getDialect()->getNamespace() == "comb" ||
+               (def->getDialect()->getNamespace() == "hw" &&
+                !isa<hw::InstanceOp, hw::OutputOp>(def))) &&
+              mlir::isMemoryEffectFree(def)) {
+            --budget;
+            IRMapping map;
+            bool changed = false;
+            for (Value o : def->getOperands()) {
+              Value c = rec(o);
+              if (!c)
+                return Value();
+              if (c != o) {
+                map.map(o, c);
+                changed = true;
+              }
+            }
+            if (changed) {
+              Operation *clone = b.clone(*def, map);
+              clone->removeAttr(kSlrAttr);
+              clone->removeAttr(kDomAttr);
+              r = clone->getResult(def->getNumResults() == 1 ? 0 : cast<OpResult>(v).getResultNumber());
+            }
+          } else if (def && !budget) {
+            return Value();
+          }
+          memo[v] = r;
+          return r;
+        };
+        return rec(root);
+      };
+      auto andOf = [&](ArrayRef<Value> ls) -> Value {
+        return ls.size() == 1 ? ls[0] : Value(comb::AndOp::create(b, ls, false));
+      };
+      // The partial's next: the AND of the leads, as a select by the late
+      // values of their cofactors' ANDs.
+      std::function<Value(ArrayRef<Value>, SmallVector<std::pair<Value, bool>>, unsigned)> selectOf =
+          [&](ArrayRef<Value> ls, SmallVector<std::pair<Value, bool>> at, unsigned i) -> Value {
+        if (i == late.size()) {
+          if (at.empty())
+            return andOf(ls);
+          SmallVector<Value> cs;
+          for (Value l : ls) {
+            Value c = cofactor(l, at);
+            if (!c)
+              return Value();
+            cs.push_back(c);
+          }
+          return andOf(cs);
+        }
+        auto on = at, off = at;
+        on.push_back({late[i], true});
+        off.push_back({late[i], false});
+        Value t = selectOf(ls, on, i + 1), f = selectOf(ls, off, i + 1);
+        if (!t || !f)
+          return Value();
+        return comb::MuxOp::create(b, late[i], t, f);
+      };
       SmallVector<Value> parts;
       for (auto &[g, ls] : leads) {
-        Value next = ls.size() == 1 ? ls[0] : Value(comb::AndOp::create(b, ls, false));
+        Value next = advancePartialsCofactor ? selectOf(ls, {}, 0) : Value();
+        if (!next)
+          next = andOf(ls);
         uint64_t init = resetOne[g] ? 1 : 0;
         auto reg = seq::FirRegOp::create(
             b, next, hostClock,
@@ -27527,11 +27619,8 @@ LogicalResult StaticFolder::buildSim() {
             hostReset, constant(1, init), hw::InnerSymAttr{}, /*isAsync=*/false,
             b.getIntegerAttr(b.getI1Type(), init));
         reg->setAttr(kPartialAttr, UnitAttr::get(context));
-        if (g >= 0) {
+        if (g >= 0)
           tagGroup(reg, g);
-          if (auto *op = next.getDefiningOp(); op && ls.size() > 1)
-            tagGroup(op, g);
-        }
         parts.push_back(reg);
         ++partialRegs;
       }
@@ -29299,18 +29388,21 @@ LogicalResult StaticFolder::extractGroups() {
       for (auto *op : parts) {
         Value p = op->getResult(0);
         DenseMap<unsigned, Value> replicaOf;
+        DenseSet<Operation *> replicas;
         for (OpOperand &use : llvm::make_early_inc_range(p.getUses())) {
           auto it = groupOfOp.find(use.getOwner());
-          if (it == groupOfOp.end() || it->second == h)
+          if (it == groupOfOp.end() || it->second == h || replicas.contains(use.getOwner()))
             continue;
           unsigned g = it->second;
           Value &rep = replicaOf[g];
           if (!rep) {
             auto *clone = pb.clone(*op);
             keepReplica(clone, g);
-            opsOf[g].push_back(clone);
-            groupOfOp[clone] = g;
+            unsigned at = advancePartialsAtReader ? g : h;
+            opsOf[at].push_back(clone);
+            groupOfOp[clone] = at;
             rep = clone->getResult(0);
+            replicas.insert(clone);
             ++partialReplicas;
           }
           use.set(rep);
@@ -30611,6 +30703,12 @@ void FoldStaticPass::runOnOperation() {
   folder.lookaheadTables = lookaheadTables;
   folder.readyAhead = readyAhead;
   folder.advancePartials = advancePartials;
+  folder.advancePartialsCofactor = advancePartialsCofactor;
+  if (advancePartialsAt != "source" && advancePartialsAt != "reader") {
+    getOperation().emitError("fold-static: advance-partials-at is source or reader");
+    return signalPassFailure();
+  }
+  folder.advancePartialsAtReader = advancePartialsAt == "reader";
   folder.roomAhead = roomAhead;
   folder.roomRegions = roomRegions;
   folder.vmemS28 = vmemS28;

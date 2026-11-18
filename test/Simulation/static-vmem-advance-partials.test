@@ -29,29 +29,53 @@
 # FAST: {{^}}MATCH 196 cycles in {{[0-9]+}} host cycles
 # CHECK: {{^}}MATCH 196 cycles
 # Two copies in two SLR groups: each copy's pending terms are ANDed in its own
-# group; each group reads the other's partial from a replica of its own.
+# group; the other group reads it from a replica of its own, beside the
+# partial (default --advance-partials-at source: the register's output
+# crosses) or in the reader (reader: the next value crosses). Each partial's
+# next a select by advance and go of the cofactors' ANDs, or the plain AND
+# (--advance-partials-plain): the same MATCH in the same host cycles.
 # RUN: foldsim --srcs top.f --top Top --out %t/g0 --static --virtual-memories ram --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-home Leaf > /dev/null 2>&1
 # RUN: foldsim --srcs top.f --top Top --out %t/g1 --static --virtual-memories ram --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-home --advance-partials Leaf > %t/g1.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/g2 --static --virtual-memories ram --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-home --advance-partials --advance-partials-at reader Leaf > /dev/null 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/g3 --static --virtual-memories ram --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-home --advance-partials --advance-partials-plain Leaf > /dev/null 2>&1
 # RUN: FileCheck %s --check-prefix=GLOG < %t/g1.log
 # GLOG: advance-partials: 4 terms in 3 partials (level 2, group 0 1, group 1 1), 0 left as they are
 # GLOG: advance-partials: 2 partial replicas in the groups that read them
 # RUN: FileCheck %s --check-prefix=GSV < %t/g1/foldsim_sim.sv
 # GSV-LABEL: module foldsim_sim_slr0(
 # GSV-DAG: vpart_s0{{(_[0-9]+)?}} <=
-# GSV-DAG: vpart_s1_g0 <=
+# GSV-DAG: vpart_s0_g1{{(_[0-9]+)?}} <=
 # GSV-LABEL: module foldsim_sim_slr1(
 # GSV-DAG: vpart_s1{{(_[0-9]+)?}} <=
-# GSV-DAG: vpart_s0_g1 <=
+# GSV-DAG: vpart_s1_g0{{(_[0-9]+)?}} <=
 # GSV-LABEL: module foldsim_sim(
+# RUN: FileCheck %s --check-prefix=RSV < %t/g2/foldsim_sim.sv
+# RSV-LABEL: module foldsim_sim_slr0(
+# RSV-DAG: vpart_s0{{(_[0-9]+)?}} <=
+# RSV-DAG: vpart_s1_g0{{(_[0-9]+)?}} <=
+# RSV-LABEL: module foldsim_sim_slr1(
+# RSV-DAG: vpart_s1{{(_[0-9]+)?}} <=
+# RSV-DAG: vpart_s0_g1{{(_[0-9]+)?}} <=
+# RSV-LABEL: module foldsim_sim(
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DCOPIES2 -DIW=1 -Mdir %t/g0/obj %S/Inputs/tb_vmem.sv top.sv %t/g0/foldsim_sim.sv > %t/g0/build.log 2>&1
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DCOPIES2 -DIW=1 -Mdir %t/g1/obj %S/Inputs/tb_vmem.sv top.sv %t/g1/foldsim_sim.sv > %t/g1/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DCOPIES2 -DIW=1 -Mdir %t/g2/obj %S/Inputs/tb_vmem.sv top.sv %t/g2/foldsim_sim.sv > %t/g2/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DCOPIES2 -DIW=1 -Mdir %t/g3/obj %S/Inputs/tb_vmem.sv top.sv %t/g3/foldsim_sim.sv > %t/g3/build.log 2>&1
 # RUN: %t/g0/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | grep MATCH > %t/g0/r1.txt
 # RUN: %t/g1/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | grep MATCH > %t/g1/r1.txt
+# RUN: %t/g2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | grep MATCH > %t/g2/r1.txt
+# RUN: %t/g3/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | grep MATCH > %t/g3/r1.txt
 # RUN: %t/g0/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/g0/r2.txt
 # RUN: %t/g1/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/g1/r2.txt
+# RUN: %t/g2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/g2/r2.txt
+# RUN: %t/g3/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/g3/r2.txt
 # RUN: FileCheck %s < %t/g1/r1.txt
 # RUN: diff %t/g0/r1.txt %t/g1/r1.txt
+# RUN: diff %t/g0/r1.txt %t/g2/r1.txt
+# RUN: diff %t/g0/r1.txt %t/g3/r1.txt
 # RUN: diff %t/g0/r2.txt %t/g1/r2.txt
+# RUN: diff %t/g0/r2.txt %t/g2/r2.txt
+# RUN: diff %t/g0/r2.txt %t/g3/r2.txt
 # Nested sequencers with bubbles.
 # RUN: foldsim --srcs top.f --top Top --out %t/n0 --static --virtual-memories ram --ready-ahead --room-ahead --nest --bubbles Leaf > /dev/null 2>&1
 # RUN: foldsim --srcs top.f --top Top --out %t/n1 --static --virtual-memories ram --ready-ahead --room-ahead --nest --bubbles --advance-partials Leaf > /dev/null 2>&1

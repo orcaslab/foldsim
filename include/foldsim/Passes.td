@@ -1222,6 +1222,16 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "or host cycle moves. Terms of other logic (a copy's pending "
            "vector without ready-ahead) stay in the AND as they are "
            "(reported)">,
+    Option<"advancePartialsAt", "advance-partials-at", "std::string", "\"source\"",
+           "With advance-partials and SLR groups: where the replica of a "
+           "partial that another group reads is: `source` (beside the "
+           "partial, in its group: the register's output crosses the SLR "
+           "into the reader's advance, one LUT) or `reader` (in the reading "
+           "group: the partial's next value crosses into it)">,
+    Option<"advancePartialsCofactor", "advance-partials-cofactor", "bool", "true",
+           "With advance-partials: each partial's next value a select by the "
+           "decision's late values (advance, go) of the ANDs of its terms' "
+           "cofactors, so that they meet the register in one LUT">,
     Option<"roomAhead", "room-ahead", "bool", "false",
            "With virtual memories: each controller's room term of the frame "
            "decision (its `free` at least the requests the decisions in "
