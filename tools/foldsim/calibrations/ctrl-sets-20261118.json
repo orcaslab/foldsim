@@ -1,11 +1,63 @@
 {
  "about": "foldsim_ctrl_check --calibration: the design total of predicted LUT-RAM write-enable control sets per family, from its built images (a32-V48 11-18, M's decision: FSD keeps the hard 10,000 refusal; 4/8 SMs WARN past their routed points, the per-SLR fraction stays the physical gate).",
  "families": {
-  "fsd": {"max_total": 10000, "past": "REFUSE", "basis": "FSD 1,024: LKG 4,580 routed; S11s8 / F28s 56-67k failed routing (CNODE overlaps)",
-          "points": [{"design": "c3L64 (LKG)", "predicted": 4580, "outcome": "routed"}, {"design": "S11s8", "predicted": 66883, "outcome": "route failed"}]},
-  "vortex-a32-4sm": {"max_total": 13284, "past": "WARN", "basis": "4-SM A100-32: e4b 13,036 routed 198.9 MHz; R4 P1 (R1L2 netlist) 13,284 routed clean 200 MHz",
-          "points": [{"design": "e4b", "predicted": 13036, "outcome": "routed 198.9 MHz"}, {"design": "R4 P1 (L2)", "predicted": 13284, "outcome": "routed clean 200 MHz"}]},
-  "vortex-a32-8sm": {"max_total": 17395, "past": "WARN", "basis": "8-SM A100-32: e8h 17,395 routed (171.9 MHz)",
-          "points": [{"design": "e8h", "predicted": 17395, "outcome": "routed 171.9 MHz"}]}
+  "fsd": {
+   "max_total": 10000,
+   "past": "REFUSE",
+   "basis": "FSD 1,024: LKG 4,580 routed; S11s8 / F28s 56-67k failed routing (CNODE overlaps)",
+   "points": [
+    {
+     "design": "c3L64 (LKG)",
+     "predicted": 4580,
+     "outcome": "routed"
+    },
+    {
+     "design": "S11s8",
+     "predicted": 66883,
+     "outcome": "route failed"
+    }
+   ]
+  },
+  "vortex-a32-4sm": {
+   "max_total": 13284,
+   "past": "WARN",
+   "basis": "4-SM A100-32: e4b 13,036 routed 198.9 MHz; R4 P1 (R1L2 netlist) 13,284 routed clean 200 MHz",
+   "points": [
+    {
+     "design": "e4b",
+     "predicted": 13036,
+     "outcome": "routed 198.9 MHz"
+    },
+    {
+     "design": "R4 P1 (L2)",
+     "predicted": 13284,
+     "outcome": "routed clean 200 MHz"
+    }
+   ]
+  },
+  "vortex-a32-8sm": {
+   "max_total": 17395,
+   "past": "WARN",
+   "basis": "8-SM A100-32: e8h 17,395 routed (171.9 MHz)",
+   "points": [
+    {
+     "design": "e8h",
+     "predicted": 17395,
+     "outcome": "routed 171.9 MHz"
+    }
+   ]
+  },
+  "vortex-a32-16sm": {
+   "max_total": 33527,
+   "past": "WARN",
+   "basis": "16-SM A100-32: T1gx (S28C ra2, 11-16) predicted 33,527, placed 27,768 control sets (6,270 < 4 BELs) and routed to the SLL assignment, which failed on SLR cut 1-2 demand (Route 35-4670), with 0-1 node overlaps: no CNODE / control-pin failure at that count (a32-T1 11-18)",
+   "points": [
+    {
+     "design": "T1gx (ra2)",
+     "predicted": 33527,
+     "outcome": "placed 27,768; route stopped at SLL assignment (cut 1-2), node overlaps 0-1"
+    }
+   ]
+  }
  }
 }
