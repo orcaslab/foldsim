@@ -271,7 +271,7 @@ def class_at(text, top, specs):
     return '\n'.join(lines), list(name.values())
 
 
-def class_auto(text, top, classes, min_count, min_ops, deep=False):
+def class_auto(text, top, classes, min_count, min_ops, deep=False, fused=()):
     """`--class-auto N[:OPS]`: the level's replicated instances as classes. What stays
     in the simulator level (outside every class) and is replicated by the design's
     generate loops (instance paths equal but for their indices, one module) grows
@@ -279,7 +279,9 @@ def class_auto(text, top, classes, min_count, min_ops, deep=False):
     least N instances, of at least OPS operations (the module and every module
     below it) and with no class below it, becomes a class of its own (an
     `--class-at TAG@GLOB` of its paths, the indices `*`), outermost first: the
-    level then holds one copy's logic a group, folded like any class. Returns
+    level then holds one copy's logic a group, folded like any class. A group
+    holding a member of a fused class (`A+B`, the pair one parent must
+    instantiate) is never taken: nesting it would part the pair. Returns
     the specs ([(tag, glob)]) and one line a group for the report.
     With `deep` (S29 F3: the arbiters sized by ports and banks), a group with
     classes below it is taken too, as a `nest:` class holding them: what the
@@ -297,7 +299,8 @@ def class_auto(text, top, classes, min_count, min_ops, deep=False):
             cur = None
     body = {m: [(mm.group(1), mm.group(3)) for i in range(s, e) for mm in [INSTANCE.search(lines[i])] if mm]
             for m, (s, e) in span.items() if e is not None}
-    size, has_class = {}, {}
+    size, has_class, has_fused = {}, {}, {}
+    fused = set(fused)
 
     def is_class(m):
         return m in classes or re.sub(r'_\d+$', '', m) in classes
@@ -307,6 +310,8 @@ def class_auto(text, top, classes, min_count, min_ops, deep=False):
             s, e = span[m]
             size[m] = (e - s) + sum(walk_size(c) for _, c in body.get(m, []) if c in body)
             has_class[m] = any(is_class(c) or (c in body and has_class[c]) for _, c in body.get(m, []))
+            has_fused[m] = any(c in fused or re.sub(r'_\d+$', '', c) in fused or (c in body and has_fused[c])
+                               for _, c in body.get(m, []))
         return size[m]
 
     groups = {}
@@ -324,7 +329,7 @@ def class_auto(text, top, classes, min_count, min_ops, deep=False):
     found = []
     for (glob, callee), paths in groups.items():
         if '*' in glob and len(paths) >= min_count and walk_size(callee) >= min_ops and \
-                (deep or not has_class[callee]):
+                (deep or not has_class[callee]) and not has_fused[callee]:
             found.append((glob, callee, len(paths), size[callee]))
     found.sort(key=lambda g: (g[0].count('.'), g[0]))
     specs, report = [], []
@@ -3545,7 +3550,8 @@ def main():
             sys.exit(f'--class-auto {a.class_auto}: not N[:OPS[:deep]] (N >= 2)')
         text = open(design).read()
         specs, report = class_auto(text, a.top, {m for c in a.classes for m in c.split('+')},
-                                   int(n), int(ops or 40), deep=mode == 'deep')
+                                   int(n), int(ops or 40), deep=mode == 'deep',
+                                   fused={m for c in a.classes if '+' in c for m in c.split('+')})
         for line in report:
             print(f'foldsim: class-auto: {line}', file=sys.stderr)
         if specs:
