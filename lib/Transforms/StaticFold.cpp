@@ -1285,6 +1285,9 @@ private:
   /// class the largest k <= kmax whose passes, k apart, fit the ungrouped
   /// frame (k x instances <= it).
   unsigned serialAuto = 0;
+  /// `slr-serialize`: the classes an entry after `auto` names (their k
+  /// stays: a later entry wins).
+  std::vector<bool> serialPinned;
   LogicalResult parseSerialize();
   unsigned serialOf(int c) const {
     return c >= 0 && unsigned(c) < serialK.size() ? serialK[c] : 1;
@@ -4550,6 +4553,7 @@ LogicalResult StaticFolder::parseSplitLatency() {
 
 LogicalResult StaticFolder::parseSerialize() {
   serialK.assign(classes.size(), 1);
+  serialPinned.assign(classes.size(), false);
   serialAuto = 0;
   for (auto &spec : slrSerializeSpecs) {
     // `auto` / `auto:<kmax>`: each crossing producer's k chosen by chooseGroups.
@@ -4560,6 +4564,8 @@ LogicalResult StaticFolder::parseSerialize() {
         return netlist.emitError("slr-serialize: '")
                << spec << "' is not auto or auto:<k>, k from 1 to 64";
       serialAuto = k;
+      // (`auto` covers every class an earlier entry named.)
+      serialPinned.assign(classes.size(), false);
       continue;
     }
     auto [pattern, count] = StringRef(spec).rsplit(':');
@@ -4577,6 +4583,7 @@ LogicalResult StaticFolder::parseSerialize() {
       int base = cls.splitFrom >= 0 ? cls.splitFrom : int(c);
       if (glob->match(classes[base].name) || glob->match(cls.name)) {
         serialK[c] = k;
+        serialPinned[c] = true;
         any = true;
       }
     }
@@ -9805,9 +9812,13 @@ LogicalResult StaticFolder::chooseGroups() {
        << " (II " << plain.length << ");";
     unsigned shown = 0;
     for (auto [c, cls] : llvm::enumerate(classes)) {
+      // (A class an entry after `auto` names keeps that entry's k.)
       unsigned k = serialAuto;
-      while (k > 1 && uint64_t(k) * std::max(1u, cls.threads()) > ungrouped)
-        --k;
+      if (serialPinned[c])
+        k = serialK[c];
+      else
+        while (k > 1 && uint64_t(k) * std::max(1u, cls.threads()) > ungrouped)
+          --k;
       serialK[c] = k;
       if (shown++ < 24)
         ls << " " << cls.name << " " << k;

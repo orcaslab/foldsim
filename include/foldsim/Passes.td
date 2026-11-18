@@ -644,7 +644,8 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "of a level) are kept k apart; SLL budgets and cuts count a "
                "k-th of its bits. auto or auto:<kmax> (default 8): each class "
                "the largest k <= kmax whose passes, k apart, fit the ungrouped "
-               "schedule's modulo lower bound (k x instances <= it)">,
+               "schedule's modulo lower bound (k x instances <= it); an entry "
+               "after `auto` keeps its k for the classes it names">,
     ListOption<"slrAssign", "slr-assign", "std::string",
                "With slr-groups, classes pinned to a group, as "
                "<class>:<group>">,

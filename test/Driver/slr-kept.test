@@ -32,6 +32,10 @@
 # RANK: slr-groups: assignment 1 of 2: 374 link wires between groups, serialized bound 0, II 16 = the ungrouped lower bound: chosen
 # RANK: foldsim-fold-static: II = 16
 # AUTO: slr-serialize auto: ungrouped lower bound 16 (II 16); Top_model 8 lvl1_model 8 node 1
+# A later entry wins over auto for the classes it names (auto:4 then
+# lvl1_model:2): lvl1_model keeps 2, the others auto's.
+# RUN: foldsim-opt %t/m/models.mlir --mlir-print-op-on-diagnostic=false '--pass-pipeline=builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim modulo schedule-only slr-groups=2 slr-capacities=60000,60000 slr-sites=node:50000,lvl1_model:10000,Top_model:10000 slr-serialize=auto:4,lvl1_model:2})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=LATER
+# LATER: slr-serialize auto: ungrouped lower bound 16 (II 16); Top_model 4 lvl1_model 2 node 1
 # STOP: slr-groups: assignment 1 of 8: 0 link bits between groups, serialized bound 0, II 16 = the ungrouped lower bound: chosen
 # STOP-NOT: slr-groups: assignment 2 of
 # STOP: foldsim-fold-static: II = 16
