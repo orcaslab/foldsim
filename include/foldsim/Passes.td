@@ -1208,6 +1208,20 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "register is kept apart (not merged with the other classes'), "
            "next to its slot tables. The same values: no schedule or host "
            "cycle moves">,
+    Option<"advancePartials", "advance-partials", "bool", "false",
+           "The frame decision's AND retimed over its terms' registers: each "
+           "term whose logic reads only registers (synchronous reset, constant "
+           "reset value) and constants is computed a host cycle ahead (its "
+           "logic over the registers' next values), and the terms of one "
+           "source SLR group (the group whose instance outputs they read; "
+           "else the level) are ANDed there into one register, the partial. "
+           "With SLR groups each group reading another group's partial gets "
+           "its own replica of it, so every group's advance is an AND of its "
+           "own registers and what crosses an SLR into the frame control ends "
+           "at a register. The same decision in every host cycle: no schedule "
+           "or host cycle moves. Terms of other logic (a copy's pending "
+           "vector without ready-ahead) stay in the AND as they are "
+           "(reported)">,
     Option<"roomAhead", "room-ahead", "bool", "false",
            "With virtual memories: each controller's room term of the frame "
            "decision (its `free` at least the requests the decisions in "

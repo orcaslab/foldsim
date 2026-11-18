@@ -414,6 +414,8 @@ def frame_options(a):
         fold += ' bubbles'
     if getattr(a, 'ready_ahead', False):
         fold += ' ready-ahead'
+    if getattr(a, 'advance_partials', False):
+        fold += ' advance-partials'
     if getattr(a, 'room_ahead', False):
         fold += ' room-ahead'
         if getattr(a, 'room_regions', False):
@@ -2553,6 +2555,12 @@ def build_parser():
                     help='with --static and virtual memories: the pending-read bits the frame decision waits '
                          'on read a host cycle ahead into registers (the decision an AND of registers), each '
                          'class\'s bubble register kept apart; the same values (fold-static ready-ahead)')
+    ap.add_argument('--advance-partials', action='store_true',
+                    help='with --static: the frame decision\'s AND retimed over its terms\' registers: the '
+                         'terms of each source SLR group a host cycle ahead, ANDed into one register there '
+                         '(the partial), replicated into each group that reads it; every group\'s advance '
+                         'one AND of its own registers. Exact (no host cycle moves); the pending terms need '
+                         '--ready-ahead to be registers (fold-static advance-partials)')
     ap.add_argument('--room-ahead', action='store_true',
                     help='with --static and virtual memories: each controller\'s room term of the frame decision '
                          'registered (free a host cycle before, two entries more); exact, may add host cycles '

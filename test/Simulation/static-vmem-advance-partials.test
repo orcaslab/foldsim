@@ -1,0 +1,68 @@
+# REQUIRES: verilator
+# --advance-partials: the frame decision's AND retimed over its terms'
+# registers. Each term that is logic over registers (the ready-ahead pending
+# bits and their lookahead tables, the room-ahead room registers) is computed a
+# host cycle ahead over the registers' next values, and the terms of one source
+# group are ANDed into one register there (`vpart_s<g>`, `vpart_level`); a
+# group reading another group's partial gets a replica of its own
+# (`vpart_s<g>_g<h>`). The same decision in every host cycle: the same MATCH in
+# the same host cycles as without the option (one copy with room terms; two
+# copies in two SLR groups; nested sequencers with bubbles).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmem
+# RUN: foldsim --srcs top.f --top Top --out %t/base --static --virtual-memories ram --ready-ahead --room-ahead Leaf > /dev/null 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/one --static --virtual-memories ram --ready-ahead --room-ahead --advance-partials Leaf > %t/one.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/one.log
+# LOG: advance-partials: 2 terms in 1 partials (level 2), 0 left as they are
+# RUN: FileCheck %s --check-prefix=IR < %t/one/foldsim_sim.mlir
+# IR: %vpart_level = seq.firreg {{%[^ ]+}} clock %hostClock reset sync %hostReset, %false preset 0 {foldsim.advance_partial}
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -Mdir %t/base/obj %S/Inputs/tb_vmem.sv top.sv %t/base/foldsim_sim.sv > %t/base/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -Mdir %t/one/obj %S/Inputs/tb_vmem.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=FAST
+# RUN: %t/base/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | grep MATCH > %t/base/r1.txt
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +lo=1 +hi=30 +stall=20 | grep MATCH > %t/one/r1.txt
+# RUN: %t/base/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/base/r2.txt
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/one/r2.txt
+# RUN: FileCheck %s < %t/one/r1.txt
+# RUN: FileCheck %s < %t/one/r2.txt
+# RUN: diff %t/base/r1.txt %t/one/r1.txt
+# RUN: diff %t/base/r2.txt %t/one/r2.txt
+# FAST: {{^}}MATCH 196 cycles in {{[0-9]+}} host cycles
+# CHECK: {{^}}MATCH 196 cycles
+# Two copies in two SLR groups: each copy's pending terms are ANDed in its own
+# group; each group reads the other's partial from a replica of its own.
+# RUN: foldsim --srcs top.f --top Top --out %t/g0 --static --virtual-memories ram --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-home Leaf > /dev/null 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/g1 --static --virtual-memories ram --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-home --advance-partials Leaf > %t/g1.log 2>&1
+# RUN: FileCheck %s --check-prefix=GLOG < %t/g1.log
+# GLOG: advance-partials: 4 terms in 3 partials (level 2, group 0 1, group 1 1), 0 left as they are
+# GLOG: advance-partials: 2 partial replicas in the groups that read them
+# RUN: FileCheck %s --check-prefix=GSV < %t/g1/foldsim_sim.sv
+# GSV-LABEL: module foldsim_sim_slr0(
+# GSV-DAG: vpart_s0{{(_[0-9]+)?}} <=
+# GSV-DAG: vpart_s1_g0 <=
+# GSV-LABEL: module foldsim_sim_slr1(
+# GSV-DAG: vpart_s1{{(_[0-9]+)?}} <=
+# GSV-DAG: vpart_s0_g1 <=
+# GSV-LABEL: module foldsim_sim(
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DCOPIES2 -DIW=1 -Mdir %t/g0/obj %S/Inputs/tb_vmem.sv top.sv %t/g0/foldsim_sim.sv > %t/g0/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DCOPIES2 -DIW=1 -Mdir %t/g1/obj %S/Inputs/tb_vmem.sv top.sv %t/g1/foldsim_sim.sv > %t/g1/build.log 2>&1
+# RUN: %t/g0/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | grep MATCH > %t/g0/r1.txt
+# RUN: %t/g1/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | grep MATCH > %t/g1/r1.txt
+# RUN: %t/g0/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/g0/r2.txt
+# RUN: %t/g1/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/g1/r2.txt
+# RUN: FileCheck %s < %t/g1/r1.txt
+# RUN: diff %t/g0/r1.txt %t/g1/r1.txt
+# RUN: diff %t/g0/r2.txt %t/g1/r2.txt
+# Nested sequencers with bubbles.
+# RUN: foldsim --srcs top.f --top Top --out %t/n0 --static --virtual-memories ram --ready-ahead --room-ahead --nest --bubbles Leaf > /dev/null 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/n1 --static --virtual-memories ram --ready-ahead --room-ahead --nest --bubbles --advance-partials Leaf > /dev/null 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DBUBBLES -Mdir %t/n0/obj %S/Inputs/tb_vmem.sv top.sv %t/n0/foldsim_sim.sv > %t/n0/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DBUBBLES -Mdir %t/n1/obj %S/Inputs/tb_vmem.sv top.sv %t/n1/foldsim_sim.sv > %t/n1/build.log 2>&1
+# RUN: %t/n0/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=1 +hi=30 +bubble=95 +burst=16 +stall=10 | grep MATCH > %t/n0/r1.txt
+# RUN: %t/n1/obj/Vtb +verilator+rand+reset+0 +verilator+seed+8 +lo=1 +hi=30 +bubble=95 +burst=16 +stall=10 | grep MATCH > %t/n1/r1.txt
+# RUN: FileCheck %s < %t/n1/r1.txt
+# RUN: diff %t/n0/r1.txt %t/n1/r1.txt
+# Without --ready-ahead the pending term reads the copy's pending vector (an
+# instance output): it stays in the AND as it is; the room term is retimed.
+# RUN: foldsim --srcs top.f --top Top --out %t/nra --static --virtual-memories ram --room-ahead --advance-partials Leaf > %t/nra.log 2>&1
+# RUN: FileCheck %s --check-prefix=NRA < %t/nra.log
+# NRA: advance-partials: 1 terms in 1 partials (level 1), 1 left as they are

@@ -1048,6 +1048,11 @@ public:
   /// `ready-ahead`: the readiness's pending bits read a host cycle ahead
   /// into registers; the classes' bubble registers kept apart.
   bool readyAhead = false;
+  /// `advance-partials`: the decision's AND retimed over its terms'
+  /// registers, one partial register per source SLR group (buildPartials),
+  /// replicated into each consuming group (extractGroups).
+  bool advancePartials = false;
+  unsigned partialTerms = 0, partialLeft = 0, partialRegs = 0, partialReplicas = 0;
   /// `room-ahead`: the controllers' room terms registered (two entries more).
   bool roomAhead = false;
   /// `room-regions` (with room-ahead): the controllers' `free` registered as
@@ -12828,6 +12833,11 @@ static constexpr int kSyncAfterLevels = 16;
 /// The SLR group an op of the simulator is built in, until `extractGroups`
 /// moves it into the group's module.
 static constexpr StringLiteral kSlrAttr = "foldsim.slr";
+
+/// `advance-partials`: a partial of the frame decision (a register of the
+/// AND of one source group's terms a host cycle ahead); extractGroups gives
+/// each other group that reads it a replica of its own.
+static constexpr StringLiteral kPartialAttr = "foldsim.advance_partial";
 
 static void tagGroup(Operation *op, int group) {
   if (group >= 0 && !op->hasAttr(kSlrAttr))
@@ -27352,6 +27362,191 @@ LogicalResult StaticFolder::buildSim() {
           b, notOf(landsNext),
           comb::AndOp::create(b, clear, false)));
     }
+    // `advance-partials`: the AND retimed over its terms' registers. A term
+    // X whose logic reads only registers (synchronous reset, a constant
+    // reset value, or no reset and a preset) and constants has its value a
+    // host cycle ahead in L1(X): the same logic over each register's next
+    // value as its D pin takes it, L1(r) = reset ? reset value : next, so
+    // X(t + 1) = L1(X)(t) in every host cycle, reset cycles included. The
+    // terms of one source group (the group of the most instance outputs
+    // their L1 logic reads, as slr-group-home homes a register; else the
+    // level) are ANDed and registered there (the partial): P(t) = AND X(t),
+    // reset to the AND of the terms at their registers' reset values (which
+    // is also their power-on value, the presets being the reset values). The
+    // decision ANDs the partials, the same value in every host cycle.
+    // (Only this AND moves; the term registers keep their other readers.)
+    if (advancePartials && !terms.empty()) {
+      DenseMap<Value, Value> lead;
+      std::function<Value(Value, unsigned)> leadOf = [&](Value v, unsigned depth) -> Value {
+        if (auto it = lead.find(v); it != lead.end())
+          return it->second;
+        Operation *def = v.getDefiningOp();
+        if (!def || depth > 64)
+          return {};
+        Value l;
+        if (auto reg = dyn_cast<seq::FirRegOp>(def)) {
+          if (reg.getIsAsync())
+            return {};
+          if (reg.hasReset()) {
+            if (!reg.getResetValue().getDefiningOp<hw::ConstantOp>())
+              return {};
+            l = comb::MuxOp::create(b, reg.getReset(), reg.getResetValue(), reg.getNext());
+          } else {
+            if (!reg.getPresetAttr())
+              return {};
+            l = reg.getNext();
+          }
+        } else if (def->getNumOperands() == 0 && def->getNumRegions() == 0 &&
+                   mlir::isMemoryEffectFree(def)) {
+          l = v;                        // a constant
+        } else if (def->getNumResults() == 1 && def->getNumRegions() == 0 &&
+                   (def->getDialect()->getNamespace() == "comb" ||
+                    (def->getDialect()->getNamespace() == "hw" &&
+                     !isa<hw::InstanceOp, hw::OutputOp>(def))) &&
+                   mlir::isMemoryEffectFree(def)) {
+          IRMapping map;
+          for (Value o : def->getOperands()) {
+            Value lo = leadOf(o, depth + 1);
+            if (!lo)
+              return {};
+            map.map(o, lo);
+          }
+          Operation *clone = b.clone(*def, map);
+          clone->removeAttr(kSlrAttr);
+          clone->removeAttr(kDomAttr);
+          l = clone->getResult(0);
+        } else {
+          return {};
+        }
+        lead[v] = l;
+        return l;
+      };
+      // The term with every register at its reset value (its preset without
+      // a reset), by the ops' folders: the partial's reset value.
+      DenseMap<Value, Attribute> atReset;
+      std::function<Attribute(Value)> resetOf = [&](Value v) -> Attribute {
+        if (auto it = atReset.find(v); it != atReset.end())
+          return it->second;
+        Operation *def = v.getDefiningOp();
+        if (!def)
+          return {};
+        Attribute r;
+        if (auto c = dyn_cast<hw::ConstantOp>(def)) {
+          r = c.getValueAttr();
+        } else if (auto reg = dyn_cast<seq::FirRegOp>(def)) {
+          if (reg.hasReset()) {
+            auto c = reg.getResetValue().getDefiningOp<hw::ConstantOp>();
+            r = c ? Attribute(c.getValueAttr()) : Attribute();
+          } else {
+            r = reg.getPresetAttr();
+          }
+        } else {
+          SmallVector<Attribute> ins;
+          for (Value o : def->getOperands()) {
+            Attribute a = resetOf(o);
+            if (!a)
+              return {};
+            ins.push_back(a);
+          }
+          SmallVector<OpFoldResult> outs;
+          if (failed(def->fold(ins, outs)) || outs.size() != 1)
+            return {};
+          if (auto a = dyn_cast<Attribute>(outs[0])) {
+            r = a;
+          } else {
+            Value same = cast<Value>(outs[0]);
+            for (auto [o, a] : llvm::zip(def->getOperands(), ins))
+              if (o == same)
+                r = a;
+          }
+        }
+        if (!r)
+          return {};
+        atReset[v] = r;
+        return r;
+      };
+      // A lead's source group: the group of more than half the instance
+      // outputs its logic reads (through logic, not past registers); -1 the
+      // level.
+      auto sourceOf = [&](Value l) -> int {
+        if (slrOf.empty())
+          return -1;
+        std::map<int, DenseSet<Value>> outs;
+        DenseSet<Operation *> seen;
+        SmallVector<Value> work{l};
+        while (!work.empty() && seen.size() < 8192) {
+          Value v = work.pop_back_val();
+          Operation *def = v.getDefiningOp();
+          if (!def)
+            continue;
+          if (isa<hw::InstanceOp>(def)) {
+            if (auto a = def->getAttrOfType<IntegerAttr>(kSlrAttr))
+              outs[a.getInt()].insert(v);
+            continue;
+          }
+          if (def->getNumRegions() || isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp,
+                                           seq::FirMemReadOp>(def) ||
+              !mlir::isMemoryEffectFree(def) || !seen.insert(def).second)
+            continue;
+          for (Value o : def->getOperands())
+            work.push_back(o);
+        }
+        unsigned total = 0, bestN = 0;
+        int best = -1;
+        for (auto &[g, vs] : outs) {
+          total += vs.size();
+          if (vs.size() > bestN)
+            best = g, bestN = vs.size();
+        }
+        return 2 * bestN > total ? best : -1;
+      };
+      std::map<int, SmallVector<Value>> leads;
+      std::map<int, bool> resetOne;
+      SmallVector<Value> kept;
+      for (Value t : terms) {
+        Value l = t.getType().isInteger(1) ? leadOf(t, 0) : Value();
+        auto rv = l ? dyn_cast_or_null<IntegerAttr>(resetOf(t)) : IntegerAttr();
+        if (!l || !rv) {
+          kept.push_back(t);
+          ++partialLeft;
+          continue;
+        }
+        int g = sourceOf(l);
+        leads[g].push_back(l);
+        auto [it, fresh] = resetOne.try_emplace(g, true);
+        it->second = it->second && rv.getValue().isOne();
+        ++partialTerms;
+      }
+      SmallVector<Value> parts;
+      for (auto &[g, ls] : leads) {
+        Value next = ls.size() == 1 ? ls[0] : Value(comb::AndOp::create(b, ls, false));
+        uint64_t init = resetOne[g] ? 1 : 0;
+        auto reg = seq::FirRegOp::create(
+            b, next, hostClock,
+            b.getStringAttr("vpart" + (g < 0 ? std::string("_level") : "_s" + std::to_string(g))),
+            hostReset, constant(1, init), hw::InnerSymAttr{}, /*isAsync=*/false,
+            b.getIntegerAttr(b.getI1Type(), init));
+        reg->setAttr(kPartialAttr, UnitAttr::get(context));
+        if (g >= 0) {
+          tagGroup(reg, g);
+          if (auto *op = next.getDefiningOp(); op && ls.size() > 1)
+            tagGroup(op, g);
+        }
+        parts.push_back(reg);
+        ++partialRegs;
+      }
+      parts.append(kept.begin(), kept.end());
+      llvm::errs() << "foldsim-fold-static: advance-partials: " << partialTerms
+                   << " terms in " << partialRegs << " partials (";
+      bool first = true;
+      for (auto &[g, ls] : leads) {
+        llvm::errs() << (first ? "" : ", ") << (g < 0 ? std::string("level") : "group " + std::to_string(g))
+                     << " " << ls.size();
+        first = false;
+      }
+      llvm::errs() << "), " << partialLeft << " left as they are (not register logic)\n";
+      terms.assign(parts.begin(), parts.end());
+    }
     virtualReady.setValue(comb::AndOp::create(b, terms, false));
   }
 
@@ -29083,6 +29278,48 @@ LogicalResult StaticFolder::extractGroups() {
                  << " cones left in the level (past " << slrGroupLocal
                  << " ops)\n";
   }
+  // `advance-partials`: a group that reads another group's partial (its
+  // copy of the frame decision, from slr-group-own / -local) takes it from a
+  // replica of its own: the same next value (the source group's AND of its
+  // terms a host cycle ahead), so the same value in every host cycle, and
+  // the register is in the reading group. What crosses an SLR into a
+  // group's frame control is then that next value, ending at a register;
+  // the group's advance is an AND of its own registers.
+  if (advancePartials && slrGroups > 1) {
+    DenseMap<Operation *, unsigned> groupOfOp;
+    for (unsigned g = 0; g < slrGroups; ++g)
+      for (auto *op : opsOf[g])
+        groupOfOp[op] = g;
+    OpBuilder pb(body->getTerminator());
+    for (unsigned h = 0; h < slrGroups; ++h) {
+      SmallVector<Operation *> parts;
+      for (auto *op : opsOf[h])
+        if (op->hasAttr(kPartialAttr))
+          parts.push_back(op);
+      for (auto *op : parts) {
+        Value p = op->getResult(0);
+        DenseMap<unsigned, Value> replicaOf;
+        for (OpOperand &use : llvm::make_early_inc_range(p.getUses())) {
+          auto it = groupOfOp.find(use.getOwner());
+          if (it == groupOfOp.end() || it->second == h)
+            continue;
+          unsigned g = it->second;
+          Value &rep = replicaOf[g];
+          if (!rep) {
+            auto *clone = pb.clone(*op);
+            keepReplica(clone, g);
+            opsOf[g].push_back(clone);
+            groupOfOp[clone] = g;
+            rep = clone->getResult(0);
+            ++partialReplicas;
+          }
+          use.set(rep);
+        }
+      }
+    }
+    llvm::errs() << "foldsim-fold-static: advance-partials: " << partialReplicas
+                 << " partial replicas in the groups that read them\n";
+  }
   // `slr-group-reset`: the level's ops take the reset through a register of
   // their own (a group's, through one in the group's module, below): every
   // part of the simulator sees hostReset a host cycle later, so no value
@@ -30373,6 +30610,7 @@ void FoldStaticPass::runOnOperation() {
   folder.dropDeadInputs = dropDeadInputs;
   folder.lookaheadTables = lookaheadTables;
   folder.readyAhead = readyAhead;
+  folder.advancePartials = advancePartials;
   folder.roomAhead = roomAhead;
   folder.roomRegions = roomRegions;
   folder.vmemS28 = vmemS28;
