@@ -1304,6 +1304,15 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
                "on the model's name; a copy goes by its class's) at N levels, "
                "<glob>:off not at all; the last matching spec wins. A spec "
                "that matches no class is an error">,
+    Option<"stageSrlStyle", "stage-srl-style", "std::string", "\"\"",
+           "With stage-levels: the srl_style synthesis attribute of every stage "
+           "register (e.g. register: no shift-register extraction). A chain of "
+           "stage registers on one stage_live enable is otherwise a candidate "
+           "for SRLs, whose enable enters the CLE through the SLICEM's write "
+           "enable, a control pin shared with the LUT RAMs and the flops' clock "
+           "enables around them (FSD 1,024 on the V80, 11-18: 52.8k SRL LUTs "
+           "of the staged Tile / node model did not route; as flops it routed). "
+           "Empty: no attribute (synthesis decides)">,
     ListOption<"multicycle", "multicycle", "std::string",
                "With stage-levels: classes (globs; a copy goes by its class's "
                "name) staged without stage registers. A copy evaluates one "

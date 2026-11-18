@@ -540,6 +540,8 @@ public:
   SmallVector<std::string> stateInRamSpecs;
   /// `stage-levels-class`: <glob>:<N|off> per class over `stage-levels`.
   SmallVector<std::string> stageLevelClassSpecs;
+  /// `stage-srl-style`: the srl_style attribute of every stage register.
+  std::string stageSrlStyle;
   /// `stage-levels-mapped`: the Beacon target whose mapped depth sizes the
   /// stages (empty: the estimate alone), and each model's mapped depth.
   std::string stageLevelsMapped;
@@ -13755,6 +13757,11 @@ LogicalResult StaticFolder::stageLogic(Class &cls, Block *body,
         b, bits.getType(), bits, hostClock, live,
         b.getStringAttr("stage" + Twine(k)), Value(), Value(), Value(),
         hw::InnerSymAttr{});
+    if (!stageSrlStyle.empty())
+      sv::addSVAttributes(staged.getDefiningOp(),
+                          {sv::SVAttributeAttr::get(
+                              b.getContext(), "srl_style",
+                              "\"" + stageSrlStyle + "\"", false)});
     if (staged.getType() != value.getType())
       staged = b.createOrFold<hw::BitcastOp>(value.getType(), staged);
     delays[{value, k}] = staged;
@@ -30540,6 +30547,7 @@ void FoldStaticPass::runOnOperation() {
   folder.splitLatencyFile = splitLatencyFile;
   folder.stageLevelClassSpecs.assign(stageLevelsClass.begin(),
                                      stageLevelsClass.end());
+  folder.stageSrlStyle = stageSrlStyle;
   if (!stageLevelsMapped.empty() &&
       !foldsim::lookupBeaconTarget(stageLevelsMapped)) {
     foldsim::emitUnknownBeaconTarget(getOperation(), stageLevelsMapped);

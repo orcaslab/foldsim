@@ -620,6 +620,8 @@ def frame_options(a):
         fold += f' stage-levels={a.stage_levels}'
     if getattr(a, 'stage_levels_class', ''):
         fold += f' stage-levels-class={a.stage_levels_class}'
+    if getattr(a, 'stage_srl_style', ''):
+        fold += f' stage-srl-style={a.stage_srl_style}'
     if getattr(a, 'stage_levels_mapped', ''):
         fold += f' stage-levels-mapped={a.stage_levels_mapped}'
     if getattr(a, 'multicycle', ''):
@@ -2963,6 +2965,10 @@ def build_parser():
                          'the Beacon TARGET\'s cells (versal for the V80), not from the estimate alone: a class '
                          'whose mapped depth fits --stage-levels is not staged (foldsim-fold-static '
                          'stage-levels-mapped)')
+    ap.add_argument('--stage-srl-style', default='', metavar='STYLE',
+                    help='with --static and --stage-levels: the srl_style attribute of every stage register (register: '
+                         'flops, no SRLs; their stage_live enable then reaches flop CE pins, not the SLICEM write enable '
+                         'shared with LUT RAMs) (foldsim-fold-static stage-srl-style)')
     ap.add_argument('--stage-levels-class', default='', metavar='CLASS:N|CLASS:off,...',
                     help='with --static: per class over --stage-levels (globs on the model name; the last '
                          'matching spec wins): stage that class at N levels, or not at all (off); a spec that '
