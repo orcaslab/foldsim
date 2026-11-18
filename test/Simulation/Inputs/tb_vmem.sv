@@ -16,6 +16,11 @@
 // with +drain=<percent> chance (default 100); a request that finds the queue
 // full prints OVERFLOW (the simulator's room terms must keep that from
 // happening) and fails the run.
+// With RNG_STREAMS each model and the channels draw from a random stream of
+// their own (xorshift), not from the one $urandom: two netlists' host cycles
+// then compare whatever order Verilator evaluates the models in (with COPIES2
+// the shared stream's order between the two models follows the netlist's
+// schedule, so equal decisions could still give different host cycles).
 // Prints MATCH or the first difference, and PROTOCOL if the simulator issues
 // a read of an instance whose read is still outstanding; then READS, the reads
 // issued, and FEWER where they are at most +maxreads=<n>. ROWW: row bits.
@@ -25,7 +30,7 @@
 `ifndef ROWW
 `define ROWW 4
 `endif
-module vmem_model #(parameter IW = 2, ROWS = 1 << `ROWW) (
+module vmem_model #(parameter IW = 2, ROWS = 1 << `ROWW, SEED = 1) (
     input logic clk, rst,
     input int cyc, lo, hi, full, queue, qlat, drain,
     output logic rsp_valid, output logic [IW-1:0] rsp_inst, output logic [7:0] rsp_data,
@@ -35,6 +40,12 @@ module vmem_model #(parameter IW = 2, ROWS = 1 << `ROWW) (
     input logic [7:0] wr_data, input logic wr_mask,
     output bit ok, output int reads);
   localparam INSTS = 1 << IW;
+`ifdef RNG_STREAMS
+  int unsigned rs = 32'h9e3779b9 ^ SEED;
+  function automatic int unsigned rnd(); rs ^= rs << 13; rs ^= rs >> 17; rs ^= rs << 5; return rs; endfunction
+`else
+  function automatic int unsigned rnd(); return $urandom; endfunction
+`endif
   logic [7:0] mem [INSTS][ROWS];
   bit outstanding [INSTS];
   int qage [$];
@@ -49,11 +60,11 @@ module vmem_model #(parameter IW = 2, ROWS = 1 << `ROWW) (
   end
   always @(negedge clk) begin
     if (queue > 0) begin
-      if (qage.size() != 0 && cyc - qage[0] >= qlat && int'($urandom % 100) < drain)
+      if (qage.size() != 0 && cyc - qage[0] >= qlat && int'(rnd() % 100) < drain)
         void'(qage.pop_front());
       free = 16'(queue - qage.size());
     end else
-      free = ($urandom % 100 >= full) ? 16'd64 : 16'd0;
+      free = (rnd() % 100 >= full) ? 16'd64 : 16'd0;
     // One due response a host cycle, any instance.
     rsp_valid = 0;
     for (int i = 0; i < INSTS; i++)
@@ -81,7 +92,7 @@ module vmem_model #(parameter IW = 2, ROWS = 1 << `ROWW) (
         ok = 0;
       end
       outstanding[rd_inst] = 1;
-      due[rd_inst] = cyc + lo + int'($urandom % (hi - lo + 1));
+      due[rd_inst] = cyc + lo + int'(rnd() % (hi - lo + 1));
       data[rd_inst] = mem[rd_inst][rd_row];
     end
 `ifndef WRITE_FIRST
@@ -165,21 +176,27 @@ module tb;
   initial if (!$value$plusargs("drain=%d", drain)) drain = 100;
   initial if (!$value$plusargs("lo=%d", lo)) lo = 1;
   initial if (!$value$plusargs("hi=%d", hi)) hi = lo;
+`ifdef RNG_STREAMS
+  int unsigned ts = 32'h2545f491;
+  function automatic int unsigned trnd(); ts ^= ts << 13; ts ^= ts >> 17; ts ^= ts << 5; return ts; endfunction
+`else
+  function automatic int unsigned trnd(); return $urandom; endfunction
+`endif
   for (genvar k = 0; k < V; k++) begin : g_vm
-    vmem_model #(.IW(`IW)) model(.clk, .rst, .cyc, .lo, .hi, .full, .queue, .qlat, .drain,
+    vmem_model #(.IW(`IW), .SEED(k + 7)) model(.clk, .rst, .cyc, .lo, .hi, .full, .queue, .qlat, .drain,
       .rsp_valid(rsp_valid[k]), .rsp_inst(rsp_inst[k]), .rsp_data(rsp_data[k]), .free(free[k]),
       .rd_valid(rd_valid[k]), .rd_inst(rd_inst[k]), .rd_row(rd_row[k]),
       .wr_valid(wr_valid[k]), .wr_inst(wr_inst[k]), .wr_row(wr_row[k]),
       .wr_data(wr_data[k]), .wr_mask(wr_mask[k]), .ok(model_ok[k]), .reads(model_reads[k]));
   end
   always @(negedge clk) begin
-    vx = ix < T && ($urandom % 100 >= stall);
-    yr = $urandom % 100 >= stall;
+    vx = ix < T && (trnd() % 100 >= stall);
+    yr = trnd() % 100 >= stall;
     if (brun > 0) begin
       adv = 0; brun--;
     end else begin
-      adv = $urandom % 100 >= bubble;
-      if (!adv && burst > 1) brun = $urandom % burst;
+      adv = trnd() % 100 >= bubble;
+      if (!adv && burst > 1) brun = trnd() % burst;
     end
   end
   always @(posedge clk) begin
