@@ -801,6 +801,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "chosen; the first whose frame is the modulo search's lower bound "
            "is chosen at once (none can beat it). Each is a whole schedule: at "
            "32 SMs tens of seconds">,
+    Option<"slrHopRegisters", "slr-hop-registers", "bool", "false",
+           "With SLR groups in die order (as --slr-region lists the SLRs): a "
+           "link between groups k > 1 apart is registered once per SLR "
+           "boundary, its bits in a register in each group between, k host "
+           "cycles (its write's enable, entry and bank as many later), rather "
+           "than in one register whose route crosses k boundaries; the links "
+           "of an slr-serialize class keep their own latency">,
     Option<"slrLinkRams", "slr-link-rams", "bool", "false",
            "With SLR groups: links may be block or ultra RAM too (by "
            "link-block-depth / link-ultra-depth or link-kind-cost), the memory "

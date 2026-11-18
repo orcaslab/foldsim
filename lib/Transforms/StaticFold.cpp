@@ -909,6 +909,9 @@ public:
   SmallVector<std::array<double, 3>> linkKindGroupCap, linkKindGroupBase;
   /// `slr-link-rams`: with SLR groups, links may be block or ultra RAM too.
   bool slrLinkRams = false;
+  /// `slr-hop-registers`: a link between groups k > 1 apart (groups in die
+  /// order) is registered once per SLR boundary.
+  bool slrHopRegisters = false;
   /// `slr-kept`: the SLR group assignments chooseGroups schedules.
   unsigned slrKept = 8;
   /// `slr-group-control`: each class's controls built in its class's group.
@@ -1297,15 +1300,25 @@ private:
     unsigned k = serialOf(p);
     return (bits + k - 1) / k;
   }
-  /// The host cycles a link of class `c` takes between groups: 1 (its
-  /// register), or with slr-serialize k + 1 (the pass's bits held, then k
-  /// chunks sent, each in a register fed only by registers).
-  unsigned crossLatency(int c) const {
+  /// `slr-hop-registers`: the SLR boundaries between class `c`'s group and
+  /// group `to` (the groups in die order, as --slr-region lists the SLRs),
+  /// each crossed from a register; 1 otherwise, and for a serialized class.
+  unsigned slrHops(int c, int to) const {
+    if (!slrHopRegisters || slrOf.empty() || c < 0 || to < 0 || serialOf(c) > 1)
+      return 1;
+    int d = std::abs(slrOf[c] - to);
+    return d > 1 ? unsigned(d) : 1;
+  }
+  /// The host cycles a link of class `c` to group `to` takes between groups:
+  /// 1 (its register), with slr-serialize k + 1 (the pass's bits held, then
+  /// k chunks sent, each in a register fed only by registers), with
+  /// slr-hop-registers one per SLR boundary.
+  unsigned crossLatency(int c, int to) const {
     unsigned k = serialOf(c);
-    return k > 1 ? k + 1 : 1;
+    return k > 1 ? k + 1 : slrHops(c, to);
   }
   int crossDelay(int p, int c) const {
-    return crosses(p, c) ? int(crossLatency(p)) : 0;
+    return crosses(p, c) ? int(crossLatency(p, slrOf[c])) : 0;
   }
   /// `slr-serialize`: the spacing of each class's passes of one kind (its
   /// k, where a link of it crosses groups and k > 1; else 0).
@@ -11429,7 +11442,8 @@ void StaticFolder::reportLinks(raw_ostream &os) {
         }
         // A crossing's write (data, enable, entry, bank) comes crossLatency
         // host cycles late: the reads it reaches are as many later.
-        unsigned cross = crossing ? crossLatency(producer.cls) : 0;
+        unsigned cross =
+            crossing ? crossLatency(producer.cls, slrOf[use.reader]) : 0;
         bool forward = oneCycleLinks &&
                        needsForward(use.producer, use.reader, takes, rows, 1 + cross);
         bool now = zeroLink(use.producer, use.reader, use.port) &&
@@ -23106,7 +23120,8 @@ LogicalResult StaticFolder::buildSim() {
     // slr-serialize: the host cycles the crossing takes; every register of
     // the write (enable, entry, bank) is that many host cycles late.
     unsigned serial = crossing ? serialOf(c) : 1;
-    unsigned crossLate = crossing ? crossLatency(c) : 1;
+    unsigned crossLate = crossing ? crossLatency(c, to) : 1;
+    unsigned hops = crossing ? slrHops(c, to) : 1;
     auto lateBy = [&](Value v, const Twine &lateName) {
       std::string n0 = lateName.str();
       v = copyReg(v, n0);
@@ -23147,6 +23162,14 @@ LogicalResult StaticFolder::buildSim() {
             tagGroup(registered.getDefiningOp(), slrOf[c]);
             if (physicalDomains)
               tagDomain(registered.getDefiningOp(), int(c));
+            // slr-hop-registers: one more register in each group between,
+            // so no route from a register crosses more than one boundary.
+            int step = to > slrOf[c] ? 1 : -1;
+            for (unsigned j = 1; j < hops; ++j) {
+              registered = copyReg(registered, crossName + "_hop" +
+                                                   std::to_string(j));
+              tagGroup(registered.getDefiningOp(), slrOf[c] + int(j) * step);
+            }
           } else {
             // slr-serialize: the producer's group holds the bits of its
             // pass (host cycle T) and sends chunk j of them in a register
@@ -25175,7 +25198,7 @@ LogicalResult StaticFolder::buildSim() {
         // after a write as it would without the crossing; else its memory
         // may be block or ultra RAM in the reader's group (slr-link-rams).
         bool crossing = to >= 0 && slrOf[producer.cls] != to;
-        unsigned cross = crossing ? crossLatency(producer.cls) : 0;
+        unsigned cross = crossing ? crossLatency(producer.cls, to) : 0;
         bool forward = oneCycleLinks &&
                        needsForward(key.first, c, takes, rows, 1 + cross);
         // Registered for the link writes where several classes read the
@@ -30622,6 +30645,7 @@ void FoldStaticPass::runOnOperation() {
   folder.readBufferBits = readBufferBits;
   folder.linkKindCost = linkKindCost;
   folder.slrLinkRams = slrLinkRams;
+  folder.slrHopRegisters = slrHopRegisters;
   folder.slrGroupControl = slrGroupControl;
   folder.slrGroupReset = slrGroupReset;
   folder.slrGroupLocal = slrGroupLocal;

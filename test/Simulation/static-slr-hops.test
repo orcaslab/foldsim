@@ -1,0 +1,29 @@
+# REQUIRES: verilator
+# slr-hop-registers: a link between SLR groups two apart (groups in die order)
+# is registered once per SLR boundary: the producer's bits in a register in
+# its own group, then in one in the group between, each host cycle; the
+# link's write (its enable, here of a one-entry link) as many host cycles later
+# in the reader's group.
+# Without the option the same assignment has one crossing register. Both match
+# the target, with the channels stalled or not.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/late
+# RUN: foldsim --srcs top.f --top Top --out %t/hop --static --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-count 3 --slr-assign Leaf:0,Leaf_copy1:2,Leaf_copy2:2,Top_model:1 --slr-hop-registers Leaf 2>&1 | FileCheck %s --check-prefix=SPLIT
+# RUN: FileCheck %s --check-prefix=HOP < %t/hop/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/hop/obj %S/Inputs/tb_late.sv top.sv %t/hop/foldsim_sim.sv > %t/hop/build.log 2>&1
+# RUN: %t/hop/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/hop/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=40 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/one --static --copies Leaf:3 --zero-latency-links --zero-latency-chains --slr-groups --slr-count 3 --slr-assign Leaf:0,Leaf_copy1:2,Leaf_copy2:2,Top_model:1 Leaf > /dev/null 2>&1
+# RUN: FileCheck %s --check-prefix=ONE < %t/one/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/one/obj %S/Inputs/tb_late.sv top.sv %t/one/foldsim_sim.sv > %t/one/build.log 2>&1
+# RUN: %t/one/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=20 | FileCheck %s
+# SPLIT: slr0 ({{[0-9]+}} sites): Leaf
+# SPLIT: slr2 ({{[0-9]+}} sites): Leaf_copy1 Leaf_copy2
+# HOP: hw.module private @foldsim_sim_slr0({{.*}}out Leaf_q_slr2_0 : i8
+# HOP: %Leaf_q_slr2_0 = seq.firreg
+# HOP: hw.module private @foldsim_sim_slr1({{.*}}in %foldsim_slr0_Leaf_q_slr2_0 : i8{{.*}}out Leaf_q_slr2_0_hop1 : i8
+# HOP: %Leaf_q_slr2_0_hop1 = seq.firreg %foldsim_slr0_Leaf_q_slr2_0 clock %hostClock
+# HOP: hw.module private @foldsim_sim_slr2(
+# HOP: %Leaf_slr2_links0_state_late2 = seq.firreg %Leaf_slr2_links0_state_late clock %hostClock
+# HOP: comb.mux %Leaf_slr2_links0_state_late2, %foldsim_slr1_Leaf_q_slr2_0_hop1, %Leaf_q_to_Leaf_copy1_d_0
+# ONE-NOT: _hop1
+# CHECK: {{^}}MATCH
