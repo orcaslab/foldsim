@@ -15,6 +15,12 @@
 # RUN: python3 %S/Inputs/linkii/ii.py foldsim %t/no/schedule.txt Unit:Reader:block:8 %t/p8/schedule.txt | FileCheck %s --check-prefix=P8
 # RUN: not foldsim --srcs top.f --top Top --out %t/bad --static --nest --modulo --schedule-only --link-kinds Unit:Reader:block:4,Unit:Reader:distributed Unit Reader 2>&1 | FileCheck %s --check-prefix=BAD
 # RUN: foldsim --srcs top.f --top Top --out %t/dup --static --nest --modulo --link-block-depth 2 --schedule-only --link-kinds Unit:Reader:block:4,Unit:Reader:block:4 Unit Reader 2>&1 | FileCheck %s --check-prefix=DUP
+# With short-lead (or SLR groups) no link is paged (linkPaged): a paged rule is built unpaged and spaces no pass,
+# the II that of no rule (a32-V48 11-17: the spacing alone cost e8h's recipe +52 host cycles a frame).
+# RUN: foldsim --srcs top.f --top Top --out %t/sl --static --nest --modulo --link-block-depth 2 --schedule-only --short-lead Unit Reader > %t/sl.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/slp --static --nest --modulo --link-block-depth 2 --schedule-only --short-lead --link-kinds Unit:Reader:block:8 Unit Reader 2>&1 | FileCheck %s --check-prefix=SLP
+# RUN: FileCheck %s --check-prefix=SL < %t/sl/schedule.txt
+# RUN: FileCheck %s --check-prefix=SL < %t/slp/schedule.txt
 # RUN: cd %S/Inputs/linkhbm
 # RUN: foldsim --srcs top.f --top Top --out %t/hno --static --nest --modulo --schedule-only Unit Reader > %t/hno.log 2>&1
 # RUN: foldsim --srcs top.f --top Top --out %t/hbm --static --nest --modulo --schedule-only --link-kinds Unit:Reader:hbm,Reader:Unit:hbm Unit Reader > %t/hbm.log 2>&1
@@ -28,6 +34,9 @@
 # P8: spacing Reader:8 Unit:8
 # P8-NEXT: link_ii 32
 # P8-NEXT: built II 32
+# SLP: link-kinds: 'Unit:Reader:block:8' built unpaged (short-lead pages no link): its passes not spaced
+# SLP: II = 5
+# SL: II = 5
 # BAD: link-kinds: 'Unit:Reader:distributed' conflicts with an earlier rule for Unit:Reader
 # DUP: II = 16
 # HBM: spacing Reader:4 Unit:3 passes Reader:16 Top_model:1 Unit:16

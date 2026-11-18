@@ -4594,6 +4594,17 @@ LogicalResult StaticFolder::parseLinkKinds() {
     for (StringRef m : {parts[0], parts[1]})
       if (!models.count(m.str()))
         return netlist.emitError("link-kinds: no class model '") << m << "'";
+    // A page where no link is ever paged (linkPaged: with SLR groups or
+    // short-lead every link is built unpaged): the rule's kind, unpaged. Its
+    // page would only space both models' passes apart, which moves the frame's
+    // passes (and the environment's outputs after them) later for nothing
+    // (a32-V48 11-17: e8h's recipe +52 host cycles a frame, 4 SMs +8).
+    if (page && (slrGroups || shortLead)) {
+      llvm::errs() << "foldsim-fold-static: link-kinds: '" << rule.trim()
+                   << "' built unpaged (" << (slrGroups ? "slr-groups" : "short-lead")
+                   << " pages no link): its passes not spaced\n";
+      page = 0;
+    }
     // A pair of models takes one kind: a second, different rule for it is
     // an error (the last would win the storage while the first's page still
     // spaced the passes).

@@ -1020,6 +1020,54 @@ def state_budget_check(a, sim, out):
           + f"; see {out('state_budget.txt')}", file=sys.stderr)
 
 
+def env_output_slots(text):
+    """A schedule report's environment outputs and their slots in the frame
+    (`output <name> @<slot>`; one registered into the next frame, `(next)`,
+    excluded): what the environment's loop (the kernel's memory endpoint,
+    the control) waits for every frame."""
+    return {m[0]: int(m[1]) for m in re.findall(r'^  output (\S+) @(\d+)$', text, re.M)}
+
+
+def link_pages_hold(a, foldsim_opt, out, fold, rules, named):
+    """The policy's paged link kinds (`<kind>:<p>`, pairs the recipe does not
+    name) where the built schedule holds them: a page spaces both models'
+    passes p apart, which may stretch the frame or move the passes after them
+    (the environment's outputs among them) later in it. Its frame cost is
+    the schedule's, not spacing x passes (link_ii): the fold is scheduled with
+    the kinds as chosen and with those pages unpaged; where the pages make
+    the II longer or any environment output later, they are unpaged, each
+    reported. Returns the rules."""
+    paged = [r for r in rules if len(r.split(':')) == 4 and ':'.join(r.split(':')[:2]) not in named]
+    if not paged:
+        return rules
+    plain = [r.rpartition(':')[0] if r in paged else r for r in rules]
+    models = out('models.mlir')
+    base = re.sub(r' report=\S+', '', fold).replace(' schedule-only', '')
+    base = re.sub(r' link-kinds=\S+', '', base)
+    got = {}
+    for tag, rs in (('paged', rules), ('unpaged', plain)):
+        rep = out(f'schedule_link_pages_{tag}.txt')
+        r = subprocess.run([foldsim_opt, models, NO_OP_DUMP, f'--pass-pipeline=builtin.module('
+                            f'foldsim-fold-static{{{base} link-kinds={",".join(rs)} report={rep} schedule-only}})',
+                            '-o', os.devnull], capture_output=True, text=True)
+        if r.returncode:
+            sys.exit(r.stderr)
+        text = open(rep).read()
+        got[tag] = (int(re.search(r'II = (\d+)', text).group(1)), env_output_slots(text))
+    (iip, op), (iiu, ou) = got['paged'], got['unpaged']
+    later = sorted(((op[o] - ou[o], o, ou[o], op[o]) for o in op if o in ou and op[o] > ou[o]), reverse=True)
+    if iip <= iiu and not later:
+        print(f"foldsim: state auto: {len(paged)} paged link kinds hold in the schedule (II {iip}, no "
+              f"environment output later)", file=sys.stderr)
+        return rules
+    why = (f'II {iiu} -> {iip}' if iip > iiu else '') + ('; ' if iip > iiu and later else '') + \
+        (f'{len(later)} environment outputs later, the most {later[0][1]} @{later[0][2]} -> @{later[0][3]}'
+         if later else '')
+    print(f"foldsim: state auto: {len(paged)} paged link kinds unpaged ({why}: the schedule does not hold "
+          f"their pages): {','.join(paged)}", file=sys.stderr)
+    return plain
+
+
 def choose_state(a, foldsim_opt, flat, passes, out, fold):
     """--state auto: where each class's state lives (foldsim_degree.choose_state:
     on chip, paged on chip, or in HBM, priced against the V80 region, its
@@ -1061,10 +1109,19 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
     weights = json.load(open(a.vmem_weights)) if a.vmem_weights else None
     vmem = (a.vmem_cache_rows, a.vmem_cache_budget) if a.vmem_cache_rows is not None else None
     links = foldsim_degree.parse_links(text)
+    # Paged link kinds (`<kind>:<p>`) only where foldsim-fold-static builds a
+    # paged link: with SLR groups or --short-lead it pages none (linkPaged),
+    # so a page would price RAM it never saves and space the models' passes
+    # (a32-V48 11-17: the 4-SM l2fs_1 -> l2req block:8 +8 host cycles a
+    # frame, e8h's recipe's pages +52).
+    link_pages = not (getattr(a, 'slr_groups', False) or getattr(a, 'short_lead', False))
+    if not link_pages:
+        print(f"foldsim: state auto: no paged link kinds ({'--slr-groups' if getattr(a, 'slr_groups', False) else '--short-lead'}"
+              f" builds no paged link)", file=sys.stderr)
     res = foldsim_degree.choose_state(cal, est, classes, foldsim_degree.parse_classes(text), ii,
                                       route=a.routability, entries=entries, vmem=vmem,
                                       pattern=pattern, weights=weights,
-                                      row_bytes_min=a.vmem_row_bytes_min)
+                                      row_bytes_min=a.vmem_row_bytes_min, link_pages=link_pages)
     if res is None:
         last = foldsim_degree.LAST_REFUSAL
         over = sorted({p.partition('@')[2] for p in last.get('over', []) if '#' in p})
@@ -1119,10 +1176,35 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
           f"{len(res['pages_offchip'])} models' pages to HBM ({h['hbm_bytes']} bytes a frame); "
           f"{res['res']['luts']} LUTs, {res['res']['bram']} RAMB36, "
           f"{round(res['res'].get('uram', 0))} URAM288; see {out('state.txt')}", file=sys.stderr)
+    # The recipe is authoritative (a32-V48 11-17, S29 C2): the policy fills only what the recipe leaves
+    # open (page, page-rows, link-kinds, virtual-memories, storage), and every change it makes is reported.
+    changes = []
     if res['page']:
-        fold = re.sub(r' page=\S+', '', fold) + f" page={res['page']}"
+        m = re.search(r' page=(\S+)', fold)
+        given = m.group(1) if m else ''
+        if given and given != 'auto':
+            # The recipe's page rules keep their models; '*:<p>' names every model.
+            named = {r.rpartition(':')[0] for r in given.split(',')}
+            add = [r for r in res['page'].split(',') if '*' not in named and r.rpartition(':')[0] not in named]
+            dropped = [r for r in res['page'].split(',') if r not in add and r not in given.split(',')]
+            if dropped:
+                changes.append(f"page: kept the recipe's {given} (policy: {','.join(dropped)})")
+            if add:
+                fold = fold.replace(m.group(0), f" page={given},{','.join(add)}")
+                changes.append(f"page: + {','.join(add)}")
+        else:
+            fold = re.sub(r' page=\S+', '', fold) + f" page={res['page']}"
+            changes.append(f"page: {res['page']}")
     if res['rows']:
-        fold += f" page-rows={res['rows']}"
+        m = re.search(r' page-rows=(\S+)', fold)
+        if m:
+            # Rows of either pattern: the recipe's stay rows.
+            if res['rows'] != m.group(1):
+                fold = fold.replace(m.group(0), f" page-rows={foldsim_degree.join_patterns(m.group(1), res['rows'])}")
+                changes.append(f"page-rows: the recipe's {m.group(1)} + {res['rows']}")
+        else:
+            fold += f" page-rows={res['rows']}"
+            changes.append(f"page-rows: {res['rows']}")
     if res.get('link_kinds'):
         # The policy's kinds for the pairs the recipe left open; a pair the
         # recipe names (--link-kinds P:R:KIND) keeps the recipe's kind: the
@@ -1143,9 +1225,14 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
         if kept:
             print(f"foldsim: state auto: --link-kinds kept for {len(kept)} pairs the recipe names: "
                   f"{', '.join(kept)}", file=sys.stderr)
+        named = {':'.join(r.split(':')[:2]) for r in (a.link_kinds or '').split(',') if r.count(':') >= 2}
+        rules = link_pages_hold(a, foldsim_opt, out, fold, rules, named)
+        policy = [r for r in rules if ':'.join(r.split(':')[:2]) not in named and r.split(':')[2] != 'distributed']
+        if policy:
+            changes.append(f"link-kinds: {len(policy)} pairs the recipe leaves open off distributed: {','.join(policy)}")
         fold = re.sub(r' link-kinds=\S+', '', fold) + f" link-kinds={','.join(rules)}"
     if res['pattern'] and res['pattern'] != pattern:
-        if m:
+        if m := re.search(r' virtual-memories=(\S+)', fold):
             fold = fold.replace(m.group(0), f" virtual-memories={res['pattern']}")
         else:
             fold += f" virtual-memories={res['pattern']}"
@@ -1153,6 +1240,9 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
                 fold += ' vmem-merge-lanes'
             if a.vmem_skip_held_reads:
                 fold += ' vmem-skip-held-reads'
+        # (join_patterns: the recipe's pattern stays one of the alternatives.)
+        changes.append(f"virtual-memories: {'the recipe' + chr(39) + 's ' + pattern + ' + ' if pattern else ''}"
+                       f"{len(res['moved'])} memories moved ({res['pattern']})")
     if res['storage']:
         m = re.search(r' storage=(\S+)', fold)
         rules = res['storage']
@@ -1161,9 +1251,18 @@ def choose_state(a, foldsim_opt, flat, passes, out, fold):
             # compiler takes one rule a store).
             given = {r.rpartition('=')[0] for r in m.group(1).split(',')}
             rules = ','.join(r for r in rules.split(',') if r.rpartition('=')[0] not in given)
+            kept = [r for r in res['storage'].split(',') if r.rpartition('=')[0] in given and r not in m.group(1).split(',')]
+            if kept:
+                changes.append(f"storage: kept the recipe's rules for {len(kept)} stores (policy: {','.join(kept)})")
         if rules:
             fold = (fold.replace(m.group(0), f" storage={m.group(1)},{rules}") if m
                     else fold + f" storage={rules}")
+            changes.append(f"storage: + {rules}")
+    for c in changes:
+        print(f"foldsim: state auto: changed: {c}", file=sys.stderr)
+    with open(out('state.txt'), 'a') as f:
+        f.write('changes to the recipe (the recipe wins; the policy fills what it leaves open):\n'
+                + ''.join(f'  {c}\n' for c in changes or ['none']))
     return fold
 
 

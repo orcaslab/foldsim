@@ -1,0 +1,15 @@
+# --state auto fills only what the recipe leaves open, and reports each change (S29 C2, a32-V48 11-17):
+# a pair the recipe's --link-kinds names keeps its kind; the policy's kinds for the other pairs, its storage rules
+# and pages are printed ("state auto: changed: ...") and listed in state.txt. With --short-lead (as with SLR groups)
+# the compiler pages no link, so the policy offers no paged link kind.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/linkpage
+# RUN: foldsim --srcs top.f --top Top --out %t/k --static --nest --modulo --link-block-depth 2 --state auto --state-copy-budget 0.001 --link-kinds Unit:Reader:distributed Unit Reader 2>&1 | FileCheck %s --check-prefix=K
+# RUN: FileCheck %s --check-prefix=KST < %t/k/state.txt
+# RUN: foldsim --srcs top.f --top Top --out %t/sl --static --nest --modulo --link-block-depth 2 --state auto --state-copy-budget 0.001 --short-lead Unit Reader 2>&1 | FileCheck %s --check-prefix=SL
+# K: state auto: --link-kinds kept for 1 pairs the recipe names: Unit:Reader:distributed (policy: Unit:Reader:block)
+# K: state auto: changed: link-kinds: {{[0-9]+}} pairs the recipe leaves open off distributed:
+# K-NOT: Unit:Reader:block
+# K: state auto: changed: storage: +
+# KST: changes to the recipe (the recipe wins; the policy fills what it leaves open):
+# KST-NEXT: link-kinds:
+# SL: state auto: no paged link kinds (--short-lead builds no paged link)
