@@ -1232,6 +1232,10 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "With advance-partials: each partial's next value a select by the "
            "decision's late values (advance, go) of the ANDs of its terms' "
            "cofactors, so that they meet the register in one LUT">,
+    Option<"advancePartialsTerms", "advance-partials-terms", "unsigned", "0",
+           "With advance-partials: at most this many terms a partial (a "
+           "group's terms spread over as many partials as that takes; 0: one "
+           "partial a group)">,
     Option<"roomAhead", "room-ahead", "bool", "false",
            "With virtual memories: each controller's room term of the frame "
            "decision (its `free` at least the requests the decisions in "

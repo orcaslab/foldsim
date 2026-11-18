@@ -1058,6 +1058,7 @@ public:
   /// decision's late values (advance, go) of ANDs of the cofactors.
   bool advancePartialsAtReader = false;
   bool advancePartialsCofactor = true;
+  unsigned advancePartialsTerms = 0;
   unsigned partialTerms = 0, partialLeft = 0, partialRegs = 0, partialReplicas = 0;
   /// `room-ahead`: the controllers' room terms registered (two entries more).
   bool roomAhead = false;
@@ -27508,7 +27509,7 @@ LogicalResult StaticFolder::buildSim() {
         return 2 * bestN > total ? best : -1;
       };
       std::map<int, SmallVector<Value>> leads;
-      std::map<int, bool> resetOne;
+      DenseMap<Value, bool> resetOne;   // a lead's term at its registers' reset values
       SmallVector<Value> kept;
       for (Value t : terms) {
         Value l = t.getType().isInteger(1) ? leadOf(t, 0) : Value();
@@ -27520,8 +27521,7 @@ LogicalResult StaticFolder::buildSim() {
         }
         int g = sourceOf(l);
         leads[g].push_back(l);
-        auto [it, fresh] = resetOne.try_emplace(g, true);
-        it->second = it->second && rv.getValue().isOne();
+        resetOne[l] = rv.getValue().isOne();
         ++partialTerms;
       }
       // The decision's own late values -- `advance` (the partials' AND,
@@ -27608,14 +27608,31 @@ LogicalResult StaticFolder::buildSim() {
         return comb::MuxOp::create(b, late[i], t, f);
       };
       SmallVector<Value> parts;
+      // (`advance-partials-terms` N: a group's terms in partials of at most N
+      // each, so that each partial's AND is shallow; the decision then ANDs
+      // more registers.)
+      std::vector<std::pair<int, SmallVector<Value>>> chunks;
       for (auto &[g, ls] : leads) {
+        unsigned n = advancePartialsTerms ? advancePartialsTerms : unsigned(ls.size());
+        unsigned k = (ls.size() + n - 1) / n;
+        for (unsigned c = 0; c < k; ++c) {
+          SmallVector<Value> part;
+          for (unsigned i = c; i < ls.size(); i += k)
+            part.push_back(ls[i]);
+          chunks.push_back({g, part});
+        }
+      }
+      std::map<int, unsigned> chunkOf;
+      for (auto &[g, ls] : chunks) {
         Value next = advancePartialsCofactor ? selectOf(ls, {}, 0) : Value();
         if (!next)
           next = andOf(ls);
-        uint64_t init = resetOne[g] ? 1 : 0;
+        uint64_t init = llvm::all_of(ls, [&](Value l) { return resetOne.lookup(l); }) ? 1 : 0;
+        unsigned idx = chunkOf[g]++;
         auto reg = seq::FirRegOp::create(
             b, next, hostClock,
-            b.getStringAttr("vpart" + (g < 0 ? std::string("_level") : "_s" + std::to_string(g))),
+            b.getStringAttr("vpart" + (g < 0 ? std::string("_level") : "_s" + std::to_string(g)) +
+                            (idx ? "_" + std::to_string(idx) : std::string())),
             hostReset, constant(1, init), hw::InnerSymAttr{}, /*isAsync=*/false,
             b.getIntegerAttr(b.getI1Type(), init));
         reg->setAttr(kPartialAttr, UnitAttr::get(context));
@@ -30704,6 +30721,7 @@ void FoldStaticPass::runOnOperation() {
   folder.readyAhead = readyAhead;
   folder.advancePartials = advancePartials;
   folder.advancePartialsCofactor = advancePartialsCofactor;
+  folder.advancePartialsTerms = advancePartialsTerms;
   if (advancePartialsAt != "source" && advancePartialsAt != "reader") {
     getOperation().emitError("fold-static: advance-partials-at is source or reader");
     return signalPassFailure();

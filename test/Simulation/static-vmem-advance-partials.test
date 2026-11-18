@@ -76,6 +76,16 @@
 # RUN: diff %t/g0/r2.txt %t/g1/r2.txt
 # RUN: diff %t/g0/r2.txt %t/g2/r2.txt
 # RUN: diff %t/g0/r2.txt %t/g3/r2.txt
+# --advance-partials-terms 1: a partial a term (the room partial's two terms
+# in two registers, reset to their own values): the same MATCH.
+# RUN: foldsim --srcs top.f --top Top --out %t/g4 --static --virtual-memories ram --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-home --advance-partials --advance-partials-terms 1 Leaf > %t/g4.log 2>&1
+# RUN: FileCheck %s --check-prefix=TLOG < %t/g4.log
+# TLOG: advance-partials: 4 terms in 4 partials (level 2, group 0 1, group 1 1), 0 left as they are
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DCOPIES2 -DIW=1 -Mdir %t/g4/obj %S/Inputs/tb_vmem.sv top.sv %t/g4/foldsim_sim.sv > %t/g4/build.log 2>&1
+# RUN: %t/g4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | grep MATCH > %t/g4/r1.txt
+# RUN: %t/g4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/g4/r2.txt
+# RUN: diff %t/g0/r1.txt %t/g4/r1.txt
+# RUN: diff %t/g0/r2.txt %t/g4/r2.txt
 # Nested sequencers with bubbles.
 # RUN: foldsim --srcs top.f --top Top --out %t/n0 --static --virtual-memories ram --ready-ahead --room-ahead --nest --bubbles Leaf > /dev/null 2>&1
 # RUN: foldsim --srcs top.f --top Top --out %t/n1 --static --virtual-memories ram --ready-ahead --room-ahead --nest --bubbles --advance-partials Leaf > /dev/null 2>&1

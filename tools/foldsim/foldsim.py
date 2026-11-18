@@ -420,6 +420,8 @@ def frame_options(a):
             fold += f' advance-partials-at={a.advance_partials_at}'
         if getattr(a, 'advance_partials_plain', False):
             fold += ' advance-partials-cofactor=false'
+        if getattr(a, 'advance_partials_terms', None):
+            fold += f' advance-partials-terms={a.advance_partials_terms}'
     if getattr(a, 'room_ahead', False):
         fold += ' room-ahead'
         if getattr(a, 'room_regions', False):
@@ -2568,6 +2570,9 @@ def build_parser():
     ap.add_argument('--advance-partials-at', choices=['source', 'reader'],
                     help='with --advance-partials and SLR groups: the replica of a partial another group reads '
                          'beside the partial (source, default) or in the reading group (reader)')
+    ap.add_argument('--advance-partials-terms', type=int, metavar='N',
+                    help='with --advance-partials: at most N terms a partial (a group\'s terms over as many '
+                         'partials as that takes; default one partial a group)')
     ap.add_argument('--advance-partials-plain', action='store_true',
                     help='with --advance-partials: a partial\'s next value the plain AND of its terms, not a '
                          'select by advance and go of their cofactors\' ANDs')
