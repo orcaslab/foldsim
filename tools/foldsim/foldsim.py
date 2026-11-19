@@ -2297,6 +2297,25 @@ def page_engine_slr(sched, pairs):
     return engines
 
 
+def vmem_outstanding(info, sched, round_trip):
+    """--hbm-round-trip: the reads a controller keeps in flight (foldsim_vmem OUTSTANDING, the kernel's
+    VMEM_OUTSTANDING; foldsim_vmem_stripe's read order), by Little's law: its reads a host cycle (the busiest page
+    engine's reads a frame / II, the schedule's `page engine traffic`; at least 1/4) times the round trip and a
+    margin of 1/4, a power of two of 128 to 4,096. A constant of the round trip and the engines' rate, never of the
+    instance count: info['vmem_outstanding'], FOLDSIM_VMEM_OUTSTANDING."""
+    m = re.search(r'II = (\d+)', sched)
+    ii = int(m.group(1)) if m else 0
+    reads = [int(x) for x in re.findall(r'^\s+page engine traffic \d+: reads (\d+)', sched, re.M)]
+    rate = max([r / ii for r in reads] + [0.25]) if ii else 1.0
+    need = rate * round_trip * 1.25
+    n = 128
+    while n < need and n < 4096:
+        n *= 2
+    info['vmem_outstanding'] = n
+    print(f'foldsim: --hbm-round-trip {round_trip}: {n} reads in flight a controller (Little: {rate:.2f} reads a '
+          f'host cycle x {round_trip}, + 1/4)', file=sys.stderr)
+
+
 def stream_master_of(info, sched, k, move_bits=32, stripe=1):
     """--stream-masters K: each controller's master (info's vmem_groups, else vmem: `master`), the heaviest first
     on the least loaded master (longest processing time). A controller's weight is its bits a frame: a page engine
@@ -4072,6 +4091,9 @@ def main():
         info['vport_slr'] = [engines.get(f'__pages{p_}', -1) for p_ in range(len(info.get('vports') or []))]
         if region:
             info['vmem_slr_names'] = [s_['name'] for s_ in json.load(open(region)).get('slrs', [])]
+    if getattr(a, 'hbm_round_trip', 0) and info.get('vmem'):
+        sched = open(out('schedule.txt')).read() if os.path.exists(out('schedule.txt')) else ''
+        vmem_outstanding(info, sched, a.hbm_round_trip)
     if getattr(a, 'stream_masters', 0) and info.get('vmem'):
         sched = open(out('schedule.txt')).read() if os.path.exists(out('schedule.txt')) else ''
         stream_master_of(info, sched, a.stream_masters, getattr(a, 'stream_move_bits', 0) or 32,
@@ -4154,6 +4176,8 @@ def main():
                     if 'cache_rows' in v:
                         f.write(f'`define FOLDSIM_VMEM_G{g}_CACHE_ROWS {v["cache_rows"]}\n')
             ctrls = info.get('vmem_groups') or info['vmem']
+            if 'vmem_outstanding' in info:
+                f.write(f'`define FOLDSIM_VMEM_OUTSTANDING {info["vmem_outstanding"]}\n')
             if 'master' in ctrls[0]:
                 key = 'G' if 'vmem_groups' in info else ''
                 f.write(f'`define FOLDSIM_VMEM_STREAM_MASTERS {info["stream_masters"]["k"]}\n')

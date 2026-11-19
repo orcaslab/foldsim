@@ -31,3 +31,12 @@
 # SVH: `define FOLDSIM_VMEM_STREAM_STRIPE 2
 # SVH: `define FOLDSIM_VMEM_0_MASTER 0
 # SVH: `define FOLDSIM_VMEM_0_MASTERS 0, 1
+
+# --hbm-round-trip: the reads a controller keeps in flight, by Little's law (the busiest page engine's reads a host
+# cycle, 16 a frame of II 26 here, x the round trip + 1/4, a power of two): FOLDSIM_VMEM_OUTSTANDING, the kernel's
+# VMEM_OUTSTANDING. A constant of the round trip, not of the instance count.
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/o --static --state-in-ram Leaf::4 --state-in-ram-pp --state-scratch-bits 0 --page-engines 4 --page-engines-pp --hbm-round-trip 800 Leaf > %t/o.log 2>&1
+# RUN: FileCheck %s --check-prefix=O < %t/o.log
+# RUN: FileCheck %s --check-prefix=OVH < %t/o/foldsim_sim.vh
+# O: foldsim: --hbm-round-trip 800: {{[0-9]+}} reads in flight a controller (Little: {{[0-9.]+}} reads a host cycle x 800, + 1/4)
+# OVH: `define FOLDSIM_VMEM_OUTSTANDING {{(1024|512|2048)}}

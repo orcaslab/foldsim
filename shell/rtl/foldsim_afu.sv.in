@@ -377,7 +377,12 @@ module foldsim_afu #(
 `endif
     // Reads in flight per controller, on as many ids as the master has (up
     // to that many), in order per id.
+    // (foldsim --hbm-round-trip: FOLDSIM_VMEM_OUTSTANDING, the round trip's reads at the engines' rate.)
+`ifdef FOLDSIM_VMEM_OUTSTANDING
+    localparam VMEM_OUTSTANDING = `FOLDSIM_VMEM_OUTSTANDING;
+`else
     localparam VMEM_OUTSTANDING = 128;
+`endif
     // Writes per controller on AXI waiting for their B (out of its buffer).
     localparam VMEM_WRITES_OUT  = 128;
     // Reads answered from a controller's write buffer, or never
