@@ -592,6 +592,8 @@ def frame_options(a):
         fold += f' slr-kept={a.slr_kept}'
     if getattr(a, 'slr_link_rams', False):
         fold += ' slr-link-rams'
+    if getattr(a, 'slr_group_ports', False):
+        fold += ' slr-group-ports'
     if getattr(a, 'slr_hop_registers', False):
         fold += ' slr-hop-registers'
     if getattr(a, 'slr_group_control', False):
@@ -2896,6 +2898,11 @@ def build_parser():
                     help='with --slr-groups: a link between groups k > 1 SLRs apart is registered once per SLR '
                          'boundary, k host cycles (foldsim-fold-static slr-hop-registers); else one register whose '
                          'route crosses every boundary between')
+    ap.add_argument('--slr-group-ports', action='store_true',
+                    help='with --slr-groups and --fold-ports: the folded port bundles\' outputs, queues and request '
+                         'record memories built in the group of the bundles\' producers, so only the folded record '
+                         'leaves that group (foldsim-fold-static slr-group-ports; the same logic): v16kjGs 11-19, '
+                         '16 x 512-bit memory write data crossed SLR1|SLR2 unfolded')
     ap.add_argument('--slr-link-rams', action='store_true',
                     help='with --slr-groups: links may be block or ultra RAM too, in their reader\'s group '
                          '(foldsim-fold-static slr-link-rams); else every link of a grouped fold is distributed '

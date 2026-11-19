@@ -909,6 +909,8 @@ public:
   SmallVector<std::array<double, 3>> linkKindGroupCap, linkKindGroupBase;
   /// `slr-link-rams`: with SLR groups, links may be block or ultra RAM too.
   bool slrLinkRams = false;
+  /// `slr-group-ports`: the fold-ports machinery in its producers' group.
+  bool slrGroupPorts = false;
   /// `slr-hop-registers`: a link between groups k > 1 apart (groups in die
   /// order) is registered once per SLR boundary.
   bool slrHopRegisters = false;
@@ -25877,9 +25879,42 @@ LogicalResult StaticFolder::buildSim() {
   // `fold-ports-rows`: the bundles' outputs are built below, a field at a
   // time (one link read per producer at the pushing bundle's instance).
   bool portRowsReq = pf.on && foldPortsRows;
+  // `slr-group-ports`: the group of every folded bundle output's producers;
+  // the outputs' reads and queues and the request records are built there
+  // (tagged; extractGroups moves them), so only the record crosses out.
+  int pfGroup = -1;
+  if (slrGroupPorts && pf.on && !slrOf.empty()) {
+    if (portRowsReq)
+      return netlist.emitError("slr-group-ports: not with fold-ports-rows");
+    for (auto [k, consumer] : llvm::enumerate(consumers)) {
+      if (consumer.cls >= 0 || !foldedOut(k))
+        continue;
+      for (auto &piece : consumer.pieces[0]) {
+        if (piece.producer < 0 || producers[piece.producer].cls < 0)
+          continue;
+        int g = slrOf[producers[piece.producer].cls];
+        if (pfGroup >= 0 && g != pfGroup)
+          return netlist.emitError("slr-group-ports: output '")
+                 << consumer.name << "' reads group " << g
+                 << ", another folded output group " << pfGroup;
+        pfGroup = g;
+      }
+    }
+  }
+  auto tagAfter = [&](Operation *mark, int group) {
+    if (group < 0)
+      return;
+    for (auto *op = mark ? mark->getNextNode() : &body->front(); op;
+         op = op->getNextNode())
+      if (!isa<hw::ConstantOp>(op))
+        tagGroup(op, group);
+  };
   for (auto [k, consumer] : llvm::enumerate(consumers)) {
     if (consumer.cls >= 0)
       continue;
+    int outGroup = foldedOut(k) ? pfGroup : -1;
+    Operation *outMark = body->empty() ? nullptr : &body->back();
+    llvm::scope_exit tagOut([&] { tagAfter(outMark, outGroup); });
     // (With fold-ports-rows a folded output is built with the request rows
     // below; a spec group's select output is also read here, for its
     // group's select register alone.)
@@ -25915,7 +25950,7 @@ LogicalResult StaticFolder::buildSim() {
       };
       bits.push_back(linkRead(piece.producer, piece.low, piece.width, address,
                               bank, producer.name + "_to_" + consumer.name,
-                              /*to=*/-1));
+                              /*to=*/outGroup));
     }
     Value data = bits.empty() ? constant(0, 0)
                  : bits.size() == 1
@@ -26021,6 +26056,7 @@ LogicalResult StaticFolder::buildSim() {
   // field's first token (the queue's from reset) zero, and the frame's reset
   // token stored beside the record at a late field's push.
   Value reqValidOut, reqChanOut, reqTresetOut, reqBitsOut;
+  Operation *recMark = body->empty() ? nullptr : &body->back();
   if (pf.on && !portRowsReq) {
     unsigned P = pf.ports, cw = pf.chanWidth;
     unsigned cap = 2;
@@ -26156,6 +26192,9 @@ LogicalResult StaticFolder::buildSim() {
     reqBitsOut = b.createOrFold<comb::ConcatOp>(
         SmallVector<Value>(fieldBits.rbegin(), fieldBits.rend()));
   }
+  // (slr-group-ports: the records' memories and selection in the bundles'
+  // producers' group.)
+  tagAfter(recMark, pfGroup);
   // `fold-ports-rows`: the request records in bundle order. Each field is
   // one memory of a row per bundle and frame mod 4, written at the field's
   // pushes (one bundle a host cycle) with one link read per producer, at the
@@ -30654,6 +30693,7 @@ void FoldStaticPass::runOnOperation() {
   folder.readBufferBits = readBufferBits;
   folder.linkKindCost = linkKindCost;
   folder.slrLinkRams = slrLinkRams;
+  folder.slrGroupPorts = slrGroupPorts;
   folder.slrHopRegisters = slrHopRegisters;
   folder.slrGroupControl = slrGroupControl;
   folder.slrGroupReset = slrGroupReset;

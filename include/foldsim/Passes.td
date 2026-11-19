@@ -809,6 +809,13 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "than in one register whose route crosses k boundaries; an "
            "slr-serialize class's chunk register is followed by one in each "
            "group between (its links k - 1 host cycles later)">,
+    Option<"slrGroupPorts", "slr-group-ports", "bool", "false",
+           "With SLR groups and fold-ports: the folded port bundles' outputs "
+           "(their link reads and queues) and the request records' memories "
+           "and selection built in the group of the bundles' producers, so "
+           "only the folded record leaves the group, not every bundle (the "
+           "same logic, in the producers' group; an error if the bundles' "
+           "producers are in more than one group)">,
     Option<"slrLinkRams", "slr-link-rams", "bool", "false",
            "With SLR groups: links may be block or ultra RAM too (by "
            "link-block-depth / link-ultra-depth or link-kind-cost), the memory "
