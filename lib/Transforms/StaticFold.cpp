@@ -5509,7 +5509,9 @@ LogicalResult StaticFolder::planStreams() {
       SmallVector<int> earliest(requests.begin(), requests.end());
       for (int &t : earliest)
         t -= int(st.beats) - 1;
-      st.slotCount = fitSlots(st, earliest);
+      // (hbm-round-trip: the ceiling, the lead's slots, at every count: a
+      // device constant, not the landings a schedule happens to bunch.)
+      st.slotCount = hbmRoundTrip ? 0 : fitSlots(st, earliest);
     }
     if (collide)
       return netlist.emitError("link streams: ")
@@ -23823,10 +23825,13 @@ LogicalResult StaticFolder::buildSim() {
     // link-landing-block: block RAM where the distributed RAM costs at
     // least linkLandingBlock LUTs a RAMB36 (the count's prices).
     auto landingBlock = [&](uint64_t depth, unsigned width, unsigned lanes) {
-      if (!linkLandingBlock)
+      // (hbm-round-trip: landings at their ceiling, in block RAM wherever a
+      // block holds them, so that the constant allocation costs no LUTs.)
+      unsigned rule = hbmRoundTrip && !linkLandingBlock ? 1u : unsigned(linkLandingBlock);
+      if (!rule)
         return false;
       auto [lut, bram] = landingPrices(depth, width, lanes);
-      if (lut < double(linkLandingBlock) * bram)
+      if (lut < double(rule) * bram)
         return false;
       landingBlocks += bram;
       landingBlockLuts += lut;
