@@ -17,11 +17,14 @@
 //
 // The region is 2^RW bytes at a multiple of 2^RW; a request's row is its
 // offset in the region >> SHIFT (a burst is one row, of 2^SHIFT bytes or
-// less, as foldsim_vmem's layout keeps it). Its stripe is the row's low
-// log2(S) bits, and it goes to master `stripe` at PORT_BASE[stripe] |
-// {row >> log2(S), offset within the row}: each master holds every S-th row,
-// packed in 2^RW / S bytes at a multiple of that (a direct HBM port reaches
-// its own pseudo-channel). Bit selects and an S-way select only: no adder.
+// less, as foldsim_vmem's layout keeps it). Its stripe is the XOR of the
+// row's log2(S)-bit groups (an address hash, as memory controllers
+// interleave), and it goes to master `stripe` at PORT_BASE[stripe] |
+// {row >> log2(S), offset within the row}: rows of one stripe differ above
+// their low log2(S) bits (rows equal there differ in the hash), so each
+// master's rows pack in 2^RW / S bytes at a multiple of that (a direct HBM
+// port reaches its own pseudo-channel). XORs, bit selects and an S-way
+// select: no adder.
 //
 // Responses go back in request order, whatever order the masters answer in:
 // R from the master of the oldest read (a FIFO of the reads' stripes, popped
@@ -112,8 +115,14 @@ module foldsim_vmem_stripe #(
         /* verilator lint_off UNUSEDSIGNAL */
         reg [63:0] x;
         /* verilator lint_on UNUSEDSIGNAL */
+        reg [SB-1:0] h;
         x = a;
-        stripe_of = (S > 1) ? x[SHIFT +: SB] : '0;
+        h = '0;
+        // (The row index's log2(S)-bit groups XORed: rows whose low bits
+        // repeat, a row's pages say, still spread over the masters.)
+        for (integer g = SHIFT; g < RW; g += SB)
+            h = h ^ SB'(x >> g);
+        stripe_of = (S > 1) ? h : '0;
     endfunction
     function automatic [63:0] addr_on(input [63:0] a);
         /* verilator lint_off UNUSEDSIGNAL */
