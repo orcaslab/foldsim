@@ -1,0 +1,69 @@
+# REQUIRES: verilator
+# --pp-idle-skip (foldsim-fold-static pp-idle-skip, with --pp-dirty-writeback): a streamed state-in-ram-pp instance
+# whose rows did not change in its pass of the frame before, and whose producers' rows did not either (its inputs
+# are early links, so they are the frame before's), skips its prefetch, its pass and its writes. Its link entries
+# keep their last write, which is the value the skipped write would write. Driver/Inputs/idle: eight nodes in a chain
+# behind a pulse source go idle between pulses. Node 0 reads the source (no clean bits), so 7 of 8 decide.
+# Exact against the target at latencies 1-90, with stalls, full controllers and bubbles: on its own controllers,
+# with P = 4 on page engines under nest/modulo, with the node links as HBM link streams, and with the S30 recipe's
+# HBM mailboxes. FOLDSIM_SKIP_TRACE prints a line a skip: skips happen. Two mutants mismatch:
+# FOLDSIM_IDLE_SKIP_MUTANT=1 ignores the producers' clean bits, =2 reads the clean bits of the wrong frame.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/idle
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/a --static --state-in-ram Node::2 --state-in-ram-pp --state-scratch-bits 0 --pp-dirty-writeback --pp-idle-skip Node Src Sink > %t/a.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/a.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/a -DFOLDSIM_SKIP_TRACE -Mdir %t/a/obj %S/Inputs/tb_pages.sv nodes.sv top.sv %t/a/foldsim_sim.sv > %t/a/build.log 2>&1
+# RUN: %t/a/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 > %t/a/r1.log
+# RUN: FileCheck %s < %t/a/r1.log
+# RUN: grep -c "idle-skip: Node" %t/a/r1.log | FileCheck %s --check-prefix=SKIPS
+# RUN: %t/a/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 > %t/a/r2.log
+# RUN: FileCheck %s < %t/a/r2.log
+# RUN: grep -c "idle-skip: Node" %t/a/r2.log | FileCheck %s --check-prefix=SKIPS
+# RUN: %t/a/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=90 +stall=30 +full=30 | FileCheck %s
+# Without the trace, no skip line.
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/a -Mdir %t/a/objq %S/Inputs/tb_pages.sv nodes.sv top.sv %t/a/foldsim_sim.sv > %t/a/buildq.log 2>&1
+# RUN: %t/a/objq/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=QUIET
+# Without --pp-dirty-writeback, nothing skips.
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/n --static --state-in-ram Node::2 --state-in-ram-pp --state-scratch-bits 0 --pp-idle-skip Node Src Sink > %t/n.log 2>&1
+# RUN: FileCheck %s --check-prefix=NODW < %t/n.log
+# P = 4, page engines, nest and modulo.
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/e --static --nest --modulo --state-in-ram Node::4 --state-in-ram-pp --state-scratch-bits 0 --page-engines 4 --page-engines-pp --pp-dirty-writeback --pp-idle-skip Node Src Sink > %t/e.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/e.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/e -DFOLDSIM_SKIP_TRACE -Mdir %t/e/obj %S/Inputs/tb_pages.sv nodes.sv top.sv %t/e/foldsim_sim.sv > %t/e/build.log 2>&1
+# RUN: %t/e/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 > %t/e/r.log
+# RUN: FileCheck %s < %t/e/r.log
+# RUN: grep -c "idle-skip: Node" %t/e/r.log | FileCheck %s --check-prefix=SKIPS
+# The node links as HBM link streams, bubbles (tb_linkhbm.sv: Top with a reset input).
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top_rst.f --top Top --out %t/h --static --nest --modulo --bubbles --state-in-ram Node::2 --state-in-ram-pp --state-scratch-bits 0 --pp-dirty-writeback --pp-idle-skip --link-kinds Node:Node:hbm Node Src Sink > %t/h.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/h.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/h -DVM1 -DBUBBLES -DFOLDSIM_SKIP_TRACE -Mdir %t/h/obj %S/Inputs/tb_linkhbm.sv nodes.sv top_rst.sv %t/h/foldsim_sim.sv > %t/h/build.log 2>&1
+# RUN: %t/h/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=80 +bubble=50 +stall=30 +full=30 > %t/h/r.log
+# RUN: FileCheck %s < %t/h/r.log
+# RUN: grep -c "idle-skip: Node" %t/h/r.log | FileCheck %s --check-prefix=SKIPS
+# The S30 recipe's links (HBM mailboxes, single banks, compact and staged links, rings, round trip 100).
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top_rst.f --top Top --out %t/m --static --nest --modulo --zero-latency-links --bubbles --compact-links --share-links --staged-links --csf-single-bank --csf-mailbox-builder --csf-mailbox-hbm --csf-mailbox-hbm-chains --csf-mailbox-hbm-split --csf-mailbox-hbm-share --link-rings 64 --lane-scan --link-hbm-beat-bits 512 --page-engines auto --page-engines-pp --hbm-round-trip 100 --min-ii 300 --slot-segments 64 --state-scratch-fixed --state-in-ram Node::2 --state-in-ram-pp --state-scratch-bits 0 --pp-dirty-writeback --pp-idle-skip Node Src Sink > %t/m.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/m.log
+# RUN: FileCheck %s --check-prefix=MBOX < %t/m.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/m -DVM1 -DBUBBLES -DFOLDSIM_SKIP_TRACE -Mdir %t/m/obj %S/Inputs/tb_linkhbm.sv nodes.sv top_rst.sv %t/m/foldsim_sim.sv > %t/m/build.log 2>&1
+# RUN: %t/m/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=90 +bubble=30 +stall=30 +full=30 > %t/m/r.log
+# RUN: FileCheck %s < %t/m/r.log
+# RUN: grep -c "idle-skip: Node" %t/m/r.log | FileCheck %s --check-prefix=SKIPS
+# Mutants: the producers' clean bits ignored; the clean bits of the wrong frame.
+# RUN: env FOLDSIM_IDLE_SKIP_MUTANT=1 FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/x1 --static --state-in-ram Node::2 --state-in-ram-pp --state-scratch-bits 0 --pp-dirty-writeback --pp-idle-skip Node Src Sink > %t/x1.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/x1 -Mdir %t/x1/obj %S/Inputs/tb_pages.sv nodes.sv top.sv %t/x1/foldsim_sim.sv > %t/x1/build.log 2>&1
+# RUN: %t/x1/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=BAD
+# RUN: env FOLDSIM_IDLE_SKIP_MUTANT=2 FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/x2 --static --state-in-ram Node::2 --state-in-ram-pp --state-scratch-bits 0 --pp-dirty-writeback --pp-idle-skip Node Src Sink > %t/x2.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/x2 -Mdir %t/x2/obj %S/Inputs/tb_pages.sv nodes.sv top.sv %t/x2/foldsim_sim.sv > %t/x2/build.log 2>&1
+# RUN: %t/x2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s --check-prefix=BAD
+
+# LOG: pp-idle-skip: 1 classes keep clean bits, 1 may skip
+# LOG: pp-idle-skip: Node: 7 of 8 instances decide ({{[0-9]+}} source reads; instances not: 0 an environment input, 0 a late input, 1 an untracked source, 0 in time)
+# LOG: pp-idle-skip: 1 classes' clean bits in {{[0-9]+}} replicas, 7 of 8 instances decide
+# MBOX: link streams: {{[1-9][0-9]*}} streams
+# NODW: pp-idle-skip: off (it needs pp-dirty-writeback)
+# NODW-NOT: instances decide
+# SKIPS: {{^[1-9][0-9][0-9]+$}}
+# QUIET-NOT: idle-skip
+# QUIET: {{^}}MATCH 196 cycles
+# BAD: {{^}}MISMATCH
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL

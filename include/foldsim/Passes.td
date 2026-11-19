@@ -967,6 +967,16 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "bytes of its row that changed (its new row against the row it "
            "read, the window's copy of HBM's), and no write where none did: "
            "HBM keeps the equal bytes it holds">,
+    Option<"ppIdleSkip", "pp-idle-skip", "bool", "false",
+           "With pp-dirty-writeback: a streamed state-in-ram-pp instance whose "
+           "rows did not change in its pass of the frame before, and whose "
+           "producers' rows did not either (so its inputs are the frame "
+           "before's), skips its prefetch, its pass and its writes: a clean "
+           "bit an instance and frame parity, decided a round trip ahead. "
+           "Only classes whose whole state streams, with no late outputs, "
+           "memories or outputs to the environment, and only instances whose "
+           "every input is an early link of such a class (or a constant), "
+           "decided after the producers' passes of the frame before">,
     Option<"streamStripe", "stream-stripe", "unsigned", "1",
            "Each controller's rows interleaved over this many of the "
            "stream-masters by their index (row x instances + instance, mod S: "

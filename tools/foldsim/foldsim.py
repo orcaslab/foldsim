@@ -541,6 +541,8 @@ def frame_options(a):
         fold += f' link-hbm-beat-bits={a.link_hbm_beat_bits}'
     if getattr(a, 'pp_dirty_writeback', False):
         fold += ' pp-dirty-writeback'
+    if getattr(a, 'pp_idle_skip', False):
+        fold += ' pp-idle-skip'
     if getattr(a, 'link_pending_counts', False):
         fold += ' link-pending-counts'
     if getattr(a, 'link_hbm_beat_rows', False):
@@ -2813,6 +2815,10 @@ def build_parser():
     ap.add_argument('--pp-dirty-writeback', action='store_true',
                     help='state-in-ram-pp rows streamed from HBM: a pass writes only the bytes of its row that changed, '
                          'none where none did (foldsim-fold-static pp-dirty-writeback)')
+    ap.add_argument('--pp-idle-skip', action='store_true',
+                    help='with --pp-dirty-writeback: a streamed PP instance whose rows and producers\' rows did not '
+                         'change in the frame before skips its prefetch, pass and writes (foldsim-fold-static '
+                         'pp-idle-skip)')
     ap.add_argument('--link-pending-counts', action='store_true',
                     help='with --link-hbm-beat-bits: a pending bit a landing slot, its beats counted in distributed '
                          'RAM, not a pending bit a beat in flops (foldsim-fold-static link-pending-counts)')

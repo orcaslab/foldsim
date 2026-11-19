@@ -218,6 +218,16 @@ struct Class {
   /// master while a chunk keeps a beat's columns): only where the frame's
   /// HBM bandwidth needs it (chooseStreamWindows), each chunk a controller.
   bool ppChunkSpread = false;
+  /// `pp-idle-skip` (StaticFolder::planIdleSkip): its instances' clean bits
+  /// kept (its whole state streams and it has no late outputs, so a pass
+  /// that wrote no row byte changed nothing), and whether its instances may
+  /// skip a pass. Built: the copy's clean output (its index; the bit of each
+  /// evaluation two host cycles after its last row's pass) and, skipping, its
+  /// skip input (the decision, a host cycle before the prefetch's first read
+  /// leaves).
+  bool idleTracked = false, idleSkip = false;
+  unsigned idleCleanOut = 0;
+  Value idleClean;
   /// `pp-beat-bits` (PPBeats): its rows as `ppBeats` beats of `ppBeatCols`
   /// columns each (1: whole rows), its reads and drains moved by these many
   /// positions on their engine.
@@ -1115,6 +1125,10 @@ public:
   bool linkHbmBeatRows = false;
   bool linkPendingCounts = false;
   bool ppDirtyWriteback = false;
+  /// `pp-idle-skip`: classes whose clean bits are kept (Class::idleTracked)
+  /// and that may skip (Class::idleSkip), planned by planIdleSkip.
+  bool ppIdleSkip = false;
+  void planIdleSkip();
   /// `link-landing-block R`: an HBM link stream's landing memory in block
   /// RAM (a registered read, its address a host cycle ahead) where its
   /// distributed RAM costs at least R LUTs a RAMB36 it would take; 0: none.
@@ -10875,6 +10889,96 @@ int StaticFolder::minStateGap(const Class &cls) const {
   return gap;
 }
 
+/// `pp-idle-skip`: which classes keep clean bits and which may skip. Instance
+/// i's pass in frame f changes nothing (its state and early outputs are the
+/// frame before's) if its rows did not change in its pass of frame f - 1 and
+/// every input it reads in frame f equals the one of f - 1. Its inputs are
+/// early links, written at their producers' passes of f - 1 with the state
+/// those leave: equal if each producer's rows did not change in its pass of
+/// f - 1 either. A class keeps clean bits (idleTracked) where a pass that
+/// wrote no row byte (pp-dirty-writeback: the HBM row written only where it
+/// changed) changed nothing: every state bit streams (no resident rows, no
+/// memories, folded stores, pages or black boxes; no beats), and it has no
+/// late outputs (so no ready passes and no state kept apart for them). It may
+/// skip (idleSkip) where a skipped pass's outputs stay right: none reaches
+/// the environment and none of its inputs is an element input; its links
+/// keep their entries a producer instance and bank each (link rings, whose
+/// entries several instances share, are not built for it), so a skipped
+/// write leaves the value of its last write, which equals the one it skips.
+/// Each instance's own eligibility (its inputs' producers, the timing of
+/// their clean bits) is decided as the simulator is built.
+void StaticFolder::planIdleSkip() {
+  if (!ppIdleSkip)
+    return;
+  for (auto &cls : classes) {
+    cls.idleTracked = cls.idleSkip = false;
+    auto refuse = [&](const Twine &why) {
+      if (cls.ppHbm)
+        llvm::errs() << "foldsim-fold-static: pp-idle-skip: " << cls.name
+                     << ": no clean bits (" << why << ")\n";
+    };
+    if (!cls.pp || !cls.ppHbm)
+      continue;
+    if (cls.ppResident || cls.ppResidentColumns ||
+        llvm::any_of(cls.ppStreamed, [](uint8_t s) { return !s; })) {
+      refuse("rows resident on chip");
+      continue;
+    }
+    if (ppBeatPorts(cls)) {
+      refuse("rows as beats");
+      continue;
+    }
+    if (cls.folding || !cls.virtualMemories.empty() || cls.page ||
+        cls.multicycle || cls.passSplit || cls.deferSpan || cls.sirMixed) {
+      refuse("state outside its rows");
+      continue;
+    }
+    if (cls.hasReady || llvm::is_contained(cls.late, true)) {
+      refuse("late outputs");
+      continue;
+    }
+    bool other = false;
+    cls.model.walk([&](Operation *op) {
+      if (isa<seq::FirMemOp, hw::InstanceOp>(op))
+        other = true;
+    });
+    if (other) {
+      refuse("memories or black boxes");
+      continue;
+    }
+    cls.idleTracked = true;
+  }
+  // Outputs to the environment, and element inputs.
+  SmallVector<bool> toEnv(classes.size(), false), elements(classes.size(), false);
+  for (auto &consumer : consumers) {
+    if (consumer.cls >= 0 && (consumer.indexOutput >= 0 || consumer.ghostOf >= 0))
+      elements[consumer.cls] = true;
+    if (consumer.cls >= 0)
+      continue;
+    for (auto &pieces : consumer.pieces)
+      for (auto &piece : pieces)
+        if (piece.producer >= 0 && producers[piece.producer].cls >= 0)
+          toEnv[producers[piece.producer].cls] = true;
+  }
+  unsigned tracked = 0, skipping = 0;
+  for (auto [c, cls] : llvm::enumerate(classes)) {
+    if (!cls.idleTracked)
+      continue;
+    ++tracked;
+    if (toEnv[c] || elements[c]) {
+      llvm::errs() << "foldsim-fold-static: pp-idle-skip: " << cls.name
+                   << ": clean bits, no skips ("
+                   << (toEnv[c] ? "an output to the environment" : "an element input")
+                   << ")\n";
+      continue;
+    }
+    cls.idleSkip = true;
+    ++skipping;
+  }
+  llvm::errs() << "foldsim-fold-static: pp-idle-skip: " << tracked
+               << " classes keep clean bits, " << skipping << " may skip\n";
+}
+
 void StaticFolder::choosePageGates() {
   // `page-write-gate`: an off-chip paged class on engines, of more than one
   // page and without a window.
@@ -16326,7 +16430,28 @@ LogicalResult StaticFolder::buildPPStream(
   Value read0 = comb::AndOp::create(b, offChip3[0],
                                     comb::OrOp::create(b, first3, active));
   Value rinst0 = offChip3[1], rrow0 = offChip3[2], rbeat0 = beat3;
+  // `pp-idle-skip`: the decision for the prefetch starting three ahead
+  // (first3), an input a host cycle before its first read leaves (first1):
+  // a skipped prefetch's reads all held back (`skipping1`, held to its last
+  // read: a prefetch's reads end before the next one starts), its slot's
+  // pending bit cleared as it is set (`kill1`, long before the pass that
+  // waits for it), so its pass waits for nothing; the simulator gates the
+  // pass itself.
+  auto fskipEdge = edges.get(i1);
+  Value skipping1, kill1, startSlot1;
+  if (cls.idleSkip) {
+    Value first1 = resetReg(resetReg(first3, "ppi_first2"), "ppi_first1");
+    auto heldNext = edges.get(i1);
+    Value held = resetReg(heldNext, "ppi_skipping");
+    skipping1 = comb::MuxOp::create(b, first1, fskipEdge, held);
+    heldNext.setValue(skipping1);
+    kill1 = comb::AndOp::create(b, first1, fskipEdge);
+  } else {
+    fskipEdge.setValue(constant(1, 0));
+  }
   for (unsigned d = 3; d-- > 0;) {
+    if (d == 0 && skipping1)
+      read0 = comb::AndOp::create(b, read0, comb::XorOp::create(b, skipping1, constant(1, 1)));
     read0 = resetReg(read0, "pps_rd_valid" + Twine(d));
     rinst0 = reg(rinst0, "pps_rd_inst" + Twine(d));
     rrow0 = reg(rrow0, "pps_rd_row" + Twine(d));
@@ -16419,6 +16544,39 @@ LogicalResult StaticFolder::buildPPStream(
   };
   Value startBit = slotBit(startSlot);
   Value all = hw::ConstantOp::create(b, APInt::getAllOnes(slotsPow));
+  Value killMask;
+  if (kill1) {
+    startSlot1 = reg(startSlot, "ppi_start_slot1");
+    killMask = comb::XorOp::create(
+        b, comb::MuxOp::create(b, kill1, slotBit(startSlot1), constant(slotsPow, 0)), all);
+  }
+  // `pp-idle-skip`, clean bits: whether the pass's row wrote any byte (the
+  // changed bytes within the lanes written, pp-dirty-writeback's masks),
+  // registered by chunk, ORed over the evaluation's rows from row 0 on: the
+  // copy's clean output, the evaluation's two host cycles after its last
+  // row's pass.
+  if (cls.idleTracked) {
+    SmallVector<Value> anyChunk;
+    for (unsigned lo = 0; lo < writes.size(); lo += 56) {
+      SmallVector<Value> ms;
+      for (unsigned c = lo; c < std::min<size_t>(writes.size(), lo + 56); ++c) {
+        assert(writes[c].second && "pp-idle-skip without the write's changed lanes");
+        ms.push_back(writes[c].second);
+      }
+      Value m = ms.size() == 1 ? ms[0] : b.createOrFold<comb::ConcatOp>(ms);
+      anyChunk.push_back(reg(comb::ICmpOp::create(b, comb::ICmpPredicate::ne, m,
+                                                  hw::ConstantOp::create(b, m.getType(), 0)),
+                             "ppi_dirty" + Twine(lo / 56)));
+    }
+    Value dirty1 = anyChunk.size() == 1 ? anyChunk[0] : comb::OrOp::create(b, anyChunk, false);
+    Value wv1 = resetReg(wvalid0, "ppi_wvalid1");
+    Value wr1 = reg(wrow0, "ppi_wrow1");
+    auto accNext = edges.get(i1);
+    Value acc = reg(accNext, "ppi_acc");
+    Value now = comb::MuxOp::create(b, isRow(wr1, 0), dirty1, comb::OrOp::create(b, acc, dirty1));
+    accNext.setValue(comb::MuxOp::create(b, wv1, now, acc));
+    cls.idleClean = reg(comb::XorOp::create(b, now, constant(1, 1)), "ppi_clean");
+  }
 
   // A chunk of at most 56 columns (4,032 bits): a virtual memory each.
   unsigned chunks = ppChunks(columns.size(), cls.ppChunkSpread, beats);
@@ -16512,14 +16670,15 @@ LogicalResult StaticFolder::buildPPStream(
     auto pendingNext = edges.get(bits(slotsPow));
     Value pending = resetReg(pendingNext, prefix + "_pending");
     Value doneBit = slotBit(rspSlot);
-    pendingNext.setValue(comb::OrOp::create(
+    Value pendingSet = comb::OrOp::create(
         b,
         comb::AndOp::create(
             b, pending,
             comb::XorOp::create(
                 b, comb::MuxOp::create(b, done, doneBit, constant(slotsPow, 0)),
                 all)),
-        comb::MuxOp::create(b, first2, startBit, constant(slotsPow, 0))));
+        comb::MuxOp::create(b, first2, startBit, constant(slotsPow, 0)));
+    pendingNext.setValue(killMask ? comb::AndOp::create(b, pendingSet, killMask) : pendingSet);
     // (The pending port is the window's slots', as wide as the window: not
     // an instance's bit each, which would grow with the instances.)
     // The pass's write: the chunk's columns, their bytes enabled by their
@@ -16633,6 +16792,9 @@ LogicalResult StaticFolder::buildPPStream(
                             builder, b.getLoc(), TypeRange{}, values)});
     cls.virtualMemories.push_back(vm);
   }
+  // (pp-idle-skip: the decision input after every virtual memory's.)
+  if (cls.idleSkip)
+    fskipEdge.setValue(copy.appendInput("ppfskip", i1).second);
   (void)context;
   llvm::errs() << "foldsim-fold-static: state-stream: " << cls.name << ": "
                << columns.size() << " columns in " << chunks
@@ -20087,6 +20249,11 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       ports.push_back({b.getStringAttr(name + what), value});
     copy.appendOutputs(ports);
   }
+  // pp-idle-skip: the clean output after every other.
+  if (cls.idleTracked && cls.idleClean) {
+    cls.idleCleanOut = copy.getNumOutputPorts();
+    copy.appendOutputs({{b.getStringAttr("ppclean"), cls.idleClean}});
+  }
   cls.copy = copy;
   model.erase();
   if (cls.multicycle && failed(checkMulticycle(cls)))
@@ -21139,6 +21306,10 @@ StaticFolder::linkRing(unsigned p, unsigned c, unsigned port,
   auto &producer = producers[p];
   if (!linkRings || ii == 0 || producer.cls < 0)
     return plan;
+  // (pp-idle-skip: a skipped pass leaves its entry as written last, which a
+  // ring entry of another instance would overwrite.)
+  if (classes[producer.cls].idleSkip)
+    return plan;
   // Within one SLR group and not split: the write's timing is the pass's.
   if (crosses(producer.cls, int(c)) || splitDelayP(int(p)))
     return plan;
@@ -21914,6 +22085,9 @@ LogicalResult StaticFolder::buildSim() {
     Value ppValid3, ppInst3, ppRow3, ppRes3, ppStr3, ppSlot3, ppPrefSlot3;
   };
   SmallVector<Controls, 0> controls(classes.size());
+  // pp-idle-skip: each skipping class's pass gates (its state pass's, its
+  // rows' passes') and its copy's decision input, set once the copies are.
+  std::map<unsigned, Backedge> idleStateSkip, idleRowSkip, idleDecision;
   // Staged classes: what each reads at a position, its stages before each
   // state pass (its links' reads, the copy's reads of its state); the
   // writes are `controls`'.
@@ -22027,6 +22201,13 @@ LogicalResult StaticFolder::buildSim() {
       ready3 = comb::AndOp::create(b, ready3, runs);
       ctl.tail2 = reg(tail3, prefix + "_tail2");
       ctl.tail3 = tail3;
+    }
+    // pp-idle-skip: a skipped evaluation's state pass does not run (its
+    // links keep their entries; set below).
+    if (cls.idleSkip) {
+      auto skip = backedges.get(i1);
+      idleStateSkip.insert({unsigned(c), skip});
+      ctl.state3 = comb::AndOp::create(b, ctl.state3, notOf(skip));
     }
     ctl.state2 = reg(ctl.state3, prefix + "_state2");
     ctl.ready2 = reg(ready3, prefix + "_ready2");
@@ -22237,6 +22418,12 @@ LogicalResult StaticFolder::buildSim() {
         ctl.ppValid3 = comb::AndOp::create(
             b, ctl.ppValid3,
             comb::OrOp::create(b, notOf(table(b, at, ptailRow, 1)), primed));
+      // (pp-idle-skip: nor its rows' passes.)
+      if (cls.idleSkip) {
+        auto skip = backedges.get(i1);
+        idleRowSkip.insert({unsigned(c), skip});
+        ctl.ppValid3 = comb::AndOp::create(b, ctl.ppValid3, notOf(skip));
+      }
       if (threads > 1)
         ctl.ppInst3 = table(b, at, pinstRow, idxWidth);
       ctl.ppRow3 = table(b, at, prowRow, rowWidth);
@@ -23053,6 +23240,11 @@ LogicalResult StaticFolder::buildSim() {
       else
         operands.push_back(answer[2]);
     }
+    if (cls.idleSkip) {
+      auto decision = backedges.get(i1);
+      idleDecision.insert({unsigned(c), decision});
+      operands.push_back(decision);
+    }
     copies[c] = hw::InstanceOp::create(b, cls.copy,
                                        b.getStringAttr(cls.name + "_copy"),
                                        operands);
@@ -23062,6 +23254,285 @@ LogicalResult StaticFolder::buildSim() {
       tagDomain(copies[c], int(c));
   }
 
+  // pp-idle-skip (planIdleSkip): instance i of a skipping class skips its
+  // evaluation of frame f where its rows and each of its producers' rows did
+  // not change in their passes of frame f - 1 (so its state and inputs are
+  // the frame before's, and so would be what it writes). Each tracked class's
+  // copy gives a clean bit an evaluation (its rows wrote no byte), two host
+  // cycles after its last row's pass; it is written at {frame parity,
+  // instance} of a 1-bit RAM, a replica per reader (constant in the
+  // instances: one RAMB36 holds 16k instances). The decision is made at the
+  // prefetch's first read position (position tables three ahead, decoded as
+  // every table): own and producers' bits of the frame before's bank read a
+  // host cycle on, the decision a host cycle later, the copy's input then (it
+  // holds the prefetch's reads back and clears its pending bit) and the
+  // window slot's skip bit, which gates the evaluation's row passes and state
+  // pass (so its HBM writes, clean bit and link writes: a link entry keeps
+  // the value of its last write, the one the skipped write would write). An
+  // instance decides only where each bit it reads is its producer's frame
+  // f - 1 pass's: written before the read (II + q - e >= 5, q the decision's
+  // position, e the producer's last row pass) and not yet overwritten by its
+  // f + 1 pass (II + e - q >= 0); every input an early link of a tracked
+  // class, or a constant; and its row passes at least three positions after
+  // the decision. Only once three frames have started (every bit written).
+  // Test hook FOLDSIM_IDLE_SKIP_MUTANT: 1 ignores the producers' bits, 2
+  // reads the other bank (both mismatch the target).
+  if (ppIdleSkip) {
+    static const int mutant = [] {
+      const char *e = getenv("FOLDSIM_IDLE_SKIP_MUTANT");
+      return e ? atoi(e) : 0;
+    }();
+    bool on = slrOf.empty();
+    if (!on)
+      llvm::errs() << "foldsim-fold-static: pp-idle-skip: off (SLR groups)\n";
+    auto wrap = [&](int pos) { return unsigned(((pos % int(ii)) + int(ii)) % int(ii)); };
+    auto floorDiv = [&](int x) {
+      return x >= 0 ? x / int(ii) : -((-x + int(ii) - 1) / int(ii));
+    };
+    auto idxOf = [&](unsigned threads) { return threads > 1 ? llvm::Log2_32_Ceil(threads) : 0u; };
+    auto lastRow = [&](const Class &k, unsigned j) {
+      return k.slot[kState][j] - int(k.stages) + int(k.pp) - 1;
+    };
+    // The frame's parity at the position three ahead (the tables').
+    Value par3 = shortLead ? parDN : parD;
+    // Frames started, to three.
+    auto startsNext = backedges.get(b.getIntegerType(2));
+    Value starts = resetReg(startsNext, "ppi_frames", 0);
+    startsNext.setValue(comb::MuxOp::create(
+        b, comb::AndOp::create(b, starting, notOf(eq(starts, 3))),
+        comb::AddOp::create(b, starts, constant(2, 1)), starts));
+    Value warm3 = eq(starts, 3);
+    // Each tracked class's clean bits: the write, and its replicas.
+    struct CleanWrite {
+      Value en, addr, data;
+      unsigned addrBits = 0;
+    };
+    std::map<unsigned, CleanWrite> cleanWrites;
+    auto cleanWrite = [&](unsigned t) -> CleanWrite & {
+      auto &cw = cleanWrites[t];
+      if (cw.en)
+        return cw;
+      auto &k = classes[t];
+      auto &ctl = controls[t];
+      unsigned n = k.threads(), iw = idxOf(n);
+      SmallVector<uint64_t> last(ii + 1, 0), inst(ii + 1, 0), flip(ii + 1, 0);
+      for (unsigned j = 0; j < n; ++j) {
+        int e = lastRow(k, j);
+        last[wrap(e)] = 1;
+        inst[wrap(e)] = j;
+        flip[wrap(e)] = unsigned(floorDiv(e)) & 1;
+      }
+      std::string prefix = k.name + "_ppi_w";
+      // (Its row passes' gate already has its skips: a skipped evaluation
+      // writes no bit.)
+      Value en = comb::AndOp::create(b, table(b, ctl.at3, last, 1), ctl.ppValid3);
+      Value bank = comb::XorOp::create(b, par3, table(b, ctl.at3, flip, 1));
+      Value at = iw ? Value(table(b, ctl.at3, inst, iw)) : Value();
+      for (unsigned d = 5; d-- > 0;) {
+        en = resetReg(en, prefix + "en" + Twine(d), 0);
+        bank = reg(bank, prefix + "bank" + Twine(d));
+        if (at)
+          at = reg(at, prefix + "inst" + Twine(d));
+      }
+      cw.en = en;
+      cw.addr = at ? b.createOrFold<comb::ConcatOp>(bank, at) : bank;
+      cw.addrBits = 1 + iw;
+      cw.data = copies[t].getResult(k.idleCleanOut);
+      return cw;
+    };
+    unsigned replicas = 0;
+    // A replica of class t's clean bits, read at `addr` (registered): its
+    // read data a host cycle on.
+    auto cleanRead = [&](unsigned t, Value addr, const Twine &name) -> Value {
+      auto &cw = cleanWrite(t);
+      auto mem = seq::FirMemOp::create(
+          b, seq::FirMemType::get(context, uint64_t(1) << cw.addrBits, 1, 1),
+          /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old, seq::WUW::Undefined,
+          b.getStringAttr(name), hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{},
+          Attribute{});
+      seq::FirMemWriteOp::create(b, mem, cw.addr, hostClock, cw.en, cw.data, Value{});
+      ++replicas;
+      return seq::FirMemReadOp::create(b, mem, addr, hostClock, constant(1, 1));
+    };
+    unsigned eligible = 0, streamed = 0;
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      if (!cls.idleSkip)
+        continue;
+      if (!on) {
+        idleDecision.at(unsigned(c)).setValue(constant(1, 0));
+        idleRowSkip.at(unsigned(c)).setValue(constant(1, 0));
+        idleStateSkip.at(unsigned(c)).setValue(constant(1, 0));
+        continue;
+      }
+      auto &ctl = controls[c];
+      unsigned n = cls.threads(), iw = idxOf(n);
+      unsigned slotBits = cls.ppSlotBits();
+      std::string prefix = cls.name + "_ppi";
+      // Each instance's decision position (its prefetch's first read) and
+      // sources: {class, instance} of every producer bit it reads, its own.
+      SmallVector<int> pf;
+      ppPrefetches(cls, cls.pageWindow, pf);
+      SmallVector<uint64_t> start(ii + 1, 0), slotAt(ii + 1, 0), valid(ii + 1, 0),
+          inst(ii + 1, 0), flip(ii + 1, 0), stValid(ii + 1, 0), stSlot(ii + 1, 0);
+      // Per producer class, the sources of each position (in order).
+      std::map<unsigned, std::vector<SmallVector<unsigned>>> srcAt;
+      unsigned why[4] = {0, 0, 0, 0};
+      for (unsigned i = 0; i < n; ++i) {
+        ++streamed;
+        int q = pf[i];
+        unsigned qq = wrap(q);
+        start[qq] = 1;
+        slotAt[qq] = cls.windowSlot[i];
+        stValid[wrap(cls.slot[kState][i])] = 1;
+        stSlot[wrap(cls.slot[kState][i])] = cls.windowSlot[i];
+        bool ok = on, structural = true;
+        std::map<unsigned, SmallVector<unsigned>> srcs;
+        for (auto [k, cons] : llvm::enumerate(cls.consumerOf)) {
+          if (cons < 0 || int(k) == cls.clockInput || (k < cls.staticInput.size() && cls.staticInput[k]))
+            continue;
+          for (auto &piece : consumers[cons].pieces[i]) {
+            if (piece.producer < 0)
+              continue;
+            auto &pr = producers[piece.producer];
+            if (pr.cls < 0 || pr.late || !classes[pr.cls].idleTracked) {
+              if (structural)
+                ++why[pr.cls < 0 ? 0 : pr.late ? 1 : 2];
+              ok = structural = false;
+              continue;
+            }
+            auto &v = srcs[unsigned(pr.cls)];
+            if (!llvm::is_contained(v, piece.inst) && !(unsigned(pr.cls) == c && piece.inst == i))
+              v.push_back(piece.inst);
+          }
+        }
+        // Timing: each bit read is its producer's frame f - 1 pass's.
+        auto timed = [&](unsigned t, unsigned j) {
+          int e = lastRow(classes[t], j);
+          return int(ii) + q - e >= 5 && int(ii) + e - q >= 0;
+        };
+        if (!timed(unsigned(c), i) || cls.slot[kState][i] - int(cls.stages) - q < 3)
+          ok = false;
+        for (auto &[t, v] : srcs)
+          for (unsigned j : v)
+            ok = ok && timed(t, j);
+        if (!ok) {
+          if (structural)
+            ++why[3];
+          continue;
+        }
+        ++eligible;
+        valid[qq] = 1;
+        inst[qq] = i;
+        flip[qq] = unsigned(floorDiv(q) + 1) & 1;
+        for (auto &[t, v] : srcs) {
+          auto &rows = srcAt[t];
+          for (auto [d, j] : llvm::enumerate(v)) {
+            if (rows.size() <= d)
+              rows.emplace_back(SmallVector<unsigned>{});
+            rows[d].resize(ii + 1, ~0u);
+            rows[d][qq] = j;
+          }
+        }
+      }
+      Operation *mark = lastOp();
+      // The decision: tables three ahead, registered (A); the bits read at A
+      // (data at B); decided at B, a host cycle before the first read leaves.
+      Value vA = resetReg(comb::AndOp::create(b, table(b, ctl.at3, valid, 1), warm3),
+                          prefix + "_valid_a", 0);
+      Value sA = resetReg(table(b, ctl.at3, start, 1), prefix + "_start_a", 0);
+      Value slA = reg(table(b, ctl.at3, slotAt, slotBits), prefix + "_slot_a");
+      Value bank3 = comb::XorOp::create(b, par3, table(b, ctl.at3, flip, 1));
+      if (mutant == 2)
+        bank3 = notOf(bank3);
+      Value bA = reg(bank3, prefix + "_bank_a");
+      auto addrOf = [&](Value instA) {
+        return instA ? b.createOrFold<comb::ConcatOp>(bA, instA) : bA;
+      };
+      Value iA = iw ? reg(table(b, ctl.at3, inst, iw), prefix + "_inst_a") : Value();
+      SmallVector<Value> terms{resetReg(vA, prefix + "_valid_b", 0),
+                               cleanRead(unsigned(c), addrOf(iA), prefix + "_own")};
+      unsigned sources = 0;
+      for (auto &[t, rows] : srcAt)
+        for (auto [d, row] : llvm::enumerate(rows)) {
+          ++sources;
+          if (mutant == 1)
+            continue;
+          SmallVector<uint64_t> sv(ii + 1, 0), si(ii + 1, 0);
+          for (unsigned q = 0; q <= ii; ++q)
+            if (row[q] != ~0u) {
+              sv[q] = 1;
+              si[q] = row[q];
+            }
+          unsigned tw = idxOf(classes[t].threads());
+          std::string sp = prefix + "_src" + Twine(sources).str();
+          Value svB = reg(reg(table(b, ctl.at3, sv, 1), sp + "_valid_a"), sp + "_valid_b");
+          Value siA = tw ? reg(table(b, ctl.at3, si, tw), sp + "_inst_a") : Value();
+          Value bit = cleanRead(t, addrOf(siA), sp + "_" + classes[t].name);
+          terms.push_back(comb::OrOp::create(b, notOf(svB), bit));
+        }
+      Value decision = comb::AndOp::create(b, terms, false);
+      Value startB = resetReg(sA, prefix + "_start_b", 0);
+      Value slotB = reg(slA, prefix + "_slot_b");
+      idleDecision.at(unsigned(c)).setValue(decision);
+      // Each window slot's skip bit, set at its prefetch's decision.
+      unsigned W = cls.pageWindow, wPow = unsigned(llvm::PowerOf2Ceil(W));
+      SmallVector<Value> slotSkip;
+      for (unsigned w = 0; w < W; ++w) {
+        auto next = backedges.get(i1);
+        Value r = resetReg(next, prefix + "_skip" + Twine(w), 0);
+        Value here = slotBits && W > 1 ? Value(comb::AndOp::create(b, startB, eq(slotB, w))) : startB;
+        next.setValue(comb::MuxOp::create(b, here, decision, r));
+        slotSkip.push_back(r);
+      }
+      for (unsigned w = W; w < wPow; ++w)
+        slotSkip.push_back(constant(1, 0));
+      auto skipOf = [&](Value slot) -> Value {
+        if (slotSkip.size() == 1)
+          return slotSkip[0];
+        unsigned need = llvm::Log2_32(wPow);
+        if (unsigned have = hw::getBitWidth(slot.getType()); have > need)
+          slot = b.createOrFold<comb::ExtractOp>(b.getIntegerType(need), slot, 0);
+        return hw::ArrayGetOp::create(
+            b, hw::ArrayCreateOp::create(b, SmallVector<Value>(slotSkip.rbegin(), slotSkip.rend())),
+            slot);
+      };
+      idleRowSkip.at(unsigned(c)).setValue(skipOf(ctl.ppSlot3));
+      idleStateSkip.at(unsigned(c)).setValue(comb::AndOp::create(
+          b, table(b, ctl.at3, stValid, 1), skipOf(table(b, ctl.at3, stSlot, slotBits))));
+      // FOLDSIM_SKIP_TRACE (simulation): a line a skipped evaluation.
+      {
+        auto top = body->getParentOp()->getParentOfType<mlir::ModuleOp>();
+        if (top && !top.lookupSymbol<sv::MacroDeclOp>("FOLDSIM_SKIP_TRACE")) {
+          OpBuilder tb(top.getBody(), top.getBody()->begin());
+          sv::MacroDeclOp::create(tb, netlist.getLoc(), "FOLDSIM_SKIP_TRACE");
+        }
+        Value clock = seq::FromClockOp::create(b, hostClock);
+        Value skipped = comb::AndOp::create(b, startB, decision);
+        sv::IfDefOp::create(
+            b, "FOLDSIM_SKIP_TRACE",
+            [&] {
+              sv::AlwaysOp::create(b, ArrayRef{sv::EventControl::AtPosEdge}, ArrayRef{clock}, [&] {
+                sv::IfOp::create(b, skipped, [&] {
+                  sv::FWriteOp::create(b, constant(32, 0x80000001),
+                                       b.getStringAttr("foldsim idle-skip: " + cls.name + "\n"),
+                                       ValueRange{});
+                });
+              });
+            },
+            [] {});
+      }
+      tagSince(mark, controlGroup(unsigned(c)), int(c));
+      llvm::errs() << "foldsim-fold-static: pp-idle-skip: " << cls.name << ": "
+                   << llvm::count(valid, 1) << " of " << n << " instances decide ("
+                   << sources << " source reads; instances not: " << why[0]
+                   << " an environment input, " << why[1] << " a late input, " << why[2]
+                   << " an untracked source, " << why[3] << " in time)\n";
+    }
+    if (!cleanWrites.empty() || eligible || streamed)
+      llvm::errs() << "foldsim-fold-static: pp-idle-skip: " << cleanWrites.size()
+                   << " classes' clean bits in " << replicas << " replicas, " << eligible
+                   << " of " << streamed << " instances decide\n";
+  }
   // Groups of links, each with its own copy of its producer's controls and of
   // the frame's parity, so that no control drives more than about
   // `regionBits` bits of links.
@@ -30711,6 +31182,7 @@ LogicalResult StaticFolder::run() {
     return failure();
   }
   choosePageGates();
+  planIdleSkip();
   reportStateInRam();
   exportTransfers();
   if (scheduleOnly) {
@@ -31000,6 +31472,9 @@ void FoldStaticPass::runOnOperation() {
   folder.linkHbmBeatRows = linkHbmBeatRows;
   folder.linkPendingCounts = linkPendingCounts;
   folder.ppDirtyWriteback = ppDirtyWriteback;
+  folder.ppIdleSkip = ppIdleSkip && ppDirtyWriteback;
+  if (ppIdleSkip && !ppDirtyWriteback)
+    llvm::errs() << "foldsim-fold-static: pp-idle-skip: off (it needs pp-dirty-writeback)\n";
   folder.linkLandingBlock = linkLandingBlock;
   // (FOLDSIM_LINK_LANDING_BLOCK=R, a test hook: the whole suite with it.)
   if (const char *env = getenv("FOLDSIM_LINK_LANDING_BLOCK"))
