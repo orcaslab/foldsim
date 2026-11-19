@@ -15852,7 +15852,12 @@ LogicalResult StaticFolder::chooseStreamWindows() {
     auto streams = [&](unsigned i) { return bool(cls.ppStreamed[i]); };
     unsigned n = all - cls.ppResident;
     unsigned rowsPow = unsigned(llvm::PowerOf2Ceil(P));
+    // (hbm-round-trip: the round trip sets the window, not a RAMB36's
+    // depth: the fewest slots that lead by it, up to every instance. The
+    // instances a frame and the frame both grow with the count, so the
+    // slots that cover a round trip do not: a ceiling.)
     unsigned cap = stateStreamWindow ? stateStreamWindow
+                   : hbmRoundTrip    ? std::max(1u, n)
                                      : std::max(1u, 512u / rowsPow);
     // The fewest slots whose prefetches lead their first passes by an HBM
     // round trip (streamLead() positions), else the most that fit: the
