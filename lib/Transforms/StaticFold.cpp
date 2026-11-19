@@ -1302,9 +1302,10 @@ private:
   }
   /// `slr-hop-registers`: the SLR boundaries between class `c`'s group and
   /// group `to` (the groups in die order, as --slr-region lists the SLRs),
-  /// each crossed from a register; 1 otherwise, and for a serialized class.
+  /// each crossed from a register; 1 otherwise. A serialized class's chunk
+  /// register is followed by one in each group between, as a link's.
   unsigned slrHops(int c, int to) const {
-    if (!slrHopRegisters || slrOf.empty() || c < 0 || to < 0 || serialOf(c) > 1)
+    if (!slrHopRegisters || slrOf.empty() || c < 0 || to < 0)
       return 1;
     int d = std::abs(slrOf[c] - to);
     return d > 1 ? unsigned(d) : 1;
@@ -1312,10 +1313,11 @@ private:
   /// The host cycles a link of class `c` to group `to` takes between groups:
   /// 1 (its register), with slr-serialize k + 1 (the pass's bits held, then
   /// k chunks sent, each in a register fed only by registers), with
-  /// slr-hop-registers one per SLR boundary.
+  /// slr-hop-registers one more per SLR boundary past the first (k + hops
+  /// serialized).
   unsigned crossLatency(int c, int to) const {
     unsigned k = serialOf(c);
-    return k > 1 ? k + 1 : slrHops(c, to);
+    return k > 1 ? k + slrHops(c, to) : slrHops(c, to);
   }
   int crossDelay(int p, int c) const {
     return crosses(p, c) ? int(crossLatency(p, slrOf[c])) : 0;
@@ -23220,6 +23222,13 @@ LogicalResult StaticFolder::buildSim() {
                 if (physicalDomains)
                   tagDomain(op, int(c));
               }
+            // slr-hop-registers: the chunk register followed by one in each
+            // group between, every chunk as many host cycles later.
+            int dir = to > slrOf[c] ? 1 : -1;
+            for (unsigned j = 1; j < hops; ++j) {
+              sent = copyReg(sent, crossName + "_hop" + std::to_string(j));
+              tagGroup(sent.getDefiningOp(), slrOf[c] + int(j) * dir);
+            }
             // The reader's side (tagged with the reader's group by the
             // input): chunk j shifted k - 1 - j times.
             SmallVector<Value> parts{sent};

@@ -806,8 +806,9 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "link between groups k > 1 apart is registered once per SLR "
            "boundary, its bits in a register in each group between, k host "
            "cycles (its write's enable, entry and bank as many later), rather "
-           "than in one register whose route crosses k boundaries; the links "
-           "of an slr-serialize class keep their own latency">,
+           "than in one register whose route crosses k boundaries; an "
+           "slr-serialize class's chunk register is followed by one in each "
+           "group between (its links k - 1 host cycles later)">,
     Option<"slrLinkRams", "slr-link-rams", "bool", "false",
            "With SLR groups: links may be block or ultra RAM too (by "
            "link-block-depth / link-ultra-depth or link-kind-cost), the memory "
