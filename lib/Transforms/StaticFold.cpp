@@ -1114,6 +1114,7 @@ public:
   /// own (popShift).
   bool linkHbmBeatRows = false;
   bool linkPendingCounts = false;
+  bool ppDirtyWriteback = false;
   /// `link-landing-block R`: an HBM link stream's landing memory in block
   /// RAM (a registered read, its address a host cycle ahead) where its
   /// distributed RAM costs at least R LUTs a RAMB36 it would take; 0: none.
@@ -16527,7 +16528,7 @@ LogicalResult StaticFolder::buildPPStream(
     for (unsigned c = 0; c < n; ++c) {
       auto &[word, mask] = writes[lo + c];
       words.push_back(word);
-      masks.push_back(mask && lanes == 9 ? mask : constant(9, 0x1ff));
+      masks.push_back(mask && (lanes == 9 || ppDirtyWriteback) ? mask : constant(9, 0x1ff));
     }
     auto pack = [&](SmallVector<Value> &parts, unsigned have, unsigned want) {
       if (want > have)
@@ -16553,6 +16554,13 @@ LogicalResult StaticFolder::buildPPStream(
       return c && c.getValue().isAllOnes();
     });
     Value wrData, wrMask, wv = wvalidQ, wi = winstQ;
+    if (ppDirtyWriteback && !beats) {
+      // (pp-dirty-writeback: no write where no byte of the chunk changed.)
+      Value any = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, pack(masks, n * 9, n * 9),
+                                       constant(n * 9, 0));
+      wv = resetReg(comb::AndOp::create(b, wvalid0, any), prefix + "_wr_valid_dirty");
+      wholeRows = false;
+    }
     if (!beats) {
       wrData = zeroReg(pack(words, width, dw), prefix + "_wr_data");
       wrMask = wholeRows && dw / 8 == n * 9
@@ -19238,7 +19246,21 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       if (colHbm(c)) {
         // To HBM, from the pass: the column's data and lane enables; partly
         // resident, a resident instance's into its RAM.
-        streamWrites.push_back({data, mask});
+        // (`pp-dirty-writeback`: the lanes whose bytes changed against the
+        // row the pass read (the column's output register, the window's copy
+        // of HBM's row, at the same stage as the write's data), within the
+        // lane enables where they are bytes: the HBM write's byte enables.)
+        if (ppDirtyWriteback) {
+          SmallVector<Value> changed;
+          for (unsigned l = 9; l-- > 0;)
+            changed.push_back(comb::ICmpOp::create(
+                b, comb::ICmpPredicate::ne, b.createOrFold<comb::ExtractOp>(bits(8), data, 8 * l),
+                b.createOrFold<comb::ExtractOp>(bits(8), col.out, 8 * l)));
+          Value dirty = b.createOrFold<comb::ConcatOp>(changed);
+          streamWrites.push_back({data, mask && lanes == 9 ? comb::AndOp::create(b, mask, dirty) : dirty});
+        } else {
+          streamWrites.push_back({data, mask});
+        }
         if (partial)
           seq::FirMemWriteOp::create(
               b, col.resident, g.resWrite, hostClock,
@@ -30970,6 +30992,7 @@ void FoldStaticPass::runOnOperation() {
   folder.linkHbmBeatBits = linkHbmBeatBits;
   folder.linkHbmBeatRows = linkHbmBeatRows;
   folder.linkPendingCounts = linkPendingCounts;
+  folder.ppDirtyWriteback = ppDirtyWriteback;
   folder.linkLandingBlock = linkLandingBlock;
   // (FOLDSIM_LINK_LANDING_BLOCK=R, a test hook: the whole suite with it.)
   if (const char *env = getenv("FOLDSIM_LINK_LANDING_BLOCK"))

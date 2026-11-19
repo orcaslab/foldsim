@@ -962,6 +962,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"streamMoveBits", "stream-move-bits", "unsigned", "32",
            "The fewest bits one row transfer moves on a master (its beat: "
            "256 for a 256-bit direct port), for the bandwidth model">,
+    Option<"ppDirtyWriteback", "pp-dirty-writeback", "bool", "false",
+           "state-in-ram-pp rows streamed from HBM: a pass writes only the "
+           "bytes of its row that changed (its new row against the row it "
+           "read, the window's copy of HBM's), and no write where none did: "
+           "HBM keeps the equal bytes it holds">,
     Option<"streamStripe", "stream-stripe", "unsigned", "1",
            "Each controller's rows interleaved over this many of the "
            "stream-masters by their index (row x instances + instance, mod S: "
