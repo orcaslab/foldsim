@@ -8193,6 +8193,16 @@ unsigned StaticFolder::placeModulo(
     }
   // Nor than a copy with paged links' passes, each its link page apart.
   // (Each evaluation by its own kind of pass's spacing: windows of one port.)
+  // Per-kind holds (33f10a4) only where the uniform hold would bound the
+  // frame: elsewhere every pass keeps the class's most, which spreads a
+  // stream producer's page writes, and so its readers' landings, over the
+  // frame (a32-S30: packed by kind they bunched, and a mailbox stream's
+  // landing slots grew from 16 to 128 at 1,024 SMs, the slots fitSlots
+  // finds for the landings within a lead).
+  for (auto [c, cls] : llvm::enumerate(classes))
+    if (cls.linkPageByKind && linkSpacing(c) > 1 &&
+        uint64_t(linkSpacing(c)) * evaluations[c] <= lower)
+      cls.linkPageByKind = false;
   SmallVector<uint64_t> linkHeld(classes.size(), 0);
   for (auto &node : nodes)
     if (linkSpacing(node.cls) > 1)
