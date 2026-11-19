@@ -45,6 +45,22 @@
 # RUN: %t/beat3v/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=1 +hi=60 | FileCheck %s
 # RUN: %t/beat3v/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +lo=1 +hi=600 | FileCheck %s
 # RUN: %t/beat3v/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +bubble=50 +stall=50 +lo=1 +hi=600 +full=30 | FileCheck %s
+# --link-pending-counts: a pending bit a slot, its landed beats counted in
+# distributed RAM (lcnt by the responses, lbase at the slot's first beat's
+# request); the RAMs start random (--x-initial unique). Exact the same, also on
+# page engines.
+# RUN: foldsim --srcs top.f --top Top --out %t/beat3c --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --bubbles --min-ii 256 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm --link-hbm-beat-bits 11 --link-pending-counts Unit Reader > %t/beat3c.log 2>&1
+# RUN: FileCheck %s --check-prefix=CNT < %t/beat3c/foldsim_sim.mlir
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/beat3c -DVM1 -DBUBBLES -Mdir %t/beat3c/obj %S/Inputs/tb_linkhbm.sv top.sv %t/beat3c/foldsim_sim.sv > %t/beat3c/build.log 2>&1
+# RUN: %t/beat3c/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=1 +hi=60 | FileCheck %s
+# RUN: %t/beat3c/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +lo=1 +hi=600 | FileCheck %s
+# RUN: %t/beat3c/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +bubble=50 +stall=50 +lo=1 +hi=600 +full=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/beatengc --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --bubbles --min-ii 256 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm --link-hbm-beat-bits 16 --page-engines 4 --link-pending-counts Unit Reader > %t/beatengc.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/beatengc -DVM1 -DBUBBLES -Mdir %t/beatengc/obj %S/Inputs/tb_linkhbm.sv top.sv %t/beatengc/foldsim_sim.sv > %t/beatengc/build.log 2>&1
+# RUN: %t/beatengc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +bubble=30 +stall=30 +lo=1 +hi=30 +full=20 | FileCheck %s
+# RUN: %t/beatengc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+7 +lo=1 +hi=600 | FileCheck %s
+# CNT: %lks{{[0-9]+}}_lcnt = seq.firmem
+# CNT: %lks{{[0-9]+}}_lbase = seq.firmem
 # The same on page engines (--page-engines): the beat stream's engine 16 bits
 # wide; its requests and writes may move by a constant (the first engine
 # they fit). Exact.

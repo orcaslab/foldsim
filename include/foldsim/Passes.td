@@ -986,6 +986,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "and a beat wide, not a row wide), read beat by beat into the "
            "members' registers from beats - 1 positions before the landing's "
            "own position">,
+    Option<"linkPendingCounts", "link-pending-counts", "bool", "false",
+           "With link-hbm-beat-bits: a stream of beats keeps a pending bit "
+           "a landing slot (set at its first beat's request, cleared when "
+           "its last beat lands), its landed beats counted in distributed "
+           "RAM (a count a slot, written by the responses, and the count at "
+           "the slot's request, written by the requests: the difference is "
+           "the beats landed), not a pending bit a slot's beat in flops: "
+           "slots bits, not slots x 2^beat bits">,
     Option<"linkHbmRowBits", "link-hbm-row-bits", "unsigned", "512",
            "HBM link streams: the most bits of a stream's row (its "
            "controller's data width, 8 to 4096): a wider word is cut into "

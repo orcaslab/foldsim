@@ -1113,6 +1113,7 @@ public:
   /// after its first, which comes that many positions before the landing's
   /// own (popShift).
   bool linkHbmBeatRows = false;
+  bool linkPendingCounts = false;
   /// `link-landing-block R`: an HBM link stream's landing memory in block
   /// RAM (a registered read, its address a host cycle ahead) where its
   /// distributed RAM costs at least R LUTs a RAMB36 it would take; 0: none.
@@ -23983,6 +23984,52 @@ LogicalResult StaticFolder::buildSim() {
     // them: with beats not a power of two, slot * beats would put a slot's
     // last beats in the next slot's bits, so a slot read as landed while
     // beats of it were still pending. The bits past `beats` stay zero.)
+    // (`link-pending-counts`, beats: a pending bit a slot in flops, set at
+    // its first beat's request and cleared when its kb-th beat lands, the
+    // beats landed counted in distributed RAM: `lcnt` a slot, written by the
+    // responses (+1 each), and `lbase`, the slot's count at its first beat's
+    // request, written by the requests (one writer each). The difference is
+    // the slot's beats landed, whatever the RAMs held at power-up; a slot is
+    // requested again only after its landing was read, so no response of
+    // its last use is still to come.)
+    if (kb > 1 && linkPendingCounts) {
+      unsigned cb = bb + 1;
+      auto mem = [&](StringRef n) {
+        return seq::FirMemOp::create(
+            b, seq::FirMemType::get(context, slots, cb, 1), /*readLatency=*/0,
+            /*writeLatency=*/1, seq::RUW::Undefined, seq::WUW::Undefined,
+            b.getStringAttr(prefix + n), hw::InnerSymAttr{}, seq::FirMemInitAttr{}, StringAttr{},
+            Attribute{});
+      };
+      auto cnt = mem("_lcnt"), base = mem("_lbase");
+      Value first = comb::AndOp::create(b, req0, eq(rbeat0, 0));
+      seq::FirMemWriteOp::create(
+          b, base, reqPtr, hostClock, first,
+          seq::FirMemReadOp::create(b, cnt, reqPtr, hostClock, constant(1, 1)), Value{});
+      Value clr = rsp, clrSlot = rspInst;
+      if (landBlock) {
+        clr = resetReg(rsp, prefix + "_rspd", 0);
+        clrSlot = reg(rspInst, prefix + "_rspslotd");
+      }
+      Value inc = comb::AddOp::create(
+          b, seq::FirMemReadOp::create(b, cnt, clrSlot, hostClock, constant(1, 1)), constant(cb, 1));
+      seq::FirMemWriteOp::create(b, cnt, clrSlot, hostClock, clr, inc, Value{});
+      Value landed = comb::SubOp::create(
+          b, inc, seq::FirMemReadOp::create(b, base, clrSlot, hostClock, constant(1, 1)));
+      Value done = comb::AndOp::create(b, clr, eq(landed, kb));
+      auto pendNext = backedges.get(b.getIntegerType(slots));
+      Value pendSlot = resetReg(pendNext, prefix + "_pending", 0);
+      auto slotAt = [&](Value on, Value at) -> Value {
+        Value one = b.createOrFold<comb::ConcatOp>(constant(slots - 1, 0), on);
+        return comb::ShlOp::create(
+            b, one, b.createOrFold<comb::ConcatOp>(constant(slots - ib, 0), at));
+      };
+      pendNext.setValue(comb::AndOp::create(
+          b, comb::OrOp::create(b, pendSlot, slotAt(first, reqPtr)),
+          comb::XorOp::create(b, slotAt(done, clrSlot),
+                              hw::ConstantOp::create(b, APInt::getAllOnes(slots)))));
+      sb.pending = pendSlot;
+    } else {
     unsigned stride = kb > 1 ? 1u << bb : 1;
     unsigned pbits = slots * stride, pb = ib + bb;
     auto pendNext = backedges.get(b.getIntegerType(pbits));
@@ -24015,6 +24062,7 @@ LogicalResult StaticFolder::buildSim() {
       sb.pending = b.createOrFold<comb::ConcatOp>(slotBits);
     } else {
       sb.pending = pendAll;
+    }
     }
     // The writes: the word held at the producer's pass, a row a host cycle
     // over the pages after it, at {bank, instance, page}.
@@ -30910,6 +30958,7 @@ void FoldStaticPass::runOnOperation() {
   folder.linkHbmRowBits = linkHbmRowBits;
   folder.linkHbmBeatBits = linkHbmBeatBits;
   folder.linkHbmBeatRows = linkHbmBeatRows;
+  folder.linkPendingCounts = linkPendingCounts;
   folder.linkLandingBlock = linkLandingBlock;
   // (FOLDSIM_LINK_LANDING_BLOCK=R, a test hook: the whole suite with it.)
   if (const char *env = getenv("FOLDSIM_LINK_LANDING_BLOCK"))

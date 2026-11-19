@@ -28,6 +28,15 @@
 # RUN: %t/rows/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +bubble=30 | FileCheck %s
 # RUN: %t/rows/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +lo=1 +hi=600 | FileCheck %s
 # RUN: %t/rows/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +bubble=50 +stall=50 +lo=1 +hi=600 +full=30 | FileCheck %s
+# The same beat rows with --link-pending-counts (a pending bit a slot, the
+# beats counted in distributed RAM; the response's slot a host cycle late with
+# the block): exact.
+# RUN: foldsim --srcs top.f --top Top --out %t/rowsc --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --bubbles --min-ii 256 --link-kinds Unit:Reader:hbm,Reader:Unit:hbm --link-hbm-beat-bits 16 --link-hbm-beat-rows --link-landing-block 1 --link-pending-counts Unit Reader > %t/rowsc.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/rowsc.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/rowsc -DVM1 -DBUBBLES -Mdir %t/rowsc/obj %S/Inputs/tb_linkhbm.sv top.sv %t/rowsc/foldsim_sim.sv > %t/rowsc/build.log 2>&1
+# RUN: %t/rowsc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +bubble=30 | FileCheck %s
+# RUN: %t/rowsc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +lo=1 +hi=600 | FileCheck %s
+# RUN: %t/rowsc/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +bubble=50 +stall=50 +lo=1 +hi=600 +full=30 | FileCheck %s
 # A ratio no landing reaches: none in block RAM.
 # RUN: foldsim --srcs top.f --top Top --out %t/none --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --link-kinds Unit:Reader:hbm,Reader:Unit:hbm --link-landing-block 100000 Unit Reader 2>&1 | FileCheck %s --check-prefix=NONE
 # LOG: foldsim-fold-static: link-landing-block: {{[1-9][0-9]*}} landings in block RAM
