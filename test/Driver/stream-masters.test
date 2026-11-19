@@ -20,3 +20,14 @@
 # KVH: `define FOLDSIM_VMEM_STREAM_MASTERS 3
 # KVH: `define FOLDSIM_VMEM_0_MASTER 0
 # KM: 2
+
+# --stream-stripe 2: a controller's rows over 2 masters (row index mod 2, foldsim_vmem_stripe); the model spreads each
+# chunk's bits over them, and the controller lists its 2 masters, the least loaded.
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/s --static --state-in-ram Leaf::4 --state-in-ram-pp --state-scratch-bits 0 --page-engines 4 --page-engines-pp --stream-masters 3 --stream-master-bits 160 --stream-move-bits 256 --stream-stripe 2 Leaf > %t/s.log 2>&1
+# RUN: FileCheck %s --check-prefix=S < %t/s.log
+# RUN: FileCheck %s --check-prefix=SVH < %t/s/foldsim_sim.vh
+# S: state-stream: II_sched 26, HBM state bits a frame 8192 (busiest master 4096), II_bw 26 (3 masters, stripe 2, 480 b/hc usable)
+# S: foldsim: --stream-masters 3: 1 controllers, bits a frame on the busiest master 4096
+# SVH: `define FOLDSIM_VMEM_STREAM_STRIPE 2
+# SVH: `define FOLDSIM_VMEM_0_MASTER 0
+# SVH: `define FOLDSIM_VMEM_0_MASTERS 0, 1

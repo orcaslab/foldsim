@@ -533,7 +533,8 @@ def frame_options(a):
         fold += f' port-plan-out={os.path.abspath(a.port_plan_out)}'
     if getattr(a, 'pp_beat_bits', 0):
         fold += f' pp-beat-bits={a.pp_beat_bits}'
-    for opt in ('stream_masters', 'stream_master_bits', 'stream_move_bits', 'pp_chunk_min_columns'):
+    for opt in ('stream_masters', 'stream_master_bits', 'stream_move_bits', 'pp_chunk_min_columns', 'stream_stripe',
+                'pp_chunk_columns'):
         if getattr(a, opt, 0):
             fold += f" {opt.replace('_', '-')}={getattr(a, opt)}"
     if getattr(a, 'link_hbm_beat_bits', 0):
@@ -2296,7 +2297,7 @@ def page_engine_slr(sched, pairs):
     return engines
 
 
-def stream_master_of(info, sched, k, move_bits=32):
+def stream_master_of(info, sched, k, move_bits=32, stripe=1):
     """--stream-masters K: each controller's master (info's vmem_groups, else vmem: `master`), the heaviest first
     on the least loaded master (longest processing time). A controller's weight is its bits a frame: a page engine
     (class `__pages<e>`), the schedule's `page engine traffic <e>: reads R writes W` times its row (at least
@@ -2306,11 +2307,16 @@ def stream_master_of(info, sched, k, move_bits=32):
     ctrls = info.get('vmem_groups') or info['vmem']
     weight = [max(8 * c['row_bytes'], move_bits) * traffic.get(c['class'], 1) for c in ctrls]
     load = [0] * k
+    s = max(1, min(stripe, k))
     for i in sorted(range(len(ctrls)), key=lambda i: -weight[i]):
-        j = min(range(k), key=lambda j: (load[j], j))
-        ctrls[i]['master'] = j
-        load[j] += weight[i]
-    info['stream_masters'] = {'k': k, 'bits': load}
+        # (--stream-stripe S: the S least loaded masters, the controller's bits split over them.)
+        js = sorted(range(k), key=lambda j: (load[j], j))[:s]
+        ctrls[i]['master'] = js[0]
+        if s > 1:
+            ctrls[i]['masters'] = js
+        for j in js:
+            load[j] += -(-weight[i] // s)
+    info['stream_masters'] = {'k': k, 'stripe': s, 'bits': load}
     print(f'foldsim: --stream-masters {k}: {len(ctrls)} controllers, bits a frame on the busiest master '
           f'{max(load)} (mean {sum(load) // k})', file=sys.stderr)
 
@@ -2797,6 +2803,13 @@ def build_parser():
     ap.add_argument('--stream-move-bits', type=int, default=0, metavar='B',
                     help='the fewest bits a row transfer moves on a master, its beat (foldsim-fold-static '
                          'stream-move-bits; 0: its default, 32)')
+    ap.add_argument('--stream-stripe', type=int, default=0, metavar='S',
+                    help="with --stream-masters: each controller's rows interleaved over S masters by row index "
+                         '(foldsim-fold-static stream-stripe; the kernel binds the controller through '
+                         'foldsim_vmem_stripe): foldsim_sim.json `masters` of each controller')
+    ap.add_argument('--pp-chunk-columns', type=int, default=0, metavar='N',
+                    help="a streamed PP class's row chunks: at most N 72-bit columns each (foldsim-fold-static "
+                         'pp-chunk-columns; 0: its default, 56)')
     ap.add_argument('--pp-chunk-min-columns', type=int, default=0, metavar='N',
                     help="a spread PP class's chunks: at least N 72-bit columns each (foldsim-fold-static "
                          'pp-chunk-min-columns; 0: its default, 7)')
@@ -4061,7 +4074,8 @@ def main():
             info['vmem_slr_names'] = [s_['name'] for s_ in json.load(open(region)).get('slrs', [])]
     if getattr(a, 'stream_masters', 0) and info.get('vmem'):
         sched = open(out('schedule.txt')).read() if os.path.exists(out('schedule.txt')) else ''
-        stream_master_of(info, sched, a.stream_masters, getattr(a, 'stream_move_bits', 0) or 32)
+        stream_master_of(info, sched, a.stream_masters, getattr(a, 'stream_move_bits', 0) or 32,
+                         getattr(a, 'stream_stripe', 0) or 1)
     with open(out('foldsim_sim.json'), 'w') as f:
         json.dump(info, f, indent=1)
     # The kernel's view of it: how many classes report their finishes, bit c
@@ -4143,8 +4157,11 @@ def main():
             if 'master' in ctrls[0]:
                 key = 'G' if 'vmem_groups' in info else ''
                 f.write(f'`define FOLDSIM_VMEM_STREAM_MASTERS {info["stream_masters"]["k"]}\n')
+                f.write(f'`define FOLDSIM_VMEM_STREAM_STRIPE {info["stream_masters"].get("stripe", 1)}\n')
                 for k, c in enumerate(ctrls):
                     f.write(f'`define FOLDSIM_VMEM_{key}{k}_MASTER {c["master"]}\n')
+                    if 'masters' in c:
+                        f.write(f'`define FOLDSIM_VMEM_{key}{k}_MASTERS ' + ', '.join(str(j) for j in c['masters']) + '\n')
             if 'slr_group' in ctrls[0]:
                 key = 'G' if 'vmem_groups' in info else ''
                 for k, c in enumerate(ctrls):

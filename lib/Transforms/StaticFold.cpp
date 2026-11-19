@@ -15037,6 +15037,8 @@ static unsigned gStreamMasterBits = 1024;
 static unsigned gStreamMoveBits = 32;
 /// `pp-chunk-min-columns`: a spread chunk's fewest columns.
 static unsigned gPpChunkMinColumns = 7;
+/// `stream-stripe`: each controller's rows over this many masters.
+static unsigned gStreamStripe = 1;
 static uint64_t streamBitsPerCycle() {
   return uint64_t(gStreamMasters) * gStreamMasterBits;
 }
@@ -15983,18 +15985,20 @@ LogicalResult StaticFolder::chooseStreamWindows() {
     // needs them).
     SmallVector<bool> spreadOf(chunkBits.size(), false);
     auto mastersOf = [&](ArrayRef<bool> choice, uint64_t &total) {
+      // (stream-stripe S: a controller's bits over S masters in turn.)
       SmallVector<uint64_t> m(gStreamMasters, 0);
       unsigned next = 0;
       total = 0;
-      for (auto [x, cb] : llvm::enumerate(chunkBits))
-        for (uint64_t c : choice[x] ? cb.spread : cb.few) {
-          m[next++ % gStreamMasters] += c;
-          total += c;
-        }
-      for (uint64_t c : foldChunks) {
-        m[next++ % gStreamMasters] += c;
+      auto put = [&](uint64_t c) {
+        for (unsigned j = 0; j < gStreamStripe; ++j)
+          m[next++ % gStreamMasters] += llvm::divideCeil(c, gStreamStripe);
         total += c;
-      }
+      };
+      for (auto [x, cb] : llvm::enumerate(chunkBits))
+        for (uint64_t c : choice[x] ? cb.spread : cb.few)
+          put(c);
+      for (uint64_t c : foldChunks)
+        put(c);
       return m;
     };
     uint64_t total = 0;
@@ -16033,7 +16037,9 @@ LogicalResult StaticFolder::chooseStreamWindows() {
     llvm::errs() << "foldsim-fold-static: state-stream: II_sched " << ii
                  << ", HBM state bits a frame " << hbmBits
                  << " (busiest master " << busiest << "), II_bw " << bw << " ("
-                 << gStreamMasters << " masters, " << streamBitsPerCycle()
+                 << gStreamMasters << " masters, "
+                 << (gStreamStripe > 1 ? "stripe " + std::to_string(gStreamStripe) + ", " : std::string())
+                 << streamBitsPerCycle()
                  << " b/hc usable): II " << std::max<uint64_t>(ii, bw) << "\n";
   }
   return success();
@@ -31006,6 +31012,7 @@ void FoldStaticPass::runOnOperation() {
   gStreamMasterBits = std::max(1u, unsigned(streamMasterBits));
   gStreamMoveBits = std::max(8u, unsigned(streamMoveBits));
   gPpChunkMinColumns = std::max(1u, unsigned(ppChunkMinColumns));
+  gStreamStripe = std::max(1u, std::min(unsigned(streamStripe), gStreamMasters));
   gSlotColumnAffine = slotColumnAffine;
   gSlotTableCompose = slotTableCompose;
   gSlotAhead = slotAhead;

@@ -962,6 +962,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
     Option<"streamMoveBits", "stream-move-bits", "unsigned", "32",
            "The fewest bits one row transfer moves on a master (its beat: "
            "256 for a 256-bit direct port), for the bandwidth model">,
+    Option<"streamStripe", "stream-stripe", "unsigned", "1",
+           "Each controller's rows interleaved over this many of the "
+           "stream-masters by their index (row x instances + instance, mod S: "
+           "the kernel's address interleave, foldsim_vmem_stripe), so that a "
+           "controller moves S masters' bits a host cycle; the bandwidth "
+           "model spreads each chunk's bits over S masters">,
     Option<"ppChunkMinColumns", "pp-chunk-min-columns", "unsigned", "7",
            "A spread PP class's chunks: at least this many 72-bit columns "
            "each (7: a 512-bit beat), so at most ceil(columns / this) chunks, "
