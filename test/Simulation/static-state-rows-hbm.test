@@ -58,6 +58,13 @@
 # RUN: cd %S/../Driver/Inputs/paged16 && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/bt -Mdir %t/bt/obj %S/Inputs/tb_pages.sv top.sv %t/bt/foldsim_sim.sv > %t/bt/build.log 2>&1
 # RUN: %t/bt/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
 # RUN: %t/bt/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=90 +stall=30 +full=30 | FileCheck %s
+# --pp-dirty-writeback with beats: a beat's byte enables its changed bytes, no write for a beat with none.
+# RUN: cd %S/../Driver/Inputs/paged16 && env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/btd --static --nest --modulo --state-in-ram Leaf::4 --state-scratch-bits 4000 --state-in-ram-pp --page-engines 4 --page-engines-pp --pp-beat-bits 144 --pp-dirty-writeback Leaf > %t/btd.log 2>&1
+# RUN: FileCheck %s --check-prefix=BTD < %t/btd/foldsim_sim.mlir
+# RUN: cd %S/../Driver/Inputs/paged16 && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/btd -Mdir %t/btd/obj %S/Inputs/tb_pages.sv top.sv %t/btd/foldsim_sim.sv > %t/btd/build.log 2>&1
+# RUN: %t/btd/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
+# RUN: %t/btd/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=90 +stall=30 +full=30 | FileCheck %s
+# BTD: _dr_valid_dirty
 # RUN: cd %S/../Driver/Inputs/paged16 && env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/btb --static --nest --modulo --bubbles --state-in-ram Leaf::4 --state-scratch-bits 4000 --state-in-ram-pp --page-engines 4 --page-engines-pp --pp-beat-bits 144 Leaf > %t/btb.log 2>&1
 # RUN: cd %S/../Driver/Inputs/paged16 && %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/btb -DBUBBLES -Mdir %t/btb/obj %S/Inputs/tb_pages.sv top.sv %t/btb/foldsim_sim.sv > %t/btb/build.log 2>&1
 # RUN: %t/btb/obj/Vtb +verilator+rand+reset+0 +verilator+seed+7 +lo=1 +hi=80 +bubble=50 +stall=30 +full=30 | FileCheck %s

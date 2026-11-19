@@ -16614,6 +16614,13 @@ LogicalResult StaticFolder::buildPPStream(
                    : zeroRegD(hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, maskBeats), dbeat1),
                               prefix + "_wr_mask");
       wv = dvalidQ;
+      if (ppDirtyWriteback && !wholeRows) {
+        // (pp-dirty-writeback, beats: a beat none of whose bytes changed
+        // sends no write; its drain position stays idle.)
+        Value beatMask = hw::ArrayGetOp::create(b, hw::ArrayCreateOp::create(b, maskBeats), dbeat1);
+        Value any = comb::ICmpOp::create(b, comb::ICmpPredicate::ne, beatMask, constant(dw / 8, 0));
+        wv = resetReg(comb::AndOp::create(b, dvalid1, any), prefix + "_dr_valid_dirty");
+      }
       wi = dinstQ;
     }
     vm.idleZero = true;
