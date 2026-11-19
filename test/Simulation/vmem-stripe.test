@@ -1,0 +1,16 @@
+# REQUIRES: verilator
+# foldsim_vmem_stripe (foldsim --stream-stripe S): one controller's rows interleaved over S masters, each master's rows
+# packed at its own base, the answers back in request order whatever order the masters give them; W after its AW, B in
+# order. Against S slave models with random ready and latency (Inputs/tb_vmem_stripe.sv), S = 1, 2, 4, 8.
+# RUN: rm -rf %t && mkdir -p %t
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION -DS=2 --x-initial unique --top-module tb -Mdir %t/s2 %S/Inputs/tb_vmem_stripe.sv %S/../../shell/rtl/foldsim_vmem_stripe.sv > %t/s2.log 2>&1
+# RUN: %t/s2/Vtb +verilator+rand+reset+2 +seed=1 | FileCheck %s
+# RUN: %t/s2/Vtb +verilator+rand+reset+2 +seed=2 +stall=60 +lat=200 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION -DS=4 --x-initial unique --top-module tb -Mdir %t/s4 %S/Inputs/tb_vmem_stripe.sv %S/../../shell/rtl/foldsim_vmem_stripe.sv > %t/s4.log 2>&1
+# RUN: %t/s4/Vtb +verilator+rand+reset+2 +seed=3 | FileCheck %s
+# RUN: %t/s4/Vtb +verilator+rand+reset+2 +seed=4 +stall=60 +lat=200 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION -DS=8 --x-initial unique --top-module tb -Mdir %t/s8 %S/Inputs/tb_vmem_stripe.sv %S/../../shell/rtl/foldsim_vmem_stripe.sv > %t/s8.log 2>&1
+# RUN: %t/s8/Vtb +verilator+rand+reset+2 +seed=5 +stall=40 +lat=100 | FileCheck %s
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint -DSIMULATION -DS=1 --x-initial unique --top-module tb -Mdir %t/s1 %S/Inputs/tb_vmem_stripe.sv %S/../../shell/rtl/foldsim_vmem_stripe.sv > %t/s1.log 2>&1
+# RUN: %t/s1/Vtb +verilator+rand+reset+2 +seed=6 +stall=40 | FileCheck %s
+# CHECK: PASS: S
