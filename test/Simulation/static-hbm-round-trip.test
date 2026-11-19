@@ -1,0 +1,23 @@
+# REQUIRES: verilator
+# hbm-round-trip (foldsim-fold-static): every off-chip read issued a whole HBM round trip ahead of its use. Here the
+# streamed state rows of a state-in-ram-pp class under a fixed scratch (Driver/Inputs/fixedscratch top128: 64 of 128
+# instances stream from HBM, II 1,158). The built-in lead (64 positions) leaves the frame waiting for a 100-cycle round
+# trip; with hbm-round-trip 100 the landing window grows from 4 to 8 slots (the spacing of the streamed instances, not
+# their count) and the frame no longer waits: H = II at a 100-cycle latency, exact as before.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/fixedscratch
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top128.f --top Top --out %t/b --static --state-in-ram Leaf::8 --state-in-ram-pp --storage Leaf:sir=block --state-scratch-bits 40000 --state-scratch-fixed Leaf > %t/b.log 2>&1
+# RUN: FileCheck %s --check-prefix=BASE < %t/b.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/b -Mdir %t/b/obj %S/Inputs/tb_pages.sv leaf.sv top128.sv %t/b/foldsim_sim.sv > %t/b/build.log 2>&1
+# RUN: %t/b/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=100 | FileCheck %s --check-prefix=SLOW
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top128.f --top Top --out %t/r --static --state-in-ram Leaf::8 --state-in-ram-pp --storage Leaf:sir=block --state-scratch-bits 40000 --state-scratch-fixed --hbm-round-trip 100 Leaf > %t/r.log 2>&1
+# RUN: FileCheck %s --check-prefix=RT < %t/r.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/r -Mdir %t/r/obj %S/Inputs/tb_pages.sv leaf.sv top128.sv %t/r/foldsim_sim.sv > %t/r/build.log 2>&1
+# RUN: %t/r/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=100 | FileCheck %s --check-prefix=FAST
+# RUN: %t/r/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=120 +stall=20 +full=20 | FileCheck %s --check-prefix=EXACT
+
+# BASE: state-stream: Leaf: P 8, 64 of 128 instances streamed, a window of 4 slots
+# SLOW: {{^}}MATCH 196 cycles in 388351 host cycles, H 1941.76
+# RT: state-stream: Leaf: P 8, 64 of 128 instances streamed, a window of 8 slots
+# FAST: {{^}}MATCH 196 cycles in 231600 host cycles, H 1158.00
+# EXACT: {{^}}MATCH 196 cycles
+# EXACT-NOT: PROTOCOL
