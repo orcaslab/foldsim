@@ -890,14 +890,19 @@ module foldsim_vmem #(
     wire          rq_issue = (rq_count != 0) & ~rq_dep[rq_head] & id_avail
                            & (~m_arvalid | m_arready) & ~reset;
 
-    reg [IT-1:0]  tbl_inst  [OUTSTANDING];
-    reg [SLW-1:0] tbl_off   [OUTSTANDING];
-    reg           tbl_ub    [OUTSTANDING];
-    reg [QW-1:0]  tbl_ubslot [OUTSTANDING];
-    reg           tbl_pin   [OUTSTANDING];
-    reg           tbl_fill  [OUTSTANDING];
-    reg [LW-1:0]  tbl_lin   [OUTSTANDING];
-    reg [PW-1:0]  tbl_pinid [OUTSTANDING];
+    // The reads in flight, by tag: one memory of OUTSTANDING entries, written
+    // at a read's issue (its tag, id_next) and read at its answer (rc_tag),
+    // one write port and one asynchronous read, in an always block of its
+    // own, so that every tool maps it as a memory (distributed RAM), at any
+    // OUTSTANDING (foldsim --hbm-round-trip sizes it from the round trip).
+    localparam TBLW = IT + SLW + 1 + QW + 1 + 1 + LW + PW;
+    reg [TBLW-1:0] tbl [OUTSTANDING];
+    wire [TBLW-1:0] tbl_in = {rq_inst[rq_head], SLW'(rq_addr[rq_head] >> RB), rq_ub[rq_head],
+                              rq_ubslot[rq_head], rq_pin[rq_head], rq_fill[rq_head], rq_lin[rq_head],
+                              rq_pinid[rq_head]};
+    always @(posedge clk)
+        if (rq_issue)
+            tbl[id_next] <= tbl_in;
 
     always @(posedge clk) begin
         if (rq_push) begin
@@ -932,14 +937,6 @@ module foldsim_vmem #(
             // A row of a shared line: the line is read, the row's place kept.
             m_araddr            <= (SUB != 0) ? {rq_addr[rq_head][63:6], 6'd0} : rq_addr[rq_head];
             m_arid              <= AXI_ID_W'(ar_rr);
-            tbl_off[id_next]    <= SLW'(rq_addr[rq_head] >> RB);
-            tbl_inst[id_next]   <= rq_inst[rq_head];
-            tbl_ub[id_next]     <= rq_ub[rq_head];
-            tbl_ubslot[id_next] <= rq_ubslot[rq_head];
-            tbl_pin[id_next]    <= rq_pin[rq_head];
-            tbl_fill[id_next]   <= rq_fill[rq_head];
-            tbl_lin[id_next]    <= rq_lin[rq_head];
-            tbl_pinid[id_next]  <= rq_pinid[rq_head];
         end
         if (rq_issue)
             m_arvalid <= 1'b1;
@@ -955,6 +952,18 @@ module foldsim_vmem #(
     // found as the beat is taken (the oldest moves on if this cycle's beat
     // ends that id's burst), so the tables are read from a register.
     reg [OW-1:0]  rc_tag;
+    // (The read's entry of the tag table, at its answer.)
+    wire [TBLW-1:0] tbl_rd = tbl[rc_tag];
+    wire [IT-1:0]  tbl_rc_inst;
+    wire [SLW-1:0] tbl_rc_off;
+    wire           tbl_rc_ub;
+    wire [QW-1:0]  tbl_rc_ubslot;
+    wire           tbl_rc_pin;
+    wire           tbl_rc_fill;
+    wire [LW-1:0]  tbl_rc_lin;
+    wire [PW-1:0]  tbl_rc_pinid;
+    assign {tbl_rc_inst, tbl_rc_off, tbl_rc_ub, tbl_rc_ubslot, tbl_rc_pin, tbl_rc_fill, tbl_rc_lin,
+            tbl_rc_pinid} = tbl_rd;
     wire [IDW-1:0] r_inid = IDW'(m_rid);
     reg [511:0]   rc_data;
     /* verilator lint_off UNUSEDSIGNAL */
@@ -998,11 +1007,11 @@ module foldsim_vmem #(
         end
     end
     if (SUB != 0) begin : g_sub_r
-        wire [SLW-1:0] off = tbl_off[rc_tag];
+        wire [SLW-1:0] off = tbl_rc_off;
         assign rc_row = 512'(rc_data[32'(off) * (ROW_BYTES * 8) +: ROW_BYTES * 8]);
     end else begin : g_line_r
         /* verilator lint_off UNUSEDSIGNAL */
-        wire unused = |tbl_off[rc_tag];
+        wire unused = |tbl_rc_off;
         /* verilator lint_on UNUSEDSIGNAL */
         assign rc_row[(BEATS-1)*512 +: 512] = rc_data;
     end
@@ -1059,7 +1068,7 @@ module foldsim_vmem #(
             default: rsp_row <= (FORWARD != 0) ? wb_data[r_slot] : '0;
             endcase
         end else begin
-            rsp_inst <= tbl_inst[rc_tag];
+            rsp_inst <= tbl_rc_inst;
             rsp_row  <= rc_row[DB-1:0];
         end
     end
@@ -1074,9 +1083,9 @@ module foldsim_vmem #(
         initial v = 1'b0;
 `endif
         always @(posedge clk) begin
-            if (rc_done & tbl_fill[rc_tag] & ~draining & ~reset & ~mv_busy & ~move) begin
+            if (rc_done & tbl_rc_fill & ~draining & ~reset & ~mv_busy & ~move) begin
                 v    <= 1'b1;
-                lin  <= tbl_lin[rc_tag];
+                lin  <= tbl_rc_lin;
                 data <= rc_row[DB-1:0];
             end else if (reset | move | fill_go | (i_wr & (i_wlin == lin))) begin
                 v    <= 1'b0;
@@ -1087,7 +1096,7 @@ module foldsim_vmem #(
         assign fl_data = data;
     end else begin : g_no_fill
         /* verilator lint_off UNUSEDSIGNAL */
-        wire unused = tbl_fill[rc_tag] | (|tbl_lin[rc_tag]);
+        wire unused = tbl_rc_fill | (|tbl_rc_lin);
         /* verilator lint_on UNUSEDSIGNAL */
         assign fl_v    = 1'b0;
         assign fl_lin  = '0;
@@ -1170,8 +1179,8 @@ module foldsim_vmem #(
         // data.
         if (r_local & r_ub)
             wb_blk[r_ubslot] <= 1'b0;
-        if (rc_done & tbl_ub[rc_tag])
-            wb_blk[tbl_ubslot[rc_tag]] <= 1'b0;
+        if (rc_done & tbl_rc_ub)
+            wb_blk[tbl_rc_ubslot] <= 1'b0;
         if (z_alloc)
             wb_blk[wb_tail] <= z_wa & z_blk;
 
@@ -1255,8 +1264,8 @@ module foldsim_vmem #(
     // ---- Pins: a shared line held for its read-first pair's read ----
     // Released when the read has its data (one answer a cycle at most). A
     // reset drops them all: no read from before it answers.
-    wire          pin_rel   = (r_local & r_pin) | (rc_done & tbl_pin[rc_tag]);
-    wire [PW-1:0] pin_relid = r_local ? r_pinid : tbl_pinid[rc_tag];
+    wire          pin_rel   = (r_local & r_pin) | (rc_done & tbl_rc_pin);
+    wire [PW-1:0] pin_relid = r_local ? r_pinid : tbl_rc_pinid;
 
     if (PIN) begin : g_pin
         reg [PINS-1:0] pin_v;
