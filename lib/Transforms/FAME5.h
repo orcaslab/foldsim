@@ -56,6 +56,13 @@ struct ThreadOptions {
   /// nothing from outside feeding them.
   bool localSchedule = false;
   uint64_t scheduleStart = 0;
+  /// With `clock-enable`: the estimated logic levels from which a register-
+  /// only part of a registered read's address or enable is computed a host
+  /// cycle ahead and registered (0: never).
+  unsigned readPortDepth = 0;
+  /// Memories addressed by `x` rather than `~x` where every port takes
+  /// `~x` (or a constant): rows reversed, which no port can tell.
+  bool unreverseAddresses = false;
 };
 /// How a register is written: never (it only holds its value), or with
 /// `data` when `enable` (always, if null).

@@ -2618,6 +2618,8 @@ void ComposePass::runOnOperation() {
                                        idleSlots, pipelineDepth, blockStateDepth,
                                        commitEnable};
   threadOptions.memoryLoads = memoryLoads;
+  threadOptions.readPortDepth = readPortDepth;
+  threadOptions.unreverseAddresses = unreverseAddresses;
   if (channelDepth < 2 || !llvm::isPowerOf2_32(channelDepth)) {
     top.emitError("a channel's depth is a power of two, at least two");
     return signalPassFailure();

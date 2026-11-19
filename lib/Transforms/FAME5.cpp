@@ -153,6 +153,8 @@ public:
         pipelineMultipliers(options.pipelineMultipliers),
         pipelineDepth(options.pipelineDepth),
         memoryLoads(options.memoryLoads),
+        readPortDepth(options.readPortDepth),
+        unreverseAddresses(options.unreverseAddresses),
         compactStaging(options.compactStaging),
         foldPipelines(options.foldPipelines),
         blockStateDepth(options.registeredState ? options.blockStateDepth : 0),
@@ -295,6 +297,11 @@ private:
   unsigned pipelineDepth;
   /// With regions: the loads above which a memory is split by bits, or 0.
   unsigned memoryLoads;
+  /// The levels of a registered read's address or enable above which its
+  /// cone on registers alone is computed a host cycle ahead, or 0.
+  unsigned readPortDepth;
+  /// Whether memories addressed by every port as `~x` are addressed by `x`.
+  bool unreverseAddresses;
   /// With regions: whether staging takes the location of the state it
   /// stages, and a staged write enable has no preset value.
   bool compactStaging;
@@ -368,6 +375,16 @@ private:
   DenseMap<Operation *, unsigned> coneLevelsOf;
   unsigned coneLevels(Value value);
   Value pipelinedCone(ImplicitLocOpBuilder &b, Value value);
+  /// The logic levels of `op` mapped to LUTs, roughly, for `readPortDepth`:
+  /// a carry chain by its width, a comparison or a wide gate by its LUT
+  /// tree, a LUT RAM read by its depth.
+  static unsigned mappedLevelsOf(Operation *op);
+  /// With `readPortDepth`: computes the register-only part of each deep
+  /// registered read's address and enable a host cycle ahead.
+  void pipelineReadPorts(ImplicitLocOpBuilder &b, hw::HWModuleOp threaded);
+  /// With `unreverseAddresses`: addresses the model's memories by `x` where
+  /// each of their ports takes `~x` or a constant.
+  void unreverseMemoryAddresses();
   /// The cone inputs registered for `pipelineMultipliers` and
   /// `pipelineDepth`, and the values computed from them on the second host
   /// cycle, each shared by cones: a value is the same whichever cut computes
@@ -1395,6 +1412,467 @@ Value Threader::pipelinedCone(ImplicitLocOpBuilder &b, Value value) {
       coneLate[result] = late;
   }
   return map.lookup(value);
+}
+
+unsigned Threader::mappedLevelsOf(Operation *op) {
+  auto log = [](uint64_t n, unsigned base) {
+    unsigned levels = 0;
+    for (uint64_t m = 1; m < n; m *= base)
+      ++levels;
+    return levels;
+  };
+  auto width = [](Value value) -> uint64_t {
+    int64_t w = hw::getBitWidth(value.getType());
+    return w > 0 ? w : 1;
+  };
+  if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+    auto depth = cast<seq::FirMemType>(read.getMemory().getType()).getDepth();
+    return 1 + log(llvm::divideCeil(depth, 64), 4);
+  }
+  if (!levelsOf(op))
+    return 0;
+  if (isa<comb::AddOp, comb::SubOp>(op))
+    return 1 + width(op->getResult(0)) / 8;
+  if (auto cmp = dyn_cast<comb::ICmpOp>(op)) {
+    uint64_t w = width(cmp.getLhs());
+    auto predicate = cmp.getPredicate();
+    if (predicate == comb::ICmpPredicate::eq ||
+        predicate == comb::ICmpPredicate::ne ||
+        predicate == comb::ICmpPredicate::ceq ||
+        predicate == comb::ICmpPredicate::cne ||
+        predicate == comb::ICmpPredicate::weq ||
+        predicate == comb::ICmpPredicate::wne)
+      return 1 + log(llvm::divideCeil(w, 3), 6);
+    return 1 + w / 8;
+  }
+  if (isa<comb::AndOp, comb::OrOp, comb::XorOp>(op))
+    return std::max(1u, log(op->getNumOperands(), 6));
+  return levelsOf(op);
+}
+
+/// A registered read of a memory takes its address and enable on the host
+/// clock's edge that ends the host cycle computing them. The part of their
+/// cone that depends on registers (and constants) alone can be computed a
+/// host cycle earlier, from those registers' next values -- with registered
+/// state, the next thread's state as it is read ahead -- and registered: the
+/// register holds on every host cycle what the cone computes on it, so the
+/// port sees the same values on the same host cycles, and its own host cycle
+/// computes only the rest, from the registers and the other values the cone
+/// reads (ports, memory reads). What is computed ahead: from the port down,
+/// the first values on registers alone at least `readPortDepth` estimated
+/// levels deep and wider than a LUT's inputs -- registering a narrower value
+/// would hide its few inputs from the logic that reads it, which merges such
+/// values (decodes of one state, say) into its own LUTs. A register's next
+/// value includes its synchronous reset; a register with an asynchronous
+/// reset or on another clock is not computed ahead; a value registered ahead
+/// starts from the preset its cone computes from its registers' presets, and
+/// is not computed ahead where those presets do not fold.
+void Threader::pipelineReadPorts(ImplicitLocOpBuilder &b,
+                                 hw::HWModuleOp threaded) {
+  auto *body = threaded.getBodyBlock();
+  b.setInsertionPoint(body->getTerminator());
+  auto latencyOf = [](seq::FirMemReadOp read) -> std::optional<unsigned> {
+    if (auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>())
+      return memory.getReadLatency();
+    return std::nullopt;
+  };
+  // The cone: combinational logic, and LUT RAM reads (a read of latency 0)
+  // as logic on their address and enable that is never computed ahead.
+  auto isConeOp = [&](Operation *op) {
+    if (auto read = dyn_cast_or_null<seq::FirMemReadOp>(op))
+      return latencyOf(read) == 0u;
+    return inCone(op);
+  };
+  auto coneOperands = [&](Operation *op) {
+    SmallVector<Value> operands;
+    if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+      operands.push_back(read.getAddress());
+      if (read.getEnable())
+        operands.push_back(read.getEnable());
+    } else {
+      operands.append(op->operand_begin(), op->operand_end());
+    }
+    return operands;
+  };
+  // Post-order over a cone, each value once: `visit` runs on a value whose
+  // cone operands were all visited before, unless `leaf` says the cone stops
+  // at it.
+  auto postOrder = [&](Value root, auto &&seen, auto &&visit,
+                       auto &&leaf) {
+    SmallVector<std::pair<Value, bool>> stack = {{root, false}};
+    while (!stack.empty()) {
+      auto [value, expanded] = stack.pop_back_val();
+      if (seen(value))
+        continue;
+      auto *op = value.getDefiningOp();
+      if (!expanded && isConeOp(op) && !leaf(value)) {
+        stack.push_back({value, true});
+        for (auto operand : coneOperands(op))
+          if (!seen(operand))
+            stack.push_back({operand, false});
+        continue;
+      }
+      visit(value);
+    }
+  };
+  // Whether a value is a function of at most a LUT's inputs (6 bits of
+  // registers, ports or other leaves): such a value is one level, and is
+  // never computed ahead -- a register of it would hide its few inputs from
+  // the logic that reads it, which merges such values (decodes of one
+  // state, say) into its own LUTs.
+  constexpr unsigned lutInputs = 6;
+  struct Support {
+    SmallVector<Value, 4> leaves;
+    bool wide = false;
+  };
+  DenseMap<Value, Support> supports;
+  std::function<const Support &(Value)> supportOf =
+      [&](Value v) -> const Support & {
+    if (auto it = supports.find(v); it != supports.end())
+      return it->second;
+    Support support;
+    auto *op = v.getDefiningOp();
+    auto bitsOf = [](const Support &s) {
+      uint64_t bits = 0;
+      for (auto leaf : s.leaves)
+        bits += std::max<int64_t>(hw::getBitWidth(leaf.getType()), 1);
+      return bits;
+    };
+    if (isa_and_nonnull<hw::ConstantOp>(op)) {
+    } else if (op && inCone(op)) {
+      for (auto operand : op->getOperands()) {
+        const Support &s = supportOf(operand);
+        if (s.wide) {
+          support.wide = true;
+          break;
+        }
+        for (auto leaf : s.leaves)
+          if (!llvm::is_contained(support.leaves, leaf))
+            support.leaves.push_back(leaf);
+        if (bitsOf(support) > lutInputs) {
+          support.wide = true;
+          break;
+        }
+      }
+    } else {
+      support.leaves.push_back(v);
+      support.wide = bitsOf(support) > lutInputs;
+    }
+    if (support.wide)
+      support.leaves.clear();
+    return supports[v] = std::move(support);
+  };
+  auto isNarrow = [&](Value v) { return !supportOf(v).wide; };
+  // Levels from the cone's leaves (registers, ports, other ops).
+  DenseMap<Value, unsigned> levels;
+  auto levelsOfValue = [&](Value root) {
+    postOrder(
+        root, [&](Value v) { return levels.count(v); },
+        [&](Value v) {
+          auto *op = v.getDefiningOp();
+          unsigned l = 0;
+          if (isConeOp(op)) {
+            for (auto operand : coneOperands(op))
+              l = std::max(l, levels.lookup(operand));
+            l += mappedLevelsOf(op);
+            if (l > 1 && isa<comb::CombDialect>(op->getDialect()) &&
+                isNarrow(v))
+              l = 1;
+          }
+          levels[v] = l;
+        },
+        [](Value) { return false; });
+    return levels.lookup(root);
+  };
+  // Whether a value depends on registers of the host clock and constants
+  // alone.
+  DenseMap<Value, bool> early;
+  auto isEarly = [&](Value root) {
+    postOrder(
+        root, [&](Value v) { return early.count(v); },
+        [&](Value v) {
+          auto *op = v.getDefiningOp();
+          bool e = false;
+          if (auto reg = dyn_cast_or_null<seq::FirRegOp>(op))
+            e = reg.getClk() == hostClock && !reg.getIsAsync();
+          else if (isa_and_nonnull<seq::FirMemReadOp>(op))
+            e = false;
+          else if (isConeOp(op))
+            e = llvm::all_of(op->getOperands(),
+                             [&](Value o) { return early.lookup(o); });
+          early[v] = e;
+        },
+        [](Value) { return false; });
+    return early.lookup(root);
+  };
+  // A register's next value, its synchronous reset included.
+  DenseMap<Value, Value> nextOf;
+  auto nextValue = [&](seq::FirRegOp reg) -> Value {
+    auto &next = nextOf[reg];
+    if (!next) {
+      next = reg.getNext();
+      if (reg.getReset())
+        next = comb::MuxOp::create(b, reg.getReset(), reg.getResetValue(),
+                                   next);
+    }
+    return next;
+  };
+  // The levels of an early value computed a host cycle ahead: from its
+  // registers' next values.
+  DenseMap<Value, unsigned> aheadLevels;
+  std::function<unsigned(Value)> levelsAhead = [&](Value v) -> unsigned {
+    if (auto it = aheadLevels.find(v); it != aheadLevels.end())
+      return it->second;
+    unsigned l = 0;
+    auto *op = v.getDefiningOp();
+    if (auto reg = dyn_cast_or_null<seq::FirRegOp>(op)) {
+      l = levelsOfValue(reg.getNext()) + (reg.getReset() ? 1 : 0);
+    } else if (isConeOp(op)) {
+      for (auto operand : op->getOperands())
+        l = std::max(l, levelsAhead(operand));
+      l += mappedLevelsOf(op);
+    }
+    return aheadLevels[v] = l;
+  };
+  // A value's preset from its registers' presets, if they fold; null if
+  // they do not, or if no register of its cone has one.
+  DenseMap<Value, Attribute> presets;
+  DenseMap<Value, bool> presetted;
+  std::function<bool(Value)> hasPreset = [&](Value v) -> bool {
+    if (auto it = presetted.find(v); it != presetted.end())
+      return it->second;
+    bool p = false;
+    auto *op = v.getDefiningOp();
+    if (auto reg = dyn_cast_or_null<seq::FirRegOp>(op))
+      p = reg.hasPresetValue();
+    else if (isConeOp(op) && !isa<hw::ConstantOp>(op))
+      p = llvm::any_of(op->getOperands(), hasPreset);
+    return presetted[v] = p;
+  };
+  std::function<Attribute(Value)> presetOf = [&](Value v) -> Attribute {
+    if (auto it = presets.find(v); it != presets.end())
+      return it->second;
+    Attribute preset;
+    auto *op = v.getDefiningOp();
+    if (auto reg = dyn_cast_or_null<seq::FirRegOp>(op)) {
+      auto type = dyn_cast<IntegerType>(v.getType());
+      if (auto attr = reg.getPresetAttr(); attr && type)
+        preset = IntegerAttr::get(
+            type, cast<IntegerAttr>(attr).getValue().zextOrTrunc(
+                      type.getWidth()));
+    } else if (auto constant = dyn_cast_or_null<hw::ConstantOp>(op)) {
+      preset = constant.getValueAttr();
+    } else if (op && isConeOp(op) && op->getNumResults() == 1) {
+      SmallVector<Attribute> operands;
+      for (auto operand : op->getOperands())
+        operands.push_back(presetOf(operand));
+      SmallVector<OpFoldResult> results;
+      if (llvm::all_of(operands, [](Attribute a) { return !!a; }) &&
+          succeeded(op->fold(operands, results)) && results.size() == 1) {
+        if (auto attr = dyn_cast<Attribute>(results[0]))
+          preset = attr;
+        else
+          for (auto [operand, attr] :
+               llvm::zip(op->getOperands(), operands))
+            if (operand == cast<Value>(results[0]))
+              preset = attr;
+      }
+    }
+    return presets[v] = preset;
+  };
+
+  DenseMap<Value, Value> aheadClone, aheadReg;
+  std::function<Value(Value)> cloneAhead = [&](Value v) -> Value {
+    if (auto it = aheadClone.find(v); it != aheadClone.end())
+      return it->second;
+    Value result;
+    auto *op = v.getDefiningOp();
+    if (auto reg = dyn_cast_or_null<seq::FirRegOp>(op)) {
+      result = nextValue(reg);
+    } else if (isa<hw::ConstantOp>(op)) {
+      result = v;
+    } else {
+      IRMapping map;
+      for (auto operand : op->getOperands())
+        map.map(operand, cloneAhead(operand));
+      result = b.clone(*op, map)->getResult(cast<OpResult>(v).getResultNumber());
+    }
+    return aheadClone[v] = result;
+  };
+  auto registerAhead = [&](Value v, StringRef memoryName) -> Value {
+    auto &reg = aheadReg[v];
+    if (!reg) {
+      Attribute preset = hasPreset(v) ? presetOf(v) : Attribute();
+      reg = seq::FirRegOp::create(b, cloneAhead(v), hostClock,
+                                  b.getStringAttr(memoryName + "_ahead"),
+                                  hw::InnerSymAttr{}, preset);
+    }
+    return reg;
+  };
+  // The cone above the values computed ahead, cloned on their registers; a
+  // LUT RAM read keeps its port, its address and enable set in place to the
+  // same values.
+  DenseSet<Value> cut;
+  DenseMap<Value, Value> lateClone;
+  std::function<Value(Value, StringRef)> cloneLate =
+      [&](Value v, StringRef memoryName) -> Value {
+    if (cut.contains(v))
+      return registerAhead(v, memoryName);
+    auto *op = v.getDefiningOp();
+    if (!isConeOp(op))
+      return v;
+    if (auto it = lateClone.find(v); it != lateClone.end())
+      return it->second;
+    Value result = v;
+    if (auto read = dyn_cast<seq::FirMemReadOp>(op)) {
+      Value address = cloneLate(read.getAddress(), memoryName);
+      if (address != read.getAddress())
+        read.getAddressMutable().assign(address);
+      if (auto enable = read.getEnable()) {
+        Value e = cloneLate(enable, memoryName);
+        if (e != enable)
+          read.getEnableMutable().assign(e);
+      }
+    } else {
+      IRMapping map;
+      bool changed = false;
+      for (auto operand : op->getOperands()) {
+        Value mapped = cloneLate(operand, memoryName);
+        changed |= mapped != operand;
+        map.map(operand, mapped);
+      }
+      if (changed)
+        result = b.clone(*op, map)->getResult(
+            cast<OpResult>(v).getResultNumber());
+    }
+    return lateClone[v] = result;
+  };
+
+  SmallVector<seq::FirMemReadOp> ports;
+  for (auto read : body->getOps<seq::FirMemReadOp>())
+    if (latencyOf(read).value_or(0) >= 1 && read.getClk() == hostClock)
+      ports.push_back(read);
+  for (auto read : ports) {
+    auto memory = read.getMemory().getDefiningOp<seq::FirMemOp>();
+    std::string memoryName = memory.getName().value_or("mem").str();
+    for (unsigned which = 0; which < 2; ++which) {
+      Value root = which ? read.getEnable() : read.getAddress();
+      if (!root || levelsOfValue(root) < readPortDepth)
+        continue;
+      // The values computed ahead: from the port down, the first values on
+      // registers alone at least `readPortDepth` levels deep, wider than a
+      // LUT's inputs, and whose presets fold where their registers have
+      // them; the cone of any other value is searched on.
+      SmallVector<Value> values;
+      uint64_t bits = 0;
+      unsigned ahead = 0;
+      DenseSet<Value> seen;
+      SmallVector<Value> stack = {root};
+      while (!stack.empty()) {
+        Value v = stack.pop_back_val();
+        auto *op = v.getDefiningOp();
+        if (!seen.insert(v).second || !isConeOp(op))
+          continue;
+        bool early = isEarly(v);
+        if (early && levelsOfValue(v) < readPortDepth)
+          continue;
+        if (early && !isNarrow(v) && (!hasPreset(v) || presetOf(v))) {
+          if (cut.insert(v).second || !llvm::is_contained(values, v)) {
+            values.push_back(v);
+            bits += std::max<int64_t>(hw::getBitWidth(v.getType()), 1);
+            ahead = std::max(ahead, levelsAhead(v));
+          }
+          continue;
+        }
+        for (auto operand : coneOperands(op))
+          stack.push_back(operand);
+      }
+      if (values.empty())
+        continue;
+      Value pipelined =
+          cloneLate(root, memoryName + (which ? "_re" : "_ra"));
+      if (which)
+        read.getEnableMutable().assign(pipelined);
+      else
+        read.getAddressMutable().assign(pipelined);
+      read.emitRemark() << "read-port-depth: " << memoryName
+                        << (which ? " enable" : " address") << " of "
+                        << levelsOfValue(root) << " estimated levels: "
+                        << values.size() << " values (" << bits
+                        << " bits) computed a host cycle ahead, at most "
+                        << ahead << " levels from the registers' next values";
+    }
+  }
+}
+
+/// An array declared [0:N-1] imports with its rows reversed: each port of its
+/// memory addresses it by `(N-1) - i`, the complement of the index, an adder
+/// on every address path. Where every port of a memory takes a complement
+/// (`all ones - x` or `x ^ all ones`) or a constant, each takes `x` (the
+/// constant's complement) instead: the same accesses to the same rows, but
+/// rows reversed, which no port can tell, the memory having no initial
+/// contents (`checkModel`).
+void Threader::unreverseMemoryAddresses() {
+  auto complementOf = [](Value address) -> std::optional<Value> {
+    auto *op = address.getDefiningOp();
+    auto isOnes = [](Value v) {
+      APInt c;
+      return matchPattern(v, m_ConstantInt(&c)) && c.isAllOnes();
+    };
+    if (auto sub = dyn_cast_or_null<comb::SubOp>(op))
+      if (isOnes(sub.getLhs()))
+        return sub.getRhs();
+    if (auto xorOp = dyn_cast_or_null<comb::XorOp>(op))
+      if (xorOp.getNumOperands() == 2) {
+        if (isOnes(xorOp.getOperand(1)))
+          return xorOp.getOperand(0);
+        if (isOnes(xorOp.getOperand(0)))
+          return xorOp.getOperand(1);
+      }
+    return std::nullopt;
+  };
+  for (auto memory : model.getBodyBlock()->getOps<seq::FirMemOp>()) {
+    SmallVector<OpOperand *> addresses;
+    bool reversed = true, any = false;
+    for (auto &use : memory->getUses()) {
+      auto *user = use.getOwner();
+      Value address;
+      if (auto read = dyn_cast<seq::FirMemReadOp>(user))
+        address = read.getAddress();
+      else if (auto write = dyn_cast<seq::FirMemWriteOp>(user))
+        address = write.getAddress();
+      else {
+        reversed = false;
+        break;
+      }
+      APInt c;
+      if (matchPattern(address, m_ConstantInt(&c))) {
+      } else if (complementOf(address)) {
+        any = true;
+      } else {
+        reversed = false;
+        break;
+      }
+      addresses.push_back(isa<seq::FirMemReadOp>(user)
+                              ? &cast<seq::FirMemReadOp>(user)
+                                     .getAddressMutable()
+                              : &cast<seq::FirMemWriteOp>(user)
+                                     .getAddressMutable());
+    }
+    if (!reversed || !any)
+      continue;
+    OpBuilder b(memory);
+    for (auto *operand : addresses) {
+      Value address = operand->get();
+      APInt c;
+      if (matchPattern(address, m_ConstantInt(&c))) {
+        b.setInsertionPoint(operand->getOwner());
+        operand->set(hw::ConstantOp::create(b, address.getLoc(), ~c));
+      } else {
+        operand->set(*complementOf(address));
+      }
+    }
+  }
 }
 
 void Threader::splitWideMemories(ImplicitLocOpBuilder &b) {
@@ -2486,6 +2964,8 @@ LogicalResult Threader::run() {
     return failure();
   if (failed(checkModel()))
     return failure();
+  if (unreverseAddresses)
+    unreverseMemoryAddresses();
   computeDeps();
   computeStateDeps();
 
@@ -3320,6 +3800,9 @@ LogicalResult Threader::run() {
   }
   unwritten.clear();
 
+  if (readPortDepth)
+    pipelineReadPorts(b, threaded);
+
   // Which output channels fire eagerly is part of the model's timing, which
   // the simulator around it relies on.
   SmallVector<Attribute> eager;
@@ -3430,7 +3913,7 @@ void FAME5Pass::runOnOperation() {
   }
   if ((regionLoads || registeredState || commitSelect || stagedRamWrites ||
        pipelineMultipliers || compactStaging || foldPipelines || idleSlots ||
-       pipelineDepth || memoryLoads) &&
+       pipelineDepth || memoryLoads || readPortDepth || unreverseAddresses) &&
       !clockEnable) {
     model.emitError("regions are for state written with `clock-enable`");
     return signalPassFailure();
@@ -3441,6 +3924,8 @@ void FAME5Pass::runOnOperation() {
                                        compactStaging,      foldPipelines,
                                        idleSlots,           pipelineDepth};
   threadOptions.memoryLoads = memoryLoads;
+  threadOptions.readPortDepth = readPortDepth;
+  threadOptions.unreverseAddresses = unreverseAddresses;
   if (failed(Threader(model, threads, name, gate, slices, channelFields,
                       clockChannel, threadIndex, /*tickFromFirst=*/false,
                       /*readySchedule=*/false,

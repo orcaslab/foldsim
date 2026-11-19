@@ -224,6 +224,13 @@ def Compose : Pass<"foldsim-compose", "::mlir::ModuleOp"> {
     Option<"pipelineDepth", "pipeline-depth", "unsigned", "0",
            "Thread each model with its deep state cones split over two host "
            "cycles, as `foldsim-fame5`'s `pipeline-depth`">,
+    Option<"unreverseAddresses", "unreverse-addresses", "bool", "false",
+           "Thread each model with its memories addressed by their indices "
+           "rather than reversed, as `foldsim-fame5`'s `unreverse-addresses`">,
+    Option<"readPortDepth", "read-port-depth", "unsigned", "0",
+           "Thread each model with its memories' deep registered-read "
+           "addresses and enables computed partly a host cycle ahead, as "
+           "`foldsim-fame5`'s `read-port-depth`">,
     Option<"memoryLoads", "memory-loads", "unsigned", "0",
            "Split a token memory of more than this many loads (bits read and "
            "written, times its depth in 32-entry LUTs) by bits into memories "
@@ -1884,6 +1891,23 @@ def FAME5 : Pass<"foldsim-fame5", "::mlir::ModuleOp"> {
            "more than this many levels if it can and the fewest bits are "
            "registered, and computes the rest on the next host cycle rather "
            "than registering the next value; 0 does not">,
+    Option<"unreverseAddresses", "unreverse-addresses", "bool", "false",
+           "A memory whose every port takes as its address the index's "
+           "complement (its last row minus the index, as an array declared "
+           "[0:N-1] imports) or a constant is addressed by the index (the "
+           "constant's complement) instead: its rows reversed, which no port "
+           "can tell -- a threaded memory has no initial contents -- and no "
+           "subtraction on its address paths">,
+    Option<"readPortDepth", "read-port-depth", "unsigned", "0",
+           "With `clock-enable`: a registered read of a memory takes the "
+           "values on registers alone that its address or enable computes "
+           "-- from the port down, the first at least this many estimated "
+           "logic levels deep and wider than a LUT's inputs -- from registers "
+           "computing them a host cycle ahead, from the registers' next "
+           "values (with registered state, the next thread's state as it is "
+           "read ahead): the port sees the same values on the same host "
+           "cycles, and its own host cycle computes only the rest, from the "
+           "inputs and other values it reads. 0 does not">,
     Option<"memoryLoads", "memory-loads", "unsigned", "0",
            "With `region-loads`: split a memory or thread state of more than "
            "this many loads (bits, times its depth in 32-entry LUTs) by bits "
