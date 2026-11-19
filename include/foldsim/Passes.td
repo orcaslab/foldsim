@@ -1578,6 +1578,11 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "to 4096): a reader's lanes, or a reader group's slice of a "
            "producer's word (the bits several groups read at the same offset "
            "in every slice), so that a reader pass lands one row">,
+    Option<"csfMailboxHbmBudget", "csf-mailbox-hbm-budget", "uint64_t", "0",
+           "With csf-mailbox-hbm: the link bits the device keeps on chip (a "
+           "device constant): offered links stay on chip, smallest first, "
+           "while their banked entries fit; only the rest stream through HBM "
+           "mailboxes. 0: every offered link streams">,
     Option<"csfMailboxHbmLead", "csf-mailbox-hbm-lead", "unsigned", "112",
            "With csf-mailbox-hbm: the most positions a mailbox stream's row "
            "request precedes its landing (the HBM round trip at its worst, "

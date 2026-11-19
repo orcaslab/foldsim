@@ -698,6 +698,8 @@ def frame_options(a):
         fold += f' csf-mailbox-hbm-row-bits={a.csf_mailbox_hbm_row_bits}'
     if getattr(a, 'csf_mailbox_hbm_lead', 0):
         fold += f' csf-mailbox-hbm-lead={a.csf_mailbox_hbm_lead}'
+    if getattr(a, 'csf_mailbox_hbm_budget', 0):
+        fold += f' csf-mailbox-hbm-budget={a.csf_mailbox_hbm_budget}'
     if getattr(a, 'csf_mailboxes', False):
         fold += ' csf-mailboxes'
         if getattr(a, 'csf_mailbox_latency', 1) != 1:
@@ -3091,6 +3093,10 @@ def build_parser():
     ap.add_argument('--csf-mailbox-hbm-lead', type=int, default=0, metavar='N',
                     help='with --csf-mailbox-hbm: the most positions a mailbox stream\'s request precedes its landing '
                          '(foldsim-fold-static csf-mailbox-hbm-lead; 0: its default, 112)')
+    ap.add_argument('--csf-mailbox-hbm-budget', type=int, default=0, metavar='BITS',
+                    help='with --csf-mailbox-hbm: the link bits the device keeps on chip (a device constant): links '
+                         'stay on chip, smallest first, while they fit; only the rest stream through HBM mailboxes '
+                         '(foldsim-fold-static csf-mailbox-hbm-budget; 0: every offered link streams)')
     ap.add_argument('--csf-mailbox-hbm', action='store_true',
                     help='constant-shell fold: reader-indexed link mailboxes in HBM, as HBM link streams of reader '
                          'rows (foldsim-fold-static csf-mailbox-hbm)')

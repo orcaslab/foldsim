@@ -789,6 +789,9 @@ public:
   /// request precedes its landing (the HBM round trip at the worst latency
   /// and a margin; less where the schedule leaves less room).
   unsigned csfMailboxHbmLead = 112;
+  /// `csf-mailbox-hbm-budget`: on-chip link bits before mailboxes stream
+  /// (0: every offered link streams).
+  uint64_t csfMailboxHbmBudget = 0;
   /// `csf-mailbox-hbm-row-bits`: the most bits of a mailbox stream's row (a
   /// reader's lanes, or a reader group's slice of a producer's word): one
   /// landing a reader pass where they fit.
@@ -4860,6 +4863,32 @@ void StaticFolder::layoutMailboxStreams(std::vector<LinkStream> &out,
       byProducer.insert(keyOf(use));
     else
       offered.push_back({&use, std::move(link)});
+  }
+  // `csf-mailbox-hbm-budget`: the link bits the device keeps on chip (its
+  // link window, a device constant): the offered links stay on chip, the
+  // smallest first, while their banked entries fit it; only the rest stream
+  // through HBM mailboxes (resident mode at small counts, streamed past it).
+  if (csfMailboxHbmBudget) {
+    SmallVector<std::pair<uint64_t, size_t>> bits;
+    for (auto [k, o] : llvm::enumerate(offered))
+      bits.push_back({2 * uint64_t(o.first->width) * o.first->rows.size(), k});
+    llvm::sort(bits);
+    uint64_t kept = 0;
+    SmallVector<bool> onChip(offered.size(), false);
+    for (auto [b, k] : bits) {
+      if (kept + b > csfMailboxHbmBudget)
+        break;
+      kept += b;
+      onChip[k] = true;
+    }
+    unsigned left = 0;
+    for (size_t k = 0; k < offered.size(); ++k)
+      if (!onChip[k])
+        offered[left++] = std::move(offered[k]);
+    llvm::errs() << "foldsim-fold-static: csf-mailbox-hbm-budget: "
+                 << offered.size() - left << " links (" << kept
+                 << " bits) stay on chip, " << left << " stream\n";
+    offered.resize(left);
   }
   SmallVector<MailboxLink> links;
   SmallVector<const LinkUse *> useOf;
@@ -16834,7 +16863,27 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
   // `vmem-auto-bits`: by size too (the memories that cannot be one, kept):
   // the checks below, silently.
   auto autoVirtual = [&](seq::FirMemOp memory, const Class &cls) {
-    return cls.stateGap >= decisionLead() + 1 && autoVirtualForm(memory);
+    if (!(cls.stateGap >= decisionLead() + 1 && autoVirtualForm(memory)))
+      return false;
+    // hbm-round-trip: a memory read in the frame it is written stays on
+    // chip. Its read leaves at the state pass (a host cycle later with held
+    // reads); its answer is needed by the instance's first pass of the next
+    // frame (a ready pass, else its state pass): that room must hold the
+    // round trip, twice with rings (the answer parks in its image and is
+    // read back), and the decision leads.
+    if (hbmRoundTrip && cls.threads() > 1 && ii > 0) {
+      bool ring = vmemRingLead != 0;
+      int need = int(hbmRoundTrip) * (ring ? 2 : 1) + 2 * decisionLead() + 8;
+      for (unsigned i = 0; i < cls.threads(); ++i) {
+        int issue = cls.slot[kState][i] + (cls.heldReads ? 1 : 0);
+        int first = cls.slot[kState][i];
+        for (unsigned l = 0; l < cls.readyLevels; ++l)
+          first = std::min(first, cls.readySlots(l)[i]);
+        if (first + int(ii) - issue < need)
+          return false;
+      }
+    }
+    return true;
   };
   unsigned autoKept = 0;
   uint64_t autoKeptBits = 0;
@@ -30666,6 +30715,7 @@ void FoldStaticPass::runOnOperation() {
   folder.linkUniformRows = linkUniformRows;
   folder.csfMailboxBuilder = csfMailboxBuilder;
   folder.csfMailboxHbm = csfMailboxHbm;
+  folder.csfMailboxHbmBudget = csfMailboxHbmBudget;
   folder.csfMailboxHbmChains = csfMailboxHbmChains;
   folder.csfMailboxHbmSplit = csfMailboxHbmSplit;
   folder.csfMailboxHbmShare = csfMailboxHbmShare;
