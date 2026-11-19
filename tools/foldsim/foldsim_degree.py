@@ -2354,7 +2354,19 @@ def state_logic(cal, form, bypass, bits):
     return table[form][1 if bypass else 0] * bits
 
 
-def copy_sites(cal, est, name, threads, entries=2, info=None, ii=0):
+def offchip_memories(est, threads, auto_bits=0, auto_instance_bits=0):
+    """`est` without the memories foldsim-fold-static homes in HBM by size
+    (vmem-auto-bits: all instances' bits; vmem-auto-instance-bits: one
+    instance's), as its vmemBySize decides: those keep no store on chip."""
+    if threads < 2 or not (auto_bits or auto_instance_bits):
+        return est
+    keep = [m for m in est['mems']
+            if not ((auto_bits and m[1] * m[2] * threads >= auto_bits) or
+                    (auto_instance_bits and m[1] * m[2] >= auto_instance_bits))]
+    return dict(est, mems=keep)
+
+
+def copy_sites(cal, est, name, threads, entries=2, info=None, ii=0, sir=False):
     """LUT sites the placer needs for one copy of class `name` (`est`, its
     class_estimates entry) at `threads` instances, calibrated: its state as
     the compiler keeps it, given the copy's line of a schedule report
@@ -2366,6 +2378,15 @@ def copy_sites(cal, est, name, threads, entries=2, info=None, ii=0):
     sites without its schedule, 168 % of the largest SLR; as built 559,939
     LUTs)."""
     kappa, lam = factors(cal, name, est['lut'])
+    if sir and threads > 1:
+        # State in RAM (state-in-ram, PP too): the registers are rows of
+        # block / ultra RAM read in place (the RAM's port is the select), not
+        # a distributed RAM of an entry per instance; its small memories stay
+        # stores of an entry per instance (a32-S30: these were priced as
+        # per-instance LUTRAM, a copy's sites growing with the instance count
+        # while the built copies stay flat).
+        lr, _ = state_lutram(est, threads, 'one')
+        return placement(kappa * est['lut'], lam * lr)[0]
     form, bypass = state_form(threads, info, ii, entries)
     lr, _ = state_lutram(est, threads, form)
     logic = kappa * est['lut'] + state_logic(cal, form, bypass, est['ff'])

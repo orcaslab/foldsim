@@ -924,7 +924,10 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "frame grow with it); link and mailbox streams request their rows "
            "this far ahead plus the decision lead and a margin, where the "
            "schedule's room allows; a link whose room is shorter stays on "
-           "chip (it is read the same frame it is written)">,
+           "chip (it is read the same frame it is written); vmem and "
+           "fold-store rings re-read their answers this far ahead, their "
+           "tables of reads in flight sized by each ring's read rate times "
+           "it (vmem-ring-flight unset)">,
     Option<"linkHbmLead", "link-hbm-lead", "unsigned", "48",
            "HBM link streams (link-kinds kind hbm): the most positions a "
            "row's request precedes its landing (the memory's round trip in "

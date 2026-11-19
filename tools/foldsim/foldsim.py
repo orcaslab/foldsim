@@ -1350,7 +1350,14 @@ def slr_options(a, foldsim_opt, models, fold, out):
     of = {c: re.sub(r'_copy\d+$', '', c) for c in classes}
     est = foldsim_degree.class_estimates(models, sorted(set(of.values())))
     # Each copy's state as that schedule keeps it (paged copies in page RAMs).
-    sites = {c: round(foldsim_degree.copy_sites(cal, est[of[c]], of[c], n, entries, info.get(c), ii))
+    # State-in-RAM classes (--state-in-ram globs on the model name) keep their
+    # registers in RAM rows; memories homed in HBM by size keep no store.
+    sir_globs = [x.split(':')[0] for x in (getattr(a, 'state_in_ram', '') or '').split(',') if x]
+    def is_sir(c):
+        return any(fnmatch.fnmatchcase(of[c], g) for g in sir_globs)
+    auto = (getattr(a, 'vmem_auto_bits', 0) or 0, getattr(a, 'vmem_auto_instance_bits', 0) or 0)
+    sites = {c: round(foldsim_degree.copy_sites(cal, foldsim_degree.offchip_memories(est[of[c]], n, *auto), of[c], n,
+                                                entries, info.get(c), ii, sir=is_sir(c)))
              for c, n in classes.items()}
     if a.slr_sites:
         # Measured: each copy's LUTs in a generated netlist of the same recipe

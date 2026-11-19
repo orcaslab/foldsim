@@ -26566,9 +26566,15 @@ LogicalResult StaticFolder::buildSim() {
       // the reads of an assumed 256-position latency, 8 to 32.)
       unsigned flight = vmemRingFlight;
       if (!flight) {
+        // (hbm-round-trip: the reads of that latency, Little's law, up to
+        // 1,024: a ring's rate, and so its table, is the same at every
+        // instance count, its prefetches and II growing together.)
+        uint64_t latency = hbmRoundTrip ? hbmRoundTrip + decisionLead() + 16
+                                        : kRingFlightLatency;
+        uint64_t most = hbmRoundTrip ? 1024 : kRingReads;
         uint64_t need = decisionLead() + 2 +
-                        (uint64_t(plan.prefetches) * kRingFlightLatency + ii - 1) / std::max(1u, ii);
-        flight = unsigned(std::min<uint64_t>(kRingReads, llvm::PowerOf2Ceil(need)));
+                        (uint64_t(plan.prefetches) * latency + ii - 1) / std::max(1u, ii);
+        flight = unsigned(std::min<uint64_t>(most, llvm::PowerOf2Ceil(need)));
       }
       return std::max<unsigned>(llvm::PowerOf2Ceil(std::max(flight, 8u)),
                                 llvm::PowerOf2Ceil(decisionLead() + 3));
@@ -30794,6 +30800,18 @@ void FoldStaticPass::runOnOperation() {
   folder.foldRingLead = foldStoreRings;
   folder.vmemRingEntries = std::max(1u, unsigned(vmemRingEntries));
   folder.vmemRingFlight = unsigned(vmemRingFlight);
+  // hbm-round-trip: the rings' answers re-read from their images the round
+  // trip ahead, and their tables of reads in flight sized by it (an unset
+  // vmem-ring-flight, its default 32, becomes the per-ring rate's size).
+  if (hbmRoundTrip) {
+    unsigned rt = unsigned(hbmRoundTrip) + 16;
+    if (folder.vmemRingLead)
+      folder.vmemRingLead = std::max(folder.vmemRingLead, rt);
+    if (folder.foldRingLead)
+      folder.foldRingLead = std::max(folder.foldRingLead, rt);
+    if (folder.vmemRingFlight == kRingReads)
+      folder.vmemRingFlight = 0;
+  }
   folder.vmemRingImageEach = vmemRingImageEach;
   folder.vmemRingClassControl = vmemRingClassControl ||
                                 std::getenv("FOLDSIM_VMEM_RING_CLASS_CONTROL") != nullptr;
