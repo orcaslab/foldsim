@@ -505,6 +505,8 @@ def frame_options(a):
         fold += f' link-ultra-depth={a.link_ultra_depth}'
     if getattr(a, 'link_hbm_lead', 0):
         fold += f' link-hbm-lead={a.link_hbm_lead}'
+    if getattr(a, 'hbm_round_trip', 0):
+        fold += f' hbm-round-trip={a.hbm_round_trip}'
     if getattr(a, 'page_engines_pp', False):
         fold += ' page-engines-pp'
     if getattr(a, 'vmem_on_engines', False):
@@ -2734,6 +2736,13 @@ def build_parser():
                          'register (foldsim-fold-static; 0: none)')
     ap.add_argument('--link-ultra-depth', type=int, default=0, metavar='N',
                     help='as --link-block-depth, in ultra RAM (foldsim-fold-static; 0: none)')
+    ap.add_argument('--hbm-round-trip', type=int, default=0, metavar='N',
+                    help='with --static: the HBM round trip in host cycles that every off-chip read is issued ahead '
+                         'of its use by (the card\'s loaded latency, ~700 at 200 MHz with every port busy): streamed '
+                         'state rows prefetch that far ahead (landing windows sized by the streamed instances\' '
+                         'spacing, constant in the instance count), link and mailbox streams request that far ahead, '
+                         'and a link whose room is shorter stays on chip (foldsim-fold-static hbm-round-trip; 0: the '
+                         'built-in leads)')
     ap.add_argument('--link-hbm-lead', type=int, default=0, metavar='N',
                     help='with --static and hbm link kinds: the most positions a stream row\'s request '
                          'precedes its landing, the memory\'s round trip in host cycles and a margin '

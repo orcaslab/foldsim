@@ -876,6 +876,9 @@ public:
   /// `link-hbm-lead`: the most positions a stream's request precedes its
   /// landing.
   unsigned linkHbmLead = kLinkHbmLead;
+  /// `hbm-round-trip`: the HBM round trip every off-chip read is issued
+  /// ahead of its use by, in host cycles (0: the built-in leads).
+  unsigned hbmRoundTrip = 0;
   /// `link-hbm-shift`: the most positions a stream's request moves earlier,
   /// or its write later, to share a page engine (0: none).
   unsigned linkHbmShift = 0;
@@ -1801,8 +1804,13 @@ private:
   /// request is issued, and pending, before the decision that waits for it.
   static constexpr unsigned kLinkHbmLead = 48;
   unsigned linkHbmMinLead() const {
-    return std::max(unsigned(decisionLead() + 6), linkHbmMinLeadOpt);
+    return std::max({unsigned(decisionLead() + 6), linkHbmMinLeadOpt,
+                     hbmRoundTrip ? unsigned(hbmRoundTrip + decisionLead() + 6)
+                                  : 0u});
   }
+  /// The lead a streamed state row's prefetch must reach before its first
+  /// pass (kStreamLead, or hbm-round-trip and a margin).
+  unsigned streamLead() const;
   std::vector<LinkStream> linkStreams;
   /// Each candidate member by (reader class, input, its bit, producer, low):
   /// its stream, its bits' offset in the stream's word, and whether the
@@ -14983,6 +14991,11 @@ static constexpr uint64_t kStreamBitsPerCycle = 8192;
 /// window allows: an HBM round trip at the kernel's clock and a margin (as
 /// kLinkHbmLead).
 static constexpr unsigned kStreamLead = 64;
+unsigned StaticFolder::streamLead() const {
+  // (The decision lead and a margin past the round trip, as linkHbmMinLead.)
+  return hbmRoundTrip ? hbmRoundTrip + unsigned(decisionLead()) + 6
+                      : kStreamLead;
+}
 /// The kernel's device-memory masters a streamed class's chunks spread over
 /// (foldsim_vmem_share: controller k on master k mod M).
 static constexpr unsigned kStreamMasters = 8;
@@ -15790,7 +15803,7 @@ LogicalResult StaticFolder::chooseStreamWindows() {
     unsigned cap = stateStreamWindow ? stateStreamWindow
                                      : std::max(1u, 512u / rowsPow);
     // The fewest slots whose prefetches lead their first passes by an HBM
-    // round trip (kStreamLead positions), else the most that fit: the
+    // round trip (streamLead() positions), else the most that fit: the
     // window's counters and slot logic are a slot's each.
     SmallVector<int> pf;
     cls.pageWindow = 0;
@@ -15813,7 +15826,7 @@ LogicalResult StaticFolder::chooseStreamWindows() {
       if (!ok)
         continue;
       fits = w;
-      if (lead >= int(kStreamLead)) {
+      if (lead >= int(streamLead())) {
         cls.pageWindow = w;
         break;
       }
@@ -30670,7 +30683,16 @@ void FoldStaticPass::runOnOperation() {
   folder.stateScratchBuiltOthers = stateScratchBuiltOthers;
   folder.stateScratchReport = stateScratchReport;
   folder.stateScratchReserve = stateScratchReserve;
-  folder.linkHbmLead = std::max(1u, unsigned(linkHbmLead));
+  folder.hbmRoundTrip = hbmRoundTrip;
+  // With hbm-round-trip, a stream's request leads its landing by the round
+  // trip, the decision lead and a margin (or its room, where less: then
+  // linkHbmMinLead() keeps the member on chip).
+  {
+    unsigned rt = hbmRoundTrip ? unsigned(hbmRoundTrip) + 16 : 0;
+    folder.linkHbmLead = std::max({1u, unsigned(linkHbmLead), rt});
+    folder.csfMailboxHbmLead = std::max(
+        {1u, unsigned(csfMailboxHbmLead), rt});
+  }
   folder.linkHbmMinLeadOpt = linkHbmMinLead;
   folder.linkHbmShift = linkHbmShift;
   folder.foldPortsSpec = foldPorts;

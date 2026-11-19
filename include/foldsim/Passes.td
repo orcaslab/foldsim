@@ -913,6 +913,18 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "(\"<uram>,<ramb36>,<luts>\": URAM288, RAMB36, logic and other "
            "LUTRAM LUTs), as a first fold built it "
            "(foldsim_link_kinds.py); 0,0,0: links alone">,
+    Option<"hbmRoundTrip", "hbm-round-trip", "unsigned", "0",
+           "The HBM round trip every off-chip read must be issued ahead of "
+           "its use, in host cycles (the card's loaded latency and a margin; "
+           "0: the built-in leads, 64 for streamed state rows, 48 / 112 for "
+           "link and mailbox streams). Streamed state rows prefetch at least "
+           "this far ahead of their first pass (a landing window of as many "
+           "slots as the spacing of the streamed instances needs: constant "
+           "in the instance count, since both the streamed instances and the "
+           "frame grow with it); link and mailbox streams request their rows "
+           "this far ahead plus the decision lead and a margin, where the "
+           "schedule's room allows; a link whose room is shorter stays on "
+           "chip (it is read the same frame it is written)">,
     Option<"linkHbmLead", "link-hbm-lead", "unsigned", "48",
            "HBM link streams (link-kinds kind hbm): the most positions a "
            "row's request precedes its landing (the memory's round trip in "
