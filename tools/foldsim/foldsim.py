@@ -533,6 +533,9 @@ def frame_options(a):
         fold += f' port-plan-out={os.path.abspath(a.port_plan_out)}'
     if getattr(a, 'pp_beat_bits', 0):
         fold += f' pp-beat-bits={a.pp_beat_bits}'
+    for opt in ('stream_masters', 'stream_master_bits', 'stream_move_bits', 'pp_chunk_min_columns'):
+        if getattr(a, opt, 0):
+            fold += f" {opt.replace('_', '-')}={getattr(a, opt)}"
     if getattr(a, 'link_hbm_beat_bits', 0):
         fold += f' link-hbm-beat-bits={a.link_hbm_beat_bits}'
     if getattr(a, 'link_hbm_beat_rows', False):
@@ -2291,6 +2294,25 @@ def page_engine_slr(sched, pairs):
     return engines
 
 
+def stream_master_of(info, sched, k, move_bits=32):
+    """--stream-masters K: each controller's master (info's vmem_groups, else vmem: `master`), the heaviest first
+    on the least loaded master (longest processing time). A controller's weight is its bits a frame: a page engine
+    (class `__pages<e>`), the schedule's `page engine traffic <e>: reads R writes W` times its row (at least
+    `move_bits`); any other, one row a frame (they are light: the class memories' traffic is the target's)."""
+    traffic = {f'__pages{m.group(1)}': int(m.group(2)) + int(m.group(3))
+               for m in re.finditer(r'^\s+page engine traffic (\d+): reads (\d+) writes (\d+)', sched, re.M)}
+    ctrls = info.get('vmem_groups') or info['vmem']
+    weight = [max(8 * c['row_bytes'], move_bits) * traffic.get(c['class'], 1) for c in ctrls]
+    load = [0] * k
+    for i in sorted(range(len(ctrls)), key=lambda i: -weight[i]):
+        j = min(range(k), key=lambda j: (load[j], j))
+        ctrls[i]['master'] = j
+        load[j] += weight[i]
+    info['stream_masters'] = {'k': k, 'bits': load}
+    print(f'foldsim: --stream-masters {k}: {len(ctrls)} controllers, bits a frame on the busiest master '
+          f'{max(load)} (mean {sum(load) // k})', file=sys.stderr)
+
+
 def vmem_slr_of(info, sched, pairs):
     """Each controller's SLR group under --vmem-slr-groups (`pairs`, [(class,
     group)]), in the kernel's controller order (info['vmem_groups'], else
@@ -2759,6 +2781,20 @@ def build_parser():
     ap.add_argument('--pp-beat-bits', type=int, default=0, metavar='N',
                     help='with --page-engines-pp: streamed PP rows as beats of at most N bits, '
                          'drained from a row buffer (foldsim-fold-static pp-beat-bits)')
+    ap.add_argument('--stream-masters', type=int, default=0, metavar='K',
+                    help='the device-memory masters the HBM state streams spread over (foldsim-fold-static '
+                         'stream-masters; 0: its default, 8). With K, each controller also gets a master '
+                         '(foldsim_sim.json `master`, foldsim_sim.vh FOLDSIM_VMEM_[G]<k>_MASTER): the heaviest '
+                         'first on the least loaded, by its bits a frame (the schedule\'s page engine traffic)')
+    ap.add_argument('--stream-master-bits', type=int, default=0, metavar='B',
+                    help="a master's usable HBM bits a host cycle, read and write together (foldsim-fold-static "
+                         'stream-master-bits; 0: its default, 1,024)')
+    ap.add_argument('--stream-move-bits', type=int, default=0, metavar='B',
+                    help='the fewest bits a row transfer moves on a master, its beat (foldsim-fold-static '
+                         'stream-move-bits; 0: its default, 32)')
+    ap.add_argument('--pp-chunk-min-columns', type=int, default=0, metavar='N',
+                    help="a spread PP class's chunks: at least N 72-bit columns each (foldsim-fold-static "
+                         'pp-chunk-min-columns; 0: its default, 7)')
     ap.add_argument('--vmem-stagger', type=int, default=0, metavar='D',
                     help='with --vmem-on-engines: a target RAM\'s requests may leave up to D positions after its '
                          'pass (held in registers) so a copy\'s memories share engines at successive positions '
@@ -4018,6 +4054,9 @@ def main():
         info['vport_slr'] = [engines.get(f'__pages{p_}', -1) for p_ in range(len(info.get('vports') or []))]
         if region:
             info['vmem_slr_names'] = [s_['name'] for s_ in json.load(open(region)).get('slrs', [])]
+    if getattr(a, 'stream_masters', 0) and info.get('vmem'):
+        sched = open(out('schedule.txt')).read() if os.path.exists(out('schedule.txt')) else ''
+        stream_master_of(info, sched, a.stream_masters, getattr(a, 'stream_move_bits', 0) or 32)
     with open(out('foldsim_sim.json'), 'w') as f:
         json.dump(info, f, indent=1)
     # The kernel's view of it: how many classes report their finishes, bit c
@@ -4096,6 +4135,11 @@ def main():
                     if 'cache_rows' in v:
                         f.write(f'`define FOLDSIM_VMEM_G{g}_CACHE_ROWS {v["cache_rows"]}\n')
             ctrls = info.get('vmem_groups') or info['vmem']
+            if 'master' in ctrls[0]:
+                key = 'G' if 'vmem_groups' in info else ''
+                f.write(f'`define FOLDSIM_VMEM_STREAM_MASTERS {info["stream_masters"]["k"]}\n')
+                for k, c in enumerate(ctrls):
+                    f.write(f'`define FOLDSIM_VMEM_{key}{k}_MASTER {c["master"]}\n')
             if 'slr_group' in ctrls[0]:
                 key = 'G' if 'vmem_groups' in info else ''
                 for k, c in enumerate(ctrls):

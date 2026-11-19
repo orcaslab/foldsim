@@ -1,0 +1,22 @@
+# The HBM state stream's bandwidth model over K device-memory masters (foldsim --stream-masters, --stream-master-bits,
+# --stream-move-bits, --pp-chunk-min-columns; a32-S30: 8 vNoC MEM masters by default, up to 64 direct HBM ports).
+# The model prices each master's share (II_bw), a row transfer at least a master's beat; with K, each controller gets
+# a master, the heaviest first on the least loaded (foldsim_sim.json `master`, FOLDSIM_VMEM_[G]<k>_MASTER), which the
+# kernel's binding (flow/v80/vmem_ports.py) follows.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/paged
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/d --static --state-in-ram Leaf::4 --state-in-ram-pp --state-scratch-bits 0 --page-engines 4 --page-engines-pp Leaf > %t/d.log 2>&1
+# RUN: FileCheck %s --check-prefix=DEF < %t/d.log
+# RUN: FileCheck %s --check-prefix=NOVH < %t/d/foldsim_sim.vh
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/k --static --state-in-ram Leaf::4 --state-in-ram-pp --state-scratch-bits 0 --page-engines 4 --page-engines-pp --stream-masters 3 --stream-master-bits 160 --stream-move-bits 256 --pp-chunk-min-columns 1 Leaf > %t/k.log 2>&1
+# RUN: FileCheck %s --check-prefix=K < %t/k.log
+# RUN: FileCheck %s --check-prefix=KVH < %t/k/foldsim_sim.vh
+# RUN: python3 %foldsim_tools/flow/v80/vmem_ports.py --sim-vh %t/k/foldsim_sim.vh --mem-ports 1 --masters | FileCheck %s --check-prefix=KM
+
+# DEF: state-stream: II_sched 26, HBM state bits a frame 4096 (busiest master 4096), II_bw 4 (8 masters, 8192 b/hc usable)
+# NOVH-NOT: _MASTER
+# (A 216-bit row moves a 256-bit beat: 3 one-column chunks would move 3 beats, so the class keeps one chunk.)
+# K: state-stream: II_sched 26, HBM state bits a frame 8192 (busiest master 8192), II_bw 52 (3 masters, 480 b/hc usable)
+# K: foldsim: --stream-masters 3: 1 controllers, bits a frame on the busiest master 8192
+# KVH: `define FOLDSIM_VMEM_STREAM_MASTERS 3
+# KVH: `define FOLDSIM_VMEM_0_MASTER 0
+# KM: 2

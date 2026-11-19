@@ -151,6 +151,19 @@ def vmem_groups(sim_vh):
     return groups
 
 
+def stream_masters(sim_vh, groups, nm):
+    """foldsim --stream-masters K: (K, [master of controller k]) from foldsim_sim.vh
+    (FOLDSIM_VMEM_STREAM_MASTERS, FOLDSIM_VMEM_[G]<k>_MASTER), else (None, None)."""
+    with open(sim_vh) as f:
+        text = f.read()
+    m = re.search(r'^`define FOLDSIM_VMEM_STREAM_MASTERS (\d+)\s*$', text, re.M)
+    if not m:
+        return None, None
+    key = 'G' if groups is not None else ''
+    at = {int(k): int(j) for k, j in re.findall(rf'^`define FOLDSIM_VMEM_{key}(\d+)_MASTER (\d+)\s*$', text, re.M)}
+    return int(m.group(1)), [at.get(k, k % int(m.group(1))) for k in range(nm)]
+
+
 def vmem_widths(sim_vh):
     """Each memory's and each group's DW from foldsim_sim.vh: {'<k>' or 'G<g>': DW}."""
     with open(sim_vh) as f:
@@ -320,6 +333,13 @@ def main():
         sys.exit('vmem_ports.py: --cache-rows is 0 or a power of two of at least 2')
     slr, names = vmem_slr(a.sim_vh, groups, nm, nv) if n else (None, None)
     of = mslr = None
+    k_stream, stream_of = stream_masters(a.sim_vh, groups, nm)
+    if k_stream and slr is None and not nv and a.vmem_masters is None and k_stream < nm:
+        # (foldsim --stream-masters: the controllers on K masters by their bits a frame.)
+        if k_stream > room:
+            sys.exit(f'vmem_ports.py: --stream-masters {k_stream} beside {p} memory-port masters; the kernel has at '
+                     f'most {MAX_MASTERS} (direct HBM ports: --vport-engines)')
+        m, of, mslr = k_stream, stream_of, [-1] * k_stream
     if slr is not None and 0 < m < n:
         # (A master at least for each group with controllers: m grows to the groups.)
         of, mslr = masters_by_slr(slr, port_bits(a.sim_vh, groups, n, nm), n, m)

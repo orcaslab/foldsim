@@ -950,6 +950,22 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "this many 72-bit columns a chunk (56: 4,032 bits, a row of 8 "
            "beats; 7: 504 bits, a beat, so that every chunk is one page-engine "
            "lane and a row's chunks stripe over engines at the same positions)">,
+    Option<"streamMasters", "stream-masters", "unsigned", "8",
+           "The kernel's device-memory masters the HBM state streams spread "
+           "over (K: 8 vNoC MEM ports; up to 64 direct HBM ports on asl9): "
+           "the bandwidth model's master count and the most chunks a streamed "
+           "PP class spreads over">,
+    Option<"streamMasterBits", "stream-master-bits", "unsigned", "1024",
+           "Usable HBM bits a host cycle of one such master, read and write "
+           "together (1,024: 8 masters x 10,240 b/hc at 0.8; a direct port: "
+           "160 at its 2,000 + 2,000 MB/s reservation, 1,024 raw at 200 MHz)">,
+    Option<"streamMoveBits", "stream-move-bits", "unsigned", "32",
+           "The fewest bits one row transfer moves on a master (its beat: "
+           "256 for a 256-bit direct port), for the bandwidth model">,
+    Option<"ppChunkMinColumns", "pp-chunk-min-columns", "unsigned", "7",
+           "A spread PP class's chunks: at least this many 72-bit columns "
+           "each (7: a 512-bit beat), so at most ceil(columns / this) chunks, "
+           "and at most stream-masters">,
     Option<"linkHbmBeatBits", "link-hbm-beat-bits", "unsigned", "0",
            "HBM link streams on their own controllers: a row wider than this "
            "many bits moves as beats (at most 8) of a controller this wide, "
