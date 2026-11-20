@@ -94,7 +94,7 @@
 # RUN: foldsim --srcs top.f --top Top --out %t/es --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-ports --slr-group-env --slr-group-own 1000 --slr-env-home --slr-cross-cofactor 3 --slr-group-outputs --slr-serialize 2 --slr-cross-select Unit > %t/es.log 2>&1
 # RUN: env FOLDSIM_SELECT_MUTANT=1 foldsim --srcs top.f --top Top --out %t/esm --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-ports --slr-group-env --slr-group-own 1000 --slr-env-home --slr-cross-cofactor 3 --slr-group-outputs --slr-serialize 2 --slr-cross-select Unit > %t/esm.log 2>&1
 # RUN: FileCheck %s --check-prefix=ESLOG < %t/es.log
-# ESLOG: slr-cross-select: 2 selects of crossing data registered a host cycle ahead
+# ESLOG: slr-cross-select: 4 selects of crossing data registered a host cycle ahead
 # RUN: FileCheck %s --check-prefix=ESSV < %t/es/foldsim_sim.sv
 # ESSV: _sel_ahead
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/es0 -Mdir %t/es0/obj %S/Inputs/tb_ports.sv top.sv %t/es0/foldsim_sim.sv > %t/es0/build.log 2>&1
