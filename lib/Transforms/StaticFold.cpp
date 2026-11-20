@@ -19560,6 +19560,17 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
                 b, comb::ICmpPredicate::ne, b.createOrFold<comb::ExtractOp>(bits(8), data, 8 * l),
                 b.createOrFold<comb::ExtractOp>(bits(8), col.out, 8 * l)));
           Value dirty = b.createOrFold<comb::ConcatOp>(changed);
+          // A pass of a row that holds none of the column's bits writes none
+          // of its bytes: its word is another row's (the select's), compared
+          // with a word of a row it never reads back. (Else its bytes look
+          // changed at every pass, and the instance never clean.)
+          if (usedRows.size() < P) {
+            SmallVector<uint64_t> usedAt(size_t(1) << hw::getBitWidth(g.wRow1.getType()), 0);
+            for (unsigned j : usedRows)
+              usedAt[j] = 1;
+            Value used = keepReg(table(b, g.wRow1, usedAt, 1), "pp_col" + Twine(c) + "_used");
+            dirty = comb::MuxOp::create(b, used, dirty, hw::ConstantOp::create(b, bits(9), 0));
+          }
           streamWrites.push_back({data, mask && lanes == 9 ? comb::AndOp::create(b, mask, dirty) : dirty});
         } else {
           streamWrites.push_back({data, mask});
