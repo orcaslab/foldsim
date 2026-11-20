@@ -945,6 +945,9 @@ public:
   /// `slr-cross-cofactor` k: a register's next value reading at most k
   /// one-bit values of another partition through logic is expanded over them.
   unsigned slrCrossCofactor = 0;
+  /// `slr-group-outputs`: an unfolded output a group produces built there.
+  bool slrGroupOutputs = false;
+  unsigned outputsGrouped = 0;
   /// `physical-domains`: the simulator as a tree of modules mirroring the
   /// class tree (extractDomains).
   bool physicalDomains = false;
@@ -25922,6 +25925,25 @@ LogicalResult StaticFolder::buildSim() {
     if (consumer.cls >= 0)
       continue;
     int outGroup = foldedOut(k) ? pfGroup : -1;
+    // `slr-group-outputs`: an unfolded output whose pieces one group's
+    // classes produce is built there too (its link reads, queue and dues).
+    if (slrGroupOutputs && !foldedOut(k) && !slrOf.empty()) {
+      int g = -1;
+      bool one = true;
+      for (auto &piece : consumer.pieces[0]) {
+        if (piece.producer < 0)
+          continue;
+        int pc = producers[piece.producer].cls;
+        int pg = pc >= 0 ? slrOf[pc] : -1;
+        if (pg < 0 || (g >= 0 && pg != g))
+          one = false;
+        g = pg;
+      }
+      if (one && g >= 0) {
+        outGroup = g;
+        ++outputsGrouped;
+      }
+    }
     Operation *outMark = body->empty() ? nullptr : &body->back();
     llvm::scope_exit tagOut([&] { tagAfter(outMark, outGroup); });
     // (With fold-ports-rows a folded output is built with the request rows
@@ -26057,6 +26079,9 @@ LogicalResult StaticFolder::buildSim() {
     }
   }
 
+  if (slrGroupOutputs)
+    llvm::errs() << "foldsim-fold-static: slr-group-outputs: " << outputsGrouped
+                 << " outputs built in their producers' group\n";
   // Folded port bundles: each field's tokens in a memory of a row per bundle
   // and queue entry (the bundle's row in turn: a write pointer per output),
   // written at the field's pushes, one bundle a host cycle (staggered). A
@@ -27626,9 +27651,12 @@ LogicalResult StaticFolder::buildSim() {
           if (isa<hw::InstanceOp>(def))
             return -1;  // sourceOf found no majority
           if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(def)) {
-            ++total;
-            if (auto a = def->getAttrOfType<IntegerAttr>(kSlrAttr))
+            // (The level's registers -- the sequencer's -- are replicated
+            // into any group: only the groups' own count.)
+            if (auto a = def->getAttrOfType<IntegerAttr>(kSlrAttr)) {
               ++regs[a.getInt()];
+              ++total;
+            }
             continue;
           }
           if (def->getNumRegions() || isa<seq::FirMemReadOp>(def) ||
@@ -31022,6 +31050,7 @@ void FoldStaticPass::runOnOperation() {
   folder.slrGroupEnv = slrGroupEnv;
   folder.slrEnvHome = slrEnvHome;
   folder.slrCrossCofactor = slrCrossCofactor;
+  folder.slrGroupOutputs = slrGroupOutputs;
   folder.physicalDomains = physicalDomains;
   for (auto &spec : domainMerge) {
     auto [name, price] = StringRef(spec).split(':');

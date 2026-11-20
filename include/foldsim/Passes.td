@@ -816,6 +816,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "only the folded record leaves the group, not every bundle (the "
            "same logic, in the producers' group; an error if the bundles' "
            "producers are in more than one group)">,
+    Option<"slrGroupOutputs", "slr-group-outputs", "bool", "false",
+           "With SLR groups: an output of the simulator (not a folded port) "
+           "whose pieces one group's classes produce is built in that group, "
+           "as slr-group-ports builds a folded one: its link reads, its "
+           "queue, dues and room term, so the producers' outputs meet logic "
+           "inside their own SLR and the output leaves the group from its "
+           "queue (and, with slr-env-home, its buffer's registers). The same "
+           "logic, in the producers' group: no value or host cycle moves">,
     Option<"slrLinkRams", "slr-link-rams", "bool", "false",
            "With SLR groups: links may be block or ultra RAM too (by "
            "link-block-depth / link-ultra-depth or link-kind-cost), the memory "

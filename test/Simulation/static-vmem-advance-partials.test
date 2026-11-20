@@ -97,7 +97,7 @@
 # GOLOG: advance-partials: 4 terms in 3 partials (level 2, group 0 1, group 1 1), 0 left as they are
 # RUN: FileCheck %s --check-prefix=GOSV < %t/g5/foldsim_sim.sv
 # GOSV-LABEL: module foldsim_sim(
-# GOSV: gpart_level <=
+# GOSV: gpart_level{{(_[0-9]+)?}} <=
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DCOPIES2 -DIW=1 -Mdir %t/g5/obj %S/Inputs/tb_vmem.sv top.sv %t/g5/foldsim_sim.sv > %t/g5/build.log 2>&1
 # RUN: %t/g5/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | grep MATCH > %t/g5/r1.txt
 # RUN: %t/g5/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/g5/r2.txt
@@ -117,6 +117,23 @@
 # RUN: FileCheck %s < %t/g6/r1.txt
 # RUN: diff %t/g0/r1.txt %t/g6/r1.txt
 # RUN: diff %t/g0/r2.txt %t/g6/r2.txt
+# --slr-group-outputs: the output, which group 1's copy produces, is built in
+# group 1 (its link read, queue and dues), so its room term's lead reads group
+# 1's registers: go's partial is group 1's (`gpart_s1`), replicated into the
+# level and group 0: the same MATCH in the same host cycles.
+# RUN: foldsim --srcs top.f --top Top --out %t/g7 --static --virtual-memories ram --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-home --advance-partials --go-partials --slr-cross-cofactor 3 --slr-group-outputs Leaf > %t/g7.log 2>&1
+# RUN: FileCheck %s --check-prefix=GOOUT < %t/g7.log
+# GOOUT: slr-group-outputs: 1 outputs built in their producers' group
+# GOOUT: go-partials: 1 terms in 1 partials (group 1 1), 1 left as they are
+# RUN: FileCheck %s --check-prefix=GOOSV < %t/g7/foldsim_sim.sv
+# GOOSV-LABEL: module foldsim_sim_slr1(
+# GOOSV: gpart_s1{{(_[0-9]+)?}} <=
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DCOPIES2 -DIW=1 -Mdir %t/g7/obj %S/Inputs/tb_vmem.sv top.sv %t/g7/foldsim_sim.sv > %t/g7/build.log 2>&1
+# RUN: %t/g7/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | grep MATCH > %t/g7/r1.txt
+# RUN: %t/g7/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/g7/r2.txt
+# RUN: FileCheck %s < %t/g7/r1.txt
+# RUN: diff %t/g0/r1.txt %t/g7/r1.txt
+# RUN: diff %t/g0/r2.txt %t/g7/r2.txt
 # Nested sequencers with bubbles.
 # RUN: foldsim --srcs top.f --top Top --out %t/n0 --static --virtual-memories ram --ready-ahead --room-ahead --nest --bubbles Leaf > /dev/null 2>&1
 # RUN: foldsim --srcs top.f --top Top --out %t/n1 --static --virtual-memories ram --ready-ahead --room-ahead --nest --bubbles --advance-partials Leaf > /dev/null 2>&1
