@@ -1252,6 +1252,19 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "With advance-partials: at most this many terms a partial (a "
            "group's terms spread over as many partials as that takes; 0: one "
            "partial a group)">,
+    Option<"goPartials", "go-partials", "bool", "false",
+           "With advance-partials: the frame's start (go: every input's token "
+           "and every output's room) retimed alike, before the advance's: each "
+           "term whose logic reads only registers (as advance-partials takes "
+           "them) a host cycle ahead, the terms of one source group (the group "
+           "of the instance outputs, else of the registers, its lead reads) "
+           "ANDed there into one register (`gpart_s<g>`, `gpart_level`) with "
+           "its next a select by advance and go of the cofactors' ANDs, a "
+           "replica a reading group as advance-partials-at says. `go` is then "
+           "an AND of registers (and the terms of no lead), the same value in "
+           "every host cycle: no schedule or host cycle moves. With "
+           "slr-group-ports a folded output's room terms are logic of its "
+           "group: they no longer cross an SLR into every group's go">,
     Option<"roomAhead", "room-ahead", "bool", "false",
            "With virtual memories: each controller's room term of the frame "
            "decision (its `free` at least the requests the decisions in "

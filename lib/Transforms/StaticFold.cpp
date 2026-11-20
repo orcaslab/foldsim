@@ -1066,6 +1066,9 @@ public:
   bool advancePartialsAtReader = false;
   bool advancePartialsCofactor = true;
   unsigned advancePartialsTerms = 0;
+  /// `go-partials` (with advance-partials): the frame's start (go) retimed
+  /// into partials alike (`gpart_s<g>`, `gpart_level`).
+  bool goPartials = false;
   unsigned partialTerms = 0, partialLeft = 0, partialRegs = 0, partialReplicas = 0;
   /// `room-ahead`: the controllers' room terms registered (two entries more).
   bool roomAhead = false;
@@ -27597,21 +27600,65 @@ LogicalResult StaticFolder::buildSim() {
         }
         return 2 * bestN > total ? best : -1;
       };
+      // `go-partials`: the source of a term that reads no instance output
+      // (a folded output's room, from counters a group's logic keeps): the
+      // group of more than half the registers its lead reads (the tagged
+      // ones), else the level.
+      auto sourceByRegs = [&](Value l) -> int {
+        int g = sourceOf(l);
+        if (g >= 0 || slrOf.empty())
+          return g;
+        std::map<int, unsigned> regs;
+        unsigned total = 0;
+        DenseSet<Operation *> seen;
+        SmallVector<Value> work{l};
+        while (!work.empty() && seen.size() < 8192) {
+          Value v = work.pop_back_val();
+          Operation *def = v.getDefiningOp();
+          if (!def || !seen.insert(def).second)
+            continue;
+          if (isa<hw::InstanceOp>(def))
+            return -1;  // sourceOf found no majority
+          if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(def)) {
+            ++total;
+            if (auto a = def->getAttrOfType<IntegerAttr>(kSlrAttr))
+              ++regs[a.getInt()];
+            continue;
+          }
+          if (def->getNumRegions() || isa<seq::FirMemReadOp>(def) ||
+              !mlir::isMemoryEffectFree(def))
+            continue;
+          for (Value o : def->getOperands())
+            work.push_back(o);
+        }
+        int best = -1;
+        unsigned bestN = 0;
+        for (auto &[g, n] : regs)
+          if (n > bestN)
+            best = g, bestN = n;
+        return 2 * bestN > total ? best : -1;
+      };
+      // The partials of a decision AND's terms (`prefix`: vpart the
+      // advance's, gpart the go's): each term with a lead goes to its source
+      // group's partial, the others are kept as they are.
+      auto partialize = [&](ArrayRef<Value> ts, StringRef prefix, bool byRegs,
+                            unsigned &nTerms, unsigned &nLeft, unsigned &nRegs,
+                            std::map<int, unsigned> &bySource) -> SmallVector<Value> {
       std::map<int, SmallVector<Value>> leads;
       DenseMap<Value, bool> resetOne;   // a lead's term at its registers' reset values
       SmallVector<Value> kept;
-      for (Value t : terms) {
+      for (Value t : ts) {
         Value l = t.getType().isInteger(1) ? leadOf(t, 0) : Value();
         auto rv = l ? dyn_cast_or_null<IntegerAttr>(resetOf(t)) : IntegerAttr();
         if (!l || !rv) {
           kept.push_back(t);
-          ++partialLeft;
+          ++nLeft;
           continue;
         }
-        int g = sourceOf(l);
+        int g = byRegs ? sourceByRegs(l) : sourceOf(l);
         leads[g].push_back(l);
         resetOne[l] = rv.getValue().isOne();
-        ++partialTerms;
+        ++nTerms;
       }
       // The decision's own late values -- `advance` (the partials' AND,
       // after this) and `go` (the frame's start: every environment
@@ -27720,7 +27767,7 @@ LogicalResult StaticFolder::buildSim() {
         unsigned idx = chunkOf[g]++;
         auto reg = seq::FirRegOp::create(
             b, next, hostClock,
-            b.getStringAttr("vpart" + (g < 0 ? std::string("_level") : "_s" + std::to_string(g)) +
+            b.getStringAttr(prefix + (g < 0 ? std::string("_level") : "_s" + std::to_string(g)) +
                             (idx ? "_" + std::to_string(idx) : std::string())),
             hostReset, constant(1, init), hw::InnerSymAttr{}, /*isAsync=*/false,
             b.getIntegerAttr(b.getI1Type(), init));
@@ -27728,15 +27775,55 @@ LogicalResult StaticFolder::buildSim() {
         if (g >= 0)
           tagGroup(reg, g);
         parts.push_back(reg);
-        ++partialRegs;
+        ++nRegs;
       }
+      for (auto &[g, ls] : leads)
+        bySource[g] += ls.size();
       parts.append(kept.begin(), kept.end());
+      return parts;
+      };
+      // `go-partials`: the frame's start retimed alike, first (its partials'
+      // next values select by the old `go`, which then reads them): `go` is
+      // then an AND of a partial a source group (and the terms of no lead),
+      // the same value in every host cycle, and the late value the advance's
+      // partials select by.
+      if (goPartials && goValue && !goValue.getDefiningOp<hw::ConstantOp>()) {
+        SmallVector<Value> gts;
+        if (auto andOp = goValue.getDefiningOp<comb::AndOp>())
+          gts.assign(andOp->getOperands().begin(), andOp->getOperands().end());
+        else
+          gts.push_back(goValue);
+        unsigned nTerms = 0, nLeft = 0, nRegs = 0;
+        std::map<int, unsigned> bySource;
+        auto gparts = partialize(gts, "gpart", /*byRegs=*/true, nTerms, nLeft, nRegs, bySource);
+        if (nRegs) {
+          Value newGo = gparts.size() == 1 ? gparts[0]
+                                           : Value(comb::AndOp::create(b, gparts, false));
+          Operation *oldGo = goValue.getDefiningOp();
+          goValue.replaceAllUsesWith(newGo);
+          if (oldGo && oldGo->use_empty())
+            oldGo->erase();
+          goValue = newGo;
+        }
+        llvm::errs() << "foldsim-fold-static: go-partials: " << nTerms << " terms in " << nRegs
+                     << " partials (";
+        bool first = true;
+        for (auto &[g, n] : bySource) {
+          llvm::errs() << (first ? "" : ", ") << (g < 0 ? std::string("level") : "group " + std::to_string(g))
+                       << " " << n;
+          first = false;
+        }
+        llvm::errs() << "), " << nLeft << " left as they are (not register logic)\n";
+      }
+      std::map<int, unsigned> bySource;
+      SmallVector<Value> parts = partialize(terms, "vpart", /*byRegs=*/false, partialTerms,
+                                            partialLeft, partialRegs, bySource);
       llvm::errs() << "foldsim-fold-static: advance-partials: " << partialTerms
                    << " terms in " << partialRegs << " partials (";
       bool first = true;
-      for (auto &[g, ls] : leads) {
+      for (auto &[g, n] : bySource) {
         llvm::errs() << (first ? "" : ", ") << (g < 0 ? std::string("level") : "group " + std::to_string(g))
-                     << " " << ls.size();
+                     << " " << n;
         first = false;
       }
       llvm::errs() << "), " << partialLeft << " left as they are (not register logic)\n";
@@ -30814,6 +30901,7 @@ void FoldStaticPass::runOnOperation() {
   folder.advancePartials = advancePartials;
   folder.advancePartialsCofactor = advancePartialsCofactor;
   folder.advancePartialsTerms = advancePartialsTerms;
+  folder.goPartials = goPartials;
   if (advancePartialsAt != "source" && advancePartialsAt != "reader") {
     getOperation().emitError("fold-static: advance-partials-at is source or reader");
     return signalPassFailure();

@@ -86,6 +86,24 @@
 # RUN: %t/g4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/g4/r2.txt
 # RUN: diff %t/g0/r1.txt %t/g4/r1.txt
 # RUN: diff %t/g0/r2.txt %t/g4/r2.txt
+# --go-partials: the frame's start (go) retimed alike, before the advance's:
+# the output's room term (logic over the queue's registers) a host cycle ahead
+# into a partial (`gpart_level`, the level's: no instance output or group
+# register in its lead), the input's token (a port) kept as it is: the same
+# MATCH in the same host cycles.
+# RUN: foldsim --srcs top.f --top Top --out %t/g5 --static --virtual-memories ram --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-group-home --advance-partials --go-partials Leaf > %t/g5.log 2>&1
+# RUN: FileCheck %s --check-prefix=GOLOG < %t/g5.log
+# GOLOG: go-partials: 1 terms in 1 partials (level 1), 1 left as they are
+# GOLOG: advance-partials: 4 terms in 3 partials (level 2, group 0 1, group 1 1), 0 left as they are
+# RUN: FileCheck %s --check-prefix=GOSV < %t/g5/foldsim_sim.sv
+# GOSV-LABEL: module foldsim_sim(
+# GOSV: gpart_level <=
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DCOPIES2 -DIW=1 -Mdir %t/g5/obj %S/Inputs/tb_vmem.sv top.sv %t/g5/foldsim_sim.sv > %t/g5/build.log 2>&1
+# RUN: %t/g5/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | grep MATCH > %t/g5/r1.txt
+# RUN: %t/g5/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=60 +full=30 | grep MATCH > %t/g5/r2.txt
+# RUN: FileCheck %s < %t/g5/r1.txt
+# RUN: diff %t/g0/r1.txt %t/g5/r1.txt
+# RUN: diff %t/g0/r2.txt %t/g5/r2.txt
 # Nested sequencers with bubbles.
 # RUN: foldsim --srcs top.f --top Top --out %t/n0 --static --virtual-memories ram --ready-ahead --room-ahead --nest --bubbles Leaf > /dev/null 2>&1
 # RUN: foldsim --srcs top.f --top Top --out %t/n1 --static --virtual-memories ram --ready-ahead --room-ahead --nest --bubbles --advance-partials Leaf > /dev/null 2>&1
