@@ -30024,8 +30024,9 @@ LogicalResult StaticFolder::extractGroups() {
     constexpr unsigned kConeOps = 1 << 16;
     OpBuilder cb(body->getTerminator());
     Location loc = simModule.getLoc();
-    unsigned expanded = 0, tooMany = 0, tooLarge = 0;
+    unsigned expanded = 0, tooMany = 0, tooLarge = 0, wires = 0;
     uint64_t cloned = 0;
+    DenseMap<Value, Value> keptWire;
     std::map<unsigned, unsigned> byBits;
     // Memo: (value, assignment) -> cofactor; an assignment (late bits and
     // their constants, by value) interned, per partition.
@@ -30148,8 +30149,26 @@ LogicalResult StaticFolder::extractGroups() {
         };
         // The select tree, the first late bit last (nearest the register).
         std::function<Value(unsigned, uint64_t)> select = [&](unsigned i, uint64_t bits) -> Value {
-          if (i == late.size())
-            return cofactor(bits);
+          if (i == late.size()) {
+            // A cofactor of logic behind a kept wire: the canonicalization
+            // (and synthesis) would merge the select into the logic's own
+            // muxes and ANDs, the late bits back at their start.
+            Value c = cofactor(bits);
+            Operation *def = c.getDefiningOp();
+            if (!isLogic(def))
+              return c;
+            Value &w = keptWire[c];
+            if (!w) {
+              auto wire = hw::WireOp::create(cb, loc, c, cb.getStringAttr("xcof"));
+              sv::addSVAttributes(wire, {sv::SVAttributeAttr::get(context, "keep", R"("true")",
+                                                                   /*emitAsComment=*/false)});
+              if (p >= 0)
+                opsOf[p].push_back(wire);
+              w = wire;
+              ++wires;
+            }
+            return w;
+          }
           Value t = select(i + 1, bits | (uint64_t(1) << i));
           Value f = select(i + 1, bits);
           if (t == f)
@@ -30171,7 +30190,7 @@ LogicalResult StaticFolder::extractGroups() {
       llvm::errs() << (first ? "" : ", ") << n << " over " << k;
       first = false;
     }
-    llvm::errs() << "; " << cloned << " ops cloned), " << tooMany << " reading more than "
+    llvm::errs() << "; " << cloned << " ops cloned, " << wires << " kept wires), " << tooMany << " reading more than "
                  << slrCrossCofactor << " left as they are, " << tooLarge << " past "
                  << kConeOps << " ops\n";
   }
