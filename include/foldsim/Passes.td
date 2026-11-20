@@ -1288,8 +1288,10 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "group's terms spread over as many partials as that takes; 0: one "
            "partial a group)">,
     Option<"goPartials", "go-partials", "bool", "false",
-           "With advance-partials: the frame's start (go: every input's token "
-           "and every output's room) retimed alike, before the advance's: each "
+           "The frame's start (go: every input's token and every output's "
+           "room) retimed as advance-partials retimes the advance (before it, "
+           "and with or without virtual memories, where there is no advance "
+           "to retime): each "
            "term whose logic reads only registers (as advance-partials takes "
            "them) a host cycle ahead, the terms of one source group (the group "
            "of the instance outputs, else of the registers, its lead reads) "

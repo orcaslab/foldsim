@@ -422,8 +422,8 @@ def frame_options(a):
             fold += ' advance-partials-cofactor=false'
         if getattr(a, 'advance_partials_terms', None):
             fold += f' advance-partials-terms={a.advance_partials_terms}'
-        if getattr(a, 'go_partials', False):
-            fold += ' go-partials'
+    if getattr(a, 'go_partials', False):
+        fold += ' go-partials'
     if getattr(a, 'room_ahead', False):
         fold += ' room-ahead'
         if getattr(a, 'room_regions', False):
@@ -2578,7 +2578,7 @@ def build_parser():
                          'on read a host cycle ahead into registers (the decision an AND of registers), each '
                          'class\'s bubble register kept apart; the same values (fold-static ready-ahead)')
     ap.add_argument('--go-partials', action='store_true',
-                    help='with --advance-partials: the frame\'s start (go: every input token and output room) '
+                    help='the frame\'s start (go: every input token and output room), with or without virtual memories, '
                          'retimed into partials alike, a register a source group (foldsim-fold-static '
                          'go-partials; the same values): a32-X16 11-19, the folded outputs\' room terms of '
                          'v16kjGsPA crossed SLR1 into every group\'s go through 4 + 6-8 LUT levels')

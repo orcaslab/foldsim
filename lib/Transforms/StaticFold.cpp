@@ -26487,6 +26487,356 @@ LogicalResult StaticFolder::buildSim() {
                                   : Value(comb::AndOp::create(b, goTerms, false));
   go.setValue(goValue);
 
+  // The decision ANDs' retiming (advance-partials, go-partials): the
+  // leads of their terms and the partials built from them.
+      DenseMap<Value, Value> lead;
+      std::function<Value(Value, unsigned)> leadOf = [&](Value v, unsigned depth) -> Value {
+        if (auto it = lead.find(v); it != lead.end())
+          return it->second;
+        Operation *def = v.getDefiningOp();
+        if (!def || depth > 64)
+          return {};
+        Value l;
+        if (auto reg = dyn_cast<seq::FirRegOp>(def)) {
+          if (reg.getIsAsync())
+            return {};
+          if (reg.hasReset()) {
+            if (!reg.getResetValue().getDefiningOp<hw::ConstantOp>())
+              return {};
+            l = comb::MuxOp::create(b, reg.getReset(), reg.getResetValue(), reg.getNext());
+          } else {
+            if (!reg.getPresetAttr())
+              return {};
+            l = reg.getNext();
+          }
+        } else if (def->getNumOperands() == 0 && def->getNumRegions() == 0 &&
+                   mlir::isMemoryEffectFree(def)) {
+          l = v;                        // a constant
+        } else if (def->getNumResults() == 1 && def->getNumRegions() == 0 &&
+                   (def->getDialect()->getNamespace() == "comb" ||
+                    (def->getDialect()->getNamespace() == "hw" &&
+                     !isa<hw::InstanceOp, hw::OutputOp>(def))) &&
+                   mlir::isMemoryEffectFree(def)) {
+          IRMapping map;
+          for (Value o : def->getOperands()) {
+            Value lo = leadOf(o, depth + 1);
+            if (!lo)
+              return {};
+            map.map(o, lo);
+          }
+          Operation *clone = b.clone(*def, map);
+          clone->removeAttr(kSlrAttr);
+          clone->removeAttr(kDomAttr);
+          l = clone->getResult(0);
+        } else {
+          return {};
+        }
+        lead[v] = l;
+        return l;
+      };
+      // The term with every register at its reset value (its preset without
+      // a reset), by the ops' folders: the partial's reset value.
+      DenseMap<Value, Attribute> atReset;
+      std::function<Attribute(Value)> resetOf = [&](Value v) -> Attribute {
+        if (auto it = atReset.find(v); it != atReset.end())
+          return it->second;
+        Operation *def = v.getDefiningOp();
+        if (!def)
+          return {};
+        Attribute r;
+        if (auto c = dyn_cast<hw::ConstantOp>(def)) {
+          r = c.getValueAttr();
+        } else if (auto reg = dyn_cast<seq::FirRegOp>(def)) {
+          if (reg.hasReset()) {
+            auto c = reg.getResetValue().getDefiningOp<hw::ConstantOp>();
+            r = c ? Attribute(c.getValueAttr()) : Attribute();
+          } else {
+            r = reg.getPresetAttr();
+          }
+        } else {
+          SmallVector<Attribute> ins;
+          for (Value o : def->getOperands()) {
+            Attribute a = resetOf(o);
+            if (!a)
+              return {};
+            ins.push_back(a);
+          }
+          SmallVector<OpFoldResult> outs;
+          if (failed(def->fold(ins, outs)) || outs.size() != 1)
+            return {};
+          if (auto a = dyn_cast<Attribute>(outs[0])) {
+            r = a;
+          } else {
+            Value same = cast<Value>(outs[0]);
+            for (auto [o, a] : llvm::zip(def->getOperands(), ins))
+              if (o == same)
+                r = a;
+          }
+        }
+        if (!r)
+          return {};
+        atReset[v] = r;
+        return r;
+      };
+      // A lead's source group: the group of more than half the instance
+      // outputs its logic reads (through logic, not past registers); -1 the
+      // level.
+      auto sourceOf = [&](Value l) -> int {
+        if (slrOf.empty())
+          return -1;
+        std::map<int, DenseSet<Value>> outs;
+        DenseSet<Operation *> seen;
+        SmallVector<Value> work{l};
+        while (!work.empty() && seen.size() < 8192) {
+          Value v = work.pop_back_val();
+          Operation *def = v.getDefiningOp();
+          if (!def)
+            continue;
+          if (isa<hw::InstanceOp>(def)) {
+            if (auto a = def->getAttrOfType<IntegerAttr>(kSlrAttr))
+              outs[a.getInt()].insert(v);
+            continue;
+          }
+          if (def->getNumRegions() || isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp,
+                                           seq::FirMemReadOp>(def) ||
+              !mlir::isMemoryEffectFree(def) || !seen.insert(def).second)
+            continue;
+          for (Value o : def->getOperands())
+            work.push_back(o);
+        }
+        unsigned total = 0, bestN = 0;
+        int best = -1;
+        for (auto &[g, vs] : outs) {
+          total += vs.size();
+          if (vs.size() > bestN)
+            best = g, bestN = vs.size();
+        }
+        return 2 * bestN > total ? best : -1;
+      };
+      // `go-partials`: the source of a term that reads no instance output
+      // (a folded output's room, from counters a group's logic keeps): the
+      // group of more than half the registers its lead reads (the tagged
+      // ones), else the level.
+      auto sourceByRegs = [&](Value l) -> int {
+        int g = sourceOf(l);
+        if (g >= 0 || slrOf.empty())
+          return g;
+        std::map<int, unsigned> regs;
+        unsigned total = 0;
+        DenseSet<Operation *> seen;
+        SmallVector<Value> work{l};
+        while (!work.empty() && seen.size() < 8192) {
+          Value v = work.pop_back_val();
+          Operation *def = v.getDefiningOp();
+          if (!def || !seen.insert(def).second)
+            continue;
+          if (isa<hw::InstanceOp>(def))
+            return -1;  // sourceOf found no majority
+          if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(def)) {
+            // (The level's registers -- the sequencer's -- are replicated
+            // into any group: only the groups' own count.)
+            if (auto a = def->getAttrOfType<IntegerAttr>(kSlrAttr)) {
+              ++regs[a.getInt()];
+              ++total;
+            }
+            continue;
+          }
+          if (def->getNumRegions() || isa<seq::FirMemReadOp>(def) ||
+              !mlir::isMemoryEffectFree(def))
+            continue;
+          for (Value o : def->getOperands())
+            work.push_back(o);
+        }
+        int best = -1;
+        unsigned bestN = 0;
+        for (auto &[g, n] : regs)
+          if (n > bestN)
+            best = g, bestN = n;
+        return 2 * bestN > total ? best : -1;
+      };
+      // The partials of a decision AND's terms (`prefix`: vpart the
+      // advance's, gpart the go's): each term with a lead goes to its source
+      // group's partial, the others are kept as they are.
+      auto partialize = [&](ArrayRef<Value> ts, StringRef prefix, bool byRegs,
+                            unsigned &nTerms, unsigned &nLeft, unsigned &nRegs,
+                            std::map<int, unsigned> &bySource) -> SmallVector<Value> {
+      std::map<int, SmallVector<Value>> leads;
+      DenseMap<Value, bool> resetOne;   // a lead's term at its registers' reset values
+      SmallVector<Value> kept;
+      for (Value t : ts) {
+        Value l = t.getType().isInteger(1) ? leadOf(t, 0) : Value();
+        auto rv = l ? dyn_cast_or_null<IntegerAttr>(resetOf(t)) : IntegerAttr();
+        if (!l || !rv) {
+          kept.push_back(t);
+          ++nLeft;
+          continue;
+        }
+        int g = byRegs ? sourceByRegs(l) : sourceOf(l);
+        leads[g].push_back(l);
+        resetOne[l] = rv.getValue().isOne();
+        ++nTerms;
+      }
+      // The decision's own late values -- `advance` (the partials' AND,
+      // after this) and `go` (the frame's start: every environment
+      // channel's token and room, deep where there are many) -- reach the
+      // leads through their registers' next values. Each partial's next is
+      // built as a select by them of four ANDs, each of the leads with
+      // `advance` and `go` constant (the leads' logic cloned where it reads
+      // them, folded by canonicalization): `advance` and `go` then meet the
+      // partial's register in one LUT, the terms' own logic beside them. The
+      // same function: no value moves. (A lead whose cone is past the clone
+      // budget is ANDed as it is.)
+      SmallVector<Value> late;
+      if (advance)
+        late.push_back(advance);
+      if (goValue && !goValue.getDefiningOp<hw::ConstantOp>())
+        late.push_back(goValue);
+      auto cofactor = [&](Value root, ArrayRef<std::pair<Value, bool>> at) -> Value {
+        DenseMap<Value, Value> memo;
+        for (auto [v, c] : at)
+          memo[v] = constant(1, c);
+        unsigned budget = 1 << 16;
+        std::function<Value(Value)> rec = [&](Value v) -> Value {
+          if (auto it = memo.find(v); it != memo.end())
+            return it->second;
+          Operation *def = v.getDefiningOp();
+          Value r = v;
+          if (def && budget && def->getNumRegions() == 0 && def->getNumOperands() &&
+              (def->getDialect()->getNamespace() == "comb" ||
+               (def->getDialect()->getNamespace() == "hw" &&
+                !isa<hw::InstanceOp, hw::OutputOp>(def))) &&
+              mlir::isMemoryEffectFree(def)) {
+            --budget;
+            IRMapping map;
+            bool changed = false;
+            for (Value o : def->getOperands()) {
+              Value c = rec(o);
+              if (!c)
+                return Value();
+              if (c != o) {
+                map.map(o, c);
+                changed = true;
+              }
+            }
+            if (changed) {
+              Operation *clone = b.clone(*def, map);
+              clone->removeAttr(kSlrAttr);
+              clone->removeAttr(kDomAttr);
+              r = clone->getResult(def->getNumResults() == 1 ? 0 : cast<OpResult>(v).getResultNumber());
+            }
+          } else if (def && !budget) {
+            return Value();
+          }
+          memo[v] = r;
+          return r;
+        };
+        return rec(root);
+      };
+      auto andOf = [&](ArrayRef<Value> ls) -> Value {
+        return ls.size() == 1 ? ls[0] : Value(comb::AndOp::create(b, ls, false));
+      };
+      // The partial's next: the AND of the leads, as a select by the late
+      // values of their cofactors' ANDs.
+      std::function<Value(ArrayRef<Value>, SmallVector<std::pair<Value, bool>>, unsigned)> selectOf =
+          [&](ArrayRef<Value> ls, SmallVector<std::pair<Value, bool>> at, unsigned i) -> Value {
+        if (i == late.size()) {
+          if (at.empty())
+            return andOf(ls);
+          SmallVector<Value> cs;
+          for (Value l : ls) {
+            Value c = cofactor(l, at);
+            if (!c)
+              return Value();
+            cs.push_back(c);
+          }
+          return andOf(cs);
+        }
+        auto on = at, off = at;
+        on.push_back({late[i], true});
+        off.push_back({late[i], false});
+        Value t = selectOf(ls, on, i + 1), f = selectOf(ls, off, i + 1);
+        if (!t || !f)
+          return Value();
+        return comb::MuxOp::create(b, late[i], t, f);
+      };
+      SmallVector<Value> parts;
+      // (`advance-partials-terms` N: a group's terms in partials of at most N
+      // each, so that each partial's AND is shallow; the decision then ANDs
+      // more registers.)
+      std::vector<std::pair<int, SmallVector<Value>>> chunks;
+      for (auto &[g, ls] : leads) {
+        unsigned n = advancePartialsTerms ? advancePartialsTerms : unsigned(ls.size());
+        unsigned k = (ls.size() + n - 1) / n;
+        for (unsigned c = 0; c < k; ++c) {
+          SmallVector<Value> part;
+          for (unsigned i = c; i < ls.size(); i += k)
+            part.push_back(ls[i]);
+          chunks.push_back({g, part});
+        }
+      }
+      std::map<int, unsigned> chunkOf;
+      for (auto &[g, ls] : chunks) {
+        Value next = advancePartialsCofactor ? selectOf(ls, {}, 0) : Value();
+        if (!next)
+          next = andOf(ls);
+        uint64_t init = llvm::all_of(ls, [&](Value l) { return resetOne.lookup(l); }) ? 1 : 0;
+        unsigned idx = chunkOf[g]++;
+        auto reg = seq::FirRegOp::create(
+            b, next, hostClock,
+            b.getStringAttr(prefix + (g < 0 ? std::string("_level") : "_s" + std::to_string(g)) +
+                            (idx ? "_" + std::to_string(idx) : std::string())),
+            hostReset, constant(1, init), hw::InnerSymAttr{}, /*isAsync=*/false,
+            b.getIntegerAttr(b.getI1Type(), init));
+        reg->setAttr(kPartialAttr, UnitAttr::get(context));
+        if (g >= 0)
+          tagGroup(reg, g);
+        parts.push_back(reg);
+        ++nRegs;
+      }
+      for (auto &[g, ls] : leads)
+        bySource[g] += ls.size();
+      parts.append(kept.begin(), kept.end());
+      return parts;
+      };
+  bool goPartialsDone = false;
+  auto runGoPartials = [&]() {
+      // `go-partials`: the frame's start retimed alike, first (its partials'
+      // next values select by the old `go`, which then reads them): `go` is
+      // then an AND of a partial a source group (and the terms of no lead),
+      // the same value in every host cycle, and the late value the advance's
+      // partials select by.
+      if (goPartialsDone || !goPartials || !goValue || goValue.getDefiningOp<hw::ConstantOp>())
+        return;
+      goPartialsDone = true;
+      {
+        SmallVector<Value> gts;
+        if (auto andOp = goValue.getDefiningOp<comb::AndOp>())
+          gts.assign(andOp->getOperands().begin(), andOp->getOperands().end());
+        else
+          gts.push_back(goValue);
+        unsigned nTerms = 0, nLeft = 0, nRegs = 0;
+        std::map<int, unsigned> bySource;
+        auto gparts = partialize(gts, "gpart", /*byRegs=*/true, nTerms, nLeft, nRegs, bySource);
+        if (nRegs) {
+          Value newGo = gparts.size() == 1 ? gparts[0]
+                                           : Value(comb::AndOp::create(b, gparts, false));
+          Operation *oldGo = goValue.getDefiningOp();
+          goValue.replaceAllUsesWith(newGo);
+          if (oldGo && oldGo->use_empty())
+            oldGo->erase();
+          goValue = newGo;
+        }
+        llvm::errs() << "foldsim-fold-static: go-partials: " << nTerms << " terms in " << nRegs
+                     << " partials (";
+        bool first = true;
+        for (auto &[g, n] : bySource) {
+          llvm::errs() << (first ? "" : ", ") << (g < 0 ? std::string("level") : "group " + std::to_string(g))
+                       << " " << n;
+          first = false;
+        }
+        llvm::errs() << "), " << nLeft << " left as they are (not register logic)\n";
+      }
+  };
   // A position runs only when, for each class of virtual memories, the
   // instance it loads has no read pending, and each controller has room for
   // the requests the decisions in flight may issue. It is the position after
@@ -27520,348 +27870,7 @@ LogicalResult StaticFolder::buildSim() {
     // decision ANDs the partials, the same value in every host cycle.
     // (Only this AND moves; the term registers keep their other readers.)
     if (advancePartials && !terms.empty()) {
-      DenseMap<Value, Value> lead;
-      std::function<Value(Value, unsigned)> leadOf = [&](Value v, unsigned depth) -> Value {
-        if (auto it = lead.find(v); it != lead.end())
-          return it->second;
-        Operation *def = v.getDefiningOp();
-        if (!def || depth > 64)
-          return {};
-        Value l;
-        if (auto reg = dyn_cast<seq::FirRegOp>(def)) {
-          if (reg.getIsAsync())
-            return {};
-          if (reg.hasReset()) {
-            if (!reg.getResetValue().getDefiningOp<hw::ConstantOp>())
-              return {};
-            l = comb::MuxOp::create(b, reg.getReset(), reg.getResetValue(), reg.getNext());
-          } else {
-            if (!reg.getPresetAttr())
-              return {};
-            l = reg.getNext();
-          }
-        } else if (def->getNumOperands() == 0 && def->getNumRegions() == 0 &&
-                   mlir::isMemoryEffectFree(def)) {
-          l = v;                        // a constant
-        } else if (def->getNumResults() == 1 && def->getNumRegions() == 0 &&
-                   (def->getDialect()->getNamespace() == "comb" ||
-                    (def->getDialect()->getNamespace() == "hw" &&
-                     !isa<hw::InstanceOp, hw::OutputOp>(def))) &&
-                   mlir::isMemoryEffectFree(def)) {
-          IRMapping map;
-          for (Value o : def->getOperands()) {
-            Value lo = leadOf(o, depth + 1);
-            if (!lo)
-              return {};
-            map.map(o, lo);
-          }
-          Operation *clone = b.clone(*def, map);
-          clone->removeAttr(kSlrAttr);
-          clone->removeAttr(kDomAttr);
-          l = clone->getResult(0);
-        } else {
-          return {};
-        }
-        lead[v] = l;
-        return l;
-      };
-      // The term with every register at its reset value (its preset without
-      // a reset), by the ops' folders: the partial's reset value.
-      DenseMap<Value, Attribute> atReset;
-      std::function<Attribute(Value)> resetOf = [&](Value v) -> Attribute {
-        if (auto it = atReset.find(v); it != atReset.end())
-          return it->second;
-        Operation *def = v.getDefiningOp();
-        if (!def)
-          return {};
-        Attribute r;
-        if (auto c = dyn_cast<hw::ConstantOp>(def)) {
-          r = c.getValueAttr();
-        } else if (auto reg = dyn_cast<seq::FirRegOp>(def)) {
-          if (reg.hasReset()) {
-            auto c = reg.getResetValue().getDefiningOp<hw::ConstantOp>();
-            r = c ? Attribute(c.getValueAttr()) : Attribute();
-          } else {
-            r = reg.getPresetAttr();
-          }
-        } else {
-          SmallVector<Attribute> ins;
-          for (Value o : def->getOperands()) {
-            Attribute a = resetOf(o);
-            if (!a)
-              return {};
-            ins.push_back(a);
-          }
-          SmallVector<OpFoldResult> outs;
-          if (failed(def->fold(ins, outs)) || outs.size() != 1)
-            return {};
-          if (auto a = dyn_cast<Attribute>(outs[0])) {
-            r = a;
-          } else {
-            Value same = cast<Value>(outs[0]);
-            for (auto [o, a] : llvm::zip(def->getOperands(), ins))
-              if (o == same)
-                r = a;
-          }
-        }
-        if (!r)
-          return {};
-        atReset[v] = r;
-        return r;
-      };
-      // A lead's source group: the group of more than half the instance
-      // outputs its logic reads (through logic, not past registers); -1 the
-      // level.
-      auto sourceOf = [&](Value l) -> int {
-        if (slrOf.empty())
-          return -1;
-        std::map<int, DenseSet<Value>> outs;
-        DenseSet<Operation *> seen;
-        SmallVector<Value> work{l};
-        while (!work.empty() && seen.size() < 8192) {
-          Value v = work.pop_back_val();
-          Operation *def = v.getDefiningOp();
-          if (!def)
-            continue;
-          if (isa<hw::InstanceOp>(def)) {
-            if (auto a = def->getAttrOfType<IntegerAttr>(kSlrAttr))
-              outs[a.getInt()].insert(v);
-            continue;
-          }
-          if (def->getNumRegions() || isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp,
-                                           seq::FirMemReadOp>(def) ||
-              !mlir::isMemoryEffectFree(def) || !seen.insert(def).second)
-            continue;
-          for (Value o : def->getOperands())
-            work.push_back(o);
-        }
-        unsigned total = 0, bestN = 0;
-        int best = -1;
-        for (auto &[g, vs] : outs) {
-          total += vs.size();
-          if (vs.size() > bestN)
-            best = g, bestN = vs.size();
-        }
-        return 2 * bestN > total ? best : -1;
-      };
-      // `go-partials`: the source of a term that reads no instance output
-      // (a folded output's room, from counters a group's logic keeps): the
-      // group of more than half the registers its lead reads (the tagged
-      // ones), else the level.
-      auto sourceByRegs = [&](Value l) -> int {
-        int g = sourceOf(l);
-        if (g >= 0 || slrOf.empty())
-          return g;
-        std::map<int, unsigned> regs;
-        unsigned total = 0;
-        DenseSet<Operation *> seen;
-        SmallVector<Value> work{l};
-        while (!work.empty() && seen.size() < 8192) {
-          Value v = work.pop_back_val();
-          Operation *def = v.getDefiningOp();
-          if (!def || !seen.insert(def).second)
-            continue;
-          if (isa<hw::InstanceOp>(def))
-            return -1;  // sourceOf found no majority
-          if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(def)) {
-            // (The level's registers -- the sequencer's -- are replicated
-            // into any group: only the groups' own count.)
-            if (auto a = def->getAttrOfType<IntegerAttr>(kSlrAttr)) {
-              ++regs[a.getInt()];
-              ++total;
-            }
-            continue;
-          }
-          if (def->getNumRegions() || isa<seq::FirMemReadOp>(def) ||
-              !mlir::isMemoryEffectFree(def))
-            continue;
-          for (Value o : def->getOperands())
-            work.push_back(o);
-        }
-        int best = -1;
-        unsigned bestN = 0;
-        for (auto &[g, n] : regs)
-          if (n > bestN)
-            best = g, bestN = n;
-        return 2 * bestN > total ? best : -1;
-      };
-      // The partials of a decision AND's terms (`prefix`: vpart the
-      // advance's, gpart the go's): each term with a lead goes to its source
-      // group's partial, the others are kept as they are.
-      auto partialize = [&](ArrayRef<Value> ts, StringRef prefix, bool byRegs,
-                            unsigned &nTerms, unsigned &nLeft, unsigned &nRegs,
-                            std::map<int, unsigned> &bySource) -> SmallVector<Value> {
-      std::map<int, SmallVector<Value>> leads;
-      DenseMap<Value, bool> resetOne;   // a lead's term at its registers' reset values
-      SmallVector<Value> kept;
-      for (Value t : ts) {
-        Value l = t.getType().isInteger(1) ? leadOf(t, 0) : Value();
-        auto rv = l ? dyn_cast_or_null<IntegerAttr>(resetOf(t)) : IntegerAttr();
-        if (!l || !rv) {
-          kept.push_back(t);
-          ++nLeft;
-          continue;
-        }
-        int g = byRegs ? sourceByRegs(l) : sourceOf(l);
-        leads[g].push_back(l);
-        resetOne[l] = rv.getValue().isOne();
-        ++nTerms;
-      }
-      // The decision's own late values -- `advance` (the partials' AND,
-      // after this) and `go` (the frame's start: every environment
-      // channel's token and room, deep where there are many) -- reach the
-      // leads through their registers' next values. Each partial's next is
-      // built as a select by them of four ANDs, each of the leads with
-      // `advance` and `go` constant (the leads' logic cloned where it reads
-      // them, folded by canonicalization): `advance` and `go` then meet the
-      // partial's register in one LUT, the terms' own logic beside them. The
-      // same function: no value moves. (A lead whose cone is past the clone
-      // budget is ANDed as it is.)
-      SmallVector<Value> late;
-      if (advance)
-        late.push_back(advance);
-      if (goValue && !goValue.getDefiningOp<hw::ConstantOp>())
-        late.push_back(goValue);
-      auto cofactor = [&](Value root, ArrayRef<std::pair<Value, bool>> at) -> Value {
-        DenseMap<Value, Value> memo;
-        for (auto [v, c] : at)
-          memo[v] = constant(1, c);
-        unsigned budget = 1 << 16;
-        std::function<Value(Value)> rec = [&](Value v) -> Value {
-          if (auto it = memo.find(v); it != memo.end())
-            return it->second;
-          Operation *def = v.getDefiningOp();
-          Value r = v;
-          if (def && budget && def->getNumRegions() == 0 && def->getNumOperands() &&
-              (def->getDialect()->getNamespace() == "comb" ||
-               (def->getDialect()->getNamespace() == "hw" &&
-                !isa<hw::InstanceOp, hw::OutputOp>(def))) &&
-              mlir::isMemoryEffectFree(def)) {
-            --budget;
-            IRMapping map;
-            bool changed = false;
-            for (Value o : def->getOperands()) {
-              Value c = rec(o);
-              if (!c)
-                return Value();
-              if (c != o) {
-                map.map(o, c);
-                changed = true;
-              }
-            }
-            if (changed) {
-              Operation *clone = b.clone(*def, map);
-              clone->removeAttr(kSlrAttr);
-              clone->removeAttr(kDomAttr);
-              r = clone->getResult(def->getNumResults() == 1 ? 0 : cast<OpResult>(v).getResultNumber());
-            }
-          } else if (def && !budget) {
-            return Value();
-          }
-          memo[v] = r;
-          return r;
-        };
-        return rec(root);
-      };
-      auto andOf = [&](ArrayRef<Value> ls) -> Value {
-        return ls.size() == 1 ? ls[0] : Value(comb::AndOp::create(b, ls, false));
-      };
-      // The partial's next: the AND of the leads, as a select by the late
-      // values of their cofactors' ANDs.
-      std::function<Value(ArrayRef<Value>, SmallVector<std::pair<Value, bool>>, unsigned)> selectOf =
-          [&](ArrayRef<Value> ls, SmallVector<std::pair<Value, bool>> at, unsigned i) -> Value {
-        if (i == late.size()) {
-          if (at.empty())
-            return andOf(ls);
-          SmallVector<Value> cs;
-          for (Value l : ls) {
-            Value c = cofactor(l, at);
-            if (!c)
-              return Value();
-            cs.push_back(c);
-          }
-          return andOf(cs);
-        }
-        auto on = at, off = at;
-        on.push_back({late[i], true});
-        off.push_back({late[i], false});
-        Value t = selectOf(ls, on, i + 1), f = selectOf(ls, off, i + 1);
-        if (!t || !f)
-          return Value();
-        return comb::MuxOp::create(b, late[i], t, f);
-      };
-      SmallVector<Value> parts;
-      // (`advance-partials-terms` N: a group's terms in partials of at most N
-      // each, so that each partial's AND is shallow; the decision then ANDs
-      // more registers.)
-      std::vector<std::pair<int, SmallVector<Value>>> chunks;
-      for (auto &[g, ls] : leads) {
-        unsigned n = advancePartialsTerms ? advancePartialsTerms : unsigned(ls.size());
-        unsigned k = (ls.size() + n - 1) / n;
-        for (unsigned c = 0; c < k; ++c) {
-          SmallVector<Value> part;
-          for (unsigned i = c; i < ls.size(); i += k)
-            part.push_back(ls[i]);
-          chunks.push_back({g, part});
-        }
-      }
-      std::map<int, unsigned> chunkOf;
-      for (auto &[g, ls] : chunks) {
-        Value next = advancePartialsCofactor ? selectOf(ls, {}, 0) : Value();
-        if (!next)
-          next = andOf(ls);
-        uint64_t init = llvm::all_of(ls, [&](Value l) { return resetOne.lookup(l); }) ? 1 : 0;
-        unsigned idx = chunkOf[g]++;
-        auto reg = seq::FirRegOp::create(
-            b, next, hostClock,
-            b.getStringAttr(prefix + (g < 0 ? std::string("_level") : "_s" + std::to_string(g)) +
-                            (idx ? "_" + std::to_string(idx) : std::string())),
-            hostReset, constant(1, init), hw::InnerSymAttr{}, /*isAsync=*/false,
-            b.getIntegerAttr(b.getI1Type(), init));
-        reg->setAttr(kPartialAttr, UnitAttr::get(context));
-        if (g >= 0)
-          tagGroup(reg, g);
-        parts.push_back(reg);
-        ++nRegs;
-      }
-      for (auto &[g, ls] : leads)
-        bySource[g] += ls.size();
-      parts.append(kept.begin(), kept.end());
-      return parts;
-      };
-      // `go-partials`: the frame's start retimed alike, first (its partials'
-      // next values select by the old `go`, which then reads them): `go` is
-      // then an AND of a partial a source group (and the terms of no lead),
-      // the same value in every host cycle, and the late value the advance's
-      // partials select by.
-      if (goPartials && goValue && !goValue.getDefiningOp<hw::ConstantOp>()) {
-        SmallVector<Value> gts;
-        if (auto andOp = goValue.getDefiningOp<comb::AndOp>())
-          gts.assign(andOp->getOperands().begin(), andOp->getOperands().end());
-        else
-          gts.push_back(goValue);
-        unsigned nTerms = 0, nLeft = 0, nRegs = 0;
-        std::map<int, unsigned> bySource;
-        auto gparts = partialize(gts, "gpart", /*byRegs=*/true, nTerms, nLeft, nRegs, bySource);
-        if (nRegs) {
-          Value newGo = gparts.size() == 1 ? gparts[0]
-                                           : Value(comb::AndOp::create(b, gparts, false));
-          Operation *oldGo = goValue.getDefiningOp();
-          goValue.replaceAllUsesWith(newGo);
-          if (oldGo && oldGo->use_empty())
-            oldGo->erase();
-          goValue = newGo;
-        }
-        llvm::errs() << "foldsim-fold-static: go-partials: " << nTerms << " terms in " << nRegs
-                     << " partials (";
-        bool first = true;
-        for (auto &[g, n] : bySource) {
-          llvm::errs() << (first ? "" : ", ") << (g < 0 ? std::string("level") : "group " + std::to_string(g))
-                       << " " << n;
-          first = false;
-        }
-        llvm::errs() << "), " << nLeft << " left as they are (not register logic)\n";
-      }
+      runGoPartials();
       std::map<int, unsigned> bySource;
       SmallVector<Value> parts = partialize(terms, "vpart", /*byRegs=*/false, partialTerms,
                                             partialLeft, partialRegs, bySource);
@@ -27878,6 +27887,8 @@ LogicalResult StaticFolder::buildSim() {
     }
     virtualReady.setValue(comb::AndOp::create(b, terms, false));
   }
+  // (Without virtual memories, or without advance-partials, go alone.)
+  runGoPartials();
 
   // Ports out: finishes, the inputs' readies, then the outputs' channels.
   SmallVector<Value> finishes;

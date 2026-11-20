@@ -108,6 +108,20 @@
 # ES2: {{^}}MATCH 196 cycles in 15133 host cycles
 # ES3: {{^}}MATCH 196 cycles in 72451 host cycles
 # ESM: {{^}}MISMATCH
+# --go-partials without virtual memories (a32-X16 11-19, R48's 4-SM rebuild:
+# with no advance to retime, the go AND stayed logic, and the folded outputs'
+# room terms -- compares of group 0's position -- crossed into the level's
+# and every group's go through 4 + 4-5 LUT levels): the room terms of the
+# folded outputs, built in group 2, are a partial there (gpart_s2), the
+# inputs' tokens kept; the same MATCH in the same host cycles.
+# RUN: foldsim --srcs top.f --top Top --out %t/eg --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-ports --slr-group-env --slr-group-own 1000 --slr-env-home --slr-cross-cofactor 3 --slr-group-outputs --go-partials Unit > %t/eg.log 2>&1
+# RUN: FileCheck %s --check-prefix=EGLOG < %t/eg.log
+# EGLOG: go-partials: 21 terms in 1 partials (group 2 21), 10 left as they are
+# RUN: sed -n '/^module foldsim_sim_slr2(/,/^endmodule/p' %t/eg/foldsim_sim.sv | FileCheck %s --check-prefix=EGSV
+# EGSV: gpart_s2{{(_[0-9]+)?}} <=
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/eg -Mdir %t/eg/obj %S/Inputs/tb_ports.sv top.sv %t/eg/foldsim_sim.sv > %t/eg/build.log 2>&1
+# RUN: %t/eg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s --check-prefix=EH2
+# RUN: %t/eg/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=EH3
 # RUN: not foldsim --srcs top.f --top Top --out %t/e1 --static --nest --modulo --fold-ports 'mp_([13])_(.*)' --fold-ports-reset rst Unit 2>&1 | FileCheck %s --check-prefix=NUM
 # RUN: not foldsim --srcs top.f --top Top --out %t/e2 --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset nosuch Unit 2>&1 | FileCheck %s --check-prefix=RST
 # OFF: `define FOLDSIM_NUM_CLASSES
