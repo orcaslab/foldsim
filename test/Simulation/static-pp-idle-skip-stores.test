@@ -1,0 +1,36 @@
+# REQUIRES: verilator
+# --pp-idle-skip with a PP class's stores (state-in-ram-pp's stored registers, kept apart from the rows): an
+# evaluation is clean only where neither its rows nor its stores changed. Driver/Inputs/idle/top_stores.sv: eight
+# SNodes in a chain behind a pulse source; a node's token bit, burst counter and output token are narrow
+# registers of the wide register's group, so they leave the rows for stores, and a token's arrival changes only
+# them (its producer, whose burst ended with the token's toggle the frame before, is clean). Exact against the
+# target at latencies 1-60 with stalls and full controllers, P = 2 and P = 4 on page engines; node 0 reads the
+# source (no clean bits), so 7 of 8 decide; skips happen.
+# FOLDSIM_IDLE_SKIP_MUTANT=3 (the stores' change left out of the clean bit) mismatches: the node skips its burst.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/idle
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top_stores.f --top Top --out %t/a --static --state-in-ram SNode::2 --state-in-ram-pp --state-scratch-bits 0 --pp-dirty-writeback --pp-idle-skip SNode Src Sink > %t/a.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/a.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/a -DFOLDSIM_SKIP_TRACE -Mdir %t/a/obj %S/Inputs/tb_pages.sv nodes.sv stores.sv top_stores.sv %t/a/foldsim_sim.sv > %t/a/build.log 2>&1
+# RUN: %t/a/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 > %t/a/r1.log
+# RUN: FileCheck %s < %t/a/r1.log
+# RUN: grep -c "idle-skip: SNode" %t/a/r1.log | FileCheck %s --check-prefix=SKIPS
+# RUN: %t/a/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
+# P = 4, page engines, nest and modulo.
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top_stores.f --top Top --out %t/e --static --nest --modulo --state-in-ram SNode::4 --state-in-ram-pp --state-scratch-bits 0 --page-engines 4 --page-engines-pp --pp-dirty-writeback --pp-idle-skip SNode Src Sink > %t/e.log 2>&1
+# RUN: FileCheck %s --check-prefix=LOG < %t/e.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/e -DFOLDSIM_SKIP_TRACE -Mdir %t/e/obj %S/Inputs/tb_pages.sv nodes.sv stores.sv top_stores.sv %t/e/foldsim_sim.sv > %t/e/build.log 2>&1
+# RUN: %t/e/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=1 +hi=60 +stall=20 +full=20 > %t/e/r.log
+# RUN: FileCheck %s < %t/e/r.log
+# RUN: grep -c "idle-skip: SNode" %t/e/r.log | FileCheck %s --check-prefix=SKIPS
+# Mutant: the stores' change left out.
+# RUN: env FOLDSIM_IDLE_SKIP_MUTANT=3 FOLDSIM_PP_ROWS=balanced foldsim --srcs top_stores.f --top Top --out %t/x3 --static --state-in-ram SNode::2 --state-in-ram-pp --state-scratch-bits 0 --pp-dirty-writeback --pp-idle-skip SNode Src Sink > %t/x3.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/x3 -Mdir %t/x3/obj %S/Inputs/tb_pages.sv nodes.sv stores.sv top_stores.sv %t/x3/foldsim_sim.sv > %t/x3/build.log 2>&1
+# RUN: %t/x3/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=BAD
+
+# LOG: pp-idle-skip: 1 classes keep clean bits, 1 may skip
+# LOG: state-in-ram-pp: SNode: {{.*}} 3 narrow registers
+# LOG: pp-idle-skip: SNode: 7 of 8 instances decide
+# SKIPS: {{^[1-9][0-9][0-9]+$}}
+# BAD: {{^}}MISMATCH
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL
