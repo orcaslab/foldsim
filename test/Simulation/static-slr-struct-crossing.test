@@ -1,0 +1,22 @@
+# REQUIRES: verilator
+# A link between SLR groups that carries an aggregate output (a packed
+# struct): the producer's bits are read through a bitcast, which must be the
+# producer group's (S30c, 11-19: at 16 SMs the bitcast of a 4 x 673-bit
+# request landed in the reader's group, and the whole output crossed SLR1 ->
+# SLR0 and back, 24 x 2,692 bits at the group ports). Two copies of Leaf in
+# two groups, its output a struct: each copy's bitcast is in its own group's
+# domain, no group port is a struct or array (the link crosses as its packed
+# bits, once), and the fold MATCHes.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/vmemstruct
+# RUN: foldsim --srcs top.f --top Top --out %t/s --static --virtual-memories ram --ready-ahead --room-ahead --copies Leaf:2 --slr-groups --slr-count 2 --slr-assign Leaf:0,Leaf_copy1:1 --slr-group-control --slr-group-reset --slr-group-local 1000 --slr-group-own 1000 --slr-serialize 2 --physical-domains Leaf > %t/s.log 2>&1
+# RUN: FileCheck %s --check-prefix=IR < %t/s/foldsim_sim.mlir
+# IR-LABEL: hw.module private @foldsim_sim_dom_Leaf(
+# IR: hw.bitcast %Leaf_copy.q : (!hw.struct<hi: i4, lo: i4>) -> i8
+# IR-LABEL: hw.module private @foldsim_sim_slr0(
+# IR-LABEL: hw.module private @foldsim_sim_dom_Leaf_copy1(
+# IR: hw.bitcast %Leaf_copy1_copy.q : (!hw.struct<hi: i4, lo: i4>) -> i8
+# IR-LABEL: hw.module private @foldsim_sim_slr1(
+# RUN: grep -E '^ *hw.module private @foldsim_sim_slr[0-9]+\(' %t/s/foldsim_sim.mlir | not grep -E 'hw\.(struct|array)'
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -DRNG_STREAMS -DCOPIES2 -DIW=1 -Mdir %t/s/obj %S/Inputs/tb_vmem.sv top.sv %t/s/foldsim_sim.sv > %t/s/build.log 2>&1
+# RUN: %t/s/obj/Vtb +verilator+rand+reset+0 +verilator+seed+4 +lo=1 +hi=40 +stall=30 +full=10 | FileCheck %s
+# CHECK: {{^}}MATCH 196 cycles

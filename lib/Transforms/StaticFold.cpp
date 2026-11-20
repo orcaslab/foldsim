@@ -23159,6 +23159,16 @@ LogicalResult StaticFolder::buildSim() {
       return v;
     };
     Value bits = asBits(b, copies[c].getResult(producer.port));
+    // A crossing reads the producer's bits in the producer's group: the
+    // bitcast of an aggregate output (struct, array) is the producer's too,
+    // else it lands in the reader's group and the whole output crosses there
+    // and back (a round trip of its full width over the boundary).
+    if (crossing)
+      if (auto cast = bits.getDefiningOp<hw::BitcastOp>()) {
+        tagGroup(cast, slrOf[c]);
+        if (physicalDomains)
+          tagDomain(cast, int(c));
+      }
     std::string baseName = linkName.str();
     SmallVector<Value> pieces, nowPieces;
     for (unsigned at = 0; at < width; at += regionBits) {
