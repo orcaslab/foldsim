@@ -23590,7 +23590,7 @@ LogicalResult StaticFolder::buildSim() {
       if (cls.idleSkip || !cls.pp || !cls.ppHbm)
         continue;
       // (Each count on its own: an instance may have several; and the
-      // environment inputs by port.)
+      // netlist's inputs it reads.)
       unsigned n = cls.threads(), why[3] = {0, 0, 0}, ok = 0;
       std::map<std::string, unsigned> envPorts;
       for (unsigned i = 0; i < n; ++i) {
@@ -23606,7 +23606,7 @@ LogicalResult StaticFolder::buildSim() {
             if (r >= 0)
               has[r] = true;
             if (r == 0)
-              ++envPorts[cls.model.getInputName(unsigned(k)).str()];
+              ++envPorts[pr.name];
           }
         }
         for (unsigned r = 0; r < 3; ++r)
