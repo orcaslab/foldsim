@@ -85,6 +85,29 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/ec -Mdir %t/ec/obj %S/Inputs/tb_ports.sv top.sv %t/ec/foldsim_sim.sv > %t/ec/build.log 2>&1
 # RUN: %t/ec/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s --check-prefix=EH2
 # RUN: %t/ec/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=EH3
+# --slr-cross-select (with --slr-serialize 2, whose links read the crossing
+# chunk through a forwarding select): the selects of crossing data registered a
+# host cycle ahead (the read registers' `_sel_ahead`): the same MATCH in the
+# same host cycles as without; a mutant whose select register is a host cycle
+# late (FOLDSIM_SELECT_MUTANT=1) MISMATCHes.
+# RUN: foldsim --srcs top.f --top Top --out %t/es0 --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-ports --slr-group-env --slr-group-own 1000 --slr-env-home --slr-cross-cofactor 3 --slr-group-outputs --slr-serialize 2 Unit > %t/es0.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/es --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-ports --slr-group-env --slr-group-own 1000 --slr-env-home --slr-cross-cofactor 3 --slr-group-outputs --slr-serialize 2 --slr-cross-select Unit > %t/es.log 2>&1
+# RUN: env FOLDSIM_SELECT_MUTANT=1 foldsim --srcs top.f --top Top --out %t/esm --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-ports --slr-group-env --slr-group-own 1000 --slr-env-home --slr-cross-cofactor 3 --slr-group-outputs --slr-serialize 2 --slr-cross-select Unit > %t/esm.log 2>&1
+# RUN: FileCheck %s --check-prefix=ESLOG < %t/es.log
+# ESLOG: slr-cross-select: 2 selects of crossing data registered a host cycle ahead
+# RUN: FileCheck %s --check-prefix=ESSV < %t/es/foldsim_sim.sv
+# ESSV: _sel_ahead
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/es0 -Mdir %t/es0/obj %S/Inputs/tb_ports.sv top.sv %t/es0/foldsim_sim.sv > %t/es0/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/es -Mdir %t/es/obj %S/Inputs/tb_ports.sv top.sv %t/es/foldsim_sim.sv > %t/es/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/esm -Mdir %t/esm/obj %S/Inputs/tb_ports.sv top.sv %t/esm/foldsim_sim.sv > %t/esm/build.log 2>&1
+# RUN: %t/es0/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s --check-prefix=ES2
+# RUN: %t/es/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s --check-prefix=ES2
+# RUN: %t/es0/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=ES3
+# RUN: %t/es/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=ES3
+# RUN: %t/esm/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s --check-prefix=ESM
+# ES2: {{^}}MATCH 196 cycles in 15133 host cycles
+# ES3: {{^}}MATCH 196 cycles in 72451 host cycles
+# ESM: {{^}}MISMATCH
 # RUN: not foldsim --srcs top.f --top Top --out %t/e1 --static --nest --modulo --fold-ports 'mp_([13])_(.*)' --fold-ports-reset rst Unit 2>&1 | FileCheck %s --check-prefix=NUM
 # RUN: not foldsim --srcs top.f --top Top --out %t/e2 --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset nosuch Unit 2>&1 | FileCheck %s --check-prefix=RST
 # OFF: `define FOLDSIM_NUM_CLASSES

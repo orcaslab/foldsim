@@ -947,6 +947,9 @@ public:
   unsigned slrCrossCofactor = 0;
   /// `slr-group-outputs`: an unfolded output a group produces built there.
   bool slrGroupOutputs = false;
+  /// `slr-cross-select`: a select of crossing data registered a host cycle
+  /// ahead.
+  bool slrCrossSelect = false;
   unsigned outputsGrouped = 0;
   /// `physical-domains`: the simulator as a tree of modules mirroring the
   /// class tree (extractDomains).
@@ -30194,6 +30197,150 @@ LogicalResult StaticFolder::extractGroups() {
                  << slrCrossCofactor << " left as they are, " << tooLarge << " past "
                  << kConeOps << " ops\n";
   }
+  // `slr-cross-select`: a register whose next value is a select of data
+  // that another partition drives (a link read forwarding the crossing
+  // write: mux(ready_late & inst_late == addr, crossing chunk, link read))
+  // takes the select from a register of its own, loaded with the select's
+  // logic over its registers' next values: the crossing data then meets the
+  // register through the select's LUT alone, the compare a host cycle ahead.
+  // Only a select whose registers have neither reset nor preset (pipeline
+  // registers, undefined until written): the select register holds the
+  // select's value in every host cycle after the first, and in the first
+  // both are undefined alike.
+  if (slrCrossSelect) {
+    DenseMap<Operation *, int> partOf;
+    for (unsigned g = 0; g < slrGroups; ++g)
+      for (auto *op : opsOf[g])
+        partOf[op] = g;
+    auto part = [&](Value v) -> int {
+      auto *def = v.getDefiningOp();
+      if (!def)
+        return -1;
+      auto it = partOf.find(def);
+      return it == partOf.end() ? -1 : it->second;
+    };
+    auto isLogic = [&](Operation *op) {
+      return op && op->getNumRegions() == 0 && op->getNumOperands() &&
+             !isa<hw::InstanceOp, hw::OutputOp>(op) &&
+             (op->getDialect()->getNamespace() == "comb" ||
+              op->getDialect()->getNamespace() == "hw") &&
+             mlir::isMemoryEffectFree(op);
+    };
+    auto isWiring = [&](Operation *op) {
+      return op && isa<comb::ConcatOp, comb::ExtractOp, hw::BitcastOp, hw::StructCreateOp,
+                       hw::StructExtractOp, hw::ArrayCreateOp, hw::ArrayConcatOp,
+                       comb::ReplicateOp>(op);
+    };
+    // Whether `v` carries bits another partition than `p` drives, through
+    // wiring alone.
+    auto crosses = [&](Value v, int p) {
+      SmallVector<Value> work{v};
+      DenseSet<Value> seen;
+      while (!work.empty()) {
+        Value x = work.pop_back_val();
+        if (!seen.insert(x).second || seen.size() > 256)
+          continue;
+        if (part(x) != p)
+          return true;
+        Operation *def = x.getDefiningOp();
+        if (isWiring(def))
+          for (Value o : def->getOperands())
+            work.push_back(o);
+      }
+      return false;
+    };
+    OpBuilder sb(body->getTerminator());
+    Location loc = simModule.getLoc();
+    Value clk = body->getArgument(0);
+    DenseMap<Value, Value> aheadOf;  // a select -> its register
+    unsigned built = 0, shared = 0, refused = 0;
+    SmallVector<seq::FirRegOp> regs;
+    for (auto &op : body->without_terminator())
+      if (auto r = dyn_cast<seq::FirRegOp>(op))
+        regs.push_back(r);
+    // (The muxes of a register's next value: itself, or its concat's parts,
+    // a link read of several chunks.)
+    SmallVector<std::pair<seq::FirRegOp, comb::MuxOp>> muxes;
+    for (auto reg : regs) {
+      Value next = reg.getNext();
+      if (auto m = next.getDefiningOp<comb::MuxOp>())
+        muxes.push_back({reg, m});
+      else if (auto c = next.getDefiningOp<comb::ConcatOp>())
+        for (Value o : c.getOperands())
+          if (auto m = o.getDefiningOp<comb::MuxOp>())
+            muxes.push_back({reg, m});
+    }
+    for (auto [reg, mux] : muxes) {
+      int p = partOf.count(reg) ? partOf[reg] : -1;
+      if (part(mux) != p || !mux.getCond().getType().isInteger(1))
+        continue;
+      if (!crosses(mux.getTrueValue(), p) && !crosses(mux.getFalseValue(), p))
+        continue;
+      Value sel = mux.getCond();
+      if (Value s = aheadOf.lookup(sel)) {
+        mux.getCondMutable().assign(s);
+        ++shared;
+        continue;
+      }
+      Operation *selDef = sel.getDefiningOp();
+      if (!isLogic(selDef) || part(sel) != p)
+        continue;
+      // The select's lead: its logic over its registers' next values.
+      DenseMap<Value, Value> lead;
+      bool ok = true;
+      unsigned ops = 0;
+      std::function<Value(Value)> leadOf = [&](Value v) -> Value {
+        if (auto it = lead.find(v); it != lead.end())
+          return it->second;
+        Operation *def = v.getDefiningOp();
+        Value l;
+        if (def && isa<hw::ConstantOp>(def)) {
+          l = v;
+        } else if (auto r = dyn_cast_or_null<seq::FirRegOp>(def)) {
+          if (part(v) != p || r.getClk() != clk || r.hasReset() || r.getPresetAttr())
+            return ok = false, Value();
+          l = r.getNext();
+        } else if (isLogic(def) && part(v) == p && ++ops <= 256) {
+          IRMapping map;
+          for (Value o : def->getOperands()) {
+            Value lo = leadOf(o);
+            if (!lo)
+              return Value();
+            map.map(o, lo);
+          }
+          Operation *clone = sb.clone(*def, map);
+          clone->removeAttr("inner_sym");
+          if (p >= 0)
+            opsOf[p].push_back(clone);
+          l = clone->getResult(cast<OpResult>(v).getResultNumber());
+        } else {
+          return ok = false, Value();
+        }
+        lead[v] = l;
+        return l;
+      };
+      Value l = leadOf(sel);
+      if (!ok || !l) {
+        ++refused;
+        continue;
+      }
+      // (FOLDSIM_SELECT_MUTANT=1, a test's mutant: the select a host cycle
+      // late.)
+      static const bool mutant = getenv("FOLDSIM_SELECT_MUTANT");
+      auto ahead = seq::FirRegOp::create(sb, loc, mutant ? sel : l, clk,
+                                         sb.getStringAttr(reg.getName() + "_sel_ahead"));
+      keep(ahead);
+      if (p >= 0)
+        opsOf[p].push_back(ahead);
+      aheadOf[sel] = ahead;
+      mux.getCondMutable().assign(ahead);
+      ++built;
+    }
+    llvm::errs() << "foldsim-fold-static: slr-cross-select: " << built
+                 << " selects of crossing data registered a host cycle ahead (" << shared
+                 << " more registers share one), " << refused
+                 << " left as they are (a register with a reset or preset, or other logic, in the select)\n";
+  }
   // A name for the port of a value: its op's name, if any.
   auto nameOf = [&](Value value) -> std::string {
     if (auto arg = dyn_cast<BlockArgument>(value))
@@ -31073,6 +31220,7 @@ void FoldStaticPass::runOnOperation() {
   folder.slrEnvHome = slrEnvHome;
   folder.slrCrossCofactor = slrCrossCofactor;
   folder.slrGroupOutputs = slrGroupOutputs;
+  folder.slrCrossSelect = slrCrossSelect;
   folder.physicalDomains = physicalDomains;
   for (auto &spec : domainMerge) {
     auto [name, price] = StringRef(spec).split(':');

@@ -600,6 +600,8 @@ def frame_options(a):
         fold += ' slr-env-home'
     if getattr(a, 'slr_group_outputs', False):
         fold += ' slr-group-outputs'
+    if getattr(a, 'slr_cross_select', False):
+        fold += ' slr-cross-select'
     if getattr(a, 'slr_cross_cofactor', None):
         fold += f' slr-cross-cofactor={a.slr_cross_cofactor}'
     if getattr(a, 'slr_hop_registers', False):
@@ -2921,6 +2923,10 @@ def build_parser():
                          'partition through logic is expanded over them (a select by those bits of the cofactors; '
                          'foldsim-fold-static slr-cross-cofactor; the same function): a32-X16 11-19, the decision '
                          'partials\' replicas reached the level\'s and the groups\' controls through 4 LUT levels')
+    ap.add_argument('--slr-cross-select', action='store_true',
+                    help='with --slr-groups: a select of crossing data (a link read forwarding the crossing write) '
+                         'registered a host cycle ahead (foldsim-fold-static slr-cross-select): a32-X16 11-19, the '
+                         'forwarding compare put the crossing chunk 2 LUT levels before the read register')
     ap.add_argument('--slr-group-outputs', action='store_true',
                     help='with --slr-groups: an unfolded output one group produces built in that group (its link '
                          'reads, queue and dues; foldsim-fold-static slr-group-outputs; the same logic): a32-X16 11-19, '

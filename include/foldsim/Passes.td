@@ -816,6 +816,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "only the folded record leaves the group, not every bundle (the "
            "same logic, in the producers' group; an error if the bundles' "
            "producers are in more than one group)">,
+    Option<"slrCrossSelect", "slr-cross-select", "bool", "false",
+           "With SLR groups: a register whose next value is a select of data "
+           "another partition drives (a link read forwarding the crossing "
+           "write) takes the select from a register of its own, loaded with "
+           "the select's logic over its registers' next values (only "
+           "registers without reset or preset, undefined until written): the "
+           "crossing data meets the register through the select's LUT alone. "
+           "The same value in every host cycle after the first">,
     Option<"slrGroupOutputs", "slr-group-outputs", "bool", "false",
            "With SLR groups: an output of the simulator (not a folded port) "
            "whose pieces one group's classes produce is built in that group, "
