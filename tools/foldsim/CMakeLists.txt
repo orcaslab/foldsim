@@ -2,7 +2,7 @@
 configure_file(foldsim.py ${CMAKE_BINARY_DIR}/bin/foldsim COPYONLY)
 install(PROGRAMS foldsim.py DESTINATION bin RENAME foldsim)
 # The fold-degree search (--copies auto): prices each class with foldsim-opt's
-# foldsim-estimate-area, the one area model.
+# beacon-estimate-area, the one area model.
 configure_file(foldsim_degree.py ${CMAKE_BINARY_DIR}/bin/foldsim_degree.py COPYONLY)
 configure_file(foldsim_cost.py ${CMAKE_BINARY_DIR}/bin/foldsim_cost.py COPYONLY)
 configure_file(foldsim_storage.py ${CMAKE_BINARY_DIR}/bin/foldsim_storage.py COPYONLY)
@@ -80,11 +80,8 @@ configure_file(foldsim_fit_bound.py ${CMAKE_BINARY_DIR}/bin/foldsim_fit_bound.py
 install(PROGRAMS foldsim_fit_bound.py DESTINATION bin)
 configure_file(foldsim_sv_limits.py ${CMAKE_BINARY_DIR}/bin/foldsim_sv_limits.py COPYONLY)
 install(PROGRAMS foldsim_sv_limits.py DESTINATION bin)
-# Beacon's routing terms (fanout, SLR crossings): fit on a placed build, score a screen.
-configure_file(foldsim_beacon_terms.py ${CMAKE_BINARY_DIR}/bin/foldsim_beacon_terms.py COPYONLY)
-install(PROGRAMS foldsim_beacon_terms.py DESTINATION bin)
-configure_file(foldsim_v80_timing.json ${CMAKE_BINARY_DIR}/bin/foldsim_v80_timing.json COPYONLY)
-install(FILES foldsim_v80_timing.json DESTINATION bin)
+# Beacon's routing terms (beacon_terms.py) and its driver come with Beacon
+# (third_party/beacon), into the same bin.
 # The V80 builds that calibrate the fold degree's area and period
 # (foldsim_degree.py calibrate), the default of --copies auto.
 configure_file(foldsim_v80.json ${CMAKE_BINARY_DIR}/bin/foldsim_v80.json COPYONLY)

@@ -6,8 +6,8 @@ k stores of its state, each about n/k instances deep (the first n mod k one
 deeper), and the frame it allows: the deepest copy's. For every choice of k per class:
 
   II      exact: the scheduler's (foldsim-fold-static schedule-only);
-  LUTs    Beacon's area of each class (foldsim-opt: foldsim-beacon-map area,
-          foldsim-estimate-area, on the V80's target), calibrated per class
+  LUTs    Beacon's area of each class (foldsim-opt: beacon-map area,
+          beacon-estimate-area, on the V80's target), calibrated per class
           against Vivado's hierarchical utilization of a build of the design;
   sites   the LUT sites the placer needs, distributed RAM weighted, against
           the V80 dynamic region (fits);
@@ -159,7 +159,7 @@ def pow2(threads):
 
 def _beacon_estimates(models, classes, foldsim_opt, out=None):
     """Per class, one instance, from Beacon's area of the models' IR
-    (foldsim-estimate-area): the area mapping's logic LUTs before Beacon's
+    (beacon-estimate-area): the area mapping's logic LUTs before Beacon's
     device scale (`lut`, what kappa calibrates, so a new scale leaves the
     fitted factors valid), the Vivado cores' LUTs (`lut_ip`), the device
     scale (`scale`, the factor without a calibration), flip-flops, and its
@@ -168,13 +168,13 @@ def _beacon_estimates(models, classes, foldsim_opt, out=None):
     threads = [1 << i for i in range(pow2(max(classes.values(), default=1)).bit_length())]
     with tempfile.TemporaryDirectory() as tmp:
         table = out or os.path.join(tmp, 'area.json')
-        pipeline = (f'builtin.module(foldsim-beacon-map{{target={AREA_TARGET} area}},'
-                    f'foldsim-estimate-area{{target={AREA_TARGET} modules={table} report= '
+        pipeline = (f'builtin.module(beacon-map{{target={AREA_TARGET} area}},'
+                    f'beacon-estimate-area{{target={AREA_TARGET} modules={table} report= '
                     f'state-threads={",".join(map(str, threads))}}})')
         r = subprocess.run([foldsim_opt, models, f'--pass-pipeline={pipeline}', '-o', os.devnull],
                            capture_output=True, text=True)
         if r.returncode:
-            sys.exit(f'foldsim-estimate-area failed on {models}:\n{r.stderr}')
+            sys.exit(f'beacon-estimate-area failed on {models}:\n{r.stderr}')
         doc = json.load(open(table))
         mods, scale = doc['modules'], doc.get('lut_scale', 1.0)
     est = {}
@@ -3323,7 +3323,7 @@ def main():
         if not any('--estimator' in x.option_strings for x in p._actions):
             p.add_argument('--estimator', choices=ESTIMATORS, default=IR_COST,
                            help='the area model: the IR cost model (foldsim_cost.py, default: the calibrations '
-                                'fitted on it) or Beacon\'s area (beacon-area: foldsim-estimate-area)')
+                                'fitted on it) or Beacon\'s area (beacon-area: beacon-estimate-area)')
     a = ap.parse_args()
     set_estimator(getattr(a, 'estimator', IR_COST))
     if a.cmd == 'fit':

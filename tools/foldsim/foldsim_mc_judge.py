@@ -4,7 +4,7 @@ allowed host cycle.
 
 usage: foldsim_mc_judge.py <endpoints.csv> <foldsim_sim.json> [--min-levels N]
 
-<endpoints.csv> is an end point table (foldsim-estimate-timing's `output`, or
+<endpoints.csv> is an end point table (beacon-estimate-timing's `output`, or
 Beacon's run/endpoints.csv): a row per end point bit with its deepest path's
 `levels`, `start` and `end`. foldsim_sim.json's `multicycle` lists each
 multicycle copy's register prefix and its host cycles M (foldsim --multicycle):

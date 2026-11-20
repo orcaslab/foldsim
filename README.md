@@ -10,15 +10,32 @@ cycle-exact to the RTL.
 
 foldsim builds on [CIRCT](https://circt.llvm.org), the way POCL builds on
 LLVM: CIRCT imports and lowers the design (`circt-verilog`, `circt-opt`,
-`firtool`), and foldsim adds the passes that build the simulator.
+`firtool`), and foldsim adds the passes that build the simulator. It uses
+[Beacon](https://github.com/orcaslab/beacon) (a submodule, `third_party/beacon`)
+for logic levels and area before synthesis: Beacon's mapping sizes a fold's
+pipeline stages (`stage-levels-mapped`) and prices a class's area
+(`--degree-estimator beacon-area`).
+
+**Versions.** CIRCT: [orcaslab/circt](https://github.com/orcaslab/circt)
+`main` (`313868c23`), which carries the CIRCT changes foldsim needs on top of
+llvm/circt. Beacon: the commit of the `third_party/beacon` submodule.
+
+**Related repositories:** [orcaslab/circt](https://github.com/orcaslab/circt),
+[orcaslab/beacon](https://github.com/orcaslab/beacon),
+[orcaslab/firesim](https://github.com/orcaslab/firesim) (the FireSim
+baseline foldsim is compared with, on the V80),
+[orcaslab/slash](https://github.com/orcaslab/slash) (the V80 shell and
+runtime images run on), and [Vortex](https://github.com/vortexgpgpu/vortex),
+the GPU foldsim folds.
 
 ## Contents
 
 | Path | What |
 |---|---|
-| `lib/Transforms` | the passes: `foldsim-extract-models`, `foldsim-fuse-models`, `foldsim-fame5`, `foldsim-compose`, and Beacon, `foldsim-beacon-map`, `foldsim-estimate-timing` and `foldsim-estimate-area` (logic levels and area before synthesis) |
-| `tools/foldsim-opt` | runs them, with CIRCT's HW, Comb, Seq and SV passes |
-| `tools/foldsim` | the driver: design in, simulator out; `foldsim-lift`, plain-port boundaries for interface-port units; the fold-degree search, priced by `foldsim-estimate-area` |
+| `lib/Transforms` | the passes: `foldsim-extract-models`, `foldsim-fuse-models`, `foldsim-fame5`, `foldsim-compose`, `foldsim-fold-static`, ... |
+| `third_party/beacon` | Beacon: `beacon-map`, `beacon-estimate-timing` and `beacon-estimate-area` (logic levels and area before synthesis), its `beacon` driver and `beacon-opt` |
+| `tools/foldsim-opt` | runs them, with Beacon's passes and CIRCT's HW, Comb, Seq, SV and Synth passes |
+| `tools/foldsim` | the driver: design in, simulator out; `foldsim-lift`, plain-port boundaries for interface-port units; the fold-degree search, priced by `beacon-estimate-area` |
 | `shell/rtl` | the FPGA shell around a simulator: the control endpoint (target reset, start, register writes, busy), a memory endpoint per AXI4 port with its DRAM bank timing model, and the token plumbing |
 | `shell/include`, `shell/emul` | the shell's register map for a host runtime, and the shell simulated in-process with Verilator |
 | `shell/model` | the normative DRAM bank model the memory endpoint implements, in C++ |
@@ -28,9 +45,11 @@ LLVM: CIRCT imports and lowers the design (`circt-verilog`, `circt-opt`,
 ## Build
 
 foldsim needs a CIRCT build or installation (its LLVM, MLIR and CIRCT CMake
-packages):
+packages) of orcaslab/circt, and the Beacon submodule; it builds Beacon with
+it (`beacon-opt`, `beacon` and `check-beacon` land in the same `bin`):
 
 ```bash
+git clone --recursive https://github.com/orcaslab/foldsim.git   # or: git submodule update --init
 cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Release \
   -DCIRCT_DIR=$CIRCT/lib/cmake/circt \
   -DMLIR_DIR=$CIRCT/lib/cmake/mlir \

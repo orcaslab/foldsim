@@ -7,11 +7,13 @@
 //===----------------------------------------------------------------------===//
 //
 // Runs foldsim's passes, with the CIRCT HW, Comb, Seq and SV dialects and
-// passes a simulator's pipeline uses between them, and the Synth passes that
-// `foldsim-beacon-map` runs to map a design to a Beacon target's cells.
+// passes a simulator's pipeline uses between them, and Beacon's passes
+// (third_party/beacon) with the Synth passes `beacon-map` runs to map a design
+// to a Beacon target's cells.
 //
 //===----------------------------------------------------------------------===//
 
+#include "beacon/Passes.h"
 #include "foldsim/Passes.h"
 #include "foldsim/Version.inc"
 #include "circt/Conversion/Passes.h"
@@ -36,6 +38,7 @@ int main(int argc, char **argv) {
                   circt::synth::SynthDialect>();
 
   foldsim::registerFoldsimPasses();
+  beacon::registerBeaconPasses();
   circt::comb::registerPasses();
   circt::hw::registerPasses();
   circt::seq::registerPasses();

@@ -88,7 +88,7 @@
 # RUN: cd %S/../Driver/Inputs/staged_wide
 # RUN: foldsim --srcs top.f --top Top --out %t/w8 --static --stage-levels 8 Leaf > %t/w8.log 2>&1
 # RUN: FileCheck %s --check-prefix=SPLIT8 < %t/w8.log
-# RUN: foldsim-opt %t/w8/foldsim_sim.mlir --pass-pipeline='builtin.module(foldsim-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=WIDE8
+# RUN: foldsim-opt %t/w8/foldsim_sim.mlir --pass-pipeline='builtin.module(beacon-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=WIDE8
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/w8/obj %S/Inputs/tb_late.sv top.sv %t/w8/foldsim_sim.sv > %t/w8/build.log 2>&1
 # RUN: %t/w8/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +stall=20 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/w6 --static --bubbles --stage-levels 6 Leaf > /dev/null 2>&1

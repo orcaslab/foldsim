@@ -15,7 +15,7 @@
 # SEARCH: <- pick
 # SEARCH: searched 1 of 2 choices: one per frame depth, then the neighbours of the front
 # NONE: foldsim: copies {{.*}}: II {{[0-9]+}}, about {{[0-9]+}} LUTs (uncalibrated)
-# With --degree-estimator beacon-area (upstream's Beacon area, foldsim-estimate-area) the shipped V80 builds' area
+# With --degree-estimator beacon-area (upstream's Beacon area, beacon-estimate-area) the shipped V80 builds' area
 # factors, fitted on the IR cost model (foldsim_cost.py), are not used and LUTs take the device scale; the period
 # fit still is.
 # RUN: foldsim --srcs top.f --top Top --out %t/beacon --static --copies auto --degree-estimator beacon-area Leaf 2>&1 | FileCheck %s --check-prefix=BCAL

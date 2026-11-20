@@ -15,15 +15,15 @@
 # RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/deep
 # RUN: foldsim --srcs top.f --top Top --out %t/plain --static --bubbles Leaf > %t/plain.log 2>&1
 # RUN: FileCheck %s --check-prefix=PLAIN < %t/plain.log
-# RUN: foldsim-opt %t/plain/foldsim_sim.mlir --pass-pipeline='builtin.module(foldsim-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=DEEP
+# RUN: foldsim-opt %t/plain/foldsim_sim.mlir --pass-pipeline='builtin.module(beacon-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=DEEP
 # RUN: foldsim --srcs top.f --top Top --out %t/s6 --static --bubbles --stage-levels 6 Leaf > %t/s6.log 2>&1
 # RUN: FileCheck %s --check-prefix=S6 < %t/s6.log
-# RUN: foldsim-opt %t/s6/foldsim_sim.mlir --pass-pipeline='builtin.module(foldsim-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CUT6
+# RUN: foldsim-opt %t/s6/foldsim_sim.mlir --pass-pipeline='builtin.module(beacon-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CUT6
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/s6/obj %S/Inputs/tb_late.sv top.sv %t/s6/foldsim_sim.sv > %t/s6/build.log 2>&1
 # RUN: %t/s6/obj/Vtb +verilator+rand+reset+0 +verilator+seed+2 +bubble=30 +stall=20 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/s4 --static --bubbles --stage-levels 4 Leaf > %t/s4.log 2>&1
 # RUN: FileCheck %s --check-prefix=S4 < %t/s4.log
-# RUN: foldsim-opt %t/s4/foldsim_sim.mlir --pass-pipeline='builtin.module(foldsim-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CUT4
+# RUN: foldsim-opt %t/s4/foldsim_sim.mlir --pass-pipeline='builtin.module(beacon-estimate-timing{top=Leaf_static report=-})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CUT4
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -DBUBBLES -Mdir %t/s4/obj %S/Inputs/tb_late.sv top.sv %t/s4/foldsim_sim.sv > %t/s4/build.log 2>&1
 # RUN: %t/s4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +bubble=30 +stall=20 | FileCheck %s
 # RUN: foldsim --srcs top.f --top Top --out %t/c2 --static --bubbles --modulo --copies Leaf:2 --stage-levels 6 Leaf > /dev/null 2>&1

@@ -16,7 +16,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "foldsim/MemoryLoads.h"
+#include "beacon/MemoryLoads.h"
 #include "foldsim/Passes.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
@@ -40,10 +40,10 @@ using namespace circt;
 
 namespace {
 
-using foldsim::isLutMemory;
-using foldsim::kLutMemoryDepth;
-using foldsim::maskGrain;
-using foldsim::memoryLoads;
+using beacon::isLutMemory;
+using beacon::kLutMemoryDepth;
+using beacon::maskGrain;
+using beacon::memoryLoads;
 
 /// Ops that only route a register's bits: copied along with a replica.
 bool isWiring(Operation *op) {

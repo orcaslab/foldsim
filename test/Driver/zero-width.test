@@ -1,6 +1,6 @@
 # Zero-width values from the import (a packed one-entry table indexed by a
 # one-bit number, as VX_rtu_core's slot table at RTU_NUM_SLOTS = 1) are
-# folded before the fold (foldsim-fold-zero-width in the driver's optimizing
+# folded before the fold (beacon-fold-zero-width in the driver's optimizing
 # passes): firtool emits the simulator, which keeps no zero-width compare.
 # RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/zero-width
 # RUN: foldsim --srcs top.f --top Top --out %t/static --static Leaf > /dev/null 2>&1

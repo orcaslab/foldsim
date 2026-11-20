@@ -30,7 +30,7 @@
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/BackedgeBuilder.h"
-#include "foldsim/Beacon.h"
+#include "beacon/Beacon.h"
 #include "foldsim/Passes.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Pass/PassRegistry.h"
@@ -88,8 +88,8 @@ struct FoldStaticPass : public foldsim::impl::FoldStaticBase<FoldStaticPass> {
     if (stageLevelsMapped.empty())
       return;
     OpPassManager pm(ModuleOp::getOperationName());
-    if (const auto *t = foldsim::lookupBeaconTarget(stageLevelsMapped))
-      if (succeeded(parsePassPipeline(foldsim::beaconMapPipeline(*t, false), pm)))
+    if (const auto *t = beacon::lookupBeaconTarget(stageLevelsMapped))
+      if (succeeded(parsePassPipeline(beacon::beaconMapPipeline(*t, false), pm)))
         pm.getDependentDialects(registry);
   }
 };
@@ -3656,7 +3656,7 @@ LogicalResult StaticFolder::analyze(Class &cls) {
 }
 
 /// An op's logic levels for staged evaluation, in half levels, by width as the
-/// logic screen counts them on the V80's fabric (foldsim-estimate-timing): an
+/// logic screen counts them on the V80's fabric (beacon-estimate-timing): an
 /// adder or an ordering compare a LUT and a carry chain of 8-bit blocks, an
 /// equality compare 3-bit matches ANDed in LUT6 trees, a wide AND/OR/XOR a
 /// LUT6 tree; a choice or a gate of two or three inputs half a level (a LUT6
@@ -4068,9 +4068,9 @@ int StaticFolder::mappedDepthOf(hw::HWModuleOp model, unsigned entryBits,
     if (auto it = mappedDepth.find(key); it != mappedDepth.end())
       return it->second;
   int depth = -1;
-  if (const auto *target = foldsim::lookupBeaconTarget(stageLevelsMapped)) {
-    // One instance of the model, alone, mapped as foldsim-beacon-map maps a
-    // design for depth and timed as foldsim-estimate-timing times it.
+  if (const auto *target = beacon::lookupBeaconTarget(stageLevelsMapped)) {
+    // One instance of the model, alone, mapped as beacon-map maps a
+    // design for depth and timed as beacon-estimate-timing times it.
     OwningOpRef<ModuleOp> design = ModuleOp::create(model.getLoc());
     OpBuilder b(model.getContext());
     b.setInsertionPointToEnd(design->getBody());
@@ -4148,9 +4148,9 @@ int StaticFolder::mappedDepthOf(hw::HWModuleOp model, unsigned entryBits,
     // (Mapped as Beacon screens a fold: adders and compares timed by carry
     // block on an FPGA.)
     unsigned carryBlock = target->asic ? 0 : kBeaconCarryBlock;
-    if (succeeded(parsePassPipeline(foldsim::beaconMapPipeline(*target, false, carryBlock), pm)) &&
+    if (succeeded(parsePassPipeline(beacon::beaconMapPipeline(*target, false, carryBlock), pm)) &&
         succeeded(pm.run(*design)))
-      if (auto d = foldsim::beaconDeepestLevels(*design, name, *target); succeeded(d))
+      if (auto d = beacon::beaconDeepestLevels(*design, name, *target); succeeded(d))
         depth = *d;
   }
   if (!stages)
@@ -33651,8 +33651,8 @@ void FoldStaticPass::runOnOperation() {
                                      stageLevelsClass.end());
   folder.stageSrlStyle = stageSrlStyle;
   if (!stageLevelsMapped.empty() &&
-      !foldsim::lookupBeaconTarget(stageLevelsMapped)) {
-    foldsim::emitUnknownBeaconTarget(getOperation(), stageLevelsMapped);
+      !beacon::lookupBeaconTarget(stageLevelsMapped)) {
+    beacon::emitUnknownBeaconTarget(getOperation(), stageLevelsMapped);
     return signalPassFailure();
   }
   folder.stageLevelsMapped = stageLevelsMapped;

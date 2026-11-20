@@ -36,6 +36,15 @@ add_custom_target(foldsim-version
   BYPRODUCTS ${FOLDSIM_VERSION_INC}
   COMMENT "Checking the foldsim revision")
 
+# Beacon (orcaslab/beacon, a submodule): its passes map a class's model for
+# depth (stage-levels-mapped) and area (--degree-estimator beacon-area).
+if(NOT EXISTS ${PROJECT_SOURCE_DIR}/third_party/beacon/CMakeLists.txt)
+  message(FATAL_ERROR "third_party/beacon is missing: git submodule update --init")
+endif()
+add_subdirectory(third_party/beacon)
+include_directories(${PROJECT_SOURCE_DIR}/third_party/beacon/include
+                    ${PROJECT_BINARY_DIR}/third_party/beacon/include)
+
 add_subdirectory(include/foldsim)
 add_subdirectory(lib)
 add_subdirectory(tools)

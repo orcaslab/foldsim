@@ -45,10 +45,10 @@ import sys
 # is replicated per thread. A conditional write of one array element becomes a
 # select per element, and sorting lets CSE merge duplicates whose users come
 # first in a module body.
-# Zero-width values first (foldsim-fold-zero-width): an import keeps them where
+# Zero-width values first (beacon-fold-zero-width): an import keeps them where
 # a parameter sizes a field to nothing (a one-entry table indexed by a one-bit
 # number), and firtool emits neither their compares nor their constants.
-OPTIMIZE = ['hw.module(hw-expand-array-writes)', 'hw.module(foldsim-fold-zero-width)',
+OPTIMIZE = ['hw.module(hw-expand-array-writes)', 'hw.module(beacon-fold-zero-width)',
             'hw.module(foldsim-remove-dead-state)',
             'hw.module(seq-reg-const-prop)',
             'hw.module(comb-share-adders)', 'canonicalize', 'hw.module(comb-low-bits-narrowing)',
@@ -3506,7 +3506,7 @@ def build_parser():
                          'by default, `none` for none')
     ap.add_argument('--degree-estimator', default='foldsim_cost.py', choices=('foldsim_cost.py', 'beacon-area'),
                     help='the area model of --copies / --page / --state auto: the IR cost model (default: '
-                         'the calibrations fitted on it) or Beacon\'s area (foldsim-estimate-area)')
+                         'the calibrations fitted on it) or Beacon\'s area (beacon-estimate-area)')
     ap.add_argument('--degree-max-points', type=int, default=256,
                     help='with --copies auto: schedule every choice up to this many, '
                          'else search them (foldsim_degree.py evaluate)')

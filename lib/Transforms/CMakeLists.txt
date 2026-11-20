@@ -1,9 +1,6 @@
 add_mlir_library(FoldsimTransforms
-  Beacon.cpp
   BlackBoxes.cpp
   Compose.cpp
-  EstimateArea.cpp
-  EstimateTiming.cpp
   LocalizeReadAddresses.cpp
   ExtractModels.cpp
   FAME5.cpp
@@ -30,13 +27,16 @@ add_mlir_library(FoldsimTransforms
   SlrSplit.cpp
   Sort.cpp
   PassSplit.cpp
+  PrepareNetlist.cpp
   StaticFold.cpp
   VmemRings.cpp
 
   DEPENDS
   FoldsimPassesIncGen
+  BeaconPassesIncGen
 
   LINK_LIBS PUBLIC
+  BeaconTransforms
   CIRCTComb
   CIRCTDatapath
   CIRCTHW
