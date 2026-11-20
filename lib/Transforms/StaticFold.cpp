@@ -1946,6 +1946,9 @@ private:
   /// The engines layoutLinkEngines made (one a reader class; the rest of
   /// linkEngineList are the classes' next engines, made by the placement).
   unsigned linkEngineLaid = 0;
+  /// `link-engines`: the engines whose requests in flight exceed their
+  /// rate's bound (the schedule's spacing of the reader not as assumed).
+  unsigned linkEngineOverRate = 0;
   /// `link-engines`: the engines of the streams not excluded, each
   /// stream's place in its engine's landings (landOff / landSpan), in
   /// `streams` (laidOutStreams and linkStreams alike).
@@ -5744,6 +5747,7 @@ LogicalResult StaticFolder::planStreams() {
   // use - the frame's order of positions makes that landing's read precede
   // the request, so no response overwrites a row before it is read - at
   // most the lead's (lead + 8: the ceiling of one request a position).
+  linkEngineOverRate = 0;
   if (linkEngines)
     for (auto &le : linkEngineList) {
       SmallVector<int> at;
@@ -5780,6 +5784,21 @@ LogicalResult StaticFolder::planStreams() {
         if (ok)
           break;
       }
+      // The ring by the engine's rate, a constant of its class (not of the
+      // schedule): a reader pass lands `span` rows at most and its reading
+      // passes are `spacing` positions apart at least (its link page), so
+      // at most (lead + 8) span / spacing requests are in flight. The fit
+      // above (the schedule's own) only where it exceeds that (logged).
+      unsigned spacing = le.pingPong ? le.span : le.span + 2;
+      unsigned rate = unsigned(llvm::PowerOf2Ceil(
+          std::max<uint64_t>(1, llvm::divideCeil(uint64_t(le.lead + 8) * le.span, std::max(1u, spacing)))));
+      if (slots > rate) {
+        ++linkEngineOverRate;
+        if (getenv("FOLDSIM_LINK_ENGINE_LOG"))
+          llvm::errs() << "link engines: " << modelOf(le.rcls) << ": " << slots
+                       << " slots in flight, past its rate's " << rate << "\n";
+      }
+      slots = std::max({slots, rate, std::max(8u, unsigned(llvm::PowerOf2Ceil(decisionLead() + 3)))});
       le.slots = std::min(slots, ceiling);
       // (FOLDSIM_LINK_ENGINE_SLOTS: a ring of that many slots, for the
       // tests' mutation: too few let a response overwrite a landing not
@@ -7194,7 +7213,7 @@ void StaticFolder::reportPageEngines(raw_ostream &os) {
         readers.insert(le.rcls);
     os << "  link engines: " << built << " engines (" << readers.size() << " reader classes, "
        << linkEngineOff << " more for write conflicts), " << on << " streams on them, rings "
-       << ringBits << " bits\n";
+       << ringBits << " bits (by rate; " << linkEngineOverRate << " past it)\n";
     for (auto &le : linkEngineList)
       if (le.pageEngine >= 0)
         os << "    link engine " << modelOf(le.rcls) << " "
@@ -24940,10 +24959,21 @@ LogicalResult StaticFolder::buildSim() {
         reqBank(ii + 1, 0), reqMember(ii + 1, 0);
     last[ii - 1] = 1;
     unsigned maxCross = 0;
+    // (Each table the OR of its members' own, each zero past the member's
+    // positions: a member's rows and landings are affine in the position
+    // where the merged ones are not, so each decodes as a stream's did.)
+    struct Part {
+      SmallVector<uint64_t> pop, cross, req, flip, low;
+      uint64_t bank, member;
+    };
+    std::vector<Part> parts;
     for (unsigned k : le.streams) {
       auto &st = linkStreams[k];
       if (!st.kept || st.engine != le.pageEngine)
         continue;
+      auto &part = parts.emplace_back();
+      for (auto *x : {&part.pop, &part.cross, &part.req, &part.flip, &part.low})
+        x->assign(ii + 1, 0);
       unsigned pIdx = st.rowIndexBits(classes[st.pcls].threads());
       unsigned pgBits = st.pages > 1 ? llvm::Log2_32_Ceil(st.pages) : 0;
       for (auto &l : st.landings) {
@@ -24953,6 +24983,8 @@ LogicalResult StaticFolder::buildSim() {
         unsigned c = unsigned(floorDiv(l.q) - floorDiv(l.q - int(st.lead)));
         cross[q] = c;
         maxCross = std::max(maxCross, c);
+        part.pop[q] = 1;
+        part.cross[q] = c;
       }
       for (unsigned q = 0; q < ii; ++q) {
         if (!st.reqValid[q])
@@ -24965,8 +24997,36 @@ LogicalResult StaticFolder::buildSim() {
         reqLow[q] = ((st.reqRow[q] & rowMask) << pgBits) | (st.reqPage[q] & pageMask);
         reqBank[q] = uint64_t(1) << (pIdx + pgBits);
         reqMember[q] = st.member;
+        part.req[q] = 1;
+        part.flip[q] = reqFlip[q];
+        part.low[q] = reqLow[q];
       }
+      part.bank = uint64_t(1) << (pIdx + pgBits);
+      part.member = st.member;
     }
+    // A table of the position as the OR of the members' (`of` picks the
+    // member's rows), three host cycles ahead as every table.
+    auto merged = [&](function_ref<ArrayRef<uint64_t>(const Part &)> of, unsigned w) -> Value {
+      SmallVector<Value> xs;
+      for (auto &part : parts)
+        if (llvm::any_of(of(part), [](uint64_t x) { return x != 0; }))
+          xs.push_back(table(b, rctl.at3, of(part), w));
+      if (xs.empty())
+        return constant(w, 0);
+      return xs.size() == 1 ? xs[0] : Value(comb::OrOp::create(b, xs, false));
+    };
+    // (The member's bank bit and member number: constants where its
+    // request valid is, ORed.)
+    auto byRequest = [&](function_ref<uint64_t(const Part &)> of, unsigned w) -> Value {
+      SmallVector<Value> xs;
+      for (auto &part : parts)
+        if (llvm::any_of(part.req, [](uint64_t x) { return x != 0; }))
+          xs.push_back(comb::MuxOp::create(b, table(b, rctl.at3, part.req, 1),
+                                           constant(w, of(part)), constant(w, 0)));
+      if (xs.empty())
+        return constant(w, 0);
+      return xs.size() == 1 ? xs[0] : Value(comb::OrOp::create(b, xs, false));
+    };
     le.popValid.assign(popValid.begin(), popValid.end());
     // (Its ring as wide as its members on it.)
     le.width = 8;
@@ -24992,13 +25052,13 @@ LogicalResult StaticFolder::buildSim() {
     Value last0 = resetReg(last1, prefix + "_last0", 0);
     ranNext.setValue(comb::MuxOp::create(b, comb::AndOp::create(b, last0, notOf(full)),
                                          comb::AddOp::create(b, ran, constant(cb, 1)), ran));
-    Value pop1 = resetReg(resetReg(table(b, rctl.at3, popValid, 1), prefix + "_pop2", 0),
+    Value pop1 = resetReg(resetReg(merged([](const Part &x) { return ArrayRef<uint64_t>(x.pop); }, 1), prefix + "_pop2", 0),
                           prefix + "_pop1", 0);
     Value skip0 = constant(1, 0);
     if (maxCross)
       skip0 = comb::ICmpOp::create(
           b, comb::ICmpPredicate::ugt,
-          reg(reg(reg(table(b, rctl.at3, cross, cb), prefix + "_cross2"), prefix + "_cross1"),
+          reg(reg(reg(merged([](const Part &x) { return ArrayRef<uint64_t>(x.cross); }, cb), prefix + "_cross2"), prefix + "_cross1"),
               prefix + "_cross0"),
           ran);
     Value pop0 = resetReg(pop1, prefix + "_pop0", 0);
@@ -25035,14 +25095,14 @@ LogicalResult StaticFolder::buildSim() {
     eb.skip = skip0;
     // The request sequencer: the schedule's request at the position, the
     // request pointer's slot.
-    eb.req0 = chain3r(table(b, rctl.at3, reqValid, 1), prefix + "_req");
-    Value flip0 = chain3(table(b, rctl.at3, reqFlip, 1), prefix + "_flip");
+    eb.req0 = chain3r(merged([](const Part &x) { return ArrayRef<uint64_t>(x.req); }, 1), prefix + "_req");
+    Value flip0 = chain3(merged([](const Part &x) { return ArrayRef<uint64_t>(x.flip); }, 1), prefix + "_flip");
     Value bank = comb::XorOp::create(b, reg(par1, prefix + "_parity0"), flip0);
-    Value low0 = chain3(table(b, rctl.at3, reqLow, aw), prefix + "_rlow");
-    Value bpos0 = chain3(table(b, rctl.at3, reqBank, aw), prefix + "_rbank");
+    Value low0 = chain3(merged([](const Part &x) { return ArrayRef<uint64_t>(x.low); }, aw), prefix + "_rlow");
+    Value bpos0 = chain3(byRequest([](const Part &x) { return x.bank; }, aw), prefix + "_rbank");
     eb.row = comb::OrOp::create(
         b, low0, comb::AndOp::create(b, bpos0, b.createOrFold<comb::ReplicateOp>(b.getIntegerType(aw), bank)));
-    eb.member = chain3(table(b, rctl.at3, reqMember, mb), prefix + "_rmember");
+    eb.member = chain3(byRequest([](const Part &x) { return x.member; }, mb), prefix + "_rmember");
     auto reqNext = backedges.get(b.getIntegerType(ib));
     eb.reqPtr = resetReg(reqNext, prefix + "_reqptr", 0);
     reqNext.setValue(comb::AddOp::create(

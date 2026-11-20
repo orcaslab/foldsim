@@ -17,7 +17,7 @@
 # RUN: %t/e/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +bubble=30 | FileCheck %s
 # RUN: %t/e/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +bubble=30 +stall=30 +lo=1 +hi=30 +full=20 | FileCheck %s
 # RUN: %t/e/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 | FileCheck %s
-# hbm-round-trip 800 (a frame of 1,024): the lead past the round trip, the ring 64 slots deep (its requests in flight,
+# hbm-round-trip 800 (a frame of 1,024): the lead past the round trip, the ring 512 slots deep (its rate: 3 landings a pass, passes 5 apart,
 # not the lead's ceiling of 1,024); exact at latencies 1 to 800, at 700 with no bubble left (H = II), and with every
 # slot in flight (800, stalls, bubbles, `free` low).
 # RUN: foldsim --srcs top.f --top Top --out %t/rt --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --bubbles --page-engines 4 --min-ii 1024 --hbm-round-trip 800 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Reader:Unit:hbm,Reader:Vnit:hbm --link-engines Unit Vnit Reader > %t/rt.log 2>&1
@@ -55,7 +55,7 @@
 # ENG-DAG: link engine Vnit 1 1
 # ONE: {{^3$}}
 # RT: link engines: 3 engines (3 reader classes, 0 more for write conflicts), 4 streams on them
-# RT: link engine Reader 2 3 815 64 32
+# RT: link engine Reader 2 3 815 512 32
 # HII: {{^}}MATCH 196 cycles in 203782 host cycles, H 1018.91
 # M96: link engines: 5 engines (3 reader classes, 2 more for write conflicts), 5 streams on them
 # M48: link engines: 5 engines (3 reader classes, 2 more for write conflicts), 5 streams on them
