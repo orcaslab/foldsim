@@ -1348,7 +1348,7 @@ void Timing::writePorts(raw_ostream &os, ArrayRef<std::string> modules) {
 /// point's own arrival takes). A crossing is clean when both are at most one
 /// level: a register at each end, or one LUT.
 void Timing::writeCrossings(raw_ostream &os, ArrayRef<std::string> modules) {
-  os << "from,to,driver,load,cell,start,end_inst,end\n";
+  os << "from,to,driver,load,fanout,node,cell,start,end_inst,end\n";
   // Each context's partition: the instance of `modules` it is in (its
   // context id), else 0 (the rest).
   std::vector<unsigned> partOf(contexts.size(), 0);
@@ -1436,7 +1436,7 @@ void Timing::writeCrossings(raw_ostream &os, ArrayRef<std::string> modules) {
       uint32_t fanout;
       unsigned crossings;
       os << partName(from) << ',' << partName(part) << ','
-         << nodes[id].levels << ',' << load << ',';
+         << nodes[id].levels << ',' << load << ',' << nodes[id].fanout << ',' << id << ',';
       printName(os, id);
       os << ',';
       printName(os, startOf(nodes[id].ctx, id, fanout, crossings));
@@ -1463,7 +1463,7 @@ void Timing::writeCrossings(raw_ostream &os, ArrayRef<std::string> modules) {
     uint32_t fanout;
     unsigned crossings;
     os << partName(partOf[nodes[id].ctx]) << ',' << partName(partOf[ep.ctx])
-       << ',' << nodes[id].levels << ",0,";
+       << ',' << nodes[id].levels << ",0," << nodes[id].fanout << ',' << id << ',';
     printName(os, id);
     os << ',';
     printName(os, startOf(nodes[id].ctx, id, fanout, crossings));
