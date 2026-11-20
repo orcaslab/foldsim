@@ -231,7 +231,12 @@ endmodule
 module tb;
   localparam T = 200, W = 4;
   function automatic logic [7:0] stim_x(int t);
+`ifdef STIM_X_SLOW
+    // (A token held STIM_X_SLOW target cycles: an input that rarely changes.)
+    logic [31:0] v = 32'(t / `STIM_X_SLOW) * 32'h9e3779b9;
+`else
     logic [31:0] v = 32'(t) * 32'h9e3779b9;
+`endif
     v ^= v >> 15; v *= 32'h2c1b3c6d; v ^= v >> 12;
     return v[7:0];
   endfunction

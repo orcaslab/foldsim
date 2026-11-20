@@ -56,7 +56,7 @@
 # RUN: %t/x2/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s --check-prefix=BAD
 
 # LOG: pp-idle-skip: 1 classes keep clean bits, 1 may skip
-# LOG: pp-idle-skip: Node: 7 of 8 instances decide ({{[0-9]+}} source reads; instances not: 0 an environment input, 0 a late input, 1 an untracked source, 0 in time)
+# LOG: pp-idle-skip: Node: 7 of 8 instances decide ({{[0-9]+}} source reads, 0 inputs; instances not: 0 an environment input, 0 a late input, 1 an untracked source, 0 in time)
 # LOG: pp-idle-skip: 1 classes' clean bits in {{[0-9]+}} replicas, 7 of 8 instances decide
 # MBOX: link streams: {{[1-9][0-9]*}} streams
 # NODW: pp-idle-skip: off (it needs pp-dirty-writeback)

@@ -22825,6 +22825,12 @@ LogicalResult StaticFolder::buildSim() {
   // the frame being decided only beyond those of the decided frames not yet
   // loaded.
   Value load = eq(pos1, 0);
+  // pp-idle-skip: an input's token for the next frame (held: `full`) and the
+  // frame's value (`x`), for a decision whether the input changes.
+  struct EnvAhead {
+    Value full, head, x;
+  };
+  std::map<unsigned, EnvAhead> envAhead;
   unsigned holdDepth = 1 + (ii < 4 ? 3 / ii : 0);
   unsigned cntWidth = llvm::Log2_32_Ceil(holdDepth + 2);
   Value decidedUnloaded;
@@ -22990,6 +22996,9 @@ LogicalResult StaticFolder::buildSim() {
         auto heldNext = backedges.get(b.getIntegerType(tokenWidth));
         head = reg(heldNext, producer.name + "_token");
         heldNext.setValue(comb::MuxOp::create(b, take, bits, head));
+        // (pp-idle-skip: the next frame's token, held, ahead of its load.)
+        if (specOf[p] < 0)
+          envAhead[unsigned(p)] = {full, head, Value()};
       }
     } else {
       auto countNext = backedges.get(b.getIntegerType(cntWidth));
@@ -23052,6 +23061,8 @@ LogicalResult StaticFolder::buildSim() {
     }
     Value taken = comb::MuxOp::create(b, load, head, x);
     next.setValue(taken);
+    if (auto it = envAhead.find(unsigned(p)); it != envAhead.end())
+      it->second.x = x;
     frameInput[p] = x;
     frameInputNext[p] = taken;
   }
@@ -23514,9 +23525,32 @@ LogicalResult StaticFolder::buildSim() {
       const char *e = getenv("FOLDSIM_IDLE_SKIP_MUTANT");
       return e ? atoi(e) : 0;
     }();
-    bool on = slrOf.empty();
+    // SLR groups: with slr-group-control (each class's controls in its
+    // copy's group), a class's decision, replicas and skip bits are in its
+    // group; a producer's clean bits in another group cross to it on
+    // registers (its group's, one a group between with slr-hop-registers,
+    // the reader's), and its timing counts them.
+    bool groups = !slrOf.empty();
+    bool on = !groups || slrGroupControl;
     if (!on)
-      llvm::errs() << "foldsim-fold-static: pp-idle-skip: off (SLR groups)\n";
+      llvm::errs() << "foldsim-fold-static: pp-idle-skip: off (SLR groups without "
+                      "slr-group-control)\n";
+    auto groupOf = [&](unsigned c) -> int { return groups ? slrOf[c] : -1; };
+    // The groups of a crossing's registers, from group `from` (-1: the
+    // level) to group `to`; none within a group.
+    auto crossChain = [&](int from, int to) -> SmallVector<int> {
+      SmallVector<int> chain;
+      if (!groups || from == to)
+        return chain;
+      chain.push_back(from);
+      if (slrHopRegisters && from >= 0 && to >= 0) {
+        int step = to > from ? 1 : -1;
+        for (int g = from + step; g != to; g += step)
+          chain.push_back(g);
+      }
+      chain.push_back(to);
+      return chain;
+    };
     auto wrap = [&](int pos) { return unsigned(((pos % int(ii)) + int(ii)) % int(ii)); };
     auto floorDiv = [&](int x) {
       return x >= 0 ? x / int(ii) : -((-x + int(ii) - 1) / int(ii));
@@ -23534,16 +23568,19 @@ LogicalResult StaticFolder::buildSim() {
         b, comb::AndOp::create(b, starting, notOf(eq(starts, 3))),
         comb::AddOp::create(b, starts, constant(2, 1)), starts));
     Value warm3 = eq(starts, 3);
-    // Each tracked class's clean bits: the write, and its replicas.
+    // Each tracked class's clean bits: the write, in its group, and its
+    // copies in each reading group (crossed); then a replica a read.
     struct CleanWrite {
       Value en, addr, data;
       unsigned addrBits = 0;
     };
     std::map<unsigned, CleanWrite> cleanWrites;
+    std::map<std::pair<unsigned, int>, CleanWrite> crossedWrites;
     auto cleanWrite = [&](unsigned t) -> CleanWrite & {
       auto &cw = cleanWrites[t];
       if (cw.en)
         return cw;
+      Operation *wmark = lastOp();
       auto &k = classes[t];
       auto &ctl = controls[t];
       unsigned n = k.threads(), iw = idxOf(n);
@@ -23582,13 +23619,32 @@ LogicalResult StaticFolder::buildSim() {
       cw.data = copies[t].getResult(k.idleCleanOut);
       if (skipped)
         cw.data = comb::OrOp::create(b, cw.data, skipped);
+      tagSince(wmark, groupOf(t), int(t));
       return cw;
     };
-    unsigned replicas = 0;
-    // A replica of class t's clean bits, read at `addr` (registered): its
-    // read data a host cycle on.
-    auto cleanRead = [&](unsigned t, Value addr, const Twine &name) -> Value {
-      auto &cw = cleanWrite(t);
+    // Class t's clean-bit write as group `to` sees it: registered along the
+    // crossing (the same host cycles for its enable, address and data).
+    auto crossedWrite = [&](unsigned t, int to) -> CleanWrite & {
+      auto key = std::make_pair(t, to);
+      if (auto it = crossedWrites.find(key); it != crossedWrites.end())
+        return it->second;
+      CleanWrite cw = cleanWrite(t);
+      unsigned hop = 0;
+      for (int g : crossChain(groupOf(t), to)) {
+        Operation *xmark = lastOp();
+        std::string name = classes[t].name + "_ppi_x" + Twine(to).str() + "_" + Twine(hop++).str();
+        cw.en = resetReg(cw.en, name + "_en", 0);
+        cw.addr = copyReg(cw.addr, name + "_addr");
+        cw.data = copyReg(cw.data, name + "_data");
+        tagSince(xmark, g);
+      }
+      return crossedWrites[key] = cw;
+    };
+    unsigned replicas = 0, crossings = 0;
+    // A replica of class t's clean bits in group `to`, read at `addr`
+    // (registered): its read data a host cycle on.
+    auto cleanRead = [&](unsigned t, int to, Value addr, const Twine &name) -> Value {
+      auto &cw = crossedWrite(t, to);
       auto mem = seq::FirMemOp::create(
           b, seq::FirMemType::get(context, uint64_t(1) << cw.addrBits, 1, 1),
           /*readLatency=*/1, /*writeLatency=*/1, seq::RUW::Old, seq::WUW::Undefined,
@@ -23597,6 +23653,43 @@ LogicalResult StaticFolder::buildSim() {
       seq::FirMemWriteOp::create(b, mem, cw.addr, hostClock, cw.en, cw.data, Value{});
       ++replicas;
       return seq::FirMemReadOp::create(b, mem, addr, hostClock, constant(1, 1));
+    };
+    // An input of the netlist (the environment) read by a deciding instance:
+    // whether its token for frame f is its token for f - 1. Decided in the
+    // frame before (the position less than 0), the token held for f against
+    // the frame's; decided in the frame, the frame's against the one before.
+    // Built in the level, crossed to each reading group.
+    struct EnvSame {
+      Value ahead, now;
+    };
+    std::map<unsigned, EnvSame> envSame;
+    std::map<std::pair<unsigned, int>, EnvSame> envCrossed;
+    auto envOf = [&](unsigned p, int to) -> EnvSame & {
+      auto key = std::make_pair(p, to);
+      if (auto it = envCrossed.find(key); it != envCrossed.end())
+        return it->second;
+      auto &e = envSame[p];
+      if (!e.ahead) {
+        Operation *emark = lastOp();
+        auto &ea = envAhead.at(p);
+        auto prevNext = backedges.get(ea.x.getType());
+        Value prev = reg(prevNext, producers[p].name + "_ppi_prev");
+        prevNext.setValue(comb::MuxOp::create(b, load, ea.x, prev));
+        e.ahead = comb::AndOp::create(
+            b, ea.full, comb::ICmpOp::create(b, comb::ICmpPredicate::eq, ea.head, ea.x));
+        e.now = comb::ICmpOp::create(b, comb::ICmpPredicate::eq, ea.x, prev);
+        tagSince(emark, -1);
+      }
+      EnvSame x = e;
+      unsigned hop = 0;
+      for (int g : crossChain(-1, to)) {
+        Operation *xmark = lastOp();
+        std::string name = producers[p].name + "_ppi_x" + Twine(to).str() + "_" + Twine(hop++).str();
+        x.ahead = resetReg(x.ahead, name + "_ahead", 0);
+        x.now = resetReg(x.now, name + "_now", 0);
+        tagSince(xmark, g);
+      }
+      return envCrossed[key] = x;
     };
     unsigned eligible = 0, streamed = 0;
     // (Each other streamed class's instances' inputs, as if it kept clean
@@ -23637,34 +23730,43 @@ LogicalResult StaticFolder::buildSim() {
                    << " an untracked source; environment inputs: " << (ports.empty() ? "none" : ports)
                    << ")\n";
     }
+    // Each skipping class's plan: its tables, and its sources by position.
+    struct Plan {
+      SmallVector<uint64_t> start, slotAt, valid, inst, flip, stValid, rowFirst, rowLast;
+      // Per producer class, the sources of each position (in order).
+      std::map<unsigned, std::vector<SmallVector<unsigned>>> srcAt;
+      // Per input of the netlist, the positions that read it, and of those
+      // the ones decided in the frame before.
+      std::map<unsigned, std::pair<SmallVector<uint64_t>, SmallVector<uint64_t>>> envAt;
+      unsigned why[4] = {0, 0, 0, 0};
+    };
+    std::map<unsigned, Plan> plans;
     for (auto [c, cls] : llvm::enumerate(classes)) {
       if (!cls.idleSkip)
         continue;
-      auto &ctl = controls[c];
-      unsigned n = cls.threads(), iw = idxOf(n);
-      unsigned slotBits = cls.ppSlotBits();
-      std::string prefix = cls.name + "_ppi";
+      auto &plan = plans[unsigned(c)];
+      int home = groupOf(unsigned(c));
+      unsigned n = cls.threads();
       // Each instance's decision position (its prefetch's first read) and
       // sources: {class, instance} of every producer bit it reads, its own.
       SmallVector<int> pf;
       ppPrefetches(cls, cls.pageWindow, pf);
-      SmallVector<uint64_t> start(ii + 1, 0), slotAt(ii + 1, 0), valid(ii + 1, 0),
-          inst(ii + 1, 0), flip(ii + 1, 0), stValid(ii + 1, 0), rowFirst(ii + 1, 0),
-          rowLast(ii + 1, 0);
-      // Per producer class, the sources of each position (in order).
-      std::map<unsigned, std::vector<SmallVector<unsigned>>> srcAt;
-      unsigned why[4] = {0, 0, 0, 0};
+      for (auto *v : {&plan.start, &plan.slotAt, &plan.valid, &plan.inst, &plan.flip,
+                      &plan.stValid, &plan.rowFirst, &plan.rowLast})
+        v->assign(ii + 1, 0);
+      auto &why = plan.why;
       for (unsigned i = 0; i < n; ++i) {
         ++streamed;
         int q = pf[i];
         unsigned qq = wrap(q);
-        start[qq] = 1;
-        slotAt[qq] = cls.windowSlot[i];
-        stValid[wrap(cls.slot[kState][i])] = 1;
-        rowFirst[wrap(cls.slot[kState][i] - int(cls.stages))] = 1;
-        rowLast[wrap(lastRow(cls, i))] = 1;
+        plan.start[qq] = 1;
+        plan.slotAt[qq] = cls.windowSlot[i];
+        plan.stValid[wrap(cls.slot[kState][i])] = 1;
+        plan.rowFirst[wrap(cls.slot[kState][i] - int(cls.stages))] = 1;
+        plan.rowLast[wrap(lastRow(cls, i))] = 1;
         bool ok = true, structural = true;
         std::map<unsigned, SmallVector<unsigned>> srcs;
+        std::set<unsigned> envs;
         for (auto [k, cons] : llvm::enumerate(cls.consumerOf)) {
           if (cons < 0 || int(k) == cls.clockInput || (k < cls.staticInput.size() && cls.staticInput[k]))
             continue;
@@ -23672,6 +23774,11 @@ LogicalResult StaticFolder::buildSim() {
             if (piece.producer < 0)
               continue;
             auto &pr = producers[piece.producer];
+            if (pr.cls < 0 && envAhead.count(unsigned(piece.producer)) &&
+                envAhead[unsigned(piece.producer)].x) {
+              envs.insert(unsigned(piece.producer));
+              continue;
+            }
             if (pr.cls < 0 || pr.late || !classes[pr.cls].idleTracked) {
               if (structural)
                 ++why[pr.cls < 0 ? 0 : pr.late ? 1 : 2];
@@ -23683,27 +23790,36 @@ LogicalResult StaticFolder::buildSim() {
               v.push_back(piece.inst);
           }
         }
-        // Timing: each bit read is its producer's frame f - 1 pass's.
+        // Timing: each bit read is its producer's frame f - 1 pass's,
+        // written (and crossed to this group) before the read.
         auto timed = [&](unsigned t, unsigned j) {
           int e = lastRow(classes[t], j);
-          return int(ii) + q - e >= 5 && int(ii) + e - q >= 0;
+          int cross = int(crossChain(groupOf(t), home).size());
+          return int(ii) + q - e >= 5 + cross && int(ii) + e - q >= 0;
         };
         if (!timed(unsigned(c), i) || cls.slot[kState][i] - int(cls.stages) - q < 3)
           ok = false;
         for (auto &[t, v] : srcs)
           for (unsigned j : v)
             ok = ok && timed(t, j);
+        // An input's sample, its crossing before the read, at least four
+        // positions into the frame it compares (its token loaded) and,
+        // decided in the frame before, before the next frame's load.
+        int envCross = int(crossChain(-1, home).size());
+        bool ahead = floorDiv(q) == -1;
+        if (!envs.empty())
+          ok = ok && (ahead ? q + int(ii) - envCross >= 4 : floorDiv(q) == 0 && q - envCross >= 4);
         if (!ok) {
           if (structural)
             ++why[3];
           continue;
         }
         ++eligible;
-        valid[qq] = 1;
-        inst[qq] = i;
-        flip[qq] = unsigned(floorDiv(q) + 1) & 1;
+        plan.valid[qq] = 1;
+        plan.inst[qq] = i;
+        plan.flip[qq] = unsigned(floorDiv(q) + 1) & 1;
         for (auto &[t, v] : srcs) {
-          auto &rows = srcAt[t];
+          auto &rows = plan.srcAt[t];
           for (auto [d, j] : llvm::enumerate(v)) {
             if (rows.size() <= d)
               rows.emplace_back(SmallVector<unsigned>{});
@@ -23711,11 +23827,44 @@ LogicalResult StaticFolder::buildSim() {
             rows[d][qq] = j;
           }
         }
+        for (unsigned p : envs) {
+          auto &[at, before] = plan.envAt[p];
+          at.resize(ii + 1, 0);
+          before.resize(ii + 1, 0);
+          at[qq] = 1;
+          before[qq] = ahead;
+        }
       }
+    }
+    // The writes and their crossings first, each in its own groups (a
+    // class's decision below is tagged into its group whole).
+    if (on)
+      for (auto &[c, plan] : plans) {
+        if (!llvm::is_contained(plan.valid, 1))
+          continue;
+        crossedWrite(c, groupOf(c));
+        for (auto &[t, rows] : plan.srcAt)
+          crossedWrite(t, groupOf(c));
+        for (auto &[p, at] : plan.envAt)
+          envOf(p, groupOf(c));
+      }
+    for (auto &[t, cw] : crossedWrites)
+      crossings += !crossChain(groupOf(t.first), t.second).empty();
+    for (auto [c, cls] : llvm::enumerate(classes)) {
+      if (!cls.idleSkip)
+        continue;
+      auto &plan = plans[unsigned(c)];
+      auto &why = plan.why;
+      auto &ctl = controls[c];
+      unsigned n = cls.threads(), iw = idxOf(n);
+      unsigned slotBits = cls.ppSlotBits();
+      int home = groupOf(unsigned(c));
+      std::string prefix = cls.name + "_ppi";
       if (!on) {
         llvm::errs() << "foldsim-fold-static: pp-idle-skip: " << cls.name << ": off (SLR groups); "
-                     << llvm::count(valid, 1) << " of " << n << " instances would decide (instances not: "
-                     << why[0] << " an environment input, " << why[1] << " a late input, " << why[2]
+                     << llvm::count(plan.valid, 1) << " of " << n
+                     << " instances would decide (instances not: " << why[0]
+                     << " an environment input, " << why[1] << " a late input, " << why[2]
                      << " an untracked source, " << why[3] << " in time)\n";
         idleDecision.at(unsigned(c)).setValue(constant(1, 0));
         idleRowSkip.at(unsigned(c)).setValue(constant(1, 0));
@@ -23725,22 +23874,22 @@ LogicalResult StaticFolder::buildSim() {
       Operation *mark = lastOp();
       // The decision: tables three ahead, registered (A); the bits read at A
       // (data at B); decided at B, a host cycle before the first read leaves.
-      Value vA = resetReg(comb::AndOp::create(b, table(b, ctl.at3, valid, 1), warm3),
+      Value vA = resetReg(comb::AndOp::create(b, table(b, ctl.at3, plan.valid, 1), warm3),
                           prefix + "_valid_a", 0);
-      Value sA = resetReg(table(b, ctl.at3, start, 1), prefix + "_start_a", 0);
-      Value slA = reg(table(b, ctl.at3, slotAt, slotBits), prefix + "_slot_a");
-      Value bank3 = comb::XorOp::create(b, par3, table(b, ctl.at3, flip, 1));
+      Value sA = resetReg(table(b, ctl.at3, plan.start, 1), prefix + "_start_a", 0);
+      Value slA = reg(table(b, ctl.at3, plan.slotAt, slotBits), prefix + "_slot_a");
+      Value bank3 = comb::XorOp::create(b, par3, table(b, ctl.at3, plan.flip, 1));
       if (mutant == 2)
         bank3 = notOf(bank3);
       Value bA = reg(bank3, prefix + "_bank_a");
       auto addrOf = [&](Value instA) {
         return instA ? b.createOrFold<comb::ConcatOp>(bA, instA) : bA;
       };
-      Value iA = iw ? reg(table(b, ctl.at3, inst, iw), prefix + "_inst_a") : Value();
+      Value iA = iw ? reg(table(b, ctl.at3, plan.inst, iw), prefix + "_inst_a") : Value();
       SmallVector<Value> terms{resetReg(vA, prefix + "_valid_b", 0),
-                               cleanRead(unsigned(c), addrOf(iA), prefix + "_own")};
+                               cleanRead(unsigned(c), home, addrOf(iA), prefix + "_own")};
       unsigned sources = 0;
-      for (auto &[t, rows] : srcAt)
+      for (auto &[t, rows] : plan.srcAt)
         for (auto [d, row] : llvm::enumerate(rows)) {
           ++sources;
           if (mutant == 1)
@@ -23755,9 +23904,23 @@ LogicalResult StaticFolder::buildSim() {
           std::string sp = prefix + "_src" + Twine(sources).str();
           Value svB = reg(reg(table(b, ctl.at3, sv, 1), sp + "_valid_a"), sp + "_valid_b");
           Value siA = tw ? reg(table(b, ctl.at3, si, tw), sp + "_inst_a") : Value();
-          Value bit = cleanRead(t, addrOf(siA), sp + "_" + classes[t].name);
+          Value bit = cleanRead(t, home, addrOf(siA), sp + "_" + classes[t].name);
           terms.push_back(comb::OrOp::create(b, notOf(svB), bit));
         }
+      // An input of the netlist: unchanged from the frame before (sampled
+      // three ahead, as the tables; at B with the clean bits).
+      // (Test hook FOLDSIM_IDLE_SKIP_MUTANT=4: the inputs' change ignored.)
+      unsigned inputs = 0;
+      for (auto &[p, at] : plan.envAt) {
+        ++inputs;
+        if (mutant == 4)
+          continue;
+        auto &e = envOf(p, home);
+        std::string sp = prefix + "_in" + Twine(inputs).str();
+        Value same = comb::MuxOp::create(b, table(b, ctl.at3, at.second, 1), e.ahead, e.now);
+        Value term = comb::OrOp::create(b, notOf(table(b, ctl.at3, at.first, 1)), same);
+        terms.push_back(reg(reg(term, sp + "_a"), sp + "_b"));
+      }
       Value decision = comb::AndOp::create(b, terms, false);
       Value startB = resetReg(sA, prefix + "_start_b", 0);
       Value slotB = reg(slA, prefix + "_slot_b");
@@ -23789,7 +23952,7 @@ LogicalResult StaticFolder::buildSim() {
       // pass: the slot is free once its rows are read), held for its other
       // rows, and from its last row to its state pass (a host cycle on;
       // positions in order, so the next evaluation's last row comes after).
-      Value first3 = table(b, ctl.at3, rowFirst, 1);
+      Value first3 = table(b, ctl.at3, plan.rowFirst, 1);
       auto rowHeldNext = backedges.get(i1);
       Value rowHeld = resetReg(rowHeldNext, prefix + "_row_skip", 0);
       Value rowSkip = comb::MuxOp::create(b, first3, skipOf(ctl.ppSlot3), rowHeld);
@@ -23797,10 +23960,10 @@ LogicalResult StaticFolder::buildSim() {
       auto stateHeldNext = backedges.get(i1);
       Value stateHeld = resetReg(stateHeldNext, prefix + "_state_skip", 0);
       stateHeldNext.setValue(
-          comb::MuxOp::create(b, table(b, ctl.at3, rowLast, 1), rowSkip, stateHeld));
+          comb::MuxOp::create(b, table(b, ctl.at3, plan.rowLast, 1), rowSkip, stateHeld));
       idleRowSkip.at(unsigned(c)).setValue(rowSkip);
       idleStateSkip.at(unsigned(c)).setValue(
-          comb::AndOp::create(b, table(b, ctl.at3, stValid, 1), stateHeld));
+          comb::AndOp::create(b, table(b, ctl.at3, plan.stValid, 1), stateHeld));
       // FOLDSIM_SKIP_TRACE (simulation): a line a skipped evaluation.
       {
         auto top = body->getParentOp()->getParentOfType<mlir::ModuleOp>();
@@ -23825,11 +23988,16 @@ LogicalResult StaticFolder::buildSim() {
       }
       tagSince(mark, controlGroup(unsigned(c)), int(c));
       llvm::errs() << "foldsim-fold-static: pp-idle-skip: " << cls.name << ": "
-                   << llvm::count(valid, 1) << " of " << n << " instances decide ("
-                   << sources << " source reads; instances not: " << why[0]
+                   << llvm::count(plan.valid, 1) << " of " << n << " instances decide ("
+                   << sources << " source reads, " << inputs << " inputs"
+                   << (groups ? ", group " + std::to_string(home) : std::string()) << "; instances not: " << why[0]
                    << " an environment input, " << why[1] << " a late input, " << why[2]
                    << " an untracked source, " << why[3] << " in time)\n";
     }
+    if (groups && on)
+      llvm::errs() << "foldsim-fold-static: pp-idle-skip: SLR groups: " << crossings
+                   << " clean-bit writes cross to another group, "
+                   << envCrossed.size() << " input samples to their readers' groups\n";
     if (on && (!cleanWrites.empty() || eligible || streamed))
       llvm::errs() << "foldsim-fold-static: pp-idle-skip: " << cleanWrites.size()
                    << " classes' clean bits in " << replicas << " replicas, " << eligible

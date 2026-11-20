@@ -1,0 +1,49 @@
+# REQUIRES: verilator
+# --pp-idle-skip under SLR groups (with slr-group-control: a class's decision, clean-bit replicas and skip bits in
+# its group) and with inputs of the netlist. Driver/Inputs/idle/top_mix.sv: eight Nodes and eight SNodes (SNode k
+# reads Node 7 - k), the two classes in groups 0 and 2: a Node's clean bits cross to group 2 on registers (its group's,
+# the group between with slr-hop-registers, the reader's), and the decision counts them. Driver/Inputs/idle/top_env.sv:
+# eight Nodes that each read the input x (held 16 target cycles: STIM_X_SLOW): whether x's token for frame f is its
+# token for f - 1 (the token held ahead of its load, or the frame's against the one before), crossed to the group.
+# Exact against the target at latencies 1-90 with stalls and full controllers. Mutants mismatch:
+# FOLDSIM_IDLE_SKIP_MUTANT=1 (the producers' clean bits ignored) across groups, =4 (the inputs' change ignored).
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/idle
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top_mix.f --top Top --out %t/g --static --state-in-ram Node::2,SNode::2 --state-in-ram-pp --state-scratch-bits 0 --slr-groups --slr-count 3 --slr-assign Node:0,SNode:2,Top_model:1 --slr-group-control --slr-level 1 --slr-hop-registers --pp-dirty-writeback --pp-idle-skip Node SNode Src Sink > %t/g.log 2>&1
+# RUN: FileCheck %s --check-prefix=GLOG < %t/g.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/g -DVM1 -DFOLDSIM_SKIP_TRACE -Mdir %t/g/obj %S/Inputs/tb_pages.sv nodes.sv stores.sv top_mix.sv %t/g/foldsim_sim.sv > %t/g/build.log 2>&1
+# RUN: %t/g/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 > %t/g/r1.log
+# RUN: FileCheck %s < %t/g/r1.log
+# RUN: grep -c "idle-skip: SNode" %t/g/r1.log | FileCheck %s --check-prefix=SKIPS
+# RUN: %t/g/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=90 +stall=30 +full=30 | FileCheck %s
+# RUN: env FOLDSIM_IDLE_SKIP_MUTANT=1 FOLDSIM_PP_ROWS=balanced foldsim --srcs top_mix.f --top Top --out %t/g1 --static --state-in-ram Node::2,SNode::2 --state-in-ram-pp --state-scratch-bits 0 --slr-groups --slr-count 3 --slr-assign Node:0,SNode:2,Top_model:1 --slr-group-control --slr-level 1 --slr-hop-registers --pp-dirty-writeback --pp-idle-skip Node SNode Src Sink > %t/g1.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/g1 -DVM1 -Mdir %t/g1/obj %S/Inputs/tb_pages.sv nodes.sv stores.sv top_mix.sv %t/g1/foldsim_sim.sv > %t/g1/build.log 2>&1
+# RUN: %t/g1/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=BAD
+# Inputs of the netlist, in one group and in a group of their own.
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top_env.f --top Top --out %t/e --static --state-in-ram Node::2 --state-in-ram-pp --state-scratch-bits 0 --pp-dirty-writeback --pp-idle-skip Node Sink > %t/e.log 2>&1
+# RUN: FileCheck %s --check-prefix=ELOG < %t/e.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/e -DSTIM_X_SLOW=16 -DFOLDSIM_SKIP_TRACE -Mdir %t/e/obj %S/Inputs/tb_pages.sv nodes.sv top_env.sv %t/e/foldsim_sim.sv > %t/e/build.log 2>&1
+# RUN: %t/e/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 > %t/e/r1.log
+# RUN: FileCheck %s < %t/e/r1.log
+# RUN: grep -c "idle-skip: Node" %t/e/r1.log | FileCheck %s --check-prefix=SKIPS
+# RUN: %t/e/obj/Vtb +verilator+rand+reset+0 +verilator+seed+5 +lo=5 +hi=90 +stall=30 +full=30 | FileCheck %s
+# RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top_env.f --top Top --out %t/eg --static --state-in-ram Node::2 --state-in-ram-pp --state-scratch-bits 0 --slr-groups --slr-count 3 --slr-assign Node:0,Top_model:2 --slr-group-control --slr-group-env --slr-level 2 --slr-hop-registers --pp-dirty-writeback --pp-idle-skip Node Sink > %t/eg.log 2>&1
+# RUN: FileCheck %s --check-prefix=EGLOG < %t/eg.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/eg -DSTIM_X_SLOW=16 -DFOLDSIM_SKIP_TRACE -Mdir %t/eg/obj %S/Inputs/tb_pages.sv nodes.sv top_env.sv %t/eg/foldsim_sim.sv > %t/eg/build.log 2>&1
+# RUN: %t/eg/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 > %t/eg/r1.log
+# RUN: FileCheck %s < %t/eg/r1.log
+# RUN: grep -c "idle-skip: Node" %t/eg/r1.log | FileCheck %s --check-prefix=SKIPS
+# RUN: %t/eg/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=5 +hi=90 +stall=30 +full=30 | FileCheck %s
+# RUN: env FOLDSIM_IDLE_SKIP_MUTANT=4 FOLDSIM_PP_ROWS=balanced foldsim --srcs top_env.f --top Top --out %t/e4 --static --state-in-ram Node::2 --state-in-ram-pp --state-scratch-bits 0 --pp-dirty-writeback --pp-idle-skip Node Sink > %t/e4.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/e4 -DSTIM_X_SLOW=16 -Mdir %t/e4/obj %S/Inputs/tb_pages.sv nodes.sv top_env.sv %t/e4/foldsim_sim.sv > %t/e4/build.log 2>&1
+# RUN: %t/e4/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s --check-prefix=BAD
+
+# GLOG: pp-idle-skip: 2 classes keep clean bits, 2 may skip
+# GLOG: pp-idle-skip: SNode: {{[1-8]}} of 8 instances decide (1 source reads, 0 inputs, group 2;
+# GLOG: pp-idle-skip: SLR groups: 1 clean-bit writes cross to another group, 0 input samples to their readers' groups
+# ELOG: pp-idle-skip: Node: {{[1-8]}} of 8 instances decide (1 source reads, 1 inputs;
+# EGLOG: pp-idle-skip: Node: {{[1-8]}} of 8 instances decide (1 source reads, 1 inputs, group 0;
+# EGLOG: pp-idle-skip: SLR groups: 0 clean-bit writes cross to another group, 1 input samples to their readers' groups
+# SKIPS: {{^[1-9][0-9][0-9]+$}}
+# BAD: {{^}}MISMATCH
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL
