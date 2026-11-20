@@ -146,8 +146,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('gen')
     ap.add_argument('--sll', required=True, help="the fit gate's sll.txt (the SLR groups' SLRs, the SLRs' RAM as placed)")
-    ap.add_argument('--xdc', default=os.environ.get('FOLDSIM_SHELL_XDC', os.path.expanduser(
-        '~/dev/fame5_work/slash_shell_1113/slash/linker/slashkit/resources/base/compute/constraints/impl.xdc')))
+    ap.add_argument('--xdc', default=os.environ.get('FOLDSIM_SHELL_XDC', os.path.join(
+        os.environ.get('SLASH_HOME', 'SLASH'), 'linker/slashkit/resources/base/compute/constraints/impl.xdc')))
     ap.add_argument('--device', default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                      'foldsim_v80_ram_sites.json'),
                     help="the part's RAM sites (foldsim_v80_ram_sites.json; 'none': every listed site exists)")

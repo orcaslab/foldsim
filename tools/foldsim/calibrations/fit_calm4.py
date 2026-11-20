@@ -8,7 +8,8 @@ measured link-memory LUTRAM / priced. Virtual-memory controllers: measured vmem_
 Fixed: the control endpoint (no estimate)."""
 import json, re, os
 S = 1.038
-C = '/home/blaise/dev/fame5_work/static/st32_1031/lk2/calm4'
+# The calm4 synthesis build (its syn/hier2.rpt), under the calibration work directory.
+C = os.path.join(os.environ.get('FOLDSIM_CAL_DIR', 'lk2'), 'calm4')
 rows, order = {}, []
 for line in open(C + '/syn/hier2.rpt'):
     f = line.split('|')
@@ -72,7 +73,7 @@ cal = dict(name='calm4-20261103',
            measured_total=dict(logic=rows['foldsim_afu'][1], lutram=rows['foldsim_afu'][2] + rows['foldsim_afu'][3],
                                ff=rows['foldsim_afu'][4], ramb36=rows['foldsim_afu'][5], ramb18=rows['foldsim_afu'][6],
                                uram=rows['foldsim_afu'][7]))
-out = '/home/blaise/dev/fame5_work/static/st32_1031/lk2/foldsim/tools/foldsim/calibrations/calm4-20261103.json'
+out = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'calm4-20261103.json')
 json.dump(cal, open(out, 'w'), indent=1)
 for e in fams: print(f"{e['family']:14s} n {e['copies']:3d} logic {e['logic']:6.3f} lutram {e['lutram']:6.3f} add {e.get('lutram_add', 0)}")
 print('top', cal['top_logic_per_link_bit'], 'links', cal['link_lutram'], 'vmem', cal['vmem_ctl']['logic'], cal['vmem_ctl']['lutram'], 'fixed', cal['fixed'])

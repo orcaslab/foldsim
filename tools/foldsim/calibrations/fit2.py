@@ -13,7 +13,8 @@ virtual-memory controllers, the control endpoint as a fixed term."""
 import json, re, os
 
 S_SYN = 1.038
-L = '/home/blaise/dev/fame5_work/static/st32_1031/lk2'
+# The calibration builds' work directory (calm4/, calm4a3/, ...).
+L = os.environ.get('FOLDSIM_CAL_DIR', 'lk2')
 POINTS = [
     dict(name='calm4 (synthesis)', rpt=L + '/calm4/syn/hier2.rpt', price=L + '/calm4/price_ab3.json', s=S_SYN,
          afu='foldsim_afu'),

@@ -45,7 +45,7 @@ Routability. The router's global routing utilization (Vivado's initial
 estimate, `Global Vertical/Horizontal Routing Utilization`) against the
 design's routing load and how densely the layout packs it, fitted over the
 V80 OOC builds and images (`fit-route`, foldsim_v80_route.csv: the OOC
-builds of fame5_work/static/ooc2x2 by `route-points`, and the images
+builds of the ooc2x2 study by `route-points`, and the images
 img_int, img_fo and img_ii8 from their impl_1 runme.log and
 place_report_utilization_0.rpt):
 

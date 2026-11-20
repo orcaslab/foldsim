@@ -6,7 +6,7 @@
 #   emul    pico_host_emul: pico_host on the kernel (foldsim_flow.py's top + rtl/kernel + <work>/gen) in Verilator
 #           in-process (flow/emul/foldsim_emul.cpp), run against golden.txt
 #   vrt     pico_host_vrt: pico_host on the V80 through VRT. Built with the system's VRT (/usr/include/vrt,
-#           /lib/x86_64-linux-gnu), never /opt/xilinx/slash or ~/dev/.slash-local (CPATH/LIBRARY_PATH/PKG_CONFIG_PATH
+#           /lib/x86_64-linux-gnu), never /opt/xilinx/slash or a local SLASH prefix (CPATH/LIBRARY_PATH/PKG_CONFIG_PATH
 #           unset); `ldd -r` must show only /lib/x86_64-linux-gnu VRT libraries and no undefined symbol. Not run.
 # Needs riscv32-unknown-elf-gcc and verilator on PATH; <work>/gen (foldsim --manifest pico_v80.toml) for emul.
 set -eo pipefail

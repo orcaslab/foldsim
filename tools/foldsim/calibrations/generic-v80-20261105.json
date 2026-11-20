@@ -1,6 +1,6 @@
 {
  "name": "generic-v80-20261105",
- "source": "design-independent: calm4b4s4-20261104.json's terms, its families replaced by a generic model of the class cost features (fit_generic.py, ridge 0.3) fitted on 15 families' classes in /home/blaise/dev/fame5_work/static/a100cfg_1102/work/gen/b4/gen/models.mlir",
+ "source": "design-independent: calm4b4s4-20261104.json's terms, its families replaced by a generic model of the class cost features (fit_generic.py, ridge 0.3) fitted on 15 families' classes in <work>/a100cfg_1102/work/gen/b4/gen/models.mlir",
  "synth_per_routed": 1.038,
  "rest": 0.0,
  "top_logic_per_link_bit": 0.232,
