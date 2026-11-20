@@ -26,7 +26,8 @@
 # page-engines-pp: the PP row chunk rides a page engine (a member at its own
 # read and write positions, its requests tagged); exact.
 # --pp-dirty-writeback: a pass writes only its row's changed bytes (against the row it read), none where none changed:
-# exact the same, on its own controllers and on page engines.
+# exact the same, on its own controllers and on page engines. The write valid is the registered mask's OR (the compare
+# and the reduction on either side of the register, not both before it).
 # RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/dw --static --state-in-ram Leaf::2 --state-in-ram-pp --state-scratch-bits 0 --pp-dirty-writeback Leaf > %t/dw.log 2>&1
 # RUN: FileCheck %s --check-prefix=DW < %t/dw/foldsim_sim.mlir
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/dw -Mdir %t/dw/obj %S/Inputs/tb_pages.sv top.sv %t/dw/foldsim_sim.sv > %t/dw/build.log 2>&1
@@ -36,7 +37,8 @@
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/dwe -Mdir %t/dwe/obj %S/Inputs/tb_pages.sv top.sv %t/dwe/foldsim_sim.sv > %t/dwe/build.log 2>&1
 # RUN: %t/dwe/obj/Vtb +verilator+rand+reset+0 +verilator+seed+1 +lo=1 | FileCheck %s
 # RUN: %t/dwe/obj/Vtb +verilator+rand+reset+0 +verilator+seed+3 +lo=1 +hi=60 +stall=20 +full=20 | FileCheck %s
-# DW: _wr_valid_dirty
+# DW: %pps0_wr_mask = seq.firreg
+# DW-NEXT: comb.icmp ne %pps0_wr_mask
 # RUN: env FOLDSIM_PP_ROWS=balanced foldsim --srcs top.f --top Top --out %t/ppe --static --state-in-ram Leaf::4 --state-in-ram-pp --state-scratch-bits 0 --page-engines 4 --page-engines-pp Leaf > %t/ppe.log 2>&1
 # RUN: FileCheck %s --check-prefix=PPE < %t/ppe/schedule.txt
 # RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --top-module tb -I%t/ppe -Mdir %t/ppe/obj %S/Inputs/tb_pages.sv top.sv %t/ppe/foldsim_sim.sv > %t/ppe/build.log 2>&1
