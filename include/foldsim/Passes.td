@@ -2525,6 +2525,13 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     ListOption<"portModules", "port-modules", "std::string",
                "Modules (and their specializations) whose instances' ports "
                "to report: the levels at each input and behind each output">,
+    Option<"crossings", "crossings", "std::string", "",
+           "Crossing table (CSV) between partitions: each instance of "
+           "`port-modules` (an SLR group's module, say) and the rest of the "
+           "design. One row per cell bit read across (wires through a port "
+           "are no crossing): the levels from its start to it (driver side) "
+           "and from it to the end points it reaches in the reading "
+           "partition (load side), with its start and that end point">,
     Option<"paths", "paths", "std::string", "",
            "Deep paths, op by op, one per pair of start and end registers "
            "(JSON lines)">,

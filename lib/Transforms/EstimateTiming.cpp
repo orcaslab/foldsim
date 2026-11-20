@@ -234,6 +234,7 @@ public:
   void writeEndPoints(raw_ostream &os, unsigned minLevels);
   void writeInstances(raw_ostream &os);
   void writePorts(raw_ostream &os, ArrayRef<std::string> modules);
+  void writeCrossings(raw_ostream &os, ArrayRef<std::string> modules);
   void writeArrivals(raw_ostream &os);
   void writePaths(raw_ostream &os, unsigned minLevels);
   void writeReport(raw_ostream &os, unsigned topPaths,
@@ -1333,6 +1334,145 @@ void Timing::writePorts(raw_ostream &os, ArrayRef<std::string> modules) {
   }
 }
 
+/// The crossings between partitions: each instance of `modules` (an SLR
+/// group's module, say) and the rest of the design (the top's own logic) is
+/// a partition, and a crossing is an edge from a cell (a register, LUT,
+/// carry, RAM...) in one to a cell in another, as placement sees the
+/// flattened design: a port that only passes wires through (a bit of a
+/// feed-through) is no crossing, and logic on either side of a port counts.
+/// One row per driving cell bit and reading partition: the levels from its
+/// start to the cell's output (the driver side) and from there to the end
+/// points it reaches in the reading partition, through that partition's
+/// logic and on (the load side: the edge's levels and the longest path over
+/// the mapped edges after it, an upper bound on the table collapse an end
+/// point's own arrival takes). A crossing is clean when both are at most one
+/// level: a register at each end, or one LUT.
+void Timing::writeCrossings(raw_ostream &os, ArrayRef<std::string> modules) {
+  os << "from,to,driver,load,cell,start,end_inst,end\n";
+  // Each context's partition: the instance of `modules` it is in (its
+  // context id), else 0 (the rest).
+  std::vector<unsigned> partOf(contexts.size(), 0);
+  for (unsigned ctx = 1, e = contexts.size(); ctx < e; ++ctx) {
+    auto &c = contexts[ctx];
+    partOf[ctx] = matchesModule(c.module.getModuleName(), modules)
+                      ? ctx
+                      : partOf[c.parent];
+  }
+  auto partName = [&](unsigned part) -> std::string {
+    return part ? path(part) : std::string("level");
+  };
+  // The readers of every evaluated node, with the levels of each edge.
+  unsigned count = nodes.size();
+  std::vector<SmallVector<std::pair<unsigned, int>, 2>> users(count);
+  SmallVector<Edge> edges;
+  for (unsigned id = 0; id < count; ++id) {
+    if (nodes[id].state != 2 || isStart(nodes[id].kind))
+      continue;
+    edges.clear();
+    inputs(id, edges);
+    for (auto &edge : edges)
+      if (edge.in < count)
+        users[edge.in].push_back({id, edge.levels});
+  }
+  // The end point each node feeds (the last, for naming), and the longest
+  // levels from a node to an end point (-1: none), memoized; `next` the
+  // reader on that path (kNone: the node is the end point's).
+  std::vector<int> endOf(count, -1);
+  for (unsigned i = 0, e = endPoints.size(); i < e; ++i)
+    if (endPoints[i].node < count)
+      endOf[endPoints[i].node] = i;
+  std::vector<int> down(count, -2); // -2: not yet
+  std::vector<unsigned> next(count, kNone);
+  auto longest = [&](unsigned root) {
+    SmallVector<std::pair<unsigned, unsigned>> stack{{root, 0}};
+    while (!stack.empty()) {
+      unsigned id = stack.back().first;
+      unsigned k = stack.back().second;
+      if (k == 0) {
+        if (down[id] >= -1) {
+          stack.pop_back();
+          continue;
+        }
+        down[id] = -3; // in progress: a loop reads it as reaching nothing
+      }
+      if (k < users[id].size()) {
+        stack.back().second = k + 1;
+        unsigned u = users[id][k].first;
+        if (down[u] == -2)
+          stack.push_back({u, 0});
+        continue;
+      }
+      int best = endOf[id] >= 0 ? 0 : -1;
+      unsigned via = kNone;
+      for (auto [u, levels] : users[id])
+        if (down[u] >= 0 && down[u] + levels > best)
+          best = down[u] + levels, via = u;
+      down[id] = best;
+      next[id] = via;
+      stack.pop_back();
+    }
+    return down[root];
+  };
+  for (unsigned id = 0; id < count; ++id) {
+    if (nodes[id].state != 2 || users[id].empty())
+      continue;
+    unsigned from = partOf[nodes[id].ctx];
+    // The worst reader in each other partition.
+    SmallVector<std::tuple<unsigned, int, unsigned>, 2> to;
+    for (auto [u, levels] : users[id]) {
+      unsigned part = partOf[nodes[u].ctx];
+      if (part == from)
+        continue;
+      int l = longest(u);
+      if (l >= 0)
+        l += levels;
+      auto *it = llvm::find_if(to, [&](auto &t) { return std::get<0>(t) == part; });
+      if (it == to.end())
+        to.push_back({part, l, u});
+      else if (l > std::get<1>(*it))
+        *it = {part, l, u};
+    }
+    for (auto [part, load, u] : to) {
+      uint32_t fanout;
+      unsigned crossings;
+      os << partName(from) << ',' << partName(part) << ','
+         << nodes[id].levels << ',' << load << ',';
+      printName(os, id);
+      os << ',';
+      printName(os, startOf(nodes[id].ctx, id, fanout, crossings));
+      os << ',';
+      unsigned end = u;
+      while (end != kNone && next[end] != kNone)
+        end = next[end];
+      if (load >= 0 && end != kNone && endOf[end] >= 0) {
+        auto &ep = endPoints[endOf[end]];
+        os << path(ep.ctx) << ',';
+        printOp(os, ep.op, ep.port, ep.bit);
+      } else {
+        os << ',';
+      }
+      os << '\n';
+    }
+  }
+  // An end point in another partition than the cell that drives it (a
+  // register, RAM write or output fed straight across): load side 0.
+  for (auto &ep : endPoints) {
+    unsigned id = ep.node;
+    if (id >= count || partOf[ep.ctx] == partOf[nodes[id].ctx])
+      continue;
+    uint32_t fanout;
+    unsigned crossings;
+    os << partName(partOf[nodes[id].ctx]) << ',' << partName(partOf[ep.ctx])
+       << ',' << nodes[id].levels << ",0,";
+    printName(os, id);
+    os << ',';
+    printName(os, startOf(nodes[id].ctx, id, fanout, crossings));
+    os << ',' << path(ep.ctx) << ',';
+    printOp(os, ep.op, ep.port, ep.bit);
+    os << '\n';
+  }
+}
+
 /// For every module instantiated below the top, the levels at which each bit
 /// of its ports arrives, the worst over its instances: an input's in the
 /// instantiating module, an output's behind it (constants arrive at 0).
@@ -1954,6 +2094,9 @@ void EstimateTimingPass::runOnOperation() {
                    [&](raw_ostream &os) { timing.writeInstances(os); })) ||
       failed(write(ports, [&](raw_ostream &os) {
         timing.writePorts(os, portModules);
+      })) ||
+      failed(write(crossings, [&](raw_ostream &os) {
+        timing.writeCrossings(os, portModules);
       })) ||
       failed(write(arrivals,
                    [&](raw_ostream &os) { timing.writeArrivals(os); })) ||
