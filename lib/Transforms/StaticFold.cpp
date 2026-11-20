@@ -30279,17 +30279,33 @@ LogicalResult StaticFolder::extractGroups() {
     for (auto &op : body->without_terminator())
       if (auto r = dyn_cast<seq::FirRegOp>(op))
         regs.push_back(r);
-    // (The muxes of a register's next value: itself, or its concat's parts,
-    // a link read of several chunks.)
+    // (The muxes of a register's next value, through wiring, the data of
+    // array reads and the arms of muxes: a link read of several chunks, of
+    // several sources chosen by a table, each forwarding its write.)
     SmallVector<std::pair<seq::FirRegOp, comb::MuxOp>> muxes;
+    DenseSet<Operation *> taken;
     for (auto reg : regs) {
-      Value next = reg.getNext();
-      if (auto m = next.getDefiningOp<comb::MuxOp>())
-        muxes.push_back({reg, m});
-      else if (auto c = next.getDefiningOp<comb::ConcatOp>())
-        for (Value o : c.getOperands())
-          if (auto m = o.getDefiningOp<comb::MuxOp>())
+      SmallVector<Value> work{reg.getNext()};
+      DenseSet<Value> seen;
+      while (!work.empty() && seen.size() < 256) {
+        Value v = work.pop_back_val();
+        if (!seen.insert(v).second)
+          continue;
+        Operation *def = v.getDefiningOp();
+        if (!def)
+          continue;
+        if (auto m = dyn_cast<comb::MuxOp>(def)) {
+          if (taken.insert(m).second)
             muxes.push_back({reg, m});
+          work.push_back(m.getTrueValue());
+          work.push_back(m.getFalseValue());
+        } else if (auto g = dyn_cast<hw::ArrayGetOp>(def)) {
+          work.push_back(g.getInput());
+        } else if (isWiring(def)) {
+          for (Value o : def->getOperands())
+            work.push_back(o);
+        }
+      }
     }
     for (auto [reg, mux] : muxes) {
       int p = partOf.count(reg) ? partOf[reg] : -1;
