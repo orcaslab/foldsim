@@ -881,6 +881,14 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "elastic buffer (credit in, present-and-confirm out), and the "
            "reset through one level register: no input port loads more than "
            "one SLR. The same tokens in the same order; host cycles move">,
+    Option<"slrEnvHome", "slr-env-home", "bool", "false",
+           "With slr-group-env: an output channel whose valid and data one "
+           "group computes (a folded port record built in its producers' "
+           "group, with slr-group-ports) gets its elastic buffer (the data "
+           "registers, full and shown) in that group, beside what fills it: "
+           "the channel leaves the group from registers, and only the stage "
+           "registers' handshake crosses back. The same netlist apart from "
+           "the hierarchy: no value or host cycle moves">,
     Option<"physicalDomains", "physical-domains", "bool", "false",
            "Physical domains: the simulator emitted as a tree of modules "
            "that mirrors the class tree. Class c's domain `<sim>_dom_<c>` "

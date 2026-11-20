@@ -55,6 +55,27 @@
 # RUN: %t/gp/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=GP3
 # GP2: {{^}}MATCH 196 cycles in 11789 host cycles
 # GP3: {{^}}MATCH 196 cycles in 69393 host cycles
+# --slr-env-home (a32-X16 11-19: v16kjGsPA's record reached the level's
+# buffer through 9 LUT levels across SLR1|SLR2): with --slr-group-env the
+# request channel, which group 2 computes (--slr-group-ports), gets its elastic
+# buffer in group 2 too, so it leaves the group from registers: the same MATCH
+# in the same host cycles as the buffer in the level.
+# RUN: foldsim --srcs top.f --top Top --out %t/ea --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-ports --slr-group-env --slr-group-own 1000 Unit > %t/ea.log 2>&1
+# RUN: foldsim --srcs top.f --top Top --out %t/eb --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-ports --slr-group-env --slr-group-own 1000 --slr-env-home Unit > %t/eb.log 2>&1
+# RUN: FileCheck %s --check-prefix=EHLOG < %t/eb.log
+# EHLOG: slr-group-env: 3 input and 2 output channels staged, 1 output buffers in their group
+# RUN: sed -n '/^module foldsim_sim_slr2(/,/^endmodule/p' %t/eb/foldsim_sim.sv | FileCheck %s --check-prefix=EH
+# RUN: sed -n '/^module foldsim_sim_slr2(/,/^endmodule/p' %t/ea/foldsim_sim.sv | FileCheck %s --check-prefix=EH0
+# EH: req_bits_envbuf
+# EH0-NOT: req_bits_envbuf
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/ea -Mdir %t/ea/obj %S/Inputs/tb_ports.sv top.sv %t/ea/foldsim_sim.sv > %t/ea/build.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/eb -Mdir %t/eb/obj %S/Inputs/tb_ports.sv top.sv %t/eb/foldsim_sim.sv > %t/eb/build.log 2>&1
+# RUN: %t/ea/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s --check-prefix=EH2
+# RUN: %t/eb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s --check-prefix=EH2
+# RUN: %t/ea/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=EH3
+# RUN: %t/eb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=EH3
+# EH2: {{^}}MATCH 196 cycles in 14740 host cycles
+# EH3: {{^}}MATCH 196 cycles in 71403 host cycles
 # RUN: not foldsim --srcs top.f --top Top --out %t/e1 --static --nest --modulo --fold-ports 'mp_([13])_(.*)' --fold-ports-reset rst Unit 2>&1 | FileCheck %s --check-prefix=NUM
 # RUN: not foldsim --srcs top.f --top Top --out %t/e2 --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset nosuch Unit 2>&1 | FileCheck %s --check-prefix=RST
 # OFF: `define FOLDSIM_NUM_CLASSES

@@ -939,6 +939,9 @@ public:
   /// `advance` enter the simulator through one register stage in the level,
   /// then one per group.
   bool slrGroupEnv = false;
+  /// `slr-env-home` (with slr-group-env): an output channel a group
+  /// computes gets its elastic buffer in that group.
+  bool slrEnvHome = false;
   /// `physical-domains`: the simulator as a tree of modules mirroring the
   /// class tree (extractDomains).
   bool physicalDomains = false;
@@ -29098,6 +29101,14 @@ LogicalResult StaticFolder::extractGroups() {
       term->setOperand(readyIt->second, r);
     }
     // Output channels.
+    // (`slr-env-home`: the group each grouped op is in, for the channels a
+    // group computes.)
+    DenseMap<Operation *, unsigned> envGroupOf;
+    if (slrEnvHome)
+      for (unsigned g = 0; g < slrGroups; ++g)
+        for (auto *op : opsOf[g])
+          envGroupOf[op] = g;
+    unsigned envHomed = 0;
     for (auto &validName : outNames) {
       StringRef chan = StringRef(validName).drop_back(6);
       auto readyIt = inIdx.find((chan + "_ready").str());
@@ -29105,6 +29116,41 @@ LogicalResult StaticFolder::extractGroups() {
         continue;
       ++outChans;
       unsigned vi = outIdx[validName];
+      // `slr-env-home`: a channel whose valid and data one group computes
+      // (none of them the level's or a port) gets its buffer there.
+      int home = -1;
+      if (slrEnvHome) {
+        auto groupOfValue = [&](Value v) -> int {
+          auto *def = v.getDefiningOp();
+          if (def && isa<hw::ConstantOp>(def))
+            return -2;
+          auto it = def ? envGroupOf.find(def) : envGroupOf.end();
+          return it == envGroupOf.end() ? -1 : int(it->second);
+        };
+        home = groupOfValue(term->getOperand(vi));
+        for (auto [name, i] : prefixed(chan, outIdx, validName)) {
+          int g = groupOfValue(term->getOperand(i));
+          if (g != -2 && g != home)
+            home = -1;
+        }
+      }
+      Operation *chanMark = term->getPrevNode();
+      llvm::scope_exit homeChan([&] {
+        if (home < 0)
+          return;
+        // The buffer's ops (not the stage registers: the first stays in the
+        // level beside the environment, the second slr-group-own replicates).
+        for (Operation *op = chanMark ? chanMark->getNextNode() : &body->front();
+             op && op != term; op = op->getNextNode()) {
+          if (isa<hw::ConstantOp>(op) || op->hasAttr(kEnvStage1))
+            continue;
+          if (auto r = dyn_cast<seq::FirRegOp>(op))
+            if (r.getName().ends_with("_env2"))
+              continue;
+          opsOf[home].push_back(op);
+        }
+        ++envHomed;
+      });
       Value y = body->getArgument(readyIt->second);
       Value innerValid = term->getOperand(vi);
       auto y1 = stage1(y, chan + "_ready");
@@ -29150,6 +29196,8 @@ LogicalResult StaticFolder::extractGroups() {
         others.push_back(simModule.getInputName(i).str());
     llvm::errs() << "foldsim-fold-static: slr-group-env: " << inChans
                  << " input and " << outChans << " output channels staged"
+                 << (slrEnvHome ? ", " + std::to_string(envHomed) + " output buffers in their group"
+                                : std::string())
                  << (advanceStaged ? ", advance staged" : "");
     if (!others.empty())
       llvm::errs() << "; inputs not on a channel, left as they are: "
@@ -30790,6 +30838,7 @@ void FoldStaticPass::runOnOperation() {
   folder.slrGroupCut = slrGroupCut;
   gUramCascadeMax = uramCascadeMax;
   folder.slrGroupEnv = slrGroupEnv;
+  folder.slrEnvHome = slrEnvHome;
   folder.physicalDomains = physicalDomains;
   for (auto &spec : domainMerge) {
     auto [name, price] = StringRef(spec).split(':');

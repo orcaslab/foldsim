@@ -596,6 +596,8 @@ def frame_options(a):
         fold += ' slr-link-rams'
     if getattr(a, 'slr_group_ports', False):
         fold += ' slr-group-ports'
+    if getattr(a, 'slr_env_home', False):
+        fold += ' slr-env-home'
     if getattr(a, 'slr_hop_registers', False):
         fold += ' slr-hop-registers'
     if getattr(a, 'slr_group_control', False):
@@ -2910,6 +2912,11 @@ def build_parser():
                          'record memories built in the group of the bundles\' producers, so only the folded record '
                          'leaves that group (foldsim-fold-static slr-group-ports; the same logic): v16kjGs 11-19, '
                          '16 x 512-bit memory write data crossed SLR1|SLR2 unfolded')
+    ap.add_argument('--slr-env-home', action='store_true',
+                    help='with --slr-group-env: an output channel one SLR group computes (a folded record, with '
+                         '--slr-group-ports) gets its elastic buffer in that group (foldsim-fold-static slr-env-home; '
+                         'the same netlist): a32-X16 11-19, v16kjGsPA\'s request record reached the level\'s buffer '
+                         'through 9 LUT levels across SLR1|SLR2')
     ap.add_argument('--slr-link-rams', action='store_true',
                     help='with --slr-groups: links may be block or ultra RAM too, in their reader\'s group '
                          '(foldsim-fold-static slr-link-rams); else every link of a grouped fold is distributed '
