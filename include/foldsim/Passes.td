@@ -815,15 +815,6 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "than in one register whose route crosses k boundaries; an "
            "slr-serialize class's chunk register is followed by one in each "
            "group between (its links k - 1 host cycles later)">,
-    Option<"slrSllExport", "slr-sll-export", "std::string", "\"\"",
-           "With slr-groups: after the build, a JSON file of the group ports "
-           "between the level and the groups, each by the classes whose ops "
-           "use it (their domains), for slr-sll-measured">,
-    ListOption<"slrSllMeasured", "slr-sll-measured", "std::string",
-               "With slr-groups: slr-sll-export files of earlier builds of the "
-               "design: the SLL model takes their measured level ports in place "
-               "of its own level items for the classes they measured (a class "
-               "outside the level's group there; a later file wins)">,
     Option<"slrGroupPorts", "slr-group-ports", "bool", "false",
            "With SLR groups and fold-ports: the folded port bundles' outputs "
            "(their link reads and queues) and the request records' memories "
