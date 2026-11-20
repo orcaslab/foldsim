@@ -271,6 +271,78 @@ def class_at(text, top, specs):
     return '\n'.join(lines), list(name.values())
 
 
+def class_auto(text, top, classes, min_count, min_ops, deep=False, fused=()):
+    """`--class-auto N[:OPS]`: the level's replicated instances as classes. What stays
+    in the simulator level (outside every class) and is replicated by the design's
+    generate loops (instance paths equal but for their indices, one module) grows
+    with the design's size: per port, per bank, per core. Each such group of at
+    least N instances, of at least OPS operations (the module and every module
+    below it) and with no class below it, becomes a class of its own (an
+    `--class-at TAG@GLOB` of its paths, the indices `*`), outermost first: the
+    level then holds one copy's logic a group, folded like any class. A group
+    holding a member of a fused class (`A+B`, the pair one parent must
+    instantiate) is never taken: nesting it would part the pair. Returns
+    the specs ([(tag, glob)]) and one line a group for the report.
+    With `deep` (S29 F3: the arbiters sized by ports and banks), a group with
+    classes below it is taken too, as a `nest:` class holding them: what the
+    level keeps of an arbiter whose slices are classes (a cache's per-bank
+    request crossbar: N banks x N inputs) folds to one copy as well."""
+    lines = text.split('\n')
+    span, cur = {}, None
+    for i, line in enumerate(lines):
+        m = re.match(r'  hw\.module (?:private )?@([\w$.]+)\(', line)
+        if m:
+            cur = m.group(1)
+            span[cur] = [i, None]
+        elif line == '  }' and cur:
+            span[cur][1] = i
+            cur = None
+    body = {m: [(mm.group(1), mm.group(3)) for i in range(s, e) for mm in [INSTANCE.search(lines[i])] if mm]
+            for m, (s, e) in span.items() if e is not None}
+    size, has_class, has_fused = {}, {}, {}
+    fused = set(fused)
+
+    def is_class(m):
+        return m in classes or re.sub(r'_\d+$', '', m) in classes
+
+    def walk_size(m):
+        if m not in size:
+            s, e = span[m]
+            size[m] = (e - s) + sum(walk_size(c) for _, c in body.get(m, []) if c in body)
+            has_class[m] = any(is_class(c) or (c in body and has_class[c]) for _, c in body.get(m, []))
+            has_fused[m] = any(c in fused or re.sub(r'_\d+$', '', c) in fused or (c in body and has_fused[c])
+                               for _, c in body.get(m, []))
+        return size[m]
+
+    groups = {}
+
+    def walk(m, path):
+        for name, callee in body.get(m, []):
+            if callee not in body or is_class(callee):
+                continue
+            p = f'{path}.{name}' if path else name
+            glob = re.sub(r'(?<=_)\d+(?=\.|$)', '*', p)
+            groups.setdefault((glob, callee), []).append(p)
+            walk(callee, p)
+
+    walk(top, '')
+    found = []
+    for (glob, callee), paths in groups.items():
+        if '*' in glob and len(paths) >= min_count and walk_size(callee) >= min_ops and \
+                (deep or not has_class[callee]) and not has_fused[callee]:
+            found.append((glob, callee, len(paths), size[callee]))
+    found.sort(key=lambda g: (g[0].count('.'), g[0]))
+    specs, report = [], []
+    for glob, callee, n, ops in found:
+        if any(glob.startswith(g + '.') for g, _, _ in specs):
+            continue
+        tag = f'auto{len(specs)}'
+        nest = has_class[callee]
+        specs.append((glob, tag, nest))
+        report.append(f'{tag}: {n} x {callee} ({ops} ops) at {glob}{" (nest: holds classes)" if nest else ""}')
+    return [(t, (NEST if nest else '') + g) for g, t, nest in specs], report
+
+
 def instantiated(text, module, names):
     """The modules of `names` the module `module` instantiates."""
     m = re.search(r'hw\.module (?:private )?@' + re.escape(module) + r'\(.*?\n  \}\n', text, re.S)
@@ -2517,6 +2589,12 @@ def build_parser():
                          'the first match takes an instance; `inner:GLOB` only an instance with no '
                          'match below it; `nest:GLOB` a class whose own instances are searched too '
                          '(a class holding classes). A class `A+B` may name them')
+    ap.add_argument('--class-auto', default='', metavar='N[:OPS[:deep]]',
+                    help='the level\'s replicated instances as classes: each group of at least N instances '
+                         'a generate loop makes of one module outside every class (paths equal but for their '
+                         'indices), of at least OPS operations (default 40) with no class below it, becomes a '
+                         'class autoK (an --class-at of its paths), outermost first; one report line a group. '
+                         ':deep takes groups holding classes too (as nest: classes, which hold them)')
     ap.add_argument('--absorb-exclusive', default='', metavar='CLASS,...',
                     help="for these classes (globs), a model input whose logic in the parent is "
                          "over the absorb limit takes the part of it that reaches that input "
@@ -3638,6 +3716,22 @@ def main():
             f.write(text)
         named = {m for c in a.classes for m in c.split('+')}
         a.classes = a.classes + [n for n in new if n not in named]
+    if getattr(a, 'class_auto', ''):
+        n, _, rest = a.class_auto.partition(':')
+        ops, _, mode = rest.partition(':')
+        if not n.isdigit() or int(n) < 2 or (ops and not ops.isdigit()) or mode not in ('', 'deep'):
+            sys.exit(f'--class-auto {a.class_auto}: not N[:OPS[:deep]] (N >= 2)')
+        text = open(design).read()
+        specs, report = class_auto(text, a.top, {m for c in a.classes for m in c.split('+')},
+                                   int(n), int(ops or 40), deep=mode == 'deep',
+                                   fused={m for c in a.classes if '+' in c for m in c.split('+')})
+        for line in report:
+            print(f'foldsim: class-auto: {line}', file=sys.stderr)
+        if specs:
+            text, new = class_at(text, a.top, specs)
+            with open(design, 'w') as f:
+                f.write(text)
+            a.classes = a.classes + new
     groups = [c.split('+') for c in a.classes if '+' in c]
     if any(len(g) != 2 for g in groups):
         sys.exit('a fused class is two modules, A+B')

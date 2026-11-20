@@ -1,0 +1,34 @@
+# REQUIRES: verilator
+# The level's replicated instances as classes (--class-auto N[:OPS]): the four counters a generate loop makes outside
+# the classes (g_ctr_*.ctr) become one class of four instances (auto0, folded like any class); exact against the
+# target, channels stalled or not, the frame unchanged. Below the size or count asked, no class.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/class-auto
+# RUN: foldsim --srcs top.f --top Top --out %t/a --static --nest --modulo --class-auto 2:10 Leaf 2>&1 | FileCheck %s --check-prefix=AUTO
+# RUN: FileCheck %s --check-prefix=SCHED < %t/a/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/a/obj %S/Inputs/tb_reset.sv top.sv %t/a/foldsim_sim.sv > %t/a/build.log 2>&1
+# RUN: %t/a/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 +stall=0 | FileCheck %s
+# RUN: %t/a/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/n --static --nest --modulo --class-auto 5:10 Leaf 2>&1 | FileCheck %s --check-prefix=NONE
+# RUN: foldsim --srcs top.f --top Top --out %t/s --static --nest --modulo --class-auto 2:1000 Leaf 2>&1 | FileCheck %s --check-prefix=NONE
+# RUN: not foldsim --srcs top.f --top Top --out %t/b --static --class-auto 1 Leaf 2>&1 | FileCheck %s --check-prefix=BAD
+# AUTO: class-auto: auto0: 4 x Ctr ({{[0-9]+}} ops) at g_ctr_*.ctr
+# AUTO: II = 8
+# SCHED: auto0 x4
+# NONE-NOT: class-auto:
+# BAD: --class-auto 1: not N[:OPS[:deep]] (N >= 2)
+# CHECK: {{^}}MATCH 196 cycles
+# :deep (S29 F3): a group holding classes is taken as a nest: class -- four per-bank arbiters, each with two slices
+# of the class Slice, become one class of four instances holding the slices; exact, the frame unchanged. Without
+# :deep that group holds classes and is not taken.
+# RUN: cd %S/../Driver/Inputs/class-auto-deep
+# RUN: foldsim --srcs top.f --top Top --out %t/d --static --nest --modulo --class-auto 2:10:deep Slice 2>&1 | FileCheck %s --check-prefix=DEEP
+# RUN: FileCheck %s --check-prefix=DSCHED < %t/d/schedule.txt
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -Mdir %t/d/obj %S/Inputs/tb_reset.sv top.sv %t/d/foldsim_sim.sv > %t/d/build.log 2>&1
+# RUN: %t/d/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +stall=0 | FileCheck %s --check-prefix=DM
+# RUN: %t/d/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +stall=30 | FileCheck %s --check-prefix=DM
+# RUN: foldsim --srcs top.f --top Top --out %t/df --static --nest --modulo --class-auto 2:10 Slice 2>&1 | FileCheck %s --check-prefix=NONE
+# DEEP: class-auto: auto0: 4 x Arb ({{[0-9]+}} ops) at g_bank_*.arb (nest: holds classes)
+# DEEP: II = 10
+# DSCHED: Slice x8 {{.*}} under auto0_model
+# DSCHED: auto0_model x4
+# DM: {{^}}MATCH 196 cycles
