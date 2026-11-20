@@ -889,6 +889,17 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "the channel leaves the group from registers, and only the stage "
            "registers' handshake crosses back. The same netlist apart from "
            "the hierarchy: no value or host cycle moves">,
+    Option<"slrCrossCofactor", "slr-cross-cofactor", "unsigned", "0",
+           "With SLR groups: a register's next value (and clock enable) that "
+           "reads, through its partition's logic (a group's, or the "
+           "level's), at most this many one-bit values another partition "
+           "drives (the frame decision's partials, replicated at their "
+           "source) is expanded over them: a select by those bits of the "
+           "logic's cofactors with them constant, folded after. Each such bit "
+           "then meets the register through the select alone -- one LUT for "
+           "two bits, or three where the cofactors fold (a held register's) "
+           "-- not through the AND and the muxes after it. The same function: "
+           "no value or host cycle moves. 0: off">,
     Option<"physicalDomains", "physical-domains", "bool", "false",
            "Physical domains: the simulator emitted as a tree of modules "
            "that mirrors the class tree. Class c's domain `<sim>_dom_<c>` "

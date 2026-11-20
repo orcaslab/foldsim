@@ -76,6 +76,15 @@
 # RUN: %t/eb/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=EH3
 # EH2: {{^}}MATCH 196 cycles in 14740 host cycles
 # EH3: {{^}}MATCH 196 cycles in 71403 host cycles
+# --slr-cross-cofactor 3 on top: the registers reading another partition's
+# one-bit values through logic take them in a select: the same MATCH in the
+# same host cycles.
+# RUN: foldsim --srcs top.f --top Top --out %t/ec --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset rst --copies Unit:2 --slr-groups --slr-region v80 --slr-assign Unit:0,Unit_copy1:1,Top_model:2 --slr-group-control --slr-group-reset --slr-level 2 --slr-group-ports --slr-group-env --slr-group-own 1000 --slr-env-home --slr-cross-cofactor 3 Unit > %t/ec.log 2>&1
+# RUN: FileCheck %s --check-prefix=ECLOG < %t/ec.log
+# ECLOG: slr-cross-cofactor: 3 register inputs expanded
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/ec -Mdir %t/ec/obj %S/Inputs/tb_ports.sv top.sv %t/ec/foldsim_sim.sv > %t/ec/build.log 2>&1
+# RUN: %t/ec/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +lo=1 +hi=60 +stall=30 | FileCheck %s --check-prefix=EH2
+# RUN: %t/ec/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=100 +hi=400 +stall=20 | FileCheck %s --check-prefix=EH3
 # RUN: not foldsim --srcs top.f --top Top --out %t/e1 --static --nest --modulo --fold-ports 'mp_([13])_(.*)' --fold-ports-reset rst Unit 2>&1 | FileCheck %s --check-prefix=NUM
 # RUN: not foldsim --srcs top.f --top Top --out %t/e2 --static --nest --modulo --fold-ports 'mp_([0-9]+)_(.*)' --fold-ports-reset nosuch Unit 2>&1 | FileCheck %s --check-prefix=RST
 # OFF: `define FOLDSIM_NUM_CLASSES

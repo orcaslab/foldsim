@@ -942,6 +942,9 @@ public:
   /// `slr-env-home` (with slr-group-env): an output channel a group
   /// computes gets its elastic buffer in that group.
   bool slrEnvHome = false;
+  /// `slr-cross-cofactor` k: a register's next value reading at most k
+  /// one-bit values of another partition through logic is expanded over them.
+  unsigned slrCrossCofactor = 0;
   /// `physical-domains`: the simulator as a tree of modules mirroring the
   /// class tree (extractDomains).
   bool physicalDomains = false;
@@ -29962,6 +29965,185 @@ LogicalResult StaticFolder::extractGroups() {
                    << " values without a lead stay in the level: the level control "
                       "they read fans out over the SLR groups unregistered\n";
   }
+  // `slr-cross-cofactor` k: a register's next value (and clock enable) that
+  // reads, through its partition's logic, at most k one-bit values another
+  // partition (a group, or the level) drives -- the frame decision's
+  // partials' replicas, say -- is expanded over them (Shannon): a select by
+  // those bits of the logic's cofactors with them constant, folded by the
+  // canonicalization after. Each bit then meets the register through the
+  // select alone (one LUT for up to two bits, or three when the cofactors
+  // fold, as a held register's do), not through the AND and muxes the
+  // partition's logic puts it in. The same function: no value moves.
+  if (slrCrossCofactor) {
+    DenseMap<Operation *, int> partOf;
+    for (unsigned g = 0; g < slrGroups; ++g)
+      for (auto *op : opsOf[g])
+        partOf[op] = g;
+    auto part = [&](Value v) -> int {
+      auto *def = v.getDefiningOp();
+      if (!def)
+        return -1;  // a port: the level's
+      auto it = partOf.find(def);
+      return it == partOf.end() ? -1 : it->second;
+    };
+    auto isLogic = [&](Operation *op) {
+      return op && op->getNumRegions() == 0 && op->getNumOperands() &&
+             !isa<hw::InstanceOp, hw::OutputOp>(op) &&
+             (op->getDialect()->getNamespace() == "comb" ||
+              op->getDialect()->getNamespace() == "hw") &&
+             mlir::isMemoryEffectFree(op);
+    };
+    constexpr unsigned kConeOps = 4096;
+    OpBuilder cb(body->getTerminator());
+    Location loc = simModule.getLoc();
+    unsigned expanded = 0, tooMany = 0, tooLarge = 0;
+    uint64_t cloned = 0;
+    std::map<unsigned, unsigned> byBits;
+    // Memo: (value, assignment) -> cofactor; an assignment (late bits and
+    // their constants, by value) interned, per partition.
+    DenseMap<std::pair<Value, unsigned>, Value> memo;
+    std::map<std::pair<int, std::vector<std::pair<void *, bool>>>, unsigned> assignIds;
+    SmallVector<Operation *> regs;
+    for (auto &op : body->without_terminator())
+      if (isa<seq::FirRegOp, seq::CompRegOp, seq::CompRegClockEnabledOp>(op))
+        regs.push_back(&op);
+    for (auto *reg : regs) {
+      int p = partOf.count(reg) ? partOf[reg] : -1;
+      SmallVector<OpOperand *, 2> pins;
+      if (auto r = dyn_cast<seq::FirRegOp>(reg))
+        pins.push_back(&r.getNextMutable());
+      else if (auto r = dyn_cast<seq::CompRegOp>(reg))
+        pins.push_back(&r.getInputMutable());
+      else if (auto r = dyn_cast<seq::CompRegClockEnabledOp>(reg)) {
+        pins.push_back(&r.getInputMutable());
+        pins.push_back(&r.getClockEnableMutable());
+      }
+      for (OpOperand *pin : pins) {
+        Value root = pin->get();
+        auto *rootDef = root.getDefiningOp();
+        if (!isLogic(rootDef) || part(root) != p)
+          continue;
+        // The late bits: one-bit values of another partition the cone reads.
+        SetVector<Value> late;
+        bool wide = false;
+        DenseSet<Operation *> seen{rootDef};
+        SmallVector<Operation *> work{rootDef};
+        while (!work.empty() && seen.size() <= kConeOps) {
+          Operation *op = work.pop_back_val();
+          for (Value o : op->getOperands()) {
+            auto *def = o.getDefiningOp();
+            if (def && isa<hw::ConstantOp>(def))
+              continue;
+            if (part(o) != p) {
+              if (o.getType().isInteger(1))
+                late.insert(o);
+              else
+                wide = true;
+              continue;
+            }
+            if (isLogic(def) && seen.insert(def).second)
+              work.push_back(def);
+          }
+        }
+        (void)wide;
+        if (late.empty())
+          continue;
+        if (seen.size() > kConeOps) {
+          ++tooLarge;
+          continue;
+        }
+        if (late.size() > slrCrossCofactor) {
+          ++tooMany;
+          continue;
+        }
+        // The cofactor of `root` at `bits` (bit i of `bits`: late[i]'s value).
+        auto cofactor = [&](uint64_t bits) -> Value {
+          std::vector<std::pair<void *, bool>> assign;
+          for (auto [i, v] : llvm::enumerate(late))
+            assign.push_back({v.getAsOpaquePointer(), bool((bits >> i) & 1)});
+          llvm::sort(assign);
+          unsigned id = assignIds.try_emplace({p, assign}, assignIds.size()).first->second;
+          DenseMap<Value, bool> at;
+          for (auto [i, v] : llvm::enumerate(late))
+            at[v] = (bits >> i) & 1;
+          SmallVector<std::pair<Value, bool>> stack{{root, false}};
+          while (!stack.empty()) {
+            auto [v, ready] = stack.back();
+            auto key = std::make_pair(v, id);
+            if (memo.count(key)) {
+              stack.pop_back();
+              continue;
+            }
+            if (auto it = at.find(v); it != at.end()) {
+              memo[key] = hw::ConstantOp::create(cb, loc, cb.getI1Type(), it->second);
+              stack.pop_back();
+              continue;
+            }
+            Operation *def = v.getDefiningOp();
+            if (!isLogic(def) || part(v) != p) {
+              memo[key] = v;
+              stack.pop_back();
+              continue;
+            }
+            if (!ready) {
+              stack.back().second = true;
+              for (Value o : def->getOperands())
+                if (!memo.count(std::make_pair(o, id)))
+                  stack.push_back({o, false});
+              continue;
+            }
+            IRMapping map;
+            bool changed = false;
+            for (Value o : def->getOperands()) {
+              Value c = memo.lookup(std::make_pair(o, id));
+              if (c != o) {
+                map.map(o, c);
+                changed = true;
+              }
+            }
+            Value r = v;
+            if (changed) {
+              Operation *clone = cb.clone(*def, map);
+              clone->removeAttr("inner_sym");
+              if (p >= 0)
+                opsOf[p].push_back(clone);
+              ++cloned;
+              r = clone->getResult(cast<OpResult>(v).getResultNumber());
+            }
+            memo[key] = r;
+            stack.pop_back();
+          }
+          return memo.lookup(std::make_pair(root, id));
+        };
+        // The select tree, the first late bit last (nearest the register).
+        std::function<Value(unsigned, uint64_t)> select = [&](unsigned i, uint64_t bits) -> Value {
+          if (i == late.size())
+            return cofactor(bits);
+          Value t = select(i + 1, bits | (uint64_t(1) << i));
+          Value f = select(i + 1, bits);
+          if (t == f)
+            return t;
+          auto mux = comb::MuxOp::create(cb, loc, late[i], t, f);
+          if (p >= 0)
+            opsOf[p].push_back(mux);
+          return mux;
+        };
+        pin->set(select(0, 0));
+        ++expanded;
+        ++byBits[late.size()];
+      }
+    }
+    llvm::errs() << "foldsim-fold-static: slr-cross-cofactor: " << expanded
+                 << " register inputs expanded over the one-bit values another partition drives (";
+    bool first = true;
+    for (auto [k, n] : byBits) {
+      llvm::errs() << (first ? "" : ", ") << n << " over " << k;
+      first = false;
+    }
+    llvm::errs() << "; " << cloned << " ops cloned), " << tooMany << " reading more than "
+                 << slrCrossCofactor << " left as they are, " << tooLarge << " past "
+                 << kConeOps << " ops\n";
+  }
   // A name for the port of a value: its op's name, if any.
   auto nameOf = [&](Value value) -> std::string {
     if (auto arg = dyn_cast<BlockArgument>(value))
@@ -30839,6 +31021,7 @@ void FoldStaticPass::runOnOperation() {
   gUramCascadeMax = uramCascadeMax;
   folder.slrGroupEnv = slrGroupEnv;
   folder.slrEnvHome = slrEnvHome;
+  folder.slrCrossCofactor = slrCrossCofactor;
   folder.physicalDomains = physicalDomains;
   for (auto &spec : domainMerge) {
     auto [name, price] = StringRef(spec).split(':');
