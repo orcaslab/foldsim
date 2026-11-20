@@ -545,6 +545,8 @@ def frame_options(a):
         fold += ' pp-idle-skip'
     if getattr(a, 'link_pending_counts', False):
         fold += ' link-pending-counts'
+    if getattr(a, 'link_engines', False):
+        fold += ' link-engines'
     if getattr(a, 'link_hbm_beat_rows', False):
         fold += ' link-hbm-beat-rows'
     if getattr(a, 'link_landing_block', 0):
@@ -2829,6 +2831,10 @@ def build_parser():
                     help='with --pp-dirty-writeback: a streamed PP instance whose rows and producers\' rows did not '
                          'change in the frame before skips its prefetch, pass and writes (foldsim-fold-static '
                          'pp-idle-skip)')
+    ap.add_argument('--link-engines', action='store_true',
+                    help='the HBM link streams of a reader class share one fixed stream engine (one page engine, '
+                         'one request sequencer, one landing ring sized by the round trip and its rate); needs '
+                         '--page-engines (foldsim-fold-static link-engines)')
     ap.add_argument('--link-pending-counts', action='store_true',
                     help='with --link-hbm-beat-bits: a pending bit a landing slot, its beats counted in distributed '
                          'RAM, not a pending bit a beat in flops (foldsim-fold-static link-pending-counts)')
