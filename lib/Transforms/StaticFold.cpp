@@ -30021,7 +30021,7 @@ LogicalResult StaticFolder::extractGroups() {
               op->getDialect()->getNamespace() == "hw") &&
              mlir::isMemoryEffectFree(op);
     };
-    constexpr unsigned kConeOps = 4096;
+    constexpr unsigned kConeOps = 1 << 16;
     OpBuilder cb(body->getTerminator());
     Location loc = simModule.getLoc();
     unsigned expanded = 0, tooMany = 0, tooLarge = 0;
@@ -30076,12 +30076,15 @@ LogicalResult StaticFolder::extractGroups() {
         (void)wide;
         if (late.empty())
           continue;
-        if (seen.size() > kConeOps) {
-          ++tooLarge;
-          continue;
-        }
-        if (late.size() > slrCrossCofactor) {
-          ++tooMany;
+        if (seen.size() > kConeOps || late.size() > slrCrossCofactor) {
+          ++(seen.size() > kConeOps ? tooLarge : tooMany);
+          static const bool log = getenv("FOLDSIM_COFACTOR_LOG");
+          if (log) {
+            auto name = reg->getAttrOfType<StringAttr>("name");
+            llvm::errs() << "slr-cross-cofactor: kept " << (name ? name.getValue() : StringRef("?"))
+                         << " (partition " << p << "): " << late.size() << " bits, cone "
+                         << seen.size() << " ops\n";
+          }
           continue;
         }
         // The cofactor of `root` at `bits` (bit i of `bits`: late[i]'s value).
