@@ -422,6 +422,8 @@ def frame_options(a):
             fold += ' advance-partials-cofactor=false'
         if getattr(a, 'advance_partials_terms', None):
             fold += f' advance-partials-terms={a.advance_partials_terms}'
+    if getattr(a, 'go_partials', False):
+        fold += ' go-partials'
     if getattr(a, 'room_ahead', False):
         fold += ' room-ahead'
         if getattr(a, 'room_regions', False):
@@ -608,6 +610,14 @@ def frame_options(a):
         fold += ' slr-link-rams'
     if getattr(a, 'slr_group_ports', False):
         fold += ' slr-group-ports'
+    if getattr(a, 'slr_env_home', False):
+        fold += ' slr-env-home'
+    if getattr(a, 'slr_group_outputs', False):
+        fold += ' slr-group-outputs'
+    if getattr(a, 'slr_cross_select', False):
+        fold += ' slr-cross-select'
+    if getattr(a, 'slr_cross_cofactor', None):
+        fold += f' slr-cross-cofactor={a.slr_cross_cofactor}'
     if getattr(a, 'slr_hop_registers', False):
         fold += ' slr-hop-registers'
     if getattr(a, 'slr_group_control', False):
@@ -2643,6 +2653,11 @@ def build_parser():
                     help='with --static and virtual memories: the pending-read bits the frame decision waits '
                          'on read a host cycle ahead into registers (the decision an AND of registers), each '
                          'class\'s bubble register kept apart; the same values (fold-static ready-ahead)')
+    ap.add_argument('--go-partials', action='store_true',
+                    help='the frame\'s start (go: every input token and output room), with or without virtual memories, '
+                         'retimed into partials alike, a register a source group (foldsim-fold-static '
+                         'go-partials; the same values): a32-X16 11-19, the folded outputs\' room terms of '
+                         'v16kjGsPA crossed SLR1 into every group\'s go through 4 + 6-8 LUT levels')
     ap.add_argument('--advance-partials', action='store_true',
                     help='with --static: the frame decision\'s AND retimed over its terms\' registers: the '
                          'terms of each source SLR group a host cycle ahead, ANDed into one register there '
@@ -3021,6 +3036,24 @@ def build_parser():
                          'record memories built in the group of the bundles\' producers, so only the folded record '
                          'leaves that group (foldsim-fold-static slr-group-ports; the same logic): v16kjGs 11-19, '
                          '16 x 512-bit memory write data crossed SLR1|SLR2 unfolded')
+    ap.add_argument('--slr-cross-cofactor', type=int, metavar='K',
+                    help='with --slr-groups: a register input reading at most K one-bit values of another SLR '
+                         'partition through logic is expanded over them (a select by those bits of the cofactors; '
+                         'foldsim-fold-static slr-cross-cofactor; the same function): a32-X16 11-19, the decision '
+                         'partials\' replicas reached the level\'s and the groups\' controls through 4 LUT levels')
+    ap.add_argument('--slr-cross-select', action='store_true',
+                    help='with --slr-groups: a select of crossing data (a link read forwarding the crossing write) '
+                         'registered a host cycle ahead (foldsim-fold-static slr-cross-select): a32-X16 11-19, the '
+                         'forwarding compare put the crossing chunk 2 LUT levels before the read register')
+    ap.add_argument('--slr-group-outputs', action='store_true',
+                    help='with --slr-groups: an unfolded output one group produces built in that group (its link '
+                         'reads, queue and dues; foldsim-fold-static slr-group-outputs; the same logic): a32-X16 11-19, '
+                         'the env-sink outputs busy / dcr_rsp met the target model\'s outputs in the level across SLR1|SLR2')
+    ap.add_argument('--slr-env-home', action='store_true',
+                    help='with --slr-group-env: an output channel one SLR group computes (a folded record, with '
+                         '--slr-group-ports) gets its elastic buffer in that group (foldsim-fold-static slr-env-home; '
+                         'the same netlist): a32-X16 11-19, v16kjGsPA\'s request record reached the level\'s buffer '
+                         'through 9 LUT levels across SLR1|SLR2')
     ap.add_argument('--slr-link-rams', action='store_true',
                     help='with --slr-groups: links may be block or ultra RAM too, in their reader\'s group '
                          '(foldsim-fold-static slr-link-rams); else every link of a grouped fold is distributed '

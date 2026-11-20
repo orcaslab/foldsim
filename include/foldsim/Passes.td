@@ -833,6 +833,22 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "only the folded record leaves the group, not every bundle (the "
            "same logic, in the producers' group; an error if the bundles' "
            "producers are in more than one group)">,
+    Option<"slrCrossSelect", "slr-cross-select", "bool", "false",
+           "With SLR groups: a register whose next value is a select of data "
+           "another partition drives (a link read forwarding the crossing "
+           "write) takes the select from a register of its own, loaded with "
+           "the select's logic over its registers' next values (only "
+           "registers without reset or preset, undefined until written): the "
+           "crossing data meets the register through the select's LUT alone. "
+           "The same value in every host cycle after the first">,
+    Option<"slrGroupOutputs", "slr-group-outputs", "bool", "false",
+           "With SLR groups: an output of the simulator (not a folded port) "
+           "whose pieces one group's classes produce is built in that group, "
+           "as slr-group-ports builds a folded one: its link reads, its "
+           "queue, dues and room term, so the producers' outputs meet logic "
+           "inside their own SLR and the output leaves the group from its "
+           "queue (and, with slr-env-home, its buffer's registers). The same "
+           "logic, in the producers' group: no value or host cycle moves">,
     Option<"slrLinkRams", "slr-link-rams", "bool", "false",
            "With SLR groups: links may be block or ultra RAM too (by "
            "link-block-depth / link-ultra-depth or link-kind-cost), the memory "
@@ -898,6 +914,25 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "elastic buffer (credit in, present-and-confirm out), and the "
            "reset through one level register: no input port loads more than "
            "one SLR. The same tokens in the same order; host cycles move">,
+    Option<"slrEnvHome", "slr-env-home", "bool", "false",
+           "With slr-group-env: an output channel whose valid and data one "
+           "group computes (a folded port record built in its producers' "
+           "group, with slr-group-ports) gets its elastic buffer (the data "
+           "registers, full and shown) in that group, beside what fills it: "
+           "the channel leaves the group from registers, and only the stage "
+           "registers' handshake crosses back. The same netlist apart from "
+           "the hierarchy: no value or host cycle moves">,
+    Option<"slrCrossCofactor", "slr-cross-cofactor", "unsigned", "0",
+           "With SLR groups: a register's next value (and clock enable) that "
+           "reads, through its partition's logic (a group's, or the "
+           "level's), at most this many one-bit values another partition "
+           "drives (the frame decision's partials, replicated at their "
+           "source) is expanded over them: a select by those bits of the "
+           "logic's cofactors with them constant, folded after. Each such bit "
+           "then meets the register through the select alone -- one LUT for "
+           "two bits, or three where the cofactors fold (a held register's) "
+           "-- not through the AND and the muxes after it. The same function: "
+           "no value or host cycle moves. 0: off">,
     Option<"physicalDomains", "physical-domains", "bool", "false",
            "Physical domains: the simulator emitted as a tree of modules "
            "that mirrors the class tree. Class c's domain `<sim>_dom_<c>` "
@@ -1339,6 +1374,21 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "With advance-partials: at most this many terms a partial (a "
            "group's terms spread over as many partials as that takes; 0: one "
            "partial a group)">,
+    Option<"goPartials", "go-partials", "bool", "false",
+           "The frame's start (go: every input's token and every output's "
+           "room) retimed as advance-partials retimes the advance (before it, "
+           "and with or without virtual memories, where there is no advance "
+           "to retime): each "
+           "term whose logic reads only registers (as advance-partials takes "
+           "them) a host cycle ahead, the terms of one source group (the group "
+           "of the instance outputs, else of the registers, its lead reads) "
+           "ANDed there into one register (`gpart_s<g>`, `gpart_level`) with "
+           "its next a select by advance and go of the cofactors' ANDs, a "
+           "replica a reading group as advance-partials-at says. `go` is then "
+           "an AND of registers (and the terms of no lead), the same value in "
+           "every host cycle: no schedule or host cycle moves. With "
+           "slr-group-ports a folded output's room terms are logic of its "
+           "group: they no longer cross an SLR into every group's go">,
     Option<"roomAhead", "room-ahead", "bool", "false",
            "With virtual memories: each controller's room term of the frame "
            "decision (its `free` at least the requests the decisions in "
@@ -2617,6 +2667,13 @@ def EstimateTiming : Pass<"foldsim-estimate-timing", "::mlir::ModuleOp"> {
     ListOption<"portModules", "port-modules", "std::string",
                "Modules (and their specializations) whose instances' ports "
                "to report: the levels at each input and behind each output">,
+    Option<"crossings", "crossings", "std::string", "",
+           "Crossing table (CSV) between partitions: each instance of "
+           "`port-modules` (an SLR group's module, say) and the rest of the "
+           "design. One row per cell bit read across (wires through a port "
+           "are no crossing): the levels from its start to it (driver side) "
+           "and from it to the end points it reaches in the reading "
+           "partition (load side), with its start and that end point">,
     Option<"paths", "paths", "std::string", "",
            "Deep paths, op by op, one per pair of start and end registers "
            "(JSON lines)">,
