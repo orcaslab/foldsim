@@ -1032,6 +1032,16 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "the slot's request, written by the requests: the difference is "
            "the beats landed), not a pending bit a slot's beat in flops: "
            "slots bits, not slots x 2^beat bits">,
+    Option<"linkEngines", "link-engines", "bool", "false",
+           "The HBM link streams of a reader class (one SLR group: a class "
+           "lives in one) share one fixed stream engine: one page engine of "
+           "their own, one request sequencer (a request a position: the "
+           "members' landings of a pass in turn, at distinct positions, each "
+           "requested one lead before it, the engine's lead), one landing "
+           "ring (as deep as its requests in flight need: a power of two, at "
+           "most the lead's ceiling) with one pending bit a slot, the links "
+           "entries of the engine's schedule (tables of the position); whole "
+           "rows (no beats). Needs page-engines">,
     Option<"linkHbmRowBits", "link-hbm-row-bits", "unsigned", "512",
            "HBM link streams: the most bits of a stream's row (its "
            "controller's data width, 8 to 4096): a wider word is cut into "

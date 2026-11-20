@@ -1,0 +1,62 @@
+# REQUIRES: verilator
+# --link-engines: the HBM link streams of a reader class share one fixed stream engine (one page engine of their own,
+# one request sequencer, one landing ring, one pending bit a slot): the members' landings of a reader pass in turn
+# (one a position), each requested the engine's one lead before it, so the requests leave in the landings' order and
+# the ring fills in that order (the request pointer's slot, read at the pop pointer). Driver/Inputs/linkengine: each
+# Reader lands two Unit rows and a Vnit row a pass (an engine of two members, three landings a pass); Unit and Vnit
+# read a Reader row each (an engine each). Exact against the target (Inputs/tb_linkhbm.sv: answers 1 to 800 host
+# cycles on, out of order, `free` low at times, channels stalled, bubbles), every slot in flight (latency 800 past a
+# lead of 815: the ring full), and with too few slots (FOLDSIM_LINK_ENGINE_SLOTS=2, a mutation) not exact.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/../Driver/Inputs/linkengine
+# RUN: foldsim --srcs top.f --top Top --out %t/e --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --bubbles --page-engines 4 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Reader:Unit:hbm,Reader:Vnit:hbm --link-engines Unit Vnit Reader > %t/e.log 2>&1
+# RUN: FileCheck %s --check-prefix=ENG < %t/e.log
+# RUN: not grep -E 'lks[0-9]+_(landing|pending)' %t/e/foldsim_sim.sv
+# RUN: grep -c -E 'reg .*lke[0-9]+_pending' %t/e/foldsim_sim.sv | FileCheck %s --check-prefix=ONE
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/e -DVM1 -DVM2 -DBUBBLES -Mdir %t/e/obj %S/Inputs/tb_linkhbm.sv top.sv %t/e/foldsim_sim.sv > %t/e/build.log 2>&1
+# RUN: %t/e/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/e/obj/Vtb +verilator+rand+reset+2 +verilator+seed+5 +bubble=30 | FileCheck %s
+# RUN: %t/e/obj/Vtb +verilator+rand+reset+2 +verilator+seed+6 +bubble=30 +stall=30 +lo=1 +hi=30 +full=20 | FileCheck %s
+# RUN: %t/e/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 | FileCheck %s
+# hbm-round-trip 800 (a frame of 1,024): the lead past the round trip, the ring 512 slots deep (its rate: 3 landings a pass, passes 5 apart,
+# not the lead's ceiling of 1,024); exact at latencies 1 to 800, at 700 with no bubble left (H = II), and with every
+# slot in flight (800, stalls, bubbles, `free` low).
+# RUN: foldsim --srcs top.f --top Top --out %t/rt --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --bubbles --page-engines 4 --min-ii 1024 --hbm-round-trip 800 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Reader:Unit:hbm,Reader:Vnit:hbm --link-engines Unit Vnit Reader > %t/rt.log 2>&1
+# RUN: FileCheck %s --check-prefix=RT < %t/rt.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/rt -DVM1 -DVM2 -DBUBBLES -Mdir %t/rt/obj %S/Inputs/tb_linkhbm.sv top.sv %t/rt/foldsim_sim.sv > %t/rt/build.log 2>&1
+# RUN: %t/rt/obj/Vtb +verilator+rand+reset+2 +verilator+seed+9 +lo=1 +hi=800 | FileCheck %s
+# RUN: %t/rt/obj/Vtb +verilator+rand+reset+2 +verilator+seed+3 +lo=700 +hi=700 | FileCheck %s --check-prefix=HII
+# RUN: %t/rt/obj/Vtb +verilator+rand+reset+2 +verilator+seed+8 +lo=800 +hi=800 +stall=20 +bubble=20 +full=20 | FileCheck %s
+# csf-mailbox-hbm (two sets of read registers a member, the reader-indexed mailbox and the producer-indexed streams),
+# frames of 96 and 48: Unit's passes are a position apart in places, so the two Unit -> Reader streams (written at
+# every Unit pass) cannot share the Vnit stream's engine's write positions within their room: each goes to the
+# class's next engine (5 engines for 3 reader classes, the same at any count: an engine a reader class and write
+# conflict).
+# RUN: foldsim --srcs top.f --top Top --out %t/m96 --static --nest --modulo --min-ii 96 --compact-links --csf-mailbox-hbm --bubbles --page-engines 8 --link-engines Unit Vnit Reader > %t/m96.log 2>&1
+# RUN: FileCheck %s --check-prefix=M96 < %t/m96.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/m96 -DVM1 -DVM2 -DVM3 -DVM4 -DBUBBLES -Mdir %t/m96/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/m96/foldsim_sim.sv > %t/m96/build.log 2>&1
+# RUN: %t/m96/obj/Vtb +verilator+rand+reset+2 +verilator+seed+1 | FileCheck %s
+# RUN: %t/m96/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
+# RUN: %t/m96/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 | FileCheck %s
+# RUN: foldsim --srcs top.f --top Top --out %t/m48 --static --nest --modulo --min-ii 48 --compact-links --csf-mailbox-hbm --bubbles --page-engines 8 --link-engines Unit Vnit Reader > %t/m48.log 2>&1
+# RUN: FileCheck %s --check-prefix=M48 < %t/m48.log
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/m48 -DVM1 -DVM2 -DVM3 -DVM4 -DBUBBLES -Mdir %t/m48/obj %S/Inputs/tb_mailbox_hbm.sv top.sv %t/m48/foldsim_sim.sv > %t/m48/build.log 2>&1
+# RUN: %t/m48/obj/Vtb +verilator+rand+reset+2 +verilator+seed+2 +stall=30 +lo=1 +hi=20 +full=20 +bubble=20 | FileCheck %s
+# RUN: %t/m48/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 | FileCheck %s
+# Mutation: a ring of 2 slots lets a response overwrite a landing not yet read (or reuse a slot still in flight).
+# RUN: env FOLDSIM_LINK_ENGINE_SLOTS=2 foldsim --srcs top.f --top Top --out %t/mut --static --no-drop-dead-inputs --no-staged-link-direct --nest --modulo --bubbles --page-engines 4 --link-kinds Unit:Reader:hbm,Vnit:Reader:hbm,Reader:Unit:hbm,Reader:Vnit:hbm --link-engines Unit Vnit Reader > %t/mut.log 2>&1
+# RUN: %verilator --binary --timing -Wno-fatal -Wno-lint --x-initial unique --top-module tb -I%t/mut -DVM1 -DVM2 -DBUBBLES -Mdir %t/mut/obj %S/Inputs/tb_linkhbm.sv top.sv %t/mut/foldsim_sim.sv > %t/mut/build.log 2>&1
+# RUN: %t/mut/obj/Vtb +verilator+rand+reset+2 +verilator+seed+4 +lo=1 +hi=60 | FileCheck %s --check-prefix=MUT
+
+# CHECK: {{^}}MATCH 196 cycles
+# CHECK-NOT: PROTOCOL
+# ENG: link engines: 3 engines (3 reader classes, 0 more for write conflicts), 4 streams on them, rings
+# ENG-DAG: link engine Reader 2 3
+# ENG-DAG: link engine Unit 1 1
+# ENG-DAG: link engine Vnit 1 1
+# ONE: {{^3$}}
+# RT: link engines: 3 engines (3 reader classes, 0 more for write conflicts), 4 streams on them
+# RT: link engine Reader 2 3 815 512 32
+# HII: {{^}}MATCH 196 cycles in 203782 host cycles, H 1018.91
+# M96: link engines: 5 engines (3 reader classes, 2 more for write conflicts), 5 streams on them
+# M48: link engines: 5 engines (3 reader classes, 2 more for write conflicts), 5 streams on them
+# MUT: {{^(MISMATCH|PROTOCOL)}}
