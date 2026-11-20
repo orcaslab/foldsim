@@ -49,6 +49,7 @@
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/Format.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/GlobPattern.h"
 #include "llvm/Support/Regex.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -963,6 +964,15 @@ public:
   /// `physical-domains`: the simulator as a tree of modules mirroring the
   /// class tree (extractDomains).
   bool physicalDomains = false;
+  /// Ops tagged with their class's domain: for physical-domains, and with SLR
+  /// groups for the SLL measurement (reportBuiltSlls; the tags are dropped
+  /// after it without physical-domains).
+  bool domainTags() const { return physicalDomains || slrGroups; }
+  /// `slr-sll-export`: where reportBuiltSlls writes the measured level
+  /// ports; `slr-sll-measured`: such files, whose ports replace the model's
+  /// level items of the classes they measured (sllItems).
+  std::string slrSllExport;
+  SmallVector<std::string> slrSllMeasured;
   /// `domain-merge`: the classes with no domain of their own (each with its
   /// copy's LUT price, 0 unknown); their ops join the nearest domain ancestor.
   llvm::StringMap<uint64_t> domainMerge;
@@ -1322,10 +1332,14 @@ private:
     uint64_t w;
     bool span;
     unsigned kind;
+    /// Built per the assignment (a vmem-s28 switch per domain root): kept
+    /// beside slr-sll-measured's nets, which leave it out.
+    bool perAssignment = false;
   };
-  static constexpr unsigned kSllKinds = 5;
+  static constexpr unsigned kSllKinds = 6;
   static constexpr const char *kSllKindName[kSllKinds] = {
-      "links", "controls", "environment", "memory controllers", "HBM streams"};
+      "links", "controls", "environment", "memory controllers", "HBM streams",
+      "measured level ports"};
   SmallVector<SllItem> sllItemList;
   /// Builds sllItemList: `kept`, after the schedule (the HBM streams' kept
   /// members; before it, a laid-out member counts as streamed).
@@ -22162,7 +22176,7 @@ LogicalResult StaticFolder::buildSim() {
     return body->empty() ? nullptr : &body->back();
   };
   auto tagSince = [&](Operation *mark, int group, int cls = -1) {
-    int dom = physicalDomains ? cls : -1;
+    int dom = domainTags() ? cls : -1;
     if (group < 0 && dom < 0)
       return;
     for (Operation *op = mark ? mark->getNextNode() : &body->front(); op;
@@ -23468,7 +23482,7 @@ LogicalResult StaticFolder::buildSim() {
                                        operands);
     if (!slrOf.empty())
       tagGroup(copies[c], slrOf[c]);
-    if (physicalDomains)
+    if (domainTags())
       tagDomain(copies[c], int(c));
   }
 
@@ -24033,7 +24047,7 @@ LogicalResult StaticFolder::buildSim() {
     if (crossing)
       if (auto cast = bits.getDefiningOp<hw::BitcastOp>()) {
         tagGroup(cast, slrOf[c]);
-        if (physicalDomains)
+        if (domainTags())
           tagDomain(cast, int(c));
       }
     std::string baseName = linkName.str();
@@ -24049,14 +24063,14 @@ LogicalResult StaticFolder::buildSim() {
         if (!registered) {
           if (auto *op = data.getDefiningOp())
             tagGroup(op, slrOf[c]);
-          if (auto *op = data.getDefiningOp(); op && physicalDomains)
+          if (auto *op = data.getDefiningOp(); op && domainTags())
             tagDomain(op, int(c));
           std::string crossName = producer.name + "_slr" + std::to_string(to) +
                                   "_" + std::to_string(low + at);
           if (serial <= 1) {
             registered = copyReg(data, crossName);
             tagGroup(registered.getDefiningOp(), slrOf[c]);
-            if (physicalDomains)
+            if (domainTags())
               tagDomain(registered.getDefiningOp(), int(c));
             // slr-hop-registers: one more register in each group between,
             // so no route from a register crosses more than one boundary.
@@ -24113,7 +24127,7 @@ LogicalResult StaticFolder::buildSim() {
             for (auto *op = mark->getNextNode(); op; op = op->getNextNode())
               if (!isa<hw::ConstantOp>(op)) {
                 tagGroup(op, slrOf[c]);
-                if (physicalDomains)
+                if (domainTags())
                   tagDomain(op, int(c));
               }
             // slr-hop-registers: the chunk register followed by one in each
@@ -25227,13 +25241,13 @@ LogicalResult StaticFolder::buildSim() {
     // physical-domains: in its class's domain likewise.
     Operation *mark = body->empty() ? nullptr : &body->back();
     llvm::scope_exit tagBuilt([&] {
-      if (to < 0 && !physicalDomains)
+      if (to < 0 && !domainTags())
         return;
       for (auto *op = mark ? mark->getNextNode() : &body->front(); op;
            op = op->getNextNode())
         if (!isa<hw::ConstantOp>(op)) {
           tagGroup(op, to);
-          if (physicalDomains)
+          if (domainTags())
             tagDomain(op, int(c));
         }
     });
@@ -26720,7 +26734,7 @@ LogicalResult StaticFolder::buildSim() {
       banked += bank;
       // (physical-domains: a mailbox is its producer's output store, in its
       // producer's domain: every lane has the same producer class.)
-      int boxDom = physicalDomains ? int(producers[box.lanes[0].producer].cls) : -1;
+      int boxDom = domainTags() ? int(producers[box.lanes[0].producer].cls) : -1;
       for (auto &lane : box.lanes)
         if (int(producers[lane.producer].cls) != boxDom)
           boxDom = -1;
@@ -29579,7 +29593,7 @@ LogicalResult StaticFolder::buildS28() {
   auto place = [&](Operation *op) {
     if (!slrOf.empty())
       tagGroup(op, curGroup);
-    if (physicalDomains)
+    if (domainTags())
       tagDomain(op, curDom);
     return op;
   };
@@ -30895,6 +30909,14 @@ LogicalResult StaticFolder::extractGroups() {
   return success();
 }
 
+/// slr-sll-measured: a measured level port the SLL model keeps its own item
+/// for, as one built per the assignment (by the name the build gives it): a
+/// vmem-s28 central switch's (one per domain root in a group).
+static bool sllModelCovers(StringRef name) {
+  static const llvm::Regex covered("^s[0-9]+(r[0-9]+_|_csw_r)");
+  return covered.match(name);
+}
+
 void StaticFolder::sllItems(bool kept) {
   unsigned n = classes.size(), level = n;
   sllItemList.clear();
@@ -31127,7 +31149,7 @@ void StaticFolder::sllItems(bool kept) {
       // as one per class with memories, an upper bound where classes share
       // a root.)
       for (unsigned c : withMem)
-        sllItemList.push_back({level, {c}, words, false, 3});
+        sllItemList.push_back({level, {c}, words, false, 3, true});
       SmallVector<unsigned> everyone;
       for (unsigned c = 0; c <= n; ++c)
         everyone.push_back(c);
@@ -31167,6 +31189,84 @@ void StaticFolder::sllItems(bool kept) {
       sllItemList.push_back({unsigned(producers[p].cls),
                              SmallVector<unsigned>(readers.begin(), readers.end()),
                              producers[p].width, false, 4});
+  // slr-sll-measured: the level ports an earlier build of the design
+  // measured (slr-sll-export), each an item from the level to its classes'
+  // groups (one net a group), replace the model's items to and from the
+  // level of the classes measured (the virtual memories' ports, read rings,
+  // stores, environment frames and stream engines it has no items for come
+  // with them), but for those built per the assignment (vmem-s28's
+  // switches, left out of the measured nets). A later file's nets replace an
+  // earlier's of the classes it measured (every class in a group there).
+  if (slrSllMeasured.empty())
+    return;
+  llvm::StringMap<unsigned> byName;
+  for (auto [c, cls] : llvm::enumerate(classes))
+    byName[cls.name] = c;
+  SmallVector<SllItem> nets;
+  std::vector<bool> measured(n, false);
+  for (auto &path : slrSllMeasured) {
+    auto buffer = llvm::MemoryBuffer::getFile(path);
+    if (!buffer) {
+      llvm::errs() << "foldsim-fold-static: warning: slr-sll-measured: cannot read " << path << "\n";
+      continue;
+    }
+    auto json = llvm::json::parse((*buffer)->getBuffer());
+    auto *object = json ? json->getAsObject() : nullptr;
+    if (!object) {
+      if (!json)
+        llvm::consumeError(json.takeError());
+      llvm::errs() << "foldsim-fold-static: warning: slr-sll-measured: " << path << " is not an export\n";
+      continue;
+    }
+    std::vector<bool> here(n, false);
+    if (auto *list = object->getArray("measured"))
+      for (auto &v : *list)
+        if (auto name = v.getAsString(); name && byName.count(*name))
+          here[byName[*name]] = true;
+    llvm::erase_if(nets, [&](const SllItem &item) {
+      return llvm::any_of(item.dst, [&](unsigned d) { return d < n && here[d]; });
+    });
+    if (auto *list = object->getArray("nets"))
+      for (auto &v : *list) {
+        auto *net = v.getAsObject();
+        if (!net || sllModelCovers(net->getString("name").value_or("")))
+          continue;
+        SllItem item{level, {}, uint64_t(net->getInteger("w").value_or(0)), false, 5};
+        if (auto *names = net->getArray("classes"))
+          for (auto &name : *names)
+            if (auto s = name.getAsString(); s && byName.count(*s))
+              item.dst.push_back(byName[*s]);
+        if (!item.dst.empty() && item.w)
+          nets.push_back(std::move(item));
+      }
+    for (unsigned c = 0; c < n; ++c)
+      measured[c] = measured[c] || here[c];
+  }
+  SmallVector<SllItem> remain;
+  for (auto &item : sllItemList) {
+    bool fromLevel = item.src == level;
+    bool toLevel = llvm::is_contained(item.dst, level);
+    if (item.perAssignment || (!fromLevel && !toLevel)) {
+      remain.push_back(std::move(item));
+      continue;
+    }
+    if (!fromLevel) {
+      // (A class's bits to the level: the measured nets have them; a
+      // broadcast from it to the other classes too stays.)
+      if (!measured[item.src])
+        remain.push_back(std::move(item));
+      else if (item.dst.size() > 1) {
+        llvm::erase_if(item.dst, [&](unsigned d) { return d == level; });
+        remain.push_back(std::move(item));
+      }
+      continue;
+    }
+    llvm::erase_if(item.dst, [&](unsigned d) { return d < n && measured[d]; });
+    if (!item.dst.empty())
+      remain.push_back(std::move(item));
+  }
+  sllItemList = std::move(remain);
+  sllItemList.append(nets.begin(), nets.end());
 }
 
 void StaticFolder::sllModel(ArrayRef<int> groupOf,
@@ -31240,6 +31340,66 @@ void StaticFolder::reportBuiltSlls() {
   DenseSet<Operation *> isGroup;
   for (auto &[inst, g] : groupInsts)
     isGroup.insert(inst);
+  // Each port's classes in its group: the domains of the ops using it (an
+  // input) or driving it (an output) there (domainTags).
+  DenseMap<Value, std::set<int>> ownersOf;
+  auto domOf = [&](Operation *op) -> int {
+    if (auto attr = op->getAttrOfType<IntegerAttr>(kDomAttr))
+      return int(attr.getInt());
+    return -1;
+  };
+  DenseMap<Value, std::string> portNameOf;
+  for (auto &[inst, g] : groupInsts) {
+    for (auto [i, operand] : llvm::enumerate(inst.getOperands()))
+      portNameOf.try_emplace(operand, inst.getInputName(i).str());
+    for (auto [j, result] : llvm::enumerate(inst.getResults()))
+      portNameOf.try_emplace(result, inst.getOutputName(j).str());
+  }
+  for (auto &[inst, g] : groupInsts) {
+    auto mod = top.lookupSymbol<hw::HWModuleOp>(inst.getModuleName());
+    if (!mod)
+      continue;
+    auto *term = mod.getBodyBlock()->getTerminator();
+    // (Through the ops of no domain, the group's own: an environment stage,
+    // a record's selection, up to the first ops of a domain each way.)
+    auto forward = [&](Value from, std::set<int> &into) {
+      SmallVector<std::pair<Value, unsigned>> work{{from, 0}};
+      DenseSet<Operation *> seen;
+      while (!work.empty() && seen.size() < 4096) {
+        auto [v, depth] = work.pop_back_val();
+        for (auto *user : v.getUsers()) {
+          if (user == term || !seen.insert(user).second)
+            continue;
+          int d = domOf(user);
+          if (d >= 0 || depth >= 16)
+            into.insert(d);
+          else
+            for (auto r : user->getResults())
+              work.push_back({r, depth + 1});
+        }
+      }
+    };
+    auto backward = [&](Value from, std::set<int> &into) {
+      SmallVector<std::pair<Value, unsigned>> work{{from, 0}};
+      DenseSet<Operation *> seen;
+      while (!work.empty() && seen.size() < 4096) {
+        auto [v, depth] = work.pop_back_val();
+        auto *def = v.getDefiningOp();
+        if (!def || !seen.insert(def).second || isa<hw::ConstantOp>(def))
+          continue;
+        int d = domOf(def);
+        if (d >= 0 || depth >= 16)
+          into.insert(d);
+        else
+          for (auto operand : def->getOperands())
+            work.push_back({operand, depth + 1});
+      }
+    };
+    for (auto [i, operand] : llvm::enumerate(inst.getOperands()))
+      forward(mod.getBodyBlock()->getArgument(i), ownersOf[operand]);
+    for (auto result : inst.getResults())
+      backward(term->getOperand(cast<OpResult>(result).getResultNumber()), ownersOf[result]);
+  }
   for (auto &[inst, g] : groupInsts) {
     auto mod = top.lookupSymbol<hw::HWModuleOp>(inst.getModuleName());
     if (!mod)
@@ -31281,6 +31441,10 @@ void StaticFolder::reportBuiltSlls() {
   unsigned n = slrGroups;
   SmallVector<uint64_t> built(n > 1 ? n - 1 : 0, 0);
   uint64_t unknown = 0, levelBits = 0;
+  // slr-sll-export: each net to the level, by its classes (their names; a
+  // port of no domain: every class of its group, `group`).
+  llvm::json::Array exported;
+  uint64_t unattributed = 0;
   for (const auto *ec : same) {
     if (!ec->isLeader())
       continue;
@@ -31293,6 +31457,44 @@ void StaticFolder::reportBuiltSlls() {
         span.insert(t->second.begin(), t->second.end());
       level |= atLevel.lookup(*m);
       w = std::max<uint64_t>(w, widthOf.lookup(*m));
+    }
+    if (level && !slrSllExport.empty() && w) {
+      std::set<int> owners;
+      bool noDomain = false;
+      for (auto m = same.member_begin(*ec); m != same.member_end(); ++m) {
+        auto it = ownersOf.find(*m);
+        if (it == ownersOf.end())
+          continue;
+        for (int o : it->second)
+          if (o >= 0)
+            owners.insert(o);
+          else
+            noDomain = true;
+      }
+      bool fallback = owners.empty() && noDomain;
+      if (fallback) {
+        unattributed += w;
+        for (int g : span)
+          for (auto [c, cls] : llvm::enumerate(classes))
+            if (slrOf[c] == g)
+              owners.insert(int(c));
+      }
+      llvm::json::Array names;
+      for (int o : owners)
+        names.push_back(classes[o].name);
+      // (The group port's name: the value's, as extractGroups names it.)
+      std::string portName;
+      for (auto m = same.member_begin(*ec); m != same.member_end() && portName.empty(); ++m)
+        portName = portNameOf.lookup(*m);
+      // (What the model has its own items for: the environment's stages and
+      // records, the controls, vmem-s28's switches and counts, the stream
+      // engines' slots; slr-sll-measured adds the other nets.)
+      if (!names.empty())
+        exported.push_back(llvm::json::Object{{"classes", std::move(names)},
+                                              {"w", int64_t(w)},
+                                              {"name", portName},
+                                              {"group", fallback},
+                                              {"covered", sllModelCovers(portName)}});
     }
     if (level) {
       if (slrLevelGroup < 0) {
@@ -31322,6 +31524,23 @@ void StaticFolder::reportBuiltSlls() {
         llvm::errs() << " " << g;
       llvm::errs() << (level ? " (level)" : "") << " " << name << "\n";
     }
+  }
+  if (!slrSllExport.empty()) {
+    llvm::json::Array measured;
+    for (auto [c, cls] : llvm::enumerate(classes))
+      if (slrOf[c] >= 0)
+        measured.push_back(cls.name);
+    std::error_code ec;
+    llvm::raw_fd_ostream file(slrSllExport, ec);
+    if (ec)
+      llvm::errs() << "foldsim-fold-static: warning: slr-sll-export: " << ec.message() << "\n";
+    else
+      file << llvm::formatv("{0:1}", llvm::json::Value(llvm::json::Object{
+                                         {"level_group", int64_t(slrLevelGroup)},
+                                         {"measured", std::move(measured)},
+                                         {"unattributed", int64_t(unattributed)},
+                                         {"nets", std::move(exported)}}))
+           << "\n";
   }
   SmallVector<uint64_t> model;
   sllItems(streamsPlanned);
@@ -31980,8 +32199,19 @@ LogicalResult StaticFolder::run() {
     return failure();
   if (!slrOf.empty() && failed(extractGroups()))
     return failure();
-  if (!slrOf.empty())
+  if (!slrOf.empty()) {
     reportBuiltSlls();
+    // (The domain tags were the measurement's alone.)
+    if (!physicalDomains) {
+      auto strip = [](hw::HWModuleOp m) {
+        m.walk([](Operation *op) { op->removeAttr(kDomAttr); });
+      };
+      strip(simModule);
+      for (unsigned g = 0; g < slrGroups; ++g)
+        if (auto m = top.lookupSymbol<hw::HWModuleOp>((simName + "_slr" + Twine(g)).str()))
+          strip(m);
+    }
+  }
   if (physicalDomains) {
     // Each SLR group's module (their own trees), then the simulator's.
     SmallVector<hw::HWModuleOp> mods;
@@ -32110,6 +32340,8 @@ void FoldStaticPass::runOnOperation() {
   folder.linkKindCost = linkKindCost;
   folder.slrLinkRams = slrLinkRams;
   folder.slrGroupPorts = slrGroupPorts;
+  folder.slrSllExport = slrSllExport;
+  folder.slrSllMeasured.assign(slrSllMeasured.begin(), slrSllMeasured.end());
   folder.slrHopRegisters = slrHopRegisters;
   folder.slrGroupControl = slrGroupControl;
   folder.slrGroupReset = slrGroupReset;

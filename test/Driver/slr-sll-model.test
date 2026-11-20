@@ -57,3 +57,24 @@
 # OK: slr boundaries: 0-1 102 bits (model, the level with group 1) (budget 110)
 # RUN: not foldsim-opt %t/base/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim slr-groups=2 slr-capacities=1000000,1000000 slr-assign=Unit:0,Reader:1,Top_model:1 slr-level-group=1 slr-group-control slr-sll-budget=95 schedule-only})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=OVER
 # OVER: slr-groups: no assignment of the classes to 2 groups of at most 1000000,1000000 sites {{.*}} with at most 95 link bits over each SLR boundary
+# slr-sll-export: after the build, each group port to the level by the classes
+# whose ops use or drive it (their domains, through the group's own ops), for
+# a later build's slr-sll-measured: its nets replace the model's items to and
+# from the level of the classes it measured (here the streams' engines and
+# virtual memory ports, the controls and the environment), each net a cost to
+# its classes' groups. Measured with the level beside the readers, it gives
+# the built count there and with the level moved to the units' group.
+# RUN: foldsim-opt %t/base/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim slr-groups=2 slr-capacities=1000000,1000000 slr-assign=Unit:0,Reader:1,Top_model:1 slr-level-group=1 link-kinds=Unit:Reader:hbm,Reader:Unit:hbm slr-sll-export=%t/ports.json})' -o /dev/null
+# RUN: FileCheck %s --check-prefix=EXPORT < %t/ports.json
+# EXPORT: "level_group": 1,
+# EXPORT: "measured": [
+# EXPORT: "name": "lks0_pending",
+# RUN: foldsim-opt %t/base/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim slr-groups=2 slr-capacities=1000000,1000000 slr-assign=Unit:0,Reader:1,Top_model:1 slr-level-group=1 link-kinds=Unit:Reader:hbm,Reader:Unit:hbm slr-sll-measured=%t/ports.json report=%t/m1.txt})' -o /dev/null 2> %t/m1.err
+# RUN: FileCheck %s --check-prefix=M1 < %t/m1.txt
+# RUN: FileCheck %s --check-prefix=M1-BUILT < %t/m1.err
+# M1: slr boundaries: 0-1 224 bits (model, the level with group 1)
+# M1: measured level ports: 0-1 152
+# M1-BUILT: slr boundaries built (group port bits, each net once over its span): 0-1 224 (model 224)
+# RUN: foldsim-opt %t/base/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim slr-groups=2 slr-capacities=1000000,1000000 slr-assign=Unit:0,Reader:1,Top_model:1 slr-level-group=0 link-kinds=Unit:Reader:hbm,Reader:Unit:hbm slr-sll-measured=%t/ports.json report=%t/m0.txt})' -o /dev/null 2> %t/m0.err
+# RUN: FileCheck %s --check-prefix=M0-BUILT < %t/m0.err
+# M0-BUILT: slr boundaries built (group port bits, each net once over its span): 0-1 244 (model 244)

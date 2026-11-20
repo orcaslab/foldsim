@@ -1503,6 +1503,17 @@ def main():
                 if grouped:
                     # The generation's own link wires over each boundary (serialized links a k-th): one SLL a wire.
                     slls = [(float(bwires[b]) if b < len(bwires) else 0.0, ct, sm) for b, (_, ct, sm) in enumerate(slls)]
+                    # As built (fold-static's count of the groups' ports, each net once over its span: the links,
+                    # the controls, the environment and every port between the level and the classes, their
+                    # virtual memories' too): that count in place of the link wires and the virtual memories' term.
+                    built = re.search(r'slr boundaries built \(group port bits[^)]*\):((?: \d+-\d+ \d+ \(model \d+\))+)',
+                                      stext)
+                    if built:
+                        bb = {int(x): int(v) for x, v in re.findall(r' (\d+)-\d+ (\d+) \(model', built.group(1))}
+                        slls = [(float(bb.get(b, lk)), ct, max(0.0, sm - (vm[b] if vm is not None else 0.0)))
+                                for b, (lk, ct, sm) in enumerate(slls)]
+                        lines.append('    (links: the group ports as built, fold-static\'s count; the virtual '
+                                     'memories\' ports in it)')
                 for b, (lk, ct, sm) in enumerate(slls):
                     lines.append(f'    boundary {names[b]}-{names[b + 1]}: {lk + ct + sm:,.0f} SLLs projected '
                                  f'(links {lk:,.0f}, cut copies {ct:,.0f}{" and split crossings" if splits else ""}, '

@@ -1503,6 +1503,11 @@ def slr_options(a, foldsim_opt, models, fold, out):
         opts += f' slr-assign={a.slr_assign}'
     if a.slr_serialize:
         opts += f' slr-serialize={a.slr_serialize}'
+    # The level ports the build measures (the SLL model's supplement for a later
+    # build: --slr-sll-measured), and those of earlier builds.
+    opts += f' slr-sll-export={out("foldsim_sll_ports.json")}'
+    if getattr(a, 'slr_sll_measured', None):
+        opts += ' slr-sll-measured=' + ','.join(os.path.abspath(p) for p in a.slr_sll_measured)
     return opts
 
 
@@ -3014,6 +3019,11 @@ def build_parser():
                     help='with --slr-groups: links may be block or ultra RAM too, in their reader\'s group '
                          '(foldsim-fold-static slr-link-rams); else every link of a grouped fold is distributed '
                          'RAM or registers')
+    ap.add_argument('--slr-sll-measured', action='append', default=[], metavar='JSON',
+                    help='with --slr-groups: foldsim_sll_ports.json of an earlier build of the design (repeatable; a '
+                         'later one wins for the classes it measured): its measured ports between the level and the '
+                         'classes that the SLL model has no items for (the virtual memories\' ports, read rings, '
+                         'environment frames) join the model the group search and its budget use')
     ap.add_argument('--slr-level', default=None, metavar='auto|G|none',
                     help='with --slr-groups: the floorplan puts the simulator level (its cells outside the groups) '
                          'and the shell environment beside it with group G (auto: the group of the region\'s SLR '
