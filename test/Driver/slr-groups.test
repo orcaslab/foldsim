@@ -87,7 +87,7 @@
 # SLL-FULL: with at most 6 link bits over each SLR boundary
 # RUN: foldsim-opt %t/split/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim copies=Leaf:3 slr-groups=2 slr-sites=Leaf:5,Leaf_copy1:5,Leaf_copy2:5 slr-capacities=10,10 slr-sll-budget=8 schedule-only report=%t/sll2.txt})' -o /dev/null
 # RUN: FileCheck %s --check-prefix=SLL-OK < %t/sll2.txt
-# SLL-OK: slr boundaries: 0-1 8 link bits (budget 8)
+# SLL-OK: slr boundaries: 0-1 8 bits (model, the level's group unknown: its bits not counted) (budget 8)
 
 # Further resources (sll-estimate: <sites>/<r1>/... in slr-sites and
 # slr-capacities): each copy one URAM, each SLR one: no two copies share an

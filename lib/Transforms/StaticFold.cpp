@@ -40,6 +40,7 @@
 #include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/EquivalenceClasses.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -1295,6 +1296,44 @@ private:
   /// Moves each SLR group's logic of the simulator into a module of its
   /// own, instantiated as `slr<g>`.
   LogicalResult extractGroups();
+  /// After extractGroups: the bits of the groups' ports over each boundary
+  /// between groups (in die order; the level with slr-level-group), each net
+  /// once over its span, a port that only passes a value through its group
+  /// not counted there, clocks not counted (global routing). Reported beside
+  /// the model's projection (sllModel) for the chosen assignment.
+  void reportBuiltSlls();
+  /// The model's bits over each boundary between groups (in die order) for
+  /// the assignment `groupOf` (a class's group, -1 unplaced).
+  void sllModel(ArrayRef<int> groupOf, SmallVectorImpl<uint64_t> &boundary,
+                SmallVectorImpl<SmallVector<uint64_t>> *byKind = nullptr);
+  /// The SLL model's items: `w` bits from endpoint `src` to endpoints `dst`
+  /// (a class, or classes.size() for the simulator level, in the level's
+  /// group). Each: a register of its own to each group of `dst` other than
+  /// `src`'s, over every boundary between (a link's crossing data, as
+  /// crossData keys them); span: one net over the boundaries between its
+  /// endpoints' outermost groups (a broadcast).
+  struct SllItem {
+    unsigned src;
+    SmallVector<unsigned> dst;
+    uint64_t w;
+    bool span;
+    unsigned kind;
+  };
+  static constexpr unsigned kSllKinds = 5;
+  static constexpr const char *kSllKindName[kSllKinds] = {
+      "links", "controls", "environment", "memory controllers", "HBM streams"};
+  SmallVector<SllItem> sllItemList;
+  /// Builds sllItemList: `kept`, after the schedule (the HBM streams' kept
+  /// members; before it, a laid-out member counts as streamed).
+  void sllItems(bool kept);
+  /// vmem-s28: the classes with virtual memories and the words' memory,
+  /// instance and row fields (sllItems, before the build).
+  /// The frame position's bits for the model before a schedule (the
+  /// ungrouped frame's).
+  unsigned sllFrameBits = 1;
+  SmallVector<bool> sllVm;
+  SmallVector<unsigned> sllVmCount;
+  std::array<unsigned, 3> sllVmW = {4, 1, 1};
   /// physical-domains: moves each class's tagged ops of `mod` (the
   /// simulator or an SLR group's module) into a module of its own, nested as
   /// the class tree.
@@ -9862,8 +9901,8 @@ LogicalResult StaticFolder::chooseGroups() {
   SmallVector<SmallVector<uint64_t>> bits;
   SmallVector<SmallVector<unsigned>> links;
   linkBits(bits, links);
-  // `slr-level-group`: each class's bits to and from the netlist's ports,
-  // a link to the level's group.
+  // `slr-level-group`: each class's bits to and from the netlist's ports
+  // (slr-adjacent keeps a class with any within one SLR of the level).
   SmallVector<uint64_t> envBits(n, 0);
   if (slrLevelGroup >= 0) {
     for (auto &consumer : consumers)
@@ -9878,7 +9917,6 @@ LogicalResult StaticFolder::chooseGroups() {
             envBits[from] += piece.width;
         }
   }
-
   // The ungrouped schedule's modulo lower bound: no assignment's frame is
   // shorter (groups only add the crossings' latencies and spacing; the
   // ungrouped frame found is not a bound: a grouped schedule may beat it), so a
@@ -9910,6 +9948,75 @@ LogicalResult StaticFolder::chooseGroups() {
     llvm::errs() << ls.str() << "\n";
     slrSerialize = llvm::any_of(serialK, [](unsigned k) { return k > 1; });
   }
+  sllFrameBits = std::max(1u, llvm::Log2_32_Ceil(std::max(2u, ungrouped)));
+  // The SLL model (sllItems), its items merged by endpoints: what an
+  // assignment puts over each boundary (with slr-capacities the groups are
+  // the region's SLRs in order: a crossing between groups i and j is on
+  // every boundary between) and the bits between groups it ranks by.
+  sllItems(/*kept=*/false);
+  struct SllAgg {
+    unsigned src;
+    SmallVector<unsigned> dst;
+    bool span;
+    uint64_t w;
+  };
+  SmallVector<SllAgg> aggs;
+  {
+    std::map<std::tuple<unsigned, std::vector<unsigned>, bool>, uint64_t> merged;
+    for (auto &item : sllItemList)
+      if (item.w)
+        merged[{item.src, std::vector<unsigned>(item.dst.begin(), item.dst.end()),
+                item.span}] += item.w;
+    for (auto &[key, w] : merged)
+      aggs.push_back({std::get<0>(key),
+                      SmallVector<unsigned>(std::get<1>(key).begin(), std::get<1>(key).end()),
+                      std::get<2>(key), w});
+  }
+  SmallVector<SmallVector<unsigned>> aggsOf(n);
+  for (auto [i, agg] : llvm::enumerate(aggs)) {
+    std::set<unsigned> ends(agg.dst.begin(), agg.dst.end());
+    ends.insert(agg.src);
+    for (unsigned e : ends)
+      if (e < n)
+        aggsOf[e].push_back(i);
+  }
+  bool ordered = !slrCapacitySpecs.empty();
+  unsigned nb = slrGroups > 1 ? slrGroups - 1 : 0;
+  // An item's bits between groups (ranked), and over each boundary, with
+  // the classes placed so far (an unplaced endpoint takes none yet: the
+  // bits only grow as classes are placed).
+  auto aggCost = [&](const SllAgg &agg, ArrayRef<int> at,
+                     MutableArrayRef<uint64_t> over) -> uint64_t {
+    auto groupAt = [&](unsigned e) -> int { return e == n ? slrLevelGroup : at[e]; };
+    int g = groupAt(agg.src);
+    if (g < 0)
+      return 0;
+    // The groups of the placed endpoints, as a mask (at most 32 groups).
+    uint32_t mask = 0;
+    for (unsigned d : agg.dst)
+      if (int h = groupAt(d); h >= 0 && h < 32)
+        mask |= 1u << h;
+    uint64_t cut = 0;
+    if (agg.span) {
+      mask |= 1u << g;
+      int lo = llvm::countr_zero(mask), hi = 31 - llvm::countl_zero(mask);
+      cut = agg.w * (ordered ? uint64_t(hi - lo) : uint64_t(llvm::popcount(mask) - 1));
+      if (ordered)
+        for (int x = lo; x < hi; ++x)
+          over[x] += agg.w;
+      return cut;
+    }
+    mask &= ~(1u << g);
+    for (uint32_t m = mask; m; m &= m - 1) {
+      int h = llvm::countr_zero(m);
+      cut += agg.w * (ordered ? uint64_t(std::abs(h - g)) : 1);
+      if (ordered)
+        for (int x = std::min(g, h); x < std::max(g, h); ++x)
+          over[x] += agg.w;
+    }
+    return cut;
+  };
+
   // A class whose links cross groups keeps its passes of a kind k apart:
   // the frame at least k x its instances.
   auto serialBound = [&](unsigned c) -> uint64_t {
@@ -9974,6 +10081,12 @@ LogicalResult StaticFolder::chooseGroups() {
              rank(bound, cut) >= rank(keptBound.back(), kept.back().first)))
           return;
         if (k == n) {
+          if (getenv("FOLDSIM_SLL_ITEMS")) {
+            llvm::errs() << "foldsim-fold-static: slr-groups leaf:";
+            for (auto x : boundary)
+              llvm::errs() << " " << x;
+            llvm::errs() << "\n";
+          }
           unsigned at = 0;
           while (at < kept.size() &&
                  rank(keptBound[at], kept[at].first) <= rank(bound, cut))
@@ -9996,12 +10109,32 @@ LogicalResult StaticFolder::chooseGroups() {
             ++prunedCapacity;
             continue;
           }
+          // What placing c at g adds over each boundary (sllItems; with
+          // slr-capacities). The rank among assignments within the budget
+          // stays the link wires between groups (and the level's bits).
+          SmallVector<uint64_t, 4> added(nb, 0);
+          if (ordered) {
+            SmallVector<uint64_t, 4> before(nb, 0), after(nb, 0);
+            for (unsigned i : aggsOf[c]) {
+              std::fill(before.begin(), before.end(), 0);
+              std::fill(after.begin(), after.end(), 0);
+              aggCost(aggs[i], group, before);
+              group[c] = g;
+              aggCost(aggs[i], group, after);
+              group[c] = -1;
+              for (unsigned b = 0; b < nb; ++b)
+                added[b] += after[b] - before[b];
+            }
+          }
           // A link between groups takes a k-th of its bits in wires
           // (slr-serialize).
           auto wires = [&](unsigned x, unsigned y) {
             return serialWires(x, bits[x][y]) + serialWires(y, bits[y][x]);
           };
-          uint64_t more = slrLevelGroup >= 0 && int(g) != slrLevelGroup ? envBits[c] : 0;
+          // (The level's bits rank only with slr-adjacent, as before the
+          // level's group was always given: the rank picks the same.)
+          uint64_t more =
+              slrAdjacent && slrLevelGroup >= 0 && int(g) != slrLevelGroup ? envBits[c] : 0;
           uint64_t bound2 = bound;
           for (unsigned j = 0; j < k; ++j) {
             unsigned d = order[j];
@@ -10030,17 +10163,8 @@ LogicalResult StaticFolder::chooseGroups() {
               continue;
             }
           }
-          SmallVector<uint64_t> added(boundary.size(), 0);
           if (budgeted) {
             bool over = false;
-            for (unsigned j = 0; j < k; ++j) {
-              unsigned d = order[j];
-              unsigned h = group[d];
-              if (h == g)
-                continue;
-              for (unsigned b = std::min(g, h); b < std::max(g, h); ++b)
-                added[b] += wires(c, d);
-            }
             uint64_t worst = 0;
             unsigned worstAt = 0;
             for (unsigned b = 0; b < boundary.size(); ++b)
@@ -10059,9 +10183,9 @@ LogicalResult StaticFolder::chooseGroups() {
               }
               continue;
             }
-            for (unsigned b = 0; b < boundary.size(); ++b)
-              boundary[b] += added[b];
           }
+          for (unsigned b = 0; b < boundary.size(); ++b)
+            boundary[b] += added[b];
           group[c] = g;
           used[g] += slrSites[c];
           for (size_t r = 0; r < moreKinds; ++r)
@@ -10076,6 +10200,9 @@ LogicalResult StaticFolder::chooseGroups() {
         }
       };
   visit(0, 0, 0, 0);
+  if (getenv("FOLDSIM_SLL_ITEMS"))
+    llvm::errs() << "foldsim-fold-static: slr-groups search: " << visited << " nodes, "
+                 << kept.size() << " kept, " << aggs.size() << " model items\n";
   if (kept.empty()) {
     std::string caps = std::to_string(slrCapacity);
     if (!slrCapacitySpecs.empty()) {
@@ -12111,21 +12238,28 @@ LogicalResult StaticFolder::schedule() {
     if (slrSerialize)
       os << "  slr links serialized: "
          << crossWires << " wires for " << crossBits << " bits\n";
-    // Groups that are the region's SLRs in order: the link bits over each
-    // boundary, the SLLs they take.
+    // Groups that are the region's SLRs in order: the bits the model
+    // (sllItems) puts over each boundary, the SLLs they take, by kind.
     if (!slrCapacitySpecs.empty() && slrGroups > 1) {
-      SmallVector<uint64_t> over(slrGroups - 1, 0);
-      for (unsigned p = 0; p < classes.size(); ++p)
-        for (unsigned c = 0; c < classes.size(); ++c)
-          if (slrOf[p] >= 0 && slrOf[c] >= 0 && slrOf[p] != slrOf[c])
-            for (int b = std::min(slrOf[p], slrOf[c]);
-                 b < std::max(slrOf[p], slrOf[c]); ++b)
-              over[b] += serialWires(p, bits[p][c]);
+      sllItems(streamsPlanned);
+      SmallVector<uint64_t> over;
+      SmallVector<SmallVector<uint64_t>> byKind;
+      sllModel(slrOf, over, &byKind);
       os << "  slr boundaries:";
       for (auto [b, x] : llvm::enumerate(over))
         os << " " << b << "-" << b + 1 << " " << x;
-      os << (slrSerialize ? " link wires" : " link bits")
-         << (sllBudget ? " (budget " + std::to_string(sllBudget) + ")" : std::string()) << "\n";
+      os << " bits (model"
+         << (slrLevelGroup >= 0 ? ", the level with group " + std::to_string(slrLevelGroup)
+                                : std::string(", the level's group unknown: its bits not counted"))
+         << ")" << (sllBudget ? " (budget " + std::to_string(sllBudget) + ")" : std::string()) << "\n";
+      for (unsigned k = 0; k < kSllKinds; ++k) {
+        if (llvm::all_of(byKind[k], [](uint64_t x) { return x == 0; }))
+          continue;
+        os << "    " << kSllKindName[k] << ":";
+        for (auto [b, x] : llvm::enumerate(byKind[k]))
+          os << " " << b << "-" << b + 1 << " " << x;
+        os << "\n";
+      }
     }
     for (unsigned p = 0; p < classes.size(); ++p)
       for (unsigned c = 0; c < classes.size(); ++c)
@@ -30607,6 +30741,461 @@ LogicalResult StaticFolder::extractGroups() {
   return success();
 }
 
+void StaticFolder::sllItems(bool kept) {
+  unsigned n = classes.size(), level = n;
+  sllItemList.clear();
+  auto idxWidth = [&](unsigned c) {
+    unsigned t = classes[c].threads();
+    return t > 1 ? llvm::Log2_32_Ceil(t) : 0u;
+  };
+  // Links: each consumer input's segments (the cuts of every instance's
+  // pieces), each source (producer, low) of a segment a link, each link in
+  // pieces of at most regionBits bits: a crossing register per (producer,
+  // low, width, reading group), serialized to a k-th of its bits (rounded
+  // up); its registers are kept (no cleanup drops them).
+  std::map<std::tuple<unsigned, unsigned, unsigned>, std::set<unsigned>> chunks;
+  std::map<unsigned, std::set<unsigned>> ctlReaders;
+  std::map<unsigned, std::set<unsigned>> streamWords;  // stream -> readers
+  for (auto &consumer : consumers) {
+    if (consumer.cls < 0 || consumer.ghostOf >= 0)
+      continue;
+    unsigned c = consumer.cls;
+    std::set<unsigned> cuts;
+    for (auto &pieces : consumer.pieces) {
+      unsigned base = 0;
+      for (auto &piece : pieces) {
+        base += piece.width;
+        cuts.insert(base);
+      }
+    }
+    unsigned at = 0;
+    for (unsigned end : cuts) {
+      if (end <= at)
+        continue;
+      unsigned width = end - at;
+      std::set<std::pair<int, unsigned>> keys;
+      for (auto &pieces : consumer.pieces) {
+        unsigned base = 0;
+        for (auto &piece : pieces) {
+          if (at >= base && at < base + piece.width) {
+            if (piece.producer >= 0)
+              keys.insert({piece.producer, piece.low + (at - base)});
+            break;
+          }
+          base += piece.width;
+        }
+      }
+      for (auto [p, low] : keys) {
+        int pc = producers[p].cls;
+        if (pc < 0 || unsigned(pc) == c)
+          continue;
+        auto member = streamMembers.find({c, consumer.port, at, unsigned(p), low});
+        if (member != streamMembers.end() &&
+            (!kept || (member->second.kept && linkStreams[member->second.stream].kept))) {
+          streamWords[member->second.stream].insert(c);
+          continue;
+        }
+        for (unsigned a = 0; a < width; a += regionBits) {
+          unsigned w = std::min<unsigned>(regionBits, width - a);
+          chunks[{unsigned(p), low + a, w}].insert(c);
+          ctlReaders[unsigned(pc)].insert(c);
+        }
+      }
+      at = end;
+    }
+  }
+  for (auto &[key, readers] : chunks) {
+    unsigned pc = producers[std::get<0>(key)].cls;
+    sllItemList.push_back({pc, SmallVector<unsigned>(readers.begin(), readers.end()),
+                           serialWires(pc, std::get<2>(key)), false, 0});
+  }
+  // A crossing link's write in the reader's group takes the producer's
+  // controls there (its instance, its state pass, its last instance, each
+  // ready pass), one net each from where they are built (the class's group
+  // with slr-group-control, else the level) to every reading group.
+  // slr-group-control: the frame's position (each group's own copy of the
+  // counter, as wide as the frame) and the bank parity, to every group.
+  if (slrGroupControl) {
+    SmallVector<unsigned> every;
+    for (unsigned c = 0; c < n; ++c)
+      every.push_back(c);
+    unsigned posBits = ii ? std::max(1u, llvm::Log2_32_Ceil(std::max(2u, ii))) : sllFrameBits;
+    sllItemList.push_back({level, every, uint64_t(posBits) + 3, false, 1});
+  }
+  // slr-group-control: each class's state pass (its enable) back to the
+  // level (the frame's bookkeeping). Else a class's own controls come from
+  // the level: its instance (three stages), its passes' enables and the
+  // frame's bank parity (two stages).
+  for (unsigned c = 0; c < n; ++c)
+    sllItemList.push_back({slrGroupControl ? c : level, {slrGroupControl ? level : c},
+                           slrGroupControl ? 1 : 3ull * idxWidth(c) + 4, false, 1});
+  // (Nested: a class reads its ancestors' controls too, its instance's
+  // place under theirs.)
+  for (unsigned c = 0; c < n; ++c)
+    for (int a = classes[c].parent; a >= 0; a = classes[a].parent)
+      ctlReaders[unsigned(a)].insert(c);
+  for (auto &[pc, readers] : ctlReaders) {
+    auto &cls = classes[pc];
+    unsigned home = slrGroupControl ? pc : level;
+    sllItemList.push_back({home, SmallVector<unsigned>(readers.begin(), readers.end()),
+                           uint64_t(idxWidth(pc)) + 2 + (cls.hasReady ? cls.readyLevels : 0),
+                           true, 1});
+  }
+  // The environment (the simulator's ports, beside the level): the outputs'
+  // bits from their producers' groups; the inputs' from the level to every
+  // group reading them (one register stage in the level, then one per
+  // group: a net over the groups). fold-ports: one request record from the
+  // folded outputs' group, one response record to the folded inputs'.
+  auto &pf = portFold;
+  std::map<unsigned, uint64_t> outBits;
+  std::set<unsigned> foldedReq, foldedRsp;
+  for (auto [k, consumer] : llvm::enumerate(consumers)) {
+    if (consumer.cls >= 0 || consumer.pieces.empty())
+      continue;
+    bool folded = pf.on && k < pf.consumerPort.size() && pf.consumerPort[k] >= 0;
+    for (auto &piece : consumer.pieces[0]) {
+      if (piece.producer < 0 || producers[piece.producer].cls < 0)
+        continue;
+      unsigned pc = producers[piece.producer].cls;
+      if (folded)
+        foldedReq.insert(pc);
+      else
+        outBits[pc] += piece.width;
+    }
+  }
+  for (auto &[pc, w] : outBits)
+    sllItemList.push_back({pc, {level}, w, false, 2});
+  std::map<unsigned, std::pair<std::set<unsigned>, uint64_t>> inReaders;
+  for (auto &consumer : consumers) {
+    if (consumer.cls < 0)
+      continue;
+    for (auto &pieces : consumer.pieces)
+      for (auto &piece : pieces) {
+        if (piece.producer < 0 || producers[piece.producer].cls >= 0)
+          continue;
+        unsigned p = piece.producer;
+        bool folded = pf.on && p < pf.producerPort.size() && pf.producerPort[p] >= 0;
+        if (folded) {
+          foldedRsp.insert(consumer.cls);
+          continue;
+        }
+        auto &entry = inReaders[p];
+        entry.first.insert(consumer.cls);
+        entry.second = std::max<uint64_t>(entry.second, producers[p].width);
+      }
+  }
+  for (auto &[p, entry] : inReaders)
+    sllItemList.push_back({level, SmallVector<unsigned>(entry.first.begin(), entry.first.end()),
+                           entry.second, true, 2});
+  if (!foldedReq.empty()) {
+    SmallVector<unsigned> to{level};
+    // (slr-group-ports: the record built in the folded outputs' group.)
+    sllItemList.push_back({*foldedReq.begin(), to, uint64_t(pf.reqWidth) + pf.chanWidth + 1,
+                           false, 2});
+  }
+  // slr-group-env: the channels' handshakes (ready, reset, the response
+  // channel's select) from the level to every group.
+  // (Each channel's staged token and its ready, read by every group's
+  // copy of the frame's decision; the folded response's channel select;
+  // the reset's.) fold-ports with slr-group-ports: each folded output's
+  // room (its count below the limit) from the folded outputs' group to
+  // every group likewise.
+  SmallVector<unsigned> all;
+  for (unsigned c = 0; c < n; ++c)
+    all.push_back(c);
+  if (slrGroupEnv) {
+    std::set<std::string> channels;
+    for (auto [p, producer] : llvm::enumerate(producers))
+      if (producer.cls < 0 && !(pf.on && p < pf.producerPort.size() && pf.producerPort[p] >= 0))
+        channels.insert(producer.name);
+    for (auto [k, consumer] : llvm::enumerate(consumers))
+      if (consumer.cls < 0 && !(pf.on && k < pf.consumerPort.size() && pf.consumerPort[k] >= 0))
+        channels.insert(consumer.name);
+    uint64_t w = 2 * (channels.size() + (pf.on ? 1 : 0)) + (pf.on ? pf.chanWidth : 0) + 2;
+    sllItemList.push_back({level, all, w, true, 2});
+  }
+  if (pf.on && slrGroupPorts && !foldedReq.empty()) {
+    uint64_t room = 0;
+    for (unsigned k = 0; k < consumers.size() && k < pf.consumerPort.size(); ++k)
+      room += consumers[k].cls < 0 && pf.consumerPort[k] >= 0;
+    sllItemList.push_back({*foldedReq.begin(), all, room, true, 2});
+  }
+  if (!foldedRsp.empty())
+    sllItemList.push_back({level, SmallVector<unsigned>(foldedRsp.begin(), foldedRsp.end()),
+                           uint64_t(pf.rspWidth) + pf.chanWidth + 1, true, 2});
+  // The virtual memories' controllers, in the level: vmem-s28, a region a
+  // group of the classes with memories, its request and response words;
+  // each class's free counts to it and its pending mask to the level and
+  // every group.
+  if (vmemS28) {
+    // The classes with virtual memories, as buildCopy finds them (by name
+    // or <class model>:<name>, or by size), once before the build.
+    if (sllVm.size() != n) {
+      sllVm.assign(n, false);
+      sllVmCount.assign(n, 0);
+      llvm::Regex pattern(virtualMemoryPattern);
+      sllVmW = {4, 1, 1};
+      for (auto [c, cls] : llvm::enumerate(classes)) {
+        StringRef model = cls.splitFrom >= 0 ? StringRef(classes[cls.splitFrom].name)
+                                             : StringRef(cls.name);
+        auto *folding = cls.folding.get();
+        unsigned count = 0;
+        for (auto memory : cls.model.getBodyBlock()->getOps<seq::FirMemOp>()) {
+          StringRef name = memory.getName().value_or("");
+          auto type = memory.getType();
+          if ((folding && folding->physical.contains(memory)) ||
+              !((!virtualMemoryPattern.empty() &&
+                 (pattern.match(name) || pattern.match((model + ":" + name).str()))) ||
+                (memory.getReadLatency() == 1 &&
+                 vmemBySize(type.getDepth(), type.getWidth(), cls.threads()))))
+            continue;
+          ++count;
+          sllVmW[1] = std::max(sllVmW[1], std::max(1u, idxWidth(c)));
+          sllVmW[2] = std::max(sllVmW[2], std::max(1u, llvm::Log2_32_Ceil(unsigned(type.getDepth()))));
+        }
+        sllVmCount[c] = count;
+        if (count) {
+          sllVm[c] = true;
+          sllVmW[0] = std::max(sllVmW[0], llvm::Log2_32_Ceil(count));
+        }
+      }
+    }
+    SmallVector<unsigned> withMem;
+    for (unsigned c = 0; c < n; ++c)
+      if (sllVm[c])
+        withMem.push_back(c);
+    if (!withMem.empty()) {
+      unsigned memW = sllVmW[0], instW = sllVmW[1], rowW = sllVmW[2];
+      // A switch's request and response words and their handshakes (valid,
+      // idle, ready, hold, response valid).
+      uint64_t words = (587 + memW + instW + rowW) + (522 + memW + instW) + 5;
+      // (A central switch per domain root with memories in a group: taken
+      // as one per class with memories, an upper bound where classes share
+      // a root.)
+      for (unsigned c : withMem)
+        sllItemList.push_back({level, {c}, words, false, 3});
+      SmallVector<unsigned> everyone;
+      for (unsigned c = 0; c <= n; ++c)
+        everyone.push_back(c);
+      // Each memory's free count to its class's group, its queue's free
+      // count to every group (each group's copy of the frame's decision),
+      // and its pending mask (an instance each) from its class's group to
+      // every group.
+      for (unsigned c : withMem) {
+        sllItemList.push_back({level, {c}, 16ull * sllVmCount[c], false, 3});
+        sllItemList.push_back({level, everyone, 16ull * sllVmCount[c], true, 3});
+        sllItemList.push_back({c, everyone,
+                               std::max<uint64_t>(1, classes[c].threads()) * sllVmCount[c], true, 3});
+      }
+    }
+  }
+  // An HBM link stream, as built: its engine in its reader's group (built
+  // with the reader's input), its word gathered there from the producer's
+  // outputs (each output port read whole there, once a group), its
+  // virtual memory port at the level.
+  std::map<unsigned, std::set<unsigned>> rawPorts;
+  for (auto &[k, readers] : streamWords) {
+    auto &st = linkStreams[k];
+    for (auto &run : st.runs)
+      rawPorts[run.producer].insert(st.rcls);
+    // The engine's virtual memory port at the level (requests: valid,
+    // instance and row for reads and writes, the written word and its
+    // mask; answers: valid, instance, the landed row, the free count) and
+    // its landing slots' pending bits, pop pointer and word position the
+    // level's frame bookkeeping reads.
+    uint64_t iw = st.portInstBits(), aw = streamRowBits(st), dw = st.portDW();
+    uint64_t vm = 4 + 3 * iw + 2 * aw + 2 * dw + kVirtualFreeWidth + (st.mailbox ? dw / 8 : 1);
+    uint64_t engine = uint64_t(st.slots()) * std::max(1u, st.beats) + 2 * st.instBits() + 1;
+    sllItemList.push_back({st.rcls, {level}, vm + engine, false, 4});
+  }
+  for (auto &[p, readers] : rawPorts)
+    if (producers[p].cls >= 0)
+      sllItemList.push_back({unsigned(producers[p].cls),
+                             SmallVector<unsigned>(readers.begin(), readers.end()),
+                             producers[p].width, false, 4});
+}
+
+void StaticFolder::sllModel(ArrayRef<int> groupOf,
+                            SmallVectorImpl<uint64_t> &boundary,
+                            SmallVectorImpl<SmallVector<uint64_t>> *byKind) {
+  unsigned nb = slrGroups > 1 ? slrGroups - 1 : 0, n = classes.size();
+  boundary.assign(nb, 0);
+  if (byKind)
+    byKind->assign(kSllKinds, SmallVector<uint64_t>(nb, 0));
+  auto groupAt = [&](unsigned e) -> int {
+    return e == n ? slrLevelGroup : groupOf[e];
+  };
+  auto add = [&](int a, int b, uint64_t w, unsigned kind) {
+    for (int x = std::min(a, b); x < std::max(a, b); ++x) {
+      boundary[x] += w;
+      if (byKind)
+        (*byKind)[kind][x] += w;
+    }
+  };
+  bool dump = getenv("FOLDSIM_SLL_ITEMS");
+  for (auto &item : sllItemList) {
+    int g = groupAt(item.src);
+    if (dump && item.w) {
+      llvm::errs() << "foldsim-fold-static: sll item " << kSllKindName[item.kind] << " " << item.w
+                   << (item.span ? " span " : " each ")
+                   << (item.src == n ? std::string("level") : classes[item.src].name) << "@" << g << " ->";
+      for (unsigned d : item.dst)
+        llvm::errs() << " " << (d == n ? std::string("level") : classes[d].name) << "@" << groupAt(d);
+      llvm::errs() << "\n";
+    }
+    if (g < 0)
+      continue;
+    if (item.span) {
+      int lo = g, hi = g;
+      for (unsigned d : item.dst)
+        if (int h = groupAt(d); h >= 0) {
+          lo = std::min(lo, h);
+          hi = std::max(hi, h);
+        }
+      add(lo, hi, item.w, item.kind);
+      continue;
+    }
+    std::set<int> to;
+    for (unsigned d : item.dst)
+      if (int h = groupAt(d); h >= 0 && h != g)
+        to.insert(h);
+    for (int h : to)
+      add(g, h, item.w, item.kind);
+  }
+}
+
+void StaticFolder::reportBuiltSlls() {
+  auto *body = simModule.getBodyBlock();
+  // Each top-level value a group's port carries: a net. A group input that
+  // its module only passes to an output joins that output's net (the same
+  // wire: no cell of the group on it).
+  llvm::EquivalenceClasses<Value> same;
+  DenseMap<Value, std::set<int>> touched;   // groups with cells on the net
+  DenseMap<Value, bool> atLevel;            // the level (or the environment)
+  DenseMap<Value, uint64_t> widthOf;
+  uint64_t passBits = 0;
+  auto isClock = [](Type t) { return isa<seq::ClockType>(t); };
+  SmallVector<std::pair<hw::InstanceOp, int>> groupInsts;
+  for (auto inst : body->getOps<hw::InstanceOp>()) {
+    StringRef name = inst.getInstanceName();
+    unsigned g = 0;
+    if (!name.consume_front("foldsim_slr") || name.getAsInteger(10, g))
+      continue;
+    groupInsts.push_back({inst, int(g)});
+  }
+  DenseSet<Operation *> isGroup;
+  for (auto &[inst, g] : groupInsts)
+    isGroup.insert(inst);
+  for (auto &[inst, g] : groupInsts) {
+    auto mod = top.lookupSymbol<hw::HWModuleOp>(inst.getModuleName());
+    if (!mod)
+      continue;
+    auto *term = mod.getBodyBlock()->getTerminator();
+    for (auto [i, operand] : llvm::enumerate(inst.getOperands())) {
+      if (isClock(operand.getType()))
+        continue;
+      same.insert(operand);
+      widthOf[operand] = hw::getBitWidth(operand.getType());
+      BlockArgument arg = mod.getBodyBlock()->getArgument(i);
+      bool onlyPassed = !arg.use_empty();
+      for (auto &use : arg.getUses())
+        if (use.getOwner() != term)
+          onlyPassed = false;
+        else
+          same.unionSets(operand, inst.getResult(use.getOperandNumber()));
+      if (onlyPassed)
+        passBits += widthOf[operand];
+      else
+        touched[operand].insert(g);
+      if (isa<BlockArgument>(operand) || !isGroup.contains(operand.getDefiningOp()))
+        atLevel[operand] = true;
+    }
+    for (auto result : inst.getResults()) {
+      if (isClock(result.getType()))
+        continue;
+      same.insert(result);
+      widthOf[result] = hw::getBitWidth(result.getType());
+      // (A result its module only passes from an input: the input's net.)
+      Value inner = term->getOperand(cast<OpResult>(result).getResultNumber());
+      if (!isa<BlockArgument>(inner))
+        touched[result].insert(g);
+      for (auto *user : result.getUsers())
+        if (!isGroup.contains(user))
+          atLevel[result] = true;
+    }
+  }
+  unsigned n = slrGroups;
+  SmallVector<uint64_t> built(n > 1 ? n - 1 : 0, 0);
+  uint64_t unknown = 0, levelBits = 0;
+  for (const auto *ec : same) {
+    if (!ec->isLeader())
+      continue;
+    std::set<int> span;
+    bool level = false;
+    uint64_t w = 0;
+    for (auto m = same.member_begin(*ec); m != same.member_end(); ++m) {
+      auto t = touched.find(*m);
+      if (t != touched.end())
+        span.insert(t->second.begin(), t->second.end());
+      level |= atLevel.lookup(*m);
+      w = std::max<uint64_t>(w, widthOf.lookup(*m));
+    }
+    if (level) {
+      if (slrLevelGroup < 0) {
+        unknown += w;
+        continue;
+      }
+      span.insert(slrLevelGroup);
+      levelBits += w;
+    }
+    if (span.size() < 2)
+      continue;
+    for (int b = *span.begin(); b < *span.rbegin(); ++b)
+      built[b] += w;
+    // FOLDSIM_SLL_NETS: each net counted, its width, groups and a name.
+    if (getenv("FOLDSIM_SLL_NETS")) {
+      std::string name;
+      for (auto m = same.member_begin(*ec); m != same.member_end() && name.empty(); ++m) {
+        Value v = *m;
+        if (auto inst = v.getDefiningOp<hw::InstanceOp>())
+          name = inst.getOutputName(cast<OpResult>(v).getResultNumber()).str();
+        else if (auto *def = v.getDefiningOp())
+          if (auto attr = def->getAttrOfType<StringAttr>("name"))
+            name = attr.getValue().str();
+      }
+      llvm::errs() << "foldsim-fold-static: sll net " << w << " groups";
+      for (int g : span)
+        llvm::errs() << " " << g;
+      llvm::errs() << (level ? " (level)" : "") << " " << name << "\n";
+    }
+  }
+  SmallVector<uint64_t> model;
+  sllItems(streamsPlanned);
+  sllModel(slrOf, model);
+  std::string line;
+  llvm::raw_string_ostream os(line);
+  os << "  slr boundaries built (group port bits, each net once over its span):";
+  for (auto [b, x] : llvm::enumerate(built))
+    os << " " << b << "-" << b + 1 << " " << x << " (model "
+       << (b < model.size() ? model[b] : 0) << ")";
+  if (passBits)
+    os << "; " << passBits << " bits only passed through a group";
+  if (unknown)
+    os << "; " << unknown << " bits to the level, whose group is unknown (slr-level-group)";
+  os << "\n";
+  for (auto [b, x] : llvm::enumerate(built))
+    if (b < model.size() && model[b] < x)
+      os << "  warning: slr boundary " << b << "-" << b + 1 << ": the model projected "
+         << model[b] << " bits, " << x - model[b] << " fewer than built\n";
+  llvm::errs() << "foldsim-fold-static:" << StringRef(line).drop_front(1);
+  if (!reportPath.empty()) {
+    std::error_code ec;
+    llvm::raw_fd_ostream file(reportPath, ec, llvm::sys::fs::OF_Append);
+    if (!ec)
+      file << line;
+  }
+}
+
 LogicalResult StaticFolder::extractDomains(hw::HWModuleOp mod, StringRef suffix) {
   auto *context = top.getContext();
   auto *body = mod.getBodyBlock();
@@ -31237,6 +31826,8 @@ LogicalResult StaticFolder::run() {
     return failure();
   if (!slrOf.empty() && failed(extractGroups()))
     return failure();
+  if (!slrOf.empty())
+    reportBuiltSlls();
   if (physicalDomains) {
     // Each SLR group's module (their own trees), then the simulator's.
     SmallVector<hw::HWModuleOp> mods;

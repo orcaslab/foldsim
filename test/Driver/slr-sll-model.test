@@ -1,0 +1,59 @@
+# The SLL model of slr-groups (sllItems): what an assignment puts over each
+# boundary between groups (in die order), as the build makes it. A link's
+# crossing registers (a register per producer bits, chunk and reading group,
+# a k-th of the chunk with slr-serialize), the producers' controls the
+# reading groups take, the environment and the virtual memories' controllers
+# at the level (in group slr-level-group), and the HBM link streams (each
+# with its engine in its reader's group: the producer's output ports read
+# there, the engine's virtual memory port and landing slots at the level).
+# After the build, the group ports counted (each net once over its span) are
+# reported beside the model, which projects no fewer.
+# Inputs/linkhbm: sixteen units (group 0) and readers (group 1) in a ring.
+# RUN: rm -rf %t && mkdir -p %t && cd %S/Inputs/linkhbm
+# RUN: foldsim --srcs top.f --top Top --out %t/base --static --nest --modulo Unit Reader > %t/base.log 2>&1
+# The level with the readers: the links' 80 bits cross (Unit -> Reader 40,
+# Reader -> Unit 32, Unit -> Top 8), the units' controls (held in the level)
+# too; the environment's bits stay in the level's group.
+# RUN: foldsim-opt %t/base/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim slr-groups=2 slr-capacities=1000000,1000000 slr-assign=Unit:0,Reader:1,Top_model:1 slr-level-group=1 report=%t/one.txt})' -o %t/one.mlir 2> %t/one.err
+# RUN: FileCheck %s --check-prefix=ONE < %t/one.txt
+# RUN: FileCheck %s --check-prefix=BUILT < %t/one.err
+# ONE: slr boundaries: 0-1 103 bits (model, the level with group 1)
+# ONE-NEXT: links: 0-1 80
+# ONE-NEXT: controls: 0-1 22
+# ONE-NEXT: environment: 0-1 1
+# BUILT: slr boundaries built (group port bits, each net once over its span): 0-1 101 (model 103)
+# BUILT-NOT: warning: slr boundary
+# The level with the units instead: the readers' input and output channels
+# (the level <-> group ports) cross now.
+# RUN: foldsim-opt %t/base/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim slr-groups=2 slr-capacities=1000000,1000000 slr-assign=Unit:0,Reader:1,Top_model:1 slr-level-group=0 report=%t/zero.txt})' -o %t/zero.mlir 2> %t/zero.err
+# RUN: FileCheck %s --check-prefix=ZERO < %t/zero.txt
+# RUN: FileCheck %s --check-prefix=ZERO-BUILT < %t/zero.err
+# ZERO: slr boundaries: 0-1 131 bits (model, the level with group 0)
+# ZERO-NEXT: links: 0-1 80
+# ZERO-NEXT: controls: 0-1 34
+# ZERO-NEXT: environment: 0-1 17
+# ZERO-BUILT: slr boundaries built (group port bits, each net once over its span): 0-1 116 (model 131)
+# ZERO-BUILT-NOT: warning: slr boundary
+# Both rings as HBM link streams: their 72 link bits leave the link term
+# (Unit -> Top's 8 stay); their traffic counts where it crosses: the unit
+# outputs read whole by the stream engine in the readers' group, and the
+# readers' outputs by the engine in the units' group with its port and
+# slots at the level (the readers' group).
+# RUN: foldsim-opt %t/base/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim slr-groups=2 slr-capacities=1000000,1000000 slr-assign=Unit:0,Reader:1,Top_model:1 slr-level-group=1 link-kinds=Unit:Reader:hbm,Reader:Unit:hbm report=%t/hbm.txt})' -o %t/hbm.mlir 2> %t/hbm.err
+# RUN: FileCheck %s --check-prefix=HBM < %t/hbm.txt
+# RUN: FileCheck %s --check-prefix=HBM-BUILT < %t/hbm.err
+# HBM: slr boundaries: 0-1 248 bits (model, the level with group 1)
+# HBM-NEXT: links: 0-1 8
+# HBM-NEXT: controls: 0-1 16
+# HBM-NEXT: environment: 0-1 1
+# HBM-NEXT: HBM streams: 0-1 223
+# HBM-BUILT: slr boundaries built (group port bits, each net once over its span): 0-1 224 (model 248)
+# HBM-BUILT-NOT: warning: slr boundary
+# The budget is on the model (before the schedule, the frame position's
+# width the ungrouped frame's): a budget of 110 passes, one of 95 does not (the controls built in each class's group,
+# slr-group-control).
+# RUN: foldsim-opt %t/base/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim slr-groups=2 slr-capacities=1000000,1000000 slr-assign=Unit:0,Reader:1,Top_model:1 slr-level-group=1 slr-group-control slr-sll-budget=110 schedule-only report=%t/ok.txt})' -o /dev/null
+# RUN: FileCheck %s --check-prefix=OK < %t/ok.txt
+# OK: slr boundaries: 0-1 102 bits (model, the level with group 1) (budget 110)
+# RUN: not foldsim-opt %t/base/models.mlir --pass-pipeline='builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim slr-groups=2 slr-capacities=1000000,1000000 slr-assign=Unit:0,Reader:1,Top_model:1 slr-level-group=1 slr-group-control slr-sll-budget=95 schedule-only})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=OVER
+# OVER: slr-groups: no assignment of the classes to 2 groups of at most 1000000,1000000 sites {{.*}} with at most 95 link bits over each SLR boundary

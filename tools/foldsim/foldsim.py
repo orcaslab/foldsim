@@ -1484,8 +1484,10 @@ def slr_options(a, foldsim_opt, models, fold, out):
                     + ','.join(f'{c}:{s}' for c, s in sites.items()))
         opts += (''
                 + f' slr-sll-budget={slr_region_sll_budget(a.slr_region)}')
-        # (--slr-adjacent: the level's group is a fixed end of the classes' port bits)
-        if getattr(a, 'slr_adjacent', False) and level is not None:
+        # The level's group (--slr-level): a fixed end of the bits between the
+        # classes and the level (the environment, its controllers, the frame
+        # control), priced over the boundaries to it (and --slr-adjacent's end).
+        if level is not None:
             opts += f' slr-level-group={level}'
     else:
         capacity = a.slr_capacity or round(foldsim_degree.PLACE_MARGIN *
@@ -1494,6 +1496,9 @@ def slr_options(a, foldsim_opt, models, fold, out):
               + ', '.join(f'{c} {s}' for c, s in sites.items()), file=sys.stderr)
         opts = (f' slr-groups={a.slr_count} slr-capacity={capacity} slr-sites='
                 + ','.join(f'{c}:{s}' for c, s in sites.items()))
+        level = slr_level_group(getattr(a, 'slr_level', None), None, a.slr_count)
+        if level is not None:
+            opts += f' slr-level-group={level}'
     if a.slr_assign:
         opts += f' slr-assign={a.slr_assign}'
     if a.slr_serialize:

@@ -14,10 +14,10 @@
 # RUN: FileCheck %s --check-prefix=ALL < %t/k.log
 # No assignment: the message says which constraint pruned the candidates, a
 # group's sites or an SLR boundary's link bits (with the least overflow seen,
-# and the boundary).
+# and the boundary; the bits as the SLL model counts them: slr-sll-model.test).
 # RUN: not foldsim-opt %t/m/models.mlir --mlir-print-op-on-diagnostic=false '--pass-pipeline=builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim modulo slr-groups=3 slr-capacities=100000,100000,100000 slr-sites=node:50000,lvl1_model:50000,Top_model:1000 slr-sll-budget=10 slr-assign=node:0,lvl1_model:2})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=SLL
 # RUN: not foldsim-opt %t/m/models.mlir --mlir-print-op-on-diagnostic=false '--pass-pipeline=builtin.module(foldsim-fold-static{module=Top sim=foldsim_sim modulo slr-groups=3 slr-capacities=1000,1000,1000 slr-sites=node:50000,lvl1_model:50000,Top_model:1000})' -o /dev/null 2>&1 | FileCheck %s --check-prefix=CAP
-# SLL: error: slr-groups: no assignment of the classes to 3 groups of at most 100000,100000,100000 sites (the largest class copy: 50000 sites) with at most 10 link bits over each SLR boundary: 0 placements past a group's sites, 1 past a boundary's link bits (the least overflow 1294 link bits, boundary 0-1)
+# SLL: error: slr-groups: no assignment of the classes to 3 groups of at most 100000,100000,100000 sites (the largest class copy: 50000 sites) with at most 10 link bits over each SLR boundary: 0 placements past a group's sites, 1 past a boundary's link bits (the least overflow 433 link bits, boundary 0-1)
 # CAP: error: slr-groups: no assignment of the classes to 3 groups of at most 1000,1000,1000 sites (the largest class copy: 50000 sites): 3 placements past a group's sites
 # The kept assignments are ranked by the frame's bound from serialized
 # crossings (k x the producer's instances, at least the ungrouped lower bound), then

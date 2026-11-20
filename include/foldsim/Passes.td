@@ -614,8 +614,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "larger than every SLR is named (its own cut is not known); and "
            "the wires between each pair of classes">,
     Option<"slrSllBudget", "slr-sll-budget", "uint64_t", "0",
-           "With slr-groups and slr-capacities, the most link bits an "
-           "assignment may put over any one SLR boundary (its SLLs; 0: any)">,
+           "With slr-groups and slr-capacities, the most bits an assignment "
+           "may put over any one SLR boundary (its SLLs; 0: any), as the SLL "
+           "model counts the build's group ports: the links' crossing "
+           "registers (serialized, per reading group), the producers' "
+           "controls, the environment, the virtual memories' controllers and "
+           "the HBM link streams' engines (the level in slr-level-group)">,
     Option<"slrAdjacent", "slr-adjacent", "bool", "false",
            "With slr-groups and slr-capacities (group g on the region's g-th "
            "SLR): no link between groups more than one SLR apart. Such a link "
@@ -625,10 +629,12 @@ def FoldStatic : Pass<"foldsim-fold-static", "::mlir::ModuleOp"> {
            "prunes it">,
     Option<"slrLevelGroup", "slr-level-group", "int", "-1",
            "With slr-groups: the group the simulator level and the "
-           "environment sit with (the driver's --slr-level): a class's bits to "
-           "and from the netlist's ports (its memory and token channels) are a "
-           "link to that group in the assignment's cut, and with slr-adjacent a "
-           "class with any is kept within one SLR of it. -1: unknown (ignored)">,
+           "environment sit with (the driver's --slr-level): the SLL model's "
+           "bits between a class and the level (its environment channels, its "
+           "memories' controllers, its controls) cross the boundaries to that "
+           "group; with slr-adjacent a class with netlist port bits is kept "
+           "within one SLR of it (and they rank its cut). -1: unknown (the "
+           "level's bits not counted)">,
     ListOption<"slrSerialize", "slr-serialize", "std::string",
                "With slr-groups, the links between groups of the given classes "
                "(globs; a copy goes by its class's name) carried over k host "
