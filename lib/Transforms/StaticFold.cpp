@@ -11053,18 +11053,24 @@ void StaticFolder::planIdleSkip() {
       why.push_back("rows resident on chip");
     if (ppBeatPorts(cls))
       why.push_back("rows as beats");
-    if (cls.folding || !cls.virtualMemories.empty() || cls.page ||
-        cls.multicycle || cls.passSplit || cls.deferSpan || cls.sirMixed)
-      why.push_back("state outside its rows");
+    // (State outside its rows: which.)
+    if (cls.folding)
+      why.push_back("state outside its rows (folded stores)");
+    if (!cls.virtualMemories.empty())
+      why.push_back("state outside its rows (virtual memories)");
+    if (cls.page || cls.multicycle || cls.passSplit || cls.deferSpan || cls.sirMixed)
+      why.push_back("state outside its rows (pages, multicycle or pass split)");
     if (cls.hasReady || llvm::is_contained(cls.late, true))
       why.push_back("late outputs");
-    bool other = false;
+    bool memories = false, boxes = false;
     cls.model.walk([&](Operation *op) {
-      if (isa<seq::FirMemOp, hw::InstanceOp>(op))
-        other = true;
+      memories |= isa<seq::FirMemOp>(op);
+      boxes |= isa<hw::InstanceOp>(op);
     });
-    if (other)
-      why.push_back("memories or black boxes");
+    if (memories)
+      why.push_back("memories");
+    if (boxes)
+      why.push_back("black boxes");
     if (!why.empty()) {
       llvm::errs() << "foldsim-fold-static: pp-idle-skip: " << cls.name << ": no clean bits ("
                    << llvm::join(why, ", ") << "; " << cls.rowStateBits << " bits x "
@@ -23583,9 +23589,12 @@ LogicalResult StaticFolder::buildSim() {
     for (auto [c, cls] : llvm::enumerate(classes)) {
       if (cls.idleSkip || !cls.pp || !cls.ppHbm)
         continue;
-      unsigned n = cls.threads(), why[3] = {0, 0, 0};
+      // (Each count on its own: an instance may have several; and the
+      // environment inputs by port.)
+      unsigned n = cls.threads(), why[3] = {0, 0, 0}, ok = 0;
+      std::map<std::string, unsigned> envPorts;
       for (unsigned i = 0; i < n; ++i) {
-        int w = -1;
+        bool has[3] = {false, false, false};
         for (auto [k, cons] : llvm::enumerate(cls.consumerOf)) {
           if (cons < 0 || int(k) == cls.clockInput || (k < cls.staticInput.size() && cls.staticInput[k]))
             continue;
@@ -23594,17 +23603,24 @@ LogicalResult StaticFolder::buildSim() {
               continue;
             auto &pr = producers[piece.producer];
             int r = pr.cls < 0 ? 0 : pr.late ? 1 : !classes[pr.cls].idleTracked ? 2 : -1;
-            if (r >= 0 && (w < 0 || r < w))
-              w = r;
+            if (r >= 0)
+              has[r] = true;
+            if (r == 0)
+              ++envPorts[cls.model.getInputName(unsigned(k)).str()];
           }
         }
-        if (w >= 0)
-          ++why[w];
+        for (unsigned r = 0; r < 3; ++r)
+          why[r] += has[r];
+        ok += !has[0] && !has[1] && !has[2];
       }
+      std::string ports;
+      for (auto &[name, count] : envPorts)
+        ports += (ports.empty() ? "" : ",") + name;
       llvm::errs() << "foldsim-fold-static: pp-idle-skip: " << cls.name << ": as a skipping class, "
-                   << n - why[0] - why[1] - why[2] << " of " << n << " instances' inputs qualify ("
-                   << why[0] << " an environment input, " << why[1] << " a late input, " << why[2]
-                   << " an untracked source)\n";
+                   << ok << " of " << n << " instances' inputs qualify (with " << why[0]
+                   << " an environment input, " << why[1] << " a late input, " << why[2]
+                   << " an untracked source; environment inputs: " << (ports.empty() ? "none" : ports)
+                   << ")\n";
     }
     for (auto [c, cls] : llvm::enumerate(classes)) {
       if (!cls.idleSkip)
