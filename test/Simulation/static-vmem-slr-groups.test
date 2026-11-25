@@ -1,3 +1,4 @@
+# REQUIRES: verilator
 # --vmem-slr-groups (foldsim-fold-static vmem-slr-groups): a page engine
 # carries the members of one SLR group only (a link stream counts as its
 # reader's), so that its port, member selects and device-memory master can sit
