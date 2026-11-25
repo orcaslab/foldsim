@@ -118,13 +118,32 @@ class ManifestList(list):
     """A list option's value from the manifest (a command line's replaces it)."""
 
 
+def toml_module():
+    """tomllib (Python >= 3.11), else tomli, the same parser before it joined
+    the standard library (Ubuntu 22.04's Python 3.10: apt install python3-tomli)."""
+    try:
+        import tomllib
+        return tomllib
+    except ModuleNotFoundError:
+        pass
+    try:
+        import tomli
+        return tomli
+    except ModuleNotFoundError:
+        return None
+
+
 def load(path):
     try:
         if path.endswith('.json'):
             return json.load(open(path))
-        import tomllib
+        toml = toml_module()
+        if toml is None:
+            sys.exit(f'manifest {path}: a TOML manifest needs Python >= 3.11 or the tomli package '
+                     f'(apt install python3-tomli, or pip install tomli); this is Python '
+                     f'{sys.version.split()[0]}. A .json manifest needs neither.')
         with open(path, 'rb') as f:
-            return tomllib.load(f)
+            return toml.load(f)
     except (OSError, ValueError) as e:
         sys.exit(f'manifest {path}: {e}')
 
