@@ -54,7 +54,8 @@ FoldSim depends on two other projects:
 
 Steps 1 to 4 build CIRCT; skip them if you already have a build of it (step 4
 of its README). Tested on Ubuntu 24.04 (x86-64) with clang 18, CMake 3.31,
-Ninja 1.11, Python 3.12, Verilator 5.050 and RISC-V GCC 12.2.
+Ninja 1.11, Python 3.12, Verilator 5.050 and RISC-V GCC 12.2; also built on
+Ubuntu 22.04 with GCC 11.4 and Python 3.10 (`check-foldsim` without Verilator).
 
 **1. Prerequisites.**
 
@@ -65,8 +66,9 @@ sudo apt-get install -y git cmake ninja-build clang lld python3 ccache curl \
 
 - **Build:** CMake 3.20 or newer, and clang 16+ or GCC 11+. Without `lld`, set
   `LINKER=gold` in step 3.
-- **Python:** 3.11 or newer for the `foldsim` driver; it reads TOML manifests
-  with `tomllib`. Some options need more packages: `foldsim-lift` needs
+- **Python:** 3.10 or newer for the `foldsim` driver. A TOML manifest is read
+  with `tomllib` (3.11+) or, on 3.10 (Ubuntu 22.04), `tomli`
+  (`sudo apt-get install -y python3-tomli`). Some options need more packages: `foldsim-lift` needs
   `pyslang`, and the state and SLR planners need `numpy` and `scipy`, plus
   `mtkahypar` for the SLR split. The demo needs none of them.
 - **Verilator 5:** used by the `check-foldsim` simulation tests and the demo.
