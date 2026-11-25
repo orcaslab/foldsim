@@ -1,4 +1,4 @@
-# REQUIRES: verilator
+# REQUIRES: verilator, toml
 # More than 64 static ports on the virtual memories' masters (the MEM binding; the 64-SM A100 netlist
 # y64c1 has 95): the 64-port limit is the direct binding's (one HBM channel a port), not this one's.
 # kernel-vh lists the ports 8 a part, parts 0-7 always and parts 8 and up as far as the ports go (here

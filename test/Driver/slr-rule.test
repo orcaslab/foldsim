@@ -1,3 +1,4 @@
+# REQUIRES: toml
 # (Placement cases on hand-sized regions, sized before the 11-11 count corrections (the level's array reads,
 # masked LUTRAM, the level logic's synthesized share) and the 11-12 ones (distributed RAM as Versal builds it, block
 # RAM aspect ratios, ROM tables, per-slice holds): counted as before, so the cases stay the ones they test.)

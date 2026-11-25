@@ -1,3 +1,4 @@
+# REQUIRES: tclsh
 # flow/v80/domain_pblocks.tcl (a32-S26X-PH): an SLR whose roots include only one
 # past the least stripe (FOLDSIM_DOMAIN_MIN_LUT, 20,000 LUTs) bands that root's
 # child domains, as a single root's, and theirs in turn (the 16-SM fold's SLR0:

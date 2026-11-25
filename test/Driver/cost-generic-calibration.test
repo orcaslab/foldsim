@@ -1,3 +1,4 @@
+# REQUIRES: toml
 # A calibration prices any design's classes: its families (a design's own fit,
 # regexes on the class names) first, then its `generic` model of the class's
 # cost features (log LUTs, select and arithmetic shares, flops and memory bits

@@ -1,3 +1,4 @@
+# REQUIRES: toml
 # A target manifest (--manifest) gives the driver's options: the same options as
 # the command line it stands for, the command line overriding any of it (a list
 # option or the positional classes replacing the manifest's list), and the

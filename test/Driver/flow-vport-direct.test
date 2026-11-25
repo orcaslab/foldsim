@@ -1,4 +1,4 @@
-# REQUIRES: verilator
+# REQUIRES: verilator, toml
 # The direct-HBM binding of static ports through the kernel flow, end to end
 # short of Vivado: a simulator with 32 static ports (Inputs/flow/vport_stub.py:
 # the simulator's side of foldsim_vport, vp<p>_*, and FOLDSIM_VPORT<p>_* in its

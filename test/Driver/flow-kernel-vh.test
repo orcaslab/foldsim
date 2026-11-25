@@ -1,3 +1,4 @@
+# REQUIRES: toml
 # foldsim_flow.py kernel-vh: the kernel shell's header from a manifest's
 # [platform]: memory ports, channel shift, AXI id width, their device-memory
 # masters (one per port; one where the simulator folds its ports) repeated 8 a

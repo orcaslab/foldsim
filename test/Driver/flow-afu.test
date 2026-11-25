@@ -1,3 +1,4 @@
+# REQUIRES: toml
 # foldsim_flow.py afu: the kernel's top with the manifest's control binding.
 # Bound roles name the target's ports (the simulator's channels, checked
 # against foldsim_sim.json, widths included); "!" binds an active-low one

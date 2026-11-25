@@ -44,3 +44,14 @@ if _py and subprocess.run([_py, "-c", "import scipy.optimize"],
                           capture_output=True).returncode == 0:
     config.available_features.add("scipy")
     config.substitutions.append(("%scipy_python", _py))
+
+# A TOML manifest (foldsim --manifest x.toml) needs tomllib (Python 3.11+) or
+# tomli (Ubuntu 22.04's Python 3.10: python3-tomli), in the python3 the driver runs.
+if _py and subprocess.run([_py, "-c", "import importlib.util as u, sys; "
+                           "sys.exit(0 if u.find_spec('tomllib') or u.find_spec('tomli') else 1)"],
+                          capture_output=True).returncode == 0:
+    config.available_features.add("toml")
+
+# The Vivado Tcl tests run their script under tclsh with Vivado stubbed.
+if shutil.which("tclsh"):
+    config.available_features.add("tclsh")

@@ -1,4 +1,4 @@
-# REQUIRES: verilator
+# REQUIRES: verilator, toml
 # The MEM binding of static ports: a simulator with 4 static ports and 2 virtual memories
 # (Inputs/flow/vport_stub.py 4 <dir> 2) and a manifest without [platform] hbm_direct puts the ports
 # on the virtual memories' device-memory masters, as controllers 2..5 after the memories' 0..1.

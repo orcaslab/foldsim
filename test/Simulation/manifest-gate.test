@@ -1,4 +1,4 @@
-# REQUIRES: verilator
+# REQUIRES: verilator, toml
 # foldsim_gate.py: a design's simulator against its own RTL, known only by its
 # ports (foldsim_sim.json). The tree-arb target folded from its manifest, the
 # unfolded Top and the simulator each on the same random stimulus, the
