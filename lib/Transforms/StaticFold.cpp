@@ -20863,6 +20863,12 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
       release(held, outputs);
   b.setInsertionPointToEnd(body);
   hw::OutputOp::create(b, outputs);
+  // A named array, not a braced ArrayRef in the loop's range: the array behind
+  // a braced list dies at the end of the range expression (before C++23), so
+  // zip would read freed stack (GCC -O3 reuses the slot and crashes).
+  static constexpr StringLiteral pageRequestPorts[] = {
+      "rd_valid", "rd_inst", "rd_row",  "wr_valid", "wr_inst",
+      "wr_row",   "wr_data", "wr_mask", "pending"};
   for (auto &[k, held] : pageRequests) {
     SmallVector<Value> values;
     release(held, values);
@@ -20870,11 +20876,7 @@ LogicalResult StaticFolder::buildCopy(Class &cls) {
     vm.firstOutput = copy.getNumOutputPorts();
     std::string name = ("vm" + Twine(k) + "_").str();
     SmallVector<std::pair<StringAttr, Value>> ports;
-    for (auto [what, value] :
-         llvm::zip(ArrayRef<StringRef>{"rd_valid", "rd_inst", "rd_row", "wr_valid",
-                                       "wr_inst", "wr_row", "wr_data", "wr_mask",
-                                       "pending"},
-                   values))
+    for (auto [what, value] : llvm::zip(pageRequestPorts, values))
       ports.push_back({b.getStringAttr(name + what), value});
     copy.appendOutputs(ports);
   }
