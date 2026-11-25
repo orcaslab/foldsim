@@ -2104,12 +2104,16 @@ void Threader::buildRegions(ImplicitLocOpBuilder &b, Value edge,
     reg.getNextMutable().assign(next);
   };
   auto inTurnAfter = [&](Value index) -> Value {
-    return comb::MuxOp::create(
-        b,
+    // One statement per op: function arguments are evaluated in an unspecified
+    // order (GCC right to left, clang left to right), so building them as
+    // nested arguments made the emitted op order depend on the compiler.
+    Value last =
         comb::ICmpOp::create(b, comb::ICmpPredicate::eq, index,
-                             hw::ConstantOp::create(b, idxType, threads - 1)),
-        hw::ConstantOp::create(b, idxType, 0),
-        comb::AddOp::create(b, index, hw::ConstantOp::create(b, idxType, 1)));
+                             hw::ConstantOp::create(b, idxType, threads - 1));
+    Value first = hw::ConstantOp::create(b, idxType, 0);
+    Value one = hw::ConstantOp::create(b, idxType, 1);
+    Value inc = comb::AddOp::create(b, index, one);
+    return comb::MuxOp::create(b, last, first, inc);
   };
   auto countTurns = [&](unsigned r, Value &current, Value &ahead) {
     if (!aheadIdx) {
