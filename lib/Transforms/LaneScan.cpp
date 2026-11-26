@@ -1413,13 +1413,18 @@ bool Scan::matchPatterns() {
     if (!inner && matchRotated(mux))
       any = true;
   }
+  // The mux is declared in the body, not in the for condition: GCC (11 and
+  // 13 at least) ends a for-condition variable's life before the iteration
+  // expression, so `cur = m.getFalseValue()` there read a dead `m` (a null
+  // load at -O2).
   for (auto &[root, p] : patterns)
     if (p.kind == PatKind::Rot)
-      for (Value cur = root->getResult(0); auto m = cur.getDefiningOp<comb::MuxOp>();
-           cur = m.getFalseValue()) {
-        if (cur == p.terminal)
+      for (Value cur = root->getResult(0); cur != p.terminal;) {
+        auto m = cur.getDefiningOp<comb::MuxOp>();
+        if (!m)
           break;
         rotGathers.insert(m.getCond());
+        cur = m.getFalseValue();
       }
   for (auto &op : *body) {
     if (op.getNumResults() != 1 || patterns.count(&op) ||
